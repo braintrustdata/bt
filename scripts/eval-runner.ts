@@ -11,6 +11,43 @@ type EvaluatorEntry = {
   reporter?: unknown;
 };
 
+type ProgressReporter = {
+  start: (name: string, total: number) => void;
+  stop: (name: string) => void;
+  increment: (name: string) => void;
+  setTotal: (name: string, total: number) => void;
+};
+
+type EvalOptions = Record<string, unknown> & {
+  progress?: Partial<ProgressReporter>;
+  stream?: (data: unknown) => void;
+  onStart?: (data: unknown) => void;
+  reporter?: unknown;
+  noSendLogs?: boolean;
+};
+
+type BtEvalMain = (context: BtEvalContext) => void | Promise<void>;
+
+type BtEvalContext = {
+  Eval: (
+    projectName: string,
+    evaluator: unknown,
+    options?: EvalOptions,
+  ) => Promise<unknown>;
+  runEval: (
+    projectName: string,
+    evaluator: Record<string, unknown>,
+    options?: EvalOptions,
+  ) => Promise<unknown>;
+  runRegisteredEvals: () => Promise<boolean>;
+  makeEvalOptions: (
+    evaluatorName: string,
+    options?: EvalOptions,
+  ) => EvalOptions | undefined;
+  sendConsole: (message: string, stream?: "stdout" | "stderr") => void;
+  sendEvent: (event: string, data: unknown) => void;
+};
+
 type SseWriter = {
   send: (event: string, data: unknown) => void;
   close: () => void;
@@ -112,16 +149,19 @@ async function loadBraintrust() {
   return (mod as any).default ?? mod;
 }
 
-async function loadFiles(files: string[]) {
-  const require = createRequire(import.meta.url);
+async function loadFiles(files: string[]): Promise<unknown[]> {
+  const require = createRequire(process.cwd() + "/");
+  const modules: unknown[] = [];
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
     try {
-      await import(fileUrl);
+      const mod = await import(fileUrl);
+      modules.push(mod);
     } catch (err) {
       if (shouldTryRequire(file, err)) {
         try {
-          require(file);
+          const mod = require(file);
+          modules.push(mod);
           continue;
         } catch (requireErr) {
           throw new Error(
@@ -132,6 +172,7 @@ async function loadFiles(files: string[]) {
       throw err;
     }
   }
+  return modules;
 }
 
 function shouldTryRequire(file: string, err: unknown): boolean {
@@ -236,9 +277,140 @@ function getEvaluators(): EvaluatorEntry[] {
   return Object.values(evals.evaluators) as EvaluatorEntry[];
 }
 
-async function runEvals(evaluators: EvaluatorEntry[]) {
-  (globalThis as any)._lazy_load = false;
+function extractBtEvalMain(mod: unknown): BtEvalMain | null {
+  if (!mod || typeof mod !== "object") {
+    return null;
+  }
+  const candidate = mod as Record<string, unknown>;
+  if (typeof candidate.btEvalMain === "function") {
+    return candidate.btEvalMain as BtEvalMain;
+  }
+  const defaultExport = candidate.default as
+    | Record<string, unknown>
+    | undefined;
+  if (defaultExport && typeof defaultExport.btEvalMain === "function") {
+    return defaultExport.btEvalMain as BtEvalMain;
+  }
+  return null;
+}
 
+function collectBtEvalMains(mods: unknown[]): BtEvalMain[] {
+  const mains: BtEvalMain[] = [];
+  for (const mod of mods) {
+    const main = extractBtEvalMain(mod);
+    if (main) {
+      mains.push(main);
+    }
+  }
+  return mains;
+}
+
+function shouldDisableSendLogs(): boolean {
+  return process.env.BT_EVAL_NO_SEND_LOGS === "1";
+}
+
+function getEvaluatorName(
+  evaluator: Record<string, unknown>,
+  fallback: string,
+): string {
+  const candidate = evaluator.evalName ?? evaluator.name ?? evaluator.task;
+  if (typeof candidate === "string" && candidate.length > 0) {
+    return candidate;
+  }
+  return fallback;
+}
+
+function mergeEvalOptions(
+  base: EvalOptions,
+  overrides?: EvalOptions,
+): EvalOptions {
+  if (!overrides) {
+    return base;
+  }
+
+  const merged: EvalOptions = { ...base, ...overrides };
+
+  const baseProgress = base.progress as Record<string, unknown> | undefined;
+  const overrideProgress = overrides.progress as
+    | Record<string, unknown>
+    | undefined;
+  if (baseProgress || overrideProgress) {
+    merged.progress = mergeProgress(baseProgress, overrideProgress);
+  }
+
+  const baseStream = base.stream as ((data: unknown) => void) | undefined;
+  const overrideStream = overrides.stream as
+    | ((data: unknown) => void)
+    | undefined;
+  if (baseStream || overrideStream) {
+    merged.stream = mergeHandlers(baseStream, overrideStream);
+  }
+
+  const baseOnStart = base.onStart as ((data: unknown) => void) | undefined;
+  const overrideOnStart = overrides.onStart as
+    | ((data: unknown) => void)
+    | undefined;
+  if (baseOnStart || overrideOnStart) {
+    merged.onStart = mergeHandlers(baseOnStart, overrideOnStart);
+  }
+
+  if (base.reporter && overrides.reporter === undefined) {
+    merged.reporter = base.reporter;
+  }
+
+  return merged;
+}
+
+function mergeHandlers<Args extends unknown[]>(
+  base?: (...args: Args) => void,
+  override?: (...args: Args) => void,
+): ((...args: Args) => void) | undefined {
+  if (base && override) {
+    return (...args: Args) => {
+      base(...args);
+      override(...args);
+    };
+  }
+  return base ?? override;
+}
+
+function mergeProgress(
+  base?: Partial<ProgressReporter>,
+  override?: Partial<ProgressReporter>,
+): ProgressReporter | undefined {
+  if (!base) {
+    return override as ProgressReporter | undefined;
+  }
+  if (!override) {
+    return base as ProgressReporter;
+  }
+  const noopName = (_name: string) => {};
+  const noopStart = (_name: string, _total: number) => {};
+  return {
+    start:
+      mergeHandlers(base.start, override.start) ??
+      base.start ??
+      override.start ??
+      noopStart,
+    stop:
+      mergeHandlers(base.stop, override.stop) ??
+      base.stop ??
+      override.stop ??
+      noopName,
+    increment:
+      mergeHandlers(base.increment, override.increment) ??
+      base.increment ??
+      override.increment ??
+      noopName,
+    setTotal:
+      mergeHandlers(base.setTotal, override.setTotal) ??
+      base.setTotal ??
+      override.setTotal ??
+      noopStart,
+  };
+}
+
+async function createEvalRunner() {
   const braintrust = await loadBraintrust();
   const Eval =
     (braintrust as any).Eval ??
@@ -248,66 +420,112 @@ async function runEvals(evaluators: EvaluatorEntry[]) {
   }
 
   const sse = createSseWriter();
-  let ok = true;
-  for (const entry of evaluators) {
-    try {
-      const opts = sse
-        ? {
-            reporter: {
-              name: "bt-silent-reporter",
-              reportEval: () => true,
-              reportRun: () => true,
-            },
-            progress: createEvalProgressReporter(sse, entry.evaluator.evalName),
-            stream: (data: unknown) => {
-              sse.send("progress", data);
-            },
-            onStart: (metadata: unknown) => {
-              sse.send("start", metadata);
-            },
-          }
-        : undefined;
+  const noSendLogs = shouldDisableSendLogs();
 
-      const result = await Eval(
-        entry.evaluator.projectName,
-        entry.evaluator as any,
-        opts as any,
-      );
+  const makeEvalOptions = (
+    evaluatorName: string,
+    overrides?: EvalOptions,
+  ): EvalOptions | undefined => {
+    let base: EvalOptions = {};
+    if (noSendLogs) {
+      base.noSendLogs = true;
+    }
+    if (sse) {
+      base = {
+        ...base,
+        reporter: {
+          name: "bt-silent-reporter",
+          reportEval: () => true,
+          reportRun: () => true,
+        },
+        progress: createEvalProgressReporter(sse, evaluatorName),
+        stream: (data: unknown) => {
+          sse.send("progress", data);
+        },
+        onStart: (metadata: unknown) => {
+          sse.send("start", metadata);
+        },
+      };
+    }
 
-      const failingResults = result.results.filter(
-        (r: { error?: unknown }) => r.error !== undefined,
+    if (!overrides) {
+      return Object.keys(base).length === 0 ? undefined : base;
+    }
+    return mergeEvalOptions(base, overrides);
+  };
+
+  const runEval = async (
+    projectName: string,
+    evaluator: Record<string, unknown>,
+    options?: EvalOptions,
+  ) => {
+    (globalThis as any)._lazy_load = false;
+    const evaluatorName = getEvaluatorName(evaluator, projectName);
+    const opts = makeEvalOptions(evaluatorName, options);
+    const result = await Eval(projectName, evaluator as any, opts as any);
+    const failingResults = result.results.filter(
+      (r: { error?: unknown }) => r.error !== undefined,
+    );
+    if (failingResults.length > 0 && sse) {
+      sendConsole(
+        sse,
+        `Evaluator ${evaluatorName} failed with ${failingResults.length} error${failingResults.length === 1 ? "" : "s"}.`,
       );
-      if (failingResults.length > 0) {
+    }
+    if (sse) {
+      sse.send("summary", result.summary);
+    }
+    return result;
+  };
+
+  const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
+    let ok = true;
+    for (const entry of evaluators) {
+      try {
+        const options = entry.reporter
+          ? { reporter: entry.reporter }
+          : undefined;
+        const result = await runEval(
+          entry.evaluator.projectName,
+          entry.evaluator,
+          options,
+        );
+        const failingResults = result.results.filter(
+          (r: { error?: unknown }) => r.error !== undefined,
+        );
+        if (failingResults.length > 0) {
+          ok = false;
+        }
+      } catch (err) {
         ok = false;
         if (sse) {
-          sendConsole(
-            sse,
-            `Evaluator ${entry.evaluator.evalName} failed with ${failingResults.length} error${failingResults.length === 1 ? "" : "s"}.`,
-          );
+          sse.send("error", serializeError(err));
+        } else {
+          console.error(err);
         }
       }
-
-      if (sse) {
-        sse.send("summary", result.summary);
-      }
-    } catch (err) {
-      ok = false;
-      if (sse) {
-        sse.send("error", serializeError(err));
-      } else {
-        console.error(err);
-      }
     }
-  }
+    return ok;
+  };
 
-  if (sse) {
-    sse.send("done", "");
-    sse.close();
-  }
+  const finish = (ok: boolean) => {
+    if (sse) {
+      sse.send("done", "");
+      sse.close();
+    }
+    if (!ok) {
+      process.exitCode = 1;
+    }
+  };
 
-  if (!ok) {
-    process.exitCode = 1;
-  }
+  return {
+    Eval,
+    sse,
+    runEval,
+    runRegisteredEvals,
+    makeEvalOptions,
+    finish,
+  };
 }
 
 async function main() {
@@ -318,17 +536,55 @@ async function main() {
   }
 
   const normalized = normalizeFiles(files);
-  initRegistry();
   ensureBraintrustAvailable();
-  await loadFiles(normalized);
-  const evaluators = getEvaluators();
+  await loadBraintrust();
+  initRegistry();
+  const modules = await loadFiles(normalized);
+  const btEvalMains = collectBtEvalMains(modules);
 
-  if (evaluators.length === 0) {
-    console.error("No evaluators found. Did you call Eval() in the file?");
-    process.exit(1);
+  const runner = await createEvalRunner();
+  const context: BtEvalContext = {
+    Eval: runner.Eval,
+    runEval: runner.runEval,
+    runRegisteredEvals: () => runner.runRegisteredEvals(getEvaluators()),
+    makeEvalOptions: runner.makeEvalOptions,
+    sendConsole: (message: string, stream?: "stdout" | "stderr") => {
+      sendConsole(runner.sse, message, stream);
+    },
+    sendEvent: (event: string, data: unknown) => {
+      if (runner.sse) {
+        runner.sse.send(event, data);
+      }
+    },
+  };
+
+  let ok = true;
+  try {
+    if (btEvalMains.length > 0) {
+      (globalThis as any)._lazy_load = false;
+      for (const main of btEvalMains) {
+        try {
+          await main(context);
+        } catch (err) {
+          ok = false;
+          if (runner.sse) {
+            runner.sse.send("error", serializeError(err));
+          } else {
+            console.error(err);
+          }
+        }
+      }
+    } else {
+      const evaluators = getEvaluators();
+      if (evaluators.length === 0) {
+        console.error("No evaluators found. Did you call Eval() in the file?");
+        process.exit(1);
+      }
+      ok = await runner.runRegisteredEvals(evaluators);
+    }
+  } finally {
+    runner.finish(ok);
   }
-
-  await runEvals(evaluators);
 }
 
 main().catch((err) => {

@@ -1,0 +1,11 @@
+{
+  "name": "bt-eval-direct-basic",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "braintrust": "^2.2.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2"
+  }
+}

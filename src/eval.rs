@@ -5,7 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use crossterm::style::{Attribute, Stylize};
+use crossterm::queue;
+use crossterm::style::{
+    Attribute, Color as CtColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    Stylize,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Deserialize;
 use strip_ansi_escapes::strip;
@@ -14,6 +18,13 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
+
+use ratatui::backend::TestBackend;
+use ratatui::layout::{Alignment, Constraint};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Cell, Row, Table};
+use ratatui::Terminal;
 
 use crate::args::BaseArgs;
 
@@ -487,27 +498,34 @@ fn format_experiment_summary(summary: &ExperimentSummary) -> String {
 
     if has_scores || has_metrics {
         let has_comparison = summary.comparison_experiment_name.is_some();
-        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut rows: Vec<Vec<Line>> = Vec::new();
 
-        if has_comparison {
-            rows.push(vec![
-                "Name".dark_grey().to_string(),
-                "Value".dark_grey().to_string(),
-                "Change".dark_grey().to_string(),
-                "Improvements".dark_grey().to_string(),
-                "Regressions".dark_grey().to_string(),
-            ]);
-        }
+        let header = if has_comparison {
+            Some(vec![
+                header_line("Name"),
+                header_line("Value"),
+                header_line("Change"),
+                header_line("Improvements"),
+                header_line("Regressions"),
+            ])
+        } else {
+            None
+        };
 
         let mut score_values: Vec<_> = summary.scores.values().collect();
         score_values.sort_by(|a, b| a.name.cmp(&b.name));
         for score in score_values {
-            let score_percent = format!("{:.2}%", score.score * 100.0);
-            let diff = format_diff(score.diff);
-            let improvements = format_improvements(score.improvements);
-            let regressions = format_regressions(score.regressions);
+            let score_percent =
+                Line::from(format!("{:.2}%", score.score * 100.0)).alignment(Alignment::Right);
+            let diff = format_diff_line(score.diff);
+            let improvements = format_improvements_line(score.improvements);
+            let regressions = format_regressions_line(score.regressions);
             let name = truncate_plain(&score.name, MAX_NAME_LENGTH);
-            let name = format!("{} {}", "◯".blue(), name);
+            let name = Line::from(vec![
+                Span::styled("◯", Style::default().fg(Color::Blue)),
+                Span::raw(" "),
+                Span::raw(name),
+            ]);
             if has_comparison {
                 rows.push(vec![name, score_percent, diff, improvements, regressions]);
             } else {
@@ -519,12 +537,17 @@ fn format_experiment_summary(summary: &ExperimentSummary) -> String {
             let mut metric_values: Vec<_> = metrics.values().collect();
             metric_values.sort_by(|a, b| a.name.cmp(&b.name));
             for metric in metric_values {
-                let formatted_value = format_metric_value(metric.metric, &metric.unit);
-                let diff = format_diff(metric.diff);
-                let improvements = format_improvements(metric.improvements);
-                let regressions = format_regressions(metric.regressions);
+                let formatted_value = Line::from(format_metric_value(metric.metric, &metric.unit))
+                    .alignment(Alignment::Right);
+                let diff = format_diff_line(metric.diff);
+                let improvements = format_improvements_line(metric.improvements);
+                let regressions = format_regressions_line(metric.regressions);
                 let name = truncate_plain(&metric.name, MAX_NAME_LENGTH);
-                let name = format!("{} {}", "◯".magenta(), name);
+                let name = Line::from(vec![
+                    Span::styled("◯", Style::default().fg(Color::Magenta)),
+                    Span::raw(" "),
+                    Span::raw(name),
+                ]);
                 if has_comparison {
                     rows.push(vec![name, formatted_value, diff, improvements, regressions]);
                 } else {
@@ -533,7 +556,7 @@ fn format_experiment_summary(summary: &ExperimentSummary) -> String {
             }
         }
 
-        parts.push(render_table(rows, has_comparison));
+        parts.push(render_table_ratatui(header, rows, has_comparison));
     }
 
     if let Some(url) = &summary.experiment_url {
@@ -544,42 +567,48 @@ fn format_experiment_summary(summary: &ExperimentSummary) -> String {
     box_with_title("Experiment summary", &content)
 }
 
-fn format_diff(diff: Option<f64>) -> String {
+fn format_diff_line(diff: Option<f64>) -> Line<'static> {
     match diff {
         Some(value) => {
             let sign = if value > 0.0 { "+" } else { "" };
             let percent = format!("{sign}{:.2}%", value * 100.0);
-            if value > 0.0 {
-                percent.green().to_string()
+            let style = if value > 0.0 {
+                Style::default().fg(Color::Green)
             } else {
-                percent.red().to_string()
-            }
+                Style::default().fg(Color::Red)
+            };
+            Line::from(Span::styled(percent, style)).alignment(Alignment::Right)
         }
-        None => "-".dark_grey().to_string(),
+        None => Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Right),
     }
 }
 
-fn format_improvements(value: i64) -> String {
+fn format_improvements_line(value: i64) -> Line<'static> {
     if value > 0 {
-        value
-            .to_string()
-            .green()
-            .attribute(Attribute::Dim)
-            .to_string()
+        Line::from(Span::styled(
+            value.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Right)
     } else {
-        "-".dark_grey().to_string()
+        Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Right)
     }
 }
 
-fn format_regressions(value: i64) -> String {
+fn format_regressions_line(value: i64) -> Line<'static> {
     if value > 0 {
-        value
-            .to_string()
-            .red()
-            .attribute(Attribute::Dim)
-            .to_string()
+        Line::from(Span::styled(
+            value.to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Right)
     } else {
-        "-".dark_grey().to_string()
+        Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Right)
     }
 }
 
@@ -596,58 +625,73 @@ fn format_metric_value(metric: f64, unit: &str) -> String {
     }
 }
 
-fn render_table(rows: Vec<Vec<String>>, has_comparison: bool) -> String {
+fn render_table_ratatui(
+    header: Option<Vec<Line<'static>>>,
+    rows: Vec<Vec<Line<'static>>>,
+    has_comparison: bool,
+) -> String {
     if rows.is_empty() {
         return String::new();
     }
 
     let columns = if has_comparison { 5 } else { 2 };
     let mut widths = vec![0usize; columns];
+
+    if let Some(header_row) = &header {
+        for (idx, line) in header_row.iter().enumerate().take(columns) {
+            widths[idx] = widths[idx].max(line.width());
+        }
+    }
+
     for row in &rows {
-        for (idx, cell) in row.iter().enumerate().take(columns) {
-            let w = visible_width(cell);
-            if w > widths[idx] {
-                widths[idx] = w;
-            }
+        for (idx, line) in row.iter().enumerate().take(columns) {
+            widths[idx] = widths[idx].max(line.width());
         }
     }
 
-    let mut lines = Vec::new();
-    for (row_idx, row) in rows.iter().enumerate() {
-        let mut line = String::new();
-        for (idx, cell) in row.iter().enumerate().take(columns) {
-            let width = widths[idx];
-            let is_header = row_idx == 0 && has_comparison;
-            let aligned = if idx == 0 || is_header {
-                pad_right_visible(cell, width)
-            } else {
-                pad_left_visible(cell, width)
-            };
-            line.push_str(&aligned);
-            if idx + 1 < columns {
-                line.push(' ');
-            }
-        }
-        lines.push(line);
+    let column_spacing = 2;
+    let total_width = widths.iter().sum::<usize>() + column_spacing * (columns - 1);
+    let mut height = rows.len();
+    if header.is_some() {
+        height += 1;
+    }
+    let backend = TestBackend::new(total_width as u16, height as u16);
+    let mut terminal = Terminal::new(backend).expect("failed to create table backend");
+
+    let table_rows = rows.into_iter().map(|row| {
+        let cells = row.into_iter().map(Cell::new).collect::<Vec<_>>();
+        Row::new(cells)
+    });
+
+    let mut table = Table::new(
+        table_rows,
+        widths.iter().map(|w| Constraint::Length(*w as u16)),
+    )
+    .column_spacing(column_spacing as u16);
+
+    if let Some(header_row) = header {
+        let header_cells = header_row.into_iter().map(Cell::new).collect::<Vec<_>>();
+        table = table.header(Row::new(header_cells));
     }
 
-    lines.join("\n")
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(table, area);
+        })
+        .expect("failed to render table");
+
+    let buffer = terminal.backend().buffer();
+    buffer_to_ansi_lines(buffer).join("\n")
 }
 
-fn pad_right_visible(text: &str, width: usize) -> String {
-    let w = visible_width(text);
-    if w >= width {
-        return text.to_string();
-    }
-    format!("{text}{}", " ".repeat(width - w))
-}
-
-fn pad_left_visible(text: &str, width: usize) -> String {
-    let w = visible_width(text);
-    if w >= width {
-        return text.to_string();
-    }
-    format!("{}{}", " ".repeat(width - w), text)
+fn header_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn truncate_plain(text: &str, max_len: usize) -> String {
@@ -702,4 +746,108 @@ fn visible_width(text: &str) -> usize {
     let stripped = strip(text.as_bytes());
     let stripped = String::from_utf8_lossy(&stripped);
     UnicodeWidthStr::width(stripped.as_ref())
+}
+
+fn buffer_to_ansi_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+    let width = buffer.area.width as usize;
+    let height = buffer.area.height as usize;
+    let mut lines = Vec::with_capacity(height);
+    let mut current_style = Style::reset();
+
+    for y in 0..height {
+        let mut line = String::new();
+        let mut skip = 0usize;
+        for x in 0..width {
+            let cell = &buffer[(x as u16, y as u16)];
+            let symbol = cell.symbol();
+            let symbol_width = UnicodeWidthStr::width(symbol);
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+
+            let style = Style {
+                fg: Some(cell.fg),
+                bg: Some(cell.bg),
+                add_modifier: cell.modifier,
+                ..Style::default()
+            };
+
+            if style != current_style {
+                line.push_str(&style_to_ansi(style));
+                current_style = style;
+            }
+
+            line.push_str(symbol);
+            skip = symbol_width.saturating_sub(1);
+        }
+        line.push_str(&style_to_ansi(Style::reset()));
+        lines.push(line.trim_end().to_string());
+    }
+
+    lines
+}
+
+fn style_to_ansi(style: Style) -> String {
+    let mut buf = Vec::new();
+    let _ = queue!(buf, SetAttribute(Attribute::Reset), ResetColor);
+
+    if let Some(fg) = style.fg {
+        let _ = queue!(buf, SetForegroundColor(convert_color(fg)));
+    }
+    if let Some(bg) = style.bg {
+        let _ = queue!(buf, SetBackgroundColor(convert_color(bg)));
+    }
+
+    let mods = style.add_modifier;
+    if mods.contains(Modifier::BOLD) {
+        let _ = queue!(buf, SetAttribute(Attribute::Bold));
+    }
+    if mods.contains(Modifier::DIM) {
+        let _ = queue!(buf, SetAttribute(Attribute::Dim));
+    }
+    if mods.contains(Modifier::ITALIC) {
+        let _ = queue!(buf, SetAttribute(Attribute::Italic));
+    }
+    if mods.contains(Modifier::UNDERLINED) {
+        let _ = queue!(buf, SetAttribute(Attribute::Underlined));
+    }
+    if mods.contains(Modifier::REVERSED) {
+        let _ = queue!(buf, SetAttribute(Attribute::Reverse));
+    }
+    if mods.contains(Modifier::CROSSED_OUT) {
+        let _ = queue!(buf, SetAttribute(Attribute::CrossedOut));
+    }
+    if mods.contains(Modifier::SLOW_BLINK) {
+        let _ = queue!(buf, SetAttribute(Attribute::SlowBlink));
+    }
+    if mods.contains(Modifier::RAPID_BLINK) {
+        let _ = queue!(buf, SetAttribute(Attribute::RapidBlink));
+    }
+
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+fn convert_color(color: Color) -> CtColor {
+    match color {
+        Color::Reset => CtColor::Reset,
+        Color::Black => CtColor::Black,
+        Color::Red => CtColor::Red,
+        Color::Green => CtColor::Green,
+        Color::Yellow => CtColor::Yellow,
+        Color::Blue => CtColor::Blue,
+        Color::Magenta => CtColor::Magenta,
+        Color::Cyan => CtColor::Cyan,
+        Color::Gray => CtColor::Grey,
+        Color::DarkGray => CtColor::DarkGrey,
+        Color::LightRed => CtColor::DarkRed,
+        Color::LightGreen => CtColor::DarkGreen,
+        Color::LightYellow => CtColor::DarkYellow,
+        Color::LightBlue => CtColor::DarkBlue,
+        Color::LightMagenta => CtColor::DarkMagenta,
+        Color::LightCyan => CtColor::DarkCyan,
+        Color::White => CtColor::White,
+        Color::Indexed(value) => CtColor::AnsiValue(value),
+        Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
+    }
 }

@@ -14,3 +14,6 @@ Thumbs.db
 
 # Local cargo overrides
 .cargo/config.toml
+
+# Node
+node_modules/

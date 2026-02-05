@@ -28,9 +28,44 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Install JS dependencies
+        run: pnpm install --ignore-scripts
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files --show-diff-on-failure
+
+  eval-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git auth for private dependencies
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.15.0"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Run eval fixtures
+        run: cargo test --test eval_fixtures
