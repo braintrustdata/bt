@@ -1,6 +1,17 @@
 repos:
+  - repo: https://github.com/rbubley/mirrors-prettier
+    rev: v3.4.1
+    hooks:
+      - id: prettier
+        files: \.(cjs|cts|js|jsx|mjs|mts|ts|tsx|json|md|mdx|yaml|yml)$
   - repo: local
     hooks:
+      - id: oxlint
+        name: oxlint
+        entry: npx --yes oxlint --max-warnings=0 --fix
+        language: system
+        files: \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$
+        pass_filenames: true
       - id: cargo-fmt
         name: cargo-fmt
         entry: cargo fmt --all

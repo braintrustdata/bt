@@ -3,6 +3,9 @@
 [env]
 _.path = "./target/debug"
 
+[tools]
+node = "22.15.0"
+
 [tasks.pre-commit-install]
 description = "Install git hooks via pre-commit"
 run = "pre-commit install"
