@@ -1,0 +1,4 @@
+# Mise will automatically read and use .tool-versions files as well as this file.
+
+[env]
+_.path = "./target/debug"
