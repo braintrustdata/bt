@@ -1,0 +1,11 @@
+[package]
+name = "bt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86.0"
+authors = ["Braintrust engineering <eng@braintrust.dev>"]
+description = "The Braintrust command line interface"
+license = "Apache-2.0"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive", "env"] }
