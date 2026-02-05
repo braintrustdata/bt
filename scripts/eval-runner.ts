@@ -130,9 +130,23 @@ function initRegistry() {
 }
 
 function ensureBraintrustAvailable() {
+  resolveBraintrustPath();
+}
+
+function resolveBraintrustPath(): string {
+  const files = normalizeFiles(process.argv.slice(2));
+  for (const file of files) {
+    try {
+      const require = createRequire(pathToFileURL(file).href);
+      return require.resolve("braintrust");
+    } catch {
+      continue;
+    }
+  }
+
   try {
     const require = createRequire(process.cwd() + "/");
-    require.resolve("braintrust");
+    return require.resolve("braintrust");
   } catch {
     const message =
       "Unable to resolve the `braintrust` package. " +
@@ -142,15 +156,13 @@ function ensureBraintrustAvailable() {
 }
 
 async function loadBraintrust() {
-  const require = createRequire(process.cwd() + "/");
-  const resolved = require.resolve("braintrust");
+  const resolved = resolveBraintrustPath();
   const moduleUrl = pathToFileURL(resolved).href;
   const mod = await import(moduleUrl);
   return (mod as any).default ?? mod;
 }
 
 async function loadFiles(files: string[]): Promise<unknown[]> {
-  const require = createRequire(process.cwd() + "/");
   const modules: unknown[] = [];
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
@@ -160,6 +172,7 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
     } catch (err) {
       if (shouldTryRequire(file, err)) {
         try {
+          const require = createRequire(fileUrl);
           const mod = require(file);
           modules.push(mod);
           continue;

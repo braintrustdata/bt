@@ -9,6 +9,7 @@ use serde::Deserialize;
 struct FixtureConfig {
     files: Vec<String>,
     runtime: Option<String>,
+    runner: Option<String>,
     env: Option<BTreeMap<String, String>>,
 }
 
@@ -74,7 +75,11 @@ fn eval_fixtures() {
         ensure_dependencies(&dir);
 
         let mut cmd = Command::new(&bt_path);
-        cmd.arg("eval").args(&config.files).current_dir(&dir);
+        cmd.arg("eval");
+        if let Some(runner) = config.runner.as_ref() {
+            cmd.arg("--runner").arg(runner);
+        }
+        cmd.args(&config.files).current_dir(&dir);
         cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
         cmd.env(
             "BRAINTRUST_API_KEY",

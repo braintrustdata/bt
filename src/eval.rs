@@ -35,6 +35,10 @@ pub struct EvalArgs {
     /// One or more eval files to execute (e.g. foo.eval.ts)
     #[arg(required = true)]
     pub files: Vec<String>,
+
+    /// Eval runner binary (e.g. tsx, bun, ts-node). Defaults to tsx if available.
+    #[arg(long, short = 'r', env = "BT_EVAL_TSX", value_name = "RUNNER")]
+    pub runner: Option<String>,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
@@ -63,7 +67,11 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         };
     });
 
-    let mut cmd = if let Some(tsx_path) = find_tsx_binary() {
+    let mut cmd = if let Some(explicit) = args.runner.as_deref() {
+        let mut command = Command::new(explicit);
+        command.arg(runner).args(&args.files);
+        command
+    } else if let Some(tsx_path) = find_tsx_binary() {
         let mut command = Command::new(tsx_path);
         command.arg(runner).args(&args.files);
         command
@@ -117,8 +125,17 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
     loop {
         tokio::select! {
-            Some(event) = rx.recv() => {
-                ui.handle(event);
+            event = rx.recv() => {
+                match event {
+                    Some(event) => ui.handle(event),
+                    None => {
+                        if status.is_none() {
+                            status = Some(child.wait().await.context("eval runner process failed")?);
+                            sse_task.abort();
+                        }
+                        break;
+                    }
+                }
             }
             exit_status = child.wait(), if status.is_none() => {
                 status = Some(exit_status.context("eval runner process failed")?);
