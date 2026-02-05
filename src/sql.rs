@@ -216,12 +216,10 @@ fn ui(frame: &mut Frame<'_>, app: &App) {
 fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> {
     if json_output {
         Ok(serde_json::to_string(response)?)
+    } else if let Some(table) = render_table(response) {
+        Ok(table)
     } else {
-        if let Some(table) = render_table(response) {
-            Ok(table)
-        } else {
-            Ok(serde_json::to_string_pretty(response)?)
-        }
+        Ok(serde_json::to_string_pretty(response)?)
     }
 }
 
@@ -377,7 +375,7 @@ fn pad_cell(cell: &str, width: usize) -> String {
     }
     let mut out = String::with_capacity(cell.len() + (width - current));
     out.push_str(cell);
-    out.extend(std::iter::repeat(' ').take(width - current));
+    out.extend(std::iter::repeat_n(' ', width - current));
     out
 }
 
@@ -502,11 +500,7 @@ impl App {
             return (String::new(), 0);
         }
 
-        let mut start = if self.cursor > available_width {
-            self.cursor - available_width
-        } else {
-            0
-        };
+        let mut start = self.cursor.saturating_sub(available_width);
 
         while start > 0 && !self.input.is_char_boundary(start) {
             start -= 1;
