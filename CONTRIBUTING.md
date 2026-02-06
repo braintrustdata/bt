@@ -68,12 +68,6 @@ Run evals (JS default runner):
 bt eval path/to/foo.eval.ts
 ```
 
-Run evals via manifest:
-
-```bash
-bt eval --manifest evals.toml
-```
-
 Eval fixture tests:
 
 ```bash

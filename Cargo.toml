@@ -18,6 +18,5 @@ reqwest = { version = "0.12.7", default-features = false, features = ["json", "r
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
 strip-ansi-escapes = "0.2.0"
-toml = "0.8.19"
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "process", "net"] }
 unicode-width = "0.1.13"
