@@ -33,15 +33,120 @@ const MAX_NAME_LENGTH: usize = 40;
 #[derive(Debug, Clone, Args)]
 pub struct EvalArgs {
     /// One or more eval files to execute (e.g. foo.eval.ts)
-    #[arg(required = true)]
+    #[arg(value_name = "FILE")]
     pub files: Vec<String>,
 
-    /// Eval runner binary (e.g. tsx, bun, ts-node). Defaults to tsx if available.
-    #[arg(long, short = 'r', env = "BT_EVAL_TSX", value_name = "RUNNER")]
-    pub runner: Option<String>,
+    /// Eval manifest file describing multiple runtimes.
+    #[arg(long, value_name = "PATH")]
+    pub manifest: Option<PathBuf>,
+
+    /// JS eval runner binary (e.g. tsx, bun, ts-node). Defaults to tsx if available.
+    #[arg(
+        long = "runner-js",
+        short = 'r',
+        alias = "runner",
+        env = "BT_EVAL_JS_RUNNER",
+        value_name = "RUNNER"
+    )]
+    pub runner_js: Option<String>,
+
+    /// Python eval runner binary (e.g. uv, python).
+    #[arg(long = "runner-py", env = "BT_EVAL_PY_RUNNER", value_name = "RUNNER")]
+    pub runner_py: Option<String>,
+
+    /// Go eval runner binary (e.g. go).
+    #[arg(long = "runner-go", env = "BT_EVAL_GO_RUNNER", value_name = "RUNNER")]
+    pub runner_go: Option<String>,
+
+    /// Rust eval runner binary (e.g. cargo).
+    #[arg(long = "runner-rs", env = "BT_EVAL_RS_RUNNER", value_name = "RUNNER")]
+    pub runner_rs: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EvalRunSpec {
+    runtime: Runtime,
+    runner: Option<String>,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runtime {
+    Js,
+    Py,
+    Go,
+    Rs,
+}
+
+impl Runtime {
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_lowercase().as_str() {
+            "js" | "javascript" | "node" => Ok(Self::Js),
+            "py" | "python" => Ok(Self::Py),
+            "go" | "golang" => Ok(Self::Go),
+            "rs" | "rust" => Ok(Self::Rs),
+            _ => anyhow::bail!("Unknown runtime '{value}'"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Js => "js",
+            Self::Py => "py",
+            Self::Go => "go",
+            Self::Rs => "rs",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalManifest {
+    #[serde(default, alias = "evals")]
+    eval: Vec<EvalManifestEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalManifestEntry {
+    runtime: Option<String>,
+    files: Vec<String>,
+    runner: Option<String>,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
+    let specs = if let Some(manifest) = args.manifest.as_ref() {
+        if !args.files.is_empty() {
+            anyhow::bail!("Use either --manifest or files, not both.");
+        }
+        load_manifest_specs(manifest, &args)?
+    } else {
+        if args.files.is_empty() {
+            anyhow::bail!("No eval files provided.");
+        }
+        vec![EvalRunSpec {
+            runtime: Runtime::Js,
+            runner: args.runner_js.clone(),
+            files: args.files.clone(),
+        }]
+    };
+
+    for spec in specs {
+        if spec.runtime != Runtime::Js {
+            anyhow::bail!(
+                "Runtime '{}' is not supported yet in this CLI.",
+                spec.runtime.as_str()
+            );
+        }
+        run_eval_files(&base, spec.runner.clone(), spec.files.clone()).await?;
+    }
+
+    Ok(())
+}
+
+async fn run_eval_files(
+    base: &BaseArgs,
+    runner_override: Option<String>,
+    files: Vec<String>,
+) -> Result<()> {
     let runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
         .join("eval-runner.ts");
@@ -67,21 +172,21 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         };
     });
 
-    let mut cmd = if let Some(explicit) = args.runner.as_deref() {
+    let runner_override = runner_override
+        .or_else(|| std::env::var("BT_EVAL_JS_RUNNER").ok())
+        .or_else(|| std::env::var("BT_EVAL_TSX").ok());
+
+    let mut cmd = if let Some(explicit) = runner_override.as_deref() {
         let mut command = Command::new(explicit);
-        command.arg(runner).args(&args.files);
+        command.arg(&runner).args(&files);
         command
     } else if let Some(tsx_path) = find_tsx_binary() {
         let mut command = Command::new(tsx_path);
-        command.arg(runner).args(&args.files);
+        command.arg(&runner).args(&files);
         command
     } else {
         let mut command = Command::new("npx");
-        command
-            .arg("--yes")
-            .arg("tsx")
-            .arg(runner)
-            .args(&args.files);
+        command.arg("--yes").arg("tsx").arg(&runner).args(&files);
         command
     };
 
@@ -162,18 +267,76 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_env(base: BaseArgs) -> Vec<(String, String)> {
+fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
     let mut envs = Vec::new();
-    if let Some(api_key) = base.api_key {
-        envs.push(("BRAINTRUST_API_KEY".to_string(), api_key));
+    if let Some(api_key) = base.api_key.as_ref() {
+        envs.push(("BRAINTRUST_API_KEY".to_string(), api_key.clone()));
     }
-    if let Some(api_url) = base.api_url {
-        envs.push(("BRAINTRUST_API_URL".to_string(), api_url));
+    if let Some(api_url) = base.api_url.as_ref() {
+        envs.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
     }
-    if let Some(project) = base.project {
-        envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project));
+    if let Some(project) = base.project.as_ref() {
+        envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
     envs
+}
+
+fn load_manifest_specs(path: &PathBuf, args: &EvalArgs) -> Result<Vec<EvalRunSpec>> {
+    let raw = std::fs::read_to_string(path).context("failed to read manifest")?;
+    let manifest: EvalManifest = toml::from_str(&raw).context("failed to parse eval manifest")?;
+
+    let manifest_dir = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    if manifest.eval.is_empty() {
+        anyhow::bail!("Eval manifest has no entries.");
+    }
+
+    let mut specs = Vec::new();
+    for (idx, entry) in manifest.eval.into_iter().enumerate() {
+        if entry.files.is_empty() {
+            anyhow::bail!("Eval manifest entry {idx} has no files.");
+        }
+        let runtime = Runtime::from_str(entry.runtime.as_deref().unwrap_or("js"))?;
+        let runner = match runtime {
+            Runtime::Js => entry.runner.or_else(|| args.runner_js.clone()),
+            Runtime::Py => entry.runner.or_else(|| args.runner_py.clone()),
+            Runtime::Go => entry.runner.or_else(|| args.runner_go.clone()),
+            Runtime::Rs => entry.runner.or_else(|| args.runner_rs.clone()),
+        };
+
+        let files = entry
+            .files
+            .into_iter()
+            .map(|file| {
+                let path = PathBuf::from(&file);
+                if path.is_relative() {
+                    manifest_dir.join(path).to_string_lossy().to_string()
+                } else {
+                    file
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let runner = runner.map(|value| {
+            let path = PathBuf::from(&value);
+            if path.is_relative() {
+                manifest_dir.join(path).to_string_lossy().to_string()
+            } else {
+                value
+            }
+        });
+
+        specs.push(EvalRunSpec {
+            runtime,
+            runner,
+            files,
+        });
+    }
+
+    Ok(specs)
 }
 
 fn find_tsx_binary() -> Option<PathBuf> {

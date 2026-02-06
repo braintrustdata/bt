@@ -93,7 +93,7 @@ fn eval_fixtures() {
 
         let tsx_path = dir.join("node_modules").join(".bin").join("tsx");
         if tsx_path.is_file() {
-            cmd.env("BT_EVAL_TSX", tsx_path);
+            cmd.env("BT_EVAL_JS_RUNNER", tsx_path);
         }
 
         let status = cmd.status().expect("run bt eval");

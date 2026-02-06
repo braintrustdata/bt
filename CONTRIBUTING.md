@@ -62,6 +62,18 @@ Run the CLI:
 cargo run -- sql "SELECT 1"
 ```
 
+Run evals (JS default runner):
+
+```bash
+bt eval path/to/foo.eval.ts
+```
+
+Run evals via manifest:
+
+```bash
+bt eval --manifest evals.toml
+```
+
 Eval fixture tests:
 
 ```bash
