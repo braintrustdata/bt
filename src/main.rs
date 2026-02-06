@@ -12,6 +12,7 @@ mod projects;
 mod prompts;
 mod self_update;
 mod sql;
+mod switch;
 mod sync;
 mod traces;
 mod ui;
@@ -45,13 +46,15 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Manage prompts
+    Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
     /// Self-management commands
     SelfCommand(self_update::SelfArgs),
-    /// Manage prompts
-    Prompts(CLIArgs<prompts::PromptsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
+    /// Switch org and project context
+    Switch(CLIArgs<switch::SwitchArgs>),
 }
 
 #[tokio::main]
@@ -68,6 +71,7 @@ async fn main() -> Result<()> {
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
+        Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
     }
