@@ -68,6 +68,12 @@ Run evals (JS default runner):
 bt eval path/to/foo.eval.ts
 ```
 
+Run evals locally (no logs sent):
+
+```bash
+bt eval --local path/to/foo.eval.ts
+```
+
 Eval fixture tests:
 
 ```bash

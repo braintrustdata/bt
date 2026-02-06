@@ -39,16 +39,32 @@ pub struct EvalArgs {
     /// JS eval runner binary (e.g. tsx, bun, ts-node). Defaults to tsx if available.
     #[arg(long, short = 'r', env = "BT_EVAL_JS_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,
+
+    /// Run evals locally (do not send logs to Braintrust).
+    #[arg(
+        long,
+        alias = "no-send-logs",
+        env = "BT_EVAL_LOCAL",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub no_send_logs: bool,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
-    run_eval_files(&base, args.runner.clone(), args.files.clone()).await
+    run_eval_files(
+        &base,
+        args.runner.clone(),
+        args.files.clone(),
+        args.no_send_logs,
+    )
+    .await
 }
 
 async fn run_eval_files(
     base: &BaseArgs,
     runner_override: Option<String>,
     files: Vec<String>,
+    no_send_logs: bool,
 ) -> Result<()> {
     let runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
@@ -64,13 +80,17 @@ async fn run_eval_files(
         match listener.accept().await {
             Ok((stream, _)) => {
                 if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
-                    let _ = tx_sse.send(EvalEvent::Error(format!("SSE stream error: {err}")));
+                    let _ = tx_sse.send(EvalEvent::Error {
+                        message: format!("SSE stream error: {err}"),
+                        stack: None,
+                    });
                 }
             }
             Err(err) => {
-                let _ = tx_sse.send(EvalEvent::Error(format!(
-                    "Failed to accept SSE connection: {err}"
-                )));
+                let _ = tx_sse.send(EvalEvent::Error {
+                    message: format!("Failed to accept SSE connection: {err}"),
+                    stack: None,
+                });
             }
         };
     });
@@ -94,6 +114,10 @@ async fn run_eval_files(
     };
 
     cmd.envs(build_env(base));
+    if no_send_logs {
+        cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
+        cmd.env("BT_EVAL_LOCAL", "1");
+    }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
         socket_path.to_string_lossy().to_string(),
@@ -219,8 +243,14 @@ enum EvalEvent {
     Summary(ExperimentSummary),
     Progress(SseProgressEventData),
     Done,
-    Error(String),
-    Console { _stream: String, message: String },
+    Error {
+        message: String,
+        stack: Option<String>,
+    },
+    Console {
+        _stream: String,
+        message: String,
+    },
 }
 
 #[allow(dead_code)]
@@ -245,6 +275,12 @@ struct ScoreSummary {
     diff: Option<f64>,
     improvements: i64,
     regressions: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalErrorPayload {
+    message: String,
+    stack: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,7 +398,17 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
             }
         }
         "error" => {
-            let _ = tx.send(EvalEvent::Error(data));
+            if let Ok(payload) = serde_json::from_str::<EvalErrorPayload>(&data) {
+                let _ = tx.send(EvalEvent::Error {
+                    message: payload.message,
+                    stack: payload.stack,
+                });
+            } else {
+                let _ = tx.send(EvalEvent::Error {
+                    message: data,
+                    stack: None,
+                });
+            }
         }
         "done" => {
             let _ = tx.send(EvalEvent::Done);
@@ -417,9 +463,19 @@ impl EvalUi {
             EvalEvent::Console { message, .. } => {
                 let _ = self.progress.println(message);
             }
-            EvalEvent::Error(message) => {
-                let line = message.red().to_string();
+            EvalEvent::Error { message, stack } => {
+                let show_hint = message.contains("Please specify an api key");
+                let line = message.as_str().red().to_string();
                 let _ = self.progress.println(line);
+                if let Some(stack) = stack {
+                    for line in stack.lines() {
+                        let _ = self.progress.println(line.dark_grey().to_string());
+                    }
+                }
+                if show_hint {
+                    let hint = "Hint: pass --api-key or set BRAINTRUST_API_KEY, or use --no-send-logs for local evals.";
+                    let _ = self.progress.println(hint.dark_grey().to_string());
+                }
             }
             EvalEvent::Done => {
                 self.finish();

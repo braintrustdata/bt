@@ -80,7 +80,7 @@ fn eval_fixtures() {
             cmd.arg("--runner").arg(runner);
         }
         cmd.args(&config.files).current_dir(&dir);
-        cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
+        cmd.env("BT_EVAL_LOCAL", "1");
         cmd.env(
             "BRAINTRUST_API_KEY",
             std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),

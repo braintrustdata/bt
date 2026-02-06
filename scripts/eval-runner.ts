@@ -319,7 +319,10 @@ function collectBtEvalMains(mods: unknown[]): BtEvalMain[] {
 }
 
 function shouldDisableSendLogs(): boolean {
-  return process.env.BT_EVAL_NO_SEND_LOGS === "1";
+  return (
+    process.env.BT_EVAL_NO_SEND_LOGS === "1" ||
+    process.env.BT_EVAL_LOCAL === "1"
+  );
 }
 
 function getEvaluatorName(
@@ -431,6 +434,9 @@ async function createEvalRunner() {
   if (typeof Eval !== "function") {
     throw new Error("Unable to load Eval() from braintrust package.");
   }
+  const login =
+    (braintrust as any).login ??
+    ((braintrust as any).default && (braintrust as any).default.login);
 
   const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
@@ -492,33 +498,32 @@ async function createEvalRunner() {
   };
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
-    let ok = true;
-    for (const entry of evaluators) {
-      try {
-        const options = entry.reporter
-          ? { reporter: entry.reporter }
-          : undefined;
-        const result = await runEval(
-          entry.evaluator.projectName,
-          entry.evaluator,
-          options,
-        );
-        const failingResults = result.results.filter(
-          (r: { error?: unknown }) => r.error !== undefined,
-        );
-        if (failingResults.length > 0) {
-          ok = false;
+    const results = await Promise.all(
+      evaluators.map(async (entry) => {
+        try {
+          const options = entry.reporter
+            ? { reporter: entry.reporter }
+            : undefined;
+          const result = await runEval(
+            entry.evaluator.projectName,
+            entry.evaluator,
+            options,
+          );
+          const failingResults = result.results.filter(
+            (r: { error?: unknown }) => r.error !== undefined,
+          );
+          return failingResults.length === 0;
+        } catch (err) {
+          if (sse) {
+            sse.send("error", serializeError(err));
+          } else {
+            console.error(err);
+          }
+          return false;
         }
-      } catch (err) {
-        ok = false;
-        if (sse) {
-          sse.send("error", serializeError(err));
-        } else {
-          console.error(err);
-        }
-      }
-    }
-    return ok;
+      }),
+    );
+    return results.every(Boolean);
   };
 
   const finish = (ok: boolean) => {
@@ -534,10 +539,12 @@ async function createEvalRunner() {
   return {
     Eval,
     sse,
+    login,
     runEval,
     runRegisteredEvals,
     makeEvalOptions,
     finish,
+    noSendLogs,
   };
 }
 
@@ -556,6 +563,19 @@ async function main() {
   const btEvalMains = collectBtEvalMains(modules);
 
   const runner = await createEvalRunner();
+  if (!runner.noSendLogs && typeof runner.login === "function") {
+    try {
+      await runner.login({});
+    } catch (err) {
+      if (runner.sse) {
+        runner.sse.send("error", serializeError(err));
+      } else {
+        console.error(err);
+      }
+      runner.finish(false);
+      return;
+    }
+  }
   const context: BtEvalContext = {
     Eval: runner.Eval,
     runEval: runner.runEval,
