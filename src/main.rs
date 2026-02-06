@@ -11,6 +11,7 @@ mod login;
 mod projects;
 mod self_update;
 mod sql;
+mod switch;
 mod ui;
 
 use crate::args::CLIArgs;
@@ -34,6 +35,8 @@ enum Commands {
     #[command(name = "self")]
     /// Self-management commands
     SelfCommand(self_update::SelfArgs),
+    /// Switch org and project context
+    Switch(CLIArgs<switch::SwitchArgs>),
 }
 
 #[tokio::main]
@@ -48,6 +51,7 @@ async fn main() -> Result<()> {
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
+        Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())
