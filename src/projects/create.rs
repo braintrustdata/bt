@@ -5,7 +5,7 @@ use dialoguer::Input;
 use reqwest::Client;
 
 use crate::login::LoginContext;
-use crate::ui::{print_command_status, CommandStatus};
+use crate::ui::{print_command_status, with_spinner, CommandStatus};
 
 use super::api;
 
@@ -21,11 +21,16 @@ pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Resul
     };
 
     // Check if project already exists
-    if api::get_project_by_name(http, ctx, &name).await?.is_some() {
+    let exists = with_spinner(
+        "Checking project...",
+        api::get_project_by_name(http, ctx, &name),
+    )
+    .await?;
+    if exists.is_some() {
         bail!("project '{}' already exists", name);
     }
 
-    match api::create_project(http, ctx, &name).await {
+    match with_spinner("Creating project...", api::create_project(http, ctx, &name)).await {
         Ok(_) => {
             print_command_status(
                 CommandStatus::Success,

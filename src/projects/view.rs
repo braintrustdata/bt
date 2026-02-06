@@ -5,7 +5,7 @@ use reqwest::Client;
 use urlencoding::encode;
 
 use crate::login::LoginContext;
-use crate::ui::{print_command_status, CommandStatus};
+use crate::ui::{print_command_status, with_spinner, CommandStatus};
 
 use super::api;
 use super::switch::select_project_interactive;
@@ -22,10 +22,12 @@ pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Resul
     };
 
     // Verify project exists
-    if api::get_project_by_name(http, ctx, &project_name)
-        .await?
-        .is_none()
-    {
+    let exists = with_spinner(
+        "Loading project...",
+        api::get_project_by_name(http, ctx, &project_name),
+    )
+    .await?;
+    if exists.is_none() {
         bail!("project '{}' not found", project_name);
     }
 

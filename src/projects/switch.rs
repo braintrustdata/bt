@@ -5,6 +5,7 @@ use reqwest::Client;
 
 use crate::login::LoginContext;
 use crate::ui;
+use crate::ui::with_spinner;
 
 use super::api;
 
@@ -12,7 +13,9 @@ pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Resul
     let project_name = match name {
         Some(n) => {
             // Check if project exists
-            if api::get_project_by_name(http, ctx, n).await?.is_none() {
+            let exists =
+                with_spinner("Loading project...", api::get_project_by_name(http, ctx, n)).await?;
+            if exists.is_none() {
                 // Offer to create
                 if !std::io::stdin().is_terminal() {
                     bail!("project '{}' not found", n);
@@ -24,7 +27,7 @@ pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Resul
                     .interact()?;
 
                 if create {
-                    api::create_project(http, ctx, n).await?;
+                    with_spinner("Creating project...", api::create_project(http, ctx, n)).await?;
                 } else {
                     bail!("project '{}' not found", n);
                 }
@@ -43,7 +46,7 @@ pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Resul
 }
 
 pub async fn select_project_interactive(http: &Client, ctx: &LoginContext) -> Result<String> {
-    let mut projects = api::list_projects(http, ctx).await?;
+    let mut projects = with_spinner("Loading projects...", api::list_projects(http, ctx)).await?;
     if projects.is_empty() {
         bail!("no projects found");
     }

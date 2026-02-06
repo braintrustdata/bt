@@ -5,13 +5,14 @@ use dialoguer::Confirm;
 use reqwest::Client;
 
 use crate::login::LoginContext;
+use crate::ui::with_spinner;
 
 use super::api;
 use super::switch::select_project_interactive;
 
 pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Result<()> {
     let project = match name {
-        Some(n) => api::get_project_by_name(http, ctx, n)
+        Some(n) => with_spinner("Loading project...", api::get_project_by_name(http, ctx, n))
             .await?
             .ok_or_else(|| anyhow::anyhow!("project '{}' not found", n))?,
         None => {
@@ -19,7 +20,7 @@ pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Resul
                 bail!("project name required. Use: bt projects delete <name>");
             }
             let name = select_project_interactive(http, ctx).await?;
-            api::get_project_by_name(http, ctx, &name)
+            with_spinner("Loading project...", api::get_project_by_name(http, ctx, &name))
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("project '{}' not found", name))?
         }
@@ -36,7 +37,7 @@ pub async fn run(http: &Client, ctx: &LoginContext, name: Option<&str>) -> Resul
         }
     }
 
-    api::delete_project(http, ctx, &project.id).await?;
+    with_spinner("Deleting project...", api::delete_project(http, ctx, &project.id)).await?;
     eprintln!("Deleted {}", project.name);
 
     Ok(())

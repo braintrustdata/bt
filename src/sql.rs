@@ -22,6 +22,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::args::BaseArgs;
 use crate::login::{login, LoginContext};
+use crate::ui::with_spinner;
 
 #[derive(Debug, Clone, Args)]
 pub struct SqlArgs {
@@ -65,7 +66,7 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
         .context("failed to build HTTP client")?;
 
     if let Some(query) = args.query {
-        let response = execute_query(&http, &ctx, &query).await?;
+        let response = with_spinner("Running query...", execute_query(&http, &ctx, &query)).await?;
         print_response(&response, base.json)?;
         return Ok(());
     }
