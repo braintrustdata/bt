@@ -12,6 +12,7 @@ mod projects;
 mod prompts;
 mod self_update;
 mod sql;
+mod switch;
 mod traces;
 mod ui;
 mod utils;
@@ -37,11 +38,13 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Manage prompts
+    Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
     /// Self-management commands
     SelfCommand(self_update::SelfArgs),
-    /// Manage prompts
-    Prompts(CLIArgs<prompts::PromptsArgs>),
+    /// Switch org and project context
+    Switch(CLIArgs<switch::SwitchArgs>),
 }
 
 #[tokio::main]
@@ -57,6 +60,7 @@ async fn main() -> Result<()> {
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
+        Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
     }
 
