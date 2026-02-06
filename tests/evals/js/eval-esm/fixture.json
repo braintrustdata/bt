@@ -1,0 +1,3 @@
+{
+  "files": ["tests/basic.eval.mjs", "tests/top-level-await.eval.mjs"]
+}
