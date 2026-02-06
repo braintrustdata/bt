@@ -11,6 +11,11 @@ type EvaluatorEntry = {
   reporter?: unknown;
 };
 
+type EvalResult = {
+  results: Array<{ error?: unknown }>;
+  summary: unknown;
+};
+
 type ProgressReporter = {
   start: (name: string, total: number) => void;
   stop: (name: string) => void;
@@ -26,19 +31,37 @@ type EvalOptions = Record<string, unknown> & {
   noSendLogs?: boolean;
 };
 
+type EvalFunction = (
+  projectName: string,
+  evaluator: Record<string, unknown>,
+  options?: EvalOptions,
+) => Promise<EvalResult>;
+
+type LoginFunction = (options?: Record<string, unknown>) => Promise<unknown>;
+
+type BraintrustModule = {
+  Eval?: EvalFunction;
+  login?: LoginFunction;
+  default?: BraintrustModule;
+};
+
+type GlobalEvals = {
+  functions: unknown[];
+  prompts: unknown[];
+  parameters: unknown[];
+  evaluators: Record<string, EvaluatorEntry>;
+  reporters: Record<string, unknown>;
+};
+
 type BtEvalMain = (context: BtEvalContext) => void | Promise<void>;
 
 type BtEvalContext = {
-  Eval: (
-    projectName: string,
-    evaluator: unknown,
-    options?: EvalOptions,
-  ) => Promise<unknown>;
+  Eval: EvalFunction;
   runEval: (
     projectName: string,
     evaluator: Record<string, unknown>,
     options?: EvalOptions,
-  ) => Promise<unknown>;
+  ) => Promise<EvalResult>;
   runRegisteredEvals: () => Promise<boolean>;
   makeEvalOptions: (
     evaluatorName: string,
@@ -52,6 +75,31 @@ type SseWriter = {
   send: (event: string, data: unknown) => void;
   close: () => void;
 };
+
+declare global {
+  // eslint-disable-next-line no-var
+  var _evals: GlobalEvals | undefined;
+  // eslint-disable-next-line no-var
+  var _lazy_load: boolean | undefined;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isBraintrustModule(value: unknown): value is BraintrustModule {
+  return isObject(value) && ("Eval" in value || "login" in value);
+}
+
+function normalizeBraintrustModule(value: unknown): BraintrustModule {
+  if (isBraintrustModule(value)) {
+    return value;
+  }
+  if (isObject(value) && isBraintrustModule(value.default)) {
+    return value.default;
+  }
+  throw new Error("Unable to load braintrust module.");
+}
 
 function normalizeFiles(files: string[]): string[] {
   return files.map((file) => path.resolve(process.cwd(), file));
@@ -119,14 +167,14 @@ function createSseWriter(): SseWriter | null {
 }
 
 function initRegistry() {
-  (globalThis as any)._evals = {
+  globalThis._evals = {
     functions: [],
     prompts: [],
     parameters: [],
     evaluators: {},
     reporters: {},
   };
-  (globalThis as any)._lazy_load = true;
+  globalThis._lazy_load = true;
 }
 
 function ensureBraintrustAvailable() {
@@ -158,8 +206,8 @@ function resolveBraintrustPath(): string {
 async function loadBraintrust() {
   const resolved = resolveBraintrustPath();
   const moduleUrl = pathToFileURL(resolved).href;
-  const mod = await import(moduleUrl);
-  return (mod as any).default ?? mod;
+  const mod: unknown = await import(moduleUrl);
+  return normalizeBraintrustModule(mod);
 }
 
 async function loadFiles(files: string[]): Promise<unknown[]> {
@@ -283,7 +331,7 @@ function sendConsole(
 }
 
 function getEvaluators(): EvaluatorEntry[] {
-  const evals = (globalThis as any)._evals;
+  const evals = globalThis._evals;
   if (!evals || !evals.evaluators) {
     return [];
   }
@@ -428,15 +476,11 @@ function mergeProgress(
 
 async function createEvalRunner() {
   const braintrust = await loadBraintrust();
-  const Eval =
-    (braintrust as any).Eval ??
-    ((braintrust as any).default && (braintrust as any).default.Eval);
+  const Eval = braintrust.Eval;
   if (typeof Eval !== "function") {
     throw new Error("Unable to load Eval() from braintrust package.");
   }
-  const login =
-    (braintrust as any).login ??
-    ((braintrust as any).default && (braintrust as any).default.login);
+  const login = braintrust.login;
 
   const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
@@ -478,10 +522,10 @@ async function createEvalRunner() {
     evaluator: Record<string, unknown>,
     options?: EvalOptions,
   ) => {
-    (globalThis as any)._lazy_load = false;
+    globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     const opts = makeEvalOptions(evaluatorName, options);
-    const result = await Eval(projectName, evaluator as any, opts as any);
+    const result = await Eval(projectName, evaluator, opts);
     const failingResults = result.results.filter(
       (r: { error?: unknown }) => r.error !== undefined,
     );
@@ -594,7 +638,7 @@ async function main() {
   let ok = true;
   try {
     if (btEvalMains.length > 0) {
-      (globalThis as any)._lazy_load = false;
+      globalThis._lazy_load = false;
       for (const main of btEvalMains) {
         try {
           await main(context);
