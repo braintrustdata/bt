@@ -148,6 +148,15 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Configure git auth for private dependencies
+        shell: bash
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install cached dist
         uses: actions/download-artifact@v4
         with:
@@ -197,6 +206,15 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+      - name: Configure git auth for private dependencies
+        shell: bash
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cached dist
         uses: actions/download-artifact@v4

@@ -1,5 +1,9 @@
 # Braintrust CLI (`bt`)
 
+## Current Limitations
+
+- `bt eval` is currently Unix-only (Linux/macOS). Windows support is planned.
+
 ## Install
 
 ### Stable (latest release)
@@ -69,3 +73,10 @@ bt --version
 ```
 
 On first install, open a new shell if `bt` is not found immediately.
+
+## Roadmap / TODO
+
+- Add first-class self-update command in the CLI (`bt self update`) with stable/canary channels.
+- Improve release verification and smoke tests for installer flows across macOS/Linux/Windows.
+- Add `bt eval` support on Windows (today, `bt eval` is Unix-only due to Unix socket usage).
+- Add clearer upgrade/downgrade docs for channel switching and pinned canary installs.
