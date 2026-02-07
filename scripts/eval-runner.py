@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 import importlib.util
 import fnmatch
+from pathlib import PurePosixPath
 
 try:
     from braintrust import login
@@ -131,13 +132,13 @@ def serialize_error(message: str, stack: str | None = None) -> dict[str, Any]:
 
 
 def check_match(path_input: str) -> bool:
-    p = os.path.abspath(path_input)
+    p = PurePosixPath(os.path.abspath(path_input).replace("\\", "/"))
     if INCLUDE:
-        matched = any(fnmatch.fnmatch(p, pattern) for pattern in INCLUDE)
+        matched = any(p.match(pattern) for pattern in INCLUDE)
         if not matched:
             return False
     if EXCLUDE:
-        if any(fnmatch.fnmatch(p, pattern) for pattern in EXCLUDE):
+        if any(p.match(pattern) for pattern in EXCLUDE):
             return False
     return True
 

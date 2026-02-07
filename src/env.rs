@@ -27,6 +27,8 @@ pub fn load_env(explicit_env_file: Option<&PathBuf>) -> Result<()> {
             if std::env::var_os(&key).is_some() {
                 continue;
             }
+            // Env files are processed from lowest to highest precedence,
+            // so later files intentionally override earlier file values.
             loaded.insert(key, value);
         }
     }
