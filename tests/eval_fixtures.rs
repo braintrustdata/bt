@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
@@ -81,19 +81,19 @@ fn eval_fixtures() {
                 ensure_dependencies(&dir);
             }
             "python" => {
-                let python = match find_python() {
+                let python = match ensure_python_env(&fixtures_root.join("py")) {
                     Some(python) => python,
                     None => {
                         eprintln!(
-                            "Skipping {} (python not installed).",
+                            "Skipping {} (uv/python not available).",
                             dir.file_name().unwrap().to_string_lossy()
                         );
                         continue;
                     }
                 };
-                if !python_can_import_braintrust(&python) {
+                if !python_can_import_braintrust(python.to_string_lossy().as_ref()) {
                     eprintln!(
-                        "Skipping {} (braintrust not installed in python).",
+                        "Skipping {} (failed to install braintrust in fixture venv).",
                         dir.file_name().unwrap().to_string_lossy()
                     );
                     continue;
@@ -130,7 +130,7 @@ fn eval_fixtures() {
         }
 
         if runtime == "python" {
-            if let Some(python) = find_python() {
+            if let Some(python) = ensure_python_env(&fixtures_root.join("py")) {
                 cmd.env("BT_EVAL_PYTHON_RUNNER", python);
             }
         }
@@ -213,18 +213,56 @@ fn command_exists(command: &str) -> bool {
     false
 }
 
-fn find_python() -> Option<String> {
-    for candidate in ["python3", "python"] {
-        if command_exists(candidate) {
-            return Some(candidate.to_string());
+fn ensure_python_env(fixtures_root: &Path) -> Option<PathBuf> {
+    if !command_exists("uv") {
+        return None;
+    }
+
+    let venv_dir = fixtures_root.join(".venv");
+    let python = venv_python_path(&venv_dir);
+
+    if !python.is_file() {
+        let status = Command::new("uv")
+            .args(["venv", venv_dir.to_string_lossy().as_ref()])
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
         }
     }
-    None
+
+    if !python_can_import_braintrust(python.to_string_lossy().as_ref()) {
+        let status = Command::new("uv")
+            .args([
+                "pip",
+                "install",
+                "--python",
+                python.to_string_lossy().as_ref(),
+                "braintrust",
+            ])
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+    }
+
+    Some(python)
+}
+
+fn venv_python_path(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
 }
 
 fn python_can_import_braintrust(python: &str) -> bool {
     Command::new(python)
         .args(["-c", "import braintrust"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
