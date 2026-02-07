@@ -9,6 +9,7 @@ mod eval;
 mod http;
 mod login;
 mod projects;
+mod self_update;
 mod sql;
 mod ui;
 
@@ -30,6 +31,9 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    #[command(name = "self")]
+    /// Self-management commands
+    SelfCommand(self_update::SelfArgs),
 }
 
 #[tokio::main]
@@ -43,6 +47,7 @@ async fn main() -> Result<()> {
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+        Commands::SelfCommand(args) => self_update::run(args).await?,
     }
 
     Ok(())
