@@ -263,11 +263,12 @@ jobs:
           - Windows: \`powershell -ExecutionPolicy Bypass -c "irm https://github.com/${REPO}/releases/download/${CANARY_TAG}/bt-installer.ps1 | iex"\`
           EOF
 
-          if gh release view "$CANARY_TAG" >/dev/null 2>&1; then
-            gh release delete "$CANARY_TAG" --yes --cleanup-tag
+          if gh release view "$CANARY_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release delete "$CANARY_TAG" --repo "$REPO" --yes --cleanup-tag
           fi
 
           gh release create "$CANARY_TAG" \
+            --repo "$REPO" \
             --target "${GITHUB_SHA}" \
             --title "Canary ${SHORT_SHA}" \
             --prerelease \
@@ -292,11 +293,12 @@ jobs:
           - Windows: \`powershell -ExecutionPolicy Bypass -c "irm https://github.com/${REPO}/releases/download/${ALIAS_TAG}/bt-installer.ps1 | iex"\`
           EOF
 
-          if gh release view "$ALIAS_TAG" >/dev/null 2>&1; then
-            gh release delete "$ALIAS_TAG" --yes --cleanup-tag
+          if gh release view "$ALIAS_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release delete "$ALIAS_TAG" --repo "$REPO" --yes --cleanup-tag
           fi
 
           gh release create "$ALIAS_TAG" \
+            --repo "$REPO" \
             --target "${GITHUB_SHA}" \
             --title "Canary (latest ${BRANCH_NAME})" \
             --prerelease \
