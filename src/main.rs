@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 
 mod args;
+mod env;
 #[cfg(unix)]
 mod eval;
 mod http;
@@ -32,7 +34,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    env::bootstrap_from_args(&argv)?;
+    let cli = Cli::parse_from(argv);
 
     match cli.command {
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,

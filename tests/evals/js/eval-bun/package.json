@@ -1,0 +1,8 @@
+{
+  "name": "bt-eval-bun",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "braintrust": "^2.2.0"
+  }
+}

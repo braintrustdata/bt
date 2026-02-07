@@ -1,16 +1,23 @@
-name: pre-commit
+name: tests
 
 on:
   pull_request:
   push:
 
 jobs:
-  pre-commit:
+  eval-tests:
+    name: eval-tests (node ${{ matrix.node-version }}, py ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "22"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     permissions:
       contents: read
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
+      BT_EVAL_REQUIRED_RUNTIMES: node,bun,python
     steps:
       - uses: actions/checkout@v4
       - name: Configure git auth for private dependencies
@@ -24,19 +31,17 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.92.0
-          components: rustfmt, clippy
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: ${{ matrix.node-version }}
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v5
       - name: Enable pnpm
         run: |
           corepack enable
           corepack prepare pnpm@10.28.2 --activate
-      - name: Install JS dependencies
-        run: pnpm install --ignore-scripts
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: pre-commit/action@v3.0.1
-        with:
-          extra_args: --all-files --show-diff-on-failure
+      - name: Run eval fixtures
+        run: cargo test --test eval_fixtures

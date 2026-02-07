@@ -1,16 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct FixtureConfig {
     files: Vec<String>,
     runtime: Option<String>,
     runner: Option<String>,
+    runners: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
+    args: Option<Vec<String>>,
+    expect_success: Option<bool>,
 }
 
 #[test]
@@ -21,6 +24,8 @@ fn eval_fixtures() {
         eprintln!("No eval fixtures found.");
         return;
     }
+
+    enforce_required_runtimes(&fixtures_root);
 
     let bt_path = match std::env::var("CARGO_BIN_EXE_bt") {
         Ok(path) => PathBuf::from(path),
@@ -58,89 +63,92 @@ fn eval_fixtures() {
         ran_any = true;
 
         let config = read_fixture_config(&config_path);
+        let fixture_name = dir.file_name().unwrap().to_string_lossy().to_string();
         if config.files.is_empty() {
-            panic!(
-                "Fixture {} has no files configured.",
-                dir.file_name().unwrap().to_string_lossy()
-            );
+            panic!("Fixture {fixture_name} has no files configured.");
         }
 
         let runtime = config.runtime.as_deref().unwrap_or("node");
         match runtime {
-            "node" => {
-                ensure_dependencies(&dir);
-            }
-            "bun" => {
-                if !command_exists("bun") {
-                    eprintln!(
-                        "Skipping {} (bun not installed).",
-                        dir.file_name().unwrap().to_string_lossy()
-                    );
-                    continue;
-                }
-                ensure_dependencies(&dir);
-            }
-            "python" => {
-                let python = match ensure_python_env(&fixtures_root.join("py")) {
-                    Some(python) => python,
-                    None => {
-                        eprintln!(
-                            "Skipping {} (uv/python not available).",
-                            dir.file_name().unwrap().to_string_lossy()
+            "node" => ensure_dependencies(&dir),
+            "bun" => ensure_dependencies(&dir),
+            "python" => {}
+            other => panic!("Unsupported runtime for fixture {fixture_name}: {other}"),
+        }
+
+        let python_runner = if runtime == "python" {
+            match ensure_python_env(&fixtures_root.join("py")) {
+                Some(python) => Some(python),
+                None => {
+                    if required_runtimes().contains("python") {
+                        panic!(
+                            "Python runtime is required but unavailable for fixture {fixture_name}"
                         );
-                        continue;
                     }
-                };
-                if !python_can_import_braintrust(python.to_string_lossy().as_ref()) {
-                    eprintln!(
-                        "Skipping {} (failed to install braintrust in fixture venv).",
-                        dir.file_name().unwrap().to_string_lossy()
-                    );
+                    eprintln!("Skipping {fixture_name} (uv/python not available).");
                     continue;
                 }
             }
-            other => {
-                panic!(
-                    "Unsupported runtime for fixture {}: {other}",
-                    dir.file_name().unwrap().to_string_lossy()
-                );
+        } else {
+            None
+        };
+
+        let runners = collect_runners(&config);
+        let mut ran_variant = false;
+        for runner in runners {
+            if needs_bun(runtime, runner.as_deref()) && !command_exists("bun") {
+                if required_runtimes().contains("bun") {
+                    panic!("Bun runtime is required but unavailable for fixture {fixture_name}");
+                }
+                let label = runner.as_deref().unwrap_or("default");
+                eprintln!("Skipping {fixture_name} [{label}] (bun not installed).");
+                continue;
             }
-        }
 
-        let mut cmd = Command::new(&bt_path);
-        cmd.arg("eval");
-        if let Some(runner) = config.runner.as_ref() {
-            cmd.arg("--runner").arg(runner);
-        }
-        cmd.args(&config.files).current_dir(&dir);
-        cmd.env("BT_EVAL_LOCAL", "1");
-        cmd.env(
-            "BRAINTRUST_API_KEY",
-            std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
-        );
-        if let Some(env) = config.env {
-            for (key, value) in env {
-                cmd.env(key, value);
+            let mut cmd = Command::new(&bt_path);
+            cmd.arg("eval");
+            if let Some(args) = config.args.as_ref() {
+                cmd.args(args);
             }
-        }
+            if let Some(runner_cmd) =
+                resolve_runner(&dir, runner.as_deref(), python_runner.as_ref())
+            {
+                cmd.arg("--runner").arg(runner_cmd);
+            }
+            cmd.args(&config.files).current_dir(&dir);
+            cmd.env("BT_EVAL_LOCAL", "1");
+            cmd.env(
+                "BRAINTRUST_API_KEY",
+                std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+            );
 
-        let tsx_path = dir.join("node_modules").join(".bin").join("tsx");
-        if tsx_path.is_file() {
-            cmd.env("BT_EVAL_JS_RUNNER", tsx_path);
-        }
+            if let Some(env) = config.env.as_ref() {
+                for (key, value) in env {
+                    cmd.env(key, value);
+                }
+            }
 
-        if runtime == "python" {
-            if let Some(python) = ensure_python_env(&fixtures_root.join("py")) {
+            if let Some(tsx_path) = local_tsx_path(&dir) {
+                cmd.env("BT_EVAL_JS_RUNNER", tsx_path);
+            }
+
+            if let Some(python) = python_runner.as_ref() {
                 cmd.env("BT_EVAL_PYTHON_RUNNER", python);
             }
+
+            let expect_success = config.expect_success.unwrap_or(true);
+            let status = cmd.status().expect("run bt eval");
+            assert!(
+                status.success() == expect_success,
+                "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})",
+                runner.as_deref().unwrap_or("default")
+            );
+            ran_variant = true;
         }
 
-        let status = cmd.status().expect("run bt eval");
-        assert!(
-            status.success(),
-            "Fixture {} failed with status {status}",
-            dir.file_name().unwrap().to_string_lossy()
-        );
+        if !ran_variant {
+            eprintln!("Skipping {fixture_name} (no runnable variants).")
+        }
     }
 
     if !ran_any {
@@ -151,6 +159,79 @@ fn eval_fixtures() {
 fn read_fixture_config(path: &Path) -> FixtureConfig {
     let raw = fs::read_to_string(path).expect("read fixture.json");
     serde_json::from_str(&raw).expect("parse fixture.json")
+}
+
+fn collect_runners(config: &FixtureConfig) -> Vec<Option<String>> {
+    if let Some(runners) = config.runners.as_ref() {
+        return runners
+            .iter()
+            .map(|value| {
+                if value == "default" {
+                    None
+                } else {
+                    Some(value.clone())
+                }
+            })
+            .collect();
+    }
+
+    vec![config.runner.clone()]
+}
+
+fn resolve_runner(dir: &Path, runner: Option<&str>, python: Option<&PathBuf>) -> Option<String> {
+    let runner = runner?;
+
+    if runner == "tsx" {
+        if let Some(tsx_path) = local_tsx_path(dir) {
+            return Some(tsx_path.to_string_lossy().to_string());
+        }
+    }
+
+    if (runner == "python" || runner == "python3") && python.is_some() {
+        return python.map(|path| path.to_string_lossy().to_string());
+    }
+
+    Some(runner.to_string())
+}
+
+fn local_tsx_path(dir: &Path) -> Option<PathBuf> {
+    let tsx_path = dir.join("node_modules").join(".bin").join("tsx");
+    tsx_path.is_file().then_some(tsx_path)
+}
+
+fn needs_bun(runtime: &str, runner: Option<&str>) -> bool {
+    runtime == "bun" || runner == Some("bun")
+}
+
+fn required_runtimes() -> BTreeSet<String> {
+    std::env::var("BT_EVAL_REQUIRED_RUNTIMES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+fn enforce_required_runtimes(fixtures_root: &Path) {
+    let required = required_runtimes();
+
+    if required.contains("node") && !command_exists("node") {
+        panic!("node runtime is required but not installed");
+    }
+
+    if required.contains("bun") && !command_exists("bun") {
+        panic!("bun runtime is required but not installed");
+    }
+
+    if required.contains("python") {
+        let python = ensure_python_env(&fixtures_root.join("py"))
+            .expect("python runtime is required but uv/python is unavailable");
+        assert!(
+            python_can_import_braintrust(python.to_string_lossy().as_ref()),
+            "python runtime is required but braintrust package is unavailable"
+        );
+    }
 }
 
 fn ensure_dependencies(dir: &Path) {

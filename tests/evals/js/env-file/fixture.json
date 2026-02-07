@@ -1,0 +1,7 @@
+{
+  "files": ["env-file.eval.ts"],
+  "args": ["--env-file", ".custom.env"],
+  "env": {
+    "NODE_ENV": "development"
+  }
+}

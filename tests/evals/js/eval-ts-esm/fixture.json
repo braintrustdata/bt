@@ -1,3 +1,4 @@
 {
+  "runners": ["tsx", "bun"],
   "files": ["tests/basic.eval.ts", "tests/top-level-await.eval.ts"]
 }
