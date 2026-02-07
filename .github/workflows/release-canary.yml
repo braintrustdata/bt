@@ -1,0 +1,287 @@
+name: release-canary
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+concurrency:
+  group: release-canary-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      val: ${{ steps.plan.outputs.manifest }}
+      short-sha: ${{ steps.meta.outputs.short_sha }}
+      branch-slug: ${{ steps.meta.outputs.branch_slug }}
+      canary-tag: ${{ steps.meta.outputs.canary_tag }}
+      alias-tag: ${{ steps.meta.outputs.alias_tag }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Configure git auth for private dependencies
+        shell: bash
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dist
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"
+
+      - name: Cache dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/dist
+
+      - id: meta
+        shell: bash
+        run: |
+          branch_slug="$(echo "${GITHUB_REF_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g' | cut -c1-40)"
+          if [ -z "$branch_slug" ]; then
+            branch_slug="branch"
+          fi
+
+          short_sha="${GITHUB_SHA::12}"
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            canary_tag="canary-$short_sha"
+            alias_tag="canary"
+          else
+            canary_tag="canary-${branch_slug}-$short_sha"
+            alias_tag="canary-${branch_slug}"
+          fi
+
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "branch_slug=$branch_slug" >> "$GITHUB_OUTPUT"
+          echo "canary_tag=$canary_tag" >> "$GITHUB_OUTPUT"
+          echo "alias_tag=$alias_tag" >> "$GITHUB_OUTPUT"
+
+      - id: plan
+        shell: bash
+        run: |
+          dist plan --output-format=json > plan-dist-manifest.json
+          echo "dist ran successfully"
+          cat plan-dist-manifest.json
+          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dist plan manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-plan-dist-manifest
+          path: plan-dist-manifest.json
+
+  build-local-artifacts:
+    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
+    needs:
+      - plan
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+    steps:
+      - name: Enable windows longpaths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Configure git auth for private dependencies
+        shell: bash
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust non-interactively if not already installed
+        if: ${{ matrix.container }}
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - name: Install dependencies
+        run: ${{ matrix.packages_install }}
+
+      - name: Build artifacts
+        shell: bash
+        run: |
+          dist build --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo "dist ran successfully"
+
+      - id: dist-files
+        name: Post-build
+        shell: bash
+        run: |
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.dist-files.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  build-global-artifacts:
+    needs:
+      - plan
+      - build-local-artifacts
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install cached dist
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+
+      - run: chmod +x ~/.cargo/bin/dist
+
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+
+      - id: dist-files
+        shell: bash
+        run: |
+          dist build --output-format=json --artifacts=global > dist-manifest.json
+          echo "dist ran successfully"
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-global
+          path: |
+            ${{ steps.dist-files.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  announce:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    if: ${{ always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CANARY_TAG: ${{ needs.plan.outputs.canary-tag }}
+      ALIAS_TAG: ${{ needs.plan.outputs.alias-tag }}
+      SHORT_SHA: ${{ needs.plan.outputs.short-sha }}
+      BRANCH_NAME: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download GitHub artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Cleanup
+        run: rm -f artifacts/*-dist-manifest.json
+
+      - name: Publish immutable canary release
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/canary-notes.md" <<EOF
+          Canary build from branch \`${BRANCH_NAME}\` at commit \`${GITHUB_SHA}\`.
+
+          Install this exact build:
+          - Unix: \`curl -fsSL https://github.com/${REPO}/releases/download/${CANARY_TAG}/bt-installer.sh | sh\`
+          - Windows: \`powershell -ExecutionPolicy Bypass -c "irm https://github.com/${REPO}/releases/download/${CANARY_TAG}/bt-installer.ps1 | iex"\`
+          EOF
+
+          if gh release view "$CANARY_TAG" >/dev/null 2>&1; then
+            gh release delete "$CANARY_TAG" --yes --cleanup-tag
+          fi
+
+          gh release create "$CANARY_TAG" \
+            --target "${GITHUB_SHA}" \
+            --title "Canary ${SHORT_SHA}" \
+            --prerelease \
+            --notes-file "$RUNNER_TEMP/canary-notes.md" \
+            artifacts/*
+
+      - name: Publish moving canary alias (latest branch head only)
+        shell: bash
+        run: |
+          encoded_ref="$(printf '%s' "${BRANCH_NAME}" | jq -sRr @uri)"
+          latest_branch_sha="$(gh api "repos/${REPO}/git/ref/heads/${encoded_ref}" --jq .object.sha)"
+          if [ "$latest_branch_sha" != "${GITHUB_SHA}" ]; then
+            echo "Skipping moving canary alias for non-latest ${BRANCH_NAME} commit: ${GITHUB_SHA}"
+            exit 0
+          fi
+
+          cat > "$RUNNER_TEMP/canary-latest-notes.md" <<EOF
+          Latest canary build from branch \`${BRANCH_NAME}\` at commit \`${GITHUB_SHA}\`.
+
+          Install latest branch canary:
+          - Unix: \`curl -fsSL https://github.com/${REPO}/releases/download/${ALIAS_TAG}/bt-installer.sh | sh\`
+          - Windows: \`powershell -ExecutionPolicy Bypass -c "irm https://github.com/${REPO}/releases/download/${ALIAS_TAG}/bt-installer.ps1 | iex"\`
+          EOF
+
+          if gh release view "$ALIAS_TAG" >/dev/null 2>&1; then
+            gh release delete "$ALIAS_TAG" --yes --cleanup-tag
+          fi
+
+          gh release create "$ALIAS_TAG" \
+            --target "${GITHUB_SHA}" \
+            --title "Canary (latest ${BRANCH_NAME})" \
+            --prerelease \
+            --notes-file "$RUNNER_TEMP/canary-latest-notes.md" \
+            artifacts/*
