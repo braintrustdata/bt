@@ -1,0 +1,5 @@
+{
+  "runtime": "bun",
+  "runner": "bun",
+  "files": ["tests/bun-imports.eval.ts", "tests/bun-file-api.eval.ts"]
+}
