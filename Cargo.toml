@@ -37,6 +37,7 @@ cargo-dist-version = "0.30.3"
 ci = "github"
 create-release = true
 pr-run-mode = "plan"
+allow-dirty = ["ci"]
 
 [package.metadata.dist]
 installers = ["shell", "powershell"]
