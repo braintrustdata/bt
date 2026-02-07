@@ -74,6 +74,24 @@ bt --version
 
 On first install, open a new shell if `bt` is not found immediately.
 
+## Uninstall
+
+Unix-like systems:
+
+```bash
+rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/bt"
+rm -rf "$HOME/.config/bt"
+hash -r
+```
+
+Windows (PowerShell):
+
+```powershell
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+Remove-Item -Force (Join-Path $cargoHome "bin\\bt.exe") -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyContinue
+```
+
 ## Roadmap / TODO
 
 - Add first-class self-update command in the CLI (`bt self update`) with stable/canary channels.
