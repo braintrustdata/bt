@@ -1,9 +1,8 @@
 use anyhow::Result;
 use dialoguer::console;
-use unicode_width::UnicodeWidthStr;
 
 use crate::http::ApiClient;
-use crate::ui::with_spinner;
+use crate::ui::{header, styled_table, with_spinner};
 
 use super::api;
 
@@ -15,43 +14,23 @@ pub async fn run(client: &ApiClient, org_name: &str, json: bool) -> Result<()> {
     } else {
         println!(
             "{} projects found in {}\n",
-            console::style(&projects.len()),
+            console::style(projects.len()),
             console::style(org_name).bold()
         );
 
-        // Calculate column widths
-        let name_width = projects
-            .iter()
-            .map(|p| p.name.width())
-            .max()
-            .unwrap_or(20)
-            .max(20);
+        let mut table = styled_table();
+        table.set_header(vec![header("Name"), header("Description")]);
 
-        // Print header
-        println!(
-            "{}  {}",
-            console::style(format!("{:width$}", "Project name", width = name_width))
-                .dim()
-                .bold(),
-            console::style("Description").dim().bold()
-        );
-
-        // Print rows
         for project in &projects {
             let desc = project
                 .description
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or("-");
-            let padding = name_width - project.name.width();
-            println!(
-                "{}{:padding$}  {}",
-                project.name,
-                "",
-                desc,
-                padding = padding
-            );
+            table.add_row(vec![&project.name, desc]);
         }
+
+        println!("{table}");
     }
 
     Ok(())
