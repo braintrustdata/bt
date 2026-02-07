@@ -32,13 +32,13 @@ pub struct ViewArgs {
     name_flag: Option<String>,
 }
 
-// impl ViewArgs {
-//     fn name(&self) -> Option<&str> {
-//         self.name_positional
-//             .as_deref()
-//             .or(self.name_flag.as_deref())
-//     }
-// }
+impl ViewArgs {
+    fn name(&self) -> Option<&str> {
+        self.name_positional
+            .as_deref()
+            .or(self.name_flag.as_deref())
+    }
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct DeleteArgs {
@@ -58,7 +58,16 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         None | Some(PromptsCommands::List) => {
             list::run(&client, project, &ctx.login.org_name, base.json).await
         }
-        Some(PromptsCommands::View(_p)) => view::run().await,
-        Some(PromptsCommands::Delete(_p)) => delete::run().await,
+        Some(PromptsCommands::View(p)) => {
+            view::run(
+                &client,
+                &ctx.app_url,
+                project,
+                &ctx.login.org_name,
+                p.name(),
+            )
+            .await
+        }
+        Some(PromptsCommands::Delete(p)) => delete::run(&client, project, p.name.as_deref()).await,
     }
 }

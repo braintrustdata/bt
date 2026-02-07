@@ -2,7 +2,7 @@ use anyhow::Result;
 use dialoguer::console;
 
 use crate::http::ApiClient;
-use crate::ui::{header, styled_table, with_spinner};
+use crate::ui::{apply_column_padding, header, styled_table, truncate, with_spinner};
 
 use super::api;
 
@@ -20,14 +20,16 @@ pub async fn run(client: &ApiClient, org_name: &str, json: bool) -> Result<()> {
 
         let mut table = styled_table();
         table.set_header(vec![header("Name"), header("Description")]);
+        apply_column_padding(&mut table, (0, 6));
 
         for project in &projects {
             let desc = project
                 .description
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .unwrap_or("-");
-            table.add_row(vec![&project.name, desc]);
+                .map(|s| truncate(s, 60))
+                .unwrap_or_else(|| "-".to_string());
+            table.add_row(vec![&project.name, &desc]);
         }
 
         println!("{table}");

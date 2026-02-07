@@ -47,7 +47,6 @@ pub async fn get_prompt_by_slug(
     Ok(list.objects.into_iter().next())
 }
 
-#[allow(dead_code)]
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
     client.delete(&path).await
