@@ -16,7 +16,7 @@ struct FixtureConfig {
 #[test]
 fn eval_fixtures() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixtures_root = root.join("tests").join("evals").join("js");
+    let fixtures_root = root.join("tests").join("evals");
     if !fixtures_root.exists() {
         eprintln!("No eval fixtures found.");
         return;
@@ -33,12 +33,20 @@ fn eval_fixtures() {
         }
     };
 
-    let mut fixture_dirs: Vec<PathBuf> = fs::read_dir(&fixtures_root)
-        .expect("read fixtures dir")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
+    let mut fixture_dirs: Vec<PathBuf> = Vec::new();
+    for runtime_dir in ["js", "py"] {
+        let root_dir = fixtures_root.join(runtime_dir);
+        if !root_dir.exists() {
+            continue;
+        }
+        let mut dirs: Vec<PathBuf> = fs::read_dir(&root_dir)
+            .expect("read fixtures dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        fixture_dirs.append(&mut dirs);
+    }
     fixture_dirs.sort();
 
     let mut ran_any = false;
@@ -58,21 +66,46 @@ fn eval_fixtures() {
         }
 
         let runtime = config.runtime.as_deref().unwrap_or("node");
-        if runtime != "node" {
-            if runtime == "bun" && !command_exists("bun") {
-                eprintln!(
-                    "Skipping {} (bun not installed).",
+        match runtime {
+            "node" => {
+                ensure_dependencies(&dir);
+            }
+            "bun" => {
+                if !command_exists("bun") {
+                    eprintln!(
+                        "Skipping {} (bun not installed).",
+                        dir.file_name().unwrap().to_string_lossy()
+                    );
+                    continue;
+                }
+                ensure_dependencies(&dir);
+            }
+            "python" => {
+                let python = match find_python() {
+                    Some(python) => python,
+                    None => {
+                        eprintln!(
+                            "Skipping {} (python not installed).",
+                            dir.file_name().unwrap().to_string_lossy()
+                        );
+                        continue;
+                    }
+                };
+                if !python_can_import_braintrust(&python) {
+                    eprintln!(
+                        "Skipping {} (braintrust not installed in python).",
+                        dir.file_name().unwrap().to_string_lossy()
+                    );
+                    continue;
+                }
+            }
+            other => {
+                panic!(
+                    "Unsupported runtime for fixture {}: {other}",
                     dir.file_name().unwrap().to_string_lossy()
                 );
-                continue;
             }
-            panic!(
-                "Unsupported runtime for fixture {}: {runtime}",
-                dir.file_name().unwrap().to_string_lossy()
-            );
         }
-
-        ensure_dependencies(&dir);
 
         let mut cmd = Command::new(&bt_path);
         cmd.arg("eval");
@@ -94,6 +127,12 @@ fn eval_fixtures() {
         let tsx_path = dir.join("node_modules").join(".bin").join("tsx");
         if tsx_path.is_file() {
             cmd.env("BT_EVAL_JS_RUNNER", tsx_path);
+        }
+
+        if runtime == "python" {
+            if let Some(python) = find_python() {
+                cmd.env("BT_EVAL_PYTHON_RUNNER", python);
+            }
         }
 
         let status = cmd.status().expect("run bt eval");
@@ -172,4 +211,21 @@ fn command_exists(command: &str) -> bool {
     }
 
     false
+}
+
+fn find_python() -> Option<String> {
+    for candidate in ["python3", "python"] {
+        if command_exists(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn python_can_import_braintrust(python: &str) -> bool {
+    Command::new(python)
+        .args(["-c", "import braintrust"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }

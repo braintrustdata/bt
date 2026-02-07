@@ -30,13 +30,19 @@ use crate::args::BaseArgs;
 
 const MAX_NAME_LENGTH: usize = 40;
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum EvalLanguage {
+    JavaScript,
+    Python,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct EvalArgs {
     /// One or more eval files to execute (e.g. foo.eval.ts)
     #[arg(required = true, value_name = "FILE")]
     pub files: Vec<String>,
 
-    /// JS eval runner binary (e.g. tsx, bun, ts-node). Defaults to tsx if available.
+    /// Eval runner binary (e.g. tsx, bun, ts-node, python). Defaults to tsx for JS files.
     #[arg(long, short = 'r', env = "BT_EVAL_JS_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,
 
@@ -66,9 +72,13 @@ async fn run_eval_files(
     files: Vec<String>,
     no_send_logs: bool,
 ) -> Result<()> {
-    let runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let language = detect_eval_language(&files)?;
+    let js_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
         .join("eval-runner.ts");
+    let py_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("eval-runner.py");
 
     let socket_path = build_sse_socket_path()?;
     let _ = std::fs::remove_file(&socket_path);
@@ -95,22 +105,9 @@ async fn run_eval_files(
         };
     });
 
-    let runner_override = runner_override
-        .or_else(|| std::env::var("BT_EVAL_JS_RUNNER").ok())
-        .or_else(|| std::env::var("BT_EVAL_TSX").ok());
-
-    let mut cmd = if let Some(explicit) = runner_override.as_deref() {
-        let mut command = Command::new(explicit);
-        command.arg(&runner).args(&files);
-        command
-    } else if let Some(tsx_path) = find_tsx_binary() {
-        let mut command = Command::new(tsx_path);
-        command.arg(&runner).args(&files);
-        command
-    } else {
-        let mut command = Command::new("npx");
-        command.arg("--yes").arg("tsx").arg(&runner).args(&files);
-        command
+    let mut cmd = match language {
+        EvalLanguage::Python => build_python_command(runner_override, &py_runner, &files)?,
+        EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files),
     };
 
     cmd.envs(build_env(base));
@@ -125,9 +122,7 @@ async fn run_eval_files(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .context("failed to start eval runner (npx tsx)")?;
+    let mut child = cmd.spawn().context("failed to start eval runner")?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -208,6 +203,89 @@ fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
     envs
 }
 
+fn detect_eval_language(files: &[String]) -> Result<EvalLanguage> {
+    let mut detected: Option<EvalLanguage> = None;
+    for file in files {
+        let ext = PathBuf::from(file)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let current = match ext.as_str() {
+            "py" => EvalLanguage::Python,
+            "ts" | "tsx" | "js" | "mjs" | "cjs" => EvalLanguage::JavaScript,
+            _ => {
+                anyhow::bail!("Unsupported eval file extension: {ext}");
+            }
+        };
+        if let Some(existing) = detected {
+            if existing != current {
+                anyhow::bail!(
+                    "Mixed eval file types are not supported yet (found {:?} and {:?}).",
+                    existing,
+                    current
+                );
+            }
+        } else {
+            detected = Some(current);
+        }
+    }
+
+    detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
+}
+
+fn build_js_command(
+    runner_override: Option<String>,
+    runner: &PathBuf,
+    files: &[String],
+) -> Command {
+    let runner_override = runner_override
+        .or_else(|| std::env::var("BT_EVAL_JS_RUNNER").ok())
+        .or_else(|| std::env::var("BT_EVAL_TSX").ok());
+
+    let command = if let Some(explicit) = runner_override.as_deref() {
+        let mut command = Command::new(explicit);
+        command.arg(runner).args(files);
+        command
+    } else if let Some(tsx_path) = find_tsx_binary() {
+        let mut command = Command::new(tsx_path);
+        command.arg(runner).args(files);
+        command
+    } else {
+        let mut command = Command::new("npx");
+        command.arg("--yes").arg("tsx").arg(runner).args(files);
+        command
+    };
+
+    command
+}
+
+fn build_python_command(
+    runner_override: Option<String>,
+    runner: &PathBuf,
+    files: &[String],
+) -> Result<Command> {
+    let runner_override = runner_override
+        .or_else(|| std::env::var("BT_EVAL_PYTHON_RUNNER").ok())
+        .or_else(|| std::env::var("BT_EVAL_PYTHON").ok());
+
+    let command = if let Some(explicit) = runner_override {
+        let mut command = Command::new(explicit);
+        command.arg(runner).args(files);
+        command
+    } else if let Some(python) = find_python_binary() {
+        let mut command = Command::new(python);
+        command.arg(runner).args(files);
+        command
+    } else {
+        anyhow::bail!(
+            "No Python interpreter found in PATH. Please install python or pass --runner."
+        );
+    };
+
+    Ok(command)
+}
+
 fn find_tsx_binary() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("BT_EVAL_TSX") {
         let candidate = PathBuf::from(path);
@@ -225,6 +303,20 @@ fn find_tsx_binary() -> Option<PathBuf> {
         }
     }
 
+    None
+}
+
+fn find_python_binary() -> Option<PathBuf> {
+    let candidates = ["python3", "python"];
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        for candidate in candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
     None
 }
 
