@@ -17,6 +17,10 @@ pub struct BaseArgs {
     /// Override API URL (or via BRAINTRUST_API_URL)
     #[arg(long, env = "BRAINTRUST_API_URL")]
     pub api_url: Option<String>,
+
+    /// Override app URL (or via BRAINTRUST_APP_URL)
+    #[arg(long, env = "BRAINTRUST_APP_URL")]
+    pub app_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
