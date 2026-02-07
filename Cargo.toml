@@ -28,9 +28,16 @@ urlencoding = "2"
 inherits = "release"
 lto = "thin"
 
-[package.metadata.dist]
+[workspace]
+members = ["."]
+
+[workspace.metadata.dist]
 cargo-dist-version = "0.30.3"
 ci = "github"
+create-release = true
+pr-run-mode = "plan"
+
+[package.metadata.dist]
 installers = ["shell", "powershell"]
 targets = [
   "aarch64-apple-darwin",
@@ -43,5 +50,3 @@ unix-archive = ".tar.gz"
 windows-archive = ".zip"
 install-path = "CARGO_HOME"
 install-updater = true
-create-release = true
-pr-run-mode = "plan"

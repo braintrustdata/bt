@@ -25,6 +25,7 @@ jobs:
       branch-slug: ${{ steps.meta.outputs.branch_slug }}
       canary-tag: ${{ steps.meta.outputs.canary_tag }}
       alias-tag: ${{ steps.meta.outputs.alias_tag }}
+      dist-tag: ${{ steps.meta.outputs.dist_tag }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -68,16 +69,19 @@ jobs:
             canary_tag="canary-${branch_slug}-$short_sha"
             alias_tag="canary-${branch_slug}"
           fi
+          pkg_version="$(sed -n 's/^version = \"\\(.*\\)\"/\\1/p' Cargo.toml | head -n1)"
+          dist_tag="v${pkg_version}-canary.${branch_slug}.${short_sha}.${GITHUB_RUN_ID}"
 
           echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
           echo "branch_slug=$branch_slug" >> "$GITHUB_OUTPUT"
           echo "canary_tag=$canary_tag" >> "$GITHUB_OUTPUT"
           echo "alias_tag=$alias_tag" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
 
       - id: plan
         shell: bash
         run: |
-          dist plan --output-format=json > plan-dist-manifest.json
+          dist host --steps=create --tag="${{ steps.meta.outputs.dist_tag }}" --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -143,7 +147,7 @@ jobs:
       - name: Build artifacts
         shell: bash
         run: |
-          dist build --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build --tag="${{ needs.plan.outputs.dist-tag }}" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
       - id: dist-files
@@ -195,7 +199,7 @@ jobs:
       - id: dist-files
         shell: bash
         run: |
-          dist build --output-format=json --artifacts=global > dist-manifest.json
+          dist build --tag="${{ needs.plan.outputs.dist-tag }}" --output-format=json --artifacts=global > dist-manifest.json
           echo "dist ran successfully"
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
