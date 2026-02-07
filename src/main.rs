@@ -13,6 +13,7 @@ mod prompts;
 mod self_update;
 mod sql;
 mod ui;
+mod utils;
 
 use crate::args::CLIArgs;
 

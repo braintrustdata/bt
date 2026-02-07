@@ -25,6 +25,7 @@ dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 dotenvy = "0.15"
 open = "5"
 urlencoding = "2"
+comfy-table = "7.2.2"
 
 [profile.dist]
 inherits = "release"
