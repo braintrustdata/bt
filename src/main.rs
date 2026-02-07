@@ -14,6 +14,7 @@ mod self_update;
 mod sql;
 mod traces;
 mod ui;
+mod utils;
 
 use crate::args::CLIArgs;
 

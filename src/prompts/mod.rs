@@ -3,6 +3,7 @@ use clap::{Args, Subcommand};
 
 use crate::{args::BaseArgs, http::ApiClient, login::login};
 
+mod api;
 mod delete;
 mod list;
 mod view;
@@ -47,14 +48,16 @@ pub struct DeleteArgs {
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let ctx = login(&base).await?;
-    let _client = ApiClient::new(&ctx)?;
-    let _project = &base
+    let client = ApiClient::new(&ctx)?;
+    let project = &base
         .project
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT"))?;
 
     match args.command {
-        None | Some(PromptsCommands::List) => list::run().await,
+        None | Some(PromptsCommands::List) => {
+            list::run(&client, project, &ctx.login.org_name, base.json).await
+        }
         Some(PromptsCommands::View(_p)) => view::run().await,
         Some(PromptsCommands::Delete(_p)) => delete::run().await,
     }
