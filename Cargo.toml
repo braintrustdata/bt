@@ -6,7 +6,7 @@ rust-version = "1.86.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
 description = "The Braintrust command line interface"
 license = "Apache-2.0"
-repository = "https://github.com/braintrustdata/braintrust-cli"
+repository = "https://github.com/braintrustdata/bt"
 
 [dependencies]
 anyhow = "1.0.89"

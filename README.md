@@ -11,13 +11,13 @@
 Unix-like systems:
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/braintrust-cli/releases/latest/download/bt-installer.sh | sh
+curl -fsSL https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/braintrust-cli/releases/latest/download/bt-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1 | iex"
 ```
 
 ### Canary (latest `main`)
@@ -25,13 +25,13 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bra
 Unix-like systems:
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/braintrust-cli/releases/download/canary/bt-installer.sh | sh
+curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/braintrust-cli/releases/download/canary/bt-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1 | iex"
 ```
 
 ### Canary (specific branch)
@@ -48,13 +48,13 @@ Example for branch `feature/sql-v2`: alias tag `canary-feature-sql-v2`.
 Unix-like systems:
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/braintrust-cli/releases/download/canary-<branch-slug>/bt-installer.sh | sh
+curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary-<branch-slug>/bt-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/braintrust-cli/releases/download/canary-<branch-slug>/bt-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary-<branch-slug>/bt-installer.ps1 | iex"
 ```
 
 ### Canary (exact commit build)
