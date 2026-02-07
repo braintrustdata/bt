@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Args;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
@@ -21,7 +21,9 @@ use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::args::BaseArgs;
-use crate::login::{login, LoginContext};
+use crate::http::ApiClient;
+use crate::login::login;
+use crate::ui::with_spinner;
 
 #[derive(Debug, Clone, Args)]
 pub struct SqlArgs {
@@ -60,37 +62,34 @@ struct RealtimeState {
 
 pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let ctx = login(&base).await?;
-    let http = reqwest::Client::builder()
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = ApiClient::new(&ctx)?;
 
     if let Some(query) = args.query {
-        let response = execute_query(&http, &ctx, &query).await?;
+        let response = with_spinner("Running query...", execute_query(&client, &query)).await?;
         print_response(&response, base.json)?;
         return Ok(());
     }
 
-    run_interactive(base, ctx, http).await
+    run_interactive(base, client).await
 }
 
-async fn run_interactive(base: BaseArgs, ctx: LoginContext, http: reqwest::Client) -> Result<()> {
+async fn run_interactive(base: BaseArgs, client: ApiClient) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| run_interactive_blocking(base.json, ctx, http, handle))
+    tokio::task::block_in_place(|| run_interactive_blocking(base.json, client, handle))
 }
 
 fn run_interactive_blocking(
     json_output: bool,
-    ctx: LoginContext,
-    http: reqwest::Client,
+    client: ApiClient,
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
-    enable_raw_mode().context("failed to enable raw mode")?;
+    enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, json_output, ctx, http, handle);
+    let res = run_app(&mut terminal, json_output, client, handle);
 
     disable_raw_mode().ok();
     terminal.backend_mut().execute(LeaveAlternateScreen).ok();
@@ -102,8 +101,7 @@ fn run_interactive_blocking(
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     json_output: bool,
-    ctx: LoginContext,
-    http: reqwest::Client,
+    client: ApiClient,
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     let mut app = App::new(json_output);
@@ -114,7 +112,7 @@ fn run_app(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if handle_key_event(&mut app, key, &ctx, &http, &handle)? {
+                    if handle_key_event(&mut app, key, &client, &handle)? {
                         break;
                     }
                 }
@@ -130,8 +128,7 @@ fn run_app(
 fn handle_key_event(
     app: &mut App,
     key: KeyEvent,
-    ctx: &LoginContext,
-    http: &reqwest::Client,
+    client: &ApiClient,
     handle: &tokio::runtime::Handle,
 ) -> Result<bool> {
     match key.code {
@@ -151,7 +148,7 @@ fn handle_key_event(
             }
 
             app.status = "Running query...".to_string();
-            let result = handle.block_on(execute_query(http, ctx, &query));
+            let result = handle.block_on(execute_query(client, &query));
             match result {
                 Ok(response) => {
                     app.output = format_response(&response, app.json_output)?;
@@ -223,38 +220,20 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
     }
 }
 
-async fn execute_query(
-    http: &reqwest::Client,
-    ctx: &LoginContext,
-    query: &str,
-) -> Result<SqlResponse> {
-    let url = format!("{}/btql", ctx.api_url.trim_end_matches('/'));
-    let request_body = json!({
+async fn execute_query(client: &ApiClient, query: &str) -> Result<SqlResponse> {
+    let body = json!({
         "query": query,
         "fmt": "json",
     });
 
-    let mut request = http
-        .post(url)
-        .bearer_auth(&ctx.login.api_key)
-        .header("Content-Type", "application/json")
-        .json(&request_body);
+    let org_name = client.org_name();
+    let headers = if !org_name.is_empty() {
+        vec![("x-bt-org-name", org_name)]
+    } else {
+        vec![]
+    };
 
-    if !ctx.login.org_name.is_empty() {
-        request = request.header("x-bt-org-name", &ctx.login.org_name);
-    }
-
-    let response = request.send().await.context("btql request failed")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("btql request failed ({}): {}", status, body);
-    }
-
-    response
-        .json::<SqlResponse>()
-        .await
-        .context("failed to parse btql response")
+    client.post_with_headers("/btql", &body, &headers).await
 }
 
 fn print_response(response: &SqlResponse, json_output: bool) -> Result<()> {
