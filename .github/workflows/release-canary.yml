@@ -238,6 +238,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CANARY_TAG: ${{ needs.plan.outputs.canary-tag }}
       ALIAS_TAG: ${{ needs.plan.outputs.alias-tag }}
+      DIST_TAG: ${{ needs.plan.outputs.dist-tag }}
       SHORT_SHA: ${{ needs.plan.outputs.short-sha }}
       BRANCH_NAME: ${{ github.ref_name }}
       REPO: ${{ github.repository }}
@@ -255,6 +256,12 @@ jobs:
       - name: Publish immutable canary release
         shell: bash
         run: |
+          for installer in artifacts/bt-installer.sh artifacts/bt-installer.ps1; do
+            if [ -f "$installer" ]; then
+              sed -i "s|/releases/download/${DIST_TAG}/|/releases/download/${CANARY_TAG}/|g" "$installer"
+            fi
+          done
+
           cat > "$RUNNER_TEMP/canary-notes.md" <<EOF
           Canary build from branch \`${BRANCH_NAME}\` at commit \`${GITHUB_SHA}\`.
 
@@ -284,6 +291,12 @@ jobs:
             echo "Skipping moving canary alias for non-latest ${BRANCH_NAME} commit: ${GITHUB_SHA}"
             exit 0
           fi
+
+          for installer in artifacts/bt-installer.sh artifacts/bt-installer.ps1; do
+            if [ -f "$installer" ]; then
+              sed -i "s|/releases/download/${CANARY_TAG}/|/releases/download/${ALIAS_TAG}/|g; s|/releases/download/${DIST_TAG}/|/releases/download/${ALIAS_TAG}/|g" "$installer"
+            fi
+          done
 
           cat > "$RUNNER_TEMP/canary-latest-notes.md" <<EOF
           Latest canary build from branch \`${BRANCH_NAME}\` at commit \`${GITHUB_SHA}\`.
