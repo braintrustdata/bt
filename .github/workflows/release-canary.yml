@@ -258,7 +258,11 @@ jobs:
         run: |
           for installer in artifacts/bt-installer.sh artifacts/bt-installer.ps1; do
             if [ -f "$installer" ]; then
-              sed -i "s|/releases/download/${DIST_TAG}/|/releases/download/${CANARY_TAG}/|g" "$installer"
+              sed -i \
+                -e "s|/releases/download/${DIST_TAG}/|/releases/download/${CANARY_TAG}/|g" \
+                -e "s|/releases/download/${DIST_TAG}|/releases/download/${CANARY_TAG}|g" \
+                -e "s|${DIST_TAG}|${CANARY_TAG}|g" \
+                "$installer"
             fi
           done
 
@@ -294,7 +298,14 @@ jobs:
 
           for installer in artifacts/bt-installer.sh artifacts/bt-installer.ps1; do
             if [ -f "$installer" ]; then
-              sed -i "s|/releases/download/${CANARY_TAG}/|/releases/download/${ALIAS_TAG}/|g; s|/releases/download/${DIST_TAG}/|/releases/download/${ALIAS_TAG}/|g" "$installer"
+              sed -i \
+                -e "s|/releases/download/${CANARY_TAG}/|/releases/download/${ALIAS_TAG}/|g" \
+                -e "s|/releases/download/${CANARY_TAG}|/releases/download/${ALIAS_TAG}|g" \
+                -e "s|/releases/download/${DIST_TAG}/|/releases/download/${ALIAS_TAG}/|g" \
+                -e "s|/releases/download/${DIST_TAG}|/releases/download/${ALIAS_TAG}|g" \
+                -e "s|${CANARY_TAG}|${ALIAS_TAG}|g" \
+                -e "s|${DIST_TAG}|${ALIAS_TAG}|g" \
+                "$installer"
             fi
           done
 
