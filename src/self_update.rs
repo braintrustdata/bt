@@ -110,9 +110,16 @@ async fn check_for_update(channel: UpdateChannel) -> Result<()> {
         .build()
         .context("failed to initialize HTTP client")?;
 
-    let release = client
+    let mut request = client
         .get(channel.github_release_api_url())
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/vnd.github+json");
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+    let release = request
         .send()
         .await
         .context("failed to query GitHub releases")?;

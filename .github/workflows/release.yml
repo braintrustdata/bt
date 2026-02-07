@@ -279,3 +279,31 @@ jobs:
         run: |
           echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+
+  smoke-install-unix:
+    needs:
+      - plan
+      - announce
+    if: ${{ needs.announce.result == 'success' }}
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      REPO: ${{ github.repository }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Install from released installer
+        shell: bash
+        run: |
+          curl -fsSL "https://github.com/${REPO}/releases/download/${RELEASE_TAG}/bt-installer.sh" | sh
+
+      - name: Verify installed binary
+        shell: bash
+        run: |
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          bt --version
+
+      - name: Verify self-update check
+        shell: bash
+        run: |
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          bt self update --check --channel stable
