@@ -69,12 +69,12 @@ jobs:
             canary_tag="canary-${branch_slug}-$short_sha"
             alias_tag="canary-${branch_slug}"
           fi
-          pkg_version="$(awk -F '\"' '/^version[[:space:]]*=[[:space:]]*\"/{print $2; exit}' Cargo.toml)"
+          pkg_version="$(grep -m1 '^version = \"' Cargo.toml | cut -d '\"' -f2)"
           if [ -z "$pkg_version" ]; then
             echo "Failed to determine package version from Cargo.toml" >&2
             exit 1
           fi
-          dist_tag="v${pkg_version}-canary.${branch_slug}.${short_sha}.${GITHUB_RUN_ID}"
+          dist_tag="v${pkg_version}"
 
           echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
           echo "branch_slug=$branch_slug" >> "$GITHUB_OUTPUT"
