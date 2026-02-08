@@ -620,7 +620,7 @@ fn build_js_command(
 
 fn build_deno_js_command(
     deno_runner: impl AsRef<OsStr>,
-    runner: &PathBuf,
+    runner: &Path,
     files: &[String],
 ) -> Command {
     let mut command = Command::new(deno_runner);
