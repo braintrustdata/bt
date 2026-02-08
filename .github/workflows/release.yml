@@ -307,3 +307,54 @@ jobs:
         run: |
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
           bt self update --check --channel stable
+
+  smoke-install-macos:
+    needs:
+      - plan
+      - announce
+    if: ${{ needs.announce.result == 'success' }}
+    runs-on: macos-13
+    env:
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      REPO: ${{ github.repository }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Install from released installer
+        shell: bash
+        run: |
+          curl -fsSL "https://github.com/${REPO}/releases/download/${RELEASE_TAG}/bt-installer.sh" | sh
+
+      - name: Verify installed binary
+        shell: bash
+        run: |
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          bt --version
+          bt self update --check --channel stable
+
+  smoke-install-windows:
+    needs:
+      - plan
+      - announce
+    if: ${{ needs.announce.result == 'success' }}
+    runs-on: windows-2022
+    env:
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      REPO: ${{ github.repository }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Install from released installer
+        shell: pwsh
+        run: |
+          irm "https://github.com/${env:REPO}/releases/download/${env:RELEASE_TAG}/bt-installer.ps1" | iex
+
+      - name: Verify installed binary
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
+          $btExe = Join-Path $cargoHome "bin\bt.exe"
+          if (!(Test-Path $btExe)) {
+            throw "bt.exe not found at $btExe"
+          }
+          & $btExe --version
+          $env:PATH = "$(Join-Path $cargoHome 'bin');$env:PATH"
+          & $btExe self update --check --channel stable

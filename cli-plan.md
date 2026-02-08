@@ -121,8 +121,9 @@ Scope:
 Status in this branch:
 
 - Added README install/update/troubleshooting docs and forward-looking roadmap updates.
-- Added release smoke install jobs for stable and canary workflows (Unix).
-- Remaining hardening is mostly expansion work (for example additional OS matrix smoke coverage and signed artifact verification docs).
+- Added release smoke install jobs for stable and canary workflows (Linux/macOS/Windows).
+- Added checksum verification guidance for manual archive installs.
+- Remaining hardening is mostly expansion work (for example extra architecture coverage and signature verification flow docs).
 
 Acceptance criteria:
 
@@ -144,7 +145,7 @@ Acceptance criteria:
    - Windows (x64 PowerShell)
 5. Verify PR3 canary channel on both `main` and a feature branch.
 6. Implement PR4 self-update command. (Done)
-7. Complete PR5 docs/tests. (In progress)
+7. Complete PR5 docs/tests. (Mostly done)
 
 ## Risks and Mitigations
 

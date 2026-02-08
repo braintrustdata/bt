@@ -74,6 +74,14 @@ bt --version
 
 On first install, open a new shell if `bt` is not found immediately.
 
+For manual archive installs, verify checksums before extracting:
+
+```bash
+curl -fsSL -O "https://github.com/braintrustdata/bt/releases/download/<tag>/bt-<target>.tar.gz"
+curl -fsSL -O "https://github.com/braintrustdata/bt/releases/download/<tag>/bt-<target>.tar.gz.sha256"
+shasum -a 256 -c "bt-<target>.tar.gz.sha256"
+```
+
 ## Self Update
 
 `bt` can self-update when installed via the official installer.
@@ -118,6 +126,6 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 ## Roadmap / TODO
 
 - Add richer channel controls for self-update (for example pinned/branch canary selection).
-- Expand release verification and smoke tests for installer flows across macOS/Linux/Windows.
+- Expand release verification and smoke tests for installer flows across more architectures/environments.
 - Add `bt eval` support on Windows (today, `bt eval` is Unix-only due to Unix socket usage).
-- Add signed artifact verification guidance (checksums/signatures) in install and upgrade docs.
+- Add signed artifact verification guidance (signature flow) in install and upgrade docs.
