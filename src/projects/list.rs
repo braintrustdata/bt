@@ -1,8 +1,12 @@
+use std::fmt::Write as _;
+
 use anyhow::Result;
 use dialoguer::console;
 
 use crate::http::ApiClient;
-use crate::ui::{apply_column_padding, header, styled_table, truncate, with_spinner};
+use crate::ui::{
+    apply_column_padding, header, print_with_pager, styled_table, truncate, with_spinner,
+};
 
 use super::api;
 
@@ -12,11 +16,14 @@ pub async fn run(client: &ApiClient, org_name: &str, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(&projects)?);
     } else {
-        println!(
+        let mut output = String::new();
+
+        writeln!(
+            output,
             "{} projects found in {}\n",
             console::style(projects.len()),
             console::style(org_name).bold()
-        );
+        )?;
 
         let mut table = styled_table();
         table.set_header(vec![header("Name"), header("Description")]);
@@ -32,7 +39,8 @@ pub async fn run(client: &ApiClient, org_name: &str, json: bool) -> Result<()> {
             table.add_row(vec![&project.name, &desc]);
         }
 
-        println!("{table}");
+        write!(output, "{table}")?;
+        print_with_pager(&output)?;
     }
 
     Ok(())

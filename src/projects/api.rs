@@ -36,7 +36,7 @@ pub async fn delete_project(client: &ApiClient, project_id: &str) -> Result<()> 
 
 pub async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<Project>> {
     let path = format!(
-        "/v1/project?org_name={}&name={}",
+        "/v1/project?org_name={}&project_name={}",
         encode(client.org_name()),
         encode(name)
     );

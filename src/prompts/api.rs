@@ -30,21 +30,18 @@ pub async fn list_prompts(client: &ApiClient, project: &str) -> Result<Vec<Promp
     Ok(list.objects)
 }
 
-#[allow(dead_code)]
-pub async fn get_prompt_by_slug(
-    client: &ApiClient,
-    project: &str,
-    slug: &str,
-) -> Result<Option<Prompt>> {
+pub async fn get_prompt_by_name(client: &ApiClient, project: &str, name: &str) -> Result<Prompt> {
     let path = format!(
-        "/v1/prompt?org_name={}&project_name={}&slug={}",
+        "/v1/prompt?org_name={}&project_name={}&prompt_name={}",
         encode(client.org_name()),
         encode(project),
-        encode(slug)
+        encode(name)
     );
-
     let list: ListResponse = client.get(&path).await?;
-    Ok(list.objects.into_iter().next())
+    list.objects
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("prompt '{name}' not found"))
 }
 
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
