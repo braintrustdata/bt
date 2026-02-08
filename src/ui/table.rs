@@ -1,14 +1,15 @@
 use comfy_table::{presets::NOTHING, Attribute, Cell, ContentArrangement, Table};
 
-/// Create a table with the standard CLI styling (no borders, no wrapping)
 pub fn styled_table() -> Table {
     let mut table = Table::new();
     table.load_preset(NOTHING);
-    table.set_content_arrangement(ContentArrangement::Disabled);
+    if let Ok((width, _)) = crossterm::terminal::size() {
+        table.set_width(width);
+    }
+    table.set_content_arrangement(ContentArrangement::Dynamic);
     table
 }
 
-/// Truncate text to max length with ellipsis
 pub fn truncate(text: &str, max_len: usize) -> String {
     if text.chars().count() <= max_len {
         return text.to_string();
@@ -19,7 +20,6 @@ pub fn truncate(text: &str, max_len: usize) -> String {
     format!("{truncated}…")
 }
 
-/// Apply padding to all columns (call after setting headers)
 pub fn apply_column_padding(table: &mut Table, padding: (u16, u16)) {
     for i in 0..table.column_count() {
         if let Some(col) = table.column_mut(i) {
@@ -28,7 +28,6 @@ pub fn apply_column_padding(table: &mut Table, padding: (u16, u16)) {
     }
 }
 
-/// Create a header cell with dim + bold styling
 pub fn header(text: &str) -> Cell {
     Cell::new(text)
         .add_attribute(Attribute::Bold)

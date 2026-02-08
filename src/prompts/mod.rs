@@ -42,7 +42,7 @@ impl ViewArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DeleteArgs {
-    /// Name of the project to delete
+    /// Name of the prompt to delete
     name: Option<String>,
 }
 
@@ -52,7 +52,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let project = &base
         .project
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT"))?;
+        .ok_or_else(|| anyhow::anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))?;
 
     match args.command {
         None | Some(PromptsCommands::List) => {

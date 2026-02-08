@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use urlencoding::encode;
 
 use crate::http::ApiClient;
@@ -17,17 +17,10 @@ pub async fn run(
     name: Option<&str>,
 ) -> Result<()> {
     let prompt = match name {
-        Some(n) => {
-            let prompts = api::list_prompts(client, project).await?;
-
-            prompts
-                .into_iter()
-                .find(|p| p.name == n)
-                .ok_or_else(|| anyhow!("prompt '{n}' not found"))?
-        }
+        Some(n) => api::get_prompt_by_name(client, project, n).await?,
         None => {
             if !std::io::stdin().is_terminal() {
-                bail!("prompt name required. Use: bt prompts view <name>")
+                bail!("prompt name required. Use: bt prompts view <name>");
             }
             select_prompt_interactive(client, project).await?
         }
