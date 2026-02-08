@@ -512,7 +512,6 @@ function createSseWriter(): SseWriter | null {
     const socket = net.createConnection({ path: sock });
     socket.on("error", (err) => {
       console.error(`Failed to connect to SSE socket: ${err.message}`);
-      process.exitCode = 1;
     });
     const send = (event: string, payload: unknown) => {
       if (!socket.writable) {

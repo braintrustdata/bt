@@ -277,8 +277,18 @@ fn eval_watch_python_dependency_retriggers() {
     let fixtures_root = root.join("tests").join("evals");
     let fixture_dir = fixtures_root.join("py").join("local_import");
 
-    let python = ensure_python_env(&fixtures_root.join("py"))
-        .expect("python runtime unavailable for watch dependency test");
+    let python = match ensure_python_env(&fixtures_root.join("py")) {
+        Some(python) => python,
+        None => {
+            if required_runtimes().contains("python") {
+                panic!("python runtime unavailable for watch dependency test");
+            }
+            eprintln!(
+                "Skipping eval_watch_python_dependency_retriggers (python runtime unavailable)."
+            );
+            return;
+        }
+    };
     let bt_path = bt_binary_path(&root);
 
     assert_watch_detects_dependency_change(
