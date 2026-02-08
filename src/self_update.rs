@@ -86,6 +86,23 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
+    if args.channel == UpdateChannel::Stable {
+        match fetch_release(args.channel).await {
+            Ok(release) => {
+                let current = env!("CARGO_PKG_VERSION");
+                if stable_is_up_to_date(current, &release.tag_name) {
+                    println!("{}", stable_check_message(current, &release.tag_name));
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to pre-check stable version ({err}); continuing with update"
+                );
+            }
+        }
+    }
+
     run_installer(args.channel)?;
     Ok(())
 }
@@ -105,6 +122,22 @@ fn ensure_installer_managed_install() -> Result<()> {
 }
 
 async fn check_for_update(channel: UpdateChannel) -> Result<()> {
+    let release = fetch_release(channel).await?;
+    let current = env!("CARGO_PKG_VERSION");
+
+    match channel {
+        UpdateChannel::Stable => {
+            println!("{}", stable_check_message(current, &release.tag_name));
+        }
+        UpdateChannel::Canary => {
+            println!("{}", canary_check_message(&release.tag_name));
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
     let client = Client::builder()
         .user_agent("bt-self-update")
         .build()
@@ -130,22 +163,10 @@ async fn check_for_update(channel: UpdateChannel) -> Result<()> {
         anyhow::bail!("failed to check for updates ({status}): {body}");
     }
 
-    let release: GitHubRelease = release
+    release
         .json()
         .await
-        .context("failed to parse GitHub release response")?;
-    let current = env!("CARGO_PKG_VERSION");
-
-    match channel {
-        UpdateChannel::Stable => {
-            println!("{}", stable_check_message(current, &release.tag_name));
-        }
-        UpdateChannel::Canary => {
-            println!("{}", canary_check_message(&release.tag_name));
-        }
-    }
-
-    Ok(())
+        .context("failed to parse GitHub release response")
 }
 
 fn run_installer(channel: UpdateChannel) -> Result<()> {
@@ -267,11 +288,15 @@ fn is_installer_managed_install(
 }
 
 fn stable_check_message(current: &str, release_tag: &str) -> String {
-    let latest = release_tag.trim_start_matches('v');
-    if latest == current {
+    if stable_is_up_to_date(current, release_tag) {
         return format!("bt {current} is up to date on the stable channel ({release_tag})");
     }
     format!("update available on stable channel: current={current}, latest={release_tag}")
+}
+
+fn stable_is_up_to_date(current: &str, release_tag: &str) -> bool {
+    let latest = release_tag.trim_start_matches('v');
+    latest == current
 }
 
 fn canary_check_message(release_tag: &str) -> String {
