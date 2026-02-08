@@ -138,9 +138,8 @@ fn eval_fixtures() {
             if let Some(args) = config.args.as_ref() {
                 cmd.args(args);
             }
-            if let Some(runner_cmd) =
-                resolve_runner(&dir, runner.as_deref(), python_runner.as_ref())
-            {
+            let resolved_runner = resolve_runner(&dir, runner.as_deref(), python_runner.as_ref());
+            if let Some(runner_cmd) = resolved_runner.as_ref() {
                 cmd.arg("--runner").arg(runner_cmd);
             }
             cmd.args(&config.files).current_dir(&dir);
@@ -170,8 +169,15 @@ fn eval_fixtures() {
             if status.success() != expect_success {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                let deno_diagnostics =
+                    if needs_deno(runtime, resolved_runner.as_deref()) && expect_success {
+                        collect_deno_eval_diagnostics(&dir, &config.files)
+                    } else {
+                        None
+                    };
                 panic!(
-                    "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})\nstdout:\n{stdout}\nstderr:\n{stderr}{}",
+                    deno_diagnostics.unwrap_or_default(),
                     runner.as_deref().unwrap_or("default")
                 );
             }
@@ -303,6 +309,35 @@ fn eval_watch_python_dependency_retriggers() {
 fn read_fixture_config(path: &Path) -> FixtureConfig {
     let raw = fs::read_to_string(path).expect("read fixture.json");
     serde_json::from_str(&raw).expect("parse fixture.json")
+}
+
+fn collect_deno_eval_diagnostics(dir: &Path, files: &[String]) -> Option<String> {
+    if !command_exists("deno") {
+        return None;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let runner_script = root.join("scripts").join("eval-runner.ts");
+    let runner_script_str = runner_script.to_string_lossy().to_string();
+
+    let mut cmd = Command::new("deno");
+    cmd.args(["run", "-A", "--node-modules-dir=auto"]);
+    cmd.arg(runner_script_str);
+    cmd.args(files);
+    cmd.current_dir(dir);
+    cmd.env("BT_EVAL_LOCAL", "1");
+    cmd.env(
+        "BRAINTRUST_API_KEY",
+        std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+    );
+
+    let output = cmd.output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Some(format!(
+        "\n[deno-direct] status: {}\n[deno-direct] stdout:\n{}\n[deno-direct] stderr:\n{}\n",
+        output.status, stdout, stderr
+    ))
 }
 
 fn bt_binary_path(root: &Path) -> PathBuf {
