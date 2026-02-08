@@ -5,7 +5,7 @@ use crate::args::BaseArgs;
 use crate::http::ApiClient;
 use crate::login::login;
 
-mod api;
+pub mod api;
 mod create;
 mod delete;
 mod list;
