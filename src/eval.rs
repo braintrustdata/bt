@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +29,10 @@ use ratatui::Terminal;
 use crate::args::BaseArgs;
 
 const MAX_NAME_LENGTH: usize = 40;
+const JS_RUNNER_FILE: &str = "eval-runner.ts";
+const PY_RUNNER_FILE: &str = "eval-runner.py";
+const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
+const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum EvalLanguage {
@@ -73,12 +77,7 @@ async fn run_eval_files(
     no_send_logs: bool,
 ) -> Result<()> {
     let language = detect_eval_language(&files)?;
-    let js_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("eval-runner.ts");
-    let py_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("eval-runner.py");
+    let (js_runner, py_runner) = prepare_eval_runners()?;
 
     let socket_path = build_sse_socket_path()?;
     let _ = std::fs::remove_file(&socket_path);
@@ -327,6 +326,44 @@ fn build_sse_socket_path() -> Result<PathBuf> {
         .context("failed to read system time")?
         .as_millis();
     Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}.sock")))
+}
+
+fn eval_runner_cache_dir() -> PathBuf {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+
+    root.join("bt")
+        .join("eval-runners")
+        .join(env!("CARGO_PKG_VERSION"))
+}
+
+fn prepare_eval_runners() -> Result<(PathBuf, PathBuf)> {
+    prepare_eval_runners_in_dir(&eval_runner_cache_dir())
+}
+
+fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+
+    let js_runner = materialize_runner_script(cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
+    let py_runner = materialize_runner_script(cache_dir, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
+    Ok((js_runner, py_runner))
+}
+
+fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
+    let path = cache_dir.join(file_name);
+    let current = std::fs::read_to_string(&path).ok();
+    if current.as_deref() != Some(source) {
+        std::fs::write(&path, source)
+            .with_context(|| format!("failed to write eval runner script {}", path.display()))?;
+    }
+    Ok(path)
 }
 
 #[derive(Debug)]
@@ -1022,5 +1059,63 @@ fn convert_color(color: Color) -> CtColor {
         Color::White => CtColor::White,
         Color::Indexed(value) => CtColor::AnsiValue(value),
         Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bt-eval-tests-{label}-{}-{now}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn materialize_runner_script_writes_file() {
+        let dir = unique_test_dir("write");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+
+        let path = materialize_runner_script(&dir, "runner.ts", "console.log('ok');")
+            .expect("runner script should be materialized");
+        let contents = std::fs::read_to_string(path).expect("runner script should be readable");
+        assert_eq!(contents, "console.log('ok');");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_runner_script_overwrites_stale_content() {
+        let dir = unique_test_dir("overwrite");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        let path = dir.join("runner.py");
+        std::fs::write(&path, "stale").expect("stale file should be written");
+
+        materialize_runner_script(&dir, "runner.py", "fresh")
+            .expect("runner script should be updated");
+        let contents = std::fs::read_to_string(path).expect("runner script should be readable");
+        assert_eq!(contents, "fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_eval_runners_writes_embedded_scripts() {
+        let dir = unique_test_dir("embedded");
+        let (js_runner, py_runner) =
+            prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
+
+        let js = std::fs::read_to_string(js_runner).expect("js runner should be readable");
+        let py = std::fs::read_to_string(py_runner).expect("python runner should be readable");
+        assert_eq!(js, JS_RUNNER_SOURCE);
+        assert_eq!(py, PY_RUNNER_SOURCE);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
