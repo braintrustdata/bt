@@ -142,7 +142,7 @@ async fn run_eval_files(
 
     let mut cmd = match language {
         EvalLanguage::Python => build_python_command(runner_override, &py_runner, &files)?,
-        EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files),
+        EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
     cmd.envs(build_env(base));
@@ -283,14 +283,16 @@ fn build_js_command(
     runner_override: Option<String>,
     runner: &PathBuf,
     files: &[String],
-) -> Command {
+) -> Result<Command> {
     let command = if let Some(explicit) = runner_override.as_deref() {
+        let runner_script = select_js_runner_entrypoint(runner, Path::new(explicit))?;
         let mut command = Command::new(explicit);
-        command.arg(runner).args(files);
+        command.arg(runner_script).args(files);
         command
     } else if let Some(auto_runner) = find_js_runner_binary(files) {
+        let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
         let mut command = Command::new(auto_runner);
-        command.arg(runner).args(files);
+        command.arg(runner_script).args(files);
         command
     } else {
         let mut command = Command::new("npx");
@@ -298,7 +300,7 @@ fn build_js_command(
         command
     };
 
-    command
+    Ok(command)
 }
 
 fn build_python_command(
@@ -328,8 +330,8 @@ fn build_python_command(
 }
 
 fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
-    // Prefer local project bins first, then PATH. `tsx` remains the preferred
-    // default, with other common TS runners as fallback.
+    // Prefer local project bins first, then PATH. `tsx` and `vite-node` are
+    // preferred, with ts-node variants as lower-priority fallback.
     const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm"];
 
     let mut search_roots = Vec::new();
@@ -357,6 +359,38 @@ fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
     }
 
     find_binary_in_path(RUNNER_CANDIDATES)
+}
+
+fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
+    if is_ts_node_runner(runner_command) {
+        return prepare_js_runner_in_cwd();
+    }
+    Ok(default_runner.to_path_buf())
+}
+
+fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    let cache_dir = cwd
+        .join(".bt")
+        .join("eval-runners")
+        .join(env!("CARGO_PKG_VERSION"));
+    std::fs::create_dir_all(&cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+}
+
+fn is_ts_node_runner(runner_command: &Path) -> bool {
+    let file_name = match runner_command.file_name().and_then(|name| name.to_str()) {
+        Some(name) => name.to_ascii_lowercase(),
+        None => return false,
+    };
+
+    let normalized = file_name.strip_suffix(".cmd").unwrap_or(&file_name);
+    normalized == "ts-node" || normalized == "ts-node-esm"
 }
 
 fn find_python_binary() -> Option<PathBuf> {
