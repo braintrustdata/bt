@@ -1,0 +1,126 @@
+name: smoke-install-minimal
+
+on:
+  workflow_run:
+    workflows:
+      - release
+      - release-canary
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (for example: v0.1.1 or canary-main-<sha>)"
+        required: true
+        type: string
+      repo:
+        description: "Repository in owner/name format"
+        required: false
+        default: "braintrustdata/bt"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-install:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-22.04
+    container:
+      image: debian:bookworm-slim
+    env:
+      DEFAULT_REPO: braintrustdata/bt
+      INPUT_TAG: ${{ inputs.tag }}
+      INPUT_REPO: ${{ inputs.repo }}
+      WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_REPO: ${{ github.event.workflow_run.repository.full_name }}
+    steps:
+      - name: Install minimal dependencies
+        shell: sh
+        run: |
+          set -eu
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl tar
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Assert rust is not preinstalled
+        shell: sh
+        run: |
+          set -eu
+          if command -v rustc >/dev/null 2>&1 || command -v cargo >/dev/null 2>&1; then
+            echo "Expected no Rust toolchain in this smoke environment."
+            exit 1
+          fi
+
+      - id: resolve
+        name: Resolve release tag and repo
+        shell: sh
+        run: |
+          set -eu
+
+          repo=""
+          tag=""
+
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+            repo="${INPUT_REPO:-$DEFAULT_REPO}"
+          else
+            repo="${RUN_REPO:-$DEFAULT_REPO}"
+            workflow="${WORKFLOW_NAME:-}"
+            branch="${HEAD_BRANCH:-}"
+            sha="${HEAD_SHA:-}"
+
+            case "$workflow" in
+              release)
+                tag="$branch"
+                ;;
+              release-canary)
+                short_sha=$(printf '%s' "$sha" | cut -c1-12)
+                if [ "$branch" = "main" ]; then
+                  tag="canary-$short_sha"
+                else
+                  branch_slug=$(printf '%s' "$branch" \
+                    | tr '[:upper:]' '[:lower:]' \
+                    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g' \
+                    | cut -c1-40)
+                  if [ -z "$branch_slug" ]; then
+                    branch_slug="branch"
+                  fi
+                  tag="canary-${branch_slug}-${short_sha}"
+                fi
+                ;;
+              *)
+                echo "Unsupported triggering workflow: $workflow"
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "Failed to resolve release tag."
+            exit 1
+          fi
+
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Installing from https://github.com/$repo/releases/download/$tag/bt-installer.sh"
+
+      - name: Install bt from release installer
+        shell: sh
+        run: |
+          set -eu
+          curl -fsSL "https://github.com/${{ steps.resolve.outputs.repo }}/releases/download/${{ steps.resolve.outputs.tag }}/bt-installer.sh" | sh
+
+      - name: Verify basic commands
+        shell: sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          bt --version
+          bt --help >/dev/null
+          bt self update --check --channel stable
+          bt self update --check --channel canary

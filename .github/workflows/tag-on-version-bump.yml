@@ -1,0 +1,89 @@
+name: tag-on-version-bump
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-on-version-bump-main
+  cancel-in-progress: false
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: versions
+        name: Read current and previous versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_version="$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)"
+          if [ -z "$current_version" ]; then
+            echo "Failed to parse current version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          previous_version=""
+          before_sha="${{ github.event.before }}"
+          if [ -n "$before_sha" ] && [ "$before_sha" != "0000000000000000000000000000000000000000" ]; then
+            if git cat-file -e "${before_sha}^{commit}" 2>/dev/null && git show "${before_sha}:Cargo.toml" >/dev/null 2>&1; then
+              previous_version="$(git show "${before_sha}:Cargo.toml" | grep -m1 '^version = "' | cut -d '"' -f2 || true)"
+            fi
+          fi
+
+          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
+          echo "previous_version=$previous_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v${current_version}" >> "$GITHUB_OUTPUT"
+
+          if [ "$current_version" = "$previous_version" ]; then
+            echo "version_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: tag-check
+        name: Check if tag already exists remotely
+        if: steps.versions.outputs.version_changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.versions.outputs.tag }}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.versions.outputs.version_changed == 'true' && steps.tag-check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.versions.outputs.tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$tag" -m "Release $tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+
+      - name: No-op (version unchanged)
+        if: steps.versions.outputs.version_changed != 'true'
+        run: echo "Cargo.toml version was unchanged; no tag created."
+
+      - name: No-op (tag already exists)
+        if: steps.versions.outputs.version_changed == 'true' && steps.tag-check.outputs.exists == 'true'
+        run: echo "Tag ${{ steps.versions.outputs.tag }} already exists; no tag created."
