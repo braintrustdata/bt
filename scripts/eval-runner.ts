@@ -93,6 +93,8 @@ declare global {
   var _evals: GlobalEvals | undefined;
   // eslint-disable-next-line no-var
   var _lazy_load: boolean | undefined;
+  // eslint-disable-next-line no-var
+  var __inherited_braintrust_state: unknown;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -284,6 +286,17 @@ async function loadBraintrust() {
   const moduleUrl = pathToFileURL(resolved).href;
   const mod: unknown = await import(moduleUrl);
   return normalizeBraintrustModule(mod);
+}
+
+function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
+  const getter = (braintrust as Record<string, unknown>)._internalGetGlobalState;
+  if (typeof getter !== "function") {
+    return;
+  }
+  const state = getter();
+  if (state !== undefined && state !== null) {
+    globalThis.__inherited_braintrust_state = state;
+  }
 }
 
 async function loadFiles(files: string[]): Promise<unknown[]> {
@@ -774,7 +787,8 @@ async function main() {
 
   const normalized = normalizeFiles(files);
   ensureBraintrustAvailable();
-  await loadBraintrust();
+  const braintrust = await loadBraintrust();
+  propagateInheritedBraintrustState(braintrust);
   initRegistry();
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
