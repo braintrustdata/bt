@@ -4,6 +4,7 @@ use std::ffi::OsString;
 
 mod args;
 mod env;
+#[cfg(unix)]
 mod eval;
 mod http;
 mod login;
@@ -24,6 +25,7 @@ struct Cli {
 enum Commands {
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
+    #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
@@ -38,6 +40,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
+        #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
     }

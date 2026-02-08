@@ -6,6 +6,7 @@ rust-version = "1.86.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
 description = "The Braintrust command line interface"
 license = "Apache-2.0"
+repository = "https://github.com/braintrustdata/bt"
 
 [dependencies]
 anyhow = "1.0.89"
@@ -24,3 +25,31 @@ dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 dotenvy = "0.15"
 open = "5"
 urlencoding = "2"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[workspace]
+members = ["."]
+
+[workspace.metadata.dist]
+cargo-dist-version = "0.30.3"
+ci = "github"
+create-release = true
+pr-run-mode = "plan"
+allow-dirty = ["ci"]
+
+[package.metadata.dist]
+installers = ["shell", "powershell"]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+install-path = "CARGO_HOME"
+install-updater = true

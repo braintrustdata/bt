@@ -14,7 +14,7 @@ repos:
         pass_filenames: false
       - id: oxlint
         name: oxlint
-        entry: pnpm dlx oxlint@latest --max-warnings=0 --fix
+        entry: pnpm dlx oxlint --max-warnings=0 --fix
         language: system
         files: \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$
         pass_filenames: true
