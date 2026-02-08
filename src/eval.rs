@@ -451,6 +451,12 @@ fn is_ts_node_runner(runner_command: &Path) -> bool {
 }
 
 fn find_python_binary() -> Option<PathBuf> {
+    if let Some(venv_root) = std::env::var_os("VIRTUAL_ENV") {
+        let candidate = PathBuf::from(venv_root).join("bin").join("python");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     find_binary_in_path(&["python3", "python"])
 }
 
