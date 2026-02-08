@@ -1,0 +1,11 @@
+{
+  "name": "bt-eval-ts-node-only",
+  "private": true,
+  "dependencies": {
+    "braintrust": "^2.2.0"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.4"
+  }
+}

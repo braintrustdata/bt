@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use crossterm::queue;
 use crossterm::style::{
     Attribute, Color as CtColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -48,9 +48,11 @@ impl Drop for SocketCleanupGuard {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum EvalLanguage {
+#[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
+pub enum EvalLanguage {
+    #[value(alias = "js")]
     JavaScript,
+    #[value(alias = "py")]
     Python,
 }
 
@@ -61,8 +63,18 @@ pub struct EvalArgs {
     pub files: Vec<String>,
 
     /// Eval runner binary (e.g. tsx, bun, ts-node, python). Defaults to tsx for JS files.
-    #[arg(long, short = 'r', env = "BT_EVAL_JS_RUNNER", value_name = "RUNNER")]
+    #[arg(long, short = 'r', env = "BT_EVAL_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,
+
+    /// Force eval language instead of inferring from file extensions.
+    #[arg(
+        long,
+        short = 'l',
+        env = "BT_EVAL_LANGUAGE",
+        value_enum,
+        value_name = "LANGUAGE"
+    )]
+    pub language: Option<EvalLanguage>,
 
     /// Run evals locally (do not send logs to Braintrust).
     #[arg(
@@ -77,6 +89,7 @@ pub struct EvalArgs {
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     run_eval_files(
         &base,
+        args.language,
         args.runner.clone(),
         args.files.clone(),
         args.no_send_logs,
@@ -86,11 +99,12 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
 async fn run_eval_files(
     base: &BaseArgs,
+    language_override: Option<EvalLanguage>,
     runner_override: Option<String>,
     files: Vec<String>,
     no_send_logs: bool,
 ) -> Result<()> {
-    let language = detect_eval_language(&files)?;
+    let language = detect_eval_language(&files, language_override)?;
     let js_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
         .join("eval-runner.ts");
@@ -228,7 +242,14 @@ fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
     envs
 }
 
-fn detect_eval_language(files: &[String]) -> Result<EvalLanguage> {
+fn detect_eval_language(
+    files: &[String],
+    language_override: Option<EvalLanguage>,
+) -> Result<EvalLanguage> {
+    if let Some(language) = language_override {
+        return Ok(language);
+    }
+
     let mut detected: Option<EvalLanguage> = None;
     for file in files {
         let ext = PathBuf::from(file)
@@ -268,8 +289,8 @@ fn build_js_command(
         let mut command = Command::new(explicit);
         command.arg(runner).args(files);
         command
-    } else if let Some(tsx_path) = find_tsx_binary() {
-        let mut command = Command::new(tsx_path);
+    } else if let Some(auto_runner) = find_js_runner_binary(files) {
+        let mut command = Command::new(auto_runner);
         command.arg(runner).args(files);
         command
     } else {
@@ -307,27 +328,73 @@ fn build_python_command(
     Ok(command)
 }
 
-fn find_tsx_binary() -> Option<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("tsx");
-            if candidate.is_file() {
-                return Some(candidate);
+fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
+    // Prefer local project bins first, then PATH. `tsx` remains the preferred
+    // default, with other common TS runners as fallback.
+    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm"];
+
+    let mut search_roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        search_roots.push(cwd.clone());
+        for file in files {
+            let path = PathBuf::from(file);
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            if let Some(parent) = absolute.parent() {
+                search_roots.push(parent.to_path_buf());
             }
         }
     }
 
-    None
+    for candidate in RUNNER_CANDIDATES {
+        for root in &search_roots {
+            if let Some(path) = find_node_module_bin(candidate, root) {
+                return Some(path);
+            }
+        }
+    }
+
+    find_binary_in_path(RUNNER_CANDIDATES)
 }
 
 fn find_python_binary() -> Option<PathBuf> {
-    let candidates = ["python3", "python"];
+    find_binary_in_path(&["python3", "python"])
+}
+
+fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        let base = dir.join("node_modules").join(".bin").join(binary);
+        if base.is_file() {
+            return Some(base);
+        }
+        if cfg!(windows) {
+            let cmd = base.with_extension("cmd");
+            if cmd.is_file() {
+                return Some(cmd);
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         for candidate in candidates {
             let path = dir.join(candidate);
             if path.is_file() {
                 return Some(path);
+            }
+            if cfg!(windows) {
+                let cmd = path.with_extension("cmd");
+                if cmd.is_file() {
+                    return Some(cmd);
+                }
             }
         }
     }
