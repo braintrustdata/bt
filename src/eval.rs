@@ -328,9 +328,9 @@ fn build_python_command(
 }
 
 fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
-    // Prefer local project bins first, then PATH. `tsx` remains the preferred
-    // default, with other common TS runners as fallback.
-    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm"];
+    // Prefer local project bins first, then PATH. We intentionally only auto-pick
+    // runners that can execute TypeScript entrypoints directly.
+    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node"];
 
     let mut search_roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
