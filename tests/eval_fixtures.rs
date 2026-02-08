@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -16,8 +20,16 @@ struct FixtureConfig {
     expect_success: Option<bool>,
 }
 
+fn test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
 #[test]
 fn eval_fixtures() {
+    let _guard = test_lock();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures_root = root.join("tests").join("evals");
     if !fixtures_root.exists() {
@@ -72,6 +84,7 @@ fn eval_fixtures() {
         match runtime {
             "node" => ensure_dependencies(&dir),
             "bun" => ensure_dependencies(&dir),
+            "deno" => ensure_dependencies(&dir),
             "python" => {}
             other => panic!("Unsupported runtime for fixture {fixture_name}: {other}"),
         }
@@ -102,6 +115,14 @@ fn eval_fixtures() {
                 }
                 let label = runner.as_deref().unwrap_or("default");
                 eprintln!("Skipping {fixture_name} [{label}] (bun not installed).");
+                continue;
+            }
+            if needs_deno(runtime, runner.as_deref()) && !command_exists("deno") {
+                if required_runtimes().contains("deno") {
+                    panic!("Deno runtime is required but unavailable for fixture {fixture_name}");
+                }
+                let label = runner.as_deref().unwrap_or("default");
+                eprintln!("Skipping {fixture_name} [{label}] (deno not installed).");
                 continue;
             }
 
@@ -156,9 +177,276 @@ fn eval_fixtures() {
     }
 }
 
+#[test]
+fn eval_watch_js_dependency_retriggers() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but unavailable for watch test");
+        }
+        eprintln!("Skipping eval_watch_js_dependency_retriggers (node not installed).");
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("js").join("eval-ts-cjs");
+    ensure_dependencies(&fixture_dir);
+
+    let bt_path = bt_binary_path(&root);
+    let runner = resolve_runner(&fixture_dir, Some("tsx"), None).expect("resolve js runner");
+
+    assert_watch_detects_dependency_change(
+        &bt_path,
+        &fixture_dir,
+        &runner,
+        "tests/async-import.eval.ts",
+        "tests/helper.js",
+    );
+}
+
+#[test]
+fn eval_watch_bun_dependency_retriggers() {
+    let _guard = test_lock();
+    if !command_exists("bun") {
+        if required_runtimes().contains("bun") {
+            panic!("bun runtime is required but unavailable for watch test");
+        }
+        eprintln!("Skipping eval_watch_bun_dependency_retriggers (bun not installed).");
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("js").join("eval-ts-cjs");
+    ensure_dependencies(&fixture_dir);
+
+    let bt_path = bt_binary_path(&root);
+
+    assert_watch_detects_dependency_change(
+        &bt_path,
+        &fixture_dir,
+        "bun",
+        "tests/async-import.eval.ts",
+        "tests/helper.js",
+    );
+}
+
+#[test]
+fn eval_watch_deno_dependency_retriggers() {
+    let _guard = test_lock();
+    if !command_exists("deno") {
+        if required_runtimes().contains("deno") {
+            panic!("deno runtime is required but unavailable for watch test");
+        }
+        eprintln!("Skipping eval_watch_deno_dependency_retriggers (deno not installed).");
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("js").join("eval-deno");
+    ensure_dependencies(&fixture_dir);
+
+    let bt_path = bt_binary_path(&root);
+
+    assert_watch_detects_dependency_change(
+        &bt_path,
+        &fixture_dir,
+        "deno",
+        "tests/basic.eval.ts",
+        "tests/helper.ts",
+    );
+}
+
+#[test]
+fn eval_watch_python_dependency_retriggers() {
+    let _guard = test_lock();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("py").join("local_import");
+
+    let python = ensure_python_env(&fixtures_root.join("py"))
+        .expect("python runtime unavailable for watch dependency test");
+    let bt_path = bt_binary_path(&root);
+
+    assert_watch_detects_dependency_change(
+        &bt_path,
+        &fixture_dir,
+        python.to_string_lossy().as_ref(),
+        "eval_local_import.py",
+        "helper.py",
+    );
+}
+
 fn read_fixture_config(path: &Path) -> FixtureConfig {
     let raw = fs::read_to_string(path).expect("read fixture.json");
     serde_json::from_str(&raw).expect("parse fixture.json")
+}
+
+fn bt_binary_path(root: &Path) -> PathBuf {
+    match std::env::var("CARGO_BIN_EXE_bt") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            let candidate = root.join("target").join("debug").join("bt");
+            if !candidate.is_file() {
+                build_bt_binary(root);
+            }
+            candidate
+        }
+    }
+}
+
+struct FileRestoreGuard {
+    path: PathBuf,
+    original: Vec<u8>,
+}
+
+impl FileRestoreGuard {
+    fn new(path: PathBuf) -> Self {
+        let original = fs::read(&path).expect("read original file bytes");
+        Self { path, original }
+    }
+}
+
+impl Drop for FileRestoreGuard {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, &self.original);
+    }
+}
+
+fn assert_watch_detects_dependency_change(
+    bt_path: &Path,
+    fixture_dir: &Path,
+    runner: &str,
+    entry_file: &str,
+    dependency_file: &str,
+) {
+    let dep_path = fixture_dir.join(dependency_file);
+    let _restore_guard = FileRestoreGuard::new(dep_path.clone());
+
+    let mut cmd = Command::new(bt_path);
+    cmd.arg("eval")
+        .arg("--watch")
+        .arg("--no-send-logs")
+        .arg("--runner")
+        .arg(runner)
+        .arg(entry_file)
+        .current_dir(fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env(
+            "BRAINTRUST_API_KEY",
+            std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn bt eval --watch");
+    let output = Arc::new(Mutex::new(String::new()));
+    let mut threads = Vec::new();
+
+    if let Some(stdout) = child.stdout.take() {
+        threads.push(spawn_output_collector(stdout, Arc::clone(&output)));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        threads.push(spawn_output_collector(stderr, Arc::clone(&output)));
+    }
+
+    wait_for_output(
+        &mut child,
+        &output,
+        "Waiting for changes...",
+        Duration::from_secs(45),
+    );
+
+    let marker_prefix = if dep_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        "#"
+    } else {
+        "//"
+    };
+    let marker = format!(
+        "\n{marker_prefix} bt-watch-test-{}\n",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    );
+    let mut updated = fs::read_to_string(&dep_path).expect("read dependency file");
+    updated.push_str(&marker);
+    fs::write(&dep_path, updated).expect("modify dependency file");
+
+    wait_for_output(
+        &mut child,
+        &output,
+        "Detected changes in",
+        Duration::from_secs(45),
+    );
+    let dep_name = dep_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .expect("dependency file name");
+    wait_for_output(&mut child, &output, dep_name, Duration::from_secs(45));
+    wait_for_output(
+        &mut child,
+        &output,
+        "Re-running evals.",
+        Duration::from_secs(45),
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    for handle in threads {
+        let _ = handle.join();
+    }
+}
+
+fn spawn_output_collector<R>(reader: R, output: Arc<Mutex<String>>) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffered = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match buffered.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let mut guard = output.lock().expect("output lock");
+                    guard.push_str(&line);
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn wait_for_output(
+    child: &mut Child,
+    output: &Arc<Mutex<String>>,
+    needle: &str,
+    timeout: Duration,
+) {
+    let started = Instant::now();
+    loop {
+        if output.lock().expect("output lock").contains(needle) {
+            return;
+        }
+
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let captured = output.lock().expect("output lock").clone();
+            panic!(
+                "watch process exited early with status {status} while waiting for '{needle}'.\n{captured}"
+            );
+        }
+
+        if started.elapsed() > timeout {
+            let captured = output.lock().expect("output lock").clone();
+            panic!("timed out waiting for '{needle}'.\n{captured}");
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn collect_runners(config: &FixtureConfig) -> Vec<Option<String>> {
@@ -203,6 +491,10 @@ fn needs_bun(runtime: &str, runner: Option<&str>) -> bool {
     runtime == "bun" || runner == Some("bun")
 }
 
+fn needs_deno(runtime: &str, runner: Option<&str>) -> bool {
+    runtime == "deno" || runner == Some("deno")
+}
+
 fn required_runtimes() -> BTreeSet<String> {
     std::env::var("BT_EVAL_REQUIRED_RUNTIMES")
         .unwrap_or_default()
@@ -222,6 +514,10 @@ fn enforce_required_runtimes(fixtures_root: &Path) {
 
     if required.contains("bun") && !command_exists("bun") {
         panic!("bun runtime is required but not installed");
+    }
+
+    if required.contains("deno") && !command_exists("deno") {
+        panic!("deno runtime is required but not installed");
     }
 
     if required.contains("python") {

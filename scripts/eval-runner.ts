@@ -1,7 +1,7 @@
 import { createRequire } from "module";
 import net from "net";
 import path from "path";
-import { pathToFileURL } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 type EvaluatorEntry = {
   evaluator: {
@@ -103,6 +103,398 @@ function normalizeBraintrustModule(value: unknown): BraintrustModule {
 
 function normalizeFiles(files: string[]): string[] {
   return files.map((file) => path.resolve(process.cwd(), file));
+}
+
+const runtimeRequire = createRequire(
+  path.join(process.cwd(), "__bt-eval-runner__.cjs"),
+);
+const fsMutable = runtimeRequire("fs") as typeof import("fs");
+const moduleMutable = (() => {
+  try {
+    return runtimeRequire("node:module") as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+})();
+
+const dependencyFiles = new Set<string>();
+const DEPENDENCY_EXTENSIONS = new Set([
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".mts",
+  ".cts",
+  ".json",
+]);
+const IGNORED_DEPENDENCY_SEGMENTS = [
+  "/node_modules/",
+  "/.git/",
+  "/.venv/",
+  "/__pycache__/",
+  "/site-packages/",
+  "/dist-packages/",
+];
+const STATIC_IMPORT_PATTERN =
+  /(?:import|export)\s+(?:[^"'`]*?\sfrom\s*)?["'`]([^"'`]+)["'`]|import\s*\(\s*["'`]([^"'`]+)["'`]\s*\)|require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g;
+
+function toDependencyPath(input: unknown): string | null {
+  try {
+    if (input instanceof URL) {
+      return fileURLToPath(input);
+    }
+    if (Buffer.isBuffer(input)) {
+      return path.resolve(process.cwd(), input.toString());
+    }
+    if (typeof input !== "string") {
+      return null;
+    }
+    if (input.startsWith("file://")) {
+      return fileURLToPath(input);
+    }
+    return path.isAbsolute(input)
+      ? path.normalize(input)
+      : path.resolve(process.cwd(), input);
+  } catch {
+    return null;
+  }
+}
+
+function shouldIgnoreDependencyPath(filePath: string): boolean {
+  const normalized = filePath.replaceAll("\\", "/");
+  return IGNORED_DEPENDENCY_SEGMENTS.some((segment) =>
+    normalized.includes(segment),
+  );
+}
+
+function maybeRecordDependency(input: unknown) {
+  const filePath = toDependencyPath(input);
+  if (!filePath || shouldIgnoreDependencyPath(filePath)) {
+    return;
+  }
+
+  const extension = path.extname(filePath).toLowerCase();
+  if (!DEPENDENCY_EXTENSIONS.has(extension)) {
+    return;
+  }
+
+  try {
+    if (fsMutable.statSync(filePath).isFile()) {
+      dependencyFiles.add(filePath);
+    }
+  } catch {
+    // Ignore inaccessible or non-file inputs.
+  }
+}
+
+function maybeRecordDependencyFromSpecifier(
+  specifier: string,
+  resolveDir?: string,
+) {
+  if (
+    specifier.startsWith("node:") ||
+    specifier.startsWith("bun:") ||
+    specifier.startsWith("npm:")
+  ) {
+    return;
+  }
+
+  if (
+    specifier.startsWith("./") ||
+    specifier.startsWith("../") ||
+    specifier.startsWith("/") ||
+    specifier.startsWith("file://")
+  ) {
+    const baseDir = resolveDir ?? process.cwd();
+    const candidate = specifier.startsWith("file://")
+      ? specifier
+      : path.resolve(baseDir, specifier);
+    maybeRecordDependency(candidate);
+  }
+}
+
+function collectStaticLocalDependencies(entryFiles: string[]) {
+  const queue = [...entryFiles];
+  const visited = new Set<string>();
+
+  while (queue.length > 0) {
+    const file = queue.pop();
+    if (!file) {
+      continue;
+    }
+    const absolute = path.resolve(file);
+    if (visited.has(absolute)) {
+      continue;
+    }
+    visited.add(absolute);
+    maybeRecordDependency(absolute);
+
+    let source = "";
+    try {
+      source = fsMutable.readFileSync(absolute, "utf8");
+    } catch {
+      continue;
+    }
+
+    STATIC_IMPORT_PATTERN.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = STATIC_IMPORT_PATTERN.exec(source)) !== null) {
+      const specifier = match[1] ?? match[2] ?? match[3];
+      if (!specifier) {
+        continue;
+      }
+      const resolved = resolveLocalSpecifier(absolute, specifier);
+      if (!resolved) {
+        continue;
+      }
+      maybeRecordDependency(resolved);
+      if (!visited.has(resolved)) {
+        queue.push(resolved);
+      }
+    }
+  }
+}
+
+function resolveLocalSpecifier(
+  fromFile: string,
+  specifier: string,
+): string | null {
+  if (
+    !specifier.startsWith("./") &&
+    !specifier.startsWith("../") &&
+    !specifier.startsWith("/") &&
+    !specifier.startsWith("file://")
+  ) {
+    return null;
+  }
+
+  const fromDir = path.dirname(fromFile);
+  const base = specifier.startsWith("file://")
+    ? fileURLToPath(specifier)
+    : specifier.startsWith("/")
+      ? path.normalize(specifier)
+      : path.resolve(fromDir, specifier);
+
+  const candidates = [base];
+  if (!path.extname(base)) {
+    for (const ext of DEPENDENCY_EXTENSIONS) {
+      candidates.push(`${base}${ext}`);
+    }
+    for (const ext of DEPENDENCY_EXTENSIONS) {
+      candidates.push(path.join(base, `index${ext}`));
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (fsMutable.statSync(candidate).isFile()) {
+        return path.normalize(candidate);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function installNodeModuleHooks() {
+  const registerHooks = moduleMutable.registerHooks as
+    | ((hooks: Record<string, (...args: unknown[]) => unknown>) => void)
+    | undefined;
+  if (typeof registerHooks !== "function") {
+    return;
+  }
+
+  registerHooks({
+    resolve: (specifier, context, nextResolve) => {
+      const next = nextResolve as (
+        specifier: unknown,
+        context: Record<string, unknown>,
+      ) => { url?: string } & Record<string, unknown>;
+      const ctx = (context ?? {}) as Record<string, unknown>;
+      const result = next(specifier, ctx);
+      const resolvedUrl = result?.url;
+      if (typeof resolvedUrl === "string") {
+        maybeRecordDependency(resolvedUrl);
+      } else if (typeof specifier === "string") {
+        const resolveDir =
+          typeof ctx.parentURL === "string" &&
+          ctx.parentURL.startsWith("file://")
+            ? path.dirname(fileURLToPath(ctx.parentURL))
+            : undefined;
+        maybeRecordDependencyFromSpecifier(specifier, resolveDir);
+      }
+      return result;
+    },
+  });
+}
+
+function installBunModuleHooks() {
+  const bun = (globalThis as { Bun?: Record<string, unknown> }).Bun as
+    | {
+        plugin?: (plugin: {
+          name: string;
+          setup: (build: Record<string, unknown>) => void;
+        }) => void;
+      }
+    | undefined;
+  if (!bun || typeof bun.plugin !== "function") {
+    return;
+  }
+
+  bun.plugin({
+    name: "bt-eval-dependency-tracker",
+    setup: (build: Record<string, unknown>) => {
+      const onResolve = build.onResolve as
+        | ((
+            options: { filter: RegExp },
+            callback: (args: Record<string, unknown>) => unknown,
+          ) => void)
+        | undefined;
+      if (typeof onResolve === "function") {
+        onResolve({ filter: /.*/ }, (args) => {
+          const specifier = args.path;
+          const resolveDir =
+            typeof args.resolveDir === "string"
+              ? args.resolveDir
+              : process.cwd();
+          if (typeof specifier === "string") {
+            maybeRecordDependencyFromSpecifier(specifier, resolveDir);
+          }
+          return null;
+        });
+      }
+    },
+  });
+}
+
+function installDependencyTracking() {
+  installNodeModuleHooks();
+  installBunModuleHooks();
+
+  const fsPatched = fsMutable as unknown as Record<string, unknown>;
+  const originalReadFileSync = fsMutable.readFileSync.bind(fsMutable);
+  Reflect.set(
+    fsPatched,
+    "readFileSync",
+    (file: unknown, ...args: unknown[]) => {
+      maybeRecordDependency(file);
+      const callArgs = [file, ...args] as unknown[];
+      return Reflect.apply(
+        originalReadFileSync as (...params: unknown[]) => unknown,
+        fsMutable,
+        callArgs,
+      );
+    },
+  );
+
+  const originalReadFile = fsMutable.readFile.bind(fsMutable);
+  Reflect.set(fsPatched, "readFile", (file: unknown, ...args: unknown[]) => {
+    maybeRecordDependency(file);
+    const callArgs = [file, ...args] as unknown[];
+    return Reflect.apply(
+      originalReadFile as (...params: unknown[]) => unknown,
+      fsMutable,
+      callArgs,
+    );
+  });
+
+  const originalPromisesReadFile = fsMutable.promises.readFile.bind(
+    fsMutable.promises,
+  );
+  const fsPromisesPatched = fsMutable.promises as unknown as Record<
+    string,
+    unknown
+  >;
+  Reflect.set(
+    fsPromisesPatched,
+    "readFile",
+    async (file: unknown, ...args: unknown[]) => {
+      maybeRecordDependency(file);
+      const callArgs = [file, ...args] as unknown[];
+      return Reflect.apply(
+        originalPromisesReadFile as (...params: unknown[]) => Promise<unknown>,
+        fsMutable.promises,
+        callArgs,
+      );
+    },
+  );
+}
+
+function collectRequireCacheDependencies() {
+  const cache = runtimeRequire.cache as Record<
+    string,
+    { filename?: string } | undefined
+  >;
+  if (!cache) {
+    return;
+  }
+  for (const [cacheKey, moduleValue] of Object.entries(cache)) {
+    maybeRecordDependency(moduleValue?.filename ?? cacheKey);
+  }
+}
+
+async function collectDenoInfoDependencies(files: string[]) {
+  const deno = (globalThis as Record<string, unknown>).Deno as
+    | {
+        Command?: new (
+          command: string,
+          options: Record<string, unknown>,
+        ) => {
+          output: () => Promise<{
+            success: boolean;
+            stdout: Uint8Array;
+          }>;
+        };
+      }
+    | undefined;
+  if (!deno || typeof deno.Command !== "function") {
+    return;
+  }
+
+  for (const file of files) {
+    try {
+      const cmd = new deno.Command("deno", {
+        args: ["info", "--json", file],
+        stdout: "piped",
+        stderr: "null",
+      });
+      const output = await cmd.output();
+      if (!output.success) {
+        continue;
+      }
+      const parsed = JSON.parse(new TextDecoder().decode(output.stdout));
+      collectFileUrlsFromJson(parsed);
+    } catch {
+      continue;
+    }
+  }
+}
+
+function collectFileUrlsFromJson(value: unknown) {
+  if (typeof value === "string") {
+    maybeRecordDependency(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectFileUrlsFromJson(item);
+    }
+    return;
+  }
+  if (!value || typeof value !== "object") {
+    return;
+  }
+  for (const child of Object.values(value)) {
+    collectFileUrlsFromJson(child);
+  }
+}
+
+function collectDependencyFiles(): string[] {
+  return Array.from(dependencyFiles).sort();
 }
 
 function serializeSseEvent(event: { event?: string; data: string }): string {
@@ -585,6 +977,7 @@ async function createEvalRunner() {
 
   const finish = (ok: boolean) => {
     if (sse) {
+      sse.send("dependencies", { files: collectDependencyFiles() });
       sse.send("done", "");
       sse.close();
     }
@@ -612,7 +1005,12 @@ async function main() {
     process.exit(1);
   }
 
+  installDependencyTracking();
   const normalized = normalizeFiles(files);
+  for (const file of normalized) {
+    maybeRecordDependency(file);
+  }
+  collectStaticLocalDependencies(normalized);
   ensureBraintrustAvailable();
   await loadBraintrust();
   initRegistry();
@@ -673,6 +1071,8 @@ async function main() {
       ok = await runner.runRegisteredEvals(evaluators);
     }
   } finally {
+    collectRequireCacheDependencies();
+    await collectDenoInfoDependencies(normalized);
     runner.finish(ok);
   }
 }

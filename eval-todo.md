@@ -27,26 +27,26 @@ Legend:
 - `partial`: implemented but behavior differs
 - `todo`: missing
 
-| Feature / Flag              |           JS CLI |           PY CLI |                                       `bt` | Notes                                                                               |
-| --------------------------- | ---------------: | ---------------: | -----------------------------------------: | ----------------------------------------------------------------------------------- |
-| Run eval files              |              yes |              yes |                                     `done` | Single-language per invocation currently enforced.                                  |
-| Local/no-upload mode        | `--no-send-logs` | `--no-send-logs` | `done` (`--local`, alias `--no-send-logs`) |                                                                                     |
-| Global auth/env passthrough |              yes |              yes |                                     `done` | Via base args/env (`BRAINTRUST_API_KEY`, `BRAINTRUST_API_URL`, project).            |
-| Progress rendering          |              yes |              yes |                                  `partial` | `bt` consumes local SSE and renders Rust TUI/progress, but not full SDK parity yet. |
-| `--list` (discover only)    |              yes |              yes |                                     `todo` |                                                                                     |
-| `--filter`                  |              yes |              yes |                                     `todo` |                                                                                     |
-| `--jsonl` summaries         |              yes |              yes |                                     `todo` |                                                                                     |
-| `--terminate-on-failure`    |              yes |              yes |                                     `todo` |                                                                                     |
-| `--watch`                   |              yes |              yes |                                     `todo` |                                                                                     |
-| `--verbose`                 |              yes |      parent flag |                                     `todo` |                                                                                     |
-| `--env-file`                |              yes |              yes |                                     `todo` |                                                                                     |
-| `--dev` remote eval server  |              yes |              yes |                                     `todo` | Important for `test_remote_evals.py` parity.                                        |
-| `--dev-host`                |              yes |              yes |                                     `todo` |                                                                                     |
-| `--dev-port`                |              yes |              yes |                                     `todo` |                                                                                     |
-| `--dev-org-name`            |              yes |              yes |                                     `todo` |                                                                                     |
-| `--num-workers`             |              n/a |              yes |                                     `todo` | Python-specific concurrency control.                                                |
-| Directory input expansion   |              yes |              yes |                                     `todo` | Today `bt` expects explicit files/extensions.                                       |
-| Mixed runtime selection     |              n/a |              n/a |                                  `partial` | Current `--runner` plus env vars; per-language runner matrix deferred.              |
+| Feature / Flag              |           JS CLI |           PY CLI |                                       `bt` | Notes                                                                                                    |
+| --------------------------- | ---------------: | ---------------: | -----------------------------------------: | -------------------------------------------------------------------------------------------------------- |
+| Run eval files              |              yes |              yes |                                     `done` | Single-language per invocation currently enforced.                                                       |
+| Local/no-upload mode        | `--no-send-logs` | `--no-send-logs` | `done` (`--local`, alias `--no-send-logs`) |                                                                                                          |
+| Global auth/env passthrough |              yes |              yes |                                     `done` | Via base args/env (`BRAINTRUST_API_KEY`, `BRAINTRUST_API_URL`, project).                                 |
+| Progress rendering          |              yes |              yes |                                  `partial` | `bt` consumes local SSE and renders Rust TUI/progress, but not full SDK parity yet.                      |
+| `--list` (discover only)    |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--filter`                  |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--jsonl` summaries         |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--terminate-on-failure`    |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--watch`                   |              yes |              yes |                                  `partial` | Poll-based watcher with Node/Bun dependency hooks, Deno graph collection, and static JS import fallback. |
+| `--verbose`                 |              yes |      parent flag |                                     `todo` |                                                                                                          |
+| `--env-file`                |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--dev` remote eval server  |              yes |              yes |                                     `todo` | Important for `test_remote_evals.py` parity.                                                             |
+| `--dev-host`                |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--dev-port`                |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--dev-org-name`            |              yes |              yes |                                     `todo` |                                                                                                          |
+| `--num-workers`             |              n/a |              yes |                                     `todo` | Python-specific concurrency control.                                                                     |
+| Directory input expansion   |              yes |              yes |                                     `todo` | Today `bt` expects explicit files/extensions.                                                            |
+| Mixed runtime selection     |              n/a |              n/a |                                  `partial` | Current `--runner` plus env vars; per-language runner matrix deferred.                                   |
 
 ## Braintrust Test Callsite Inventory
 

@@ -17,7 +17,7 @@ jobs:
       contents: read
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
-      BT_EVAL_REQUIRED_RUNTIMES: node,bun,python
+      BT_EVAL_REQUIRED_RUNTIMES: node,bun,python,deno
     steps:
       - uses: actions/checkout@v4
       - name: Configure git auth for private dependencies
@@ -38,6 +38,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - uses: astral-sh/setup-uv@v5
       - name: Enable pnpm
         run: |

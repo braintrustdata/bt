@@ -1,0 +1,5 @@
+{
+  "runtime": "deno",
+  "runner": "deno",
+  "files": ["tests/basic.eval.ts"]
+}
