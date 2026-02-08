@@ -321,7 +321,12 @@ fn collect_deno_eval_diagnostics(dir: &Path, files: &[String]) -> Option<String>
     let runner_script_str = runner_script.to_string_lossy().to_string();
 
     let mut cmd = Command::new("deno");
-    cmd.args(["run", "-A", "--node-modules-dir=auto"]);
+    cmd.args([
+        "run",
+        "-A",
+        "--node-modules-dir=auto",
+        "--unstable-detect-cjs",
+    ]);
     cmd.arg(runner_script_str);
     cmd.args(files);
     cmd.current_dir(dir);

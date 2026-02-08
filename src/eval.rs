@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -622,13 +622,20 @@ fn build_deno_js_command(
     files: &[String],
 ) -> Command {
     let mut command = Command::new(deno_runner);
+    command.args(deno_js_command_args(runner, files));
     command
-        .arg("run")
-        .arg("-A")
-        .arg("--node-modules-dir=auto")
-        .arg(runner)
-        .args(files);
-    command
+}
+
+fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("run"),
+        OsString::from("-A"),
+        OsString::from("--node-modules-dir=auto"),
+        OsString::from("--unstable-detect-cjs"),
+        runner.as_os_str().to_os_string(),
+    ];
+    args.extend(files.iter().map(OsString::from));
+    args
 }
 
 fn build_python_command(
@@ -1687,5 +1694,26 @@ mod tests {
         assert!(dependencies.contains(&entry));
         assert!(dependencies.contains(&helper));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_deno_js_command_includes_detect_cjs_flag() {
+        let runner = PathBuf::from("/tmp/eval-runner.ts");
+        let files = vec!["tests/basic.eval.ts".to_string()];
+        let args: Vec<String> = deno_js_command_args(&runner, &files)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-A",
+                "--node-modules-dir=auto",
+                "--unstable-detect-cjs",
+                "/tmp/eval-runner.ts",
+                "tests/basic.eval.ts",
+            ]
+        );
     }
 }
