@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
-use crate::{args::BaseArgs, http::ApiClient, login::login};
+use crate::{args::BaseArgs, http::ApiClient, login::login, projects::api::get_project_by_name};
 
 mod api;
 mod delete;
@@ -53,6 +53,10 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         .project
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))?;
+
+    get_project_by_name(&client, project)
+        .await?
+        .ok_or_else(|| anyhow!("project '{project}' not found"))?;
 
     match args.command {
         None | Some(PromptsCommands::List) => {
