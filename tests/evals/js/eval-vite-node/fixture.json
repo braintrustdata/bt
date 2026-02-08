@@ -1,0 +1,4 @@
+{
+  "runner": "./node_modules/.bin/vite-node",
+  "files": ["tests/basic.eval.ts", "tests/top-level-await.eval.ts"]
+}
