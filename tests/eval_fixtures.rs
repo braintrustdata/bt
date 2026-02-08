@@ -318,7 +318,11 @@ fn collect_deno_eval_diagnostics(dir: &Path, files: &[String]) -> Option<String>
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let runner_script = root.join("scripts").join("eval-runner.ts");
-    let runner_script_str = runner_script.to_string_lossy().to_string();
+    let local_runner_dir = dir.join(".bt").join("eval-runners");
+    fs::create_dir_all(&local_runner_dir).ok()?;
+    let local_runner = local_runner_dir.join("diag-eval-runner.ts");
+    fs::copy(&runner_script, &local_runner).ok()?;
+    let runner_script_str = local_runner.to_string_lossy().to_string();
 
     let mut cmd = Command::new("deno");
     cmd.args([

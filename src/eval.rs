@@ -591,7 +591,8 @@ fn build_js_command(
 ) -> Result<Command> {
     let command = if let Some(explicit) = runner_override.as_deref() {
         if is_deno_runner(explicit) {
-            build_deno_js_command(explicit, runner, files)
+            let runner_script = prepare_js_runner_in_cwd()?;
+            build_deno_js_command(explicit, &runner_script, files)
         } else {
             let runner_script = select_js_runner_entrypoint(runner, Path::new(explicit))?;
             let mut command = Command::new(explicit);
@@ -600,7 +601,8 @@ fn build_js_command(
         }
     } else if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
-            build_deno_js_command(auto_runner.as_os_str(), runner, files)
+            let runner_script = prepare_js_runner_in_cwd()?;
+            build_deno_js_command(auto_runner.as_os_str(), &runner_script, files)
         } else {
             let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
             let mut command = Command::new(auto_runner);
