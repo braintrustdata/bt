@@ -1,0 +1,10 @@
+{
+  "name": "bt-eval-ts-cjs",
+  "private": true,
+  "dependencies": {
+    "braintrust": "^2.2.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2"
+  }
+}

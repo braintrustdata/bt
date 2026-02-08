@@ -1,0 +1,3 @@
+{
+  "files": ["tests/basic.eval.ts", "tests/async-import.eval.ts"]
+}

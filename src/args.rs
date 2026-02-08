@@ -1,4 +1,5 @@
 use clap::Args;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
@@ -21,6 +22,10 @@ pub struct BaseArgs {
     /// Override app URL (or via BRAINTRUST_APP_URL)
     #[arg(long, env = "BRAINTRUST_APP_URL")]
     pub app_url: Option<String>,
+
+    /// Path to a .env file to load before running commands.
+    #[arg(long, env = "BRAINTRUST_ENV_FILE")]
+    pub env_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

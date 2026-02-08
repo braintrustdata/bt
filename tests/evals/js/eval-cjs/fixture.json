@@ -1,0 +1,8 @@
+{
+  "files": [
+    "tests/async-import.eval.js",
+    "tests/dirname-filename.eval.js",
+    "tests/module-exports.eval.js",
+    "tests/require-builtin.eval.js"
+  ]
+}

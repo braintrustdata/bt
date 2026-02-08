@@ -14,3 +14,9 @@ Thumbs.db
 
 # Local cargo overrides
 .cargo/config.toml
+
+# Node
+node_modules/
+tests/evals/js/eval-bun/test-data.txt
+
+__pycache__

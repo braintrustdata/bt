@@ -1,0 +1,9 @@
+{
+  "name": "braintrust-cli",
+  "private": true,
+  "packageManager": "pnpm@10.28.2",
+  "devDependencies": {
+    "@types/node": "22.15.0",
+    "typescript": "5.4.4"
+  }
+}
