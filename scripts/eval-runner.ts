@@ -1,5 +1,4 @@
 import { createRequire } from "node:module";
-import net from "node:net";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -116,6 +115,16 @@ const moduleMutable = (() => {
     return {};
   }
 })();
+
+type NetModule = {
+  createConnection: (options: Record<string, unknown>) => {
+    writable: boolean;
+    end: () => void;
+    setNoDelay: (value?: boolean) => void;
+    on: (event: string, listener: (...args: unknown[]) => void) => void;
+    write: (data: string) => void;
+  };
+};
 
 const dependencyFiles = new Set<string>();
 const DEPENDENCY_EXTENSIONS = new Set([
@@ -507,11 +516,22 @@ function serializeSseEvent(event: { event?: string; data: string }): string {
 }
 
 function createSseWriter(): SseWriter | null {
+  const netModule = (() => {
+    try {
+      return runtimeRequire("node:net") as NetModule;
+    } catch {
+      return null;
+    }
+  })();
+
   const sock = process.env.BT_EVAL_SSE_SOCK;
   if (sock) {
-    let socket: net.Socket;
+    if (!netModule) {
+      return null;
+    }
+    let socket: ReturnType<NetModule["createConnection"]>;
     try {
-      socket = net.createConnection({ path: sock });
+      socket = netModule.createConnection({ path: sock });
     } catch (err) {
       console.error(
         `Failed to connect to SSE socket: ${
@@ -521,7 +541,8 @@ function createSseWriter(): SseWriter | null {
       return null;
     }
     socket.on("error", (err) => {
-      console.error(`Failed to connect to SSE socket: ${err.message}`);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Failed to connect to SSE socket: ${message}`);
     });
     const send = (event: string, payload: unknown) => {
       if (!socket.writable) {
@@ -548,9 +569,13 @@ function createSseWriter(): SseWriter | null {
     throw new Error(`Invalid BT_EVAL_SSE_ADDR: ${addr}`);
   }
 
-  let socket: net.Socket;
+  if (!netModule) {
+    return null;
+  }
+
+  let socket: ReturnType<NetModule["createConnection"]>;
   try {
-    socket = net.createConnection({ host, port });
+    socket = netModule.createConnection({ host, port });
   } catch (err) {
     console.error(
       `Failed to connect to SSE address ${addr}: ${
@@ -561,7 +586,8 @@ function createSseWriter(): SseWriter | null {
   }
   socket.setNoDelay(true);
   socket.on("error", (err) => {
-    console.error(`Failed to connect to SSE address ${addr}: ${err.message}`);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Failed to connect to SSE address ${addr}: ${message}`);
   });
 
   const send = (event: string, payload: unknown) => {
