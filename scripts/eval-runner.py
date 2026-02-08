@@ -264,8 +264,9 @@ def resolve_module_info(in_file: str) -> tuple[str, list[str]]:
     return module_name, extra_paths
 
 
-def load_evaluators(files: list[str]) -> list[EvaluatorInstance]:
+def load_evaluators(files: list[str]) -> tuple[list[EvaluatorInstance], dict[str, Any]]:
     evaluator_instances: list[EvaluatorInstance] = []
+    reporters: dict[str, Any] = {}
     unique_files: set[str] = set()
     for file_path in files:
         for candidate in collect_files(file_path):
@@ -296,10 +297,34 @@ def load_evaluators(files: list[str]) -> list[EvaluatorInstance]:
                         if isinstance(instance, EvaluatorInstance)
                     ]
                 )
+                for reporter_name, reporter in _evals.reporters.items():
+                    if reporter_name not in reporters:
+                        reporters[reporter_name] = reporter
             finally:
                 _evals.clear()
 
-    return evaluator_instances
+    return evaluator_instances, reporters
+
+
+def resolve_reporter(
+    reporter: Any,
+    reporters: dict[str, Any],
+) -> Any | None:
+    if isinstance(reporter, str):
+        if reporter not in reporters:
+            raise ValueError(f"Reporter {reporter} not found")
+        return reporters[reporter]
+    if reporter is not None:
+        return reporter
+
+    if len(reporters) == 0:
+        return None
+    if len(reporters) == 1:
+        return next(iter(reporters.values()))
+    reporter_names = ", ".join(reporters.keys())
+    raise ValueError(
+        f"Multiple reporters found ({reporter_names}). Please specify a reporter explicitly."
+    )
 
 
 def _init_experiment_for_eval(evaluator):
@@ -371,7 +396,7 @@ async def run_once(
     sse: SseWriter | None,
     config: RunnerConfig,
 ) -> bool:
-    evaluators = load_evaluators(files)
+    evaluators, reporters = load_evaluators(files)
     if not evaluators and not config.list_only:
         message = "No evaluators found. Did you call Eval() in the file?"
         if sse:
@@ -390,6 +415,22 @@ async def run_once(
 
     all_success = True
     for idx, evaluator_instance in enumerate(evaluators):
+        try:
+            resolved_reporter = resolve_reporter(
+                getattr(evaluator_instance, "reporter", None),
+                reporters,
+            )
+        except Exception as exc:
+            all_success = False
+            err = serialize_error(str(exc), traceback.format_exc())
+            if sse:
+                sse.send("error", err)
+            else:
+                eprint(err.get("message"))
+            if config.terminate_on_failure:
+                break
+            continue
+
         progress_cb = create_progress_reporter(sse, evaluator_instance.evaluator.eval_name)
         try:
             result = await run_evaluator_task(
@@ -418,7 +459,7 @@ async def run_once(
             print(result.summary)
 
         failures = [row for row in result.results if row.error]
-        if failures:
+        if failures and resolved_reporter is None:
             all_success = False
             first_error = failures[0]
             message = (

@@ -427,6 +427,41 @@ function getEvaluators(): EvaluatorEntry[] {
   return Object.values(evals.evaluators) as EvaluatorEntry[];
 }
 
+function getReporters(): Record<string, unknown> {
+  const evals = globalThis._evals;
+  if (!evals || !evals.reporters) {
+    return {};
+  }
+  return evals.reporters as Record<string, unknown>;
+}
+
+function resolveReporter(
+  reporter: unknown,
+  reporters: Record<string, unknown>,
+): unknown | undefined {
+  if (typeof reporter === "string") {
+    if (!(reporter in reporters)) {
+      throw new Error(`Reporter ${reporter} not found`);
+    }
+    return reporters[reporter];
+  }
+  if (reporter !== undefined && reporter !== null) {
+    return reporter;
+  }
+
+  const values = Object.values(reporters);
+  if (values.length === 0) {
+    return undefined;
+  }
+  if (values.length === 1) {
+    return values[0];
+  }
+  const names = Object.keys(reporters).join(", ");
+  throw new Error(
+    `Multiple reporters found (${names}). Please specify a reporter explicitly.`,
+  );
+}
+
 function evaluateFilter(
   object: Record<string, unknown>,
   filter: EvalFilter,
@@ -661,11 +696,14 @@ async function createEvalRunner(config: RunnerConfig) {
   };
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
+    const reporters = getReporters();
     const runEntry = async (entry: EvaluatorEntry): Promise<boolean> => {
       try {
-        const options = entry.reporter
-          ? { reporter: entry.reporter }
-          : undefined;
+        const resolvedReporter = resolveReporter(entry.reporter, reporters);
+        const options =
+          resolvedReporter !== undefined
+            ? { reporter: resolvedReporter }
+            : undefined;
         const result = await runEval(
           entry.evaluator.projectName,
           entry.evaluator,
@@ -674,7 +712,10 @@ async function createEvalRunner(config: RunnerConfig) {
         const failingResults = result.results.filter(
           (r: { error?: unknown }) => r.error !== undefined,
         );
-        return failingResults.length === 0;
+        if (failingResults.length > 0 && resolvedReporter === undefined) {
+          return false;
+        }
+        return true;
       } catch (err) {
         if (sse) {
           sse.send("error", serializeError(err));
