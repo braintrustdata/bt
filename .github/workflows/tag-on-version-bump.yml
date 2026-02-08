@@ -8,6 +8,7 @@ on:
       - Cargo.toml
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -79,6 +80,15 @@ jobs:
 
           git tag -a "$tag" -m "Release $tag" "$GITHUB_SHA"
           git push origin "refs/tags/$tag"
+
+      - name: Trigger release workflow for new tag
+        if: steps.versions.outputs.version_changed == 'true' && steps.tag-check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --ref main -f tag="${{ steps.versions.outputs.tag }}"
 
       - name: No-op (version unchanged)
         if: steps.versions.outputs.version_changed != 'true'

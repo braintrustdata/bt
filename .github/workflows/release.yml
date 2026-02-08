@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (for example v0.1.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,8 +22,8 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ github.ref_name }}
-      tag-flag: ${{ format('--tag={0}', github.ref_name) }}
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+      tag-flag: ${{ steps.resolve-tag.outputs.tag_flag }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -25,6 +31,24 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+      - id: resolve-tag
+        name: Resolve release tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must match v<major>.<minor>.<patch>; got: $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag_flag=--tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Configure git auth for private dependencies
         shell: bash
@@ -48,7 +72,7 @@ jobs:
       - id: plan
         shell: bash
         run: |
-          dist host --steps=create --tag="${{ github.ref_name }}" --output-format=json > plan-dist-manifest.json
+          dist host --steps=create --tag="${{ steps.resolve-tag.outputs.tag }}" --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
