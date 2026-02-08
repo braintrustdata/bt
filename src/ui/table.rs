@@ -10,11 +10,13 @@ pub fn styled_table() -> Table {
 
 /// Truncate text to max length with ellipsis
 pub fn truncate(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}…", &text[..max_len.saturating_sub(1)])
+    if text.chars().count() <= max_len {
+        return text.to_string();
     }
+
+    let keep = max_len.saturating_sub(1);
+    let truncated: String = text.chars().take(keep).collect();
+    format!("{truncated}…")
 }
 
 /// Apply padding to all columns (call after setting headers)
