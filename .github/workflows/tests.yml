@@ -11,8 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["20", "22"]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - node-version: "20"
+            python-version: "3.10"
+          - node-version: "20"
+            python-version: "3.11"
+          - node-version: "22"
+            python-version: "3.12"
+          - node-version: "22"
+            python-version: "3.13"
     permissions:
       contents: read
     env:
