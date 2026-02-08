@@ -1,7 +1,7 @@
-import { createRequire } from "module";
-import net from "net";
-import path from "path";
-import { fileURLToPath, pathToFileURL } from "url";
+import { createRequire } from "node:module";
+import net from "node:net";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 type EvaluatorEntry = {
   evaluator: {
@@ -108,7 +108,7 @@ function normalizeFiles(files: string[]): string[] {
 const runtimeRequire = createRequire(
   path.join(process.cwd(), "__bt-eval-runner__.cjs"),
 );
-const fsMutable = runtimeRequire("fs") as typeof import("fs");
+const fsMutable = runtimeRequire("node:fs") as typeof import("node:fs");
 const moduleMutable = (() => {
   try {
     return runtimeRequire("node:module") as Record<string, unknown>;
