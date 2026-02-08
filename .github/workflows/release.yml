@@ -312,7 +312,7 @@ jobs:
     needs:
       - plan
       - announce
-    if: ${{ needs.announce.result == 'success' }}
+    if: ${{ needs.announce.result == 'success' && vars.BT_ENABLE_MACOS_SMOKE == '1' }}
     runs-on: macos-13
     env:
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
