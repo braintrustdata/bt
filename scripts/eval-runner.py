@@ -267,6 +267,9 @@ def resolve_module_info(in_file: str) -> tuple[str, list[str]]:
 def load_evaluators(files: list[str]) -> tuple[list[EvaluatorInstance], dict[str, Any]]:
     evaluator_instances: list[EvaluatorInstance] = []
     reporters: dict[str, Any] = {}
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
     unique_files: set[str] = set()
     for file_path in files:
         for candidate in collect_files(file_path):
@@ -400,10 +403,10 @@ async def run_once(
     if not evaluators and not config.list_only:
         message = "No evaluators found. Did you call Eval() in the file?"
         if sse:
-            sse.send("error", serialize_error(message))
+            sse.send("console", {"stream": "stderr", "message": message})
         else:
             eprint(message)
-        return False
+        return True
 
     evaluators = filter_evaluators(evaluators, config.filters)
     if config.list_only:

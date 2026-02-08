@@ -303,23 +303,46 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
-    try {
-      const mod = await import(fileUrl);
-      modules.push(mod);
-    } catch (err) {
-      if (shouldTryRequire(file, err)) {
+    const preferRequire =
+      file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs");
+
+    if (preferRequire) {
+      try {
+        const require = createRequire(fileUrl);
+        const mod = require(file);
+        modules.push(mod);
+        continue;
+      } catch (requireErr) {
         try {
-          const require = createRequire(fileUrl);
-          const mod = require(file);
+          const mod = await import(fileUrl);
           modules.push(mod);
           continue;
-        } catch (requireErr) {
+        } catch (esmErr) {
           throw new Error(
-            `Failed to load ${file} as ESM (${formatError(err)}) or CJS (${formatError(requireErr)}).`,
+            `Failed to load ${file} as CJS (${formatError(requireErr)}) or ESM (${formatError(esmErr)}).`,
           );
         }
       }
-      throw err;
+    }
+
+    try {
+      const mod = await import(fileUrl);
+      modules.push(mod);
+      continue;
+    } catch (err) {
+      if (!shouldTryRequire(file, err)) {
+        throw err;
+      }
+      try {
+        const require = createRequire(fileUrl);
+        const mod = require(file);
+        modules.push(mod);
+        continue;
+      } catch (requireErr) {
+        throw new Error(
+          `Failed to load ${file} as ESM (${formatError(err)}) or CJS (${formatError(requireErr)}).`,
+        );
+      }
     }
   }
   return modules;
