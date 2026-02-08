@@ -509,7 +509,17 @@ function serializeSseEvent(event: { event?: string; data: string }): string {
 function createSseWriter(): SseWriter | null {
   const sock = process.env.BT_EVAL_SSE_SOCK;
   if (sock) {
-    const socket = net.createConnection({ path: sock });
+    let socket: net.Socket;
+    try {
+      socket = net.createConnection({ path: sock });
+    } catch (err) {
+      console.error(
+        `Failed to connect to SSE socket: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return null;
+    }
     socket.on("error", (err) => {
       console.error(`Failed to connect to SSE socket: ${err.message}`);
     });
@@ -538,8 +548,21 @@ function createSseWriter(): SseWriter | null {
     throw new Error(`Invalid BT_EVAL_SSE_ADDR: ${addr}`);
   }
 
-  const socket = net.createConnection({ host, port });
+  let socket: net.Socket;
+  try {
+    socket = net.createConnection({ host, port });
+  } catch (err) {
+    console.error(
+      `Failed to connect to SSE address ${addr}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
   socket.setNoDelay(true);
+  socket.on("error", (err) => {
+    console.error(`Failed to connect to SSE address ${addr}: ${err.message}`);
+  });
 
   const send = (event: string, payload: unknown) => {
     if (!socket.writable) {
