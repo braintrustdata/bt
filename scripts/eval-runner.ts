@@ -240,6 +240,12 @@ function shouldTryRequire(file: string, err: unknown): boolean {
   if (process.env.BT_EVAL_CJS === "1" || file.endsWith(".cjs")) {
     return true;
   }
+  if (
+    (file.endsWith(".ts") || file.endsWith(".tsx")) &&
+    isNodeErrorCode(err, "ERR_UNKNOWN_FILE_EXTENSION")
+  ) {
+    return true;
+  }
   if (!(err instanceof Error)) {
     return false;
   }
@@ -250,6 +256,13 @@ function shouldTryRequire(file: string, err: unknown): boolean {
     message.includes("module is not defined") ||
     message.includes("Cannot use import statement outside a module")
   );
+}
+
+function isNodeErrorCode(err: unknown, code: string): boolean {
+  if (!isObject(err) || !("code" in err)) {
+    return false;
+  }
+  return typeof err.code === "string" && err.code === code;
 }
 
 function formatError(err: unknown): string {

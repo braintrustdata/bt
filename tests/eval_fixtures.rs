@@ -129,7 +129,7 @@ fn eval_fixtures() {
             }
 
             if let Some(tsx_path) = local_tsx_path(&dir) {
-                cmd.env("BT_EVAL_JS_RUNNER", tsx_path);
+                cmd.env("BT_EVAL_RUNNER", tsx_path);
             }
 
             if let Some(python) = python_runner.as_ref() {
