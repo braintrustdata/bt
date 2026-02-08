@@ -144,12 +144,16 @@ fn eval_fixtures() {
             }
 
             let expect_success = config.expect_success.unwrap_or(true);
-            let status = cmd.status().expect("run bt eval");
-            assert!(
-                status.success() == expect_success,
-                "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})",
-                runner.as_deref().unwrap_or("default")
-            );
+            let output = cmd.output().expect("run bt eval");
+            let status = output.status;
+            if status.success() != expect_success {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                panic!(
+                    "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    runner.as_deref().unwrap_or("default")
+                );
+            }
             ran_variant = true;
         }
 
