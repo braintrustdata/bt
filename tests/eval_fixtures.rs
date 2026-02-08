@@ -53,6 +53,7 @@ fn eval_fixtures() {
         fixture_dirs.append(&mut dirs);
     }
     fixture_dirs.sort();
+    let selected_runtimes = selected_fixture_runtimes();
 
     let mut ran_any = false;
     for dir in fixture_dirs {
@@ -69,6 +70,12 @@ fn eval_fixtures() {
         }
 
         let runtime = config.runtime.as_deref().unwrap_or("node");
+        if let Some(selected) = selected_runtimes.as_ref() {
+            if !selected.contains(runtime) {
+                eprintln!("Skipping {fixture_name} (runtime {runtime} filtered out).");
+                continue;
+            }
+        }
         match runtime {
             "node" => ensure_dependencies(&dir),
             "bun" => ensure_dependencies(&dir),
@@ -208,7 +215,16 @@ fn needs_bun(runtime: &str, runner: Option<&str>) -> bool {
 }
 
 fn required_runtimes() -> BTreeSet<String> {
-    std::env::var("BT_EVAL_REQUIRED_RUNTIMES")
+    parse_runtime_list("BT_EVAL_REQUIRED_RUNTIMES")
+}
+
+fn selected_fixture_runtimes() -> Option<BTreeSet<String>> {
+    let selected = parse_runtime_list("BT_EVAL_FIXTURE_RUNTIMES");
+    (!selected.is_empty()).then_some(selected)
+}
+
+fn parse_runtime_list(env_var: &str) -> BTreeSet<String> {
+    std::env::var(env_var)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
