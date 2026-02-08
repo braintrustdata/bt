@@ -76,6 +76,18 @@ type SseWriter = {
   close: () => void;
 };
 
+type EvalFilter = {
+  path: string[];
+  pattern: RegExp;
+};
+
+type RunnerConfig = {
+  jsonl: boolean;
+  list: boolean;
+  terminateOnFailure: boolean;
+  filters: EvalFilter[];
+};
+
 declare global {
   // eslint-disable-next-line no-var
   var _evals: GlobalEvals | undefined;
@@ -103,6 +115,70 @@ function normalizeBraintrustModule(value: unknown): BraintrustModule {
 
 function normalizeFiles(files: string[]): string[] {
   return files.map((file) => path.resolve(process.cwd(), file));
+}
+
+function envFlag(name: string): boolean {
+  const value = process.env[name];
+  if (!value) {
+    return false;
+  }
+  const normalized = value.toLowerCase();
+  return !["0", "false", "no", "off", ""].includes(normalized);
+}
+
+function serializeJSONWithPlainString(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+function parseFilterExpressions(serialized: string | undefined): EvalFilter[] {
+  if (!serialized) {
+    return [];
+  }
+
+  let values: string[] = [];
+  try {
+    const parsed = JSON.parse(serialized);
+    if (
+      Array.isArray(parsed) &&
+      parsed.every((value) => typeof value === "string")
+    ) {
+      values = parsed;
+    } else {
+      throw new Error("BT_EVAL_FILTER must be a JSON array of strings.");
+    }
+  } catch (err) {
+    throw new Error(
+      `Invalid BT_EVAL_FILTER value: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  return values.map((value) => {
+    const equalsIdx = value.indexOf("=");
+    if (equalsIdx === -1) {
+      throw new Error(`Invalid filter expression: ${value}`);
+    }
+    const keyPath = value.slice(0, equalsIdx).trim();
+    const patternSource = value.slice(equalsIdx + 1);
+    if (!keyPath) {
+      throw new Error(`Invalid filter expression: ${value}`);
+    }
+    return {
+      path: keyPath.split("."),
+      pattern: new RegExp(patternSource),
+    };
+  });
+}
+
+function readRunnerConfig(): RunnerConfig {
+  return {
+    jsonl: envFlag("BT_EVAL_JSONL"),
+    list: envFlag("BT_EVAL_LIST"),
+    terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
+    filters: parseFilterExpressions(process.env.BT_EVAL_FILTER),
+  };
 }
 
 function serializeSseEvent(event: { event?: string; data: string }): string {
@@ -351,6 +427,34 @@ function getEvaluators(): EvaluatorEntry[] {
   return Object.values(evals.evaluators) as EvaluatorEntry[];
 }
 
+function evaluateFilter(
+  object: Record<string, unknown>,
+  filter: EvalFilter,
+): boolean {
+  const key = filter.path.reduce<unknown>((acc, part) => {
+    if (!isObject(acc)) {
+      return undefined;
+    }
+    return acc[part];
+  }, object);
+  if (key === undefined) {
+    return false;
+  }
+  return filter.pattern.test(serializeJSONWithPlainString(key));
+}
+
+function filterEvaluators(
+  evaluators: EvaluatorEntry[],
+  filters: EvalFilter[],
+): EvaluatorEntry[] {
+  if (filters.length === 0) {
+    return evaluators;
+  }
+  return evaluators.filter((entry) =>
+    filters.every((filter) => evaluateFilter(entry.evaluator, filter)),
+  );
+}
+
 function extractBtEvalMain(mod: unknown): BtEvalMain | null {
   if (!mod || typeof mod !== "object") {
     return null;
@@ -487,7 +591,7 @@ function mergeProgress(
   };
 }
 
-async function createEvalRunner() {
+async function createEvalRunner(config: RunnerConfig) {
   const braintrust = await loadBraintrust();
   const Eval = braintrust.Eval;
   if (typeof Eval !== "function") {
@@ -550,35 +654,49 @@ async function createEvalRunner() {
     }
     if (sse) {
       sse.send("summary", result.summary);
+    } else if (config.jsonl) {
+      console.log(JSON.stringify(result.summary));
     }
     return result;
   };
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
-    const results = await Promise.all(
-      evaluators.map(async (entry) => {
-        try {
-          const options = entry.reporter
-            ? { reporter: entry.reporter }
-            : undefined;
-          const result = await runEval(
-            entry.evaluator.projectName,
-            entry.evaluator,
-            options,
-          );
-          const failingResults = result.results.filter(
-            (r: { error?: unknown }) => r.error !== undefined,
-          );
-          return failingResults.length === 0;
-        } catch (err) {
-          if (sse) {
-            sse.send("error", serializeError(err));
-          } else {
-            console.error(err);
-          }
+    const runEntry = async (entry: EvaluatorEntry): Promise<boolean> => {
+      try {
+        const options = entry.reporter
+          ? { reporter: entry.reporter }
+          : undefined;
+        const result = await runEval(
+          entry.evaluator.projectName,
+          entry.evaluator,
+          options,
+        );
+        const failingResults = result.results.filter(
+          (r: { error?: unknown }) => r.error !== undefined,
+        );
+        return failingResults.length === 0;
+      } catch (err) {
+        if (sse) {
+          sse.send("error", serializeError(err));
+        } else {
+          console.error(err);
+        }
+        return false;
+      }
+    };
+
+    if (config.terminateOnFailure) {
+      for (const entry of evaluators) {
+        const ok = await runEntry(entry);
+        if (!ok) {
           return false;
         }
-      }),
+      }
+      return true;
+    }
+
+    const results = await Promise.all(
+      evaluators.map((entry) => runEntry(entry)),
     );
     return results.every(Boolean);
   };
@@ -606,6 +724,7 @@ async function createEvalRunner() {
 }
 
 async function main() {
+  const config = readRunnerConfig();
   const files = process.argv.slice(2);
   if (files.length === 0) {
     console.error("No eval files provided.");
@@ -619,7 +738,7 @@ async function main() {
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 
-  const runner = await createEvalRunner();
+  const runner = await createEvalRunner(config);
   if (!runner.noSendLogs && typeof runner.login === "function") {
     try {
       await runner.login({});
@@ -636,7 +755,10 @@ async function main() {
   const context: BtEvalContext = {
     Eval: runner.Eval,
     runEval: runner.runEval,
-    runRegisteredEvals: () => runner.runRegisteredEvals(getEvaluators()),
+    runRegisteredEvals: () =>
+      runner.runRegisteredEvals(
+        filterEvaluators(getEvaluators(), config.filters),
+      ),
     makeEvalOptions: runner.makeEvalOptions,
     sendConsole: (message: string, stream?: "stdout" | "stderr") => {
       sendConsole(runner.sse, message, stream);
@@ -650,6 +772,18 @@ async function main() {
 
   let ok = true;
   try {
+    const discoveredEvaluators = getEvaluators();
+    const filteredEvaluators = filterEvaluators(
+      discoveredEvaluators,
+      config.filters,
+    );
+    if (config.list) {
+      for (const entry of filteredEvaluators) {
+        console.log(entry.evaluator.evalName);
+      }
+      return;
+    }
+
     if (btEvalMains.length > 0) {
       globalThis._lazy_load = false;
       for (const main of btEvalMains) {
@@ -665,12 +799,11 @@ async function main() {
         }
       }
     } else {
-      const evaluators = getEvaluators();
-      if (evaluators.length === 0) {
+      if (discoveredEvaluators.length === 0) {
         console.error("No evaluators found. Did you call Eval() in the file?");
         process.exit(1);
       }
-      ok = await runner.runRegisteredEvals(evaluators);
+      ok = await runner.runRegisteredEvals(filteredEvaluators);
     }
   } finally {
     runner.finish(ok);

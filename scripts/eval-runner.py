@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import fnmatch
+import importlib.util
 import json
 import os
+import re
 import socket
 import sys
 import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
-import importlib.util
-import fnmatch
 from pathlib import PurePosixPath
 
 try:
@@ -20,6 +21,7 @@ try:
         _evals,
         _set_lazy_load,
         run_evaluator,
+        set_thread_pool_max_workers,
     )
     from braintrust.logger import Dataset
     from braintrust.util import eprint
@@ -33,6 +35,21 @@ except Exception as exc:  # pragma: no cover - runtime guard
 
 INCLUDE = ["**/eval_*.py", "**/*.eval.py"]
 EXCLUDE = ["**/site-packages/**", "**/__pycache__/**"]
+
+
+@dataclass(frozen=True)
+class EvalFilter:
+    path: list[str]
+    pattern: re.Pattern[str]
+
+
+@dataclass(frozen=True)
+class RunnerConfig:
+    jsonl: bool
+    list_only: bool
+    terminate_on_failure: bool
+    num_workers: int | None
+    filters: list[EvalFilter]
 
 
 @dataclass
@@ -82,6 +99,78 @@ def env_flag(name: str) -> bool:
     if value is None:
         return False
     return value.lower() not in {"0", "false", "no", "off", ""}
+
+
+def parse_filter_expressions(serialized: str | None) -> list[EvalFilter]:
+    if not serialized:
+        return []
+
+    parsed = json.loads(serialized)
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise ValueError("BT_EVAL_FILTER must be a JSON array of strings")
+
+    filters: list[EvalFilter] = []
+    for expression in parsed:
+        equals_idx = expression.find("=")
+        if equals_idx == -1:
+            raise ValueError(f"Invalid filter expression: {expression}")
+        key_path = expression[:equals_idx].strip()
+        pattern = expression[equals_idx + 1 :]
+        if not key_path:
+            raise ValueError(f"Invalid filter expression: {expression}")
+        filters.append(EvalFilter(path=key_path.split("."), pattern=re.compile(pattern)))
+    return filters
+
+
+def read_runner_config() -> RunnerConfig:
+    num_workers_value = os.getenv("BT_EVAL_NUM_WORKERS")
+    num_workers = int(num_workers_value) if num_workers_value else None
+    return RunnerConfig(
+        jsonl=env_flag("BT_EVAL_JSONL"),
+        list_only=env_flag("BT_EVAL_LIST"),
+        terminate_on_failure=env_flag("BT_EVAL_TERMINATE_ON_FAILURE"),
+        num_workers=num_workers,
+        filters=parse_filter_expressions(os.getenv("BT_EVAL_FILTER")),
+    )
+
+
+def _to_mapping(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _to_mapping(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_mapping(v) for v in value]
+    if hasattr(value, "__dict__"):
+        return {
+            key: _to_mapping(val)
+            for key, val in vars(value).items()
+            if not key.startswith("_")
+        }
+    return value
+
+
+def serialize_json_with_plain_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def evaluate_filter(value: Any, filt: EvalFilter) -> bool:
+    current = _to_mapping(value)
+    for part in filt.path:
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return bool(filt.pattern.search(serialize_json_with_plain_string(current)))
+
+
+def filter_evaluators(evaluators: list[EvaluatorInstance], filters: list[EvalFilter]) -> list[EvaluatorInstance]:
+    if not filters:
+        return evaluators
+    return [
+        evaluator
+        for evaluator in evaluators
+        if all(evaluate_filter(evaluator.evaluator, filt) for filt in filters)
+    ]
 
 
 def snake_to_camel(value: str) -> str:
@@ -276,9 +365,14 @@ async def run_evaluator_task(
         if experiment:
             experiment.flush()
 
-async def run_once(files: list[str], no_send_logs: bool, sse: SseWriter | None) -> bool:
+async def run_once(
+    files: list[str],
+    no_send_logs: bool,
+    sse: SseWriter | None,
+    config: RunnerConfig,
+) -> bool:
     evaluators = load_evaluators(files)
-    if not evaluators:
+    if not evaluators and not config.list_only:
         message = "No evaluators found. Did you call Eval() in the file?"
         if sse:
             sse.send("error", serialize_error(message))
@@ -286,25 +380,25 @@ async def run_once(files: list[str], no_send_logs: bool, sse: SseWriter | None) 
             eprint(message)
         return False
 
+    evaluators = filter_evaluators(evaluators, config.filters)
+    if config.list_only:
+        for evaluator_instance in evaluators:
+            print(evaluator_instance.evaluator.eval_name)
+        return True
+
     supports_progress = run_evaluator_supports_progress()
 
-    tasks = []
-    progress_callbacks = []
+    all_success = True
     for idx, evaluator_instance in enumerate(evaluators):
         progress_cb = create_progress_reporter(sse, evaluator_instance.evaluator.eval_name)
-        progress_callbacks.append(progress_cb)
-        tasks.append(
-            asyncio.create_task(
-                run_evaluator_task(
-                    evaluator_instance.evaluator, idx, no_send_logs, progress_cb, supports_progress
-                )
-            )
-        )
-
-    all_success = True
-    for evaluator_instance, task, progress_cb in zip(evaluators, tasks, progress_callbacks):
         try:
-            result = await task
+            result = await run_evaluator_task(
+                evaluator_instance.evaluator,
+                idx,
+                no_send_logs,
+                progress_cb,
+                supports_progress,
+            )
         except Exception as exc:
             all_success = False
             err = serialize_error(str(exc), traceback.format_exc())
@@ -312,10 +406,14 @@ async def run_once(files: list[str], no_send_logs: bool, sse: SseWriter | None) 
                 sse.send("error", err)
             else:
                 eprint(err.get("message"))
+            if config.terminate_on_failure:
+                break
             continue
 
         if sse:
             sse.send("summary", format_summary(result.summary.as_dict()))
+        elif config.jsonl:
+            print(json.dumps(format_summary(result.summary.as_dict())))
         else:
             print(result.summary)
 
@@ -331,6 +429,8 @@ async def run_once(files: list[str], no_send_logs: bool, sse: SseWriter | None) 
                 sse.send("error", serialize_error(message, stack))
             else:
                 eprint(message)
+            if config.terminate_on_failure:
+                break
 
     return all_success
 
@@ -349,15 +449,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    config = read_runner_config()
     local = args.local or env_flag("BT_EVAL_LOCAL") or env_flag("BT_EVAL_NO_SEND_LOGS")
     files = args.files or ["."]
+    if config.num_workers is not None:
+        set_thread_pool_max_workers(config.num_workers)
 
     if not local:
         login(api_key=args.api_key, org_name=args.org_name, app_url=args.app_url)
 
     sse = create_sse_writer()
     try:
-        success = asyncio.run(run_once(files, local, sse))
+        success = asyncio.run(run_once(files, local, sse, config))
         if sse:
             sse.send("done", {"success": success})
         return 0 if success else 1
