@@ -1,0 +1,8 @@
+{
+  "name": "bt-eval-vite-node",
+  "private": true,
+  "dependencies": {
+    "braintrust": "^2.2.0",
+    "vite-node": "^5.3.0"
+  }
+}

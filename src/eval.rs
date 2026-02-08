@@ -1,10 +1,12 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use crossterm::queue;
 use crossterm::style::{
     Attribute, Color as CtColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -29,10 +31,32 @@ use ratatui::Terminal;
 use crate::args::BaseArgs;
 
 const MAX_NAME_LENGTH: usize = 40;
+const JS_RUNNER_FILE: &str = "eval-runner.ts";
+const PY_RUNNER_FILE: &str = "eval-runner.py";
+const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
+const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-enum EvalLanguage {
+struct SocketCleanupGuard {
+    path: PathBuf,
+}
+
+impl SocketCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for SocketCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
+pub enum EvalLanguage {
+    #[value(alias = "js")]
     JavaScript,
+    #[value(alias = "py")]
     Python,
 }
 
@@ -43,8 +67,18 @@ pub struct EvalArgs {
     pub files: Vec<String>,
 
     /// Eval runner binary (e.g. tsx, bun, ts-node, python). Defaults to tsx for JS files.
-    #[arg(long, short = 'r', env = "BT_EVAL_JS_RUNNER", value_name = "RUNNER")]
+    #[arg(long, short = 'r', env = "BT_EVAL_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,
+
+    /// Force eval language instead of inferring from file extensions.
+    #[arg(
+        long,
+        short = 'l',
+        env = "BT_EVAL_LANGUAGE",
+        value_enum,
+        value_name = "LANGUAGE"
+    )]
+    pub language: Option<EvalLanguage>,
 
     /// Run evals locally (do not send logs to Braintrust).
     #[arg(
@@ -59,6 +93,7 @@ pub struct EvalArgs {
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     run_eval_files(
         &base,
+        args.language,
         args.runner.clone(),
         args.files.clone(),
         args.no_send_logs,
@@ -68,27 +103,27 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
 async fn run_eval_files(
     base: &BaseArgs,
+    language_override: Option<EvalLanguage>,
     runner_override: Option<String>,
     files: Vec<String>,
     no_send_logs: bool,
 ) -> Result<()> {
-    let language = detect_eval_language(&files)?;
-    let js_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("eval-runner.ts");
-    let py_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("eval-runner.py");
+    let language = detect_eval_language(&files, language_override)?;
+    let (js_runner, py_runner) = prepare_eval_runners()?;
 
     let socket_path = build_sse_socket_path()?;
+    let _socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).context("failed to bind SSE unix socket")?;
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let sse_connected = Arc::new(AtomicBool::new(false));
 
     let tx_sse = tx.clone();
+    let sse_connected_for_task = Arc::clone(&sse_connected);
     let sse_task = tokio::spawn(async move {
         match listener.accept().await {
             Ok((stream, _)) => {
+                sse_connected_for_task.store(true, Ordering::Relaxed);
                 if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
                     let _ = tx_sse.send(EvalEvent::Error {
                         message: format!("SSE stream error: {err}"),
@@ -158,7 +193,9 @@ async fn run_eval_files(
                     None => {
                         if status.is_none() {
                             status = Some(child.wait().await.context("eval runner process failed")?);
-                            sse_task.abort();
+                            if !sse_connected.load(Ordering::Relaxed) {
+                                sse_task.abort();
+                            }
                         }
                         break;
                     }
@@ -166,7 +203,9 @@ async fn run_eval_files(
             }
             exit_status = child.wait(), if status.is_none() => {
                 status = Some(exit_status.context("eval runner process failed")?);
-                sse_task.abort();
+                if !sse_connected.load(Ordering::Relaxed) {
+                    sse_task.abort();
+                }
             }
         }
 
@@ -184,7 +223,6 @@ async fn run_eval_files(
             anyhow::bail!("eval runner exited with status {status}");
         }
     }
-    let _ = std::fs::remove_file(&socket_path);
 
     Ok(())
 }
@@ -203,7 +241,14 @@ fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
     envs
 }
 
-fn detect_eval_language(files: &[String]) -> Result<EvalLanguage> {
+fn detect_eval_language(
+    files: &[String],
+    language_override: Option<EvalLanguage>,
+) -> Result<EvalLanguage> {
+    if let Some(language) = language_override {
+        return Ok(language);
+    }
+
     let mut detected: Option<EvalLanguage> = None;
     for file in files {
         let ext = PathBuf::from(file)
@@ -239,16 +284,12 @@ fn build_js_command(
     runner: &PathBuf,
     files: &[String],
 ) -> Command {
-    let runner_override = runner_override
-        .or_else(|| std::env::var("BT_EVAL_JS_RUNNER").ok())
-        .or_else(|| std::env::var("BT_EVAL_TSX").ok());
-
     let command = if let Some(explicit) = runner_override.as_deref() {
         let mut command = Command::new(explicit);
         command.arg(runner).args(files);
         command
-    } else if let Some(tsx_path) = find_tsx_binary() {
-        let mut command = Command::new(tsx_path);
+    } else if let Some(auto_runner) = find_js_runner_binary(files) {
+        let mut command = Command::new(auto_runner);
         command.arg(runner).args(files);
         command
     } else {
@@ -286,34 +327,73 @@ fn build_python_command(
     Ok(command)
 }
 
-fn find_tsx_binary() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BT_EVAL_TSX") {
-        let candidate = PathBuf::from(path);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
+fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
+    // Prefer local project bins first, then PATH. `tsx` remains the preferred
+    // default, with other common TS runners as fallback.
+    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm"];
 
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("tsx");
-            if candidate.is_file() {
-                return Some(candidate);
+    let mut search_roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        search_roots.push(cwd.clone());
+        for file in files {
+            let path = PathBuf::from(file);
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            if let Some(parent) = absolute.parent() {
+                search_roots.push(parent.to_path_buf());
             }
         }
     }
 
-    None
+    for candidate in RUNNER_CANDIDATES {
+        for root in &search_roots {
+            if let Some(path) = find_node_module_bin(candidate, root) {
+                return Some(path);
+            }
+        }
+    }
+
+    find_binary_in_path(RUNNER_CANDIDATES)
 }
 
 fn find_python_binary() -> Option<PathBuf> {
-    let candidates = ["python3", "python"];
+    find_binary_in_path(&["python3", "python"])
+}
+
+fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        let base = dir.join("node_modules").join(".bin").join(binary);
+        if base.is_file() {
+            return Some(base);
+        }
+        if cfg!(windows) {
+            let cmd = base.with_extension("cmd");
+            if cmd.is_file() {
+                return Some(cmd);
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         for candidate in candidates {
             let path = dir.join(candidate);
             if path.is_file() {
                 return Some(path);
+            }
+            if cfg!(windows) {
+                let cmd = path.with_extension("cmd");
+                if cmd.is_file() {
+                    return Some(cmd);
+                }
             }
         }
     }
@@ -327,6 +407,44 @@ fn build_sse_socket_path() -> Result<PathBuf> {
         .context("failed to read system time")?
         .as_millis();
     Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}.sock")))
+}
+
+fn eval_runner_cache_dir() -> PathBuf {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+
+    root.join("bt")
+        .join("eval-runners")
+        .join(env!("CARGO_PKG_VERSION"))
+}
+
+fn prepare_eval_runners() -> Result<(PathBuf, PathBuf)> {
+    prepare_eval_runners_in_dir(&eval_runner_cache_dir())
+}
+
+fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+
+    let js_runner = materialize_runner_script(cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
+    let py_runner = materialize_runner_script(cache_dir, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
+    Ok((js_runner, py_runner))
+}
+
+fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
+    let path = cache_dir.join(file_name);
+    let current = std::fs::read_to_string(&path).ok();
+    if current.as_deref() != Some(source) {
+        std::fs::write(&path, source)
+            .with_context(|| format!("failed to write eval runner script {}", path.display()))?;
+    }
+    Ok(path)
 }
 
 #[derive(Debug)]
@@ -627,11 +745,12 @@ impl EvalUi {
 
 fn fit_name_to_spaces(name: &str, length: usize) -> String {
     let mut padded = name.to_string();
-    if padded.len() < length {
-        padded.push_str(&" ".repeat(length - padded.len()));
+    let char_count = padded.chars().count();
+    if char_count < length {
+        padded.push_str(&" ".repeat(length - char_count));
         return padded;
     }
-    if padded.len() <= length {
+    if char_count <= length {
         return padded;
     }
     if length <= 3 {
@@ -900,7 +1019,9 @@ fn box_with_title(title: &str, content: &str) -> String {
     let mut boxed = vec![top];
     for line in lines {
         let line_width = visible_width(line);
-        let right_padding = inner_width - line_width - padding;
+        // Defensive: if width accounting ever drifts (e.g. escape-sequence parsing),
+        // avoid underflow and render without extra trailing padding.
+        let right_padding = inner_width.saturating_sub(line_width + padding);
         let mut row = String::from("│");
         row.push_str(&" ".repeat(padding));
         row.push_str(line);
@@ -1013,14 +1134,81 @@ fn convert_color(color: Color) -> CtColor {
         Color::Cyan => CtColor::Cyan,
         Color::Gray => CtColor::Grey,
         Color::DarkGray => CtColor::DarkGrey,
-        Color::LightRed => CtColor::DarkRed,
-        Color::LightGreen => CtColor::DarkGreen,
-        Color::LightYellow => CtColor::DarkYellow,
-        Color::LightBlue => CtColor::DarkBlue,
-        Color::LightMagenta => CtColor::DarkMagenta,
-        Color::LightCyan => CtColor::DarkCyan,
+        Color::LightRed => CtColor::Red,
+        Color::LightGreen => CtColor::Green,
+        Color::LightYellow => CtColor::Yellow,
+        Color::LightBlue => CtColor::Blue,
+        Color::LightMagenta => CtColor::Magenta,
+        Color::LightCyan => CtColor::Cyan,
         Color::White => CtColor::White,
         Color::Indexed(value) => CtColor::AnsiValue(value),
         Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bt-eval-tests-{label}-{}-{now}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn materialize_runner_script_writes_file() {
+        let dir = unique_test_dir("write");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+
+        let path = materialize_runner_script(&dir, "runner.ts", "console.log('ok');")
+            .expect("runner script should be materialized");
+        let contents = std::fs::read_to_string(path).expect("runner script should be readable");
+        assert_eq!(contents, "console.log('ok');");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_runner_script_overwrites_stale_content() {
+        let dir = unique_test_dir("overwrite");
+        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        let path = dir.join("runner.py");
+        std::fs::write(&path, "stale").expect("stale file should be written");
+
+        materialize_runner_script(&dir, "runner.py", "fresh")
+            .expect("runner script should be updated");
+        let contents = std::fs::read_to_string(path).expect("runner script should be readable");
+        assert_eq!(contents, "fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_eval_runners_writes_embedded_scripts() {
+        let dir = unique_test_dir("embedded");
+        let (js_runner, py_runner) =
+            prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
+
+        let js = std::fs::read_to_string(js_runner).expect("js runner should be readable");
+        let py = std::fs::read_to_string(py_runner).expect("python runner should be readable");
+        assert_eq!(js, JS_RUNNER_SOURCE);
+        assert_eq!(py, PY_RUNNER_SOURCE);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn box_with_title_handles_ansi_content_without_panicking() {
+        let content = "plain line\n\x1b[38;5;196mred text\x1b[0m";
+        let boxed = box_with_title("Summary", content);
+        assert!(boxed.contains("Summary"));
+        assert!(boxed.contains("plain line"));
+        assert!(boxed.contains("red text"));
     }
 }
