@@ -413,23 +413,17 @@ async def run_once(
 
     supports_progress = run_evaluator_supports_progress()
 
-    all_success = True
-    for idx, evaluator_instance in enumerate(evaluators):
+    async def run_single_evaluator(
+        idx: int, evaluator_instance: EvaluatorInstance
+    ) -> tuple[EvaluatorInstance, Any | None, Any | None, dict[str, Any] | None]:
         try:
             resolved_reporter = resolve_reporter(
                 getattr(evaluator_instance, "reporter", None),
                 reporters,
             )
         except Exception as exc:
-            all_success = False
             err = serialize_error(str(exc), traceback.format_exc())
-            if sse:
-                sse.send("error", err)
-            else:
-                eprint(err.get("message"))
-            if config.terminate_on_failure:
-                break
-            continue
+            return evaluator_instance, None, None, err
 
         progress_cb = create_progress_reporter(sse, evaluator_instance.evaluator.eval_name)
         try:
@@ -441,14 +435,33 @@ async def run_once(
                 supports_progress,
             )
         except Exception as exc:
-            all_success = False
             err = serialize_error(str(exc), traceback.format_exc())
+            return evaluator_instance, resolved_reporter, None, err
+
+        return evaluator_instance, resolved_reporter, result, None
+
+    execution_results: list[tuple[EvaluatorInstance, Any | None, Any | None, dict[str, Any] | None]] = []
+    if config.terminate_on_failure:
+        for idx, evaluator_instance in enumerate(evaluators):
+            run_result = await run_single_evaluator(idx, evaluator_instance)
+            execution_results.append(run_result)
+            if run_result[3] is not None:
+                break
+    else:
+        tasks = [
+            asyncio.create_task(run_single_evaluator(idx, evaluator_instance))
+            for idx, evaluator_instance in enumerate(evaluators)
+        ]
+        execution_results = list(await asyncio.gather(*tasks))
+
+    all_success = True
+    for evaluator_instance, resolved_reporter, result, err in execution_results:
+        if err is not None:
+            all_success = False
             if sse:
                 sse.send("error", err)
             else:
                 eprint(err.get("message"))
-            if config.terminate_on_failure:
-                break
             continue
 
         if sse:
