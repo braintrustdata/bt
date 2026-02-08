@@ -38,6 +38,10 @@ struct EvalRunOutput {
     status: ExitStatus,
     dependencies: Vec<PathBuf>,
 }
+const JS_RUNNER_FILE: &str = "eval-runner.ts";
+const PY_RUNNER_FILE: &str = "eval-runner.py";
+const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
+const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 
 struct SocketCleanupGuard {
     path: PathBuf,
@@ -190,12 +194,7 @@ async fn run_eval_files_once(
     no_send_logs: bool,
 ) -> Result<EvalRunOutput> {
     let language = detect_eval_language(&files, language_override)?;
-    let js_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("eval-runner.ts");
-    let py_runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("eval-runner.py");
+    let (js_runner, py_runner) = prepare_eval_runners()?;
 
     let socket_path = build_sse_socket_path()?;
     let _socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
@@ -228,7 +227,7 @@ async fn run_eval_files_once(
 
     let mut cmd = match language {
         EvalLanguage::Python => build_python_command(runner_override, &py_runner, &files)?,
-        EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files),
+        EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
     cmd.envs(build_env(base));
@@ -589,21 +588,23 @@ fn build_js_command(
     runner_override: Option<String>,
     runner: &PathBuf,
     files: &[String],
-) -> Command {
+) -> Result<Command> {
     let command = if let Some(explicit) = runner_override.as_deref() {
         if is_deno_runner(explicit) {
             build_deno_js_command(explicit, runner, files)
         } else {
+            let runner_script = select_js_runner_entrypoint(runner, Path::new(explicit))?;
             let mut command = Command::new(explicit);
-            command.arg(runner).args(files);
+            command.arg(runner_script).args(files);
             command
         }
     } else if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
             build_deno_js_command(auto_runner.as_os_str(), runner, files)
         } else {
+            let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
             let mut command = Command::new(auto_runner);
-            command.arg(runner).args(files);
+            command.arg(runner_script).args(files);
             command
         }
     } else {
@@ -612,7 +613,7 @@ fn build_js_command(
         command
     };
 
-    command
+    Ok(command)
 }
 
 fn build_deno_js_command(
@@ -704,6 +705,38 @@ fn is_deno_runner_path(runner: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
+    if is_ts_node_runner(runner_command) {
+        return prepare_js_runner_in_cwd();
+    }
+    Ok(default_runner.to_path_buf())
+}
+
+fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    let cache_dir = cwd
+        .join(".bt")
+        .join("eval-runners")
+        .join(env!("CARGO_PKG_VERSION"));
+    std::fs::create_dir_all(&cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+}
+
+fn is_ts_node_runner(runner_command: &Path) -> bool {
+    let file_name = match runner_command.file_name().and_then(|name| name.to_str()) {
+        Some(name) => name.to_ascii_lowercase(),
+        None => return false,
+    };
+
+    let normalized = file_name.strip_suffix(".cmd").unwrap_or(&file_name);
+    normalized == "ts-node" || normalized == "ts-node-esm"
+}
+
 fn find_python_binary() -> Option<PathBuf> {
     find_binary_in_path(&["python3", "python"])
 }
@@ -752,6 +785,44 @@ fn build_sse_socket_path() -> Result<PathBuf> {
         .context("failed to read system time")?
         .as_millis();
     Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}.sock")))
+}
+
+fn eval_runner_cache_dir() -> PathBuf {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+
+    root.join("bt")
+        .join("eval-runners")
+        .join(env!("CARGO_PKG_VERSION"))
+}
+
+fn prepare_eval_runners() -> Result<(PathBuf, PathBuf)> {
+    prepare_eval_runners_in_dir(&eval_runner_cache_dir())
+}
+
+fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+
+    let js_runner = materialize_runner_script(cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
+    let py_runner = materialize_runner_script(cache_dir, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
+    Ok((js_runner, py_runner))
+}
+
+fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
+    let path = cache_dir.join(file_name);
+    let current = std::fs::read_to_string(&path).ok();
+    if current.as_deref() != Some(source) {
+        std::fs::write(&path, source)
+            .with_context(|| format!("failed to write eval runner script {}", path.display()))?;
+    }
+    Ok(path)
 }
 
 #[derive(Debug)]
@@ -1471,10 +1542,7 @@ fn convert_color(color: Color) -> CtColor {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        box_with_title, collect_js_static_dependencies, detect_watch_changes, merge_watch_paths,
-        snapshot_watch_state,
-    };
+    use super::*;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1490,6 +1558,46 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn materialize_runner_script_writes_file() {
+        let dir = make_temp_dir("write");
+
+        let path = materialize_runner_script(&dir, "runner.ts", "console.log('ok');")
+            .expect("runner script should be materialized");
+        let contents = fs::read_to_string(path).expect("runner script should be readable");
+        assert_eq!(contents, "console.log('ok');");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_runner_script_overwrites_stale_content() {
+        let dir = make_temp_dir("overwrite");
+        let path = dir.join("runner.py");
+        fs::write(&path, "stale").expect("stale file should be written");
+
+        materialize_runner_script(&dir, "runner.py", "fresh")
+            .expect("runner script should be updated");
+        let contents = fs::read_to_string(path).expect("runner script should be readable");
+        assert_eq!(contents, "fresh");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_eval_runners_writes_embedded_scripts() {
+        let dir = make_temp_dir("embedded");
+        let (js_runner, py_runner) =
+            prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
+
+        let js = fs::read_to_string(js_runner).expect("js runner should be readable");
+        let py = fs::read_to_string(py_runner).expect("python runner should be readable");
+        assert_eq!(js, JS_RUNNER_SOURCE);
+        assert_eq!(py, PY_RUNNER_SOURCE);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

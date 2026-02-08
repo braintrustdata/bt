@@ -5,19 +5,19 @@ on:
   push:
 
 jobs:
-  eval-tests:
-    name: eval-tests (node ${{ matrix.node-version }}, py ${{ matrix.python-version }})
+  eval-tests-node:
+    name: eval-tests-node (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         node-version: ["20", "22"]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
     permissions:
       contents: read
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
-      BT_EVAL_REQUIRED_RUNTIMES: node,bun,python,deno
+      BT_EVAL_REQUIRED_RUNTIMES: node,bun,deno
+      BT_EVAL_FIXTURE_RUNTIMES: node,bun,deno
     steps:
       - uses: actions/checkout@v4
       - name: Configure git auth for private dependencies
@@ -35,16 +35,45 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - uses: astral-sh/setup-uv@v5
       - name: Enable pnpm
         run: |
           corepack enable
           corepack prepare pnpm@10.28.2 --activate
+      - name: Run eval fixtures
+        run: cargo test --test eval_fixtures
+
+  eval-tests-python:
+    name: eval-tests-python (py ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+      BT_EVAL_REQUIRED_RUNTIMES: python
+      BT_EVAL_FIXTURE_RUNTIMES: python
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git auth for private dependencies
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v5
       - name: Run eval fixtures
         run: cargo test --test eval_fixtures

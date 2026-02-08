@@ -65,6 +65,7 @@ fn eval_fixtures() {
         fixture_dirs.append(&mut dirs);
     }
     fixture_dirs.sort();
+    let selected_runtimes = selected_fixture_runtimes();
 
     let mut ran_any = false;
     for dir in fixture_dirs {
@@ -81,6 +82,12 @@ fn eval_fixtures() {
         }
 
         let runtime = config.runtime.as_deref().unwrap_or("node");
+        if let Some(selected) = selected_runtimes.as_ref() {
+            if !selected.contains(runtime) {
+                eprintln!("Skipping {fixture_name} (runtime {runtime} filtered out).");
+                continue;
+            }
+        }
         match runtime {
             "node" => ensure_dependencies(&dir),
             "bun" => ensure_dependencies(&dir),
@@ -158,12 +165,16 @@ fn eval_fixtures() {
             }
 
             let expect_success = config.expect_success.unwrap_or(true);
-            let status = cmd.status().expect("run bt eval");
-            assert!(
-                status.success() == expect_success,
-                "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})",
-                runner.as_deref().unwrap_or("default")
-            );
+            let output = cmd.output().expect("run bt eval");
+            let status = output.status;
+            if status.success() != expect_success {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                panic!(
+                    "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    runner.as_deref().unwrap_or("default")
+                );
+            }
             ran_variant = true;
         }
 
@@ -496,7 +507,16 @@ fn needs_deno(runtime: &str, runner: Option<&str>) -> bool {
 }
 
 fn required_runtimes() -> BTreeSet<String> {
-    std::env::var("BT_EVAL_REQUIRED_RUNTIMES")
+    parse_runtime_list("BT_EVAL_REQUIRED_RUNTIMES")
+}
+
+fn selected_fixture_runtimes() -> Option<BTreeSet<String>> {
+    let selected = parse_runtime_list("BT_EVAL_FIXTURE_RUNTIMES");
+    (!selected.is_empty()).then_some(selected)
+}
+
+fn parse_runtime_list(env_var: &str) -> BTreeSet<String> {
+    std::env::var(env_var)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
