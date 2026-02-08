@@ -105,7 +105,7 @@ function normalizeFiles(files: string[]): string[] {
 }
 
 const runtimeRequire = createRequire(
-  path.join(process.cwd(), "__bt-eval-runner__.cjs"),
+  process.argv[1] ?? path.join(process.cwd(), "package.json"),
 );
 const fsMutable = runtimeRequire("node:fs") as typeof import("node:fs");
 const moduleMutable = (() => {
