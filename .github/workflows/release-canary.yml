@@ -348,7 +348,8 @@ jobs:
       - name: Upsert PR install comment
         shell: bash
         run: |
-          pr_number="$(gh api "repos/${REPO}/pulls" -f state=open -f head="${OWNER}:${BRANCH_NAME}" --jq '.[0].number // empty')"
+          encoded_head="$(printf '%s' "${OWNER}:${BRANCH_NAME}" | jq -sRr @uri)"
+          pr_number="$(gh api --method GET "repos/${REPO}/pulls?state=open&head=${encoded_head}" --jq '.[0].number // empty')"
           if [ -z "$pr_number" ]; then
             echo "No open PR found for ${OWNER}:${BRANCH_NAME}; skipping PR install comment."
             exit 0
@@ -367,7 +368,7 @@ jobs:
           payload_file="$RUNNER_TEMP/pr-comment-payload.json"
           jq -n --arg body "$(cat "$body_file")" '{body:$body}' > "$payload_file"
 
-          comment_id="$(gh api "repos/${REPO}/issues/${pr_number}/comments" --paginate --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1)"
+          comment_id="$(gh api --method GET "repos/${REPO}/issues/${pr_number}/comments" --paginate --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n1)"
           if [ -n "$comment_id" ]; then
             gh api --method PATCH "repos/${REPO}/issues/comments/${comment_id}" --input "$payload_file" >/dev/null
             echo "Updated PR #${pr_number} install comment (${comment_id})."
