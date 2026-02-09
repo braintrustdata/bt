@@ -16,8 +16,8 @@ jobs:
       contents: read
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
-      BT_EVAL_REQUIRED_RUNTIMES: node,bun
-      BT_EVAL_FIXTURE_RUNTIMES: node,bun
+      BT_EVAL_REQUIRED_RUNTIMES: node,bun,deno
+      BT_EVAL_FIXTURE_RUNTIMES: node,bun,deno
     steps:
       - uses: actions/checkout@v4
       - name: Configure git auth for private dependencies
@@ -35,6 +35,9 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - uses: oven-sh/setup-bun@v2
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - name: Enable pnpm
         run: |
           corepack enable

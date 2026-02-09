@@ -35,6 +35,14 @@ except Exception as exc:  # pragma: no cover - runtime guard
 
 INCLUDE = ["**/eval_*.py", "**/*.eval.py"]
 EXCLUDE = ["**/site-packages/**", "**/__pycache__/**"]
+WATCHABLE_PYTHON_EXTENSIONS = {".py"}
+WATCH_EXCLUDE_SEGMENTS = (
+    "/site-packages/",
+    "/dist-packages/",
+    "/__pycache__/",
+    "/.venv/",
+    "/venv/",
+)
 
 
 @dataclass(frozen=True)
@@ -242,6 +250,41 @@ def collect_files(input_path: str) -> list[str]:
                     matches.append(fname)
         return matches
     return [input_path]
+
+
+def is_watchable_dependency(path_input: str, cwd: str) -> bool:
+    path = os.path.abspath(path_input)
+    normalized = path.replace("\\", "/")
+    if not os.path.isfile(path):
+        return False
+    if os.path.splitext(path)[1].lower() not in WATCHABLE_PYTHON_EXTENSIONS:
+        return False
+    if any(segment in normalized for segment in WATCH_EXCLUDE_SEGMENTS):
+        return False
+
+    try:
+        common = os.path.commonpath([path, cwd])
+    except ValueError:
+        return False
+    return common == cwd
+
+
+def collect_dependency_files(cwd: str, input_files: list[str]) -> list[str]:
+    dependencies: set[str] = set()
+    for module in list(sys.modules.values()):
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            continue
+        candidate = module_file[:-1] if module_file.endswith(".pyc") else module_file
+        if is_watchable_dependency(candidate, cwd):
+            dependencies.add(os.path.abspath(candidate))
+
+    for file_path in input_files:
+        path = os.path.abspath(file_path)
+        if is_watchable_dependency(path, cwd):
+            dependencies.add(path)
+
+    return sorted(dependencies)
 
 
 def resolve_module_info(in_file: str) -> tuple[str, list[str]]:
@@ -516,9 +559,11 @@ def main(argv: list[str] | None = None) -> int:
         login(api_key=args.api_key, org_name=args.org_name, app_url=args.app_url)
 
     sse = create_sse_writer()
+    cwd = os.path.abspath(os.getcwd())
     try:
         success = asyncio.run(run_once(files, local, sse, config))
         if sse:
+            sse.send("dependencies", {"files": collect_dependency_files(cwd, files)})
             sse.send("done", {"success": success})
         return 0 if success else 1
     finally:

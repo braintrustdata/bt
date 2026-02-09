@@ -1,0 +1,8 @@
+{
+  "name": "bt-eval-deno",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "braintrust": "^2.2.0"
+  }
+}
