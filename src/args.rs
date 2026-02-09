@@ -7,6 +7,10 @@ pub struct BaseArgs {
     #[arg(short = 'j', long)]
     pub json: bool,
 
+    // Override active org
+    #[arg(short = 'o', long, env = "BRAINTRUST_DEFAULT_ORG")]
+    pub org: Option<String>,
+
     /// Override active project
     #[arg(short = 'p', long, env = "BRAINTRUST_DEFAULT_PROJECT")]
     pub project: Option<String>,
