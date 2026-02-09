@@ -13,6 +13,10 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
     pub profile: Option<String>,
 
+    // Override active org
+    #[arg(short = 'o', long, env = "BRAINTRUST_DEFAULT_ORG")]
+    pub org: Option<String>,
+
     /// Override active project
     #[arg(short = 'p', long, env = "BRAINTRUST_DEFAULT_PROJECT", global = true)]
     pub project: Option<String>,

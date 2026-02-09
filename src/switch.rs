@@ -124,7 +124,7 @@ async fn select_org_interactive(_http: &Client, _ctx: &LoginContext) -> Result<S
 async fn org_exists(_http: &Client, _ctx: &LoginContext, _name: &str) -> Result<bool> {
     // TODO: Replace with actual API call to check org exists
     // For now, check against placeholder list
-    let orgs = vec!["acme-corp", "dev-team", "personal"];
+    let orgs = ["acme-corp", "dev-team", "personal"];
     Ok(orgs.contains(&_name))
 }
 
@@ -187,7 +187,7 @@ async fn select_project_interactive(
 fn print_switch_exports(org: &str, project: &str) {
     print_command_status(
         CommandStatus::Success,
-        &format!("Switched to {}/{}", org, project),
+        &format!("Switched to {org}/{project}"),
     );
 }
 

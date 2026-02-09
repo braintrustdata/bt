@@ -33,6 +33,7 @@ comfy-table = "7.2.2"
 base64 = "0.22"
 oauth2 = { version = "4.4", default-features = false, features = ["reqwest", "rustls-tls"] }
 getrandom = "0.3"
+dirs = "5"
 
 [profile.dist]
 inherits = "release"
