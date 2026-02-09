@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
@@ -31,6 +32,12 @@ use ratatui::Terminal;
 use crate::args::BaseArgs;
 
 const MAX_NAME_LENGTH: usize = 40;
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+struct EvalRunOutput {
+    status: ExitStatus,
+    dependencies: Vec<PathBuf>,
+}
 const JS_RUNNER_FILE: &str = "eval-runner.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
@@ -66,7 +73,7 @@ pub struct EvalArgs {
     #[arg(required = true, value_name = "FILE")]
     pub files: Vec<String>,
 
-    /// Eval runner binary (e.g. tsx, bun, ts-node, python). Defaults to tsx for JS files.
+    /// Eval runner binary (e.g. tsx, bun, ts-node, deno, python). Defaults to tsx for JS files.
     #[arg(long, short = 'r', env = "BT_EVAL_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,
 
@@ -88,26 +95,104 @@ pub struct EvalArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub no_send_logs: bool,
+
+    /// Re-run evals when input files change.
+    #[arg(long, short = 'w')]
+    pub watch: bool,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
-    run_eval_files(
-        &base,
-        args.language,
-        args.runner.clone(),
-        args.files.clone(),
-        args.no_send_logs,
-    )
-    .await
+    if args.watch {
+        run_eval_files_watch(
+            &base,
+            args.language,
+            args.runner.clone(),
+            args.files.clone(),
+            args.no_send_logs,
+        )
+        .await
+    } else {
+        let output = run_eval_files_once(
+            &base,
+            args.language,
+            args.runner.clone(),
+            args.files.clone(),
+            args.no_send_logs,
+        )
+        .await?;
+        if !output.status.success() {
+            anyhow::bail!("eval runner exited with status {}", output.status);
+        }
+        Ok(())
+    }
 }
 
-async fn run_eval_files(
+async fn run_eval_files_watch(
     base: &BaseArgs,
     language_override: Option<EvalLanguage>,
     runner_override: Option<String>,
     files: Vec<String>,
     no_send_logs: bool,
 ) -> Result<()> {
+    let input_watch_paths = resolve_watch_paths(&files)?;
+    let mut active_watch_paths = input_watch_paths.clone();
+    let mut watch_state = snapshot_watch_state(&active_watch_paths)?;
+
+    eprintln!(
+        "Watch mode enabled for {} path(s). Press Ctrl-C to stop.",
+        active_watch_paths.len()
+    );
+
+    loop {
+        match run_eval_files_once(
+            base,
+            language_override,
+            runner_override.clone(),
+            files.clone(),
+            no_send_logs,
+        )
+        .await
+        {
+            Ok(output) => {
+                let merged_paths = merge_watch_paths(&input_watch_paths, &output.dependencies);
+                update_watch_targets(&mut active_watch_paths, &mut watch_state, merged_paths)?;
+                if output.status.success() {
+                    eprintln!(
+                        "Eval run completed. Watching {} path(s). Waiting for changes...",
+                        active_watch_paths.len()
+                    );
+                } else {
+                    eprintln!(
+                        "Eval run failed: eval runner exited with status {}",
+                        output.status
+                    );
+                    eprintln!(
+                        "Watching {} path(s). Waiting for changes...",
+                        active_watch_paths.len()
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("Eval run failed: {err:#}");
+                eprintln!("Waiting for changes...");
+            }
+        }
+
+        let changed = wait_for_watch_changes(&active_watch_paths, &mut watch_state).await?;
+        eprintln!(
+            "Detected changes in {}. Re-running evals.\n",
+            format_watch_paths(&changed)
+        );
+    }
+}
+
+async fn run_eval_files_once(
+    base: &BaseArgs,
+    language_override: Option<EvalLanguage>,
+    runner_override: Option<String>,
+    files: Vec<String>,
+    no_send_logs: bool,
+) -> Result<EvalRunOutput> {
     let language = detect_eval_language(&files, language_override)?;
     let show_js_runner_hint_on_failure =
         language == EvalLanguage::JavaScript && runner_override.is_none();
@@ -184,6 +269,7 @@ async fn run_eval_files(
 
     let mut ui = EvalUi::new();
     let mut status = None;
+    let mut dependency_files: Vec<String> = Vec::new();
 
     drop(tx);
 
@@ -191,6 +277,9 @@ async fn run_eval_files(
         tokio::select! {
             event = rx.recv() => {
                 match event {
+                    Some(EvalEvent::Dependencies { files }) => {
+                        dependency_files.extend(files);
+                    }
                     Some(event) => ui.handle(event),
                     None => {
                         if status.is_none() {
@@ -220,18 +309,234 @@ async fn run_eval_files(
 
     ui.finish();
 
-    if let Some(status) = status {
-        if !status.success() {
-            if show_js_runner_hint_on_failure {
-                anyhow::bail!(
-                    "eval runner exited with status {status}\nHint: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
-                );
+    let status = status.context("eval runner process exited without a status")?;
+    if !status.success() && show_js_runner_hint_on_failure {
+        eprintln!(
+            "Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
+        );
+    }
+    let mut dependencies = normalize_watch_paths(dependency_files.into_iter().map(PathBuf::from))?;
+    if language == EvalLanguage::JavaScript {
+        let static_dependencies = collect_js_static_dependencies(&files)?;
+        dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+    }
+
+    Ok(EvalRunOutput {
+        status,
+        dependencies,
+    })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct WatchEntry {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+type WatchState = HashMap<PathBuf, Option<WatchEntry>>;
+
+fn resolve_watch_paths(files: &[String]) -> Result<Vec<PathBuf>> {
+    normalize_watch_paths(files.iter().map(PathBuf::from))
+}
+
+fn normalize_watch_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Vec<PathBuf>> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let mut deduped = BTreeSet::new();
+
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        deduped.insert(absolute);
+    }
+
+    Ok(deduped.into_iter().collect())
+}
+
+fn merge_watch_paths(inputs: &[PathBuf], dependencies: &[PathBuf]) -> Vec<PathBuf> {
+    let mut deduped = BTreeSet::new();
+    deduped.extend(inputs.iter().cloned());
+    deduped.extend(dependencies.iter().cloned());
+    deduped.into_iter().collect()
+}
+
+fn collect_js_static_dependencies(files: &[String]) -> Result<Vec<PathBuf>> {
+    let roots = resolve_watch_paths(files)?;
+    let mut queue: VecDeque<PathBuf> = roots.into_iter().collect();
+    let mut visited = BTreeSet::new();
+    let mut discovered = BTreeSet::new();
+
+    while let Some(file) = queue.pop_front() {
+        if !visited.insert(file.clone()) {
+            continue;
+        }
+        discovered.insert(file.clone());
+
+        let content = match std::fs::read_to_string(&file) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", file.display()));
             }
-            anyhow::bail!("eval runner exited with status {status}");
+        };
+
+        for specifier in extract_js_local_specifiers(&content) {
+            if let Some(resolved) = resolve_js_local_specifier(&file, &specifier) {
+                if !visited.contains(&resolved) {
+                    queue.push_back(resolved.clone());
+                }
+                discovered.insert(resolved);
+            }
         }
     }
 
+    Ok(discovered.into_iter().collect())
+}
+
+fn extract_js_local_specifiers(content: &str) -> Vec<String> {
+    const PATTERNS: &[(&str, char)] = &[
+        ("from \"", '"'),
+        ("from '", '\''),
+        ("import(\"", '"'),
+        ("import('", '\''),
+        ("require(\"", '"'),
+        ("require('", '\''),
+    ];
+
+    let mut specifiers = Vec::new();
+    for (prefix, quote) in PATTERNS {
+        let mut offset = 0usize;
+        while let Some(start) = content[offset..].find(prefix) {
+            let specifier_start = offset + start + prefix.len();
+            if let Some(end_rel) = content[specifier_start..].find(*quote) {
+                let specifier = &content[specifier_start..specifier_start + end_rel];
+                if specifier.starts_with("./")
+                    || specifier.starts_with("../")
+                    || specifier.starts_with("/")
+                    || specifier.starts_with("file://")
+                {
+                    specifiers.push(specifier.to_string());
+                }
+                offset = specifier_start + end_rel + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    specifiers
+}
+
+fn resolve_js_local_specifier(base_file: &Path, specifier: &str) -> Option<PathBuf> {
+    let base_dir = base_file.parent()?;
+    let candidate = if specifier.starts_with("file://") {
+        PathBuf::from(specifier.trim_start_matches("file://"))
+    } else if specifier.starts_with('/') {
+        PathBuf::from(specifier)
+    } else {
+        base_dir.join(specifier)
+    };
+
+    let mut candidates = vec![candidate.clone()];
+    if candidate.extension().is_none() {
+        for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "json"] {
+            candidates.push(candidate.with_extension(ext));
+        }
+        for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "json"] {
+            candidates.push(candidate.join(format!("index.{ext}")));
+        }
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn read_watch_entry(path: &Path) -> Result<Option<WatchEntry>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(WatchEntry {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read metadata for {}", path.display()))
+        }
+    }
+}
+
+fn snapshot_watch_state(paths: &[PathBuf]) -> Result<WatchState> {
+    let mut state = HashMap::with_capacity(paths.len());
+    for path in paths {
+        state.insert(path.clone(), read_watch_entry(path)?);
+    }
+    Ok(state)
+}
+
+fn update_watch_targets(
+    active_paths: &mut Vec<PathBuf>,
+    state: &mut WatchState,
+    next_paths: Vec<PathBuf>,
+) -> Result<()> {
+    let next_set: BTreeSet<PathBuf> = next_paths.into_iter().collect();
+    let current_set: BTreeSet<PathBuf> = active_paths.iter().cloned().collect();
+    if next_set == current_set {
+        return Ok(());
+    }
+
+    state.retain(|path, _| next_set.contains(path));
+    for path in &next_set {
+        if !state.contains_key(path) {
+            state.insert(path.clone(), read_watch_entry(path)?);
+        }
+    }
+
+    *active_paths = next_set.into_iter().collect();
     Ok(())
+}
+
+fn detect_watch_changes(paths: &[PathBuf], state: &mut WatchState) -> Result<Vec<PathBuf>> {
+    let mut changed = Vec::new();
+
+    for path in paths {
+        let current = read_watch_entry(path)?;
+        let previous = state.get(path).cloned().unwrap_or(None);
+        if current != previous {
+            changed.push(path.clone());
+            state.insert(path.clone(), current);
+        }
+    }
+
+    Ok(changed)
+}
+
+async fn wait_for_watch_changes(paths: &[PathBuf], state: &mut WatchState) -> Result<Vec<PathBuf>> {
+    loop {
+        let changed = detect_watch_changes(paths, state)?;
+        if !changed.is_empty() {
+            return Ok(changed);
+        }
+        tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+    }
+}
+
+fn format_watch_paths(paths: &[PathBuf]) -> String {
+    const MAX_DISPLAYED: usize = 3;
+
+    let rendered = paths
+        .iter()
+        .take(MAX_DISPLAYED)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+
+    if paths.len() > MAX_DISPLAYED {
+        format!(
+            "{} and {} more path(s)",
+            rendered.join(", "),
+            paths.len() - MAX_DISPLAYED
+        )
+    } else {
+        rendered.join(", ")
+    }
 }
 
 fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
@@ -293,15 +598,25 @@ fn build_js_command(
 ) -> Result<Command> {
     let command = if let Some(explicit) = runner_override.as_deref() {
         let resolved_runner = resolve_js_runner_command(explicit, files);
-        let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
-        let mut command = Command::new(resolved_runner);
-        command.arg(runner_script).args(files);
-        command
+        if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
+            let runner_script = prepare_js_runner_in_cwd()?;
+            build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files)
+        } else {
+            let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
+            let mut command = Command::new(resolved_runner);
+            command.arg(runner_script).args(files);
+            command
+        }
     } else if let Some(auto_runner) = find_js_runner_binary(files) {
-        let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
-        let mut command = Command::new(auto_runner);
-        command.arg(runner_script).args(files);
-        command
+        if is_deno_runner_path(&auto_runner) {
+            let runner_script = prepare_js_runner_in_cwd()?;
+            build_deno_js_command(auto_runner.as_os_str(), &runner_script, files)
+        } else {
+            let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
+            let mut command = Command::new(auto_runner);
+            command.arg(runner_script).args(files);
+            command
+        }
     } else {
         let mut command = Command::new("npx");
         command.arg("--yes").arg("tsx").arg(runner).args(files);
@@ -309,6 +624,28 @@ fn build_js_command(
     };
 
     Ok(command)
+}
+
+fn build_deno_js_command(
+    deno_runner: impl AsRef<OsStr>,
+    runner: &Path,
+    files: &[String],
+) -> Command {
+    let mut command = Command::new(deno_runner);
+    command.args(deno_js_command_args(runner, files));
+    command
+}
+
+fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("run"),
+        OsString::from("-A"),
+        OsString::from("--node-modules-dir=auto"),
+        OsString::from("--unstable-detect-cjs"),
+        runner.as_os_str().to_os_string(),
+    ];
+    args.extend(files.iter().map(OsString::from));
+    args
 }
 
 fn build_python_command(
@@ -338,9 +675,9 @@ fn build_python_command(
 }
 
 fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
-    // Prefer local project bins first, then PATH. `tsx` and `vite-node` are
-    // preferred, with ts-node variants as lower-priority fallback.
-    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm"];
+    // Prefer local project bins first, then PATH. `tsx` remains the preferred
+    // default, with other common TS runners as fallback.
+    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm", "deno"];
 
     for candidate in RUNNER_CANDIDATES {
         if let Some(path) = find_node_module_bin_for_files(candidate, files) {
@@ -393,6 +730,22 @@ fn js_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
         }
     }
     search_roots
+}
+
+fn is_deno_runner(runner: &str) -> bool {
+    let file_name = Path::new(runner)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(runner);
+    file_name.eq_ignore_ascii_case("deno") || file_name.eq_ignore_ascii_case("deno.exe")
+}
+
+fn is_deno_runner_path(runner: &Path) -> bool {
+    runner
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| name.eq_ignore_ascii_case("deno") || name.eq_ignore_ascii_case("deno.exe"))
+        .unwrap_or(false)
 }
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
@@ -520,6 +873,9 @@ enum EvalEvent {
     Start(ExperimentSummary),
     Summary(ExperimentSummary),
     Progress(SseProgressEventData),
+    Dependencies {
+        files: Vec<String>,
+    },
     Done,
     Error {
         message: String,
@@ -596,6 +952,11 @@ struct EvalProgressData {
 struct SseConsoleEventData {
     stream: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseDependenciesEventData {
+    files: Vec<String>,
 }
 
 async fn forward_stream<T>(
@@ -688,6 +1049,13 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
                 });
             }
         }
+        "dependencies" => {
+            if let Ok(payload) = serde_json::from_str::<SseDependenciesEventData>(&data) {
+                let _ = tx.send(EvalEvent::Dependencies {
+                    files: payload.files,
+                });
+            }
+        }
         "done" => {
             let _ = tx.send(EvalEvent::Done);
         }
@@ -738,6 +1106,7 @@ impl EvalUi {
             EvalEvent::Progress(progress) => {
                 self.handle_progress(progress);
             }
+            EvalEvent::Dependencies { .. } => {}
             EvalEvent::Console { message, .. } => {
                 let _ = self.progress.println(message);
             }
@@ -1217,63 +1586,66 @@ fn convert_color(color: Color) -> CtColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_test_dir(label: &str) -> PathBuf {
+    fn make_temp_dir(prefix: &str) -> PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("clock should be monotonic")
+            .expect("system clock before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "bt-eval-tests-{label}-{}-{now}",
+        let path = std::env::temp_dir().join(format!(
+            "bt-eval-tests-{prefix}-{}-{now}",
             std::process::id()
-        ))
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 
     #[test]
     fn materialize_runner_script_writes_file() {
-        let dir = unique_test_dir("write");
-        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        let dir = make_temp_dir("write");
 
         let path = materialize_runner_script(&dir, "runner.ts", "console.log('ok');")
             .expect("runner script should be materialized");
-        let contents = std::fs::read_to_string(path).expect("runner script should be readable");
+        let contents = fs::read_to_string(path).expect("runner script should be readable");
         assert_eq!(contents, "console.log('ok');");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn materialize_runner_script_overwrites_stale_content() {
-        let dir = unique_test_dir("overwrite");
-        std::fs::create_dir_all(&dir).expect("test dir should be created");
+        let dir = make_temp_dir("overwrite");
         let path = dir.join("runner.py");
-        std::fs::write(&path, "stale").expect("stale file should be written");
+        fs::write(&path, "stale").expect("stale file should be written");
 
         materialize_runner_script(&dir, "runner.py", "fresh")
             .expect("runner script should be updated");
-        let contents = std::fs::read_to_string(path).expect("runner script should be readable");
+        let contents = fs::read_to_string(path).expect("runner script should be readable");
         assert_eq!(contents, "fresh");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn prepare_eval_runners_writes_embedded_scripts() {
-        let dir = unique_test_dir("embedded");
+        let dir = make_temp_dir("embedded");
         let (js_runner, py_runner) =
             prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
 
-        let js = std::fs::read_to_string(js_runner).expect("js runner should be readable");
-        let py = std::fs::read_to_string(py_runner).expect("python runner should be readable");
+        let js = fs::read_to_string(js_runner).expect("js runner should be readable");
+        let py = fs::read_to_string(py_runner).expect("python runner should be readable");
         assert_eq!(js, JS_RUNNER_SOURCE);
         assert_eq!(py, PY_RUNNER_SOURCE);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn resolve_js_runner_command_finds_local_node_module_bin() {
-        let dir = unique_test_dir("resolve-runner");
+        let dir = make_temp_dir("resolve-runner");
         let eval_dir = dir.join("evals");
         let bin_dir = dir.join("node_modules").join(".bin");
         std::fs::create_dir_all(&eval_dir).expect("eval dir should be created");
@@ -1297,5 +1669,106 @@ mod tests {
         assert!(boxed.contains("Summary"));
         assert!(boxed.contains("plain line"));
         assert!(boxed.contains("red text"));
+    }
+
+    #[test]
+    fn detect_watch_changes_detects_file_create() {
+        let dir = make_temp_dir("create");
+        let file = dir.join("watch.eval.ts");
+        let paths = vec![file.clone()];
+
+        let mut state = snapshot_watch_state(&paths).expect("snapshot watch state");
+        assert!(detect_watch_changes(&paths, &mut state)
+            .expect("check changes")
+            .is_empty());
+
+        fs::write(&file, "export {}").expect("write test file");
+        let changed = detect_watch_changes(&paths, &mut state).expect("check changes");
+        assert_eq!(changed, vec![file.clone()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_watch_changes_detects_file_update() {
+        let dir = make_temp_dir("update");
+        let file = dir.join("watch.eval.ts");
+        fs::write(&file, "export const v = 1;").expect("write initial file");
+        let paths = vec![file.clone()];
+
+        let mut state = snapshot_watch_state(&paths).expect("snapshot watch state");
+        assert!(detect_watch_changes(&paths, &mut state)
+            .expect("check changes")
+            .is_empty());
+
+        fs::write(&file, "export const value = 2;").expect("write updated file");
+        let changed = detect_watch_changes(&paths, &mut state).expect("check changes");
+        assert_eq!(changed, vec![file.clone()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_watch_paths_dedupes_and_includes_dependencies() {
+        let input = vec![
+            PathBuf::from("/tmp/a.eval.ts"),
+            PathBuf::from("/tmp/b.eval.ts"),
+        ];
+        let deps = vec![
+            PathBuf::from("/tmp/b.eval.ts"),
+            PathBuf::from("/tmp/helper.ts"),
+        ];
+
+        let merged = merge_watch_paths(&input, &deps);
+        assert_eq!(
+            merged,
+            vec![
+                PathBuf::from("/tmp/a.eval.ts"),
+                PathBuf::from("/tmp/b.eval.ts"),
+                PathBuf::from("/tmp/helper.ts")
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_js_static_dependencies_follows_local_imports() {
+        let dir = make_temp_dir("js-static");
+        let entry = dir.join("entry.eval.ts");
+        let helper = dir.join("helper.js");
+
+        fs::write(
+            &entry,
+            "import { helper } from './helper.js';\nexport default helper;",
+        )
+        .expect("write entry file");
+        fs::write(&helper, "export const helper = 'ok';").expect("write helper file");
+
+        let files = vec![entry.to_string_lossy().to_string()];
+        let dependencies = collect_js_static_dependencies(&files).expect("collect js dependencies");
+
+        assert!(dependencies.contains(&entry));
+        assert!(dependencies.contains(&helper));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_deno_js_command_includes_detect_cjs_flag() {
+        let runner = PathBuf::from("/tmp/eval-runner.ts");
+        let files = vec!["tests/basic.eval.ts".to_string()];
+        let args: Vec<String> = deno_js_command_args(&runner, &files)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-A",
+                "--node-modules-dir=auto",
+                "--unstable-detect-cjs",
+                "/tmp/eval-runner.ts",
+                "tests/basic.eval.ts",
+            ]
+        );
     }
 }
