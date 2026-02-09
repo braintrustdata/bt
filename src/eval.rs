@@ -194,6 +194,8 @@ async fn run_eval_files_once(
     no_send_logs: bool,
 ) -> Result<EvalRunOutput> {
     let language = detect_eval_language(&files, language_override)?;
+    let show_js_runner_hint_on_failure =
+        language == EvalLanguage::JavaScript && runner_override.is_none();
     let (js_runner, py_runner) = prepare_eval_runners()?;
 
     let socket_path = build_sse_socket_path()?;
@@ -308,6 +310,11 @@ async fn run_eval_files_once(
     ui.finish();
 
     let status = status.context("eval runner process exited without a status")?;
+    if !status.success() && show_js_runner_hint_on_failure {
+        eprintln!(
+            "Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
+        );
+    }
     let mut dependencies = normalize_watch_paths(dependency_files.into_iter().map(PathBuf::from))?;
     if language == EvalLanguage::JavaScript {
         let static_dependencies = collect_js_static_dependencies(&files)?;
@@ -590,12 +597,13 @@ fn build_js_command(
     files: &[String],
 ) -> Result<Command> {
     let command = if let Some(explicit) = runner_override.as_deref() {
-        if is_deno_runner(explicit) {
+        let resolved_runner = resolve_js_runner_command(explicit, files);
+        if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            build_deno_js_command(explicit, &runner_script, files)
+            build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files)
         } else {
-            let runner_script = select_js_runner_entrypoint(runner, Path::new(explicit))?;
-            let mut command = Command::new(explicit);
+            let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
+            let mut command = Command::new(resolved_runner);
             command.arg(runner_script).args(files);
             command
         }
@@ -671,6 +679,41 @@ fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
     // default, with other common TS runners as fallback.
     const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm", "deno"];
 
+    for candidate in RUNNER_CANDIDATES {
+        if let Some(path) = find_node_module_bin_for_files(candidate, files) {
+            return Some(path);
+        }
+    }
+
+    find_binary_in_path(RUNNER_CANDIDATES)
+}
+
+fn resolve_js_runner_command(runner: &str, files: &[String]) -> PathBuf {
+    if is_path_like_runner(runner) {
+        return PathBuf::from(runner);
+    }
+
+    find_node_module_bin_for_files(runner, files)
+        .or_else(|| find_binary_in_path(&[runner]))
+        .unwrap_or_else(|| PathBuf::from(runner))
+}
+
+fn is_path_like_runner(runner: &str) -> bool {
+    let path = Path::new(runner);
+    path.is_absolute() || runner.contains('/') || runner.contains('\\') || runner.starts_with('.')
+}
+
+fn find_node_module_bin_for_files(binary: &str, files: &[String]) -> Option<PathBuf> {
+    let search_roots = js_runner_search_roots(files);
+    for root in &search_roots {
+        if let Some(path) = find_node_module_bin(binary, root) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn js_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
     let mut search_roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         search_roots.push(cwd.clone());
@@ -686,16 +729,7 @@ fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
             }
         }
     }
-
-    for candidate in RUNNER_CANDIDATES {
-        for root in &search_roots {
-            if let Some(path) = find_node_module_bin(candidate, root) {
-                return Some(path);
-            }
-        }
-    }
-
-    find_binary_in_path(RUNNER_CANDIDATES)
+    search_roots
 }
 
 fn is_deno_runner(runner: &str) -> bool {
@@ -1607,6 +1641,25 @@ mod tests {
         assert_eq!(py, PY_RUNNER_SOURCE);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_js_runner_command_finds_local_node_module_bin() {
+        let dir = make_temp_dir("resolve-runner");
+        let eval_dir = dir.join("evals");
+        let bin_dir = dir.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&eval_dir).expect("eval dir should be created");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir should be created");
+        let local_runner = bin_dir.join("vite-node");
+        std::fs::write(&local_runner, "echo").expect("local runner should be written");
+
+        let file = eval_dir.join("sample.eval.ts");
+        let files = vec![file.to_string_lossy().to_string()];
+
+        let resolved = resolve_js_runner_command("vite-node", &files);
+        assert_eq!(resolved, local_runner);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
