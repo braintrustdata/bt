@@ -174,7 +174,7 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
     {
         let installer_url = channel.installer_url();
         println!("updating bt from {} channel...", channel.name());
-        let cmd = format!("curl -fsSL '{}' | sh", installer_url);
+        let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let status = Command::new("sh")
             .arg("-c")
             .arg(cmd)
