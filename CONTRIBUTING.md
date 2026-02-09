@@ -11,6 +11,7 @@ Prereqs:
 Clone and install tools:
 
 ```bash
+mise trust
 mise install
 ```
 

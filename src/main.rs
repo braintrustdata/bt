@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 
 mod args;
+mod auth;
+mod config;
 mod env;
 #[cfg(unix)]
 mod eval;
@@ -24,6 +26,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Authenticate with Braintrust
+    Auth(auth::AuthArgs),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     #[cfg(unix)]
@@ -43,6 +47,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(argv);
 
     match cli.command {
+        Commands::Auth(args) => auth::run(args).await?,
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,

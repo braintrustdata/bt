@@ -11,6 +11,10 @@ pub struct BaseArgs {
     #[arg(short = 'p', long, env = "BRAINTRUST_DEFAULT_PROJECT")]
     pub project: Option<String>,
 
+    /// Auth profile to use
+    #[arg(long, env = "BRAINTRUST_PROFILE", default_value = "DEFAULT")]
+    pub profile: String,
+
     /// Override stored API key (or via BRAINTRUST_API_KEY)
     #[arg(long, env = "BRAINTRUST_API_KEY")]
     pub api_key: Option<String>,

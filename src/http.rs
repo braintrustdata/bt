@@ -21,8 +21,8 @@ impl ApiClient {
         Ok(Self {
             http,
             base_url: ctx.api_url.trim_end_matches('/').to_string(),
-            api_key: ctx.login.api_key.clone(),
-            org_name: ctx.login.org_name.clone(),
+            api_key: ctx.api_key().to_string(),
+            org_name: ctx.org_name().unwrap_or("").to_string(),
         })
     }
 

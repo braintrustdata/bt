@@ -30,6 +30,7 @@ use ratatui::widgets::{Cell, Row, Table};
 use ratatui::Terminal;
 
 use crate::args::BaseArgs;
+use crate::login::{login, LoginContext};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -145,10 +146,12 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         list: args.list,
         filter: args.filter,
     };
+    // Resolve credentials and project from profile or explicit flags
+    let ctx = login(&base).await?;
 
     if args.watch {
         run_eval_files_watch(
-            &base,
+            &ctx,
             args.language,
             args.runner.clone(),
             args.files.clone(),
@@ -158,7 +161,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         .await
     } else {
         let output = run_eval_files_once(
-            &base,
+            &ctx,
             args.language,
             args.runner.clone(),
             args.files.clone(),
@@ -174,7 +177,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 }
 
 async fn run_eval_files_watch(
-    base: &BaseArgs,
+    ctx: &LoginContext,
     language_override: Option<EvalLanguage>,
     runner_override: Option<String>,
     files: Vec<String>,
@@ -192,7 +195,7 @@ async fn run_eval_files_watch(
 
     loop {
         match run_eval_files_once(
-            base,
+            ctx,
             language_override,
             runner_override.clone(),
             files.clone(),
@@ -235,7 +238,7 @@ async fn run_eval_files_watch(
 }
 
 async fn run_eval_files_once(
-    base: &BaseArgs,
+    ctx: &LoginContext,
     language_override: Option<EvalLanguage>,
     runner_override: Option<String>,
     files: Vec<String>,
@@ -284,7 +287,7 @@ async fn run_eval_files_once(
         EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
-    cmd.envs(build_env(base));
+    cmd.envs(build_env(ctx));
     if no_send_logs {
         cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
         cmd.env("BT_EVAL_LOCAL", "1");
@@ -630,17 +633,20 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
+fn build_env(ctx: &LoginContext) -> Vec<(String, String)> {
     let mut envs = Vec::new();
-    if let Some(api_key) = base.api_key.as_ref() {
-        envs.push(("BRAINTRUST_API_KEY".to_string(), api_key.clone()));
-    }
-    if let Some(api_url) = base.api_url.as_ref() {
-        envs.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
-    }
-    if let Some(project) = base.project.as_ref() {
+
+    // Use resolved API key from LoginContext (from profile or explicit)
+    envs.push(("BRAINTRUST_API_KEY".to_string(), ctx.api_key().to_string()));
+
+    // Use resolved API URL from LoginContext
+    envs.push(("BRAINTRUST_API_URL".to_string(), ctx.api_url.clone()));
+
+    // Use resolved project from LoginContext (--project > BRAINTRUST_DEFAULT_PROJECT > profile.project)
+    if let Some(project) = &ctx.project {
         envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
+
     envs
 }
 
