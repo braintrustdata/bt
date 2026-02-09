@@ -289,7 +289,8 @@ async function loadBraintrust() {
 }
 
 function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
-  const getter = (braintrust as Record<string, unknown>)._internalGetGlobalState;
+  const getter = (braintrust as Record<string, unknown>)
+    ._internalGetGlobalState;
   if (typeof getter !== "function") {
     return;
   }
