@@ -123,6 +123,16 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 
+## `bt eval` runners
+
+- By default, `bt eval` auto-detects a JavaScript runner from your project (`tsx`, `vite-node`, `ts-node`, then `ts-node-esm`).
+- You can also set a runner explicitly with `--runner`:
+  - `bt eval --runner vite-node tutorial.eval.ts`
+  - `bt eval --runner tsx tutorial.eval.ts`
+- You do not need to pass a full path for common runners; `bt` resolves local `node_modules/.bin` entries automatically.
+- If eval execution fails with ESM/top-level-await related errors, retry with:
+  - `bt eval --runner vite-node tutorial.eval.ts`
+
 ## Roadmap / TODO
 
 - Add richer channel controls for self-update (for example pinned/branch canary selection).
