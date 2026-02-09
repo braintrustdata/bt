@@ -75,11 +75,30 @@ type SseWriter = {
   close: () => void;
 };
 
+type EvalFilter = {
+  path: string[];
+  pattern: RegExp;
+};
+
+type SerializedEvalFilter = {
+  path: string[];
+  pattern: string;
+};
+
+type RunnerConfig = {
+  jsonl: boolean;
+  list: boolean;
+  terminateOnFailure: boolean;
+  filters: EvalFilter[];
+};
+
 declare global {
   // eslint-disable-next-line no-var
   var _evals: GlobalEvals | undefined;
   // eslint-disable-next-line no-var
   var _lazy_load: boolean | undefined;
+  // eslint-disable-next-line no-var
+  var __inherited_braintrust_state: unknown;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -102,6 +121,74 @@ function normalizeBraintrustModule(value: unknown): BraintrustModule {
 
 function normalizeFiles(files: string[]): string[] {
   return files.map((file) => path.resolve(process.cwd(), file));
+}
+
+function envFlag(name: string): boolean {
+  const value = process.env[name];
+  if (!value) {
+    return false;
+  }
+  const normalized = value.toLowerCase();
+  return !["0", "false", "no", "off", ""].includes(normalized);
+}
+
+function serializeJSONWithPlainString(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  return JSON.stringify(value);
+}
+
+function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
+  if (!serialized) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(serialized);
+    if (!Array.isArray(parsed)) {
+      throw new Error("BT_EVAL_FILTER_PARSED must be a JSON array.");
+    }
+    return parsed.map((value) => {
+      if (!isObject(value)) {
+        throw new Error(
+          "BT_EVAL_FILTER_PARSED entries must be objects with {path, pattern}.",
+        );
+      }
+      const { path: rawPath, pattern: rawPattern } =
+        value as SerializedEvalFilter;
+      if (
+        !Array.isArray(rawPath) ||
+        !rawPath.every((part) => typeof part === "string")
+      ) {
+        throw new Error(
+          "BT_EVAL_FILTER_PARSED entry path must be an array of strings.",
+        );
+      }
+      if (typeof rawPattern !== "string") {
+        throw new Error(
+          "BT_EVAL_FILTER_PARSED entry pattern must be a string.",
+        );
+      }
+      return {
+        path: rawPath,
+        pattern: new RegExp(rawPattern),
+      };
+    });
+  } catch (err) {
+    throw new Error(
+      `Invalid BT_EVAL_FILTER_PARSED value: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function readRunnerConfig(): RunnerConfig {
+  return {
+    jsonl: envFlag("BT_EVAL_JSONL"),
+    list: envFlag("BT_EVAL_LIST"),
+    terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
+    filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
+  };
 }
 
 const runtimeRequire = createRequire(
@@ -650,27 +737,62 @@ async function loadBraintrust() {
   return normalizeBraintrustModule(mod);
 }
 
+function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
+  const getter = (braintrust as Record<string, unknown>)
+    ._internalGetGlobalState;
+  if (typeof getter !== "function") {
+    return;
+  }
+  const state = getter();
+  if (state !== undefined && state !== null) {
+    globalThis.__inherited_braintrust_state = state;
+  }
+}
+
 async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
-    try {
-      const mod = await import(fileUrl);
-      modules.push(mod);
-    } catch (err) {
-      if (shouldTryRequire(file, err)) {
+    const preferRequire =
+      file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs");
+
+    if (preferRequire) {
+      try {
+        const require = createRequire(fileUrl);
+        const mod = require(file);
+        modules.push(mod);
+        continue;
+      } catch (requireErr) {
         try {
-          const require = createRequire(fileUrl);
-          const mod = require(file);
+          const mod = await import(fileUrl);
           modules.push(mod);
           continue;
-        } catch (requireErr) {
+        } catch (esmErr) {
           throw new Error(
-            `Failed to load ${file} as ESM (${formatError(err)}) or CJS (${formatError(requireErr)}).`,
+            `Failed to load ${file} as CJS (${formatError(requireErr)}) or ESM (${formatError(esmErr)}).`,
           );
         }
       }
-      throw err;
+    }
+
+    try {
+      const mod = await import(fileUrl);
+      modules.push(mod);
+      continue;
+    } catch (err) {
+      if (!shouldTryRequire(file, err)) {
+        throw err;
+      }
+      try {
+        const require = createRequire(fileUrl);
+        const mod = require(file);
+        modules.push(mod);
+        continue;
+      } catch (requireErr) {
+        throw new Error(
+          `Failed to load ${file} as ESM (${formatError(err)}) or CJS (${formatError(requireErr)}).`,
+        );
+      }
     }
   }
   return modules;
@@ -789,6 +911,69 @@ function getEvaluators(): EvaluatorEntry[] {
     return [];
   }
   return Object.values(evals.evaluators) as EvaluatorEntry[];
+}
+
+function getReporters(): Record<string, unknown> {
+  const evals = globalThis._evals;
+  if (!evals || !evals.reporters) {
+    return {};
+  }
+  return evals.reporters as Record<string, unknown>;
+}
+
+function resolveReporter(
+  reporter: unknown,
+  reporters: Record<string, unknown>,
+): unknown | undefined {
+  if (typeof reporter === "string") {
+    if (!(reporter in reporters)) {
+      throw new Error(`Reporter ${reporter} not found`);
+    }
+    return reporters[reporter];
+  }
+  if (reporter !== undefined && reporter !== null) {
+    return reporter;
+  }
+
+  const values = Object.values(reporters);
+  if (values.length === 0) {
+    return undefined;
+  }
+  if (values.length === 1) {
+    return values[0];
+  }
+  const names = Object.keys(reporters).join(", ");
+  throw new Error(
+    `Multiple reporters found (${names}). Please specify a reporter explicitly.`,
+  );
+}
+
+function evaluateFilter(
+  object: Record<string, unknown>,
+  filter: EvalFilter,
+): boolean {
+  const key = filter.path.reduce<unknown>((acc, part) => {
+    if (!isObject(acc)) {
+      return undefined;
+    }
+    return acc[part];
+  }, object);
+  if (key === undefined) {
+    return false;
+  }
+  return filter.pattern.test(serializeJSONWithPlainString(key));
+}
+
+function filterEvaluators(
+  evaluators: EvaluatorEntry[],
+  filters: EvalFilter[],
+): EvaluatorEntry[] {
+  if (filters.length === 0) {
+    return evaluators;
+  }
+  return evaluators.filter((entry) =>
+    filters.every((filter) => evaluateFilter(entry.evaluator, filter)),
+  );
 }
 
 function extractBtEvalMain(mod: unknown): BtEvalMain | null {
@@ -927,7 +1112,7 @@ function mergeProgress(
   };
 }
 
-async function createEvalRunner() {
+async function createEvalRunner(config: RunnerConfig) {
   const braintrust = await loadBraintrust();
   const Eval = braintrust.Eval;
   if (typeof Eval !== "function") {
@@ -990,35 +1175,55 @@ async function createEvalRunner() {
     }
     if (sse) {
       sse.send("summary", result.summary);
+    } else if (config.jsonl) {
+      console.log(JSON.stringify(result.summary));
     }
     return result;
   };
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
-    const results = await Promise.all(
-      evaluators.map(async (entry) => {
-        try {
-          const options = entry.reporter
-            ? { reporter: entry.reporter }
+    const reporters = getReporters();
+    const runEntry = async (entry: EvaluatorEntry): Promise<boolean> => {
+      try {
+        const resolvedReporter = resolveReporter(entry.reporter, reporters);
+        const options =
+          resolvedReporter !== undefined
+            ? { reporter: resolvedReporter }
             : undefined;
-          const result = await runEval(
-            entry.evaluator.projectName,
-            entry.evaluator,
-            options,
-          );
-          const failingResults = result.results.filter(
-            (r: { error?: unknown }) => r.error !== undefined,
-          );
-          return failingResults.length === 0;
-        } catch (err) {
-          if (sse) {
-            sse.send("error", serializeError(err));
-          } else {
-            console.error(err);
-          }
+        const result = await runEval(
+          entry.evaluator.projectName,
+          entry.evaluator,
+          options,
+        );
+        const failingResults = result.results.filter(
+          (r: { error?: unknown }) => r.error !== undefined,
+        );
+        if (failingResults.length > 0 && resolvedReporter === undefined) {
           return false;
         }
-      }),
+        return true;
+      } catch (err) {
+        if (sse) {
+          sse.send("error", serializeError(err));
+        } else {
+          console.error(err);
+        }
+        return false;
+      }
+    };
+
+    if (config.terminateOnFailure) {
+      for (const entry of evaluators) {
+        const ok = await runEntry(entry);
+        if (!ok) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    const results = await Promise.all(
+      evaluators.map((entry) => runEntry(entry)),
     );
     return results.every(Boolean);
   };
@@ -1047,6 +1252,7 @@ async function createEvalRunner() {
 }
 
 async function main() {
+  const config = readRunnerConfig();
   const files = process.argv.slice(2);
   if (files.length === 0) {
     console.error("No eval files provided.");
@@ -1060,12 +1266,13 @@ async function main() {
   }
   collectStaticLocalDependencies(normalized);
   ensureBraintrustAvailable();
-  await loadBraintrust();
+  const braintrust = await loadBraintrust();
+  propagateInheritedBraintrustState(braintrust);
   initRegistry();
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 
-  const runner = await createEvalRunner();
+  const runner = await createEvalRunner(config);
   if (!runner.noSendLogs && typeof runner.login === "function") {
     try {
       await runner.login({});
@@ -1082,7 +1289,10 @@ async function main() {
   const context: BtEvalContext = {
     Eval: runner.Eval,
     runEval: runner.runEval,
-    runRegisteredEvals: () => runner.runRegisteredEvals(getEvaluators()),
+    runRegisteredEvals: () =>
+      runner.runRegisteredEvals(
+        filterEvaluators(getEvaluators(), config.filters),
+      ),
     makeEvalOptions: runner.makeEvalOptions,
     sendConsole: (message: string, stream?: "stdout" | "stderr") => {
       sendConsole(runner.sse, message, stream);
@@ -1096,6 +1306,18 @@ async function main() {
 
   let ok = true;
   try {
+    const discoveredEvaluators = getEvaluators();
+    const filteredEvaluators = filterEvaluators(
+      discoveredEvaluators,
+      config.filters,
+    );
+    if (config.list) {
+      for (const entry of filteredEvaluators) {
+        console.log(entry.evaluator.evalName);
+      }
+      return;
+    }
+
     if (btEvalMains.length > 0) {
       globalThis._lazy_load = false;
       for (const main of btEvalMains) {
@@ -1111,12 +1333,11 @@ async function main() {
         }
       }
     } else {
-      const evaluators = getEvaluators();
-      if (evaluators.length === 0) {
+      if (discoveredEvaluators.length === 0) {
         console.error("No evaluators found. Did you call Eval() in the file?");
         process.exit(1);
       }
-      ok = await runner.runRegisteredEvals(evaluators);
+      ok = await runner.runRegisteredEvals(filteredEvaluators);
     }
   } finally {
     collectRequireCacheDependencies();

@@ -14,7 +14,7 @@ use crossterm::style::{
     Stylize,
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use strip_ansi_escapes::strip;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
@@ -38,6 +38,13 @@ struct EvalRunOutput {
     status: ExitStatus,
     dependencies: Vec<PathBuf>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunnerFilter {
+    path: Vec<String>,
+    pattern: String,
+}
+
 const JS_RUNNER_FILE: &str = "eval-runner.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
@@ -96,12 +103,49 @@ pub struct EvalArgs {
     )]
     pub no_send_logs: bool,
 
+    /// Output one JSON summary per evaluator.
+    #[arg(long)]
+    pub jsonl: bool,
+
+    /// Stop after the first failing evaluator.
+    #[arg(long)]
+    pub terminate_on_failure: bool,
+
+    /// Number of worker threads for Python eval execution.
+    #[arg(long, value_name = "COUNT")]
+    pub num_workers: Option<usize>,
+
+    /// List evaluators without executing them.
+    #[arg(long)]
+    pub list: bool,
+
+    /// Filter expression(s) used to select which evaluators to run.
+    #[arg(long, value_name = "FILTER")]
+    pub filter: Vec<String>,
+
     /// Re-run evals when input files change.
     #[arg(long, short = 'w')]
     pub watch: bool,
 }
 
+#[derive(Debug, Clone)]
+struct EvalRunOptions {
+    jsonl: bool,
+    terminate_on_failure: bool,
+    num_workers: Option<usize>,
+    list: bool,
+    filter: Vec<String>,
+}
+
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
+    let options = EvalRunOptions {
+        jsonl: args.jsonl,
+        terminate_on_failure: args.terminate_on_failure,
+        num_workers: args.num_workers,
+        list: args.list,
+        filter: args.filter,
+    };
+
     if args.watch {
         run_eval_files_watch(
             &base,
@@ -109,6 +153,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             args.runner.clone(),
             args.files.clone(),
             args.no_send_logs,
+            options,
         )
         .await
     } else {
@@ -118,6 +163,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             args.runner.clone(),
             args.files.clone(),
             args.no_send_logs,
+            options,
         )
         .await?;
         if !output.status.success() {
@@ -133,6 +179,7 @@ async fn run_eval_files_watch(
     runner_override: Option<String>,
     files: Vec<String>,
     no_send_logs: bool,
+    options: EvalRunOptions,
 ) -> Result<()> {
     let input_watch_paths = resolve_watch_paths(&files)?;
     let mut active_watch_paths = input_watch_paths.clone();
@@ -150,6 +197,7 @@ async fn run_eval_files_watch(
             runner_override.clone(),
             files.clone(),
             no_send_logs,
+            options.clone(),
         )
         .await
         {
@@ -192,8 +240,12 @@ async fn run_eval_files_once(
     runner_override: Option<String>,
     files: Vec<String>,
     no_send_logs: bool,
+    options: EvalRunOptions,
 ) -> Result<EvalRunOutput> {
     let language = detect_eval_language(&files, language_override)?;
+    if language != EvalLanguage::Python && options.num_workers.is_some() {
+        anyhow::bail!("--num-workers is only supported for Python evals.");
+    }
     let show_js_runner_hint_on_failure =
         language == EvalLanguage::JavaScript && runner_override.is_none();
     let (js_runner, py_runner) = prepare_eval_runners()?;
@@ -237,6 +289,24 @@ async fn run_eval_files_once(
         cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
         cmd.env("BT_EVAL_LOCAL", "1");
     }
+    if options.jsonl {
+        cmd.env("BT_EVAL_JSONL", "1");
+    }
+    if options.terminate_on_failure {
+        cmd.env("BT_EVAL_TERMINATE_ON_FAILURE", "1");
+    }
+    if options.list {
+        cmd.env("BT_EVAL_LIST", "1");
+    }
+    if let Some(num_workers) = options.num_workers {
+        cmd.env("BT_EVAL_NUM_WORKERS", num_workers.to_string());
+    }
+    if !options.filter.is_empty() {
+        let parsed = parse_eval_filter_expressions(&options.filter)?;
+        let serialized =
+            serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
+        cmd.env("BT_EVAL_FILTER_PARSED", serialized);
+    }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
         socket_path.to_string_lossy().to_string(),
@@ -267,7 +337,7 @@ async fn run_eval_files_once(
         });
     }
 
-    let mut ui = EvalUi::new();
+    let mut ui = EvalUi::new(options.jsonl, options.list);
     let mut status = None;
     let mut dependency_files: Vec<String> = Vec::new();
 
@@ -337,6 +407,27 @@ type WatchState = HashMap<PathBuf, Option<WatchEntry>>;
 
 fn resolve_watch_paths(files: &[String]) -> Result<Vec<PathBuf>> {
     normalize_watch_paths(files.iter().map(PathBuf::from))
+}
+
+fn parse_eval_filter_expression(expression: &str) -> Result<RunnerFilter> {
+    let (path, pattern) = expression
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("Invalid filter {expression}"))?;
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("Invalid filter {expression}");
+    }
+    Ok(RunnerFilter {
+        path: path.split('.').map(str::to_string).collect(),
+        pattern: pattern.to_string(),
+    })
+}
+
+fn parse_eval_filter_expressions(filters: &[String]) -> Result<Vec<RunnerFilter>> {
+    filters
+        .iter()
+        .map(|filter| parse_eval_filter_expression(filter))
+        .collect()
 }
 
 fn normalize_watch_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Vec<PathBuf>> {
@@ -781,6 +872,12 @@ fn is_ts_node_runner(runner_command: &Path) -> bool {
 }
 
 fn find_python_binary() -> Option<PathBuf> {
+    if let Some(venv_root) = std::env::var_os("VIRTUAL_ENV") {
+        let candidate = PathBuf::from(venv_root).join("bin").join("python");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     find_binary_in_path(&["python3", "python"])
 }
 
@@ -882,13 +979,13 @@ enum EvalEvent {
         stack: Option<String>,
     },
     Console {
-        _stream: String,
+        stream: String,
         message: String,
     },
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExperimentSummary {
     project_name: String,
@@ -902,7 +999,7 @@ struct ExperimentSummary {
     metrics: Option<HashMap<String, MetricSummary>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ScoreSummary {
     name: String,
     score: f64,
@@ -917,7 +1014,7 @@ struct EvalErrorPayload {
     stack: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct MetricSummary {
     name: String,
     metric: f64,
@@ -970,7 +1067,7 @@ where
     let mut lines = BufReader::new(stream).lines();
     while let Some(line) = lines.next_line().await? {
         let _ = tx.send(EvalEvent::Console {
-            _stream: name.to_string(),
+            stream: name.to_string(),
             message: line,
         });
     }
@@ -1031,7 +1128,7 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
         "console" => {
             if let Ok(console) = serde_json::from_str::<SseConsoleEventData>(&data) {
                 let _ = tx.send(EvalEvent::Console {
-                    _stream: console.stream,
+                    stream: console.stream,
                     message: console.message,
                 });
             }
@@ -1068,10 +1165,12 @@ struct EvalUi {
     bars: HashMap<String, ProgressBar>,
     bar_style: ProgressStyle,
     spinner_style: ProgressStyle,
+    jsonl: bool,
+    list: bool,
 }
 
 impl EvalUi {
-    fn new() -> Self {
+    fn new(jsonl: bool, list: bool) -> Self {
         let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10));
         let bar_style =
             ProgressStyle::with_template("{bar:10.blue} {msg} {percent}% {pos}/{len} {eta}")
@@ -1082,6 +1181,8 @@ impl EvalUi {
             bars: HashMap::new(),
             bar_style,
             spinner_style,
+            jsonl,
+            list,
         }
     }
 
@@ -1098,17 +1199,27 @@ impl EvalUi {
                 let _ = self.progress.println(line);
             }
             EvalEvent::Summary(summary) => {
-                let rendered = format_experiment_summary(&summary);
-                for line in rendered.lines() {
-                    let _ = self.progress.println(line);
+                if self.jsonl {
+                    if let Ok(line) = serde_json::to_string(&summary) {
+                        println!("{line}");
+                    }
+                } else {
+                    let rendered = format_experiment_summary(&summary);
+                    for line in rendered.lines() {
+                        let _ = self.progress.println(line);
+                    }
                 }
             }
             EvalEvent::Progress(progress) => {
                 self.handle_progress(progress);
             }
             EvalEvent::Dependencies { .. } => {}
-            EvalEvent::Console { message, .. } => {
-                let _ = self.progress.println(message);
+            EvalEvent::Console { stream, message } => {
+                if stream == "stdout" && (self.list || self.jsonl) {
+                    println!("{message}");
+                } else {
+                    let _ = self.progress.println(message);
+                }
             }
             EvalEvent::Error { message, stack } => {
                 let show_hint = message.contains("Please specify an api key");
@@ -1769,6 +1880,38 @@ mod tests {
                 "/tmp/eval-runner.ts",
                 "tests/basic.eval.ts",
             ]
+        );
+    }
+
+    #[test]
+    fn parse_eval_filter_expression_splits_path_and_pattern() {
+        let parsed =
+            parse_eval_filter_expression("metadata.case=smoke.*").expect("parse should succeed");
+        assert_eq!(
+            parsed,
+            RunnerFilter {
+                path: vec!["metadata".to_string(), "case".to_string()],
+                pattern: "smoke.*".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_filter_expression_rejects_missing_equals() {
+        let err =
+            parse_eval_filter_expression("metadata.case").expect_err("missing equals should fail");
+        assert!(
+            err.to_string().contains("Invalid filter"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_eval_filter_expression_rejects_empty_path() {
+        let err = parse_eval_filter_expression("=foo").expect_err("empty path should fail");
+        assert!(
+            err.to_string().contains("Invalid filter"),
+            "unexpected error: {err}"
         );
     }
 }
