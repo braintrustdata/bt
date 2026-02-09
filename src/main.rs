@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 
 mod args;
+mod config;
 mod env;
 #[cfg(unix)]
 mod eval;
@@ -51,6 +52,20 @@ enum Commands {
 async fn main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
+
+    if let Ok(cfg) = config::load_global() {
+        if let Some(org) = &cfg.org {
+            if std::env::var("BRAINTRUST_DEFAULT_ORG").is_err() {
+                std::env::set_var("BRAINTRUST_DEFAULT_ORG", org);
+            }
+        }
+        if let Some(proj) = &cfg.project {
+            if std::env::var("BRAINTRUST_DEFAULT_PROJECT").is_err() {
+                std::env::set_var("BRAINTRUST_DEFAULT_PROJECT", proj);
+            }
+        }
+    }
+
     let cli = Cli::parse_from(argv);
 
     match cli.command {
