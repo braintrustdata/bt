@@ -38,6 +38,13 @@ struct EvalRunOutput {
     status: ExitStatus,
     dependencies: Vec<PathBuf>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunnerFilter {
+    path: Vec<String>,
+    pattern: String,
+}
+
 const JS_RUNNER_FILE: &str = "eval-runner.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
@@ -295,9 +302,10 @@ async fn run_eval_files_once(
         cmd.env("BT_EVAL_NUM_WORKERS", num_workers.to_string());
     }
     if !options.filter.is_empty() {
+        let parsed = parse_eval_filter_expressions(&options.filter)?;
         let serialized =
-            serde_json::to_string(&options.filter).context("failed to serialize eval filters")?;
-        cmd.env("BT_EVAL_FILTER", serialized);
+            serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
+        cmd.env("BT_EVAL_FILTER_PARSED", serialized);
     }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
@@ -399,6 +407,27 @@ type WatchState = HashMap<PathBuf, Option<WatchEntry>>;
 
 fn resolve_watch_paths(files: &[String]) -> Result<Vec<PathBuf>> {
     normalize_watch_paths(files.iter().map(PathBuf::from))
+}
+
+fn parse_eval_filter_expression(expression: &str) -> Result<RunnerFilter> {
+    let (path, pattern) = expression
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("Invalid filter {expression}"))?;
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("Invalid filter {expression}");
+    }
+    Ok(RunnerFilter {
+        path: path.split('.').map(str::to_string).collect(),
+        pattern: pattern.to_string(),
+    })
+}
+
+fn parse_eval_filter_expressions(filters: &[String]) -> Result<Vec<RunnerFilter>> {
+    filters
+        .iter()
+        .map(|filter| parse_eval_filter_expression(filter))
+        .collect()
 }
 
 fn normalize_watch_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Vec<PathBuf>> {
@@ -1851,6 +1880,38 @@ mod tests {
                 "/tmp/eval-runner.ts",
                 "tests/basic.eval.ts",
             ]
+        );
+    }
+
+    #[test]
+    fn parse_eval_filter_expression_splits_path_and_pattern() {
+        let parsed =
+            parse_eval_filter_expression("metadata.case=smoke.*").expect("parse should succeed");
+        assert_eq!(
+            parsed,
+            RunnerFilter {
+                path: vec!["metadata".to_string(), "case".to_string()],
+                pattern: "smoke.*".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eval_filter_expression_rejects_missing_equals() {
+        let err =
+            parse_eval_filter_expression("metadata.case").expect_err("missing equals should fail");
+        assert!(
+            err.to_string().contains("Invalid filter"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_eval_filter_expression_rejects_empty_path() {
+        let err = parse_eval_filter_expression("=foo").expect_err("empty path should fail");
+        assert!(
+            err.to_string().contains("Invalid filter"),
+            "unexpected error: {err}"
         );
     }
 }

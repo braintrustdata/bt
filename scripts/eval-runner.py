@@ -109,24 +109,25 @@ def env_flag(name: str) -> bool:
     return value.lower() not in {"0", "false", "no", "off", ""}
 
 
-def parse_filter_expressions(serialized: str | None) -> list[EvalFilter]:
+def parse_serialized_filters(serialized: str | None) -> list[EvalFilter]:
     if not serialized:
         return []
 
     parsed = json.loads(serialized)
-    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise ValueError("BT_EVAL_FILTER must be a JSON array of strings")
+    if not isinstance(parsed, list):
+        raise ValueError("BT_EVAL_FILTER_PARSED must be a JSON array")
 
     filters: list[EvalFilter] = []
-    for expression in parsed:
-        equals_idx = expression.find("=")
-        if equals_idx == -1:
-            raise ValueError(f"Invalid filter expression: {expression}")
-        key_path = expression[:equals_idx].strip()
-        pattern = expression[equals_idx + 1 :]
-        if not key_path:
-            raise ValueError(f"Invalid filter expression: {expression}")
-        filters.append(EvalFilter(path=key_path.split("."), pattern=re.compile(pattern)))
+    for i, entry in enumerate(parsed):
+        if not isinstance(entry, dict):
+            raise ValueError("BT_EVAL_FILTER_PARSED entries must be objects with {path, pattern}")
+        key_path = entry.get("path")
+        pattern = entry.get("pattern")
+        if not isinstance(key_path, list) or not all(isinstance(part, str) for part in key_path):
+            raise ValueError(f"BT_EVAL_FILTER_PARSED entry {i} path must be an array of strings")
+        if not isinstance(pattern, str):
+            raise ValueError(f"BT_EVAL_FILTER_PARSED entry {i} pattern must be a string")
+        filters.append(EvalFilter(path=key_path, pattern=re.compile(pattern)))
     return filters
 
 
@@ -138,7 +139,7 @@ def read_runner_config() -> RunnerConfig:
         list_only=env_flag("BT_EVAL_LIST"),
         terminate_on_failure=env_flag("BT_EVAL_TERMINATE_ON_FAILURE"),
         num_workers=num_workers,
-        filters=parse_filter_expressions(os.getenv("BT_EVAL_FILTER")),
+        filters=parse_serialized_filters(os.getenv("BT_EVAL_FILTER_PARSED")),
     )
 
 

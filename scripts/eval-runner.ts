@@ -80,6 +80,11 @@ type EvalFilter = {
   pattern: RegExp;
 };
 
+type SerializedEvalFilter = {
+  path: string[];
+  pattern: string;
+};
+
 type RunnerConfig = {
   jsonl: boolean;
   list: boolean;
@@ -134,43 +139,47 @@ function serializeJSONWithPlainString(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function parseFilterExpressions(serialized: string | undefined): EvalFilter[] {
+function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
   if (!serialized) {
     return [];
   }
 
-  let values: string[] = [];
   try {
     const parsed = JSON.parse(serialized);
-    if (
-      Array.isArray(parsed) &&
-      parsed.every((value) => typeof value === "string")
-    ) {
-      values = parsed;
-    } else {
-      throw new Error("BT_EVAL_FILTER must be a JSON array of strings.");
+    if (!Array.isArray(parsed)) {
+      throw new Error("BT_EVAL_FILTER_PARSED must be a JSON array.");
     }
+    return parsed.map((value) => {
+      if (!isObject(value)) {
+        throw new Error(
+          "BT_EVAL_FILTER_PARSED entries must be objects with {path, pattern}.",
+        );
+      }
+      const { path: rawPath, pattern: rawPattern } =
+        value as SerializedEvalFilter;
+      if (
+        !Array.isArray(rawPath) ||
+        !rawPath.every((part) => typeof part === "string")
+      ) {
+        throw new Error(
+          "BT_EVAL_FILTER_PARSED entry path must be an array of strings.",
+        );
+      }
+      if (typeof rawPattern !== "string") {
+        throw new Error(
+          "BT_EVAL_FILTER_PARSED entry pattern must be a string.",
+        );
+      }
+      return {
+        path: rawPath,
+        pattern: new RegExp(rawPattern),
+      };
+    });
   } catch (err) {
     throw new Error(
-      `Invalid BT_EVAL_FILTER value: ${err instanceof Error ? err.message : String(err)}`,
+      `Invalid BT_EVAL_FILTER_PARSED value: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-
-  return values.map((value) => {
-    const equalsIdx = value.indexOf("=");
-    if (equalsIdx === -1) {
-      throw new Error(`Invalid filter expression: ${value}`);
-    }
-    const keyPath = value.slice(0, equalsIdx).trim();
-    const patternSource = value.slice(equalsIdx + 1);
-    if (!keyPath) {
-      throw new Error(`Invalid filter expression: ${value}`);
-    }
-    return {
-      path: keyPath.split("."),
-      pattern: new RegExp(patternSource),
-    };
-  });
 }
 
 function readRunnerConfig(): RunnerConfig {
@@ -178,7 +187,7 @@ function readRunnerConfig(): RunnerConfig {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
-    filters: parseFilterExpressions(process.env.BT_EVAL_FILTER),
+    filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
   };
 }
 
