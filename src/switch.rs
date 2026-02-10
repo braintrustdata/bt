@@ -4,14 +4,20 @@ use anyhow::{bail, Result};
 use clap::Args;
 
 use crate::args::BaseArgs;
-use crate::config;
+use crate::config::{self, write_target, WriteTarget};
 use crate::http::ApiClient;
 use crate::login::login;
 use crate::projects::api;
-use crate::ui::{self, print_command_status, with_spinner, CommandStatus};
+use crate::ui::{print_command_status, select_project_interactive, with_spinner, CommandStatus};
 
 #[derive(Debug, Clone, Args)]
 pub struct SwitchArgs {
+    /// force set global config value
+    #[arg(long, short = 'g', conflicts_with = "local")]
+    global: bool,
+    /// force set local config value
+    #[arg(long, short = 'l')]
+    local: bool,
     /// Target: project name or org/project
     #[arg(value_name = "TARGET")]
     target: Option<String>,
@@ -24,7 +30,6 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     // TODO: support org switching when multi-org auth is ready
     let org_name = &client.org_name();
 
-    // Priority: positional target > --project flag/env > interactive
     let project_name = if let Some(t) = &args.target {
         if t.contains('/') {
             // org/project format - ignore org part for now, just use project
@@ -33,8 +38,6 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         } else {
             validate_or_create_project(&client, t).await?
         }
-    } else if let Some(name) = &base.project {
-        validate_or_create_project(&client, name).await?
     } else {
         select_project_interactive(&client).await?
     };
@@ -43,9 +46,26 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let mut cfg = config::load_global().unwrap_or_default();
     cfg.org = Some(org_name.to_string());
     cfg.project = Some(project_name.clone());
-    config::save_global(&cfg)?;
 
-    let path = config::global_path()?;
+    let path = if args.global {
+        config::save_global(&cfg)?;
+        config::global_path()?
+    } else if args.local {
+        config::save_local(&cfg, true)?;
+        std::env::current_dir()?.join(".bt/config.json")
+    } else {
+        match write_target()? {
+            WriteTarget::Local(p) => {
+                config::save_file(&p, &cfg)?;
+                p
+            }
+            WriteTarget::Global(p) => {
+                config::save_file(&p, &cfg)?;
+                p
+            }
+        }
+    };
+
     print_command_status(
         CommandStatus::Success,
         &format!("Switched to {org_name}/{project_name}"),
@@ -77,18 +97,4 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<St
     } else {
         bail!("project '{name}' not found");
     }
-}
-
-async fn select_project_interactive(client: &ApiClient) -> Result<String> {
-    let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
-
-    if projects.is_empty() {
-        bail!("no projects found in org '{}'", &client.org_name());
-    }
-
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
-
-    let selection = ui::fuzzy_select("Select project", &names)?;
-    Ok(projects[selection].name.clone())
 }
