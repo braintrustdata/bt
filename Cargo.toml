@@ -54,3 +54,6 @@ unix-archive = ".tar.gz"
 windows-archive = ".zip"
 install-path = "CARGO_HOME"
 install-updater = true
+
+[dev-dependencies]
+tempfile = "3"

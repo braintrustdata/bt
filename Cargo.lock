@@ -146,6 +146,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strip-ansi-escapes",
+ "tempfile",
  "tokio",
  "unicode-width 0.1.14",
  "urlencoding",
