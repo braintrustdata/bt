@@ -8,10 +8,12 @@ mod env;
 #[cfg(unix)]
 mod eval;
 mod http;
+mod init;
 mod login;
 mod projects;
 mod self_update;
 mod sql;
+mod status;
 mod switch;
 mod ui;
 
@@ -26,6 +28,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Initialize .bt config directory and files
+    Init(CLIArgs<init::InitArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     #[cfg(unix)]
@@ -38,6 +42,8 @@ enum Commands {
     SelfCommand(self_update::SelfArgs),
     /// Switch org and project context
     Switch(CLIArgs<switch::SwitchArgs>),
+    /// Show current org and project context
+    Status(CLIArgs<status::StatusArgs>),
 }
 
 #[tokio::main]
@@ -45,28 +51,37 @@ async fn main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
-    if let Ok(cfg) = config::load_global() {
-        if let Some(org) = &cfg.org {
-            if std::env::var("BRAINTRUST_DEFAULT_ORG").is_err() {
-                std::env::set_var("BRAINTRUST_DEFAULT_ORG", org);
-            }
-        }
-        if let Some(proj) = &cfg.project {
-            if std::env::var("BRAINTRUST_DEFAULT_PROJECT").is_err() {
-                std::env::set_var("BRAINTRUST_DEFAULT_PROJECT", proj);
-            }
-        }
-    }
-
     let cli = Cli::parse_from(argv);
 
+    let cfg = config::load().unwrap_or_default();
+
     match cli.command {
-        Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
+        Commands::Init(cmd) => {
+            // Don't merge config - init should prompt for project interactively
+            init::run(cmd.base, cmd.args).await?
+        }
+        Commands::Sql(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            sql::run(base, args).await?
+        }
         #[cfg(unix)]
-        Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
-        Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+        Commands::Eval(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            eval::run(base, args).await?
+        }
+        Commands::Projects(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            projects::run(base, args).await?
+        }
         Commands::SelfCommand(args) => self_update::run(args).await?,
-        Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
+        Commands::Switch(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            switch::run(base, args).await?
+        }
+        Commands::Status(cmd) => {
+            // Don't merge config - status command inspects config directly
+            status::run(cmd.base, cmd.args).await?
+        }
     }
 
     Ok(())
