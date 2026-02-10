@@ -46,7 +46,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_config(
+pub(crate) fn resolve_config(
     base: &BaseArgs,
     global: &config::Config,
     local: &config::Config,
@@ -78,4 +78,128 @@ fn resolve_config(
     };
 
     (org, project, source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
+        BaseArgs {
+            json: false,
+            org: org.map(String::from),
+            project: project.map(String::from),
+            api_key: None,
+            api_url: None,
+            app_url: None,
+            env_file: None,
+        }
+    }
+
+    fn config(org: Option<&str>, project: Option<&str>) -> config::Config {
+        config::Config {
+            org: org.map(String::from),
+            project: project.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cli_overrides_everything() {
+        let base = base_args(Some("cli-org"), Some("cli-proj"));
+        let global = config(Some("global-org"), Some("global-proj"));
+        let local = config(Some("local-org"), Some("local-proj"));
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (org, project, source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(org, Some("cli-org".into()));
+        assert_eq!(project, Some("cli-proj".into()));
+        assert_eq!(source, Some("cli".into()));
+    }
+
+    #[test]
+    fn local_overrides_global() {
+        let base = base_args(None, None);
+        let global = config(Some("global-org"), Some("global-proj"));
+        let local = config(Some("local-org"), Some("local-proj"));
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (org, project, source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(org, Some("local-org".into()));
+        assert_eq!(project, Some("local-proj".into()));
+        assert_eq!(source, Some("/project/.bt/config.json".into()));
+    }
+
+    #[test]
+    fn global_used_when_local_empty() {
+        let base = base_args(None, None);
+        let global = config(Some("global-org"), Some("global-proj"));
+        let local = config(None, None);
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (org, project, source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(org, Some("global-org".into()));
+        assert_eq!(project, Some("global-proj".into()));
+        assert_eq!(source, Some("/home/.bt/config.json".into()));
+    }
+
+    #[test]
+    fn no_source_when_all_empty() {
+        let base = base_args(None, None);
+        let global = config(None, None);
+        let local = config(None, None);
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (org, project, source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(org, None);
+        assert_eq!(project, None);
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn mixed_sources_org_cli_project_local() {
+        let base = base_args(Some("cli-org"), None);
+        let global = config(Some("global-org"), Some("global-proj"));
+        let local = config(None, Some("local-proj"));
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (org, project, source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(org, Some("cli-org".into()));
+        assert_eq!(project, Some("local-proj".into()));
+        // Source reports CLI since at least one value came from CLI
+        assert_eq!(source, Some("cli".into()));
+    }
+
+    #[test]
+    fn values_cascade_across_layers() {
+        let base = base_args(None, None);
+        let global = config(Some("global-org"), None);
+        let local = config(None, Some("local-proj"));
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (org, project, source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(org, Some("global-org".into()));
+        assert_eq!(project, Some("local-proj".into()));
+        // Source reports local since that's where the highest-priority non-empty value came from
+        assert_eq!(source, Some("/project/.bt/config.json".into()));
+    }
 }

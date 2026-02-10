@@ -141,3 +141,135 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
     }
     save_file(&dir.join("config.json"), config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn merge_other_takes_precedence() {
+        let base = Config {
+            org: Some("base-org".into()),
+            project: Some("base-proj".into()),
+            ..Default::default()
+        };
+        let other = Config {
+            org: Some("other-org".into()),
+            project: Some("other-proj".into()),
+            ..Default::default()
+        };
+        let merged = base.merge(&other);
+        assert_eq!(merged.org, Some("other-org".into()));
+        assert_eq!(merged.project, Some("other-proj".into()));
+    }
+
+    #[test]
+    fn merge_self_fills_when_other_none() {
+        let base = Config {
+            org: Some("base-org".into()),
+            project: Some("base-proj".into()),
+            ..Default::default()
+        };
+        let other = Config::default();
+        let merged = base.merge(&other);
+        assert_eq!(merged.org, Some("base-org".into()));
+        assert_eq!(merged.project, Some("base-proj".into()));
+    }
+
+    #[test]
+    fn merge_both_none_stays_none() {
+        let base = Config::default();
+        let other = Config::default();
+        let merged = base.merge(&other);
+        assert_eq!(merged.org, None);
+        assert_eq!(merged.project, None);
+    }
+
+    #[test]
+    fn merge_partial_fill() {
+        let base = Config {
+            org: Some("base-org".into()),
+            project: None,
+            ..Default::default()
+        };
+        let other = Config {
+            org: None,
+            project: Some("other-proj".into()),
+            ..Default::default()
+        };
+        let merged = base.merge(&other);
+        assert_eq!(merged.org, Some("base-org".into()));
+        assert_eq!(merged.project, Some("other-proj".into()));
+    }
+
+    #[test]
+    fn load_missing_file_returns_default() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("nonexistent.json");
+        let config = load_file(&path);
+        assert_eq!(config.org, None);
+        assert_eq!(config.project, None);
+    }
+
+    #[test]
+    fn load_invalid_json_returns_default() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("invalid.json");
+        fs::write(&path, "not valid json {{{").unwrap();
+        let config = load_file(&path);
+        assert_eq!(config.org, None);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+
+        let original = Config {
+            org: Some("test-org".into()),
+            project: Some("test-project".into()),
+            api_url: Some("https://api.example.com".into()),
+            app_url: Some("https://app.example.com".into()),
+            extra: Default::default(),
+        };
+
+        save_file(&path, &original).unwrap();
+        let loaded = load_file(&path);
+
+        assert_eq!(loaded.org, original.org);
+        assert_eq!(loaded.project, original.project);
+        assert_eq!(loaded.api_url, original.api_url);
+        assert_eq!(loaded.app_url, original.app_url);
+    }
+
+    #[test]
+    fn load_unknown_keys_still_returns_config() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"org": "my-org", "unknown_field": "value", "another": 123}"#,
+        )
+        .unwrap();
+
+        let config = load_file(&path);
+        assert_eq!(config.org, Some("my-org".into()));
+        assert!(config.extra.contains_key("unknown_field"));
+        assert!(config.extra.contains_key("another"));
+    }
+
+    #[test]
+    fn save_creates_parent_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("nested").join("dir").join("config.json");
+
+        let config = Config {
+            org: Some("test".into()),
+            ..Default::default()
+        };
+
+        save_file(&path, &config).unwrap();
+        assert!(path.exists());
+    }
+}
