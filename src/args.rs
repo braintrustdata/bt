@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 pub use braintrust_sdk_rust::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
+use crate::config::Config;
+
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
     /// Output as JSON
@@ -13,7 +15,7 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
     pub profile: Option<String>,
 
-    // Override active org
+    /// Override active org
     #[arg(short = 'o', long, env = "BRAINTRUST_DEFAULT_ORG")]
     pub org: Option<String>,
 
@@ -46,6 +48,18 @@ pub struct BaseArgs {
     pub env_file: Option<PathBuf>,
 }
 
+impl BaseArgs {
+    pub fn with_config_defaults(mut self, cfg: &Config) -> Self {
+        if self.org.is_none() {
+            self.org = cfg.org.clone();
+        }
+        if self.project.is_none() {
+            self.project = cfg.project.clone();
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct CLIArgs<T: Args> {
     #[command(flatten)]
@@ -53,4 +67,10 @@ pub struct CLIArgs<T: Args> {
 
     #[command(flatten)]
     pub args: T,
+}
+
+impl<T: Args> CLIArgs<T> {
+    pub fn with_config(self, cfg: &Config) -> (BaseArgs, T) {
+        (self.base.with_config_defaults(cfg), self.args)
+    }
 }
