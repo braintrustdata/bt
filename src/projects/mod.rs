@@ -9,7 +9,6 @@ pub(crate) mod api;
 mod create;
 mod delete;
 mod list;
-pub mod switch;
 mod view;
 
 #[derive(Debug, Clone, Args)]
@@ -28,8 +27,6 @@ enum ProjectsCommands {
     View(ViewArgs),
     /// Delete a project
     Delete(DeleteArgs),
-    /// Switch to a project
-    Switch(SwitchArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -87,6 +84,5 @@ pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
             view::run(&client, &ctx.app_url, &ctx.login.org_name, a.name()).await
         }
         Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref(), a.force).await,
-        Some(ProjectsCommands::Switch(a)) => switch::run(&client, a.name.as_deref()).await,
     }
 }

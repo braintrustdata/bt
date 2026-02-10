@@ -4,10 +4,9 @@ use anyhow::{bail, Result};
 use dialoguer::Confirm;
 
 use crate::http::ApiClient;
-use crate::ui::{print_command_status, with_spinner, CommandStatus};
+use crate::ui::{print_command_status, select_project_interactive, with_spinner, CommandStatus};
 
 use super::api;
-use super::switch::select_project_interactive;
 
 pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<()> {
     if force && name.is_none() {
