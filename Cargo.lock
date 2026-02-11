@@ -194,6 +194,7 @@ dependencies = [
  "indicatif",
  "lingua",
  "open",
+ "pathdiff",
  "ratatui",
  "reqwest",
  "serde",
