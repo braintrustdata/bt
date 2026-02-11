@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use clap::{Args, Subcommand};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -6,7 +7,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::args::BaseArgs;
 use crate::ui::{print_command_status, CommandStatus};
+
+mod get;
+mod list;
+mod set;
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -19,7 +25,48 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+pub const KNOWN_KEYS: &[&str] = &["org", "project", "api_url", "app_url"];
+
 impl Config {
+    pub fn get_field(&self, key: &str) -> Option<&str> {
+        match key {
+            "org" => self.org.as_deref(),
+            "project" => self.project.as_deref(),
+            "api_url" => self.api_url.as_deref(),
+            "app_url" => self.app_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn set_field(&mut self, key: &str, value: String) -> bool {
+        match key {
+            "org" => self.org = Some(value),
+            "project" => self.project = Some(value),
+            "api_url" => self.api_url = Some(value),
+            "app_url" => self.app_url = Some(value),
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn unset_field(&mut self, key: &str) -> bool {
+        match key {
+            "org" => self.org = None,
+            "project" => self.project = None,
+            "api_url" => self.api_url = None,
+            "app_url" => self.app_url = None,
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn non_empty_fields(&self) -> Vec<(&str, &str)> {
+        KNOWN_KEYS
+            .iter()
+            .filter_map(|&key| self.get_field(key).map(|v| (key, v)))
+            .collect()
+    }
+
     fn merge(&self, other: &Config) -> Config {
         Config {
             org: other.org.clone().or_else(|| self.org.clone()),
@@ -140,6 +187,104 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
         fs::create_dir_all(&dir)?;
     }
     save_file(&dir.join("config.json"), config)
+}
+
+// --- CLI commands ---
+
+#[derive(Debug, Clone, Args)]
+pub struct ScopeArgs {
+    /// Apply to global config (~/.bt/config.json)
+    #[arg(long, short = 'g')]
+    global: bool,
+
+    /// Apply to local config (.bt/config.json)
+    #[arg(long, short = 'l')]
+    local: bool,
+}
+
+impl ScopeArgs {
+    fn validate(&self) -> Result<()> {
+        if self.global && self.local {
+            bail!("Cannot specify both --global and --local");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    command: Option<ConfigCommands>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ConfigCommands {
+    /// List config values
+    List {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Show config values grouped by source
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+    /// Get a config value
+    Get {
+        /// Config key (org, project, api_url, app_url)
+        key: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
+    /// Set a config value
+    Set {
+        /// Config key (org, project, api_url, app_url)
+        key: String,
+        /// Value to set
+        value: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
+    /// Remove a config value
+    Unset {
+        /// Config key (org, project, api_url, app_url)
+        key: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
+}
+
+fn validate_key(key: &str) -> Result<()> {
+    if !KNOWN_KEYS.contains(&key) {
+        bail!(
+            "Unknown config key: {key}\nValid keys: {}",
+            KNOWN_KEYS.join(", ")
+        );
+    }
+    Ok(())
+}
+
+pub fn run(base: BaseArgs, args: ConfigArgs) -> Result<()> {
+    match args.command {
+        None => list::run(base, false, false, false),
+        Some(ConfigCommands::List { scope, verbose }) => {
+            scope.validate()?;
+            list::run(base, scope.global, scope.local, verbose)
+        }
+        Some(ConfigCommands::Get { key, scope }) => {
+            scope.validate()?;
+            validate_key(&key)?;
+            get::run(base, &key, scope.global, scope.local)
+        }
+        Some(ConfigCommands::Set { key, value, scope }) => {
+            scope.validate()?;
+            validate_key(&key)?;
+            set::run(&key, &value, scope.global, scope.local)
+        }
+        Some(ConfigCommands::Unset { key, scope }) => {
+            scope.validate()?;
+            validate_key(&key)?;
+            set::unset(&key, scope.global, scope.local)
+        }
+    }
 }
 
 #[cfg(test)]

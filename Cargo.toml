@@ -34,6 +34,7 @@ base64 = "0.22"
 oauth2 = { version = "4.4", default-features = false, features = ["reqwest", "rustls-tls"] }
 getrandom = "0.3"
 dirs = "5"
+pathdiff = "0.2.3"
 
 [profile.dist]
 inherits = "release"
