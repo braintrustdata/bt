@@ -28,6 +28,7 @@ enum Commands {
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     /// View project traces in an interactive terminal UI
+    #[command(visible_alias = "trace")]
     Traces(CLIArgs<traces::TracesArgs>),
     #[cfg(unix)]
     /// Run eval files

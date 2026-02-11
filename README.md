@@ -138,13 +138,16 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - Open an interactive terminal trace viewer for a project:
   - `bt -p <project-name> traces`
   - `bt traces --project-id <project-id>`
+  - `bt trace <braintrust-url>` (alias that opens a trace URL directly)
 - Optional flags:
   - `--limit <N>`: number of summary traces to load (default `50`)
   - `--preview-length <N>`: preview length used in summary rows (default `125`)
+  - `--url <braintrust-url>`: open a Braintrust URL directly (`r`/`s`/`tvt` parsed)
   - `--print-queries`: print each BTQL query and invoke payload before execution
 - Controls:
   - Trace table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
   - Search bar: `/` to edit search text, `Enter` to apply, `Esc` to cancel, `Ctrl+u` to clear input
+  - Open URL: `Ctrl+k` to paste a Braintrust URL, `Enter` to open, `Esc` to cancel
   - Detail view: `t` toggles between span detail and thread view (project default preprocessor)
   - Split-pane focus: `Right` focuses detail pane, `Left` focuses span tree
   - Span/detail nav: with tree focus `Up/Down` selects spans; in span detail focus `Up/Down` scrolls (`PgUp/PgDn` also scroll)

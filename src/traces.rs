@@ -22,8 +22,10 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::Terminal;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use unicode_width::UnicodeWidthStr;
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
@@ -35,6 +37,8 @@ const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
 const THREAD_PREPROCESSOR_NAME: &str = "project_default";
 const LOADER_DELAY: Duration = Duration::from_millis(250);
+const DOUBLE_G_TIMEOUT: Duration = Duration::from_millis(700);
+const MAX_SAFE_PARAGRAPH_SCROLL: u16 = 60_000;
 const TRACE_TEXT_SEARCH_FIELDS: [&str; 6] = [
     "input",
     "expected",
@@ -49,6 +53,14 @@ pub struct TracesArgs {
     /// Project ID to query (overrides -p/--project)
     #[arg(long)]
     pub project_id: Option<String>,
+
+    /// Braintrust app URL to open directly (parses org/project/r/s/tvt)
+    #[arg(long)]
+    pub url: Option<String>,
+
+    /// Braintrust app URL to open directly (same as --url)
+    #[arg(value_name = "URL")]
+    pub url_arg: Option<String>,
 
     /// Number of traces to show in the main table
     #[arg(long, default_value_t = 50)]
@@ -76,6 +88,24 @@ struct BtqlResponse {
 struct ProjectSelection {
     id: String,
     name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTraceUrl {
+    org: Option<String>,
+    project: Option<String>,
+    page: Option<String>,
+    row_ref: Option<String>,
+    span_id: Option<String>,
+    trace_view_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTraceTarget {
+    project: ProjectSelection,
+    root_span_id: String,
+    span_id: Option<String>,
+    detail_view: DetailView,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +139,7 @@ struct SpanListEntry {
 enum Screen {
     Traces,
     SpanDetail,
+    OpeningTrace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +161,13 @@ struct TraceViewerApp {
     trace_search_query: String,
     trace_search_input: String,
     trace_search_mode: bool,
+    pending_g_prefix_at: Option<Instant>,
+    url_open_mode: bool,
+    url_open_input: String,
+    url_open_loading_input: String,
+    url_open_started_at: Option<Instant>,
+    url_open_spinner_tick: usize,
+    url_open_rx: Option<Receiver<(String, Result<ResolvedTraceTarget>)>>,
     summary_loading_search_query: String,
     summary_pending_refresh: Option<(String, Option<String>)>,
     summary_load_started_at: Option<Instant>,
@@ -158,6 +196,8 @@ struct TraceViewerApp {
     thread_spinner_tick: usize,
     thread_load_rx: Option<Receiver<Result<Vec<Value>>>>,
     loaded_root_span_id: Option<String>,
+    pending_open_span_id: Option<String>,
+    pending_open_detail_view: Option<DetailView>,
     screen: Screen,
     status: String,
     status_detail: String,
@@ -177,7 +217,7 @@ impl TraceViewerApp {
     ) -> Self {
         let trace_count = traces.len();
         let status = format!(
-            "Loaded {trace_count} traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit"
+            "Loaded {trace_count} traces. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit"
         );
         Self {
             project,
@@ -186,6 +226,13 @@ impl TraceViewerApp {
             trace_search_query: String::new(),
             trace_search_input: String::new(),
             trace_search_mode: false,
+            pending_g_prefix_at: None,
+            url_open_mode: false,
+            url_open_input: String::new(),
+            url_open_loading_input: String::new(),
+            url_open_started_at: None,
+            url_open_spinner_tick: 0,
+            url_open_rx: None,
             summary_loading_search_query: String::new(),
             summary_pending_refresh: None,
             summary_load_started_at: None,
@@ -214,6 +261,8 @@ impl TraceViewerApp {
             thread_spinner_tick: 0,
             thread_load_rx: None,
             loaded_root_span_id: None,
+            pending_open_span_id: None,
+            pending_open_detail_view: None,
             screen: Screen::Traces,
             status,
             status_detail: String::new(),
@@ -256,15 +305,32 @@ impl TraceViewerApp {
         }
     }
 
+    fn move_trace_top(&mut self) {
+        self.selected_trace = 0;
+    }
+
     fn move_trace_down(&mut self) {
         if self.selected_trace + 1 < self.traces.len() {
             self.selected_trace += 1;
         }
     }
 
+    fn move_trace_bottom(&mut self) {
+        if !self.traces.is_empty() {
+            self.selected_trace = self.traces.len().saturating_sub(1);
+        }
+    }
+
     fn move_span_up(&mut self) {
         if self.selected_span > 0 {
             self.selected_span -= 1;
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn move_span_top(&mut self) {
+        if !self.spans.is_empty() {
+            self.selected_span = 0;
             self.detail_scroll = 0;
         }
     }
@@ -276,12 +342,19 @@ impl TraceViewerApp {
         }
     }
 
+    fn move_span_bottom(&mut self) {
+        if !self.spans.is_empty() {
+            self.selected_span = self.spans.len().saturating_sub(1);
+            self.detail_scroll = 0;
+        }
+    }
+
     fn scroll_detail_up(&mut self, amount: u16) {
         self.detail_scroll = self.detail_scroll.saturating_sub(amount);
     }
 
-    fn scroll_detail_down(&mut self, amount: u16) {
-        self.detail_scroll = self.detail_scroll.saturating_add(amount);
+    fn scroll_detail_top(&mut self) {
+        self.detail_scroll = 0;
     }
 
     fn move_thread_message_up(&mut self) {
@@ -290,12 +363,25 @@ impl TraceViewerApp {
         }
     }
 
+    fn move_thread_message_top(&mut self) {
+        self.thread_selected_message = 0;
+    }
+
     fn move_thread_message_down(&mut self) {
         let Some(messages) = &self.thread_messages else {
             return;
         };
         if self.thread_selected_message + 1 < messages.len() {
             self.thread_selected_message += 1;
+        }
+    }
+
+    fn move_thread_message_bottom(&mut self) {
+        let Some(messages) = &self.thread_messages else {
+            return;
+        };
+        if !messages.is_empty() {
+            self.thread_selected_message = messages.len().saturating_sub(1);
         }
     }
 
@@ -314,24 +400,40 @@ pub async fn run(base: BaseArgs, args: TracesArgs) -> Result<()> {
         bail!("--limit must be greater than 0");
     }
 
+    let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
+    let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
+
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
 
-    let project =
-        resolve_project(&client, base.project.as_deref(), args.project_id.as_deref()).await?;
-
-    let initial_rows = with_spinner(
-        "Loading traces...",
-        fetch_summary_rows(
-            &client,
-            &project.id,
-            args.preview_length,
-            args.limit,
-            None,
-            args.print_queries,
-        ),
+    let project = resolve_project(
+        &client,
+        base.project.as_deref(),
+        args.project_id.as_deref(),
+        parsed_startup_url
+            .as_ref()
+            .and_then(|u| u.project.as_deref()),
     )
     .await?;
+
+    let interactive_startup = !base.json && std::io::stdin().is_terminal();
+    let skip_initial_summary = interactive_startup && parsed_startup_url.is_some();
+    let initial_rows = if skip_initial_summary {
+        Vec::new()
+    } else {
+        with_spinner(
+            "Loading traces...",
+            fetch_summary_rows(
+                &client,
+                &project.id,
+                args.preview_length,
+                args.limit,
+                None,
+                args.print_queries,
+            ),
+        )
+        .await?
+    };
     let traces = parse_summary_rows(initial_rows);
 
     if base.json || !std::io::stdin().is_terminal() {
@@ -351,6 +453,7 @@ pub async fn run(base: BaseArgs, args: TracesArgs) -> Result<()> {
         args.limit,
         args.preview_length,
         args.print_queries,
+        parsed_startup_url,
         client,
     )
     .await
@@ -360,6 +463,7 @@ async fn resolve_project(
     client: &ApiClient,
     project_name_from_base: Option<&str>,
     explicit_project_id: Option<&str>,
+    project_name_from_url: Option<&str>,
 ) -> Result<ProjectSelection> {
     if let Some(project_id) = explicit_project_id {
         return Ok(ProjectSelection {
@@ -369,6 +473,23 @@ async fn resolve_project(
     }
 
     if let Some(name) = project_name_from_base {
+        let project = get_project_by_name(client, name)
+            .await?
+            .with_context(|| format!("project '{name}' not found"))?;
+
+        return Ok(ProjectSelection {
+            id: project.id,
+            name: Some(project.name),
+        });
+    }
+
+    if let Some(name) = project_name_from_url {
+        if is_uuid_like(name) {
+            return Ok(ProjectSelection {
+                id: name.to_string(),
+                name: None,
+            });
+        }
         let project = get_project_by_name(client, name)
             .await?
             .with_context(|| format!("project '{name}' not found"))?;
@@ -424,6 +545,7 @@ async fn run_interactive(
     limit: usize,
     preview_length: usize,
     print_queries: bool,
+    startup_trace_url: Option<ParsedTraceUrl>,
     client: ApiClient,
 ) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
@@ -434,6 +556,7 @@ async fn run_interactive(
             limit,
             preview_length,
             print_queries,
+            startup_trace_url,
             client,
             handle,
         )
@@ -446,6 +569,7 @@ fn run_interactive_blocking(
     limit: usize,
     preview_length: usize,
     print_queries: bool,
+    startup_trace_url: Option<ParsedTraceUrl>,
     client: ApiClient,
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
@@ -456,6 +580,9 @@ fn run_interactive_blocking(
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = TraceViewerApp::new(project, traces, limit, preview_length, print_queries);
+    if let Some(parsed_url) = startup_trace_url {
+        request_open_trace_for_parsed_url(&mut app, &client, &handle, parsed_url)?;
+    }
     let result = run_app(&mut terminal, &mut app, client, handle);
 
     disable_raw_mode().ok();
@@ -472,6 +599,7 @@ fn run_app(
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     loop {
+        poll_pending_url_open(app, &client, &handle)?;
         poll_pending_summary_load(app, &client, &handle)?;
         poll_pending_trace_load(app, &client, &handle)?;
         poll_pending_full_span_load(app, &client, &handle)?;
@@ -500,6 +628,34 @@ fn handle_key_event(
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
 ) -> Result<bool> {
+    if app
+        .pending_g_prefix_at
+        .map(|at| at.elapsed() > DOUBLE_G_TIMEOUT)
+        .unwrap_or(false)
+    {
+        app.pending_g_prefix_at = None;
+    }
+
+    if matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.url_open_mode = true;
+        app.url_open_input.clear();
+        app.trace_search_mode = false;
+        app.set_status("Open URL mode. Paste a Braintrust URL and press Enter (Esc cancels).");
+        return Ok(false);
+    }
+
+    if app.url_open_mode {
+        handle_url_open_input_key(app, key, client, handle)?;
+        return Ok(false);
+    }
+
+    let is_plain_g = matches!(key.code, KeyCode::Char('g')) && key.modifiers.is_empty();
+    if !is_plain_g {
+        app.pending_g_prefix_at = None;
+    }
+
     match key.code {
         KeyCode::Char('q')
             if !(app.screen == Screen::Traces
@@ -512,8 +668,13 @@ fn handle_key_event(
             if app.screen == Screen::SpanDetail {
                 app.screen = Screen::Traces;
                 app.set_status(
-                    "Back to traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit",
+                    "Back to traces. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit",
                 );
+                ensure_traces_loaded_after_detail_exit(app, client, handle)?;
+                return Ok(false);
+            }
+            if app.screen == Screen::OpeningTrace {
+                app.set_status("Opening trace in progress. Press q to quit.");
                 return Ok(false);
             }
             if app.screen == Screen::Traces && app.trace_search_mode {
@@ -531,9 +692,45 @@ fn handle_key_event(
     match app.screen {
         Screen::Traces => handle_traces_key(app, key, client, handle)?,
         Screen::SpanDetail => handle_span_detail_key(app, key, client, handle)?,
+        Screen::OpeningTrace => {}
     }
 
     Ok(false)
+}
+
+fn ensure_traces_loaded_after_detail_exit(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    let opened_root = app.loaded_root_span_id.clone();
+
+    let mut root_found_in_table = false;
+    if let Some(root_span_id) = opened_root.as_deref() {
+        if let Some(idx) = app
+            .traces
+            .iter()
+            .position(|row| row.root_span_id == root_span_id)
+        {
+            app.selected_trace = idx;
+            root_found_in_table = true;
+        }
+    }
+
+    let should_refresh = app.traces.is_empty() || !root_found_in_table;
+    if !should_refresh {
+        return Ok(());
+    }
+
+    let search_query = app.trace_search_query.trim().to_string();
+    let previous_root = opened_root;
+    if app.summary_load_rx.is_some() {
+        app.summary_pending_refresh = Some((search_query, previous_root));
+    } else {
+        start_summary_load(app, client, handle, search_query, previous_root);
+    }
+
+    Ok(())
 }
 
 fn handle_traces_key(
@@ -547,6 +744,14 @@ fn handle_traces_key(
     }
 
     match key.code {
+        KeyCode::Char('g') if key.modifiers.is_empty() => {
+            if app.pending_g_prefix_at.take().is_some() {
+                app.move_trace_top();
+            } else {
+                app.pending_g_prefix_at = Some(Instant::now());
+            }
+        }
+        KeyCode::Char('G') => app.move_trace_bottom(),
         KeyCode::Char('/') => {
             app.trace_search_mode = true;
             app.trace_search_input = app.trace_search_query.clone();
@@ -558,6 +763,51 @@ fn handle_traces_key(
         KeyCode::Char('r') => request_refresh_traces(app, client, handle)?,
         _ => {}
     }
+    Ok(())
+}
+
+fn handle_url_open_input_key(
+    app: &mut TraceViewerApp,
+    key: KeyEvent,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.url_open_mode = false;
+            app.url_open_input.clear();
+            app.set_status("URL open canceled");
+        }
+        KeyCode::Enter => {
+            let input = app.url_open_input.trim().to_string();
+            app.url_open_mode = false;
+            if input.is_empty() {
+                app.set_status("Open URL canceled");
+            } else if let Err(err) = request_open_trace_for_url(app, client, handle, input) {
+                app.set_error(format!("Failed to open URL: {}", root_error_message(&err)));
+            }
+        }
+        KeyCode::Backspace => {
+            app.url_open_input.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.url_open_input.clear();
+        }
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            app.url_open_input.push(c);
+        }
+        _ => {}
+    }
+
+    if app.url_open_mode {
+        let preview = if app.url_open_input.is_empty() {
+            "<empty>".to_string()
+        } else {
+            truncate_chars(&app.url_open_input, 120)
+        };
+        app.set_status(format!("Open URL mode: {preview}"));
+    }
+
     Ok(())
 }
 
@@ -604,6 +854,64 @@ fn apply_trace_search(
     request_refresh_traces(app, client, handle)
 }
 
+fn request_open_trace_for_url(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    url: String,
+) -> Result<()> {
+    let parsed = parse_trace_url(&url)?;
+    request_open_trace_for_parsed_url(app, client, handle, parsed)
+}
+
+fn request_open_trace_for_parsed_url(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    parsed: ParsedTraceUrl,
+) -> Result<()> {
+    if app.url_open_rx.is_some() {
+        app.set_status("A URL open is already in progress");
+        return Ok(());
+    }
+
+    let url_for_status = parsed
+        .page
+        .as_deref()
+        .map(|page| format!("{}/{}", project_label(&app.project), page))
+        .unwrap_or_else(|| project_label(&app.project));
+    let (tx, rx) = mpsc::channel();
+    let client = client.clone();
+    let current_project = app.project.clone();
+    let print_queries = app.print_queries;
+    let parsed_for_task = parsed.clone();
+    handle.spawn(async move {
+        let result = resolve_trace_target_for_url(
+            &client,
+            &current_project,
+            &parsed_for_task,
+            print_queries,
+        )
+        .await;
+        let _ = tx.send((url_for_status, result));
+    });
+
+    app.url_open_loading_input = parsed
+        .row_ref
+        .clone()
+        .or_else(|| parsed.span_id.clone())
+        .unwrap_or_else(|| "<url>".to_string());
+    app.url_open_started_at = Some(Instant::now());
+    app.url_open_spinner_tick = 0;
+    app.url_open_rx = Some(rx);
+    app.screen = Screen::OpeningTrace;
+    app.set_status(format!(
+        "Resolving URL for {}...",
+        app.url_open_loading_input
+    ));
+    Ok(())
+}
+
 fn handle_span_detail_key(
     app: &mut TraceViewerApp,
     key: KeyEvent,
@@ -611,6 +919,34 @@ fn handle_span_detail_key(
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
     match key.code {
+        KeyCode::Char('g') if key.modifiers.is_empty() => {
+            if app.pending_g_prefix_at.take().is_some() {
+                if app.detail_pane_focus == DetailPaneFocus::Tree {
+                    app.move_span_top();
+                    if app.detail_view == DetailView::Span {
+                        request_selected_span_load(app, client, handle, false)?;
+                    }
+                } else if app.detail_view == DetailView::Thread {
+                    app.move_thread_message_top();
+                } else {
+                    app.scroll_detail_top();
+                }
+            } else {
+                app.pending_g_prefix_at = Some(Instant::now());
+            }
+        }
+        KeyCode::Char('G') => {
+            if app.detail_pane_focus == DetailPaneFocus::Tree {
+                app.move_span_bottom();
+                if app.detail_view == DetailView::Span {
+                    request_selected_span_load(app, client, handle, false)?;
+                }
+            } else if app.detail_view == DetailView::Thread {
+                app.move_thread_message_bottom();
+            } else {
+                scroll_detail_to_bottom(app);
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.detail_pane_focus == DetailPaneFocus::Tree {
                 app.move_span_up();
@@ -632,7 +968,7 @@ fn handle_span_detail_key(
             } else if app.detail_view == DetailView::Thread {
                 app.move_thread_message_down();
             } else {
-                app.scroll_detail_down(1);
+                scroll_detail_down_bounded(app, 1);
             }
         }
         KeyCode::PageUp => {
@@ -642,20 +978,20 @@ fn handle_span_detail_key(
         }
         KeyCode::PageDown => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                app.scroll_detail_down(10);
+                scroll_detail_down_bounded(app, 10);
             }
         }
         KeyCode::Backspace => {
             app.screen = Screen::Traces;
             app.set_status(
-                "Back to traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit",
+                "Back to traces. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit",
             );
         }
-        KeyCode::Left => {
+        KeyCode::Left | KeyCode::Char('h') => {
             app.detail_pane_focus = DetailPaneFocus::Tree;
             app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
         }
-        KeyCode::Right => {
+        KeyCode::Right | KeyCode::Char('l') => {
             app.detail_pane_focus = DetailPaneFocus::Detail;
             app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
         }
@@ -696,12 +1032,72 @@ fn handle_span_detail_key(
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                app.scroll_detail_down(10)
+                scroll_detail_down_bounded(app, 10)
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn scroll_detail_down_bounded(app: &mut TraceViewerApp, amount: u16) {
+    let max_scroll = current_span_detail_max_scroll(app).unwrap_or(MAX_SAFE_PARAGRAPH_SCROLL);
+    app.detail_scroll = app.detail_scroll.saturating_add(amount).min(max_scroll);
+}
+
+fn scroll_detail_to_bottom(app: &mut TraceViewerApp) {
+    let max_scroll = current_span_detail_max_scroll(app).unwrap_or(MAX_SAFE_PARAGRAPH_SCROLL);
+    app.detail_scroll = max_scroll;
+}
+
+fn current_span_detail_max_scroll(app: &TraceViewerApp) -> Option<u16> {
+    if app.detail_view != DetailView::Span {
+        return None;
+    }
+
+    let span = app.current_span()?;
+    let full_row = app.full_span_cache.get(&span.id);
+    let is_loading = app
+        .full_span_loading_row_id
+        .as_deref()
+        .map(|id| id == span.id)
+        .unwrap_or(false);
+
+    let detail_text = render_span_details(
+        span,
+        full_row.unwrap_or(&span.row),
+        full_row.is_some(),
+        is_loading,
+        None,
+    );
+
+    let (content_width, content_height) = span_detail_content_size()?;
+    let wrapped_lines = wrapped_line_count(&detail_text, content_width);
+    let max_scroll = wrapped_lines.saturating_sub(content_height);
+    Some(u16::try_from(max_scroll).unwrap_or(MAX_SAFE_PARAGRAPH_SCROLL))
+}
+
+fn span_detail_content_size() -> Option<(usize, usize)> {
+    let (terminal_width, terminal_height) = crossterm::terminal::size().ok()?;
+    let center_height = terminal_height.saturating_sub(6);
+    let detail_width = ((u32::from(terminal_width) * 65) / 100) as u16;
+
+    let content_width = detail_width.saturating_sub(2).max(1);
+    let content_height = center_height.saturating_sub(2).max(1);
+    Some((usize::from(content_width), usize::from(content_height)))
+}
+
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return text.lines().count().max(1);
+    }
+
+    let mut total = 0usize;
+    for line in text.split('\n') {
+        let line_width = UnicodeWidthStr::width(line);
+        total += ((line_width + width.saturating_sub(1)) / width).max(1);
+    }
+    total.max(1)
 }
 
 fn request_refresh_traces(
@@ -805,12 +1201,12 @@ fn apply_summary_rows(
     if app.screen == Screen::Traces {
         if search_query.trim().is_empty() {
             app.set_status(format!(
-                "Loaded {} traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit",
+                "Loaded {} traces. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit",
                 app.traces.len()
             ));
         } else {
             app.set_status(format!(
-                "Loaded {} traces for '{search_query}'. Up/Down: move  Enter: open trace  /: search  r: refresh",
+                "Loaded {} traces for '{search_query}'. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh",
                 app.traces.len()
             ));
         }
@@ -873,6 +1269,105 @@ fn poll_pending_summary_load(
     if app.summary_load_rx.is_none() {
         if let Some((search_query, previous_root)) = app.summary_pending_refresh.take() {
             start_summary_load(app, client, handle, search_query, previous_root);
+        }
+    }
+
+    Ok(())
+}
+
+fn poll_pending_url_open(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    if app.url_open_rx.is_none() {
+        return Ok(());
+    }
+
+    app.url_open_spinner_tick = app.url_open_spinner_tick.wrapping_add(1);
+
+    if app
+        .url_open_started_at
+        .map(|start| start.elapsed() >= LOADER_DELAY)
+        .unwrap_or(false)
+    {
+        app.set_status(format!(
+            "Resolving URL {} {}",
+            app.url_open_loading_input,
+            spinner_char(app.url_open_spinner_tick)
+        ));
+    }
+
+    let recv_result = app.url_open_rx.as_ref().map(|rx| rx.try_recv());
+    let Some(recv_result) = recv_result else {
+        return Ok(());
+    };
+
+    match recv_result {
+        Ok((url_label, result)) => {
+            app.url_open_rx = None;
+            app.url_open_started_at = None;
+            app.url_open_loading_input.clear();
+            match result {
+                Ok(target) => {
+                    if target.project.id != app.project.id {
+                        app.project = target.project.clone();
+                        app.screen = Screen::Traces;
+                        app.traces.clear();
+                        app.selected_trace = 0;
+                        app.summary_load_rx = None;
+                        app.summary_load_started_at = None;
+                        app.summary_loading_search_query.clear();
+                        app.summary_pending_refresh = None;
+                        app.trace_load_rx = None;
+                        app.trace_loading_root_span_id = None;
+                        app.trace_pending_root_span_id = None;
+                        app.trace_load_started_at = None;
+                        app.full_span_load_rx = None;
+                        app.full_span_loading_row_id = None;
+                        app.full_span_pending_row_id = None;
+                        app.full_span_load_started_at = None;
+                        app.spans.clear();
+                        app.full_span_cache.clear();
+                        app.loaded_root_span_id = None;
+                        request_refresh_traces(app, client, handle)?;
+                    }
+
+                    let target_root = target.root_span_id.clone();
+                    app.pending_open_span_id = target.span_id.clone();
+                    app.pending_open_detail_view = Some(target.detail_view);
+                    request_trace_load_for_root_span(app, client, handle, target_root.clone())?;
+                    if app.screen == Screen::Traces {
+                        if let Some(idx) = app
+                            .traces
+                            .iter()
+                            .position(|row| row.root_span_id == target_root)
+                        {
+                            app.selected_trace = idx;
+                        }
+                    }
+                    app.set_status(format!("Opening trace from URL {url_label}..."));
+                }
+                Err(err) => {
+                    app.screen = Screen::Traces;
+                    let detail = root_error_message(&err);
+                    if let Some(query) = query_from_error(&err) {
+                        app.set_error_with_query(
+                            format!("Failed to resolve trace URL: {detail}"),
+                            query,
+                        );
+                    } else {
+                        app.set_error(format!("Failed to resolve trace URL: {detail}"));
+                    }
+                }
+            }
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            app.url_open_rx = None;
+            app.url_open_started_at = None;
+            app.url_open_loading_input.clear();
+            app.set_error("Failed to resolve URL: request channel closed");
         }
     }
 
@@ -987,8 +1482,24 @@ fn apply_loaded_trace_rows(
     app.full_span_load_rx = None;
     app.selected_span = 0;
     app.detail_scroll = 0;
-    app.detail_view = DetailView::Span;
-    app.detail_pane_focus = DetailPaneFocus::Tree;
+    if let Some(target_span_id) = app.pending_open_span_id.take() {
+        if let Some(idx) = app
+            .spans
+            .iter()
+            .position(|span| span.span_id == target_span_id || span.id == target_span_id)
+        {
+            app.selected_span = idx;
+        }
+    }
+    app.detail_view = app
+        .pending_open_detail_view
+        .take()
+        .unwrap_or(DetailView::Span);
+    app.detail_pane_focus = if app.detail_view == DetailView::Thread {
+        DetailPaneFocus::Detail
+    } else {
+        DetailPaneFocus::Tree
+    };
     app.thread_messages = None;
     app.thread_selected_message = 0;
     app.thread_expanded.clear();
@@ -999,6 +1510,9 @@ fn apply_loaded_trace_rows(
     app.screen = Screen::SpanDetail;
     app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
     request_selected_span_load(app, client, handle, false)?;
+    if app.detail_view == DetailView::Thread {
+        request_thread_messages_load(app, client, handle, false)?;
+    }
 
     Ok(())
 }
@@ -1057,6 +1571,9 @@ fn poll_pending_trace_load(
                     apply_loaded_trace_rows(app, client, handle, root_span_id, rows)?;
                 }
                 Err(err) => {
+                    if app.screen == Screen::OpeningTrace {
+                        app.screen = Screen::Traces;
+                    }
                     let detail = root_error_message(&err);
                     if let Some(query) = query_from_error(&err) {
                         app.set_error_with_query(
@@ -1102,6 +1619,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TraceViewerApp) {
     let header_title = match app.screen {
         Screen::Traces => "Trace Explorer",
         Screen::SpanDetail => "Trace Explorer / Detail",
+        Screen::OpeningTrace => "Trace Explorer / Opening",
     };
     let header = Paragraph::new(Line::from(vec![
         Span::styled(header_title, Style::default().add_modifier(Modifier::BOLD)),
@@ -1122,6 +1640,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TraceViewerApp) {
     match app.screen {
         Screen::Traces => draw_traces_table(frame, chunks[1], app),
         Screen::SpanDetail => draw_span_detail_view(frame, chunks[1], app),
+        Screen::OpeningTrace => draw_opening_trace_view(frame, chunks[1], app),
     }
 
     let status_style = if app.status_is_error {
@@ -1157,24 +1676,39 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
         .map(|start| start.elapsed() >= LOADER_DELAY)
         .unwrap_or(false);
     let summary_spinner = spinner_char(app.summary_spinner_tick);
+    let url_loading = app
+        .url_open_started_at
+        .map(|start| start.elapsed() >= LOADER_DELAY)
+        .unwrap_or(false);
+    let url_spinner = spinner_char(app.url_open_spinner_tick);
 
-    let search_text = if app.trace_search_mode {
+    let top_text = if app.url_open_mode {
+        app.url_open_input.as_str()
+    } else if app.trace_search_mode {
         app.trace_search_input.as_str()
     } else {
         app.trace_search_query.as_str()
     };
-    let search_line = if search_text.trim().is_empty() {
+    let search_line = if top_text.trim().is_empty() {
         Line::from(Span::styled(
-            "Press / to search traces",
+            if app.url_open_mode {
+                "Paste Braintrust trace URL"
+            } else {
+                "Press / to search traces"
+            },
             Style::default().fg(Color::DarkGray),
         ))
-    } else if app.trace_search_mode {
-        Line::from(Span::raw(format!("{search_text}█")))
+    } else if app.trace_search_mode || app.url_open_mode {
+        Line::from(Span::raw(format!("{top_text}█")))
     } else {
-        Line::from(Span::raw(search_text))
+        Line::from(Span::raw(top_text))
     };
     let search_block = Block::default()
-        .title(if app.trace_search_mode {
+        .title(if app.url_open_mode {
+            "Open URL [active]".to_string()
+        } else if url_loading {
+            format!("Open URL [loading {url_spinner}]")
+        } else if app.trace_search_mode {
             "Search [active]".to_string()
         } else if summary_loading {
             format!("Search [loading {summary_spinner}]")
@@ -1183,14 +1717,20 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
         })
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(if app.trace_search_mode || summary_loading {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        })
-        .title_bottom(if app.trace_search_mode {
+        .border_style(
+            if app.url_open_mode || url_loading || app.trace_search_mode || summary_loading {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        )
+        .title_bottom(if app.url_open_mode {
+            "Enter open  Esc cancel  Ctrl+u clear"
+        } else if url_loading {
+            "Resolving URL..."
+        } else if app.trace_search_mode {
             "Enter apply  Esc cancel  Ctrl+u clear"
         } else if summary_loading {
             let search = app.summary_loading_search_query.trim();
@@ -1200,7 +1740,7 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
                 "Searching..."
             }
         } else {
-            "/ edit search"
+            "/ search  Ctrl+k open URL"
         });
     let search_widget = Paragraph::new(search_line).block(search_block);
     frame.render_widget(search_widget, chunks[0]);
@@ -1260,10 +1800,11 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
                             spinner_char(app.trace_spinner_tick)
                         )
                     } else {
-                        "Enter opens selected trace  / search  r refresh".to_string()
+                        "Enter opens selected trace  / search  Ctrl+k open URL  r refresh"
+                            .to_string()
                     }
                 } else {
-                    "Enter opens selected trace  / search  r refresh".to_string()
+                    "Enter opens selected trace  / search  Ctrl+k open URL  r refresh".to_string()
                 },
             ),
     )
@@ -1409,6 +1950,45 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
             }
         }
     }
+}
+
+fn draw_opening_trace_view(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &TraceViewerApp,
+) {
+    let spinner = spinner_char(
+        app.url_open_spinner_tick
+            .wrapping_add(app.trace_spinner_tick)
+            .wrapping_add(app.summary_spinner_tick),
+    );
+
+    let detail = if app.url_open_rx.is_some() {
+        format!(
+            "Opening trace {spinner}\n\nResolving URL reference: {}",
+            if app.url_open_loading_input.is_empty() {
+                "<url>"
+            } else {
+                app.url_open_loading_input.as_str()
+            }
+        )
+    } else if let Some(root_span_id) = app.trace_loading_root_span_id.as_deref() {
+        format!("Opening trace {spinner}\n\nLoading spans for root_span_id:\n{root_span_id}")
+    } else if app.summary_load_rx.is_some() {
+        "Opening trace...\n\nRefreshing project traces...".to_string()
+    } else {
+        "Opening trace...".to_string()
+    };
+
+    let panel = Paragraph::new(detail)
+        .block(
+            Block::default()
+                .title("Trace Open")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
 }
 
 fn parse_summary_rows(rows: Vec<Map<String, Value>>) -> Vec<TraceSummaryRow> {
@@ -1682,10 +2262,9 @@ fn extract_parent_span_id(row: &Map<String, Value>) -> Option<String> {
 fn span_label(row: &Map<String, Value>, span_id: &str) -> String {
     let span_attributes = value_as_object_owned(row.get("span_attributes")).unwrap_or_default();
 
-    let name = value_as_string(span_attributes.get("name")).unwrap_or_else(|| span_id.to_string());
+    let fallback_name =
+        value_as_string(span_attributes.get("name")).unwrap_or_else(|| span_id.to_string());
     let kind = value_as_string(span_attributes.get("type")).unwrap_or_else(|| "span".to_string());
-
-    let duration = format_duration(row.get("metrics"));
     let has_error = row
         .get("error")
         .map(|v| match v {
@@ -1695,11 +2274,150 @@ fn span_label(row: &Map<String, Value>, span_id: &str) -> String {
         })
         .unwrap_or(false);
 
-    if has_error {
-        format!("{name} [{kind}] {duration} !")
+    let model_name = if kind.eq_ignore_ascii_case("llm") {
+        extract_model_name(row)
     } else {
-        format!("{name} [{kind}] {duration}")
+        None
+    };
+
+    let mut details: Vec<String> = Vec::new();
+    if let Some(duration_seconds) = extract_duration_seconds(row.get("metrics")) {
+        details.push(format_compact_duration(duration_seconds));
     }
+    if let Some(total_tokens) = extract_total_tokens(row) {
+        details.push(format!("{} tok", format_u64_with_commas(total_tokens)));
+    }
+
+    let mut label = if kind.eq_ignore_ascii_case("llm") {
+        model_name.unwrap_or(fallback_name)
+    } else if kind == "span" {
+        fallback_name
+    } else {
+        format!("{fallback_name} [{kind}]")
+    };
+    if !details.is_empty() {
+        label.push_str(" | ");
+        label.push_str(&details.join(" | "));
+    }
+    if has_error {
+        label.push_str(" !");
+    }
+    label
+}
+
+fn extract_duration_seconds(metrics: Option<&Value>) -> Option<f64> {
+    let metrics_obj = value_as_object_owned(metrics)?;
+    let duration = metrics_obj.get("duration")?;
+    match duration {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn format_compact_duration(seconds: f64) -> String {
+    if seconds < 1.0 {
+        format!("{seconds:.2}s")
+    } else if seconds < 10.0 {
+        format!("{seconds:.2}s")
+    } else if seconds < 100.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{seconds:.0}s")
+    }
+}
+
+fn extract_total_tokens(row: &Map<String, Value>) -> Option<u64> {
+    let metrics = value_as_object_owned(row.get("metrics"))?;
+    let total = parse_u64ish(metrics.get("total_tokens"))
+        .or_else(|| parse_u64ish(metrics.get("tokens")))
+        .or_else(|| {
+            let prompt = parse_u64ish(metrics.get("prompt_tokens"))
+                .or_else(|| parse_u64ish(metrics.get("input_tokens")));
+            let completion = parse_u64ish(metrics.get("completion_tokens"))
+                .or_else(|| parse_u64ish(metrics.get("output_tokens")));
+            match (prompt, completion) {
+                (Some(p), Some(c)) => Some(p.saturating_add(c)),
+                _ => None,
+            }
+        })?;
+    if total == 0 {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+fn extract_model_name(row: &Map<String, Value>) -> Option<String> {
+    let span_attributes = value_as_object_owned(row.get("span_attributes")).unwrap_or_default();
+
+    let model = value_as_string(row.get("metadata.model"))
+        .or_else(|| value_as_string(row.get("metadata_model")))
+        .or_else(|| value_as_string(row.get("model")))
+        .or_else(|| {
+            let metadata = value_as_object_owned(row.get("metadata"))?;
+            value_as_string(metadata.get("model"))
+        })
+        .or_else(|| {
+            let metadata = value_as_object_owned(row.get("metadata"))?;
+            value_as_string(metadata.get("model_name"))
+        })
+        .or_else(|| {
+            let metadata = value_as_object_owned(row.get("metadata"))?;
+            let model_obj = value_as_object_owned(metadata.get("model"))?;
+            value_as_string(model_obj.get("name"))
+                .or_else(|| value_as_string(model_obj.get("id")))
+                .or_else(|| value_as_string(model_obj.get("model")))
+        })
+        .or_else(|| value_as_string(span_attributes.get("model")));
+
+    model.and_then(|m| {
+        let trimmed = m.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_u64ish(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok())),
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            if let Ok(v) = s.parse::<u64>() {
+                return Some(v);
+            }
+            s.parse::<f64>().ok().and_then(|v| {
+                if v.is_finite() && v >= 0.0 {
+                    Some(v.round() as u64)
+                } else {
+                    None
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+fn format_u64_with_commas(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    let len = digits.len();
+    for (idx, ch) in digits.chars().enumerate() {
+        out.push(ch);
+        let remaining = len.saturating_sub(idx + 1);
+        if remaining > 0 && remaining % 3 == 0 {
+            out.push(',');
+        }
+    }
+    out
 }
 
 fn render_span_details(
@@ -2040,16 +2758,16 @@ fn draw_thread_messages_list(
 fn span_detail_status(view: DetailView, pane_focus: DetailPaneFocus) -> &'static str {
     match (view, pane_focus) {
         (DetailView::Span, DetailPaneFocus::Tree) => {
-            "Span view (tree focus). Right: detail pane  Up/Down: select span  t: thread  Backspace/Esc: back"
+            "Span view (tree focus). Right: detail pane  Up/Down: select span  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Span, DetailPaneFocus::Detail) => {
-            "Span view (detail focus). Left: tree pane  Up/Down: scroll  Enter: load span  t: thread  Backspace/Esc: back"
+            "Span view (detail focus). Left: tree pane  Up/Down: scroll  Enter: load span  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Thread, DetailPaneFocus::Tree) => {
-            "Thread view (tree focus). Right: detail pane  Up/Down: select span  Enter: toggle/retry  t: span  Backspace/Esc: back"
+            "Thread view (tree focus). Right: detail pane  Up/Down: select span  Enter: toggle/retry  t: span  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Thread, DetailPaneFocus::Detail) => {
-            "Thread view (detail focus). Left: tree pane  Up/Down: select message  Enter: expand/collapse (or retry)  t: span  Backspace/Esc: back"
+            "Thread view (detail focus). Left: tree pane  Up/Down: select message  Enter: expand/collapse (or retry)  t: span  Ctrl+k: open URL  Backspace/Esc: back"
         }
     }
 }
@@ -2158,6 +2876,263 @@ fn project_label(project: &ProjectSelection) -> String {
     }
 }
 
+fn select_startup_url(
+    long_url: Option<&str>,
+    positional_url: Option<&str>,
+) -> Result<Option<String>> {
+    match (long_url, positional_url) {
+        (Some(a), Some(b)) if a.trim() != b.trim() => {
+            bail!("received both --url and positional URL with different values; pass only one")
+        }
+        (Some(a), _) => Ok(Some(a.trim().to_string())),
+        (_, Some(b)) => Ok(Some(b.trim().to_string())),
+        _ => Ok(None),
+    }
+}
+
+fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
+    let input = input.trim();
+    if input.is_empty() {
+        bail!("trace URL is empty");
+    }
+
+    let parsed_url = if let Ok(url) = Url::parse(input) {
+        url
+    } else if input.contains("://") {
+        Url::parse(input).context("invalid trace URL")?
+    } else {
+        let with_scheme = if input.starts_with('/') {
+            format!("https://www.braintrust.dev{input}")
+        } else {
+            format!("https://{input}")
+        };
+        Url::parse(&with_scheme).context("invalid trace URL")?
+    };
+
+    let mut parsed = ParsedTraceUrl {
+        org: None,
+        project: None,
+        page: None,
+        row_ref: None,
+        span_id: None,
+        trace_view_type: None,
+    };
+
+    if let Some(segments) = parsed_url.path_segments() {
+        let parts: Vec<&str> = segments.filter(|part| !part.is_empty()).collect();
+        if parts.len() >= 2 && parts[0] == "app" {
+            parsed.org = Some(parts[1].to_string());
+            if parts.len() >= 4 && parts[2] == "p" {
+                parsed.project = Some(parts[3].to_string());
+                if parts.len() >= 5 {
+                    parsed.page = Some(parts[4].to_string());
+                }
+            }
+        }
+    }
+
+    for (key, value) in parsed_url.query_pairs() {
+        match key.as_ref() {
+            "r" => {
+                if !value.is_empty() {
+                    parsed.row_ref = Some(value.to_string());
+                }
+            }
+            "s" => {
+                if !value.is_empty() {
+                    parsed.span_id = Some(value.to_string());
+                }
+            }
+            "tvt" => {
+                if !value.is_empty() {
+                    parsed.trace_view_type = Some(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if parsed.row_ref.is_none() && parsed.span_id.is_none() {
+        bail!("trace URL must include query parameter `r` or `s`");
+    }
+
+    Ok(parsed)
+}
+
+fn detail_view_from_tvt(trace_view_type: Option<&str>) -> DetailView {
+    if trace_view_type
+        .map(|v| v.eq_ignore_ascii_case("thread"))
+        .unwrap_or(false)
+    {
+        DetailView::Thread
+    } else {
+        DetailView::Span
+    }
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (idx, b) in bytes.iter().enumerate() {
+        let is_hyphen = matches!(idx, 8 | 13 | 18 | 23);
+        if is_hyphen {
+            if *b != b'-' {
+                return false;
+            }
+        } else if !(*b as char).is_ascii_hexdigit() {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn resolve_trace_target_for_url(
+    client: &ApiClient,
+    current_project: &ProjectSelection,
+    parsed: &ParsedTraceUrl,
+    print_queries: bool,
+) -> Result<ResolvedTraceTarget> {
+    let project =
+        resolve_project_target_for_url(client, current_project, parsed.project.as_deref()).await?;
+    let project_id = project.id.as_str();
+
+    let mut root_span_id: Option<String> = None;
+    if let Some(row_ref) = parsed.row_ref.as_deref() {
+        root_span_id = lookup_root_span_id_for_query(
+            client,
+            &build_url_lookup_by_root_span_id_query(project_id, row_ref),
+            "url-open-root-span-id",
+            print_queries,
+        )
+        .await?;
+
+        if root_span_id.is_none() {
+            root_span_id = lookup_root_span_id_for_query(
+                client,
+                &build_url_lookup_by_row_id_query(project_id, row_ref),
+                "url-open-row-id",
+                print_queries,
+            )
+            .await?;
+        }
+    }
+
+    if root_span_id.is_none() {
+        if let Some(span_id) = parsed.span_id.as_deref() {
+            root_span_id = lookup_root_span_id_for_query(
+                client,
+                &build_url_lookup_by_span_id_query(project_id, span_id),
+                "url-open-span-id",
+                print_queries,
+            )
+            .await?;
+        }
+    }
+
+    let root_span_id = root_span_id.with_context(|| {
+        if let Some(row_ref) = parsed.row_ref.as_deref() {
+            format!(
+                "could not resolve trace from URL parameter r='{row_ref}' (tried root_span_id then row id lookup)"
+            )
+        } else if let Some(span_id) = parsed.span_id.as_deref() {
+            format!("could not resolve trace from URL parameter s='{span_id}'")
+        } else {
+            "trace URL must include query parameter `r` or `s`".to_string()
+        }
+    })?;
+
+    Ok(ResolvedTraceTarget {
+        project,
+        root_span_id,
+        span_id: parsed.span_id.clone(),
+        detail_view: detail_view_from_tvt(parsed.trace_view_type.as_deref()),
+    })
+}
+
+async fn resolve_project_target_for_url(
+    client: &ApiClient,
+    current_project: &ProjectSelection,
+    url_project: Option<&str>,
+) -> Result<ProjectSelection> {
+    let Some(url_project) = url_project else {
+        return Ok(current_project.clone());
+    };
+
+    let matches_current = url_project == current_project.id
+        || current_project
+            .name
+            .as_deref()
+            .map(|name| name == url_project)
+            .unwrap_or(false);
+    if matches_current {
+        return Ok(current_project.clone());
+    }
+
+    if is_uuid_like(url_project) {
+        return Ok(ProjectSelection {
+            id: url_project.to_string(),
+            name: None,
+        });
+    }
+
+    let project = get_project_by_name(client, url_project)
+        .await?
+        .with_context(|| format!("project '{url_project}' not found"))?;
+    Ok(ProjectSelection {
+        id: project.id,
+        name: Some(project.name),
+    })
+}
+
+async fn lookup_root_span_id_for_query(
+    client: &ApiClient,
+    query: &str,
+    label: &str,
+    print_queries: bool,
+) -> Result<Option<String>> {
+    maybe_print_query(print_queries, label, query);
+    let response = execute_query(client, query)
+        .await
+        .with_context(|| format!("BTQL query failed: {query}"))?;
+
+    Ok(response
+        .data
+        .into_iter()
+        .next()
+        .and_then(|row| {
+            value_as_string(row.get("root_span_id")).or_else(|| value_as_string(row.get("span_id")))
+        })
+        .filter(|v| !v.is_empty()))
+}
+
+fn build_url_lookup_by_root_span_id_query(project_id: &str, root_span_id: &str) -> String {
+    format!(
+        "select: root_span_id, span_id | from: project_logs({}) spans | filter: root_span_id = {} | limit: 1",
+        sql_quote(project_id),
+        sql_quote(root_span_id),
+    )
+}
+
+fn build_url_lookup_by_row_id_query(project_id: &str, row_id: &str) -> String {
+    format!(
+        "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: id = {} | limit: 1",
+        sql_quote(project_id),
+        sql_quote(row_id),
+    )
+}
+
+fn build_url_lookup_by_span_id_query(project_id: &str, span_id: &str) -> String {
+    format!(
+        "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: span_id = {} | limit: 1",
+        sql_quote(project_id),
+        sql_quote(span_id),
+    )
+}
+
 fn build_summary_query(
     project_id: &str,
     preview_length: usize,
@@ -2205,7 +3180,7 @@ fn build_spans_query(
         .map(|c| format!(" | cursor: {}", btql_quote(c)))
         .unwrap_or_default();
     format!(
-        "select: id, span_id, root_span_id, _pagination_key, _xact_id, created, span_parents, span_attributes, error, scores, metrics | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: 125 | sort: _pagination_key ASC | limit: {}{}",
+        "select: id, span_id, root_span_id, _pagination_key, _xact_id, created, span_parents, span_attributes, metadata.model, error, scores, metrics | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: 125 | sort: _pagination_key ASC | limit: {}{}",
         sql_quote(project_id),
         sql_quote(root_span_id),
         limit,
