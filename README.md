@@ -133,6 +133,20 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - If eval execution fails with ESM/top-level-await related errors, retry with:
   - `bt eval --runner vite-node tutorial.eval.ts`
 
+## `bt traces`
+
+- Open an interactive terminal trace viewer for a project:
+  - `bt -p <project-name> traces`
+  - `bt traces --project-id <project-id>`
+- Optional flags:
+  - `--limit <N>`: number of summary traces to load (default `50`)
+  - `--preview-length <N>`: preview length used in summary rows (default `125`)
+  - `--print-queries`: print each SQL query before execution
+- Controls:
+  - Trace table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
+  - Span view: `Up/Down` to select span, `PgUp/PgDn` to scroll, `Esc` to go back
+  - Global: `q` to quit
+
 ## Roadmap / TODO
 
 - Add richer channel controls for self-update (for example pinned/branch canary selection).
