@@ -141,6 +141,7 @@ dependencies = [
  "dotenvy",
  "indicatif",
  "open",
+ "pathdiff",
  "ratatui",
  "reqwest",
  "serde",

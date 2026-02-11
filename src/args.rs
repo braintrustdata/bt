@@ -6,7 +6,7 @@ use crate::config::Config;
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
     /// Output as JSON
-    #[arg(short = 'j', long)]
+    #[arg(short = 'j', long, global = true)]
     pub json: bool,
 
     /// Override active org

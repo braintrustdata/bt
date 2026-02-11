@@ -26,6 +26,7 @@ dotenvy = "0.15"
 open = "5"
 urlencoding = "2"
 dirs = "5"
+pathdiff = "0.2.3"
 
 [profile.dist]
 inherits = "release"
