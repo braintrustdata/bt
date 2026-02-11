@@ -146,7 +146,8 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
   - Trace table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
   - Detail view: `t` toggles between span detail and thread view (project default preprocessor)
   - Split-pane focus: `Right` focuses detail pane, `Left` focuses span tree
-  - Span/detail nav: with tree focus `Up/Down` selects spans; with detail focus `Up/Down` scrolls (`PgUp/PgDn` also scroll)
+  - Span/detail nav: with tree focus `Up/Down` selects spans; in span detail focus `Up/Down` scrolls (`PgUp/PgDn` also scroll)
+  - Thread blocks: in thread detail focus, `Up/Down` selects messages and `Enter` expands/collapses (collapsed by default)
   - Back: `Backspace` or `Esc` returns to trace table
   - Global: `q` to quit
 

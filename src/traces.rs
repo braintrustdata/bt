@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::IsTerminal;
@@ -17,7 +18,8 @@ use ratatui::prelude::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Wrap,
 };
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
@@ -118,11 +120,17 @@ struct TraceViewerApp {
     selected_trace: usize,
     spans: Vec<SpanListEntry>,
     full_span_cache: HashMap<String, Map<String, Value>>,
+    full_span_loading_row_id: Option<String>,
+    full_span_pending_row_id: Option<String>,
+    full_span_spinner_tick: usize,
+    full_span_load_rx: Option<Receiver<(String, Result<Option<Map<String, Value>>>)>>,
     selected_span: usize,
     detail_scroll: u16,
     detail_view: DetailView,
     detail_pane_focus: DetailPaneFocus,
     thread_messages: Option<Vec<Value>>,
+    thread_selected_message: usize,
+    thread_expanded: HashSet<usize>,
     thread_loading: bool,
     thread_spinner_tick: usize,
     thread_load_rx: Option<Receiver<Result<Vec<Value>>>>,
@@ -154,11 +162,17 @@ impl TraceViewerApp {
             selected_trace: 0,
             spans: Vec::new(),
             full_span_cache: HashMap::new(),
+            full_span_loading_row_id: None,
+            full_span_pending_row_id: None,
+            full_span_spinner_tick: 0,
+            full_span_load_rx: None,
             selected_span: 0,
             detail_scroll: 0,
             detail_view: DetailView::Span,
             detail_pane_focus: DetailPaneFocus::Tree,
             thread_messages: None,
+            thread_selected_message: 0,
+            thread_expanded: HashSet::new(),
             thread_loading: false,
             thread_spinner_tick: 0,
             thread_load_rx: None,
@@ -231,6 +245,30 @@ impl TraceViewerApp {
 
     fn scroll_detail_down(&mut self, amount: u16) {
         self.detail_scroll = self.detail_scroll.saturating_add(amount);
+    }
+
+    fn move_thread_message_up(&mut self) {
+        if self.thread_selected_message > 0 {
+            self.thread_selected_message -= 1;
+        }
+    }
+
+    fn move_thread_message_down(&mut self) {
+        let Some(messages) = &self.thread_messages else {
+            return;
+        };
+        if self.thread_selected_message + 1 < messages.len() {
+            self.thread_selected_message += 1;
+        }
+    }
+
+    fn toggle_selected_thread_message(&mut self) {
+        let idx = self.thread_selected_message;
+        if self.thread_expanded.contains(&idx) {
+            self.thread_expanded.remove(&idx);
+        } else {
+            self.thread_expanded.insert(idx);
+        }
     }
 }
 
@@ -396,6 +434,7 @@ fn run_app(
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     loop {
+        poll_pending_full_span_load(app, &client, &handle)?;
         poll_pending_thread_load(app);
         terminal.draw(|frame| draw_ui(frame, app))?;
 
@@ -472,8 +511,10 @@ fn handle_span_detail_key(
             if app.detail_pane_focus == DetailPaneFocus::Tree {
                 app.move_span_up();
                 if app.detail_view == DetailView::Span {
-                    ensure_selected_span_loaded(app, client, handle)?;
+                    request_selected_span_load(app, client, handle, false)?;
                 }
+            } else if app.detail_view == DetailView::Thread {
+                app.move_thread_message_up();
             } else {
                 app.scroll_detail_up(1);
             }
@@ -482,8 +523,10 @@ fn handle_span_detail_key(
             if app.detail_pane_focus == DetailPaneFocus::Tree {
                 app.move_span_down();
                 if app.detail_view == DetailView::Span {
-                    ensure_selected_span_loaded(app, client, handle)?;
+                    request_selected_span_load(app, client, handle, false)?;
                 }
+            } else if app.detail_view == DetailView::Thread {
+                app.move_thread_message_down();
             } else {
                 app.scroll_detail_down(1);
             }
@@ -512,9 +555,11 @@ fn handle_span_detail_key(
         }
         KeyCode::Enter => {
             if app.detail_view == DetailView::Span {
-                ensure_selected_span_loaded(app, client, handle)?;
-            } else {
+                request_selected_span_load(app, client, handle, true)?;
+            } else if app.thread_loading || app.thread_messages.is_none() {
                 request_thread_messages_load(app, client, handle, true)?;
+            } else {
+                app.toggle_selected_thread_message();
             }
         }
         KeyCode::Char('t') => {
@@ -530,7 +575,7 @@ fn handle_span_detail_key(
                 request_thread_messages_load(app, client, handle, false)?;
             } else {
                 app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
-                ensure_selected_span_loaded(app, client, handle)?;
+                request_selected_span_load(app, client, handle, false)?;
             }
         }
         KeyCode::Char('r') => {
@@ -641,18 +686,24 @@ fn load_selected_trace(
 
             app.spans = spans;
             app.full_span_cache.clear();
+            app.full_span_loading_row_id = None;
+            app.full_span_pending_row_id = None;
+            app.full_span_spinner_tick = 0;
+            app.full_span_load_rx = None;
             app.selected_span = 0;
             app.detail_scroll = 0;
             app.detail_view = DetailView::Span;
             app.detail_pane_focus = DetailPaneFocus::Tree;
             app.thread_messages = None;
+            app.thread_selected_message = 0;
+            app.thread_expanded.clear();
             app.thread_loading = false;
             app.thread_spinner_tick = 0;
             app.thread_load_rx = None;
             app.loaded_root_span_id = Some(root_span_id.clone());
             app.screen = Screen::SpanDetail;
             app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
-            ensure_selected_span_loaded(app, client, handle)?;
+            request_selected_span_load(app, client, handle, false)?;
         }
         Err(err) => {
             let detail = root_error_message(&err);
@@ -673,42 +724,65 @@ fn load_selected_trace(
 fn draw_ui(frame: &mut Frame<'_>, app: &TraceViewerApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
         .split(frame.area());
 
+    let header_title = match app.screen {
+        Screen::Traces => "Trace Explorer",
+        Screen::SpanDetail => "Trace Explorer / Detail",
+    };
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(header_title, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            project_label(&app.project),
+            Style::default().fg(Color::Gray),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title("bt traces"),
+    );
+    frame.render_widget(header, chunks[0]);
+
     match app.screen {
-        Screen::Traces => draw_traces_table(frame, chunks[0], app),
-        Screen::SpanDetail => draw_span_detail_view(frame, chunks[0], app),
+        Screen::Traces => draw_traces_table(frame, chunks[1], app),
+        Screen::SpanDetail => draw_span_detail_view(frame, chunks[1], app),
     }
 
     let status_style = if app.status_is_error {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
+        Style::default().fg(Color::Gray)
     };
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Project: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(project_label(&app.project)),
-        Span::raw("  |  "),
-        Span::styled(app.status.as_str(), status_style),
-    ])];
+    let mut lines = vec![Line::from(Span::styled(app.status.as_str(), status_style))];
     if !app.status_detail.is_empty() {
         lines.push(Line::from(Span::styled(
             app.status_detail.as_str(),
-            status_style,
+            Style::default().fg(Color::Red),
         )));
     }
 
-    let status = Paragraph::new(lines).block(Block::default().borders(Borders::TOP));
+    let status = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded),
+    );
 
-    frame.render_widget(status, chunks[1]);
+    frame.render_widget(status, chunks[2]);
 }
 
 fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &TraceViewerApp) {
     let header = Row::new(vec!["Created", "Trace", "Input", "Duration"]).style(
         Style::default()
-            .fg(Color::Gray)
+            .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -742,13 +816,14 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
     .header(header)
     .block(
         Block::default()
-            .title("Traces")
+            .title("Recent Traces")
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .title_bottom("Enter opens selected trace"),
     )
     .row_highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(Color::Rgb(42, 47, 56))
             .add_modifier(Modifier::BOLD),
     );
 
@@ -788,6 +863,7 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
             Block::default()
                 .title(tree_title)
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(if tree_is_focused {
                     Style::default()
                         .fg(Color::Cyan)
@@ -799,7 +875,7 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(Color::Rgb(42, 47, 56))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -809,55 +885,73 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
     }
     frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    let (detail_title, detail_text) = match app.detail_view {
-        DetailView::Span => {
-            let text = app
-                .current_span()
-                .map(|span| {
-                    let full_row = app.full_span_cache.get(&span.id);
-                    render_span_details(span, full_row.unwrap_or(&span.row), full_row.is_some())
-                })
-                .unwrap_or_else(|| "No span selected".to_string());
-            ("Span Detail", text)
-        }
-        DetailView::Thread => {
-            let text = if app.thread_loading {
-                render_thread_loading_state(app.thread_spinner_tick)
-            } else {
-                match &app.thread_messages {
-                    Some(messages) => render_thread_details(messages),
-                    None => {
-                        "Thread not loaded. Press `t` to load the thread view (or Enter to retry)."
-                            .to_string()
-                    }
-                }
-            };
-            ("Thread View", text)
-        }
+    let detail_title = match app.detail_view {
+        DetailView::Span => "Span Detail",
+        DetailView::Thread => "Thread View",
     };
     let detail_title_with_focus = if detail_is_focused {
         format!("{detail_title} [active]")
     } else {
         detail_title.to_string()
     };
+    let detail_block = Block::default()
+        .title(detail_title_with_focus)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if detail_is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
 
-    let detail = Paragraph::new(detail_text)
-        .block(
-            Block::default()
-                .title(detail_title_with_focus)
-                .borders(Borders::ALL)
-                .border_style(if detail_is_focused {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                }),
-        )
-        .scroll((app.detail_scroll, 0))
-        .wrap(Wrap { trim: false });
+    match app.detail_view {
+        DetailView::Span => {
+            let detail_text = app
+                .current_span()
+                .map(|span| {
+                    let full_row = app.full_span_cache.get(&span.id);
+                    let is_loading = app
+                        .full_span_loading_row_id
+                        .as_deref()
+                        .map(|id| id == span.id)
+                        .unwrap_or(false);
+                    render_span_details(
+                        span,
+                        full_row.unwrap_or(&span.row),
+                        full_row.is_some(),
+                        is_loading,
+                    )
+                })
+                .unwrap_or_else(|| "No span selected".to_string());
 
-    frame.render_widget(detail, chunks[1]);
+            let detail = Paragraph::new(detail_text)
+                .block(detail_block)
+                .scroll((app.detail_scroll, 0))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(detail, chunks[1]);
+        }
+        DetailView::Thread => {
+            if app.thread_loading {
+                let detail = Paragraph::new(render_thread_loading_state(app.thread_spinner_tick))
+                    .block(detail_block)
+                    .scroll((app.detail_scroll, 0))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(detail, chunks[1]);
+            } else if let Some(messages) = &app.thread_messages {
+                draw_thread_messages_list(frame, chunks[1], app, messages, detail_block);
+            } else {
+                let detail = Paragraph::new(
+                    "Thread not loaded. Press `t` to load the thread view (or Enter to retry).",
+                )
+                .block(detail_block)
+                .scroll((app.detail_scroll, 0))
+                .wrap(Wrap { trim: false });
+                frame.render_widget(detail, chunks[1]);
+            }
+        }
+    }
 }
 
 fn parse_summary_rows(rows: Vec<Map<String, Value>>) -> Vec<TraceSummaryRow> {
@@ -880,7 +974,10 @@ fn build_span_entries(rows: Vec<Map<String, Value>>) -> Vec<SpanListEntry> {
         root_span_id: String,
         parent_span_id: Option<String>,
         label: String,
-        sort_key: String,
+        pagination_key: String,
+        xact_id: String,
+        start_time: Option<f64>,
+        exec_counter: i64,
         row: Map<String, Value>,
     }
 
@@ -895,9 +992,12 @@ fn build_span_entries(rows: Vec<Map<String, Value>>) -> Vec<SpanListEntry> {
         let root_span_id =
             value_as_string(row.get("root_span_id")).unwrap_or_else(|| span_id.clone());
         let parent_span_id = extract_parent_span_id(&row);
-        let sort_key = value_as_string(row.get("_pagination_key"))
+        let pagination_key = value_as_string(row.get("_pagination_key"))
             .or_else(|| value_as_string(row.get("created")))
             .unwrap_or_default();
+        let xact_id = value_as_string(row.get("_xact_id")).unwrap_or_default();
+        let start_time = extract_start_time(&row);
+        let exec_counter = extract_exec_counter(&row);
 
         let label = span_label(&row, &span_id);
 
@@ -909,7 +1009,10 @@ fn build_span_entries(rows: Vec<Map<String, Value>>) -> Vec<SpanListEntry> {
                 root_span_id,
                 parent_span_id,
                 label,
-                sort_key,
+                pagination_key,
+                xact_id,
+                start_time,
+                exec_counter,
                 row,
             },
         );
@@ -919,36 +1022,99 @@ fn build_span_entries(rows: Vec<Map<String, Value>>) -> Vec<SpanListEntry> {
         return Vec::new();
     }
 
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    let mut roots: Vec<String> = Vec::new();
+    let root_span_id_hint = temp_spans
+        .values()
+        .next()
+        .map(|s| s.root_span_id.clone())
+        .unwrap_or_default();
 
+    let root_span_id = temp_spans
+        .values()
+        .find(|span| span.span_id == span.root_span_id)
+        .map(|span| span.span_id.clone())
+        .or_else(|| {
+            temp_spans
+                .values()
+                .find(|span| span.span_id == root_span_id_hint)
+                .map(|span| span.span_id.clone())
+        })
+        .or_else(|| {
+            temp_spans
+                .values()
+                .find(|span| span.parent_span_id.is_none())
+                .map(|span| span.span_id.clone())
+        })
+        .or_else(|| temp_spans.keys().next().cloned())
+        .unwrap_or_default();
+
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
     for span in temp_spans.values() {
-        if let Some(parent) = &span.parent_span_id {
-            if temp_spans.contains_key(parent) {
-                children
-                    .entry(parent.clone())
-                    .or_default()
-                    .push(span.span_id.clone());
-                continue;
-            }
+        if span.span_id == root_span_id {
+            continue;
         }
 
-        roots.push(span.span_id.clone());
+        let parent_key = match &span.parent_span_id {
+            Some(parent)
+                if parent != &span.span_id
+                    && temp_spans.contains_key(parent)
+                    && parent != &root_span_id =>
+            {
+                parent.clone()
+            }
+            _ => root_span_id.clone(),
+        };
+
+        children
+            .entry(parent_key)
+            .or_default()
+            .push(span.span_id.clone());
     }
+
+    let compare_span_ids = |a: &str, b: &str| {
+        let left = temp_spans.get(a);
+        let right = temp_spans.get(b);
+
+        let Some(left) = left else {
+            return a.cmp(b);
+        };
+        let Some(right) = right else {
+            return a.cmp(b);
+        };
+
+        match (left.start_time, right.start_time) {
+            (Some(a_start), Some(b_start)) => {
+                if let Some(ord) = a_start.partial_cmp(&b_start) {
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            (None, None) => {}
+        }
+
+        let exec_counter_cmp = left.exec_counter.cmp(&right.exec_counter);
+        if exec_counter_cmp != Ordering::Equal {
+            return exec_counter_cmp;
+        }
+
+        let pagination_cmp = left.pagination_key.cmp(&right.pagination_key);
+        if pagination_cmp != Ordering::Equal {
+            return pagination_cmp;
+        }
+
+        let xact_cmp = left.xact_id.cmp(&right.xact_id);
+        if xact_cmp != Ordering::Equal {
+            return xact_cmp;
+        }
+
+        left.span_id.cmp(&right.span_id)
+    };
 
     for child_ids in children.values_mut() {
-        child_ids.sort_by(|a, b| {
-            let a_key = temp_spans.get(a).map(|s| s.sort_key.as_str()).unwrap_or("");
-            let b_key = temp_spans.get(b).map(|s| s.sort_key.as_str()).unwrap_or("");
-            a_key.cmp(b_key)
-        });
+        child_ids.sort_by(|a, b| compare_span_ids(a, b));
     }
-
-    roots.sort_by(|a, b| {
-        let a_key = temp_spans.get(a).map(|s| s.sort_key.as_str()).unwrap_or("");
-        let b_key = temp_spans.get(b).map(|s| s.sort_key.as_str()).unwrap_or("");
-        a_key.cmp(b_key)
-    });
 
     let mut ordered: Vec<SpanListEntry> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -985,8 +1151,15 @@ fn build_span_entries(rows: Vec<Map<String, Value>>) -> Vec<SpanListEntry> {
         }
     }
 
-    for root in &roots {
-        visit(root, 0, &temp_spans, &children, &mut ordered, &mut visited);
+    if !root_span_id.is_empty() {
+        visit(
+            &root_span_id,
+            0,
+            &temp_spans,
+            &children,
+            &mut ordered,
+            &mut visited,
+        );
     }
 
     // Handle disconnected spans/cycles by appending anything not visited.
@@ -996,11 +1169,7 @@ fn build_span_entries(rows: Vec<Map<String, Value>>) -> Vec<SpanListEntry> {
         .cloned()
         .collect();
 
-    leftovers.sort_by(|a, b| {
-        let a_key = temp_spans.get(a).map(|s| s.sort_key.as_str()).unwrap_or("");
-        let b_key = temp_spans.get(b).map(|s| s.sort_key.as_str()).unwrap_or("");
-        a_key.cmp(b_key)
-    });
+    leftovers.sort_by(|a, b| compare_span_ids(a, b));
 
     for span_id in leftovers {
         visit(
@@ -1014,6 +1183,28 @@ fn build_span_entries(rows: Vec<Map<String, Value>>) -> Vec<SpanListEntry> {
     }
 
     ordered
+}
+
+fn extract_start_time(row: &Map<String, Value>) -> Option<f64> {
+    let metrics = value_as_object_owned(row.get("metrics"))?;
+    match metrics.get("start")? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_exec_counter(row: &Map<String, Value>) -> i64 {
+    let span_attributes = match value_as_object_owned(row.get("span_attributes")) {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    match span_attributes.get("exec_counter") {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn extract_parent_span_id(row: &Map<String, Value>) -> Option<String> {
@@ -1054,11 +1245,22 @@ fn span_label(row: &Map<String, Value>, span_id: &str) -> String {
     }
 }
 
-fn render_span_details(span: &SpanListEntry, row: &Map<String, Value>, is_full: bool) -> String {
+fn render_span_details(
+    span: &SpanListEntry,
+    row: &Map<String, Value>,
+    is_full: bool,
+    is_loading: bool,
+) -> String {
     let mut out = String::new();
 
     if !is_full {
-        out.push_str("FULL CONTENT: not loaded (loading on selection; press Enter to retry)\n\n");
+        if is_loading {
+            out.push_str("FULL CONTENT: loading in background...\n\n");
+        } else {
+            out.push_str(
+                "FULL CONTENT: not loaded (loading on selection; press Enter to retry)\n\n",
+            );
+        }
     }
 
     out.push_str(&format!("span_id: {}\n", span.span_id));
@@ -1208,49 +1410,165 @@ fn render_tool_calls_inline(tool_calls: &Value) -> String {
     }
 }
 
-fn render_thread_details(messages: &[Value]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("Thread view: {} messages\n", messages.len()));
+fn thread_role_style(role: &str) -> Style {
+    match role {
+        "user" => Style::default().fg(Color::Cyan),
+        "assistant" => Style::default().fg(Color::Green),
+        "tool" => Style::default().fg(Color::Yellow),
+        "system" | "developer" | "model" => Style::default().fg(Color::Magenta),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
 
+fn truncate_for_preview(text: &str, max_lines: usize, max_chars: usize) -> (String, bool) {
+    let mut lines_out: Vec<String> = Vec::new();
+    let mut truncated = false;
+    let mut seen_lines = 0usize;
+
+    for line in text.lines() {
+        seen_lines += 1;
+        if lines_out.len() >= max_lines {
+            truncated = true;
+            break;
+        }
+
+        let clipped = truncate_chars(line, max_chars);
+        if clipped.chars().count() < line.chars().count() {
+            truncated = true;
+        }
+        lines_out.push(clipped);
+    }
+
+    if seen_lines > max_lines {
+        truncated = true;
+    }
+
+    (lines_out.join("\n"), truncated)
+}
+
+fn draw_thread_messages_list(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &TraceViewerApp,
+    messages: &[Value],
+    detail_block: Block<'_>,
+) {
     if messages.is_empty() {
-        out.push_str("\nNo messages returned by preprocessor.");
-        return out;
+        let detail = Paragraph::new("No messages returned by preprocessor.")
+            .block(detail_block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(detail, area);
+        return;
     }
 
-    for (index, message) in messages.iter().enumerate() {
-        let (role, content, tool_calls) = match message {
-            Value::Object(obj) => (
-                value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string()),
-                obj.get("content"),
-                obj.get("tool_calls"),
-            ),
-            _ => ("message".to_string(), Some(message), None),
-        };
+    let items: Vec<ListItem<'_>> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let (role, content, tool_calls) = match message {
+                Value::Object(obj) => (
+                    value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string()),
+                    obj.get("content"),
+                    obj.get("tool_calls"),
+                ),
+                _ => ("message".to_string(), Some(message), None),
+            };
 
-        let role_display = role_display_name(&role);
-        out.push_str(&format!("\n{} {} ", "=".repeat(10), role_display));
-        out.push_str(&"=".repeat(40));
-        out.push_str(&format!("\n#{}\n\n", index + 1));
+            let expanded = app.thread_expanded.contains(&index);
+            let arrow = if expanded { "▾" } else { "▸" };
+            let role_display = role_display_name(&role);
 
-        let content_text = content.map(render_message_content).unwrap_or_default();
-        if content_text.trim().is_empty() {
-            out.push_str("(empty)\n");
-        } else {
-            out.push_str(content_text.trim_end());
-            out.push('\n');
-        }
+            let mut lines: Vec<Line<'_>> = vec![Line::from(vec![
+                Span::styled(
+                    format!("{arrow}  #{:<3}", index + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    role_display.to_string(),
+                    thread_role_style(&role).add_modifier(Modifier::BOLD),
+                ),
+            ])];
 
-        if let Some(calls) = tool_calls {
-            let tool_calls_text = render_tool_calls_inline(calls);
-            if !tool_calls_text.is_empty() {
-                out.push_str("\nTool calls:\n");
-                out.push_str(&tool_calls_text);
-                out.push('\n');
+            let content_text = content.map(render_message_content).unwrap_or_default();
+            let normalized_content = if content_text.trim().is_empty() {
+                "(empty)".to_string()
+            } else {
+                content_text.trim_end().to_string()
+            };
+            let (shown_content, content_truncated) = if expanded {
+                (normalized_content, false)
+            } else {
+                truncate_for_preview(&normalized_content, 4, 160)
+            };
+
+            for line in shown_content.lines() {
+                lines.push(Line::from(Span::raw(format!("    {line}"))));
             }
-        }
-    }
+            if content_truncated {
+                lines.push(Line::from(Span::styled(
+                    "    ...",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
 
-    out
+            if let Some(calls) = tool_calls {
+                let tool_calls_text = render_tool_calls_inline(calls);
+                if !tool_calls_text.trim().is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "    Tool calls:",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    let (shown_tools, tools_truncated) = if expanded {
+                        (tool_calls_text, false)
+                    } else {
+                        truncate_for_preview(&tool_calls_text, 3, 140)
+                    };
+                    for line in shown_tools.lines() {
+                        lines.push(Line::from(Span::raw(format!("      {line}"))));
+                    }
+                    if tools_truncated {
+                        lines.push(Line::from(Span::styled(
+                            "      ...",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+            }
+
+            if !expanded {
+                lines.push(Line::from(Span::styled(
+                    "    Enter to expand",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "    Enter to collapse",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::from(""));
+
+            ListItem::new(lines)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(detail_block.title_bottom(
+            "Up/Down: select message  Enter: expand/collapse  Left: span tree  t: span/thread",
+        ))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ");
+
+    let mut state = ListState::default();
+    state.select(Some(
+        app.thread_selected_message
+            .min(messages.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn span_detail_status(view: DetailView, pane_focus: DetailPaneFocus) -> &'static str {
@@ -1262,10 +1580,10 @@ fn span_detail_status(view: DetailView, pane_focus: DetailPaneFocus) -> &'static
             "Span view (detail focus). Left: tree pane  Up/Down: scroll  Enter: load span  t: thread  Backspace/Esc: back"
         }
         (DetailView::Thread, DetailPaneFocus::Tree) => {
-            "Thread view (tree focus). Right: detail pane  Up/Down: select span  Enter: retry thread  t: span  Backspace/Esc: back"
+            "Thread view (tree focus). Right: detail pane  Up/Down: select span  Enter: toggle/retry  t: span  Backspace/Esc: back"
         }
         (DetailView::Thread, DetailPaneFocus::Detail) => {
-            "Thread view (detail focus). Left: tree pane  Up/Down: scroll  Enter: retry thread  t: span  Backspace/Esc: back"
+            "Thread view (detail focus). Left: tree pane  Up/Down: select message  Enter: expand/collapse (or retry)  t: span  Backspace/Esc: back"
         }
     }
 }
@@ -1402,7 +1720,7 @@ fn build_spans_query(
         .map(|c| format!(" | cursor: {}", btql_quote(c)))
         .unwrap_or_default();
     format!(
-        "select: id, span_id, root_span_id, _pagination_key, created, span_parents, span_attributes, error, scores, metrics | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: 125 | sort: _pagination_key ASC | limit: {}{}",
+        "select: id, span_id, root_span_id, _pagination_key, _xact_id, created, span_parents, span_attributes, error, scores, metrics | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: 125 | sort: _pagination_key ASC | limit: {}{}",
         sql_quote(project_id),
         sql_quote(root_span_id),
         limit,
@@ -1610,47 +1928,147 @@ async fn fetch_thread_messages(
     Ok(extract_thread_messages(response))
 }
 
-fn ensure_selected_span_loaded(
+fn span_display_id_for_row_id(app: &TraceViewerApp, row_id: &str) -> String {
+    app.spans
+        .iter()
+        .find(|span| span.id == row_id)
+        .map(|span| span.span_id.clone())
+        .unwrap_or_else(|| row_id.to_string())
+}
+
+fn start_full_span_load_for_row_id(
     app: &mut TraceViewerApp,
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
+    row_id: String,
+) {
+    let (tx, rx) = mpsc::channel();
+    let client = client.clone();
+    let project_id = app.project.id.clone();
+    let print_queries = app.print_queries;
+    let row_id_for_task = row_id.clone();
+
+    handle.spawn(async move {
+        let result =
+            fetch_full_span_row(&client, &project_id, &row_id_for_task, print_queries).await;
+        let _ = tx.send((row_id_for_task, result));
+    });
+
+    app.full_span_loading_row_id = Some(row_id.clone());
+    app.full_span_spinner_tick = 0;
+    app.full_span_load_rx = Some(rx);
+
+    if app.detail_view == DetailView::Span {
+        let span_label = span_display_id_for_row_id(app, &row_id);
+        app.set_status(format!("Loading span {span_label} in background..."));
+    }
+}
+
+fn request_selected_span_load(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    force_refresh: bool,
 ) -> Result<()> {
     let Some(span) = app.current_span().cloned() else {
         return Ok(());
     };
 
-    if span.id.is_empty() || app.full_span_cache.contains_key(&span.id) {
+    if span.id.is_empty() {
         return Ok(());
     }
 
-    app.set_status(format!("Loading full span {}...", span.span_id));
-    let result = handle.block_on(fetch_full_span_row(
-        client,
-        &app.project.id,
-        &span.id,
-        app.print_queries,
-    ));
+    if !force_refresh && app.full_span_cache.contains_key(&span.id) {
+        return Ok(());
+    }
 
-    match result {
-        Ok(Some(row)) => {
-            app.full_span_cache.insert(span.id.clone(), row);
-            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+    if app
+        .full_span_loading_row_id
+        .as_deref()
+        .map(|id| id == span.id)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    if app.full_span_loading_row_id.is_some() {
+        app.full_span_pending_row_id = Some(span.id.clone());
+        return Ok(());
+    }
+
+    start_full_span_load_for_row_id(app, client, handle, span.id.clone());
+    Ok(())
+}
+
+fn poll_pending_full_span_load(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    if app.full_span_loading_row_id.is_none() {
+        if let Some(next_row_id) = app.full_span_pending_row_id.take() {
+            if !next_row_id.is_empty() && !app.full_span_cache.contains_key(&next_row_id) {
+                start_full_span_load_for_row_id(app, client, handle, next_row_id);
+            }
         }
-        Ok(None) => {
-            app.set_status(format!("No full row found for span {}", span.span_id));
+        return Ok(());
+    }
+
+    app.full_span_spinner_tick = app.full_span_spinner_tick.wrapping_add(1);
+
+    let recv_result = app.full_span_load_rx.as_ref().map(|rx| rx.try_recv());
+    let Some(recv_result) = recv_result else {
+        return Ok(());
+    };
+
+    match recv_result {
+        Ok((row_id, result)) => {
+            app.full_span_load_rx = None;
+            app.full_span_loading_row_id = None;
+
+            match result {
+                Ok(Some(row)) => {
+                    app.full_span_cache.insert(row_id.clone(), row);
+                    let current_selected_row_id = app
+                        .current_span()
+                        .map(|span| span.id.as_str())
+                        .unwrap_or("");
+                    if app.detail_view == DetailView::Span && current_selected_row_id == row_id {
+                        app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+                    }
+                }
+                Ok(None) => {
+                    if app.detail_view == DetailView::Span {
+                        let span_label = span_display_id_for_row_id(app, &row_id);
+                        app.set_status(format!("No full row found for span {span_label}"));
+                    }
+                }
+                Err(err) => {
+                    let detail = root_error_message(&err);
+                    let span_label = span_display_id_for_row_id(app, &row_id);
+                    if let Some(query) = query_from_error(&err) {
+                        app.set_error_with_query(
+                            format!("Failed to load full span {span_label}: {detail}"),
+                            query,
+                        );
+                    } else {
+                        app.set_error(format!("Failed to load full span {span_label}: {detail}"));
+                    }
+                }
+            }
         }
-        Err(err) => {
-            let detail = root_error_message(&err);
-            if let Some(query) = query_from_error(&err) {
-                app.set_error_with_query(
-                    format!("Failed to load full span {}: {detail}", span.span_id),
-                    query,
-                );
-            } else {
-                app.set_error(format!(
-                    "Failed to load full span {}: {detail}",
-                    span.span_id
-                ));
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            app.full_span_load_rx = None;
+            app.full_span_loading_row_id = None;
+            app.set_error("Failed to load full span: request channel closed");
+        }
+    }
+
+    if app.full_span_loading_row_id.is_none() {
+        if let Some(next_row_id) = app.full_span_pending_row_id.take() {
+            if !next_row_id.is_empty() && !app.full_span_cache.contains_key(&next_row_id) {
+                start_full_span_load_for_row_id(app, client, handle, next_row_id);
             }
         }
     }
@@ -1679,6 +2097,8 @@ fn request_thread_messages_load(
     }
 
     app.thread_messages = None;
+    app.thread_selected_message = 0;
+    app.thread_expanded.clear();
     app.thread_loading = true;
     app.thread_spinner_tick = 0;
     app.set_status(format!("Loading thread for trace {root_span_id}..."));
@@ -1714,6 +2134,17 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
             app.thread_loading = false;
             app.thread_load_rx = None;
             app.thread_messages = Some(messages);
+            if let Some(messages) = &app.thread_messages {
+                if messages.is_empty() {
+                    app.thread_selected_message = 0;
+                    app.thread_expanded.clear();
+                } else {
+                    app.thread_selected_message = app
+                        .thread_selected_message
+                        .min(messages.len().saturating_sub(1));
+                    app.thread_expanded.retain(|idx| *idx < messages.len());
+                }
+            }
             if app.detail_view == DetailView::Thread {
                 app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
             }
