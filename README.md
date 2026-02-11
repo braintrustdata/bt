@@ -141,10 +141,13 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - Optional flags:
   - `--limit <N>`: number of summary traces to load (default `50`)
   - `--preview-length <N>`: preview length used in summary rows (default `125`)
-  - `--print-queries`: print each SQL query before execution
+  - `--print-queries`: print each BTQL query and invoke payload before execution
 - Controls:
   - Trace table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
-  - Span view: `Up/Down` to select span, `PgUp/PgDn` to scroll, `Esc` to go back
+  - Detail view: `t` toggles between span detail and thread view (project default preprocessor)
+  - Split-pane focus: `Right` focuses detail pane, `Left` focuses span tree
+  - Span/detail nav: with tree focus `Up/Down` selects spans; with detail focus `Up/Down` scrolls (`PgUp/PgDn` also scroll)
+  - Back: `Backspace` or `Esc` returns to trace table
   - Global: `q` to quit
 
 ## Roadmap / TODO

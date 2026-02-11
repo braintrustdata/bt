@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::IsTerminal;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -30,6 +31,7 @@ use crate::ui::{fuzzy_select, with_spinner};
 
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
+const THREAD_PREPROCESSOR_NAME: &str = "project_default";
 
 #[derive(Debug, Clone, Args)]
 pub struct TracesArgs {
@@ -45,7 +47,7 @@ pub struct TracesArgs {
     #[arg(long, default_value_t = 125)]
     pub preview_length: usize,
 
-    /// Print each SQL query before execution
+    /// Print each BTQL query and invoke payload before execution
     #[arg(long)]
     pub print_queries: bool,
 }
@@ -98,6 +100,18 @@ enum Screen {
     SpanDetail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailView {
+    Span,
+    Thread,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailPaneFocus {
+    Tree,
+    Detail,
+}
+
 struct TraceViewerApp {
     project: ProjectSelection,
     traces: Vec<TraceSummaryRow>,
@@ -106,6 +120,12 @@ struct TraceViewerApp {
     full_span_cache: HashMap<String, Map<String, Value>>,
     selected_span: usize,
     detail_scroll: u16,
+    detail_view: DetailView,
+    detail_pane_focus: DetailPaneFocus,
+    thread_messages: Option<Vec<Value>>,
+    thread_loading: bool,
+    thread_spinner_tick: usize,
+    thread_load_rx: Option<Receiver<Result<Vec<Value>>>>,
     loaded_root_span_id: Option<String>,
     screen: Screen,
     status: String,
@@ -136,6 +156,12 @@ impl TraceViewerApp {
             full_span_cache: HashMap::new(),
             selected_span: 0,
             detail_scroll: 0,
+            detail_view: DetailView::Span,
+            detail_pane_focus: DetailPaneFocus::Tree,
+            thread_messages: None,
+            thread_loading: false,
+            thread_spinner_tick: 0,
+            thread_load_rx: None,
             loaded_root_span_id: None,
             screen: Screen::Traces,
             status,
@@ -370,6 +396,7 @@ fn run_app(
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     loop {
+        poll_pending_thread_load(app);
         terminal.draw(|frame| draw_ui(frame, app))?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -442,21 +469,69 @@ fn handle_span_detail_key(
 ) -> Result<()> {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            app.move_span_up();
-            ensure_selected_span_loaded(app, client, handle)?;
+            if app.detail_pane_focus == DetailPaneFocus::Tree {
+                app.move_span_up();
+                if app.detail_view == DetailView::Span {
+                    ensure_selected_span_loaded(app, client, handle)?;
+                }
+            } else {
+                app.scroll_detail_up(1);
+            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.move_span_down();
-            ensure_selected_span_loaded(app, client, handle)?;
+            if app.detail_pane_focus == DetailPaneFocus::Tree {
+                app.move_span_down();
+                if app.detail_view == DetailView::Span {
+                    ensure_selected_span_loaded(app, client, handle)?;
+                }
+            } else {
+                app.scroll_detail_down(1);
+            }
         }
-        KeyCode::PageUp => app.scroll_detail_up(10),
-        KeyCode::PageDown => app.scroll_detail_down(10),
-        KeyCode::Left | KeyCode::Backspace => {
+        KeyCode::PageUp => {
+            if app.detail_pane_focus == DetailPaneFocus::Detail {
+                app.scroll_detail_up(10);
+            }
+        }
+        KeyCode::PageDown => {
+            if app.detail_pane_focus == DetailPaneFocus::Detail {
+                app.scroll_detail_down(10);
+            }
+        }
+        KeyCode::Backspace => {
             app.screen = Screen::Traces;
             app.set_status("Back to traces. Up/Down: move  Enter: open trace  r: refresh  q: quit");
         }
+        KeyCode::Left => {
+            app.detail_pane_focus = DetailPaneFocus::Tree;
+            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+        }
+        KeyCode::Right => {
+            app.detail_pane_focus = DetailPaneFocus::Detail;
+            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+        }
         KeyCode::Enter => {
-            ensure_selected_span_loaded(app, client, handle)?;
+            if app.detail_view == DetailView::Span {
+                ensure_selected_span_loaded(app, client, handle)?;
+            } else {
+                request_thread_messages_load(app, client, handle, true)?;
+            }
+        }
+        KeyCode::Char('t') => {
+            app.detail_scroll = 0;
+            app.detail_view = if app.detail_view == DetailView::Span {
+                DetailView::Thread
+            } else {
+                DetailView::Span
+            };
+
+            if app.detail_view == DetailView::Thread {
+                app.detail_pane_focus = DetailPaneFocus::Detail;
+                request_thread_messages_load(app, client, handle, false)?;
+            } else {
+                app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+                ensure_selected_span_loaded(app, client, handle)?;
+            }
         }
         KeyCode::Char('r') => {
             if app.loaded_root_span_id.is_some() {
@@ -464,10 +539,14 @@ fn handle_span_detail_key(
             }
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_detail_up(10)
+            if app.detail_pane_focus == DetailPaneFocus::Detail {
+                app.scroll_detail_up(10)
+            }
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.scroll_detail_down(10)
+            if app.detail_pane_focus == DetailPaneFocus::Detail {
+                app.scroll_detail_down(10)
+            }
         }
         _ => {}
     }
@@ -564,11 +643,15 @@ fn load_selected_trace(
             app.full_span_cache.clear();
             app.selected_span = 0;
             app.detail_scroll = 0;
+            app.detail_view = DetailView::Span;
+            app.detail_pane_focus = DetailPaneFocus::Tree;
+            app.thread_messages = None;
+            app.thread_loading = false;
+            app.thread_spinner_tick = 0;
+            app.thread_load_rx = None;
             app.loaded_root_span_id = Some(root_span_id.clone());
             app.screen = Screen::SpanDetail;
-            app.set_status(
-                "Span view. Up/Down: span  PgUp/PgDn: scroll  Esc: back  r: reload  q: quit",
-            );
+            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
             ensure_selected_span_loaded(app, client, handle)?;
         }
         Err(err) => {
@@ -692,12 +775,27 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
         })
         .collect();
 
+    let tree_is_focused = app.detail_pane_focus == DetailPaneFocus::Tree;
+    let detail_is_focused = app.detail_pane_focus == DetailPaneFocus::Detail;
+    let tree_title = if tree_is_focused {
+        "Span Tree [active]"
+    } else {
+        "Span Tree"
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
-                .title("Span Tree")
+                .title(tree_title)
                 .borders(Borders::ALL)
-                .title_bottom("Esc returns to trace table"),
+                .border_style(if tree_is_focused {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                })
+                .title_bottom("Left/Right switch pane  t toggles thread/span  Backspace/Esc back"),
         )
         .highlight_style(
             Style::default()
@@ -711,16 +809,51 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
     }
     frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    let detail_text = app
-        .current_span()
-        .map(|span| {
-            let full_row = app.full_span_cache.get(&span.id);
-            render_span_details(span, full_row.unwrap_or(&span.row), full_row.is_some())
-        })
-        .unwrap_or_else(|| "No span selected".to_string());
+    let (detail_title, detail_text) = match app.detail_view {
+        DetailView::Span => {
+            let text = app
+                .current_span()
+                .map(|span| {
+                    let full_row = app.full_span_cache.get(&span.id);
+                    render_span_details(span, full_row.unwrap_or(&span.row), full_row.is_some())
+                })
+                .unwrap_or_else(|| "No span selected".to_string());
+            ("Span Detail", text)
+        }
+        DetailView::Thread => {
+            let text = if app.thread_loading {
+                render_thread_loading_state(app.thread_spinner_tick)
+            } else {
+                match &app.thread_messages {
+                    Some(messages) => render_thread_details(messages),
+                    None => {
+                        "Thread not loaded. Press `t` to load the thread view (or Enter to retry)."
+                            .to_string()
+                    }
+                }
+            };
+            ("Thread View", text)
+        }
+    };
+    let detail_title_with_focus = if detail_is_focused {
+        format!("{detail_title} [active]")
+    } else {
+        detail_title.to_string()
+    };
 
     let detail = Paragraph::new(detail_text)
-        .block(Block::default().title("Span Detail").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(detail_title_with_focus)
+                .borders(Borders::ALL)
+                .border_style(if detail_is_focused {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                }),
+        )
         .scroll((app.detail_scroll, 0))
         .wrap(Wrap { trim: false });
 
@@ -962,6 +1095,181 @@ fn render_span_details(span: &SpanListEntry, row: &Map<String, Value>, is_full: 
     out
 }
 
+fn render_thread_loading_state(tick: usize) -> String {
+    let spinner = match tick % 4 {
+        0 => '|',
+        1 => '/',
+        2 => '-',
+        _ => '\\',
+    };
+
+    format!(
+        "Loading thread {spinner}\n\nRunning preprocessor `{THREAD_PREPROCESSOR_NAME}` with `mode: json`.\nLarge traces can take a few seconds."
+    )
+}
+
+fn role_display_name(role: &str) -> &str {
+    match role {
+        "user" => "User",
+        "assistant" => "Assistant",
+        "system" => "System",
+        "tool" => "Tool",
+        "developer" => "Developer",
+        "model" => "Model",
+        _ => "Message",
+    }
+}
+
+fn render_message_content(content: &Value) -> String {
+    match content {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let mut parts: Vec<String> = Vec::new();
+            for item in items {
+                match item {
+                    Value::Object(obj) => {
+                        let item_type = value_as_string(obj.get("type")).unwrap_or_default();
+                        if item_type == "text" {
+                            if let Some(text) = value_as_string(obj.get("text")) {
+                                parts.push(text);
+                            }
+                            continue;
+                        }
+
+                        if item_type == "tool_call" {
+                            let name = value_as_string(obj.get("name"))
+                                .or_else(|| value_as_string(obj.get("tool_name")))
+                                .unwrap_or_else(|| "tool_call".to_string());
+                            let args = obj.get("arguments").or_else(|| obj.get("input"));
+                            if let Some(args) = args {
+                                parts.push(format!(
+                                    "[Tool Call] {name}\n{}",
+                                    format_pretty_value(Some(args))
+                                ));
+                            } else {
+                                parts.push(format!("[Tool Call] {name}"));
+                            }
+                            continue;
+                        }
+
+                        parts.push(
+                            serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string()),
+                        );
+                    }
+                    _ => parts.push(
+                        serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string()),
+                    ),
+                }
+            }
+            parts.join("\n\n")
+        }
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn render_tool_calls_inline(tool_calls: &Value) -> String {
+    match tool_calls {
+        Value::Array(calls) => {
+            let mut out = String::new();
+            for call in calls {
+                if let Value::Object(obj) = call {
+                    let name = value_as_string(obj.get("name"))
+                        .or_else(|| {
+                            value_as_object_owned(obj.get("function"))
+                                .and_then(|f| value_as_string(f.get("name")))
+                        })
+                        .or_else(|| value_as_string(obj.get("tool_name")))
+                        .unwrap_or_else(|| "tool_call".to_string());
+                    out.push_str(&format!("[Tool Call] {name}\n"));
+
+                    let args = obj
+                        .get("arguments")
+                        .cloned()
+                        .or_else(|| obj.get("input").cloned())
+                        .or_else(|| {
+                            value_as_object_owned(obj.get("function"))
+                                .and_then(|f| f.get("arguments").cloned())
+                        });
+
+                    if let Some(args) = args.as_ref() {
+                        out.push_str(&format_pretty_value(Some(args)));
+                        out.push('\n');
+                    }
+                    out.push('\n');
+                } else {
+                    out.push_str(&format_pretty_value(Some(call)));
+                    out.push('\n');
+                }
+            }
+            out.trim_end().to_string()
+        }
+        other => format_pretty_value(Some(other)),
+    }
+}
+
+fn render_thread_details(messages: &[Value]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Thread view: {} messages\n", messages.len()));
+
+    if messages.is_empty() {
+        out.push_str("\nNo messages returned by preprocessor.");
+        return out;
+    }
+
+    for (index, message) in messages.iter().enumerate() {
+        let (role, content, tool_calls) = match message {
+            Value::Object(obj) => (
+                value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string()),
+                obj.get("content"),
+                obj.get("tool_calls"),
+            ),
+            _ => ("message".to_string(), Some(message), None),
+        };
+
+        let role_display = role_display_name(&role);
+        out.push_str(&format!("\n{} {} ", "=".repeat(10), role_display));
+        out.push_str(&"=".repeat(40));
+        out.push_str(&format!("\n#{}\n\n", index + 1));
+
+        let content_text = content.map(render_message_content).unwrap_or_default();
+        if content_text.trim().is_empty() {
+            out.push_str("(empty)\n");
+        } else {
+            out.push_str(content_text.trim_end());
+            out.push('\n');
+        }
+
+        if let Some(calls) = tool_calls {
+            let tool_calls_text = render_tool_calls_inline(calls);
+            if !tool_calls_text.is_empty() {
+                out.push_str("\nTool calls:\n");
+                out.push_str(&tool_calls_text);
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+fn span_detail_status(view: DetailView, pane_focus: DetailPaneFocus) -> &'static str {
+    match (view, pane_focus) {
+        (DetailView::Span, DetailPaneFocus::Tree) => {
+            "Span view (tree focus). Right: detail pane  Up/Down: select span  t: thread  Backspace/Esc: back"
+        }
+        (DetailView::Span, DetailPaneFocus::Detail) => {
+            "Span view (detail focus). Left: tree pane  Up/Down: scroll  Enter: load span  t: thread  Backspace/Esc: back"
+        }
+        (DetailView::Thread, DetailPaneFocus::Tree) => {
+            "Thread view (tree focus). Right: detail pane  Up/Down: select span  Enter: retry thread  t: span  Backspace/Esc: back"
+        }
+        (DetailView::Thread, DetailPaneFocus::Detail) => {
+            "Thread view (detail focus). Left: tree pane  Up/Down: scroll  Enter: retry thread  t: span  Backspace/Esc: back"
+        }
+    }
+}
+
 fn append_section(out: &mut String, title: &str, value: Option<&Value>) {
     out.push('\n');
     out.push_str(&title.to_uppercase());
@@ -1110,9 +1418,36 @@ fn build_full_span_query(project_id: &str, span_row_id: &str) -> String {
     )
 }
 
+fn build_thread_invoke_request(project_id: &str, root_span_id: &str) -> Value {
+    json!({
+        "global_function": THREAD_PREPROCESSOR_NAME,
+        "function_type": "preprocessor",
+        "input": {
+            "trace_ref": {
+                "object_type": "project_logs",
+                "object_id": project_id,
+                "root_span_id": root_span_id,
+            }
+        },
+        "mode": "json",
+    })
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
 fn maybe_print_query(enabled: bool, label: &str, query: &str) {
     if enabled {
         eprintln!("bt traces [{label}] BTQL:\n{query}\n");
+    }
+}
+
+fn maybe_print_invoke(enabled: bool, label: &str, request: &Value) {
+    if enabled {
+        let formatted =
+            serde_json::to_string_pretty(request).unwrap_or_else(|_| compact_json(request));
+        eprintln!("bt traces [{label}] INVOKE /function/invoke:\n{formatted}\n");
     }
 }
 
@@ -1128,6 +1463,16 @@ fn query_from_error(err: &anyhow::Error) -> Option<String> {
         let msg = cause.to_string();
         if let Some(query) = msg.strip_prefix("BTQL query failed: ") {
             return Some(format!("BTQL: {query}"));
+        }
+    }
+    None
+}
+
+fn invoke_from_error(err: &anyhow::Error) -> Option<String> {
+    for cause in err.chain() {
+        let msg = cause.to_string();
+        if let Some(request) = msg.strip_prefix("Invoke request failed: ") {
+            return Some(format!("Invoke: {request}"));
         }
     }
     None
@@ -1230,6 +1575,41 @@ async fn fetch_full_span_row(
     Ok(response.data.into_iter().next())
 }
 
+fn extract_thread_messages(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(messages) => messages,
+        Value::Object(obj) => {
+            if let Some(Value::Array(messages)) = obj.get("output") {
+                return messages.clone();
+            }
+            if let Some(Value::Array(messages)) = obj.get("messages") {
+                return messages.clone();
+            }
+            if let Some(Value::Array(messages)) = obj.get("thread") {
+                return messages.clone();
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+async fn fetch_thread_messages(
+    client: &ApiClient,
+    project_id: &str,
+    root_span_id: &str,
+    print_queries: bool,
+) -> Result<Vec<Value>> {
+    let request = build_thread_invoke_request(project_id, root_span_id);
+    maybe_print_invoke(print_queries, "thread-preprocessor", &request);
+
+    let response = execute_invoke(client, &request)
+        .await
+        .with_context(|| format!("Invoke request failed: {}", compact_json(&request)))?;
+
+    Ok(extract_thread_messages(response))
+}
+
 fn ensure_selected_span_loaded(
     app: &mut TraceViewerApp,
     client: &ApiClient,
@@ -1254,9 +1634,7 @@ fn ensure_selected_span_loaded(
     match result {
         Ok(Some(row)) => {
             app.full_span_cache.insert(span.id.clone(), row);
-            app.set_status(
-                "Span view. Up/Down: span  PgUp/PgDn: scroll  Esc: back  r: reload  q: quit",
-            );
+            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
         }
         Ok(None) => {
             app.set_status(format!("No full row found for span {}", span.span_id));
@@ -1280,6 +1658,96 @@ fn ensure_selected_span_loaded(
     Ok(())
 }
 
+fn request_thread_messages_load(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    force_refresh: bool,
+) -> Result<()> {
+    let Some(root_span_id) = app.loaded_root_span_id.clone() else {
+        app.set_error("No trace loaded");
+        return Ok(());
+    };
+
+    if !force_refresh && (app.thread_messages.is_some() || app.thread_loading) {
+        app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+        return Ok(());
+    }
+
+    if app.thread_loading {
+        return Ok(());
+    }
+
+    app.thread_messages = None;
+    app.thread_loading = true;
+    app.thread_spinner_tick = 0;
+    app.set_status(format!("Loading thread for trace {root_span_id}..."));
+
+    let (tx, rx) = mpsc::channel();
+    let client = client.clone();
+    let project_id = app.project.id.clone();
+    let print_queries = app.print_queries;
+    handle.spawn(async move {
+        let result =
+            fetch_thread_messages(&client, &project_id, &root_span_id, print_queries).await;
+        let _ = tx.send(result);
+    });
+    app.thread_load_rx = Some(rx);
+
+    Ok(())
+}
+
+fn poll_pending_thread_load(app: &mut TraceViewerApp) {
+    if !app.thread_loading {
+        return;
+    }
+
+    app.thread_spinner_tick = app.thread_spinner_tick.wrapping_add(1);
+
+    let recv_result = app.thread_load_rx.as_ref().map(|rx| rx.try_recv());
+    let Some(recv_result) = recv_result else {
+        return;
+    };
+
+    match recv_result {
+        Ok(Ok(messages)) => {
+            app.thread_loading = false;
+            app.thread_load_rx = None;
+            app.thread_messages = Some(messages);
+            if app.detail_view == DetailView::Thread {
+                app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+            }
+        }
+        Ok(Err(err)) => {
+            app.thread_loading = false;
+            app.thread_load_rx = None;
+            app.thread_messages = None;
+            let root_span_id = app
+                .loaded_root_span_id
+                .as_deref()
+                .unwrap_or("<unknown-trace>");
+            let detail = root_error_message(&err);
+            if let Some(request) = invoke_from_error(&err) {
+                app.set_error_with_query(
+                    format!("Failed to load thread for trace {root_span_id}: {detail}"),
+                    request,
+                );
+            } else {
+                app.set_error(format!(
+                    "Failed to load thread for trace {root_span_id}: {detail}"
+                ));
+            }
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            app.thread_loading = false;
+            app.thread_load_rx = None;
+            app.thread_messages = None;
+            app.set_error("Failed to load thread: request channel closed");
+        }
+    }
+}
+
 async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> {
     let body = json!({
         "query": query,
@@ -1294,4 +1762,17 @@ async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> 
     };
 
     client.post_with_headers("/btql", &body, &headers).await
+}
+
+async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
+    let org_name = client.org_name();
+    let headers = if !org_name.is_empty() {
+        vec![("x-bt-org-name", org_name)]
+    } else {
+        Vec::new()
+    };
+
+    client
+        .post_with_headers("/function/invoke", request, &headers)
+        .await
 }
