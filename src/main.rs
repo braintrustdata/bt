@@ -52,6 +52,8 @@ enum Commands {
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
     Status(CLIArgs<status::StatusArgs>),
+    /// View and modify config
+    Config(CLIArgs<config::ConfigArgs>),
 }
 
 #[tokio::main]
@@ -92,6 +94,7 @@ async fn main() -> Result<()> {
             let (base, args) = cmd.with_config(&cfg);
             switch::run(base, args).await?
         }
+        Commands::Config(cmd) => config::run(cmd.base, cmd.args)?,
     }
 
     Ok(())
