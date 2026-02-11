@@ -20,7 +20,7 @@ pub async fn run(
             if !std::io::stdin().is_terminal() {
                 bail!("project name required. Use: bt projects view <name>")
             }
-            select_project_interactive(client).await?
+            select_project_interactive(client, None).await?
         }
     };
 

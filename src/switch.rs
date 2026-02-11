@@ -30,6 +30,15 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     // TODO: support org switching when multi-org auth is ready
     let org_name = &client.org_name();
 
+    if args.target.is_none() && base.org.is_none() && base.project.is_none() {
+        let cfg = config::load().unwrap_or_default();
+        if let (Some(org), Some(project)) = (&cfg.org, &cfg.project) {
+            eprintln!("Current: {org}/{project}");
+        } else {
+            eprintln!("No org/project configured");
+        }
+    }
+
     let project_name = if let Some(t) = &args.target {
         if t.contains('/') {
             // org/project format - ignore org part for now, just use project
@@ -39,7 +48,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
             validate_or_create_project(&client, t).await?
         }
     } else {
-        select_project_interactive(&client).await?
+        select_project_interactive(&client, None).await?
     };
 
     // Save to config
