@@ -144,6 +144,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
   - `--print-queries`: print each BTQL query and invoke payload before execution
 - Controls:
   - Trace table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
+  - Search bar: `/` to edit search text, `Enter` to apply, `Esc` to cancel, `Ctrl+u` to clear input
   - Detail view: `t` toggles between span detail and thread view (project default preprocessor)
   - Split-pane focus: `Right` focuses detail pane, `Left` focuses span tree
   - Span/detail nav: with tree focus `Up/Down` selects spans; in span detail focus `Up/Down` scrolls (`PgUp/PgDn` also scroll)

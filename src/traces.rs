@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::IsTerminal;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -34,6 +34,15 @@ use crate::ui::{fuzzy_select, with_spinner};
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
 const THREAD_PREPROCESSOR_NAME: &str = "project_default";
+const LOADER_DELAY: Duration = Duration::from_millis(250);
+const TRACE_TEXT_SEARCH_FIELDS: [&str; 6] = [
+    "input",
+    "expected",
+    "metadata",
+    "tags",
+    "output",
+    "span_attributes",
+];
 
 #[derive(Debug, Clone, Args)]
 pub struct TracesArgs {
@@ -118,10 +127,24 @@ struct TraceViewerApp {
     project: ProjectSelection,
     traces: Vec<TraceSummaryRow>,
     selected_trace: usize,
+    trace_search_query: String,
+    trace_search_input: String,
+    trace_search_mode: bool,
+    summary_loading_search_query: String,
+    summary_pending_refresh: Option<(String, Option<String>)>,
+    summary_load_started_at: Option<Instant>,
+    summary_spinner_tick: usize,
+    summary_load_rx: Option<Receiver<(String, Option<String>, Result<Vec<Map<String, Value>>>)>>,
+    trace_loading_root_span_id: Option<String>,
+    trace_pending_root_span_id: Option<String>,
+    trace_load_started_at: Option<Instant>,
+    trace_spinner_tick: usize,
+    trace_load_rx: Option<Receiver<(String, Result<Vec<Map<String, Value>>>)>>,
     spans: Vec<SpanListEntry>,
     full_span_cache: HashMap<String, Map<String, Value>>,
     full_span_loading_row_id: Option<String>,
     full_span_pending_row_id: Option<String>,
+    full_span_load_started_at: Option<Instant>,
     full_span_spinner_tick: usize,
     full_span_load_rx: Option<Receiver<(String, Result<Option<Map<String, Value>>>)>>,
     selected_span: usize,
@@ -154,16 +177,30 @@ impl TraceViewerApp {
     ) -> Self {
         let trace_count = traces.len();
         let status = format!(
-            "Loaded {trace_count} traces. Up/Down: move  Enter: open trace  r: refresh  q: quit"
+            "Loaded {trace_count} traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit"
         );
         Self {
             project,
             traces,
             selected_trace: 0,
+            trace_search_query: String::new(),
+            trace_search_input: String::new(),
+            trace_search_mode: false,
+            summary_loading_search_query: String::new(),
+            summary_pending_refresh: None,
+            summary_load_started_at: None,
+            summary_spinner_tick: 0,
+            summary_load_rx: None,
+            trace_loading_root_span_id: None,
+            trace_pending_root_span_id: None,
+            trace_load_started_at: None,
+            trace_spinner_tick: 0,
+            trace_load_rx: None,
             spans: Vec::new(),
             full_span_cache: HashMap::new(),
             full_span_loading_row_id: None,
             full_span_pending_row_id: None,
+            full_span_load_started_at: None,
             full_span_spinner_tick: 0,
             full_span_load_rx: None,
             selected_span: 0,
@@ -290,6 +327,7 @@ pub async fn run(base: BaseArgs, args: TracesArgs) -> Result<()> {
             &project.id,
             args.preview_length,
             args.limit,
+            None,
             args.print_queries,
         ),
     )
@@ -434,6 +472,8 @@ fn run_app(
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     loop {
+        poll_pending_summary_load(app, &client, &handle)?;
+        poll_pending_trace_load(app, &client, &handle)?;
         poll_pending_full_span_load(app, &client, &handle)?;
         poll_pending_thread_load(app);
         terminal.draw(|frame| draw_ui(frame, app))?;
@@ -461,13 +501,25 @@ fn handle_key_event(
     handle: &tokio::runtime::Handle,
 ) -> Result<bool> {
     match key.code {
-        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('q')
+            if !(app.screen == Screen::Traces
+                && app.trace_search_mode
+                && key.modifiers.is_empty()) =>
+        {
+            return Ok(true)
+        }
         KeyCode::Esc => {
             if app.screen == Screen::SpanDetail {
                 app.screen = Screen::Traces;
                 app.set_status(
-                    "Back to traces. Up/Down: move  Enter: open trace  r: refresh  q: quit",
+                    "Back to traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit",
                 );
+                return Ok(false);
+            }
+            if app.screen == Screen::Traces && app.trace_search_mode {
+                app.trace_search_mode = false;
+                app.trace_search_input = app.trace_search_query.clone();
+                app.set_status("Search canceled");
                 return Ok(false);
             }
             return Ok(true);
@@ -490,14 +542,66 @@ fn handle_traces_key(
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
+    if app.trace_search_mode {
+        return handle_trace_search_input_key(app, key, client, handle);
+    }
+
     match key.code {
+        KeyCode::Char('/') => {
+            app.trace_search_mode = true;
+            app.trace_search_input = app.trace_search_query.clone();
+            app.set_status("Search mode. Type to edit, Enter applies, Esc cancels.");
+        }
         KeyCode::Up | KeyCode::Char('k') => app.move_trace_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_trace_down(),
-        KeyCode::Enter | KeyCode::Right => load_selected_trace(app, client, handle)?,
-        KeyCode::Char('r') => refresh_traces(app, client, handle)?,
+        KeyCode::Enter | KeyCode::Right => request_selected_trace_load(app, client, handle)?,
+        KeyCode::Char('r') => request_refresh_traces(app, client, handle)?,
         _ => {}
     }
     Ok(())
+}
+
+fn handle_trace_search_input_key(
+    app: &mut TraceViewerApp,
+    key: KeyEvent,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.trace_search_mode = false;
+            app.trace_search_input = app.trace_search_query.clone();
+            app.set_status("Search canceled");
+        }
+        KeyCode::Enter => {
+            apply_trace_search(app, client, handle)?;
+        }
+        KeyCode::Backspace => {
+            app.trace_search_input.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.trace_search_input.clear();
+        }
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            app.trace_search_input.push(c);
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn apply_trace_search(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    let next_query = app.trace_search_input.trim().to_string();
+    app.trace_search_mode = false;
+    app.trace_search_query = next_query;
+    app.selected_trace = 0;
+
+    request_refresh_traces(app, client, handle)
 }
 
 fn handle_span_detail_key(
@@ -543,7 +647,9 @@ fn handle_span_detail_key(
         }
         KeyCode::Backspace => {
             app.screen = Screen::Traces;
-            app.set_status("Back to traces. Up/Down: move  Enter: open trace  r: refresh  q: quit");
+            app.set_status(
+                "Back to traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit",
+            );
         }
         KeyCode::Left => {
             app.detail_pane_focus = DetailPaneFocus::Tree;
@@ -580,7 +686,7 @@ fn handle_span_detail_key(
         }
         KeyCode::Char('r') => {
             if app.loaded_root_span_id.is_some() {
-                load_selected_trace(app, client, handle)?;
+                request_loaded_trace_reload(app, client, handle)?;
             }
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -598,60 +704,182 @@ fn handle_span_detail_key(
     Ok(())
 }
 
-fn refresh_traces(
+fn request_refresh_traces(
     app: &mut TraceViewerApp,
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
+    let search_query = app.trace_search_query.trim().to_string();
     let previous_root = app.current_trace().map(|r| r.root_span_id.clone());
-    app.set_status("Refreshing trace table...");
 
-    let response = handle.block_on(fetch_summary_rows(
-        client,
-        &app.project.id,
-        app.preview_length,
-        app.limit,
-        app.print_queries,
-    ));
+    if app.summary_load_rx.is_some() {
+        app.summary_pending_refresh = Some((search_query.clone(), previous_root));
+        if search_query.is_empty() {
+            app.set_status("Queued trace refresh...");
+        } else {
+            app.set_status(format!("Queued search refresh for '{search_query}'..."));
+        }
+        return Ok(());
+    }
 
-    match response {
-        Ok(rows) => {
-            app.traces = parse_summary_rows(rows);
-            if app.traces.is_empty() {
-                app.selected_trace = 0;
+    start_summary_load(app, client, handle, search_query, previous_root);
+    Ok(())
+}
+
+fn start_summary_load(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    search_query: String,
+    previous_root: Option<String>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let client = client.clone();
+    let project_id = app.project.id.clone();
+    let preview_length = app.preview_length;
+    let limit = app.limit;
+    let print_queries = app.print_queries;
+    let search_for_task = search_query.clone();
+    let previous_root_for_task = previous_root.clone();
+
+    handle.spawn(async move {
+        let search_opt = if search_for_task.trim().is_empty() {
+            None
+        } else {
+            Some(search_for_task.as_str())
+        };
+        let result = fetch_summary_rows(
+            &client,
+            &project_id,
+            preview_length,
+            limit,
+            search_opt,
+            print_queries,
+        )
+        .await;
+        let _ = tx.send((search_for_task, previous_root_for_task, result));
+    });
+
+    app.summary_loading_search_query = search_query.clone();
+    app.summary_load_started_at = Some(Instant::now());
+    app.summary_spinner_tick = 0;
+    app.summary_load_rx = Some(rx);
+    if app.screen == Screen::Traces {
+        if search_query.is_empty() {
+            app.set_status("Refreshing trace table...");
+        } else {
+            app.set_status(format!("Searching traces for '{search_query}'..."));
+        }
+    }
+}
+
+fn apply_summary_rows(
+    app: &mut TraceViewerApp,
+    search_query: &str,
+    previous_root: Option<String>,
+    rows: Vec<Map<String, Value>>,
+) {
+    app.traces = parse_summary_rows(rows);
+    if app.traces.is_empty() {
+        app.selected_trace = 0;
+        if app.screen == Screen::Traces {
+            if search_query.trim().is_empty() {
                 app.set_status("No traces found for the selected project");
-                return Ok(());
-            }
-
-            if let Some(root) = previous_root {
-                if let Some(idx) = app.traces.iter().position(|row| row.root_span_id == root) {
-                    app.selected_trace = idx;
-                } else {
-                    app.selected_trace = 0;
-                }
             } else {
-                app.selected_trace = app.selected_trace.min(app.traces.len().saturating_sub(1));
+                app.set_status(format!("No traces found for search '{search_query}'"));
             }
+        }
+        return;
+    }
 
+    if let Some(root) = previous_root {
+        if let Some(idx) = app.traces.iter().position(|row| row.root_span_id == root) {
+            app.selected_trace = idx;
+        } else {
+            app.selected_trace = 0;
+        }
+    } else {
+        app.selected_trace = app.selected_trace.min(app.traces.len().saturating_sub(1));
+    }
+
+    if app.screen == Screen::Traces {
+        if search_query.trim().is_empty() {
             app.set_status(format!(
-                "Loaded {} traces. Up/Down: move  Enter: open trace  r: refresh  q: quit",
+                "Loaded {} traces. Up/Down: move  Enter: open trace  /: search  r: refresh  q: quit",
+                app.traces.len()
+            ));
+        } else {
+            app.set_status(format!(
+                "Loaded {} traces for '{search_query}'. Up/Down: move  Enter: open trace  /: search  r: refresh",
                 app.traces.len()
             ));
         }
-        Err(err) => {
-            let detail = root_error_message(&err);
-            if let Some(query) = query_from_error(&err) {
-                app.set_error_with_query(format!("Failed to refresh traces: {detail}"), query);
-            } else {
-                app.set_error(format!("Failed to refresh traces: {detail}"));
+    }
+}
+
+fn poll_pending_summary_load(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    if app.summary_load_rx.is_none() {
+        if let Some((search_query, previous_root)) = app.summary_pending_refresh.take() {
+            start_summary_load(app, client, handle, search_query, previous_root);
+        }
+        return Ok(());
+    }
+
+    app.summary_spinner_tick = app.summary_spinner_tick.wrapping_add(1);
+
+    let recv_result = app.summary_load_rx.as_ref().map(|rx| rx.try_recv());
+    let Some(recv_result) = recv_result else {
+        return Ok(());
+    };
+
+    match recv_result {
+        Ok((search_query, previous_root, result)) => {
+            app.summary_load_rx = None;
+            app.summary_load_started_at = None;
+            app.summary_loading_search_query.clear();
+
+            match result {
+                Ok(rows) => apply_summary_rows(app, &search_query, previous_root, rows),
+                Err(err) => {
+                    let detail = root_error_message(&err);
+                    if app.screen == Screen::Traces {
+                        if let Some(query) = query_from_error(&err) {
+                            app.set_error_with_query(
+                                format!("Failed to refresh traces: {detail}"),
+                                query,
+                            );
+                        } else {
+                            app.set_error(format!("Failed to refresh traces: {detail}"));
+                        }
+                    }
+                }
             }
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            app.summary_load_rx = None;
+            app.summary_load_started_at = None;
+            app.summary_loading_search_query.clear();
+            if app.screen == Screen::Traces {
+                app.set_error("Failed to refresh traces: request channel closed");
+            }
+        }
+    }
+
+    if app.summary_load_rx.is_none() {
+        if let Some((search_query, previous_root)) = app.summary_pending_refresh.take() {
+            start_summary_load(app, client, handle, search_query, previous_root);
         }
     }
 
     Ok(())
 }
 
-fn load_selected_trace(
+fn request_selected_trace_load(
     app: &mut TraceViewerApp,
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
@@ -666,54 +894,194 @@ fn load_selected_trace(
         return Ok(());
     }
 
-    app.set_status(format!("Loading trace {root_span_id}..."));
+    request_trace_load_for_root_span(app, client, handle, root_span_id)
+}
 
-    let result = handle.block_on(fetch_trace_span_rows_for_tree(
-        client,
-        &app.project.id,
-        &root_span_id,
-        MAX_TRACE_SPANS,
-        app.print_queries,
-    ));
+fn request_loaded_trace_reload(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    if let Some(root_span_id) = app.loaded_root_span_id.clone() {
+        request_trace_load_for_root_span(app, client, handle, root_span_id)
+    } else {
+        request_selected_trace_load(app, client, handle)
+    }
+}
 
-    match result {
-        Ok(rows) => {
-            let spans = build_span_entries(rows);
-            if spans.is_empty() {
-                app.set_status(format!("No spans found for trace {root_span_id}"));
-                return Ok(());
+fn request_trace_load_for_root_span(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    root_span_id: String,
+) -> Result<()> {
+    if app
+        .trace_loading_root_span_id
+        .as_deref()
+        .map(|id| id == root_span_id.as_str())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    if app.trace_loading_root_span_id.is_some() {
+        app.trace_pending_root_span_id = Some(root_span_id.clone());
+        app.set_status(format!("Queued trace load for {root_span_id}"));
+        return Ok(());
+    }
+
+    start_trace_load_for_root_span(app, client, handle, root_span_id);
+    Ok(())
+}
+
+fn start_trace_load_for_root_span(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    root_span_id: String,
+) {
+    let (tx, rx) = mpsc::channel();
+    let client = client.clone();
+    let project_id = app.project.id.clone();
+    let print_queries = app.print_queries;
+    let root_span_id_for_task = root_span_id.clone();
+
+    handle.spawn(async move {
+        let result = fetch_trace_span_rows_for_tree(
+            &client,
+            &project_id,
+            &root_span_id_for_task,
+            MAX_TRACE_SPANS,
+            print_queries,
+        )
+        .await;
+        let _ = tx.send((root_span_id_for_task, result));
+    });
+
+    app.trace_loading_root_span_id = Some(root_span_id.clone());
+    app.trace_load_started_at = Some(Instant::now());
+    app.trace_spinner_tick = 0;
+    app.trace_load_rx = Some(rx);
+    app.set_status(format!("Opening trace {root_span_id}..."));
+}
+
+fn apply_loaded_trace_rows(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+    root_span_id: String,
+    rows: Vec<Map<String, Value>>,
+) -> Result<()> {
+    let spans = build_span_entries(rows);
+    if spans.is_empty() {
+        app.set_status(format!("No spans found for trace {root_span_id}"));
+        return Ok(());
+    }
+
+    app.spans = spans;
+    app.full_span_cache.clear();
+    app.full_span_loading_row_id = None;
+    app.full_span_pending_row_id = None;
+    app.full_span_load_started_at = None;
+    app.full_span_spinner_tick = 0;
+    app.full_span_load_rx = None;
+    app.selected_span = 0;
+    app.detail_scroll = 0;
+    app.detail_view = DetailView::Span;
+    app.detail_pane_focus = DetailPaneFocus::Tree;
+    app.thread_messages = None;
+    app.thread_selected_message = 0;
+    app.thread_expanded.clear();
+    app.thread_loading = false;
+    app.thread_spinner_tick = 0;
+    app.thread_load_rx = None;
+    app.loaded_root_span_id = Some(root_span_id.clone());
+    app.screen = Screen::SpanDetail;
+    app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+    request_selected_span_load(app, client, handle, false)?;
+
+    Ok(())
+}
+
+fn poll_pending_trace_load(
+    app: &mut TraceViewerApp,
+    client: &ApiClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<()> {
+    if app.trace_loading_root_span_id.is_none() {
+        if let Some(next_root_span_id) = app.trace_pending_root_span_id.take() {
+            if !next_root_span_id.is_empty() {
+                start_trace_load_for_root_span(app, client, handle, next_root_span_id);
+            }
+        }
+        return Ok(());
+    }
+
+    app.trace_spinner_tick = app.trace_spinner_tick.wrapping_add(1);
+
+    if app.screen == Screen::SpanDetail
+        && !app.status_is_error
+        && app
+            .trace_load_started_at
+            .map(|start| start.elapsed() >= LOADER_DELAY)
+            .unwrap_or(false)
+    {
+        if let Some(root_span_id) = app.trace_loading_root_span_id.as_deref() {
+            app.set_status(format!(
+                "Loading trace {root_span_id} {}",
+                spinner_char(app.trace_spinner_tick)
+            ));
+        }
+    }
+
+    let recv_result = app.trace_load_rx.as_ref().map(|rx| rx.try_recv());
+    let Some(recv_result) = recv_result else {
+        return Ok(());
+    };
+
+    match recv_result {
+        Ok((root_span_id, result)) => {
+            app.trace_load_rx = None;
+            app.trace_loading_root_span_id = None;
+            app.trace_load_started_at = None;
+
+            if let Some(next_root_span_id) = app.trace_pending_root_span_id.take() {
+                if !next_root_span_id.is_empty() && next_root_span_id != root_span_id {
+                    start_trace_load_for_root_span(app, client, handle, next_root_span_id);
+                    return Ok(());
+                }
             }
 
-            app.spans = spans;
-            app.full_span_cache.clear();
-            app.full_span_loading_row_id = None;
-            app.full_span_pending_row_id = None;
-            app.full_span_spinner_tick = 0;
-            app.full_span_load_rx = None;
-            app.selected_span = 0;
-            app.detail_scroll = 0;
-            app.detail_view = DetailView::Span;
-            app.detail_pane_focus = DetailPaneFocus::Tree;
-            app.thread_messages = None;
-            app.thread_selected_message = 0;
-            app.thread_expanded.clear();
-            app.thread_loading = false;
-            app.thread_spinner_tick = 0;
-            app.thread_load_rx = None;
-            app.loaded_root_span_id = Some(root_span_id.clone());
-            app.screen = Screen::SpanDetail;
-            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
-            request_selected_span_load(app, client, handle, false)?;
+            match result {
+                Ok(rows) => {
+                    apply_loaded_trace_rows(app, client, handle, root_span_id, rows)?;
+                }
+                Err(err) => {
+                    let detail = root_error_message(&err);
+                    if let Some(query) = query_from_error(&err) {
+                        app.set_error_with_query(
+                            format!("Failed to load trace {root_span_id}: {detail}"),
+                            query,
+                        );
+                    } else {
+                        app.set_error(format!("Failed to load trace {root_span_id}: {detail}"));
+                    }
+                }
+            }
         }
-        Err(err) => {
-            let detail = root_error_message(&err);
-            if let Some(query) = query_from_error(&err) {
-                app.set_error_with_query(
-                    format!("Failed to load trace {root_span_id}: {detail}"),
-                    query,
-                );
-            } else {
-                app.set_error(format!("Failed to load trace {root_span_id}: {detail}"));
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            app.trace_load_rx = None;
+            app.trace_loading_root_span_id = None;
+            app.trace_load_started_at = None;
+            app.set_error("Failed to load trace: request channel closed");
+        }
+    }
+
+    if app.trace_loading_root_span_id.is_none() {
+        if let Some(next_root_span_id) = app.trace_pending_root_span_id.take() {
+            if !next_root_span_id.is_empty() {
+                start_trace_load_for_root_span(app, client, handle, next_root_span_id);
             }
         }
     }
@@ -780,6 +1148,63 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TraceViewerApp) {
 }
 
 fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &TraceViewerApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
+    let summary_loading = app
+        .summary_load_started_at
+        .map(|start| start.elapsed() >= LOADER_DELAY)
+        .unwrap_or(false);
+    let summary_spinner = spinner_char(app.summary_spinner_tick);
+
+    let search_text = if app.trace_search_mode {
+        app.trace_search_input.as_str()
+    } else {
+        app.trace_search_query.as_str()
+    };
+    let search_line = if search_text.trim().is_empty() {
+        Line::from(Span::styled(
+            "Press / to search traces",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if app.trace_search_mode {
+        Line::from(Span::raw(format!("{search_text}█")))
+    } else {
+        Line::from(Span::raw(search_text))
+    };
+    let search_block = Block::default()
+        .title(if app.trace_search_mode {
+            "Search [active]".to_string()
+        } else if summary_loading {
+            format!("Search [loading {summary_spinner}]")
+        } else {
+            "Search".to_string()
+        })
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if app.trace_search_mode || summary_loading {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        })
+        .title_bottom(if app.trace_search_mode {
+            "Enter apply  Esc cancel  Ctrl+u clear"
+        } else if summary_loading {
+            let search = app.summary_loading_search_query.trim();
+            if search.is_empty() {
+                "Refreshing traces..."
+            } else {
+                "Searching..."
+            }
+        } else {
+            "/ edit search"
+        });
+    let search_widget = Paragraph::new(search_line).block(search_block);
+    frame.render_widget(search_widget, chunks[0]);
+
     let header = Row::new(vec!["Created", "Trace", "Input", "Duration"]).style(
         Style::default()
             .fg(Color::DarkGray)
@@ -816,10 +1241,31 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
     .header(header)
     .block(
         Block::default()
-            .title("Recent Traces")
+            .title(if app.trace_search_query.trim().is_empty() {
+                "Recent Traces"
+            } else {
+                "Recent Traces [filtered]"
+            })
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title_bottom("Enter opens selected trace"),
+            .title_bottom(
+                if app
+                    .trace_load_started_at
+                    .map(|start| start.elapsed() >= LOADER_DELAY)
+                    .unwrap_or(false)
+                {
+                    if let Some(root_span_id) = app.trace_loading_root_span_id.as_deref() {
+                        format!(
+                            "Loading trace {root_span_id} {}",
+                            spinner_char(app.trace_spinner_tick)
+                        )
+                    } else {
+                        "Enter opens selected trace  / search  r refresh".to_string()
+                    }
+                } else {
+                    "Enter opens selected trace  / search  r refresh".to_string()
+                },
+            ),
     )
     .row_highlight_style(
         Style::default()
@@ -832,7 +1278,7 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
         state.select(Some(app.selected_trace));
     }
 
-    frame.render_stateful_widget(table, area, &mut state);
+    frame.render_stateful_widget(table, chunks[1], &mut state);
 }
 
 fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &TraceViewerApp) {
@@ -917,11 +1363,22 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
                         .as_deref()
                         .map(|id| id == span.id)
                         .unwrap_or(false);
+                    let loading_spinner = if is_loading
+                        && app
+                            .full_span_load_started_at
+                            .map(|start| start.elapsed() >= LOADER_DELAY)
+                            .unwrap_or(false)
+                    {
+                        Some(spinner_char(app.full_span_spinner_tick))
+                    } else {
+                        None
+                    };
                     render_span_details(
                         span,
                         full_row.unwrap_or(&span.row),
                         full_row.is_some(),
                         is_loading,
+                        loading_spinner,
                     )
                 })
                 .unwrap_or_else(|| "No span selected".to_string());
@@ -1250,12 +1707,17 @@ fn render_span_details(
     row: &Map<String, Value>,
     is_full: bool,
     is_loading: bool,
+    loading_spinner: Option<char>,
 ) -> String {
     let mut out = String::new();
 
     if !is_full {
         if is_loading {
-            out.push_str("FULL CONTENT: loading in background...\n\n");
+            if let Some(spinner) = loading_spinner {
+                out.push_str(&format!("FULL CONTENT: loading {spinner}\n\n"));
+            } else {
+                out.push_str("FULL CONTENT: loading\n\n");
+            }
         } else {
             out.push_str(
                 "FULL CONTENT: not loaded (loading on selection; press Enter to retry)\n\n",
@@ -1298,16 +1760,20 @@ fn render_span_details(
 }
 
 fn render_thread_loading_state(tick: usize) -> String {
-    let spinner = match tick % 4 {
-        0 => '|',
-        1 => '/',
-        2 => '-',
-        _ => '\\',
-    };
+    let spinner = spinner_char(tick);
 
     format!(
         "Loading thread {spinner}\n\nRunning preprocessor `{THREAD_PREPROCESSOR_NAME}` with `mode: json`.\nLarge traces can take a few seconds."
     )
+}
+
+fn spinner_char(tick: usize) -> char {
+    match tick % 4 {
+        0 => '|',
+        1 => '/',
+        2 => '-',
+        _ => '\\',
+    }
 }
 
 fn role_display_name(role: &str) -> &str {
@@ -1697,17 +2163,36 @@ fn build_summary_query(
     preview_length: usize,
     limit: usize,
     cursor: Option<&str>,
+    search_query: Option<&str>,
 ) -> String {
     let cursor_clause = cursor
         .map(|c| format!(" | cursor: {}", btql_quote(c)))
         .unwrap_or_default();
+    let filter_clause = build_summary_filter(search_query);
     format!(
-        "select: * | from: project_logs({}) summary | filter: created >= NOW() - INTERVAL 3 DAY | preview_length: {} | sort: _pagination_key DESC | limit: {}{}",
+        "select: * | from: project_logs({}) summary | filter: {} | preview_length: {} | sort: _pagination_key DESC | limit: {}{}",
         sql_quote(project_id),
+        filter_clause,
         preview_length,
         limit,
         cursor_clause,
     )
+}
+
+fn build_summary_filter(search_query: Option<&str>) -> String {
+    let base = "created >= NOW() - INTERVAL 3 DAY";
+    let Some(search) = search_query.map(str::trim).filter(|s| !s.is_empty()) else {
+        return base.to_string();
+    };
+
+    let match_term = sql_quote(search);
+    let match_clause = TRACE_TEXT_SEARCH_FIELDS
+        .iter()
+        .map(|field| format!("{field} MATCH {match_term}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    format!("{base} AND ({match_clause})")
 }
 
 fn build_spans_query(
@@ -1810,6 +2295,7 @@ async fn fetch_summary_rows(
     project_id: &str,
     preview_length: usize,
     total_limit: usize,
+    search_query: Option<&str>,
     print_queries: bool,
 ) -> Result<Vec<Map<String, Value>>> {
     let mut rows: Vec<Map<String, Value>> = Vec::new();
@@ -1817,7 +2303,13 @@ async fn fetch_summary_rows(
 
     while rows.len() < total_limit {
         let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
-        let query = build_summary_query(project_id, preview_length, page_limit, cursor.as_deref());
+        let query = build_summary_query(
+            project_id,
+            preview_length,
+            page_limit,
+            cursor.as_deref(),
+            search_query,
+        );
         maybe_print_query(print_queries, "summary", &query);
 
         let response = execute_query(client, &query)
@@ -1955,6 +2447,7 @@ fn start_full_span_load_for_row_id(
     });
 
     app.full_span_loading_row_id = Some(row_id.clone());
+    app.full_span_load_started_at = Some(Instant::now());
     app.full_span_spinner_tick = 0;
     app.full_span_load_rx = Some(rx);
 
@@ -2025,6 +2518,7 @@ fn poll_pending_full_span_load(
         Ok((row_id, result)) => {
             app.full_span_load_rx = None;
             app.full_span_loading_row_id = None;
+            app.full_span_load_started_at = None;
 
             match result {
                 Ok(Some(row)) => {
@@ -2061,6 +2555,7 @@ fn poll_pending_full_span_load(
         Err(TryRecvError::Disconnected) => {
             app.full_span_load_rx = None;
             app.full_span_loading_row_id = None;
+            app.full_span_load_started_at = None;
             app.set_error("Failed to load full span: request channel closed");
         }
     }
