@@ -12,6 +12,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use lingua::processing::import::{import_messages_from_spans, Span as LinguaSpan};
+use lingua::universal::{
+    AssistantContent, AssistantContentPart, Message as LinguaMessage, ToolCallArguments,
+    ToolContentPart, UserContent, UserContentPart,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::Frame;
@@ -154,6 +159,12 @@ enum DetailPaneFocus {
     Detail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanDetailTab {
+    Messages,
+    Raw,
+}
+
 struct TraceViewerApp {
     project: ProjectSelection,
     traces: Vec<TraceSummaryRow>,
@@ -179,6 +190,7 @@ struct TraceViewerApp {
     trace_spinner_tick: usize,
     trace_load_rx: Option<Receiver<(String, Result<Vec<Map<String, Value>>>)>>,
     spans: Vec<SpanListEntry>,
+    collapsed_span_row_ids: HashSet<String>,
     full_span_cache: HashMap<String, Map<String, Value>>,
     full_span_loading_row_id: Option<String>,
     full_span_pending_row_id: Option<String>,
@@ -189,6 +201,10 @@ struct TraceViewerApp {
     detail_scroll: u16,
     detail_view: DetailView,
     detail_pane_focus: DetailPaneFocus,
+    span_detail_tab: SpanDetailTab,
+    span_detail_messages: Option<Vec<Value>>,
+    span_detail_message_selected: usize,
+    span_detail_message_expanded: HashSet<usize>,
     thread_messages: Option<Vec<Value>>,
     thread_selected_message: usize,
     thread_expanded: HashSet<usize>,
@@ -244,6 +260,7 @@ impl TraceViewerApp {
             trace_spinner_tick: 0,
             trace_load_rx: None,
             spans: Vec::new(),
+            collapsed_span_row_ids: HashSet::new(),
             full_span_cache: HashMap::new(),
             full_span_loading_row_id: None,
             full_span_pending_row_id: None,
@@ -254,6 +271,10 @@ impl TraceViewerApp {
             detail_scroll: 0,
             detail_view: DetailView::Span,
             detail_pane_focus: DetailPaneFocus::Tree,
+            span_detail_tab: SpanDetailTab::Messages,
+            span_detail_messages: None,
+            span_detail_message_selected: 0,
+            span_detail_message_expanded: HashSet::new(),
             thread_messages: None,
             thread_selected_message: 0,
             thread_expanded: HashSet::new(),
@@ -299,6 +320,123 @@ impl TraceViewerApp {
         self.spans.get(self.selected_span)
     }
 
+    fn visible_span_indices(&self) -> Vec<usize> {
+        let mut visible = Vec::new();
+        let mut collapsed_depth_stack: Vec<usize> = Vec::new();
+
+        for (idx, span) in self.spans.iter().enumerate() {
+            while collapsed_depth_stack
+                .last()
+                .copied()
+                .map(|depth| span.depth <= depth)
+                .unwrap_or(false)
+            {
+                collapsed_depth_stack.pop();
+            }
+
+            if collapsed_depth_stack.is_empty() {
+                visible.push(idx);
+            }
+
+            if self.collapsed_span_row_ids.contains(&span.id) {
+                collapsed_depth_stack.push(span.depth);
+            }
+        }
+
+        visible
+    }
+
+    fn selected_visible_span_position(&self, visible_indices: &[usize]) -> Option<usize> {
+        visible_indices
+            .iter()
+            .position(|idx| *idx == self.selected_span)
+            .or_else(|| {
+                visible_indices
+                    .iter()
+                    .rposition(|idx| *idx <= self.selected_span)
+            })
+            .or_else(|| (!visible_indices.is_empty()).then_some(0))
+    }
+
+    fn span_has_children_at_index(&self, index: usize) -> bool {
+        let Some(current) = self.spans.get(index) else {
+            return false;
+        };
+        self.spans
+            .get(index + 1)
+            .map(|next| next.depth > current.depth)
+            .unwrap_or(false)
+    }
+
+    fn is_span_collapsed_at_index(&self, index: usize) -> bool {
+        self.spans
+            .get(index)
+            .map(|span| self.collapsed_span_row_ids.contains(&span.id))
+            .unwrap_or(false)
+    }
+
+    fn set_default_tree_collapse_state(&mut self) {
+        self.collapsed_span_row_ids = self
+            .spans
+            .iter()
+            .filter(|span| span_purpose_is_scorer(&span.row))
+            .map(|span| span.id.clone())
+            .collect();
+    }
+
+    fn expand_ancestor_chain_for_selected_span(&mut self) {
+        let Some(selected) = self.spans.get(self.selected_span) else {
+            return;
+        };
+        let mut target_depth = selected.depth;
+        for idx in (0..self.selected_span).rev() {
+            let Some(candidate) = self.spans.get(idx) else {
+                continue;
+            };
+            if candidate.depth < target_depth {
+                self.collapsed_span_row_ids.remove(&candidate.id);
+                target_depth = candidate.depth;
+                if target_depth == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn ensure_selected_span_visible(&mut self) {
+        let visible = self.visible_span_indices();
+        if visible.is_empty() {
+            self.selected_span = 0;
+            return;
+        }
+        if visible.contains(&self.selected_span) {
+            return;
+        }
+        if let Some(pos) = self.selected_visible_span_position(&visible) {
+            self.selected_span = visible[pos];
+        } else {
+            self.selected_span = visible[0];
+        }
+        self.refresh_span_detail_messages(true);
+    }
+
+    fn toggle_selected_span_collapsed(&mut self) -> bool {
+        if !self.span_has_children_at_index(self.selected_span) {
+            return false;
+        }
+
+        let Some(span) = self.current_span().cloned() else {
+            return false;
+        };
+        if self.collapsed_span_row_ids.contains(&span.id) {
+            self.collapsed_span_row_ids.remove(&span.id);
+        } else {
+            self.collapsed_span_row_ids.insert(span.id);
+        }
+        self.ensure_selected_span_visible();
+        true
+    }
+
     fn move_trace_up(&mut self) {
         if self.selected_trace > 0 {
             self.selected_trace -= 1;
@@ -322,30 +460,44 @@ impl TraceViewerApp {
     }
 
     fn move_span_up(&mut self) {
-        if self.selected_span > 0 {
-            self.selected_span -= 1;
+        let visible = self.visible_span_indices();
+        let Some(pos) = self.selected_visible_span_position(&visible) else {
+            return;
+        };
+        if pos > 0 {
+            self.selected_span = visible[pos - 1];
             self.detail_scroll = 0;
+            self.refresh_span_detail_messages(true);
         }
     }
 
     fn move_span_top(&mut self) {
-        if !self.spans.is_empty() {
-            self.selected_span = 0;
+        let visible = self.visible_span_indices();
+        if let Some(first) = visible.first().copied() {
+            self.selected_span = first;
             self.detail_scroll = 0;
+            self.refresh_span_detail_messages(true);
         }
     }
 
     fn move_span_down(&mut self) {
-        if self.selected_span + 1 < self.spans.len() {
-            self.selected_span += 1;
+        let visible = self.visible_span_indices();
+        let Some(pos) = self.selected_visible_span_position(&visible) else {
+            return;
+        };
+        if pos + 1 < visible.len() {
+            self.selected_span = visible[pos + 1];
             self.detail_scroll = 0;
+            self.refresh_span_detail_messages(true);
         }
     }
 
     fn move_span_bottom(&mut self) {
-        if !self.spans.is_empty() {
-            self.selected_span = self.spans.len().saturating_sub(1);
+        let visible = self.visible_span_indices();
+        if let Some(last) = visible.last().copied() {
+            self.selected_span = last;
             self.detail_scroll = 0;
+            self.refresh_span_detail_messages(true);
         }
     }
 
@@ -391,6 +543,103 @@ impl TraceViewerApp {
             self.thread_expanded.remove(&idx);
         } else {
             self.thread_expanded.insert(idx);
+        }
+    }
+
+    fn move_span_detail_message_up(&mut self) {
+        if self.span_detail_message_selected > 0 {
+            self.span_detail_message_selected -= 1;
+        }
+    }
+
+    fn move_span_detail_message_down(&mut self) {
+        let Some(messages) = &self.span_detail_messages else {
+            return;
+        };
+        if self.span_detail_message_selected + 1 < messages.len() {
+            self.span_detail_message_selected += 1;
+        }
+    }
+
+    fn move_span_detail_message_top(&mut self) {
+        self.span_detail_message_selected = 0;
+    }
+
+    fn move_span_detail_message_bottom(&mut self) {
+        let Some(messages) = &self.span_detail_messages else {
+            return;
+        };
+        if !messages.is_empty() {
+            self.span_detail_message_selected = messages.len().saturating_sub(1);
+        }
+    }
+
+    fn toggle_selected_span_detail_message(&mut self) {
+        let idx = self.span_detail_message_selected;
+        if self.span_detail_message_expanded.contains(&idx) {
+            self.span_detail_message_expanded.remove(&idx);
+        } else {
+            self.span_detail_message_expanded.insert(idx);
+        }
+    }
+
+    fn span_detail_has_message_list(&self) -> bool {
+        self.span_detail_messages
+            .as_ref()
+            .map(|messages| !messages.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn span_detail_shows_messages(&self) -> bool {
+        self.detail_view == DetailView::Span
+            && self.span_detail_tab == SpanDetailTab::Messages
+            && self.span_detail_has_message_list()
+    }
+
+    fn span_detail_status_text(&self) -> &'static str {
+        span_detail_status(
+            self.detail_view,
+            self.detail_pane_focus,
+            self.span_detail_shows_messages(),
+        )
+    }
+
+    fn toggle_span_detail_tab(&mut self) {
+        self.span_detail_tab = match self.span_detail_tab {
+            SpanDetailTab::Messages => SpanDetailTab::Raw,
+            SpanDetailTab::Raw => SpanDetailTab::Messages,
+        };
+        self.detail_scroll = 0;
+    }
+
+    fn refresh_span_detail_messages(&mut self, reset_selection: bool) {
+        let Some(span) = self.current_span().cloned() else {
+            self.span_detail_messages = None;
+            self.span_detail_message_selected = 0;
+            self.span_detail_message_expanded.clear();
+            return;
+        };
+
+        let row = self.full_span_cache.get(&span.id).unwrap_or(&span.row);
+        let messages = extract_span_detail_messages(row);
+        if messages.is_empty() {
+            self.span_detail_messages = None;
+            self.span_detail_message_selected = 0;
+            self.span_detail_message_expanded.clear();
+            return;
+        }
+
+        let message_count = messages.len();
+        self.span_detail_messages = Some(messages);
+        if reset_selection {
+            self.span_detail_message_selected = 0;
+            self.span_detail_message_expanded.clear();
+        } else {
+            self.span_detail_message_selected = self
+                .span_detail_message_selected
+                .min(message_count.saturating_sub(1));
+            self.span_detail_message_expanded
+                .retain(|idx| *idx < message_count);
         }
     }
 }
@@ -918,6 +1167,9 @@ fn handle_span_detail_key(
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
+    let span_detail_message_mode =
+        app.detail_pane_focus == DetailPaneFocus::Detail && app.span_detail_shows_messages();
+
     match key.code {
         KeyCode::Char('g') if key.modifiers.is_empty() => {
             if app.pending_g_prefix_at.take().is_some() {
@@ -928,6 +1180,8 @@ fn handle_span_detail_key(
                     }
                 } else if app.detail_view == DetailView::Thread {
                     app.move_thread_message_top();
+                } else if span_detail_message_mode {
+                    app.move_span_detail_message_top();
                 } else {
                     app.scroll_detail_top();
                 }
@@ -943,6 +1197,8 @@ fn handle_span_detail_key(
                 }
             } else if app.detail_view == DetailView::Thread {
                 app.move_thread_message_bottom();
+            } else if span_detail_message_mode {
+                app.move_span_detail_message_bottom();
             } else {
                 scroll_detail_to_bottom(app);
             }
@@ -955,6 +1211,8 @@ fn handle_span_detail_key(
                 }
             } else if app.detail_view == DetailView::Thread {
                 app.move_thread_message_up();
+            } else if span_detail_message_mode {
+                app.move_span_detail_message_up();
             } else {
                 app.scroll_detail_up(1);
             }
@@ -967,18 +1225,32 @@ fn handle_span_detail_key(
                 }
             } else if app.detail_view == DetailView::Thread {
                 app.move_thread_message_down();
+            } else if span_detail_message_mode {
+                app.move_span_detail_message_down();
             } else {
                 scroll_detail_down_bounded(app, 1);
             }
         }
         KeyCode::PageUp => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                app.scroll_detail_up(10);
+                if span_detail_message_mode {
+                    for _ in 0..10 {
+                        app.move_span_detail_message_up();
+                    }
+                } else {
+                    app.scroll_detail_up(10);
+                }
             }
         }
         KeyCode::PageDown => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                scroll_detail_down_bounded(app, 10);
+                if span_detail_message_mode {
+                    for _ in 0..10 {
+                        app.move_span_detail_message_down();
+                    }
+                } else {
+                    scroll_detail_down_bounded(app, 10);
+                }
             }
         }
         KeyCode::Backspace => {
@@ -989,15 +1261,19 @@ fn handle_span_detail_key(
         }
         KeyCode::Left | KeyCode::Char('h') => {
             app.detail_pane_focus = DetailPaneFocus::Tree;
-            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+            app.set_status(app.span_detail_status_text());
         }
         KeyCode::Right | KeyCode::Char('l') => {
             app.detail_pane_focus = DetailPaneFocus::Detail;
-            app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+            app.set_status(app.span_detail_status_text());
         }
         KeyCode::Enter => {
             if app.detail_view == DetailView::Span {
-                request_selected_span_load(app, client, handle, true)?;
+                if span_detail_message_mode && current_span_is_fully_loaded(app) {
+                    app.toggle_selected_span_detail_message();
+                } else {
+                    request_selected_span_load(app, client, handle, true)?;
+                }
             } else if app.thread_loading || app.thread_messages.is_none() {
                 request_thread_messages_load(app, client, handle, true)?;
             } else {
@@ -1016,8 +1292,14 @@ fn handle_span_detail_key(
                 app.detail_pane_focus = DetailPaneFocus::Detail;
                 request_thread_messages_load(app, client, handle, false)?;
             } else {
-                app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+                app.set_status(app.span_detail_status_text());
                 request_selected_span_load(app, client, handle, false)?;
+            }
+        }
+        KeyCode::Tab => {
+            if app.detail_view == DetailView::Span {
+                app.toggle_span_detail_tab();
+                app.set_status(app.span_detail_status_text());
             }
         }
         KeyCode::Char('r') => {
@@ -1025,19 +1307,44 @@ fn handle_span_detail_key(
                 request_loaded_trace_reload(app, client, handle)?;
             }
         }
+        KeyCode::Char(' ') => {
+            if app.detail_pane_focus == DetailPaneFocus::Tree
+                && app.toggle_selected_span_collapsed()
+            {
+                app.set_status(app.span_detail_status_text());
+            }
+        }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                app.scroll_detail_up(10)
+                if span_detail_message_mode {
+                    for _ in 0..10 {
+                        app.move_span_detail_message_up();
+                    }
+                } else {
+                    app.scroll_detail_up(10)
+                }
             }
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                scroll_detail_down_bounded(app, 10)
+                if span_detail_message_mode {
+                    for _ in 0..10 {
+                        app.move_span_detail_message_down();
+                    }
+                } else {
+                    scroll_detail_down_bounded(app, 10)
+                }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn current_span_is_fully_loaded(app: &TraceViewerApp) -> bool {
+    app.current_span()
+        .map(|span| app.full_span_cache.contains_key(&span.id))
+        .unwrap_or(false)
 }
 
 fn scroll_detail_down_bounded(app: &mut TraceViewerApp, amount: u16) {
@@ -1051,7 +1358,7 @@ fn scroll_detail_to_bottom(app: &mut TraceViewerApp) {
 }
 
 fn current_span_detail_max_scroll(app: &TraceViewerApp) -> Option<u16> {
-    if app.detail_view != DetailView::Span {
+    if app.detail_view != DetailView::Span || app.span_detail_shows_messages() {
         return None;
     }
 
@@ -1328,7 +1635,11 @@ fn poll_pending_url_open(
                         app.full_span_pending_row_id = None;
                         app.full_span_load_started_at = None;
                         app.spans.clear();
+                        app.collapsed_span_row_ids.clear();
                         app.full_span_cache.clear();
+                        app.span_detail_messages = None;
+                        app.span_detail_message_selected = 0;
+                        app.span_detail_message_expanded.clear();
                         app.loaded_root_span_id = None;
                         request_refresh_traces(app, client, handle)?;
                     }
@@ -1474,6 +1785,7 @@ fn apply_loaded_trace_rows(
     }
 
     app.spans = spans;
+    app.set_default_tree_collapse_state();
     app.full_span_cache.clear();
     app.full_span_loading_row_id = None;
     app.full_span_pending_row_id = None;
@@ -1491,6 +1803,8 @@ fn apply_loaded_trace_rows(
             app.selected_span = idx;
         }
     }
+    app.expand_ancestor_chain_for_selected_span();
+    app.ensure_selected_span_visible();
     app.detail_view = app
         .pending_open_detail_view
         .take()
@@ -1506,9 +1820,13 @@ fn apply_loaded_trace_rows(
     app.thread_loading = false;
     app.thread_spinner_tick = 0;
     app.thread_load_rx = None;
+    app.span_detail_messages = None;
+    app.span_detail_message_selected = 0;
+    app.span_detail_message_expanded.clear();
     app.loaded_root_span_id = Some(root_span_id.clone());
     app.screen = Screen::SpanDetail;
-    app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+    app.refresh_span_detail_messages(true);
+    app.set_status(app.span_detail_status_text());
     request_selected_span_load(app, client, handle, false)?;
     if app.detail_view == DetailView::Thread {
         request_thread_messages_load(app, client, handle, false)?;
@@ -1828,12 +2146,22 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(area);
 
-    let items: Vec<ListItem<'_>> = app
-        .spans
+    let visible_span_indices = app.visible_span_indices();
+    let items: Vec<ListItem<'_>> = visible_span_indices
         .iter()
-        .map(|span| {
+        .filter_map(|idx| app.spans.get(*idx).map(|span| (*idx, span)))
+        .map(|(idx, span)| {
             let indent = "  ".repeat(span.depth.min(16));
-            ListItem::new(format!("{indent}{}", span.label))
+            let marker = if app.span_has_children_at_index(idx) {
+                if app.is_span_collapsed_at_index(idx) {
+                    "▸"
+                } else {
+                    "▾"
+                }
+            } else {
+                "•"
+            };
+            ListItem::new(format!("{indent}{marker} {}", span.label))
         })
         .collect();
 
@@ -1858,7 +2186,9 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
                 } else {
                     Style::default()
                 })
-                .title_bottom("Left/Right switch pane  t toggles thread/span  Backspace/Esc back"),
+                .title_bottom(
+                    "Left/Right switch pane  Space collapse/expand  Tab raw/messages  t thread/span  Backspace/Esc back",
+                ),
         )
         .highlight_style(
             Style::default()
@@ -1867,13 +2197,16 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
         );
 
     let mut list_state = ListState::default();
-    if !app.spans.is_empty() {
-        list_state.select(Some(app.selected_span));
+    if let Some(selected_visible_pos) = app.selected_visible_span_position(&visible_span_indices) {
+        list_state.select(Some(selected_visible_pos));
     }
     frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
     let detail_title = match app.detail_view {
-        DetailView::Span => "Span Detail",
+        DetailView::Span => match app.span_detail_tab {
+            SpanDetailTab::Messages => "Span Detail [messages]",
+            SpanDetailTab::Raw => "Span Detail [raw]",
+        },
         DetailView::Thread => "Thread View",
     };
     let detail_title_with_focus = if detail_is_focused {
@@ -1895,40 +2228,77 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
 
     match app.detail_view {
         DetailView::Span => {
-            let detail_text = app
+            let detail_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(5), Constraint::Min(0)])
+                .split(chunks[1]);
+
+            let summary_text = app
                 .current_span()
                 .map(|span| {
                     let full_row = app.full_span_cache.get(&span.id);
-                    let is_loading = app
-                        .full_span_loading_row_id
-                        .as_deref()
-                        .map(|id| id == span.id)
-                        .unwrap_or(false);
-                    let loading_spinner = if is_loading
-                        && app
-                            .full_span_load_started_at
-                            .map(|start| start.elapsed() >= LOADER_DELAY)
-                            .unwrap_or(false)
-                    {
-                        Some(spinner_char(app.full_span_spinner_tick))
-                    } else {
-                        None
-                    };
-                    render_span_details(
-                        span,
-                        full_row.unwrap_or(&span.row),
-                        full_row.is_some(),
-                        is_loading,
-                        loading_spinner,
-                    )
+                    render_span_summary(span, full_row.unwrap_or(&span.row))
                 })
                 .unwrap_or_else(|| "No span selected".to_string());
 
-            let detail = Paragraph::new(detail_text)
-                .block(detail_block)
-                .scroll((app.detail_scroll, 0))
+            let summary = Paragraph::new(summary_text)
+                .block(
+                    Block::default()
+                        .title("Summary")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded),
+                )
                 .wrap(Wrap { trim: false });
-            frame.render_widget(detail, chunks[1]);
+            frame.render_widget(summary, detail_chunks[0]);
+
+            if app.span_detail_shows_messages() {
+                if let Some(messages) = &app.span_detail_messages {
+                    draw_span_messages_list(frame, detail_chunks[1], app, messages, detail_block);
+                } else {
+                    let detail = Paragraph::new(
+                        "No parseable messages found. Press Tab for raw span input/output.",
+                    )
+                    .block(detail_block)
+                    .scroll((app.detail_scroll, 0))
+                    .wrap(Wrap { trim: false });
+                    frame.render_widget(detail, detail_chunks[1]);
+                }
+            } else {
+                let detail_text = app
+                    .current_span()
+                    .map(|span| {
+                        let full_row = app.full_span_cache.get(&span.id);
+                        let is_loading = app
+                            .full_span_loading_row_id
+                            .as_deref()
+                            .map(|id| id == span.id)
+                            .unwrap_or(false);
+                        let loading_spinner = if is_loading
+                            && app
+                                .full_span_load_started_at
+                                .map(|start| start.elapsed() >= LOADER_DELAY)
+                                .unwrap_or(false)
+                        {
+                            Some(spinner_char(app.full_span_spinner_tick))
+                        } else {
+                            None
+                        };
+                        render_span_details(
+                            span,
+                            full_row.unwrap_or(&span.row),
+                            full_row.is_some(),
+                            is_loading,
+                            loading_spinner,
+                        )
+                    })
+                    .unwrap_or_else(|| "No span selected".to_string());
+
+                let detail = Paragraph::new(detail_text)
+                    .block(detail_block)
+                    .scroll((app.detail_scroll, 0))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(detail, detail_chunks[1]);
+            }
         }
         DetailView::Thread => {
             if app.thread_loading {
@@ -2305,14 +2675,41 @@ fn span_label(row: &Map<String, Value>, span_id: &str) -> String {
     label
 }
 
+fn span_purpose_is_scorer(row: &Map<String, Value>) -> bool {
+    let span_attributes = value_as_object_owned(row.get("span_attributes")).unwrap_or_default();
+    value_as_string(span_attributes.get("purpose"))
+        .map(|purpose| purpose.eq_ignore_ascii_case("scorer"))
+        .unwrap_or(false)
+}
+
 fn extract_duration_seconds(metrics: Option<&Value>) -> Option<f64> {
     let metrics_obj = value_as_object_owned(metrics)?;
-    let duration = metrics_obj.get("duration")?;
-    match duration {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
-        _ => None,
-    }
+    parse_f64ish(metrics_obj.get("duration"))
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .or_else(|| {
+            let start = parse_f64ish(metrics_obj.get("start"))?;
+            let end = parse_f64ish(metrics_obj.get("end"))?;
+            let delta = end - start;
+            (delta.is_finite() && delta >= 0.0).then_some(delta)
+        })
+}
+
+fn extract_ttft_seconds(metrics: &Map<String, Value>) -> Option<f64> {
+    let keys = [
+        "time_to_first_token",
+        "ttft",
+        "time_to_first_token_seconds",
+        "first_token_latency",
+    ];
+    keys.iter().find_map(|key| {
+        parse_f64ish(metrics.get(*key)).and_then(|value| {
+            if value.is_finite() && value >= 0.0 {
+                Some(value)
+            } else {
+                None
+            }
+        })
+    })
 }
 
 fn format_compact_duration(seconds: f64) -> String {
@@ -2406,6 +2803,14 @@ fn parse_u64ish(value: Option<&Value>) -> Option<u64> {
     }
 }
 
+fn parse_f64ish(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 fn format_u64_with_commas(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::new();
@@ -2464,8 +2869,8 @@ fn render_span_details(
         }
     }
 
-    append_section(&mut out, "input", row.get("input"));
-    append_section(&mut out, "output", row.get("output"));
+    append_message_aware_section(&mut out, "input", row.get("input"));
+    append_message_aware_section(&mut out, "output", row.get("output"));
     append_section(&mut out, "expected", row.get("expected"));
     append_section(&mut out, "error", row.get("error"));
     append_section(&mut out, "tags", row.get("tags"));
@@ -2475,6 +2880,124 @@ fn render_span_details(
     append_section(&mut out, "span_attributes", row.get("span_attributes"));
 
     out
+}
+
+fn render_span_summary(span: &SpanListEntry, row: &Map<String, Value>) -> String {
+    let span_attributes = value_as_object_owned(row.get("span_attributes")).unwrap_or_default();
+    let name = value_as_string(span_attributes.get("name")).unwrap_or_else(|| span.span_id.clone());
+    let kind = value_as_string(span_attributes.get("type")).unwrap_or_else(|| "span".to_string());
+    let model = extract_model_name(row).unwrap_or_else(|| "-".to_string());
+
+    let metrics = value_as_object_owned(row.get("metrics")).unwrap_or_default();
+    let duration_seconds = extract_duration_seconds(row.get("metrics"));
+    let ttft_seconds = extract_ttft_seconds(&metrics);
+    let total_tokens = parse_u64ish(metrics.get("total_tokens"))
+        .or_else(|| parse_u64ish(metrics.get("tokens")))
+        .or_else(|| extract_total_tokens(row));
+    let prompt_tokens = parse_u64ish(metrics.get("prompt_tokens"))
+        .or_else(|| parse_u64ish(metrics.get("input_tokens")));
+    let completion_tokens = parse_u64ish(metrics.get("completion_tokens"))
+        .or_else(|| parse_u64ish(metrics.get("output_tokens")));
+    let cached_tokens = parse_u64ish(metrics.get("prompt_cached_tokens"))
+        .or_else(|| parse_u64ish(metrics.get("cache_creation_input_tokens")));
+    let estimated_cost =
+        parse_f64ish(metrics.get("estimated_cost")).or_else(|| parse_f64ish(metrics.get("cost")));
+
+    let duration_part = match (duration_seconds, ttft_seconds) {
+        (Some(duration), Some(ttft)) => {
+            format!(
+                "dur {} (ttft {})",
+                format_compact_duration(duration),
+                format_compact_duration(ttft)
+            )
+        }
+        (Some(duration), None) => format!("dur {}", format_compact_duration(duration)),
+        (None, Some(ttft)) => format!("ttft {}", format_compact_duration(ttft)),
+        (None, None) => "dur -".to_string(),
+    };
+
+    let mut metrics_parts = vec![duration_part];
+    if let Some(total) = total_tokens {
+        metrics_parts.push(format!("tok {}", format_u64_with_commas(total)));
+    }
+    if let Some(prompt) = prompt_tokens {
+        metrics_parts.push(format!("in {}", format_u64_with_commas(prompt)));
+    }
+    if let Some(completion) = completion_tokens {
+        metrics_parts.push(format!("out {}", format_u64_with_commas(completion)));
+    }
+    if let Some(cached) = cached_tokens {
+        metrics_parts.push(format!("cached {}", format_u64_with_commas(cached)));
+    }
+    if let Some(cost) = estimated_cost {
+        metrics_parts.push(format!("cost ${cost:.4}"));
+    }
+
+    let params = extract_span_param_summary(row, 6);
+    let params_text = if params.is_empty() {
+        "params -".to_string()
+    } else {
+        format!("params {}", params.join(" "))
+    };
+
+    format!(
+        "{name} [{kind}]  model {model}\n{}  |  {params_text}",
+        metrics_parts.join("  |  "),
+    )
+}
+
+fn extract_span_param_summary(row: &Map<String, Value>, max_items: usize) -> Vec<String> {
+    let metadata = value_as_object_owned(row.get("metadata")).unwrap_or_default();
+    let mut maps: Vec<Map<String, Value>> = vec![metadata.clone()];
+    if let Some(params) = value_as_object_owned(metadata.get("params")) {
+        maps.push(params);
+    }
+    if let Some(params) = value_as_object_owned(metadata.get("model_params")) {
+        maps.push(params);
+    }
+    if let Some(params) = value_as_object_owned(metadata.get("llm_params")) {
+        maps.push(params);
+    }
+
+    let preferred_keys = [
+        ("temperature", "temp"),
+        ("top_p", "top_p"),
+        ("max_tokens", "max_tok"),
+        ("frequency_penalty", "freq_pen"),
+        ("presence_penalty", "pres_pen"),
+        ("reasoning_effort", "effort"),
+        ("tool_choice", "tool"),
+        ("parallel_tool_calls", "ptools"),
+    ];
+
+    let mut out: Vec<String> = Vec::new();
+    for (key, label) in preferred_keys {
+        let value = maps
+            .iter()
+            .find_map(|map| map.get(key))
+            .and_then(compact_scalar_value);
+        if let Some(value) = value {
+            out.push(format!("{label}={value}"));
+            if out.len() >= max_items {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn compact_scalar_value(value: &Value) -> Option<String> {
+    let raw = match value {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    if raw.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&raw, 18))
+    }
 }
 
 fn render_thread_loading_state(tick: usize) -> String {
@@ -2523,9 +3046,10 @@ fn render_message_content(content: &Value) -> String {
                             continue;
                         }
 
-                        if item_type == "tool_call" {
+                        if item_type == "tool_call" || item_type == "tool-call" {
                             let name = value_as_string(obj.get("name"))
                                 .or_else(|| value_as_string(obj.get("tool_name")))
+                                .or_else(|| value_as_string(obj.get("toolName")))
                                 .unwrap_or_else(|| "tool_call".to_string());
                             let args = obj.get("arguments").or_else(|| obj.get("input"));
                             if let Some(args) = args {
@@ -2566,6 +3090,7 @@ fn render_tool_calls_inline(tool_calls: &Value) -> String {
                                 .and_then(|f| value_as_string(f.get("name")))
                         })
                         .or_else(|| value_as_string(obj.get("tool_name")))
+                        .or_else(|| value_as_string(obj.get("toolName")))
                         .unwrap_or_else(|| "tool_call".to_string());
                     out.push_str(&format!("[Tool Call] {name}\n"));
 
@@ -2637,8 +3162,49 @@ fn draw_thread_messages_list(
     messages: &[Value],
     detail_block: Block<'_>,
 ) {
+    draw_messages_list(
+        frame,
+        area,
+        messages,
+        detail_block,
+        app.thread_selected_message,
+        &app.thread_expanded,
+        "No messages returned by preprocessor.",
+        "Up/Down: select message  Enter: expand/collapse  Left: span tree  t: span/thread",
+    );
+}
+
+fn draw_span_messages_list(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &TraceViewerApp,
+    messages: &[Value],
+    detail_block: Block<'_>,
+) {
+    draw_messages_list(
+        frame,
+        area,
+        messages,
+        detail_block,
+        app.span_detail_message_selected,
+        &app.span_detail_message_expanded,
+        "No parseable messages found in span input/output.",
+        "Up/Down: select message  Enter: expand/collapse  Left: span tree  Tab: raw",
+    );
+}
+
+fn draw_messages_list(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    messages: &[Value],
+    detail_block: Block<'_>,
+    selected_message: usize,
+    expanded_set: &HashSet<usize>,
+    empty_state_text: &str,
+    controls_text: &str,
+) {
     if messages.is_empty() {
-        let detail = Paragraph::new("No messages returned by preprocessor.")
+        let detail = Paragraph::new(empty_state_text)
             .block(detail_block)
             .wrap(Wrap { trim: false });
         frame.render_widget(detail, area);
@@ -2649,20 +3215,21 @@ fn draw_thread_messages_list(
         .iter()
         .enumerate()
         .map(|(index, message)| {
-            let (role, content, tool_calls) = match message {
+            let (role, section, content, tool_calls) = match message {
                 Value::Object(obj) => (
                     value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string()),
+                    value_as_string(obj.get("_section")),
                     obj.get("content"),
                     obj.get("tool_calls"),
                 ),
-                _ => ("message".to_string(), Some(message), None),
+                _ => ("message".to_string(), None, Some(message), None),
             };
 
-            let expanded = app.thread_expanded.contains(&index);
+            let expanded = expanded_set.contains(&index);
             let arrow = if expanded { "▾" } else { "▸" };
             let role_display = role_display_name(&role);
 
-            let mut lines: Vec<Line<'_>> = vec![Line::from(vec![
+            let mut header_spans = vec![
                 Span::styled(
                     format!("{arrow}  #{:<3}", index + 1),
                     Style::default().fg(Color::DarkGray),
@@ -2671,7 +3238,14 @@ fn draw_thread_messages_list(
                     role_display.to_string(),
                     thread_role_style(&role).add_modifier(Modifier::BOLD),
                 ),
-            ])];
+            ];
+            if let Some(section) = section {
+                header_spans.push(Span::styled(
+                    format!("  [{section}]"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let mut lines: Vec<Line<'_>> = vec![Line::from(header_spans)];
 
             let content_text = content.map(render_message_content).unwrap_or_default();
             let normalized_content = if content_text.trim().is_empty() {
@@ -2737,9 +3311,7 @@ fn draw_thread_messages_list(
         .collect();
 
     let list = List::new(items)
-        .block(detail_block.title_bottom(
-            "Up/Down: select message  Enter: expand/collapse  Left: span tree  t: span/thread",
-        ))
+        .block(detail_block.title_bottom(controls_text))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -2748,20 +3320,24 @@ fn draw_thread_messages_list(
         .highlight_symbol("▌ ");
 
     let mut state = ListState::default();
-    state.select(Some(
-        app.thread_selected_message
-            .min(messages.len().saturating_sub(1)),
-    ));
+    state.select(Some(selected_message.min(messages.len().saturating_sub(1))));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn span_detail_status(view: DetailView, pane_focus: DetailPaneFocus) -> &'static str {
+fn span_detail_status(
+    view: DetailView,
+    pane_focus: DetailPaneFocus,
+    span_has_message_list: bool,
+) -> &'static str {
     match (view, pane_focus) {
         (DetailView::Span, DetailPaneFocus::Tree) => {
-            "Span view (tree focus). Right: detail pane  Up/Down: select span  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
+            "Span view (tree focus). Right: detail pane  Up/Down: select span  Space: collapse/expand  Tab: raw/messages  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
+        }
+        (DetailView::Span, DetailPaneFocus::Detail) if span_has_message_list => {
+            "Span view (detail focus). Left: tree pane  Up/Down: select message  Enter: expand/collapse  Tab: raw  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Span, DetailPaneFocus::Detail) => {
-            "Span view (detail focus). Left: tree pane  Up/Down: scroll  Enter: load span  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
+            "Span view (detail focus). Left: tree pane  Up/Down: scroll  Enter: load span  Tab: messages  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Thread, DetailPaneFocus::Tree) => {
             "Thread view (tree focus). Right: detail pane  Up/Down: select span  Enter: toggle/retry  t: span  Ctrl+k: open URL  Backspace/Esc: back"
@@ -2770,6 +3346,318 @@ fn span_detail_status(view: DetailView, pane_focus: DetailPaneFocus) -> &'static
             "Thread view (detail focus). Left: tree pane  Up/Down: select message  Enter: expand/collapse (or retry)  t: span  Ctrl+k: open URL  Backspace/Esc: back"
         }
     }
+}
+
+fn append_message_aware_section(out: &mut String, title: &str, value: Option<&Value>) {
+    out.push('\n');
+    out.push_str(&title.to_uppercase());
+    out.push('\n');
+    out.push_str(&"-".repeat(title.len().max(8)));
+    out.push('\n');
+
+    let Some(raw_value) = value else {
+        out.push_str("-\n");
+        return;
+    };
+
+    let parsed_value = normalize_value_for_display(raw_value);
+    let messages = import_lingua_messages_from_section(raw_value);
+    if messages.is_empty() {
+        out.push_str(&format_pretty_value(Some(&parsed_value)));
+        out.push('\n');
+        return;
+    }
+
+    out.push_str(&format_lingua_messages_for_span(&messages));
+    out.push('\n');
+}
+
+fn extract_span_detail_messages(row: &Map<String, Value>) -> Vec<Value> {
+    let mut messages = Vec::new();
+    messages.extend(import_lingua_messages_for_display(
+        "input",
+        row.get("input"),
+    ));
+    messages.extend(import_lingua_messages_for_display(
+        "output",
+        row.get("output"),
+    ));
+    messages
+}
+
+fn import_lingua_messages_for_display(section: &str, value: Option<&Value>) -> Vec<Value> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+
+    import_lingua_messages_from_section(value)
+        .into_iter()
+        .map(|message| {
+            if let Value::Object(mut obj) = lingua_message_to_display_json(&message) {
+                obj.insert("_section".to_string(), Value::String(section.to_string()));
+                Value::Object(obj)
+            } else {
+                Value::Null
+            }
+        })
+        .filter(|message| !message.is_null())
+        .collect()
+}
+
+fn normalize_value_for_display(value: &Value) -> Value {
+    match value {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| value.clone()),
+        _ => value.clone(),
+    }
+}
+
+fn import_lingua_messages_from_section(value: &Value) -> Vec<LinguaMessage> {
+    let mut candidates = vec![value.clone()];
+    if let Value::String(s) = value {
+        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+            candidates.push(parsed);
+        }
+    }
+
+    for candidate in candidates {
+        let Some(input) = std_json_to_lingua_value(&candidate) else {
+            continue;
+        };
+        let span = LinguaSpan {
+            input: Some(input),
+            output: None,
+            other: lingua::serde_json::Map::new(),
+        };
+        let messages = import_messages_from_spans(vec![span]);
+        if !messages.is_empty() {
+            return messages;
+        }
+    }
+
+    Vec::new()
+}
+
+fn std_json_to_lingua_value(value: &Value) -> Option<lingua::serde_json::Value> {
+    let encoded = serde_json::to_string(value).ok()?;
+    lingua::serde_json::from_str(&encoded).ok()
+}
+
+fn lingua_json_to_std_value(value: &lingua::serde_json::Value) -> Value {
+    let encoded = lingua::serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+    serde_json::from_str(&encoded).unwrap_or(Value::Null)
+}
+
+fn format_lingua_messages_for_span(messages: &[LinguaMessage]) -> String {
+    let mut out = String::new();
+    for (idx, message) in messages.iter().enumerate() {
+        let display_message = lingua_message_to_display_json(message);
+        let Value::Object(obj) = display_message else {
+            continue;
+        };
+        let role = value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string());
+        out.push_str(&format!("[{}] role: {}\n", idx + 1, role));
+
+        let content_text = obj
+            .get("content")
+            .map(render_message_content)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !content_text.is_empty() {
+            out.push_str(&content_text);
+            out.push('\n');
+        } else if obj.get("tool_calls").is_none() {
+            out.push_str("(empty)\n");
+        }
+
+        if let Some(tool_calls) = obj.get("tool_calls") {
+            let tool_calls_text = render_tool_calls_inline(tool_calls);
+            if !tool_calls_text.trim().is_empty() {
+                out.push_str("[tool_calls]\n");
+                out.push_str(tool_calls_text.trim_end());
+                out.push('\n');
+            }
+        }
+
+        if idx + 1 < messages.len() {
+            out.push('\n');
+        }
+    }
+
+    if out.trim().is_empty() {
+        "-".to_string()
+    } else {
+        out
+    }
+}
+
+fn lingua_message_to_display_json(message: &LinguaMessage) -> Value {
+    let mut out = Map::new();
+
+    match message {
+        LinguaMessage::System { content } => {
+            out.insert("role".to_string(), Value::String("system".to_string()));
+            out.insert("content".to_string(), user_content_to_display_json(content));
+        }
+        LinguaMessage::User { content } => {
+            out.insert("role".to_string(), Value::String("user".to_string()));
+            out.insert("content".to_string(), user_content_to_display_json(content));
+        }
+        LinguaMessage::Assistant { content, .. } => {
+            out.insert("role".to_string(), Value::String("assistant".to_string()));
+            let (content_value, tool_calls) = assistant_content_to_display_json(content);
+            out.insert("content".to_string(), content_value);
+            if let Some(tool_calls) = tool_calls {
+                out.insert("tool_calls".to_string(), tool_calls);
+            }
+        }
+        LinguaMessage::Tool { content } => {
+            out.insert("role".to_string(), Value::String("tool".to_string()));
+            out.insert("content".to_string(), tool_content_to_display_json(content));
+        }
+    }
+
+    Value::Object(out)
+}
+
+fn user_content_to_display_json(content: &UserContent) -> Value {
+    match content {
+        UserContent::String(s) => Value::String(s.clone()),
+        UserContent::Array(parts) => Value::Array(
+            parts
+                .iter()
+                .map(user_content_part_to_display_json)
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+fn user_content_part_to_display_json(part: &UserContentPart) -> Value {
+    match part {
+        UserContentPart::Text(text) => {
+            json!({"type": "text", "text": text.text.clone()})
+        }
+        UserContentPart::Image {
+            image, media_type, ..
+        } => {
+            json!({
+                "type": "image",
+                "media_type": media_type,
+                "image": lingua_json_to_std_value(image),
+            })
+        }
+        UserContentPart::File {
+            data,
+            filename,
+            media_type,
+            ..
+        } => {
+            json!({
+                "type": "file",
+                "filename": filename,
+                "media_type": media_type,
+                "data": lingua_json_to_std_value(data),
+            })
+        }
+    }
+}
+
+fn assistant_content_to_display_json(content: &AssistantContent) -> (Value, Option<Value>) {
+    match content {
+        AssistantContent::String(s) => (Value::String(s.clone()), None),
+        AssistantContent::Array(parts) => {
+            let mut content_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+
+            for part in parts {
+                match part {
+                    AssistantContentPart::Text(text) => {
+                        content_parts.push(json!({"type": "text", "text": text.text.clone()}));
+                    }
+                    AssistantContentPart::Reasoning { text, .. } => {
+                        content_parts.push(json!({"type": "reasoning", "text": text.clone()}));
+                    }
+                    AssistantContentPart::ToolCall {
+                        tool_call_id,
+                        tool_name,
+                        arguments,
+                        ..
+                    } => {
+                        tool_calls.push(json!({
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "tool_name": tool_name,
+                            "arguments": tool_call_arguments_to_std_value(arguments),
+                        }));
+                    }
+                    AssistantContentPart::ToolResult {
+                        tool_call_id,
+                        tool_name,
+                        output,
+                        ..
+                    } => {
+                        content_parts.push(json!({
+                            "type": "tool_result",
+                            "tool_call_id": tool_call_id,
+                            "tool_name": tool_name,
+                            "output": lingua_json_to_std_value(output),
+                        }));
+                    }
+                    AssistantContentPart::File {
+                        data,
+                        filename,
+                        media_type,
+                        ..
+                    } => {
+                        content_parts.push(json!({
+                            "type": "file",
+                            "filename": filename,
+                            "media_type": media_type,
+                            "data": lingua_json_to_std_value(data),
+                        }));
+                    }
+                }
+            }
+
+            let content_value = if content_parts.is_empty() {
+                Value::String(String::new())
+            } else {
+                Value::Array(content_parts)
+            };
+            let tool_calls_value = if tool_calls.is_empty() {
+                None
+            } else {
+                Some(Value::Array(tool_calls))
+            };
+            (content_value, tool_calls_value)
+        }
+    }
+}
+
+fn tool_call_arguments_to_std_value(arguments: &ToolCallArguments) -> Value {
+    match arguments {
+        ToolCallArguments::Valid(map) => {
+            lingua_json_to_std_value(&lingua::serde_json::Value::Object(map.clone()))
+        }
+        ToolCallArguments::Invalid(s) => Value::String(s.clone()),
+    }
+}
+
+fn tool_content_to_display_json(content: &[ToolContentPart]) -> Value {
+    let mut parts = Vec::new();
+    for part in content {
+        match part {
+            ToolContentPart::ToolResult(result) => {
+                parts.push(json!({
+                    "type": "tool_result",
+                    "tool_call_id": result.tool_call_id.clone(),
+                    "tool_name": result.tool_name.clone(),
+                    "output": lingua_json_to_std_value(&result.output),
+                }));
+            }
+        }
+    }
+    Value::Array(parts)
 }
 
 fn append_section(out: &mut String, title: &str, value: Option<&Value>) {
@@ -2830,23 +3718,9 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn format_duration(metrics: Option<&Value>) -> String {
-    let Some(metrics_obj) = value_as_object_owned(metrics) else {
-        return "-".to_string();
-    };
-
-    let Some(duration) = metrics_obj.get("duration") else {
-        return "-".to_string();
-    };
-
-    if let Some(seconds) = duration.as_f64() {
-        return format!("{seconds:.3}s");
-    }
-
-    if let Some(text) = duration.as_str() {
-        return format!("{text}s");
-    }
-
-    "-".to_string()
+    extract_duration_seconds(metrics)
+        .map(|seconds| format!("{seconds:.3}s"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn value_as_string(value: Option<&Value>) -> Option<String> {
@@ -3502,8 +4376,11 @@ fn poll_pending_full_span_load(
                         .current_span()
                         .map(|span| span.id.as_str())
                         .unwrap_or("");
-                    if app.detail_view == DetailView::Span && current_selected_row_id == row_id {
-                        app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+                    if current_selected_row_id == row_id {
+                        app.refresh_span_detail_messages(false);
+                        if app.detail_view == DetailView::Span {
+                            app.set_status(app.span_detail_status_text());
+                        }
                     }
                 }
                 Ok(None) => {
@@ -3558,7 +4435,7 @@ fn request_thread_messages_load(
     };
 
     if !force_refresh && (app.thread_messages.is_some() || app.thread_loading) {
-        app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+        app.set_status(app.span_detail_status_text());
         return Ok(());
     }
 
@@ -3616,7 +4493,7 @@ fn poll_pending_thread_load(app: &mut TraceViewerApp) {
                 }
             }
             if app.detail_view == DetailView::Thread {
-                app.set_status(span_detail_status(app.detail_view, app.detail_pane_focus));
+                app.set_status(app.span_detail_status_text());
             }
         }
         Ok(Err(err)) => {
