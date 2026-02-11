@@ -22,6 +22,8 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         return Ok(());
     }
 
+    println!("Link to a Braintrust project...");
+
     let (org, project) = if let (Some(o), Some(p)) = (&base.org, &base.project) {
         (o.clone(), p.clone())
     } else if !std::io::stdin().is_terminal() {
@@ -31,7 +33,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         let client = ApiClient::new(&ctx)?;
 
         let org = client.org_name().to_string();
-        let project = select_project_interactive(&client).await?;
+        let project = select_project_interactive(&client, Some("Link to project")).await?;
 
         (org, project)
     };
@@ -47,9 +49,9 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
 
     print_command_status(
         CommandStatus::Success,
-        &format!("Initialized with {org}/{project}"),
+        &format!("Project linked to {org}/{project}"),
     );
-    eprintln!("Created .bt/config.json");
+    print_command_status(CommandStatus::Success, "Created .bt/config.json");
 
     Ok(())
 }

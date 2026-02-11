@@ -6,7 +6,11 @@ use crate::args::BaseArgs;
 use crate::config;
 
 #[derive(Debug, Clone, Args)]
-pub struct StatusArgs {}
+pub struct StatusArgs {
+    /// Output verbose status
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
 
 #[derive(Serialize)]
 struct StatusOutput {
@@ -15,7 +19,7 @@ struct StatusOutput {
     source: Option<String>,
 }
 
-pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
     let global_path = config::global_path().ok();
     let global_cfg = config::load_global().unwrap_or_default();
     let local_path = config::local_path();
@@ -34,12 +38,20 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
             project,
             source,
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!("org: {}", org.as_deref().unwrap_or("(not set)"));
-        println!("project: {}", project.as_deref().unwrap_or("(not set)"));
+        println!("{}", serde_json::to_string(&output)?);
+        return Ok(());
+    }
+
+    if args.verbose {
+        println!("org: {}", org.as_deref().unwrap_or("(unset)"));
+        println!("project: {}", project.as_deref().unwrap_or("(unset)"));
         if let Some(src) = source {
             println!("source: {src}");
+        }
+    } else {
+        match (&org, &project) {
+            (Some(o), Some(p)) => println!("{o}/{p}"),
+            _ => println!("No org/project configured"),
         }
     }
 
