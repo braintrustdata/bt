@@ -21,13 +21,17 @@ pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T]) -> Result<usize> {
         .with_prompt(prompt)
         .items(&labels)
         .default(0)
+        .max_length(12)
         .interact()?;
 
     Ok(selection)
 }
 
 /// Interactive selector for project data
-pub async fn select_project_interactive(client: &ApiClient) -> Result<String> {
+pub async fn select_project_interactive(
+    client: &ApiClient,
+    select_label: Option<&str>,
+) -> Result<String> {
     let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
 
     if projects.is_empty() {
@@ -37,6 +41,7 @@ pub async fn select_project_interactive(client: &ApiClient) -> Result<String> {
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
 
-    let selection = fuzzy_select("Select project", &names)?;
+    let label = select_label.unwrap_or("Select project");
+    let selection = fuzzy_select(label, &names)?;
     Ok(projects[selection].name.clone())
 }
