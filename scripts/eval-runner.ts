@@ -822,8 +822,7 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
-    const isTsFile =
-      file.endsWith(".ts") || file.endsWith(".tsx");
+    const isTsFile = file.endsWith(".ts") || file.endsWith(".tsx");
     const isCjsFile = file.endsWith(".cjs") || file.endsWith(".cts");
 
     // For .cjs/.cts files, always prefer require().
