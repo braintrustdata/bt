@@ -396,6 +396,22 @@ function resolveLocalSpecifier(
   return null;
 }
 
+const TS_RESOLVE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"];
+
+function isRelativeOrAbsoluteSpecifier(specifier: string): boolean {
+  return (
+    specifier.startsWith("./") ||
+    specifier.startsWith("../") ||
+    specifier.startsWith("/") ||
+    specifier.startsWith("file://")
+  );
+}
+
+function specifierHasExtension(specifier: string): boolean {
+  const lastSegment = specifier.split("/").pop() ?? specifier;
+  return lastSegment.includes(".");
+}
+
 function installNodeModuleHooks() {
   const registerHooks = moduleMutable.registerHooks as
     | ((hooks: Record<string, (...args: unknown[]) => unknown>) => void)
@@ -411,19 +427,47 @@ function installNodeModuleHooks() {
         context: Record<string, unknown>,
       ) => { url?: string } & Record<string, unknown>;
       const ctx = (context ?? {}) as Record<string, unknown>;
-      const result = next(specifier, ctx);
-      const resolvedUrl = result?.url;
-      if (typeof resolvedUrl === "string") {
-        maybeRecordDependency(resolvedUrl);
-      } else if (typeof specifier === "string") {
-        const resolveDir =
-          typeof ctx.parentURL === "string" &&
-          ctx.parentURL.startsWith("file://")
-            ? path.dirname(fileURLToPath(ctx.parentURL))
-            : undefined;
-        maybeRecordDependencyFromSpecifier(specifier, resolveDir);
+      try {
+        const result = next(specifier, ctx);
+        const resolvedUrl = result?.url;
+        if (typeof resolvedUrl === "string") {
+          maybeRecordDependency(resolvedUrl);
+        }
+        return result;
+      } catch (err) {
+        // When resolution fails for an extensionless relative/absolute specifier,
+        // try appending TypeScript extensions. This makes extensionless TS imports
+        // work without tsx hooks (e.g. `import { foo } from "./bar"` resolves to
+        // ./bar.ts).
+        if (
+          typeof specifier === "string" &&
+          isRelativeOrAbsoluteSpecifier(specifier) &&
+          !specifierHasExtension(specifier)
+        ) {
+          for (const ext of TS_RESOLVE_EXTENSIONS) {
+            try {
+              const result = next(specifier + ext, ctx);
+              const resolvedUrl = result?.url;
+              if (typeof resolvedUrl === "string") {
+                maybeRecordDependency(resolvedUrl);
+              }
+              return result;
+            } catch {
+              continue;
+            }
+          }
+        }
+        // Fall through: record dependency from the original specifier and rethrow.
+        if (typeof specifier === "string") {
+          const resolveDir =
+            typeof ctx.parentURL === "string" &&
+            ctx.parentURL.startsWith("file://")
+              ? path.dirname(fileURLToPath(ctx.parentURL))
+              : undefined;
+          maybeRecordDependencyFromSpecifier(specifier, resolveDir);
+        }
+        throw err;
       }
-      return result;
     },
   });
 }
@@ -749,14 +793,41 @@ function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
   }
 }
 
+/**
+ * Detect if a file lives inside a `"type": "module"` package by walking
+ * up the directory tree looking for the nearest package.json.
+ */
+function isInsideEsmPackage(file: string): boolean {
+  let dir = path.dirname(file);
+  const root = path.parse(dir).root;
+  while (dir !== root) {
+    const pkgPath = path.join(dir, "package.json");
+    try {
+      const content = fsMutable.readFileSync(pkgPath, "utf8");
+      const pkg = JSON.parse(content);
+      return pkg.type === "module";
+    } catch {
+      // No package.json here, keep walking up.
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return false;
+}
+
 async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
-    const preferRequire =
-      file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs");
+    const isTsFile =
+      file.endsWith(".ts") || file.endsWith(".tsx");
+    const isCjsFile = file.endsWith(".cjs") || file.endsWith(".cts");
 
-    if (preferRequire) {
+    // For .cjs/.cts files, always prefer require().
+    if (isCjsFile) {
       try {
         const require = createRequire(fileUrl);
         const mod = require(file);
@@ -775,6 +846,54 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
       }
     }
 
+    // For TypeScript files in "type": "module" packages, prefer import() to
+    // avoid the require-of-ESM path which can corrupt the module graph on
+    // Node < 22.14 (see nodejs/node#54577). Only fall back to require() if
+    // import() fails with ERR_UNKNOWN_FILE_EXTENSION (no TS loader active).
+    if (isTsFile && isInsideEsmPackage(file)) {
+      try {
+        const mod = await import(fileUrl);
+        modules.push(mod);
+        continue;
+      } catch (esmErr) {
+        if (!shouldTryRequire(file, esmErr)) {
+          throw esmErr;
+        }
+        try {
+          const require = createRequire(fileUrl);
+          const mod = require(file);
+          modules.push(mod);
+          continue;
+        } catch (requireErr) {
+          throw new Error(
+            `Failed to load ${file} as ESM (${formatError(esmErr)}) or CJS (${formatError(requireErr)}).`,
+          );
+        }
+      }
+    }
+
+    // For TS files NOT in an ESM package, prefer require() (original behavior,
+    // works well with tsx CJS hooks).
+    if (isTsFile) {
+      try {
+        const require = createRequire(fileUrl);
+        const mod = require(file);
+        modules.push(mod);
+        continue;
+      } catch (requireErr) {
+        try {
+          const mod = await import(fileUrl);
+          modules.push(mod);
+          continue;
+        } catch (esmErr) {
+          throw new Error(
+            `Failed to load ${file} as CJS (${formatError(requireErr)}) or ESM (${formatError(esmErr)}).`,
+          );
+        }
+      }
+    }
+
+    // For .js/.mjs and other files, prefer import().
     try {
       const mod = await import(fileUrl);
       modules.push(mod);
