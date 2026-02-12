@@ -9,12 +9,12 @@ use crate::{
     ui::{self, print_command_status, with_spinner, CommandStatus},
 };
 
-pub async fn run(client: &ApiClient, project: &str, name: Option<&str>) -> Result<()> {
-    let prompt = match name {
-        Some(n) => api::get_prompt_by_name(client, project, n).await?,
+pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>) -> Result<()> {
+    let prompt = match slug {
+        Some(s) => api::get_prompt_by_slug(client, project, s).await?,
         None => {
             if !std::io::stdin().is_terminal() {
-                bail!("prompt name required. Use: bt prompts delete <name>");
+                bail!("prompt slug required. Use: bt prompts delete <slug>");
             }
             select_prompt_interactive(client, project).await?
         }

@@ -30,27 +30,27 @@ enum PromptsCommands {
 
 #[derive(Debug, Clone, Args)]
 pub struct ViewArgs {
-    /// Prompt name (positional)
-    #[arg(value_name = "NAME")]
-    name_positional: Option<String>,
+    /// Prompt slug (positional)
+    #[arg(value_name = "SLUG")]
+    slug_positional: Option<String>,
 
-    /// Prompt name (flag)
-    #[arg(long = "name", short = 'n')]
-    name_flag: Option<String>,
+    /// Prompt slug (flag)
+    #[arg(long = "slug", short = 's')]
+    slug_flag: Option<String>,
 }
 
 impl ViewArgs {
-    fn name(&self) -> Option<&str> {
-        self.name_positional
+    fn slug(&self) -> Option<&str> {
+        self.slug_positional
             .as_deref()
-            .or(self.name_flag.as_deref())
+            .or(self.slug_flag.as_deref())
     }
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct DeleteArgs {
-    /// Name of the prompt to delete
-    name: Option<String>,
+    /// Slug of the prompt to delete
+    slug: Option<String>,
 }
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
@@ -76,10 +76,10 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
                 &ctx.app_url,
                 &project,
                 &ctx.login.org_name,
-                p.name(),
+                p.slug(),
             )
             .await
         }
-        Some(PromptsCommands::Delete(p)) => delete::run(&client, &project, p.name.as_deref()).await,
+        Some(PromptsCommands::Delete(p)) => delete::run(&client, &project, p.slug.as_deref()).await,
     }
 }
