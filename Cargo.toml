@@ -24,6 +24,7 @@ unicode-width = "0.1.13"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 dotenvy = "0.15"
 open = "5"
+regex = "1"
 urlencoding = "2"
 lingua = { git = "https://github.com/braintrustdata/lingua", rev = "3c79f2c427d12d3e2fe104910ef3c0768ad83770" }
 comfy-table = "7.2.2"

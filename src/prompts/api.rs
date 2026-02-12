@@ -12,6 +12,8 @@ pub struct Prompt {
     pub project_id: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub prompt_data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

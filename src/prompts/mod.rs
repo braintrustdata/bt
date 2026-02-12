@@ -23,8 +23,11 @@ pub struct PromptsArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum PromptsCommands {
+    /// List all prompts
     List,
+    /// View a prompt's content
     View(ViewArgs),
+    /// Delete a prompt
     Delete(DeleteArgs),
 }
 
@@ -37,6 +40,14 @@ pub struct ViewArgs {
     /// Prompt slug (flag)
     #[arg(long = "slug", short = 's')]
     slug_flag: Option<String>,
+
+    /// Open in browser instead of showing in terminal
+    #[arg(long)]
+    web: bool,
+
+    /// Show all model parameters and configuration
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 impl ViewArgs {
@@ -77,6 +88,9 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
                 &project,
                 &ctx.login.org_name,
                 p.slug(),
+                base.json,
+                p.web,
+                p.verbose,
             )
             .await
         }
