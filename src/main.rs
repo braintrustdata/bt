@@ -86,7 +86,10 @@ async fn main() -> Result<()> {
         }
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
-        Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
+        Commands::Switch(cmd) => {
+            // Don't merge config - switch command inspects config directly
+            switch::run(cmd.base, cmd.args).await?
+        }
         Commands::Status(cmd) => {
             // Don't merge config - status command inspects config directly
             status::run(cmd.base, cmd.args).await?
