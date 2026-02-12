@@ -1,5 +1,4 @@
 mod select;
-mod shell;
 mod spinner;
 mod status;
 
