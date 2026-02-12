@@ -1,7 +1,14 @@
+use std::io::IsTerminal;
+
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
-use crate::{args::BaseArgs, http::ApiClient, login::login, projects::api::get_project_by_name};
+use crate::{
+    args::BaseArgs,
+    http::ApiClient,
+    login::login,
+    projects::{api::get_project_by_name, switch::select_project_interactive},
+};
 
 mod api;
 mod delete;
@@ -49,29 +56,30 @@ pub struct DeleteArgs {
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let project = &base
-        .project
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))?;
+    let project = match base.project {
+        Some(p) => p,
+        None if std::io::stdin().is_terminal() => select_project_interactive(&client).await?,
+        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
+    };
 
-    get_project_by_name(&client, project)
+    get_project_by_name(&client, &project)
         .await?
         .ok_or_else(|| anyhow!("project '{project}' not found"))?;
 
     match args.command {
         None | Some(PromptsCommands::List) => {
-            list::run(&client, project, &ctx.login.org_name, base.json).await
+            list::run(&client, &project, &ctx.login.org_name, base.json).await
         }
         Some(PromptsCommands::View(p)) => {
             view::run(
                 &client,
                 &ctx.app_url,
-                project,
+                &project,
                 &ctx.login.org_name,
                 p.name(),
             )
             .await
         }
-        Some(PromptsCommands::Delete(p)) => delete::run(&client, project, p.name.as_deref()).await,
+        Some(PromptsCommands::Delete(p)) => delete::run(&client, &project, p.name.as_deref()).await,
     }
 }
