@@ -39,14 +39,13 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         return Ok(());
     }
 
-    std::fs::create_dir_all(&bt_dir)?;
-
     let cfg = config::Config {
         org: Some(org.clone()),
         project: Some(project.clone()),
         ..Default::default()
     };
-    config::save_local(&cfg, false)?;
+
+    config::save_local(&cfg, true)?;
 
     print_command_status(
         CommandStatus::Success,

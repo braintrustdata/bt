@@ -418,6 +418,25 @@ mod tests {
     }
 
     #[test]
+    fn unknown_keys_roundtrip_through_save() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"org": "my-org", "unknown_field": "value", "another": 123}"#,
+        )
+        .unwrap();
+
+        let config = load_file(&path);
+        save_file(&path, &config).unwrap();
+        let reloaded = load_file(&path);
+
+        assert_eq!(reloaded.org, Some("my-org".into()));
+        assert!(reloaded.extra.contains_key("unknown_field"));
+        assert!(reloaded.extra.contains_key("another"));
+    }
+
+    #[test]
     fn save_creates_parent_dirs() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("nested").join("dir").join("config.json");
