@@ -8,7 +8,7 @@ use crate::config;
 #[derive(Debug, Clone, Args)]
 pub struct StatusArgs {
     /// Output verbose status
-    #[arg(short = 'v', long)]
+    #[arg(long)]
     pub verbose: bool,
 }
 
