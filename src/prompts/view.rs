@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::sync::LazyLock;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
 use regex::Regex;
 use urlencoding::encode;
@@ -26,13 +26,12 @@ pub async fn run(
     verbose: bool,
 ) -> Result<()> {
     let prompt = match slug {
-        Some(s) => {
-            with_spinner(
-                "Loading prompt...",
-                api::get_prompt_by_slug(client, project, s),
-            )
-            .await?
-        }
+        Some(s) => with_spinner(
+            "Loading prompt...",
+            api::get_prompt_by_slug(client, project, s),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
         None => {
             if !std::io::stdin().is_terminal() {
                 bail!("prompt slug required. Use: bt prompts view <slug>");
