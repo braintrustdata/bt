@@ -1,11 +1,10 @@
 use std::io::IsTerminal;
-use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
 
 use crate::args::BaseArgs;
-use crate::config::{self, write_target, WriteTarget};
+use crate::config;
 use crate::http::ApiClient;
 use crate::login::login;
 use crate::projects::api;
@@ -45,6 +44,8 @@ impl SwitchArgs {
 }
 
 pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
+    let path = config::resolve_write_path(args.global, args.local)?;
+
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
     // For now, always use org from API client
@@ -65,7 +66,6 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    let path = resolve_target_path(args.global, args.local)?;
     let mut cfg = config::load_file(&path);
     // TODO: use `resolved_org` in place of `org_name` to support switching when multi-org auth is ready
     cfg.org = Some(org_name.to_string());
@@ -82,21 +82,6 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     eprintln!("Wrote to {}", path.display());
 
     Ok(())
-}
-
-fn resolve_target_path(global: bool, local: bool) -> Result<PathBuf> {
-    if global {
-        config::global_path()
-    } else if local {
-        let dir = std::env::current_dir()?.join(".bt");
-        std::fs::create_dir_all(&dir)?;
-
-        Ok(dir.join("config.json"))
-    } else {
-        match write_target()? {
-            WriteTarget::Local(p) | WriteTarget::Global(p) => Ok(p),
-        }
-    }
 }
 
 async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<String> {

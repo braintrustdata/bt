@@ -189,6 +189,24 @@ pub fn write_target() -> Result<WriteTarget> {
     }
 }
 
+/// Resolve which config file to write based on --global/--local flags.
+pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
+    if global {
+        global_path()
+    } else if local {
+        match local_path() {
+            Some(p) => Ok(p),
+            None => {
+                bail!("No local .bt directory found. Use bt init to initialize this directory.")
+            }
+        }
+    } else {
+        match write_target()? {
+            WriteTarget::Local(p) | WriteTarget::Global(p) => Ok(p),
+        }
+    }
+}
+
 pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
     let dir = std::env::current_dir()?.join(".bt");
     if create_dir && !dir.exists() {
