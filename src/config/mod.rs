@@ -202,21 +202,12 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
 #[derive(Debug, Clone, Args)]
 pub struct ScopeArgs {
     /// Apply to global config (~/.bt/config.json)
-    #[arg(long, short = 'g')]
+    #[arg(long, short = 'g', conflicts_with = "local")]
     global: bool,
 
     /// Apply to local config (.bt/config.json)
     #[arg(long, short = 'l')]
     local: bool,
-}
-
-impl ScopeArgs {
-    fn validate(&self) -> Result<()> {
-        if self.global && self.local {
-            bail!("Cannot specify both --global and --local");
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -232,7 +223,7 @@ enum ConfigCommands {
         #[command(flatten)]
         scope: ScopeArgs,
         /// Show config values grouped by source
-        #[arg(long, short = 'v')]
+        #[arg(long)]
         verbose: bool,
     },
     /// Get a config value
@@ -274,21 +265,17 @@ pub fn run(base: BaseArgs, args: ConfigArgs) -> Result<()> {
     match args.command {
         None => list::run(base, false, false, false),
         Some(ConfigCommands::List { scope, verbose }) => {
-            scope.validate()?;
             list::run(base, scope.global, scope.local, verbose)
         }
         Some(ConfigCommands::Get { key, scope }) => {
-            scope.validate()?;
             validate_key(&key)?;
             get::run(base, &key, scope.global, scope.local)
         }
         Some(ConfigCommands::Set { key, value, scope }) => {
-            scope.validate()?;
             validate_key(&key)?;
             set::run(&key, &value, scope.global, scope.local)
         }
         Some(ConfigCommands::Unset { key, scope }) => {
-            scope.validate()?;
             validate_key(&key)?;
             set::unset(&key, scope.global, scope.local)
         }
