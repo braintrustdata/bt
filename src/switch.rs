@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 
 use crate::args::BaseArgs;
@@ -48,10 +48,12 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
     // For now, always use org from API client
-    // TODO: support org switching when multi-org auth is ready
+    // We use the org_name from the client to ensure user's can't override it
+    // accidentally when switching until we have multi-org oauth setup
     let org_name = &client.org_name();
 
-    let (_resolved_org, resolved_project) = args.resolve_target(&base);
+    // TODO: get `resolved_org` available when multi-org auth is ready
+    let (_, resolved_project) = args.resolve_target(&base);
 
     let project_name = match resolved_project {
         Some(p) => validate_or_create_project(&client, &p).await?,
@@ -65,25 +67,19 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let path = resolve_target_path(args.global, args.local)?;
     let mut cfg = config::load_file(&path);
+    // TODO: use `resolved_org` in place of `org_name` to support switching when multi-org auth is ready
     cfg.org = Some(org_name.to_string());
     cfg.project = Some(project_name.clone());
 
-    match config::save_file(&path, &cfg) {
-        Ok(_) => {
-            print_command_status(
-                CommandStatus::Success,
-                &format!("Switched to {org_name}/{project_name}"),
-            );
-            // TODO: Only show in --verbose mode
-            eprintln!("Wrote to {}", path.display());
-        }
-        Err(_) => {
-            print_command_status(
-                CommandStatus::Error,
-                &format!("Could not switch to {org_name}/{project_name}"),
-            );
-        }
-    }
+    config::save_file(&path, &cfg)
+        .context(format!("Could not save config to {}", path.display()))?;
+
+    print_command_status(
+        CommandStatus::Success,
+        &format!("Switched to {org_name}/{project_name}"),
+    );
+    // TODO: Only show in --verbose mode
+    eprintln!("Wrote to {}", path.display());
 
     Ok(())
 }

@@ -2,14 +2,16 @@ use anyhow::{bail, Result};
 
 use crate::ui::{print_command_status, CommandStatus};
 
-fn resolve_target(global: bool, local: bool) -> Result<std::path::PathBuf> {
+fn resolve_target_path(global: bool, local: bool) -> Result<std::path::PathBuf> {
     if global {
         return super::global_path();
     }
     if local {
         return match super::local_path() {
             Some(p) => Ok(p),
-            None => bail!("No local .bt directory found"),
+            None => {
+                bail!("No local .bt directory found. Use bt init to initialize this directory.")
+            }
         };
     }
     match super::write_target()? {
@@ -18,7 +20,7 @@ fn resolve_target(global: bool, local: bool) -> Result<std::path::PathBuf> {
 }
 
 pub fn run(key: &str, value: &str, global: bool, local: bool) -> Result<()> {
-    let path = resolve_target(global, local)?;
+    let path = resolve_target_path(global, local)?;
     let mut cfg = super::load_file(&path);
 
     cfg.set_field(key, value.to_string());
@@ -30,7 +32,7 @@ pub fn run(key: &str, value: &str, global: bool, local: bool) -> Result<()> {
 }
 
 pub fn unset(key: &str, global: bool, local: bool) -> Result<()> {
-    let path = resolve_target(global, local)?;
+    let path = resolve_target_path(global, local)?;
     let mut cfg = super::load_file(&path);
 
     cfg.unset_field(key);

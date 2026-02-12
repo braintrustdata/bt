@@ -38,7 +38,9 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
             project,
             source,
         };
-        eprintln!("{}", serde_json::to_string(&output)?);
+        // send json to stdout instead of stderr like we other commands
+        // so it can be piped to other tools
+        println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
 
