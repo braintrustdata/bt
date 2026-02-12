@@ -4,10 +4,8 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::{
-    args::BaseArgs,
-    http::ApiClient,
-    login::login,
-    projects::{api::get_project_by_name, switch::select_project_interactive},
+    args::BaseArgs, http::ApiClient, login::login, projects::api::get_project_by_name,
+    ui::select_project_interactive,
 };
 
 mod api;
@@ -86,7 +84,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let client = ApiClient::new(&ctx)?;
     let project = match base.project {
         Some(p) => p,
-        None if std::io::stdin().is_terminal() => select_project_interactive(&client).await?,
+        None if std::io::stdin().is_terminal() => select_project_interactive(&client, None).await?,
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 
