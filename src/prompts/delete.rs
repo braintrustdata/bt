@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use dialoguer::Confirm;
 
 use crate::{
@@ -15,7 +15,9 @@ pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: b
     }
 
     let prompt = match slug {
-        Some(s) => api::get_prompt_by_slug(client, project, s).await?,
+        Some(s) => api::get_prompt_by_slug(client, project, s)
+            .await?
+            .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
         None => {
             if !std::io::stdin().is_terminal() {
                 bail!("prompt slug required. Use: bt prompts delete <slug>");

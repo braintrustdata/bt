@@ -60,12 +60,25 @@ impl ViewArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DeleteArgs {
-    /// Slug of the prompt to delete
-    slug: Option<String>,
+    /// Prompt slug (positional) of the prompt to delete
+    #[arg(value_name = "SLUG")]
+    slug_positional: Option<String>,
+
+    /// Prompt slug (flag) of the prompt to delete
+    #[arg(long = "slug", short = 's')]
+    slug_flag: Option<String>,
 
     /// Skip confirmation prompt (requires slug)
     #[arg(long, short = 'f')]
     force: bool,
+}
+
+impl DeleteArgs {
+    fn slug(&self) -> Option<&str> {
+        self.slug_positional
+            .as_deref()
+            .or(self.slug_flag.as_deref())
+    }
 }
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
@@ -98,8 +111,6 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
             )
             .await
         }
-        Some(PromptsCommands::Delete(p)) => {
-            delete::run(&client, &project, p.slug.as_deref(), p.force).await
-        }
+        Some(PromptsCommands::Delete(p)) => delete::run(&client, &project, p.slug(), p.force).await,
     }
 }

@@ -195,6 +195,7 @@ dependencies = [
  "lingua",
  "open",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json 1.0.149",
