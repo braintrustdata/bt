@@ -50,7 +50,7 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         }
     } else {
         match (&org, &project) {
-            (Some(o), Some(p)) => println!("{o}/{p}"),
+            (Some(o), Some(p)) => eprintln!("{o}/{p}"),
             _ => eprintln!("No org/project configured"),
         }
     }
