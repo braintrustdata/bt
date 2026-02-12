@@ -201,7 +201,7 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
 
 #[derive(Debug, Clone, Args)]
 pub struct ScopeArgs {
-    /// Apply to global config (~/.bt/config.json)
+    /// Apply to global config (~/.config/bt/config.json)
     #[arg(long, short = 'g', conflicts_with = "local")]
     global: bool,
 
