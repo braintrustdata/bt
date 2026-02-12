@@ -62,11 +62,22 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     cfg.org = Some(org_name.to_string());
     cfg.project = Some(project_name.clone());
 
-    print_command_status(
-        CommandStatus::Success,
-        &format!("Switched to {org_name}/{project_name}"),
-    );
-    eprintln!("Wrote to {}", path.display());
+    match config::save_file(&path, &cfg) {
+        Ok(_) => {
+            print_command_status(
+                CommandStatus::Success,
+                &format!("Switched to {org_name}/{project_name}"),
+            );
+            // TODO: Only show in --verbose mode
+            eprintln!("Wrote to {}", path.display());
+        }
+        Err(_) => {
+            print_command_status(
+                CommandStatus::Error,
+                &format!("Could not switch to {org_name}/{project_name}"),
+            );
+        }
+    }
 
     Ok(())
 }
