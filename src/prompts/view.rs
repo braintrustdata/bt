@@ -14,13 +14,13 @@ pub async fn run(
     app_url: &str,
     project: &str,
     org_name: &str,
-    name: Option<&str>,
+    slug: Option<&str>,
 ) -> Result<()> {
-    let prompt = match name {
-        Some(n) => api::get_prompt_by_name(client, project, n).await?,
+    let prompt = match slug {
+        Some(s) => api::get_prompt_by_slug(client, project, s).await?,
         None => {
             if !std::io::stdin().is_terminal() {
-                bail!("prompt name required. Use: bt prompts view <name>");
+                bail!("prompt slug required. Use: bt prompts view <slug>");
             }
             select_prompt_interactive(client, project).await?
         }
