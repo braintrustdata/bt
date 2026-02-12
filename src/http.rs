@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::login::LoginContext;
 
+#[derive(Clone)]
 pub struct ApiClient {
     http: Client,
     base_url: String,

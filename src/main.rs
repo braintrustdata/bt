@@ -11,6 +11,7 @@ mod login;
 mod projects;
 mod self_update;
 mod sql;
+mod traces;
 mod ui;
 
 use crate::args::CLIArgs;
@@ -26,6 +27,9 @@ struct Cli {
 enum Commands {
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
+    /// View project traces in an interactive terminal UI
+    #[command(visible_alias = "trace")]
+    Traces(CLIArgs<traces::TracesArgs>),
     #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
@@ -44,6 +48,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
+        Commands::Traces(cmd) => traces::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
