@@ -15,13 +15,6 @@ use crate::{
 pub struct InitArgs {}
 
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
-    let bt_dir = std::env::current_dir()?.join(".bt");
-
-    if bt_dir.exists() {
-        print_command_status(CommandStatus::Warning, "Already Initialized");
-        return Ok(());
-    }
-
     println!("Link to a Braintrust project...");
 
     let (org, project) = if let (Some(o), Some(p)) = (&base.org, &base.project) {
@@ -37,6 +30,12 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
 
         (org, project)
     };
+
+    let bt_dir = std::env::current_dir()?.join(".bt");
+    if bt_dir.exists() {
+        print_command_status(CommandStatus::Warning, "Already Initialized");
+        return Ok(());
+    }
 
     std::fs::create_dir_all(&bt_dir)?;
 

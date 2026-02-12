@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::Args;
@@ -41,8 +42,13 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let project_name = if let Some(t) = &args.target {
         if t.contains('/') {
-            // org/project format - ignore org part for now, just use project
-            let project = t.split('/').nth(1).unwrap();
+            // parse org/project format
+            let parts: Vec<&str> = t.splitn(2, '/').collect();
+            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                bail!("invalid target format. expected org/project");
+            }
+            // ignore org part for now, just use project
+            let project = parts[1];
             validate_or_create_project(&client, project).await?
         } else {
             validate_or_create_project(&client, t).await?
@@ -51,29 +57,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         select_project_interactive(&client, None).await?
     };
 
-    // Save to config
-    let mut cfg = config::load_global().unwrap_or_default();
+    let path = resolve_target_path(args.global, args.local)?;
+    let mut cfg = config::load_file(&path);
     cfg.org = Some(org_name.to_string());
     cfg.project = Some(project_name.clone());
-
-    let path = if args.global {
-        config::save_global(&cfg)?;
-        config::global_path()?
-    } else if args.local {
-        config::save_local(&cfg, true)?;
-        std::env::current_dir()?.join(".bt/config.json")
-    } else {
-        match write_target()? {
-            WriteTarget::Local(p) => {
-                config::save_file(&p, &cfg)?;
-                p
-            }
-            WriteTarget::Global(p) => {
-                config::save_file(&p, &cfg)?;
-                p
-            }
-        }
-    };
 
     print_command_status(
         CommandStatus::Success,
@@ -82,6 +69,21 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     eprintln!("Wrote to {}", path.display());
 
     Ok(())
+}
+
+fn resolve_target_path(global: bool, local: bool) -> Result<PathBuf> {
+    if global {
+        config::global_path()
+    } else if local {
+        let dir = std::env::current_dir()?.join(".bt");
+        std::fs::create_dir_all(&dir)?;
+
+        Ok(dir.join("config.json"))
+    } else {
+        match write_target()? {
+            WriteTarget::Local(p) | WriteTarget::Global(p) => Ok(p),
+        }
+    }
 }
 
 async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<String> {
