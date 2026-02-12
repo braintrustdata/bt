@@ -24,7 +24,13 @@ fn run_resolved(base: BaseArgs, global: bool, local: bool) -> Result<()> {
 
     let output = format_resolved(&config, base.json)?;
     if !output.is_empty() {
-        println!("{output}");
+        if base.json {
+            // send json to stdout instead of stderr like we other commands
+            // so it can be piped to other tools
+            println!("{output}");
+        } else {
+            eprintln!("{output}");
+        }
     }
 
     Ok(())
