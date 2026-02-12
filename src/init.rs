@@ -32,7 +32,9 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
     };
 
     let bt_dir = std::env::current_dir()?.join(".bt");
-    if bt_dir.exists() {
+    let bt_config = &bt_dir.join("config.json");
+
+    if bt_config.exists() {
         print_command_status(CommandStatus::Warning, "Already Initialized");
         return Ok(());
     }

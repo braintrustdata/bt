@@ -14,7 +14,7 @@ mod get;
 mod list;
 mod set;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub org: Option<String>,
