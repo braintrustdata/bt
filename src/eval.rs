@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use crossterm::queue;
@@ -13,8 +14,11 @@ use crossterm::style::{
     Attribute, Color as CtColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     Stylize,
 };
+use futures_util::stream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use strip_ansi_escapes::strip;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
@@ -37,6 +41,70 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 struct EvalRunOutput {
     status: ExitStatus,
     dependencies: Vec<PathBuf>,
+}
+
+struct EvalRunnerProcess {
+    child: tokio::process::Child,
+    rx: mpsc::UnboundedReceiver<EvalEvent>,
+    sse_task: tokio::task::JoinHandle<()>,
+    sse_connected: Arc<AtomicBool>,
+    _socket_cleanup_guard: SocketCleanupGuard,
+}
+
+struct EvalProcessOutput {
+    status: ExitStatus,
+    dependency_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DevEvalRequest {
+    name: String,
+    #[serde(default)]
+    parameters: Option<Value>,
+    data: Value,
+    #[serde(default)]
+    scores: Option<Vec<DevEvalScore>>,
+    #[serde(default)]
+    experiment_name: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    parent: Option<Value>,
+    #[serde(default)]
+    stream: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DevEvalScore {
+    name: String,
+    function_id: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DatasetLookupRow {
+    project_id: String,
+    name: String,
+}
+
+#[derive(Clone)]
+struct DevServerState {
+    base: BaseArgs,
+    language_override: Option<EvalLanguage>,
+    runner_override: Option<String>,
+    files: Vec<String>,
+    no_send_logs: bool,
+    options: EvalRunOptions,
+    host: String,
+    port: u16,
+    allowed_org_name: Option<String>,
+    app_url: String,
+    http_client: Client,
+}
+
+#[derive(Debug)]
+struct DevAuthContext {
+    token: String,
+    org_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +194,22 @@ pub struct EvalArgs {
     /// Re-run evals when input files change.
     #[arg(long, short = 'w')]
     pub watch: bool,
+
+    /// Start the eval dev web server.
+    #[arg(long)]
+    pub dev: bool,
+
+    /// Host interface for eval dev server.
+    #[arg(long, default_value = "localhost")]
+    pub dev_host: String,
+
+    /// Port for eval dev server.
+    #[arg(long, default_value_t = 8300)]
+    pub dev_port: u16,
+
+    /// Restrict eval dev server access to a specific org name.
+    #[arg(long)]
+    pub dev_org_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +222,10 @@ struct EvalRunOptions {
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
+    if args.dev && args.watch {
+        anyhow::bail!("--watch is not supported with --dev.");
+    }
+
     let options = EvalRunOptions {
         jsonl: args.jsonl,
         terminate_on_failure: args.terminate_on_failure,
@@ -145,6 +233,25 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         list: args.list,
         filter: args.filter,
     };
+
+    if args.dev {
+        let state = DevServerState {
+            base: base.clone(),
+            language_override: args.language,
+            runner_override: args.runner.clone(),
+            files: args.files.clone(),
+            no_send_logs: args.no_send_logs,
+            options,
+            host: args.dev_host.clone(),
+            port: args.dev_port,
+            allowed_org_name: args.dev_org_name.clone(),
+            app_url: resolve_app_url(&base),
+            http_client: Client::builder()
+                .build()
+                .context("failed to create dev server HTTP client")?,
+        };
+        return run_dev_server(state).await;
+    }
 
     if args.watch {
         run_eval_files_watch(
@@ -242,6 +349,46 @@ async fn run_eval_files_once(
     no_send_logs: bool,
     options: EvalRunOptions,
 ) -> Result<EvalRunOutput> {
+    let (process, language, show_js_runner_hint_on_failure) = spawn_eval_runner(
+        base,
+        language_override,
+        runner_override,
+        files.clone(),
+        no_send_logs,
+        &options,
+        &[],
+    )
+    .await?;
+    let mut ui = EvalUi::new(options.jsonl, options.list);
+    let output = drive_eval_runner(process, |event| ui.handle(event)).await?;
+    ui.finish();
+    if !output.status.success() && show_js_runner_hint_on_failure {
+        eprintln!(
+            "Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
+        );
+    }
+    let mut dependencies =
+        normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
+    if language == EvalLanguage::JavaScript {
+        let static_dependencies = collect_js_static_dependencies(&files)?;
+        dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+    }
+
+    Ok(EvalRunOutput {
+        status: output.status,
+        dependencies,
+    })
+}
+
+async fn spawn_eval_runner(
+    base: &BaseArgs,
+    language_override: Option<EvalLanguage>,
+    runner_override: Option<String>,
+    files: Vec<String>,
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+    extra_env: &[(String, String)],
+) -> Result<(EvalRunnerProcess, EvalLanguage, bool)> {
     let language = detect_eval_language(&files, language_override)?;
     if language != EvalLanguage::Python && options.num_workers.is_some() {
         anyhow::bail!("--num-workers is only supported for Python evals.");
@@ -251,10 +398,10 @@ async fn run_eval_files_once(
     let (js_runner, py_runner) = prepare_eval_runners()?;
 
     let socket_path = build_sse_socket_path()?;
-    let _socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
+    let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).context("failed to bind SSE unix socket")?;
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
     let tx_sse = tx.clone();
@@ -267,6 +414,7 @@ async fn run_eval_files_once(
                     let _ = tx_sse.send(EvalEvent::Error {
                         message: format!("SSE stream error: {err}"),
                         stack: None,
+                        status: None,
                     });
                 }
             }
@@ -274,6 +422,7 @@ async fn run_eval_files_once(
                 let _ = tx_sse.send(EvalEvent::Error {
                     message: format!("Failed to accept SSE connection: {err}"),
                     stack: None,
+                    status: None,
                 });
             }
         };
@@ -285,6 +434,9 @@ async fn run_eval_files_once(
     };
 
     cmd.envs(build_env(base));
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     if no_send_logs {
         cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
         cmd.env("BT_EVAL_LOCAL", "1");
@@ -337,64 +489,601 @@ async fn run_eval_files_once(
         });
     }
 
-    let mut ui = EvalUi::new(options.jsonl, options.list);
+    drop(tx);
+
+    Ok((
+        EvalRunnerProcess {
+            child,
+            rx,
+            sse_task,
+            sse_connected,
+            _socket_cleanup_guard: socket_cleanup_guard,
+        },
+        language,
+        show_js_runner_hint_on_failure,
+    ))
+}
+
+async fn drive_eval_runner<F>(
+    mut process: EvalRunnerProcess,
+    mut on_event: F,
+) -> Result<EvalProcessOutput>
+where
+    F: FnMut(EvalEvent),
+{
     let mut status = None;
     let mut dependency_files: Vec<String> = Vec::new();
 
-    drop(tx);
-
     loop {
         tokio::select! {
-            event = rx.recv() => {
+            event = process.rx.recv() => {
                 match event {
                     Some(EvalEvent::Dependencies { files }) => {
-                        dependency_files.extend(files);
+                        dependency_files.extend(files.clone());
+                        on_event(EvalEvent::Dependencies { files });
                     }
-                    Some(event) => ui.handle(event),
+                    Some(event) => on_event(event),
                     None => {
                         if status.is_none() {
-                            status = Some(child.wait().await.context("eval runner process failed")?);
-                            if !sse_connected.load(Ordering::Relaxed) {
-                                sse_task.abort();
+                            status = Some(process.child.wait().await.context("eval runner process failed")?);
+                            if !process.sse_connected.load(Ordering::Relaxed) {
+                                process.sse_task.abort();
                             }
                         }
                         break;
                     }
                 }
             }
-            exit_status = child.wait(), if status.is_none() => {
+            exit_status = process.child.wait(), if status.is_none() => {
                 status = Some(exit_status.context("eval runner process failed")?);
-                if !sse_connected.load(Ordering::Relaxed) {
-                    sse_task.abort();
+                if !process.sse_connected.load(Ordering::Relaxed) {
+                    process.sse_task.abort();
                 }
             }
         }
 
-        if status.is_some() && rx.is_closed() {
+        if status.is_some() && process.rx.is_closed() {
             break;
         }
     }
 
-    let _ = sse_task.await;
+    let _ = process.sse_task.await;
 
-    ui.finish();
+    Ok(EvalProcessOutput {
+        status: status.context("eval runner process exited without a status")?,
+        dependency_files,
+    })
+}
 
-    let status = status.context("eval runner process exited without a status")?;
-    if !status.success() && show_js_runner_hint_on_failure {
-        eprintln!(
-            "Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
+fn resolve_app_url(base: &BaseArgs) -> String {
+    if let Some(app_url) = base.app_url.as_ref() {
+        return app_url.clone();
+    }
+    if let Some(api_url) = base.api_url.as_ref() {
+        return api_url
+            .replace("api.braintrust", "www.braintrust")
+            .replace("api.braintrustdata", "www.braintrustdata");
+    }
+    "https://www.braintrust.dev".to_string()
+}
+
+fn json_error_response(status: actix_web::http::StatusCode, message: &str) -> HttpResponse {
+    HttpResponse::build(status).json(json!({ "error": message }))
+}
+
+fn parse_auth_token(req: &HttpRequest) -> Option<String> {
+    if let Some(token) = req.headers().get("x-bt-auth-token") {
+        if let Ok(value) = token.to_str() {
+            if !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+
+    let auth = req.headers().get("authorization")?;
+    let auth = auth.to_str().ok()?.trim();
+    if auth.is_empty() {
+        return None;
+    }
+    if let Some(token) = auth.strip_prefix("Bearer ") {
+        let token = token.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token.to_string())
+        }
+    } else {
+        Some(auth.to_string())
+    }
+}
+
+async fn authenticate_dev_request(
+    req: &HttpRequest,
+    state: &DevServerState,
+) -> std::result::Result<DevAuthContext, HttpResponse> {
+    let token = match parse_auth_token(req) {
+        Some(token) if !token.eq_ignore_ascii_case("null") => token,
+        _ => {
+            return Err(json_error_response(
+                actix_web::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+            ));
+        }
+    };
+
+    let org_name = match req
+        .headers()
+        .get("x-bt-org-name")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            return Err(json_error_response(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "Missing x-bt-org-name header",
+            ));
+        }
+    };
+
+    if let Some(allowed_org_name) = state.allowed_org_name.as_ref() {
+        if allowed_org_name != &org_name {
+            let message = format!(
+                "Org '{org_name}' is not allowed. Only org '{allowed_org_name}' is allowed."
+            );
+            return Err(json_error_response(
+                actix_web::http::StatusCode::FORBIDDEN,
+                &message,
+            ));
+        }
+    }
+
+    let login_url = format!("{}/api/apikey/login", state.app_url.trim_end_matches('/'));
+    let response = state
+        .http_client
+        .post(login_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|_| {
+            json_error_response(actix_web::http::StatusCode::UNAUTHORIZED, "Unauthorized")
+        })?;
+    if !response.status().is_success() {
+        return Err(json_error_response(
+            actix_web::http::StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+        ));
+    }
+
+    let payload = response.json::<Value>().await.unwrap_or(Value::Null);
+    if let Some(orgs) = payload.get("org_info").and_then(|value| value.as_array()) {
+        let matched = orgs.iter().any(|org| {
+            org.get("name")
+                .and_then(|name| name.as_str())
+                .map(|name| name == org_name)
+                .unwrap_or(false)
+        });
+        if !matched {
+            return Err(json_error_response(
+                actix_web::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+            ));
+        }
+    }
+
+    Ok(DevAuthContext { token, org_name })
+}
+
+async fn resolve_dataset_ref_for_eval_request(
+    state: &DevServerState,
+    auth: &DevAuthContext,
+    eval_request: &mut DevEvalRequest,
+) -> std::result::Result<(), HttpResponse> {
+    let data_obj = eval_request.data.as_object();
+    let Some(data_obj) = data_obj else {
+        return Ok(());
+    };
+
+    let Some(dataset_id_value) = data_obj.get("dataset_id") else {
+        return Ok(());
+    };
+    let Some(dataset_id) = dataset_id_value.as_str() else {
+        return Err(json_error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "Invalid dataset_id: expected a string.",
+        ));
+    };
+    if dataset_id.trim().is_empty() {
+        return Err(json_error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "Invalid dataset_id: expected a non-empty string.",
+        ));
+    }
+
+    let lookup_url = format!("{}/api/dataset/get", state.app_url.trim_end_matches('/'));
+    let response = state
+        .http_client
+        .post(lookup_url)
+        .bearer_auth(&auth.token)
+        .header("x-bt-org-name", auth.org_name.clone())
+        .json(&json!({ "id": dataset_id }))
+        .send()
+        .await
+        .map_err(|err| {
+            json_error_response(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                &format!("Failed to load dataset '{dataset_id}': {err}"),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(json_error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            &format!(
+                "Failed to load dataset '{dataset_id}' (status {}).",
+                response.status()
+            ),
+        ));
+    }
+
+    let datasets = response
+        .json::<Vec<DatasetLookupRow>>()
+        .await
+        .map_err(|err| {
+            json_error_response(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                &format!("Failed to parse dataset response for '{dataset_id}': {err}"),
+            )
+        })?;
+    let Some(dataset) = datasets.first() else {
+        return Err(json_error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            &format!("Dataset '{dataset_id}' not found."),
+        ));
+    };
+
+    let mut resolved = serde_json::Map::new();
+    resolved.insert(
+        "project_id".to_string(),
+        Value::String(dataset.project_id.clone()),
+    );
+    resolved.insert(
+        "dataset_name".to_string(),
+        Value::String(dataset.name.clone()),
+    );
+    if let Some(btql) = data_obj.get("_internal_btql") {
+        resolved.insert("_internal_btql".to_string(), btql.clone());
+    }
+    eval_request.data = Value::Object(resolved);
+    Ok(())
+}
+
+fn make_remote_runner_env(
+    auth: &DevAuthContext,
+    state: &DevServerState,
+    request: Option<&DevEvalRequest>,
+    list_json: bool,
+) -> Result<Vec<(String, String)>> {
+    let mut env = vec![
+        ("BRAINTRUST_API_KEY".to_string(), auth.token.clone()),
+        ("BRAINTRUST_ORG_NAME".to_string(), auth.org_name.clone()),
+        ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
+    ];
+    if list_json {
+        env.push(("BT_EVAL_REMOTE_LIST_JSON".to_string(), "1".to_string()));
+    }
+    if let Some(request) = request {
+        let serialized = serde_json::to_string(request)
+            .context("failed to serialize remote eval request payload")?;
+        env.push(("BT_EVAL_REMOTE_REQUEST_JSON".to_string(), serialized));
+    }
+    Ok(env)
+}
+
+fn serialize_sse_event(event: &str, data: &str) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
+fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
+    match event {
+        EvalEvent::Start(summary) => serde_json::to_string(summary)
+            .ok()
+            .map(|data| serialize_sse_event("start", &data)),
+        EvalEvent::Summary(summary) => serde_json::to_string(summary)
+            .ok()
+            .map(|data| serialize_sse_event("summary", &data)),
+        EvalEvent::Progress(progress) => serde_json::to_string(progress)
+            .ok()
+            .map(|data| serialize_sse_event("progress", &data)),
+        EvalEvent::Dependencies { files } => serde_json::to_string(&json!({ "files": files }))
+            .ok()
+            .map(|data| serialize_sse_event("dependencies", &data)),
+        EvalEvent::Done => Some(serialize_sse_event("done", "")),
+        EvalEvent::Error {
+            message,
+            stack,
+            status,
+        } => serde_json::to_string(&json!({
+            "message": message,
+            "stack": stack,
+            "status": status,
+        }))
+        .ok()
+        .map(|data| serialize_sse_event("error", &data)),
+        EvalEvent::Console { stream, message } => serde_json::to_string(&json!({
+            "stream": stream,
+            "message": message,
+        }))
+        .ok()
+        .map(|data| serialize_sse_event("console", &data)),
+    }
+}
+
+async fn dev_server_index() -> HttpResponse {
+    HttpResponse::Ok().body("Hello, world!")
+}
+
+async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> HttpResponse {
+    let auth = match authenticate_dev_request(&req, &state).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+    let extra_env = match make_remote_runner_env(&auth, &state, None, true) {
+        Ok(extra_env) => extra_env,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+
+    let (process, _, _) = match spawn_eval_runner(
+        &state.base,
+        state.language_override,
+        state.runner_override.clone(),
+        state.files.clone(),
+        state.no_send_logs,
+        &state.options,
+        &extra_env,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+
+    let mut stdout_lines = Vec::new();
+    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
+    let output = match drive_eval_runner(process, |event| match event {
+        EvalEvent::Console { stream, message } if stream == "stdout" => {
+            stdout_lines.push(message);
+        }
+        EvalEvent::Error {
+            message,
+            stack: _,
+            status,
+        } => errors.push((message, status)),
+        _ => {}
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+
+    if let Some((message, status)) = errors.first() {
+        let status = status
+            .and_then(|status| actix_web::http::StatusCode::from_u16(status).ok())
+            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        return json_error_response(status, message);
+    }
+    if !output.status.success() {
+        return json_error_response(
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Eval runner exited with an error.",
         );
     }
-    let mut dependencies = normalize_watch_paths(dependency_files.into_iter().map(PathBuf::from))?;
-    if language == EvalLanguage::JavaScript {
-        let static_dependencies = collect_js_static_dependencies(&files)?;
-        dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+
+    let mut parsed_manifest: Option<Value> = None;
+    for line in stdout_lines.iter().rev() {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            parsed_manifest = Some(value);
+            break;
+        }
+    }
+    if parsed_manifest.is_none() {
+        let joined = stdout_lines.join("\n");
+        if let Ok(value) = serde_json::from_str::<Value>(&joined) {
+            parsed_manifest = Some(value);
+        }
     }
 
-    Ok(EvalRunOutput {
-        status,
-        dependencies,
+    match parsed_manifest {
+        Some(manifest) => HttpResponse::Ok().json(manifest),
+        None => json_error_response(
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to parse evaluator manifest from runner output.",
+        ),
+    }
+}
+
+async fn dev_server_eval(
+    state: web::Data<DevServerState>,
+    req: HttpRequest,
+    body: web::Bytes,
+) -> HttpResponse {
+    let auth = match authenticate_dev_request(&req, &state).await {
+        Ok(auth) => auth,
+        Err(response) => return response,
+    };
+
+    let mut eval_request: DevEvalRequest = match serde_json::from_slice(&body) {
+        Ok(eval_request) => eval_request,
+        Err(err) => {
+            return json_error_response(actix_web::http::StatusCode::BAD_REQUEST, &err.to_string());
+        }
+    };
+    if let Err(response) =
+        resolve_dataset_ref_for_eval_request(&state, &auth, &mut eval_request).await
+    {
+        return response;
+    }
+    let stream_requested = eval_request.stream.unwrap_or(false);
+    let extra_env = match make_remote_runner_env(&auth, &state, Some(&eval_request), false) {
+        Ok(extra_env) => extra_env,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+
+    let (process, _, _) = match spawn_eval_runner(
+        &state.base,
+        state.language_override,
+        state.runner_override.clone(),
+        state.files.clone(),
+        state.no_send_logs,
+        &state.options,
+        &extra_env,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+
+    if stream_requested {
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut saw_error = false;
+            let mut saw_done = false;
+            let output = drive_eval_runner(process, |event| {
+                if matches!(event, EvalEvent::Error { .. }) {
+                    saw_error = true;
+                }
+                if matches!(event, EvalEvent::Done) {
+                    saw_done = true;
+                }
+                if let Some(encoded) = encode_eval_event_for_http(&event) {
+                    let _ = tx.send(encoded);
+                }
+            })
+            .await;
+
+            match output {
+                Ok(output) => {
+                    if !output.status.success() && !saw_error {
+                        let error = serialize_sse_event(
+                            "error",
+                            &json!({ "message": "Eval runner exited with an error." }).to_string(),
+                        );
+                        let _ = tx.send(error);
+                    }
+                }
+                Err(err) => {
+                    let error = serialize_sse_event(
+                        "error",
+                        &json!({ "message": format!("{err:#}") }).to_string(),
+                    );
+                    let _ = tx.send(error);
+                }
+            }
+
+            if !saw_done {
+                let _ = tx.send(serialize_sse_event("done", ""));
+            }
+        });
+
+        let response_stream = stream::unfold(rx, |mut rx| async {
+            rx.recv()
+                .await
+                .map(|chunk| (Ok::<_, actix_web::Error>(web::Bytes::from(chunk)), rx))
+        });
+        return HttpResponse::Ok()
+            .append_header(("Content-Type", "text/event-stream"))
+            .append_header(("Cache-Control", "no-cache"))
+            .append_header(("Connection", "keep-alive"))
+            .streaming(response_stream);
+    }
+
+    let mut summary: Option<ExperimentSummary> = None;
+    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
+    let output = match drive_eval_runner(process, |event| match event {
+        EvalEvent::Summary(current) => summary = Some(current),
+        EvalEvent::Error {
+            message,
+            stack: _,
+            status,
+        } => errors.push((message, status)),
+        _ => {}
     })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+
+    if let Some((message, status)) = errors.first() {
+        let status = status
+            .and_then(|status| actix_web::http::StatusCode::from_u16(status).ok())
+            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        return json_error_response(status, message);
+    }
+    if let Some(summary) = summary {
+        return HttpResponse::Ok().json(summary);
+    }
+    if !output.status.success() {
+        return json_error_response(
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Eval runner exited with an error.",
+        );
+    }
+    json_error_response(
+        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "Eval runner did not return a summary.",
+    )
+}
+
+async fn run_dev_server(state: DevServerState) -> Result<()> {
+    println!(
+        "Starting eval dev server on http://{}:{}",
+        state.host, state.port
+    );
+    let host = state.host.clone();
+    let port = state.port;
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(state.clone()))
+            .route("/", web::get().to(dev_server_index))
+            .route("/list", web::get().to(dev_server_list))
+            .route("/eval", web::post().to(dev_server_eval))
+    })
+    .bind((host.as_str(), port))
+    .with_context(|| format!("failed to bind eval dev server on {}:{}", host, port))?
+    .run()
+    .await
+    .context("eval dev server exited unexpectedly")
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -977,6 +1666,7 @@ enum EvalEvent {
     Error {
         message: String,
         stack: Option<String>,
+        status: Option<u16>,
     },
     Console {
         stream: String,
@@ -1012,6 +1702,7 @@ struct ScoreSummary {
 struct EvalErrorPayload {
     message: String,
     stack: Option<String>,
+    status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1025,7 +1716,7 @@ struct MetricSummary {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SseProgressEventData {
     id: String,
     object_type: String,
@@ -1138,11 +1829,13 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
                 let _ = tx.send(EvalEvent::Error {
                     message: payload.message,
                     stack: payload.stack,
+                    status: payload.status,
                 });
             } else {
                 let _ = tx.send(EvalEvent::Error {
                     message: data,
                     stack: None,
+                    status: None,
                 });
             }
         }
@@ -1221,7 +1914,7 @@ impl EvalUi {
                     let _ = self.progress.println(message);
                 }
             }
-            EvalEvent::Error { message, stack } => {
+            EvalEvent::Error { message, stack, .. } => {
                 let show_hint = message.contains("Please specify an api key");
                 let line = message.as_str().red().to_string();
                 let _ = self.progress.println(line);

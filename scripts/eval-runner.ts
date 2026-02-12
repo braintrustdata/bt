@@ -37,10 +37,17 @@ type EvalFunction = (
 ) => Promise<EvalResult>;
 
 type LoginFunction = (options?: Record<string, unknown>) => Promise<unknown>;
+type InitDatasetFunction = (
+  projectOrOptions: string | Record<string, unknown>,
+  options?: Record<string, unknown>,
+) => unknown;
+type InvokeFunction = (options: Record<string, unknown>) => Promise<unknown>;
 
 type BraintrustModule = {
   Eval?: EvalFunction;
   login?: LoginFunction;
+  initDataset?: InitDatasetFunction;
+  invoke?: InvokeFunction;
   default?: BraintrustModule;
 };
 
@@ -90,6 +97,27 @@ type RunnerConfig = {
   list: boolean;
   terminateOnFailure: boolean;
   filters: EvalFilter[];
+  remoteListJson: boolean;
+  remoteRequest: RemoteEvalRequest | null;
+};
+
+type RemoteScoreSpec = {
+  name: string;
+  function_id: Record<string, unknown>;
+};
+
+type RemoteEvalRequest = {
+  name: string;
+  parameters?: Record<string, unknown>;
+  parent?: unknown;
+  experiment_name?: string;
+  project_id?: string;
+  data:
+    | { data: unknown[] }
+    | { project_id: string; dataset_name: string; _internal_btql?: unknown }
+    | { project_name: string; dataset_name: string; _internal_btql?: unknown };
+  scores?: RemoteScoreSpec[];
+  stream?: boolean;
 };
 
 declare global {
@@ -182,12 +210,41 @@ function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
   }
 }
 
+function parseRemoteEvalRequest(
+  serialized: string | undefined,
+): RemoteEvalRequest | null {
+  if (!serialized) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(serialized);
+    if (!isObject(parsed)) {
+      throw new Error("BT_EVAL_REMOTE_REQUEST_JSON must be a JSON object.");
+    }
+    if (typeof parsed.name !== "string" || parsed.name.length === 0) {
+      throw new Error("Remote eval request must include a non-empty name.");
+    }
+    if (!isObject(parsed.data)) {
+      throw new Error("Remote eval request must include a data object.");
+    }
+    return parsed as RemoteEvalRequest;
+  } catch (err) {
+    throw new Error(
+      `Invalid BT_EVAL_REMOTE_REQUEST_JSON value: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
+    remoteListJson: envFlag("BT_EVAL_REMOTE_LIST_JSON"),
+    remoteRequest: parseRemoteEvalRequest(
+      process.env.BT_EVAL_REMOTE_REQUEST_JSON,
+    ),
   };
 }
 
@@ -882,11 +939,18 @@ function sendEvalProgress(
   });
 }
 
-function serializeError(err: unknown) {
+function serializeError(err: unknown, status?: number) {
   if (err instanceof Error) {
-    return { message: err.message, stack: err.stack };
+    return {
+      message: err.message,
+      stack: err.stack,
+      ...(status !== undefined ? { status } : {}),
+    };
   }
-  return { message: String(err) };
+  return {
+    message: String(err),
+    ...(status !== undefined ? { status } : {}),
+  };
 }
 
 function sendConsole(
@@ -974,6 +1038,319 @@ function filterEvaluators(
   return evaluators.filter((entry) =>
     filters.every((filter) => evaluateFilter(entry.evaluator, filter)),
   );
+}
+
+function sendRunnerError(sse: SseWriter | null, err: unknown, status?: number) {
+  if (sse) {
+    sse.send("error", serializeError(err, status));
+  } else if (err instanceof Error) {
+    console.error(err.message);
+  } else {
+    console.error(String(err));
+  }
+}
+
+function extractScoreName(score: unknown, idx: number): string {
+  if (typeof score === "function" && typeof score.name === "string") {
+    return score.name || `scorer_${idx}`;
+  }
+  return `scorer_${idx}`;
+}
+
+async function serializeEvaluatorParameters(
+  raw: unknown,
+): Promise<unknown | undefined> {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  const resolved = raw instanceof Promise ? await raw : raw;
+  if (!isObject(resolved)) {
+    return undefined;
+  }
+
+  const marker = Reflect.get(resolved, "__braintrust_parameters_marker");
+  if (marker === true) {
+    const schema = Reflect.get(resolved, "schema");
+    const source = {
+      parametersId: Reflect.get(resolved, "id"),
+      slug: Reflect.get(resolved, "slug"),
+      name: Reflect.get(resolved, "name"),
+      projectId: Reflect.get(resolved, "projectId"),
+      version: Reflect.get(resolved, "version"),
+    };
+    return {
+      type: "braintrust.parameters",
+      schema,
+      source,
+    };
+  }
+
+  const schema: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(resolved)) {
+    if (isObject(value) && value.type === "prompt") {
+      schema[name] = {
+        type: "prompt",
+        ...(value.default !== undefined ? { default: value.default } : {}),
+        ...(typeof value.description === "string"
+          ? { description: value.description }
+          : {}),
+      };
+    } else {
+      schema[name] = {
+        type: "data",
+        schema: {},
+      };
+    }
+  }
+
+  return {
+    type: "braintrust.staticParameters",
+    schema,
+    source: null,
+  };
+}
+
+async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
+  const result: Record<
+    string,
+    { parameters?: unknown; scores: Array<{ name: string }> }
+  > = {};
+
+  for (const entry of evaluators) {
+    const scores = Array.isArray(entry.evaluator.scores)
+      ? entry.evaluator.scores.map((score, idx) => ({
+          name: extractScoreName(score, idx),
+        }))
+      : [];
+    const parameters = await serializeEvaluatorParameters(
+      entry.evaluator.parameters,
+    );
+
+    result[entry.evaluator.evalName] = {
+      ...(parameters !== undefined ? { parameters } : {}),
+      scores,
+    };
+  }
+
+  return result;
+}
+
+function normalizeRemoteParent(parent: unknown): string | undefined {
+  if (parent === undefined || parent === null) {
+    return undefined;
+  }
+  if (typeof parent === "string") {
+    return parent;
+  }
+  return JSON.stringify(parent);
+}
+
+function resolveRemoteData(
+  data: RemoteEvalRequest["data"],
+  initDataset: InitDatasetFunction | undefined,
+): unknown {
+  if ("data" in data) {
+    return data.data;
+  }
+  if ("project_id" in data && "dataset_name" in data) {
+    if (typeof initDataset !== "function") {
+      throw new Error(
+        "Unable to resolve dataset references: initDataset() is unavailable.",
+      );
+    }
+    return initDataset({
+      projectId: data.project_id,
+      dataset: data.dataset_name,
+      _internal_btql: data._internal_btql,
+    });
+  }
+  if ("project_name" in data && "dataset_name" in data) {
+    if (typeof initDataset !== "function") {
+      throw new Error(
+        "Unable to resolve dataset references: initDataset() is unavailable.",
+      );
+    }
+    return initDataset(data.project_name, {
+      dataset: data.dataset_name,
+      _internal_btql: data._internal_btql,
+    });
+  }
+  throw new Error("Invalid remote eval data payload.");
+}
+
+function convertRemoteFunctionId(
+  functionId: Record<string, unknown>,
+): Record<string, unknown> {
+  const converted: Record<string, unknown> = {};
+
+  if (functionId.function_id !== undefined) {
+    converted.function_id = functionId.function_id;
+  }
+  if (typeof functionId.project_name === "string") {
+    converted.projectName = functionId.project_name;
+  }
+  if (typeof functionId.slug === "string") {
+    converted.slug = functionId.slug;
+  }
+  if (typeof functionId.global_function === "string") {
+    converted.globalFunction = functionId.global_function;
+  }
+  if (typeof functionId.function_type === "string") {
+    converted.functionType = functionId.function_type;
+  }
+  if (typeof functionId.prompt_session_id === "string") {
+    converted.promptSessionId = functionId.prompt_session_id;
+  }
+  if (typeof functionId.prompt_session_function_id === "string") {
+    converted.promptSessionFunctionId = functionId.prompt_session_function_id;
+  }
+  if (typeof functionId.version === "string") {
+    converted.version = functionId.version;
+  }
+
+  return converted;
+}
+
+function makeRemoteScorer(
+  invoke: InvokeFunction,
+  score: RemoteScoreSpec,
+  projectId: string | undefined,
+) {
+  const scorer = async (args: Record<string, unknown>) => {
+    return await invoke({
+      ...convertRemoteFunctionId(score.function_id),
+      input: {
+        input: args.input,
+        output: args.output,
+        expected: args.expected,
+        metadata: args.metadata,
+      },
+      stream: false,
+      mode: "auto",
+      strict: true,
+      ...(projectId ? { projectId } : {}),
+    });
+  };
+
+  Object.defineProperty(scorer, "name", {
+    value: score.name,
+    writable: false,
+  });
+  return scorer;
+}
+
+function inferRemoteErrorStatus(err: unknown): number {
+  if (!(err instanceof Error)) {
+    return 500;
+  }
+  const message = err.message.toLowerCase();
+  if (
+    message.includes("invalid parameter") ||
+    message.includes("invalid parameters") ||
+    message.includes("must include") ||
+    message.includes("invalid remote eval")
+  ) {
+    return 400;
+  }
+  if (message.includes("not found")) {
+    return 404;
+  }
+  return 500;
+}
+
+type EvalRunner = {
+  Eval: EvalFunction;
+  initDataset?: InitDatasetFunction;
+  invoke?: InvokeFunction;
+  sse: SseWriter | null;
+  login?: LoginFunction;
+  runEval: (
+    projectName: string,
+    evaluator: Record<string, unknown>,
+    options?: EvalOptions,
+  ) => Promise<EvalResult>;
+  runRegisteredEvals: (evaluators: EvaluatorEntry[]) => Promise<boolean>;
+  makeEvalOptions: (
+    evaluatorName: string,
+    options?: EvalOptions,
+  ) => EvalOptions | undefined;
+  finish: (ok: boolean) => void;
+  noSendLogs: boolean;
+};
+
+async function runRemoteEvalRequest(
+  runner: EvalRunner,
+  config: RunnerConfig,
+  request: RemoteEvalRequest,
+): Promise<boolean> {
+  const evaluators = filterEvaluators(getEvaluators(), config.filters);
+  const entry = evaluators.find(
+    (candidate) => candidate.evaluator.evalName === request.name,
+  );
+  if (!entry) {
+    sendRunnerError(
+      runner.sse,
+      new Error(`Evaluator '${request.name}' not found`),
+      404,
+    );
+    return false;
+  }
+
+  if (typeof runner.invoke !== "function") {
+    sendRunnerError(
+      runner.sse,
+      new Error("Unable to run remote eval: invoke() is unavailable."),
+      500,
+    );
+    return false;
+  }
+
+  try {
+    const data = resolveRemoteData(request.data, runner.initDataset);
+    const extraScores = (request.scores ?? []).map((score) =>
+      makeRemoteScorer(
+        runner.invoke as InvokeFunction,
+        score,
+        request.project_id,
+      ),
+    );
+    const mergedScores = Array.isArray(entry.evaluator.scores)
+      ? entry.evaluator.scores.concat(extraScores)
+      : extraScores;
+
+    const evaluator = {
+      ...entry.evaluator,
+      data,
+      scores: mergedScores,
+      ...(request.experiment_name
+        ? { experimentName: request.experiment_name }
+        : {}),
+      ...(request.project_id ? { projectId: request.project_id } : {}),
+    };
+
+    const reporters = getReporters();
+    const resolvedReporter = resolveReporter(entry.reporter, reporters);
+    const options: EvalOptions = {
+      ...(request.parameters ? { parameters: request.parameters } : {}),
+      ...(request.parent !== undefined
+        ? { parent: normalizeRemoteParent(request.parent) }
+        : {}),
+      ...(resolvedReporter !== undefined ? { reporter: resolvedReporter } : {}),
+    };
+    const result = await runner.runEval(
+      entry.evaluator.projectName,
+      evaluator,
+      options,
+    );
+    const failingResults = result.results.filter(
+      (row: { error?: unknown }) => row.error !== undefined,
+    );
+    return failingResults.length === 0 || resolvedReporter !== undefined;
+  } catch (err) {
+    sendRunnerError(runner.sse, err, inferRemoteErrorStatus(err));
+    return false;
+  }
 }
 
 function extractBtEvalMain(mod: unknown): BtEvalMain | null {
@@ -1112,13 +1489,15 @@ function mergeProgress(
   };
 }
 
-async function createEvalRunner(config: RunnerConfig) {
+async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   const braintrust = await loadBraintrust();
   const Eval = braintrust.Eval;
   if (typeof Eval !== "function") {
     throw new Error("Unable to load Eval() from braintrust package.");
   }
   const login = braintrust.login;
+  const initDataset = braintrust.initDataset;
+  const invoke = braintrust.invoke;
 
   const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
@@ -1241,6 +1620,8 @@ async function createEvalRunner(config: RunnerConfig) {
 
   return {
     Eval,
+    initDataset,
+    invoke,
     sse,
     login,
     runEval,
@@ -1311,6 +1692,17 @@ async function main() {
       discoveredEvaluators,
       config.filters,
     );
+    if (config.remoteListJson) {
+      const definitions = await buildEvaluatorDefinitions(filteredEvaluators);
+      console.log(JSON.stringify(definitions));
+      return;
+    }
+
+    if (config.remoteRequest) {
+      ok = await runRemoteEvalRequest(runner, config, config.remoteRequest);
+      return;
+    }
+
     if (config.list) {
       for (const entry of filteredEvaluators) {
         console.log(entry.evaluator.evalName);
