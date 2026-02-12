@@ -38,20 +38,20 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
             project,
             source,
         };
-        println!("{}", serde_json::to_string(&output)?);
+        eprintln!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
 
     if args.verbose {
-        println!("org: {}", org.as_deref().unwrap_or("(unset)"));
-        println!("project: {}", project.as_deref().unwrap_or("(unset)"));
+        eprintln!("org: {}", org.as_deref().unwrap_or("(unset)"));
+        eprintln!("project: {}", project.as_deref().unwrap_or("(unset)"));
         if let Some(src) = source {
-            println!("source: {src}");
+            eprintln!("source: {src}");
         }
     } else {
         match (&org, &project) {
             (Some(o), Some(p)) => println!("{o}/{p}"),
-            _ => println!("No org/project configured"),
+            _ => eprintln!("No org/project configured"),
         }
     }
 

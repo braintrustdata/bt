@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 use std::{
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -78,9 +78,17 @@ impl Config {
     }
 }
 
+pub fn global_config_dir() -> Result<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(xdg).join("bt"));
+    }
+    dirs::home_dir()
+        .map(|path| path.join(".config").join("bt"))
+        .ok_or_else(|| anyhow!("$HOME not configured."))
+}
+
 pub fn global_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
-    Ok(home.join(".bt").join("config.json"))
+    Ok(global_config_dir()?.join("config.json"))
 }
 
 pub fn load_file(path: &Path) -> Config {
