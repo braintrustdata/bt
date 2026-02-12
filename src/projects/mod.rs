@@ -64,13 +64,6 @@ struct DeleteArgs {
     force: bool,
 }
 
-#[derive(Debug, Clone, Args)]
-struct SwitchArgs {
-    /// Project name
-    #[arg(long = "name", short = 'n')]
-    name: Option<String>,
-}
-
 pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;

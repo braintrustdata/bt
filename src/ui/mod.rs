@@ -1,6 +1,5 @@
 mod pager;
 mod select;
-mod shell;
 mod spinner;
 mod status;
 mod table;
