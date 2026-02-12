@@ -9,7 +9,7 @@ pub mod api;
 mod create;
 mod delete;
 mod list;
-mod switch;
+pub mod switch;
 mod view;
 
 #[derive(Debug, Clone, Args)]
