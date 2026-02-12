@@ -15,7 +15,7 @@ use crate::{
 pub struct InitArgs {}
 
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
-    println!("Link to a Braintrust project...");
+    eprintln!("Link to a Braintrust project...");
 
     let (org, project) = if let (Some(o), Some(p)) = (&base.org, &base.project) {
         (o.clone(), p.clone())
