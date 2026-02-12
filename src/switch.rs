@@ -13,15 +13,33 @@ use crate::ui::{print_command_status, select_project_interactive, with_spinner, 
 
 #[derive(Debug, Clone, Args)]
 pub struct SwitchArgs {
-    /// force set global config value
+    /// Force set global config value
     #[arg(long, short = 'g', conflicts_with = "local")]
     global: bool,
-    /// force set local config value
+    /// Force set local config value
     #[arg(long, short = 'l')]
     local: bool,
     /// Target: project name or org/project
     #[arg(value_name = "TARGET")]
     target: Option<String>,
+}
+
+impl SwitchArgs {
+    fn resolve_target(&self, base: &BaseArgs) -> (Option<String>, Option<String>) {
+        let (pos_org, pos_project) = match &self.target {
+            None => (None, None),
+            Some(t) if t.contains('/') => {
+                let parts: Vec<&str> = t.splitn(2, '/').collect();
+                (Some(parts[0].to_string()), Some(parts[1].to_string()))
+            }
+            Some(t) => (None, Some(t.clone())),
+        };
+
+        let org = base.org.clone().or(pos_org);
+        let project = base.project.clone().or(pos_project);
+
+        (org, project)
+    }
 }
 
 pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
@@ -31,30 +49,16 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     // TODO: support org switching when multi-org auth is ready
     let org_name = &client.org_name();
 
-    if args.target.is_none() && base.org.is_none() && base.project.is_none() {
-        let cfg = config::load().unwrap_or_default();
-        if let (Some(org), Some(project)) = (&cfg.org, &cfg.project) {
-            eprintln!("Current: {org}/{project}");
-        } else {
-            eprintln!("No org/project configured");
-        }
-    }
+    let (_resolved_org, resolved_project) = args.resolve_target(&base);
 
-    let project_name = if let Some(t) = &args.target {
-        if t.contains('/') {
-            // parse org/project format
-            let parts: Vec<&str> = t.splitn(2, '/').collect();
-            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-                bail!("invalid target format. expected org/project");
+    let project_name = match resolved_project {
+        Some(p) => validate_or_create_project(&client, &p).await?,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                bail!("project required. Use: bt switch <target> or bt switch --project <name>");
             }
-            // ignore org part for now, just use project
-            let project = parts[1];
-            validate_or_create_project(&client, project).await?
-        } else {
-            validate_or_create_project(&client, t).await?
+            select_project_interactive(&client, None).await?
         }
-    } else {
-        select_project_interactive(&client, None).await?
     };
 
     let path = resolve_target_path(args.global, args.local)?;
