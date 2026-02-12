@@ -9,7 +9,11 @@ use crate::{
     ui::{self, print_command_status, with_spinner, CommandStatus},
 };
 
-pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>) -> Result<()> {
+pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: bool) -> Result<()> {
+    if force && slug.is_none() {
+        bail!("slug required when using --force. Use: bt prompts delete <slug> --force");
+    }
+
     let prompt = match slug {
         Some(s) => api::get_prompt_by_slug(client, project, s).await?,
         None => {
@@ -20,7 +24,7 @@ pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>) -> Resul
         }
     };
 
-    if std::io::stdin().is_terminal() {
+    if !force && std::io::stdin().is_terminal() {
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete prompt '{}' from {}?",
@@ -40,6 +44,7 @@ pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>) -> Resul
                 CommandStatus::Success,
                 &format!("Deleted '{}'", prompt.name),
             );
+            eprintln!("Run `bt prompts list` to see remaining prompts.");
             Ok(())
         }
         Err(e) => {

@@ -61,6 +61,10 @@ impl ViewArgs {
 struct DeleteArgs {
     /// Name of the project to delete
     name: Option<String>,
+
+    /// Skip confirmation prompt (requires name)
+    #[arg(long, short = 'f')]
+    force: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -82,7 +86,7 @@ pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
         Some(ProjectsCommands::View(a)) => {
             view::run(&client, &ctx.app_url, &ctx.login.org_name, a.name()).await
         }
-        Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref()).await,
+        Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref(), a.force).await,
         Some(ProjectsCommands::Switch(a)) => switch::run(&client, a.name.as_deref()).await,
     }
 }

@@ -46,7 +46,7 @@ pub struct ViewArgs {
     web: bool,
 
     /// Show all model parameters and configuration
-    #[arg(long, short = 'v')]
+    #[arg(long)]
     verbose: bool,
 }
 
@@ -62,6 +62,10 @@ impl ViewArgs {
 pub struct DeleteArgs {
     /// Slug of the prompt to delete
     slug: Option<String>,
+
+    /// Skip confirmation prompt (requires slug)
+    #[arg(long, short = 'f')]
+    force: bool,
 }
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
@@ -94,6 +98,8 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
             )
             .await
         }
-        Some(PromptsCommands::Delete(p)) => delete::run(&client, &project, p.slug.as_deref()).await,
+        Some(PromptsCommands::Delete(p)) => {
+            delete::run(&client, &project, p.slug.as_deref(), p.force).await
+        }
     }
 }
