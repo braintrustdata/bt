@@ -44,6 +44,12 @@ const THREAD_PREPROCESSOR_NAME: &str = "project_default";
 const LOADER_DELAY: Duration = Duration::from_millis(250);
 const DOUBLE_G_TIMEOUT: Duration = Duration::from_millis(700);
 const MAX_SAFE_PARAGRAPH_SCROLL: u16 = 60_000;
+const MAX_RENDER_LINE_CHARS: usize = 220;
+const MAX_PREVIEW_RENDER_LINES: usize = 24;
+const MAX_EXPANDED_RENDER_LINES: usize = 120;
+const MAX_EXPANDED_TOOL_RENDER_LINES: usize = 60;
+const MAX_INLINE_EXPAND_CHARS: usize = 20_000;
+const INLINE_EXPAND_ENABLED: bool = false;
 const TRACE_TEXT_SEARCH_FIELDS: [&str; 6] = [
     "input",
     "expected",
@@ -205,6 +211,8 @@ struct TraceViewerApp {
     span_detail_messages: Option<Vec<Value>>,
     span_detail_message_selected: usize,
     span_detail_message_expanded: HashSet<usize>,
+    message_viewer_open: bool,
+    message_viewer_scroll: u16,
     thread_messages: Option<Vec<Value>>,
     thread_selected_message: usize,
     thread_expanded: HashSet<usize>,
@@ -275,6 +283,8 @@ impl TraceViewerApp {
             span_detail_messages: None,
             span_detail_message_selected: 0,
             span_detail_message_expanded: HashSet::new(),
+            message_viewer_open: false,
+            message_viewer_scroll: 0,
             thread_messages: None,
             thread_selected_message: 0,
             thread_expanded: HashSet::new(),
@@ -467,6 +477,7 @@ impl TraceViewerApp {
         if pos > 0 {
             self.selected_span = visible[pos - 1];
             self.detail_scroll = 0;
+            self.close_message_viewer();
             self.refresh_span_detail_messages(true);
         }
     }
@@ -476,6 +487,7 @@ impl TraceViewerApp {
         if let Some(first) = visible.first().copied() {
             self.selected_span = first;
             self.detail_scroll = 0;
+            self.close_message_viewer();
             self.refresh_span_detail_messages(true);
         }
     }
@@ -488,6 +500,7 @@ impl TraceViewerApp {
         if pos + 1 < visible.len() {
             self.selected_span = visible[pos + 1];
             self.detail_scroll = 0;
+            self.close_message_viewer();
             self.refresh_span_detail_messages(true);
         }
     }
@@ -497,6 +510,7 @@ impl TraceViewerApp {
         if let Some(last) = visible.last().copied() {
             self.selected_span = last;
             self.detail_scroll = 0;
+            self.close_message_viewer();
             self.refresh_span_detail_messages(true);
         }
     }
@@ -512,11 +526,13 @@ impl TraceViewerApp {
     fn move_thread_message_up(&mut self) {
         if self.thread_selected_message > 0 {
             self.thread_selected_message -= 1;
+            self.close_message_viewer();
         }
     }
 
     fn move_thread_message_top(&mut self) {
         self.thread_selected_message = 0;
+        self.close_message_viewer();
     }
 
     fn move_thread_message_down(&mut self) {
@@ -525,6 +541,7 @@ impl TraceViewerApp {
         };
         if self.thread_selected_message + 1 < messages.len() {
             self.thread_selected_message += 1;
+            self.close_message_viewer();
         }
     }
 
@@ -534,6 +551,7 @@ impl TraceViewerApp {
         };
         if !messages.is_empty() {
             self.thread_selected_message = messages.len().saturating_sub(1);
+            self.close_message_viewer();
         }
     }
 
@@ -549,6 +567,7 @@ impl TraceViewerApp {
     fn move_span_detail_message_up(&mut self) {
         if self.span_detail_message_selected > 0 {
             self.span_detail_message_selected -= 1;
+            self.close_message_viewer();
         }
     }
 
@@ -558,11 +577,13 @@ impl TraceViewerApp {
         };
         if self.span_detail_message_selected + 1 < messages.len() {
             self.span_detail_message_selected += 1;
+            self.close_message_viewer();
         }
     }
 
     fn move_span_detail_message_top(&mut self) {
         self.span_detail_message_selected = 0;
+        self.close_message_viewer();
     }
 
     fn move_span_detail_message_bottom(&mut self) {
@@ -571,15 +592,7 @@ impl TraceViewerApp {
         };
         if !messages.is_empty() {
             self.span_detail_message_selected = messages.len().saturating_sub(1);
-        }
-    }
-
-    fn toggle_selected_span_detail_message(&mut self) {
-        let idx = self.span_detail_message_selected;
-        if self.span_detail_message_expanded.contains(&idx) {
-            self.span_detail_message_expanded.remove(&idx);
-        } else {
-            self.span_detail_message_expanded.insert(idx);
+            self.close_message_viewer();
         }
     }
 
@@ -597,6 +610,9 @@ impl TraceViewerApp {
     }
 
     fn span_detail_status_text(&self) -> &'static str {
+        if self.message_viewer_open {
+            return "Message view. Up/Down: scroll  PgUp/PgDn: page  gg/G: top/bottom  v: close  Esc: close";
+        }
         span_detail_status(
             self.detail_view,
             self.detail_pane_focus,
@@ -610,6 +626,17 @@ impl TraceViewerApp {
             SpanDetailTab::Raw => SpanDetailTab::Messages,
         };
         self.detail_scroll = 0;
+        self.close_message_viewer();
+    }
+
+    fn open_message_viewer(&mut self) {
+        self.message_viewer_open = true;
+        self.message_viewer_scroll = 0;
+    }
+
+    fn close_message_viewer(&mut self) {
+        self.message_viewer_open = false;
+        self.message_viewer_scroll = 0;
     }
 
     fn refresh_span_detail_messages(&mut self, reset_selection: bool) {
@@ -914,6 +941,11 @@ fn handle_key_event(
             return Ok(true)
         }
         KeyCode::Esc => {
+            if app.screen == Screen::SpanDetail && app.message_viewer_open {
+                app.close_message_viewer();
+                app.set_status(app.span_detail_status_text());
+                return Ok(false);
+            }
             if app.screen == Screen::SpanDetail {
                 app.screen = Screen::Traces;
                 app.set_status(
@@ -1167,8 +1199,51 @@ fn handle_span_detail_key(
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
 ) -> Result<()> {
-    let span_detail_message_mode =
-        app.detail_pane_focus == DetailPaneFocus::Detail && app.span_detail_shows_messages();
+    let detail_message_list_mode = app.detail_pane_focus == DetailPaneFocus::Detail
+        && (app.span_detail_shows_messages()
+            || (app.detail_view == DetailView::Thread
+                && !app.thread_loading
+                && app.thread_messages.is_some()));
+    let message_viewer_mode = app.message_viewer_open && detail_message_list_mode;
+
+    if message_viewer_mode {
+        match key.code {
+            KeyCode::Char('g') if key.modifiers.is_empty() => {
+                if app.pending_g_prefix_at.take().is_some() {
+                    app.message_viewer_scroll = 0;
+                } else {
+                    app.pending_g_prefix_at = Some(Instant::now());
+                }
+            }
+            KeyCode::Char('G') => {
+                scroll_message_viewer_to_bottom(app);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.message_viewer_scroll = app.message_viewer_scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => scroll_message_viewer_down_bounded(app, 1),
+            KeyCode::PageUp => {
+                app.message_viewer_scroll = app.message_viewer_scroll.saturating_sub(10)
+            }
+            KeyCode::PageDown => scroll_message_viewer_down_bounded(app, 10),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.message_viewer_scroll = app.message_viewer_scroll.saturating_sub(10)
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                scroll_message_viewer_down_bounded(app, 10)
+            }
+            KeyCode::Esc | KeyCode::Char('v') => {
+                app.close_message_viewer();
+                app.set_status(app.span_detail_status_text());
+            }
+            KeyCode::Backspace => {
+                app.close_message_viewer();
+                app.set_status(app.span_detail_status_text());
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
 
     match key.code {
         KeyCode::Char('g') if key.modifiers.is_empty() => {
@@ -1180,7 +1255,7 @@ fn handle_span_detail_key(
                     }
                 } else if app.detail_view == DetailView::Thread {
                     app.move_thread_message_top();
-                } else if span_detail_message_mode {
+                } else if detail_message_list_mode {
                     app.move_span_detail_message_top();
                 } else {
                     app.scroll_detail_top();
@@ -1197,7 +1272,7 @@ fn handle_span_detail_key(
                 }
             } else if app.detail_view == DetailView::Thread {
                 app.move_thread_message_bottom();
-            } else if span_detail_message_mode {
+            } else if detail_message_list_mode {
                 app.move_span_detail_message_bottom();
             } else {
                 scroll_detail_to_bottom(app);
@@ -1211,7 +1286,7 @@ fn handle_span_detail_key(
                 }
             } else if app.detail_view == DetailView::Thread {
                 app.move_thread_message_up();
-            } else if span_detail_message_mode {
+            } else if detail_message_list_mode {
                 app.move_span_detail_message_up();
             } else {
                 app.scroll_detail_up(1);
@@ -1225,7 +1300,7 @@ fn handle_span_detail_key(
                 }
             } else if app.detail_view == DetailView::Thread {
                 app.move_thread_message_down();
-            } else if span_detail_message_mode {
+            } else if detail_message_list_mode {
                 app.move_span_detail_message_down();
             } else {
                 scroll_detail_down_bounded(app, 1);
@@ -1233,9 +1308,15 @@ fn handle_span_detail_key(
         }
         KeyCode::PageUp => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                if span_detail_message_mode {
-                    for _ in 0..10 {
-                        app.move_span_detail_message_up();
+                if detail_message_list_mode {
+                    if app.detail_view == DetailView::Thread {
+                        for _ in 0..10 {
+                            app.move_thread_message_up();
+                        }
+                    } else {
+                        for _ in 0..10 {
+                            app.move_span_detail_message_up();
+                        }
                     }
                 } else {
                     app.scroll_detail_up(10);
@@ -1244,9 +1325,15 @@ fn handle_span_detail_key(
         }
         KeyCode::PageDown => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                if span_detail_message_mode {
-                    for _ in 0..10 {
-                        app.move_span_detail_message_down();
+                if detail_message_list_mode {
+                    if app.detail_view == DetailView::Thread {
+                        for _ in 0..10 {
+                            app.move_thread_message_down();
+                        }
+                    } else {
+                        for _ in 0..10 {
+                            app.move_span_detail_message_down();
+                        }
                     }
                 } else {
                     scroll_detail_down_bounded(app, 10);
@@ -1268,20 +1355,31 @@ fn handle_span_detail_key(
             app.set_status(app.span_detail_status_text());
         }
         KeyCode::Enter => {
-            if app.detail_view == DetailView::Span {
-                if span_detail_message_mode && current_span_is_fully_loaded(app) {
-                    app.toggle_selected_span_detail_message();
-                } else {
-                    request_selected_span_load(app, client, handle, true)?;
+            if detail_message_list_mode {
+                if selected_detail_message(app).is_some() {
+                    app.open_message_viewer();
+                    app.set_status(app.span_detail_status_text());
                 }
+                return Ok(());
+            }
+
+            if app.detail_view == DetailView::Span {
+                request_selected_span_load(app, client, handle, true)?;
             } else if app.thread_loading || app.thread_messages.is_none() {
                 request_thread_messages_load(app, client, handle, true)?;
             } else {
                 app.toggle_selected_thread_message();
             }
         }
+        KeyCode::Char('v') => {
+            if detail_message_list_mode {
+                app.open_message_viewer();
+                app.set_status(app.span_detail_status_text());
+            }
+        }
         KeyCode::Char('t') => {
             app.detail_scroll = 0;
+            app.close_message_viewer();
             app.detail_view = if app.detail_view == DetailView::Span {
                 DetailView::Thread
             } else {
@@ -1316,9 +1414,15 @@ fn handle_span_detail_key(
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                if span_detail_message_mode {
-                    for _ in 0..10 {
-                        app.move_span_detail_message_up();
+                if detail_message_list_mode {
+                    if app.detail_view == DetailView::Thread {
+                        for _ in 0..10 {
+                            app.move_thread_message_up();
+                        }
+                    } else {
+                        for _ in 0..10 {
+                            app.move_span_detail_message_up();
+                        }
                     }
                 } else {
                     app.scroll_detail_up(10)
@@ -1327,9 +1431,15 @@ fn handle_span_detail_key(
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.detail_pane_focus == DetailPaneFocus::Detail {
-                if span_detail_message_mode {
-                    for _ in 0..10 {
-                        app.move_span_detail_message_down();
+                if detail_message_list_mode {
+                    if app.detail_view == DetailView::Thread {
+                        for _ in 0..10 {
+                            app.move_thread_message_down();
+                        }
+                    } else {
+                        for _ in 0..10 {
+                            app.move_span_detail_message_down();
+                        }
                     }
                 } else {
                     scroll_detail_down_bounded(app, 10)
@@ -1339,12 +1449,6 @@ fn handle_span_detail_key(
         _ => {}
     }
     Ok(())
-}
-
-fn current_span_is_fully_loaded(app: &TraceViewerApp) -> bool {
-    app.current_span()
-        .map(|span| app.full_span_cache.contains_key(&span.id))
-        .unwrap_or(false)
 }
 
 fn scroll_detail_down_bounded(app: &mut TraceViewerApp, amount: u16) {
@@ -1382,6 +1486,60 @@ fn current_span_detail_max_scroll(app: &TraceViewerApp) -> Option<u16> {
     let wrapped_lines = wrapped_line_count(&detail_text, content_width);
     let max_scroll = wrapped_lines.saturating_sub(content_height);
     Some(u16::try_from(max_scroll).unwrap_or(MAX_SAFE_PARAGRAPH_SCROLL))
+}
+
+fn selected_detail_message(app: &TraceViewerApp) -> Option<&Value> {
+    match app.detail_view {
+        DetailView::Thread => app
+            .thread_messages
+            .as_ref()
+            .and_then(|messages| messages.get(app.thread_selected_message)),
+        DetailView::Span if app.span_detail_shows_messages() => app
+            .span_detail_messages
+            .as_ref()
+            .and_then(|messages| messages.get(app.span_detail_message_selected)),
+        _ => None,
+    }
+}
+
+fn selected_message_viewer_max_scroll(app: &TraceViewerApp) -> Option<u16> {
+    if !app.message_viewer_open {
+        return None;
+    }
+
+    let message = selected_detail_message(app)?;
+    let text = render_full_message_text(message);
+    let (content_width, content_height) = message_viewer_content_size(app)?;
+    let wrapped_lines = wrapped_line_count(&text, content_width);
+    let max_scroll = wrapped_lines.saturating_sub(content_height);
+    Some(u16::try_from(max_scroll).unwrap_or(MAX_SAFE_PARAGRAPH_SCROLL))
+}
+
+fn message_viewer_content_size(app: &TraceViewerApp) -> Option<(usize, usize)> {
+    let (terminal_width, terminal_height) = crossterm::terminal::size().ok()?;
+    let center_height = terminal_height.saturating_sub(6);
+    let detail_width = ((u32::from(terminal_width) * 65) / 100) as u16;
+
+    // Inside border for the detail panel.
+    let content_width = detail_width.saturating_sub(2).max(1);
+    let content_height = match app.detail_view {
+        DetailView::Span => center_height.saturating_sub(5).saturating_sub(2).max(1),
+        DetailView::Thread => center_height.saturating_sub(2).max(1),
+    };
+    Some((usize::from(content_width), usize::from(content_height)))
+}
+
+fn scroll_message_viewer_down_bounded(app: &mut TraceViewerApp, amount: u16) {
+    let max_scroll = selected_message_viewer_max_scroll(app).unwrap_or(MAX_SAFE_PARAGRAPH_SCROLL);
+    app.message_viewer_scroll = app
+        .message_viewer_scroll
+        .saturating_add(amount)
+        .min(max_scroll);
+}
+
+fn scroll_message_viewer_to_bottom(app: &mut TraceViewerApp) {
+    let max_scroll = selected_message_viewer_max_scroll(app).unwrap_or(MAX_SAFE_PARAGRAPH_SCROLL);
+    app.message_viewer_scroll = max_scroll;
 }
 
 fn span_detail_content_size() -> Option<(usize, usize)> {
@@ -1620,6 +1778,7 @@ fn poll_pending_url_open(
                     if target.project.id != app.project.id {
                         app.project = target.project.clone();
                         app.screen = Screen::Traces;
+                        app.close_message_viewer();
                         app.traces.clear();
                         app.selected_trace = 0;
                         app.summary_load_rx = None;
@@ -1823,6 +1982,7 @@ fn apply_loaded_trace_rows(
     app.span_detail_messages = None;
     app.span_detail_message_selected = 0;
     app.span_detail_message_expanded.clear();
+    app.close_message_viewer();
     app.loaded_root_span_id = Some(root_span_id.clone());
     app.screen = Screen::SpanDetail;
     app.refresh_span_detail_messages(true);
@@ -2252,7 +2412,16 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
             frame.render_widget(summary, detail_chunks[0]);
 
             if app.span_detail_shows_messages() {
-                if let Some(messages) = &app.span_detail_messages {
+                if app.message_viewer_open {
+                    if let Some(message) = selected_detail_message(app) {
+                        draw_message_viewer(frame, detail_chunks[1], app, message, detail_block);
+                    } else {
+                        let detail = Paragraph::new("No message selected.")
+                            .block(detail_block)
+                            .wrap(Wrap { trim: false });
+                        frame.render_widget(detail, detail_chunks[1]);
+                    }
+                } else if let Some(messages) = &app.span_detail_messages {
                     draw_span_messages_list(frame, detail_chunks[1], app, messages, detail_block);
                 } else {
                     let detail = Paragraph::new(
@@ -2307,6 +2476,15 @@ fn draw_span_detail_view(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app
                     .scroll((app.detail_scroll, 0))
                     .wrap(Wrap { trim: false });
                 frame.render_widget(detail, chunks[1]);
+            } else if app.message_viewer_open {
+                if let Some(message) = selected_detail_message(app) {
+                    draw_message_viewer(frame, chunks[1], app, message, detail_block);
+                } else {
+                    let detail = Paragraph::new("No message selected.")
+                        .block(detail_block)
+                        .wrap(Wrap { trim: false });
+                    frame.render_widget(detail, chunks[1]);
+                }
             } else if let Some(messages) = &app.thread_messages {
                 draw_thread_messages_list(frame, chunks[1], app, messages, detail_block);
             } else {
@@ -3155,6 +3333,89 @@ fn truncate_for_preview(text: &str, max_lines: usize, max_chars: usize) -> (Stri
     (lines_out.join("\n"), truncated)
 }
 
+fn sanitize_terminal_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' | '\t' => out.push(ch),
+            '\r' => out.push('\n'),
+            '\x1b' => {}
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn push_text_lines_limited(
+    lines: &mut Vec<Line<'_>>,
+    text: &str,
+    indent: &str,
+    max_line_chars: usize,
+    max_lines: usize,
+) -> (usize, bool) {
+    if max_lines == 0 || max_line_chars == 0 {
+        return (0, !text.is_empty());
+    }
+
+    let mut added = 0usize;
+    let mut line_iter = text.lines().peekable();
+
+    while let Some(line) = line_iter.next() {
+        if added >= max_lines {
+            return (added, true);
+        }
+
+        if line.is_empty() {
+            lines.push(Line::from(Span::raw(indent.to_string())));
+            added += 1;
+            if added >= max_lines && line_iter.peek().is_some() {
+                return (added, true);
+            }
+            continue;
+        }
+
+        let mut chunk = String::new();
+        let mut chunk_chars = 0usize;
+        let mut chars = line.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            chunk.push(ch);
+            chunk_chars += 1;
+
+            if chunk_chars >= max_line_chars {
+                if added >= max_lines {
+                    return (added, true);
+                }
+                lines.push(Line::from(Span::raw(format!("{indent}{chunk}"))));
+                added += 1;
+                chunk.clear();
+                chunk_chars = 0;
+
+                if added >= max_lines {
+                    if chars.peek().is_some() || line_iter.peek().is_some() {
+                        return (added, true);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !chunk.is_empty() {
+            if added >= max_lines {
+                return (added, true);
+            }
+            lines.push(Line::from(Span::raw(format!("{indent}{chunk}"))));
+            added += 1;
+            if added >= max_lines && line_iter.peek().is_some() {
+                return (added, true);
+            }
+        }
+    }
+
+    (added, false)
+}
+
 fn draw_thread_messages_list(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
@@ -3170,7 +3431,7 @@ fn draw_thread_messages_list(
         app.thread_selected_message,
         &app.thread_expanded,
         "No messages returned by preprocessor.",
-        "Up/Down: select message  Enter: expand/collapse  Left: span tree  t: span/thread",
+        "Up/Down: select message  Enter: full view  v: full view  Left: span tree  t: span/thread",
     );
 }
 
@@ -3189,8 +3450,89 @@ fn draw_span_messages_list(
         app.span_detail_message_selected,
         &app.span_detail_message_expanded,
         "No parseable messages found in span input/output.",
-        "Up/Down: select message  Enter: expand/collapse  Left: span tree  Tab: raw",
+        "Up/Down: select message  Enter: full view  v: full view  Left: span tree  Tab: raw",
     );
+}
+
+fn draw_message_viewer(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    app: &TraceViewerApp,
+    message: &Value,
+    detail_block: Block<'_>,
+) {
+    let text = render_full_message_text(message);
+    let panel = Paragraph::new(text)
+        .block(
+            detail_block
+                .title_bottom("Up/Down: scroll  PgUp/PgDn: page  gg/G: top/bottom  v/Esc: close"),
+        )
+        .scroll((app.message_viewer_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
+fn render_full_message_text(message: &Value) -> String {
+    let (role, section, content, tool_calls) = match message {
+        Value::Object(obj) => (
+            value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string()),
+            value_as_string(obj.get("_section")),
+            obj.get("content"),
+            obj.get("tool_calls"),
+        ),
+        _ => ("message".to_string(), None, Some(message), None),
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("Role: {}", role_display_name(&role)));
+    if let Some(section) = section {
+        out.push_str(&format!(" [{section}]"));
+    }
+    out.push_str("\n\nContent\n-------\n");
+
+    let content_text = content
+        .map(render_message_content)
+        .map(|text| sanitize_terminal_text(&text))
+        .unwrap_or_default();
+    if content_text.trim().is_empty() {
+        out.push_str("(empty)\n");
+    } else {
+        out.push_str(content_text.trim_end());
+        out.push('\n');
+    }
+
+    if let Some(tool_calls) = tool_calls {
+        let tool_text = sanitize_terminal_text(&render_tool_calls_inline(tool_calls));
+        if !tool_text.trim().is_empty() {
+            out.push_str("\nTool Calls\n----------\n");
+            out.push_str(tool_text.trim_end());
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn message_inline_render_char_count(message: &Value) -> usize {
+    let (_, _, content, tool_calls) = match message {
+        Value::Object(obj) => (
+            value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string()),
+            value_as_string(obj.get("_section")),
+            obj.get("content"),
+            obj.get("tool_calls"),
+        ),
+        _ => ("message".to_string(), None, Some(message), None),
+    };
+
+    let content_len = content
+        .map(render_message_content)
+        .map(|text| sanitize_terminal_text(&text).chars().count())
+        .unwrap_or(0);
+    let tools_len = tool_calls
+        .map(render_tool_calls_inline)
+        .map(|text| sanitize_terminal_text(&text).chars().count())
+        .unwrap_or(0);
+    content_len.saturating_add(tools_len)
 }
 
 fn draw_messages_list(
@@ -3225,7 +3567,10 @@ fn draw_messages_list(
                 _ => ("message".to_string(), None, Some(message), None),
             };
 
-            let expanded = expanded_set.contains(&index);
+            let expanded_requested = expanded_set.contains(&index);
+            let too_large_for_inline = INLINE_EXPAND_ENABLED
+                && message_inline_render_char_count(message) > MAX_INLINE_EXPAND_CHARS;
+            let expanded = INLINE_EXPAND_ENABLED && expanded_requested && !too_large_for_inline;
             let arrow = if expanded { "▾" } else { "▸" };
             let role_display = role_display_name(&role);
 
@@ -3246,8 +3591,17 @@ fn draw_messages_list(
                 ));
             }
             let mut lines: Vec<Line<'_>> = vec![Line::from(header_spans)];
+            let mut remaining_lines = if expanded {
+                MAX_EXPANDED_RENDER_LINES
+            } else {
+                MAX_PREVIEW_RENDER_LINES
+            };
+            remaining_lines = remaining_lines.saturating_sub(1);
 
-            let content_text = content.map(render_message_content).unwrap_or_default();
+            let content_text = content
+                .map(render_message_content)
+                .map(|text| sanitize_terminal_text(&text))
+                .unwrap_or_default();
             let normalized_content = if content_text.trim().is_empty() {
                 "(empty)".to_string()
             } else {
@@ -3259,48 +3613,92 @@ fn draw_messages_list(
                 truncate_for_preview(&normalized_content, 4, 160)
             };
 
-            for line in shown_content.lines() {
-                lines.push(Line::from(Span::raw(format!("    {line}"))));
-            }
-            if content_truncated {
+            let (content_lines_added, content_budget_truncated) = push_text_lines_limited(
+                &mut lines,
+                &shown_content,
+                "    ",
+                MAX_RENDER_LINE_CHARS,
+                remaining_lines,
+            );
+            remaining_lines = remaining_lines.saturating_sub(content_lines_added);
+            if content_truncated || content_budget_truncated {
                 lines.push(Line::from(Span::styled(
                     "    ...",
                     Style::default().fg(Color::DarkGray),
                 )));
+                remaining_lines = remaining_lines.saturating_sub(1);
             }
 
             if let Some(calls) = tool_calls {
-                let tool_calls_text = render_tool_calls_inline(calls);
-                if !tool_calls_text.trim().is_empty() {
+                let tool_calls_text = sanitize_terminal_text(&render_tool_calls_inline(calls));
+                if !tool_calls_text.trim().is_empty() && remaining_lines > 0 {
                     lines.push(Line::from(Span::styled(
                         "    Tool calls:",
                         Style::default().fg(Color::DarkGray),
                     )));
+                    remaining_lines = remaining_lines.saturating_sub(1);
                     let (shown_tools, tools_truncated) = if expanded {
                         (tool_calls_text, false)
                     } else {
                         truncate_for_preview(&tool_calls_text, 3, 140)
                     };
-                    for line in shown_tools.lines() {
-                        lines.push(Line::from(Span::raw(format!("      {line}"))));
-                    }
-                    if tools_truncated {
+                    let tools_line_cap = if expanded {
+                        MAX_EXPANDED_TOOL_RENDER_LINES
+                    } else {
+                        10
+                    };
+                    let allowed_tool_lines = remaining_lines.min(tools_line_cap);
+                    let (tool_lines_added, tools_budget_truncated) = push_text_lines_limited(
+                        &mut lines,
+                        &shown_tools,
+                        "      ",
+                        MAX_RENDER_LINE_CHARS,
+                        allowed_tool_lines,
+                    );
+                    remaining_lines = remaining_lines.saturating_sub(tool_lines_added);
+                    if tools_truncated || tools_budget_truncated {
                         lines.push(Line::from(Span::styled(
                             "      ...",
                             Style::default().fg(Color::DarkGray),
                         )));
+                        remaining_lines = remaining_lines.saturating_sub(1);
                     }
                 }
             }
 
-            if !expanded {
+            if too_large_for_inline {
                 lines.push(Line::from(Span::styled(
-                    "    Enter to expand",
+                    "    Large message: inline view is truncated for stability. Press v for full view.",
                     Style::default().fg(Color::DarkGray),
                 )));
-            } else {
+                remaining_lines = remaining_lines.saturating_sub(1);
+            }
+
+            if remaining_lines > 0 {
+                if INLINE_EXPAND_ENABLED {
+                    if !expanded {
+                        lines.push(Line::from(Span::styled(
+                            "    Enter to expand",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            "    Enter to collapse",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "    Enter or v for full view",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                remaining_lines = remaining_lines.saturating_sub(1);
+            }
+
+            if remaining_lines == 0 {
                 lines.push(Line::from(Span::styled(
-                    "    Enter to collapse",
+                    "    [truncated for display]",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -3334,7 +3732,7 @@ fn span_detail_status(
             "Span view (tree focus). Right: detail pane  Up/Down: select span  Space: collapse/expand  Tab: raw/messages  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Span, DetailPaneFocus::Detail) if span_has_message_list => {
-            "Span view (detail focus). Left: tree pane  Up/Down: select message  Enter: expand/collapse  Tab: raw  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
+            "Span view (detail focus). Left: tree pane  Up/Down: select message  Enter/v: full view  Tab: raw  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Span, DetailPaneFocus::Detail) => {
             "Span view (detail focus). Left: tree pane  Up/Down: scroll  Enter: load span  Tab: messages  t: thread  Ctrl+k: open URL  Backspace/Esc: back"
@@ -3343,7 +3741,7 @@ fn span_detail_status(
             "Thread view (tree focus). Right: detail pane  Up/Down: select span  Enter: toggle/retry  t: span  Ctrl+k: open URL  Backspace/Esc: back"
         }
         (DetailView::Thread, DetailPaneFocus::Detail) => {
-            "Thread view (detail focus). Left: tree pane  Up/Down: select message  Enter: expand/collapse (or retry)  t: span  Ctrl+k: open URL  Backspace/Esc: back"
+            "Thread view (detail focus). Left: tree pane  Up/Down: select message  Enter/v: full view  t: span  Ctrl+k: open URL  Backspace/Esc: back"
         }
     }
 }
@@ -4312,6 +4710,8 @@ fn request_selected_span_load(
     handle: &tokio::runtime::Handle,
     force_refresh: bool,
 ) -> Result<()> {
+    app.close_message_viewer();
+
     let Some(span) = app.current_span().cloned() else {
         return Ok(());
     };
@@ -4429,6 +4829,8 @@ fn request_thread_messages_load(
     handle: &tokio::runtime::Handle,
     force_refresh: bool,
 ) -> Result<()> {
+    app.close_message_viewer();
+
     let Some(root_span_id) = app.loaded_root_span_id.clone() else {
         app.set_error("No trace loaded");
         return Ok(());
@@ -4553,4 +4955,78 @@ async fn execute_invoke(client: &ApiClient, request: &Value) -> Result<Value> {
     client
         .post_with_headers("/function/invoke", request, &headers)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::{Block, Borders};
+    use ratatui::Terminal;
+    use serde_json::json;
+
+    fn draw_messages_once(messages: &[Value], expanded: bool) -> bool {
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).expect("create terminal");
+        let mut expanded_set = HashSet::new();
+        if expanded {
+            expanded_set.insert(0usize);
+        }
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_messages_list(
+                    frame,
+                    area,
+                    messages,
+                    Block::default().title("Messages").borders(Borders::ALL),
+                    0,
+                    &expanded_set,
+                    "empty",
+                    "controls",
+                );
+            })
+            .expect("draw list");
+
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| !cell.symbol().trim().is_empty())
+    }
+
+    #[test]
+    fn draw_messages_list_survives_huge_message_expansion_loop() {
+        for size in [2_048usize, 16_384, 131_072] {
+            let long_text = format!(
+                "{}\n{}\n{}\u{1b}[2J{}",
+                "A".repeat(size),
+                "B".repeat(size),
+                "C".repeat(size / 2),
+                "D".repeat(size)
+            );
+            let large_tool_json = json!({
+                "payload": format!("{}{}", "T".repeat(size), "U".repeat(size / 2))
+            });
+            let messages = vec![json!({
+                "role": "system",
+                "content": long_text,
+                "tool_calls": [{
+                    "name": "large_tool",
+                    "arguments": large_tool_json
+                }]
+            })];
+
+            for i in 0..50 {
+                let expanded = i % 2 == 0;
+                let rendered = draw_messages_once(&messages, expanded);
+                assert!(
+                    rendered,
+                    "render produced empty buffer at size={size}, iter={i}"
+                );
+            }
+        }
+    }
 }
