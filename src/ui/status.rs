@@ -14,7 +14,7 @@ pub fn print_command_status(status: CommandStatus, message: &str) {
     };
 
     match status {
-        CommandStatus::Success => println!("{indicator} {message}"),
+        CommandStatus::Success => eprintln!("{indicator} {message}"),
         _ => eprintln!("{indicator} {message}"),
     }
 }
