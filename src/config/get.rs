@@ -1,5 +1,4 @@
-use anyhow::Result;
-use std::process;
+use anyhow::{bail, Result};
 
 use crate::args::BaseArgs;
 
@@ -25,7 +24,7 @@ pub fn run(base: BaseArgs, key: &str, global: bool, local: bool) -> Result<()> {
             Ok(())
         }
         None => {
-            process::exit(1);
+            bail!("Config key '{key}' is not set.")
         }
     }
 }
