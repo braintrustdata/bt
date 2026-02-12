@@ -30,7 +30,9 @@ impl SwitchArgs {
             None => (None, None),
             Some(t) if t.contains('/') => {
                 let parts: Vec<&str> = t.splitn(2, '/').collect();
-                (Some(parts[0].to_string()), Some(parts[1].to_string()))
+                let o = (!parts[0].is_empty()).then(|| parts[0].to_string());
+                let p = (!parts[1].is_empty()).then(|| parts[1].to_string());
+                (o, p)
             }
             Some(t) => (None, Some(t.clone())),
         };
@@ -122,5 +124,122 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<St
         Ok(name.to_string())
     } else {
         bail!("project '{name}' not found");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn switch_args(target: Option<&str>) -> SwitchArgs {
+        SwitchArgs {
+            global: false,
+            local: false,
+            target: target.map(String::from),
+        }
+    }
+
+    fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
+        BaseArgs {
+            json: false,
+            org: org.map(String::from),
+            project: project.map(String::from),
+            api_key: None,
+            api_url: None,
+            app_url: None,
+            env_file: None,
+        }
+    }
+
+    #[test]
+    fn no_args_returns_none() {
+        let args = switch_args(None);
+        let base = base_args(None, None);
+        assert_eq!(args.resolve_target(&base), (None, None));
+    }
+
+    #[test]
+    fn positional_org_project() {
+        let args = switch_args(Some("myorg/proj"));
+        let base = base_args(None, None);
+        assert_eq!(
+            args.resolve_target(&base),
+            (Some("myorg".into()), Some("proj".into()))
+        );
+    }
+
+    #[test]
+    fn positional_project_only() {
+        let args = switch_args(Some("proj"));
+        let base = base_args(None, None);
+        assert_eq!(args.resolve_target(&base), (None, Some("proj".into())));
+    }
+
+    #[test]
+    fn slash_with_empty_org() {
+        let args = switch_args(Some("/project"));
+        let base = base_args(None, None);
+        assert_eq!(args.resolve_target(&base), (None, Some("project".into())));
+    }
+
+    #[test]
+    fn slash_with_empty_project() {
+        let args = switch_args(Some("org/"));
+        let base = base_args(None, None);
+        assert_eq!(args.resolve_target(&base), (Some("org".into()), None));
+    }
+
+    #[test]
+    fn flag_org_only() {
+        let args = switch_args(None);
+        let base = base_args(Some("x"), None);
+        assert_eq!(args.resolve_target(&base), (Some("x".into()), None));
+    }
+
+    #[test]
+    fn flag_project_only() {
+        let args = switch_args(None);
+        let base = base_args(None, Some("y"));
+        assert_eq!(args.resolve_target(&base), (None, Some("y".into())));
+    }
+
+    #[test]
+    fn flags_only() {
+        let args = switch_args(None);
+        let base = base_args(Some("a"), Some("b"));
+        assert_eq!(
+            args.resolve_target(&base),
+            (Some("a".into()), Some("b".into()))
+        );
+    }
+
+    #[test]
+    fn flag_overrides_positional_project() {
+        let args = switch_args(Some("myorg/proj"));
+        let base = base_args(None, Some("foo"));
+        assert_eq!(
+            args.resolve_target(&base),
+            (Some("myorg".into()), Some("foo".into()))
+        );
+    }
+
+    #[test]
+    fn flag_org_with_positional_project() {
+        let args = switch_args(Some("proj"));
+        let base = base_args(Some("bar"), None);
+        assert_eq!(
+            args.resolve_target(&base),
+            (Some("bar".into()), Some("proj".into()))
+        );
+    }
+
+    #[test]
+    fn flag_override_both() {
+        let args = switch_args(Some("myorg/proj"));
+        let base = base_args(Some("x"), Some("y"));
+        assert_eq!(
+            args.resolve_target(&base),
+            (Some("x".into()), Some("y".into()))
+        );
     }
 }
