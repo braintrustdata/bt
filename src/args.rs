@@ -56,6 +56,12 @@ impl BaseArgs {
         if self.project.is_none() {
             self.project = cfg.project.clone();
         }
+        if self.api_url.is_none() {
+            self.api_url = cfg.api_url.clone();
+        }
+        if self.app_url.is_none() {
+            self.app_url = cfg.app_url.clone();
+        }
         self
     }
 }
