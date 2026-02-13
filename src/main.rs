@@ -6,6 +6,7 @@ mod args;
 mod env;
 #[cfg(unix)]
 mod eval;
+mod experiments;
 mod functions;
 mod http;
 mod login;
@@ -49,6 +50,9 @@ enum Commands {
     Tools(CLIArgs<tools::ToolsArgs>),
     /// Manage scorers
     Scorers(CLIArgs<scorers::ScorersArgs>),
+    /// Manage experiments
+    #[command(visible_alias = "exp")]
+    Experiments(CLIArgs<experiments::ExperimentsArgs>),
 }
 
 #[tokio::main]
@@ -67,6 +71,7 @@ async fn main() -> Result<()> {
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
+        Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())
