@@ -14,6 +14,7 @@ use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandSta
 
 use super::api;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &ApiClient,
     app_url: &str,
