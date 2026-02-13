@@ -9,10 +9,12 @@ mod eval;
 mod http;
 mod login;
 mod projects;
+mod prompts;
 mod self_update;
 mod sql;
 mod traces;
 mod ui;
+mod utils;
 
 use crate::args::CLIArgs;
 
@@ -38,6 +40,8 @@ enum Commands {
     #[command(name = "self")]
     /// Self-management commands
     SelfCommand(self_update::SelfArgs),
+    /// Manage prompts
+    Prompts(CLIArgs<prompts::PromptsArgs>),
 }
 
 #[tokio::main]
@@ -53,6 +57,7 @@ async fn main() -> Result<()> {
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
+        Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())

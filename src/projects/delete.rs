@@ -9,7 +9,11 @@ use crate::ui::{print_command_status, with_spinner, CommandStatus};
 use super::api;
 use super::switch::select_project_interactive;
 
-pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
+pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<()> {
+    if force && name.is_none() {
+        bail!("project name required when using --force. Use: bt projects delete <name> --force");
+    }
+
     let project = match name {
         Some(n) => with_spinner("Loading project...", api::get_project_by_name(client, n))
             .await?
@@ -28,7 +32,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
         }
     };
 
-    if std::io::stdin().is_terminal() {
+    if !force && std::io::stdin().is_terminal() {
         let confirm = Confirm::new()
             .with_prompt(format!("Delete project '{}'?", project.name))
             .default(false)
@@ -50,6 +54,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
                 CommandStatus::Success,
                 &format!("Deleted '{}'", project.name),
             );
+            eprintln!("Run `bt projects list` to see remaining projects.");
             Ok(())
         }
         Err(e) => {

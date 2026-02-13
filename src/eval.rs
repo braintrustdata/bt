@@ -669,9 +669,7 @@ fn detect_eval_language(
         if let Some(existing) = detected {
             if existing != current {
                 anyhow::bail!(
-                    "Mixed eval file types are not supported yet (found {:?} and {:?}).",
-                    existing,
-                    current
+                    "Mixed eval file types are not supported yet (found {existing:?} and {current:?})."
                 );
             }
         } else {
@@ -1454,9 +1452,9 @@ fn format_regressions_line(value: i64) -> Line<'static> {
 
 fn format_metric_value(metric: f64, unit: &str) -> String {
     let formatted = if metric.fract() == 0.0 {
-        format!("{:.0}", metric)
+        format!("{metric:.0}")
     } else {
-        format!("{:.2}", metric)
+        format!("{metric:.2}")
     };
     if unit == "$" {
         format!("{unit}{formatted}")
