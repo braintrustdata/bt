@@ -1,11 +1,17 @@
 use clap::Args;
 use std::path::PathBuf;
 
+use crate::config::Config;
+
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
     /// Output as JSON
     #[arg(short = 'j', long, global = true)]
     pub json: bool,
+
+    /// Override active org
+    #[arg(short = 'o', long, env = "BRAINTRUST_DEFAULT_ORG")]
+    pub org: Option<String>,
 
     /// Override active project
     #[arg(short = 'p', long, env = "BRAINTRUST_DEFAULT_PROJECT", global = true)]
@@ -28,6 +34,24 @@ pub struct BaseArgs {
     pub env_file: Option<PathBuf>,
 }
 
+impl BaseArgs {
+    pub fn with_config_defaults(mut self, cfg: &Config) -> Self {
+        if self.org.is_none() {
+            self.org = cfg.org.clone();
+        }
+        if self.project.is_none() {
+            self.project = cfg.project.clone();
+        }
+        if self.api_url.is_none() {
+            self.api_url = cfg.api_url.clone();
+        }
+        if self.app_url.is_none() {
+            self.app_url = cfg.app_url.clone();
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct CLIArgs<T: Args> {
     #[command(flatten)]
@@ -35,4 +59,91 @@ pub struct CLIArgs<T: Args> {
 
     #[command(flatten)]
     pub args: T,
+}
+
+impl<T: Args> CLIArgs<T> {
+    pub fn with_config(self, cfg: &Config) -> (BaseArgs, T) {
+        (self.base.with_config_defaults(cfg), self.args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_args() -> BaseArgs {
+        BaseArgs {
+            json: false,
+            org: None,
+            project: None,
+            api_key: None,
+            api_url: None,
+            app_url: None,
+            env_file: None,
+        }
+    }
+
+    fn config(org: Option<&str>, project: Option<&str>) -> Config {
+        Config {
+            org: org.map(String::from),
+            project: project.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_args_filled_from_config() {
+        let args = empty_args();
+        let cfg = config(Some("cfg-org"), Some("cfg-proj"));
+
+        let result = args.with_config_defaults(&cfg);
+
+        assert_eq!(result.org, Some("cfg-org".into()));
+        assert_eq!(result.project, Some("cfg-proj".into()));
+    }
+
+    #[test]
+    fn existing_args_not_overwritten() {
+        let args = BaseArgs {
+            org: Some("cli-org".into()),
+            project: Some("cli-proj".into()),
+            ..empty_args()
+        };
+        let cfg = config(Some("cfg-org"), Some("cfg-proj"));
+
+        let result = args.with_config_defaults(&cfg);
+
+        assert_eq!(result.org, Some("cli-org".into()));
+        assert_eq!(result.project, Some("cli-proj".into()));
+    }
+
+    #[test]
+    fn partial_fill_org_set_project_from_config() {
+        let args = BaseArgs {
+            org: Some("cli-org".into()),
+            project: None,
+            ..empty_args()
+        };
+        let cfg = config(Some("cfg-org"), Some("cfg-proj"));
+
+        let result = args.with_config_defaults(&cfg);
+
+        assert_eq!(result.org, Some("cli-org".into()));
+        assert_eq!(result.project, Some("cfg-proj".into()));
+    }
+
+    #[test]
+    fn empty_config_leaves_args_unchanged() {
+        let args = BaseArgs {
+            org: Some("cli-org".into()),
+            project: None,
+            ..empty_args()
+        };
+        let cfg = config(None, None);
+
+        let result = args.with_config_defaults(&cfg);
+
+        assert_eq!(result.org, Some("cli-org".into()));
+        assert_eq!(result.project, None);
+    }
 }
