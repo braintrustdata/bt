@@ -83,7 +83,8 @@ impl DeleteArgs {
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let ctx = login(&base).await?;
-    let client = ApiClient::new(&ctx)?;
+    let org_name = base.org.unwrap_or_else(|| ctx.login.org_name.clone());
+    let client = ApiClient::new(&ctx)?.with_org_name(org_name.clone());
     let project = match base.project {
         Some(p) => p,
         None if std::io::stdin().is_terminal() => select_project_interactive(&client).await?,
@@ -96,14 +97,14 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
 
     match args.command {
         None | Some(PromptsCommands::List) => {
-            list::run(&client, &project, &ctx.login.org_name, base.json).await
+            list::run(&client, &project, &org_name, base.json).await
         }
         Some(PromptsCommands::View(p)) => {
             view::run(
                 &client,
                 &ctx.app_url,
                 &project,
-                &ctx.login.org_name,
+                &org_name,
                 p.slug(),
                 base.json,
                 p.web,

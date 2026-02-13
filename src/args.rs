@@ -23,6 +23,10 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_APP_URL", global = true)]
     pub app_url: Option<String>,
 
+    /// Override organization name (or via BRAINTRUST_DEFAULT_ORG)
+    #[arg(short = 'o', long, env = "BRAINTRUST_DEFAULT_ORG", global = true)]
+    pub org: Option<String>,
+
     /// Path to a .env file to load before running commands.
     #[arg(long, env = "BRAINTRUST_ENV_FILE")]
     pub env_file: Option<PathBuf>,

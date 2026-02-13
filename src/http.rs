@@ -36,6 +36,11 @@ impl ApiClient {
         &self.org_name
     }
 
+    pub fn with_org_name(mut self, org: String) -> Self {
+        self.org_name = org;
+        self
+    }
+
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.url(path);
         let response = self

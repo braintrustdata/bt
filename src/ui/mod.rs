@@ -1,4 +1,5 @@
 mod pager;
+pub mod prompt_render;
 mod select;
 mod shell;
 mod spinner;
