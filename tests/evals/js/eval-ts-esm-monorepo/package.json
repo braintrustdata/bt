@@ -1,0 +1,12 @@
+{
+  "name": "bt-eval-ts-esm-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "@repo/lib": "workspace:*",
+    "braintrust": "^2.2.0"
+  }
+}
