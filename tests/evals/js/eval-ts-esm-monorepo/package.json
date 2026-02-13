@@ -6,6 +6,7 @@
     "packages/*"
   ],
   "dependencies": {
+    "@repo/lib": "workspace:*",
     "braintrust": "^2.2.0"
   }
 }
