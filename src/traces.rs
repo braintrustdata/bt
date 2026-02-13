@@ -59,6 +59,10 @@ const TRACE_TEXT_SEARCH_FIELDS: [&str; 6] = [
     "span_attributes",
 ];
 
+type SummaryLoadResult = (String, Option<String>, Result<Vec<Map<String, Value>>>);
+type TraceLoadResult = (String, Result<Vec<Map<String, Value>>>);
+type FullSpanLoadResult = (String, Result<Option<Map<String, Value>>>);
+
 #[derive(Debug, Clone, Args)]
 pub struct TracesArgs {
     /// Project ID to query (overrides -p/--project)
@@ -189,12 +193,12 @@ struct TraceViewerApp {
     summary_pending_refresh: Option<(String, Option<String>)>,
     summary_load_started_at: Option<Instant>,
     summary_spinner_tick: usize,
-    summary_load_rx: Option<Receiver<(String, Option<String>, Result<Vec<Map<String, Value>>>)>>,
+    summary_load_rx: Option<Receiver<SummaryLoadResult>>,
     trace_loading_root_span_id: Option<String>,
     trace_pending_root_span_id: Option<String>,
     trace_load_started_at: Option<Instant>,
     trace_spinner_tick: usize,
-    trace_load_rx: Option<Receiver<(String, Result<Vec<Map<String, Value>>>)>>,
+    trace_load_rx: Option<Receiver<TraceLoadResult>>,
     spans: Vec<SpanListEntry>,
     collapsed_span_row_ids: HashSet<String>,
     full_span_cache: HashMap<String, Map<String, Value>>,
@@ -202,7 +206,7 @@ struct TraceViewerApp {
     full_span_pending_row_id: Option<String>,
     full_span_load_started_at: Option<Instant>,
     full_span_spinner_tick: usize,
-    full_span_load_rx: Option<Receiver<(String, Result<Option<Map<String, Value>>>)>>,
+    full_span_load_rx: Option<Receiver<FullSpanLoadResult>>,
     selected_span: usize,
     detail_scroll: u16,
     detail_view: DetailView,
@@ -825,26 +829,12 @@ async fn run_interactive(
     client: ApiClient,
 ) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| {
-        run_interactive_blocking(
-            project,
-            traces,
-            limit,
-            preview_length,
-            print_queries,
-            startup_trace_url,
-            client,
-            handle,
-        )
-    })
+    let app = TraceViewerApp::new(project, traces, limit, preview_length, print_queries);
+    tokio::task::block_in_place(|| run_interactive_blocking(app, startup_trace_url, client, handle))
 }
 
 fn run_interactive_blocking(
-    project: ProjectSelection,
-    traces: Vec<TraceSummaryRow>,
-    limit: usize,
-    preview_length: usize,
-    print_queries: bool,
+    mut app: TraceViewerApp,
     startup_trace_url: Option<ParsedTraceUrl>,
     client: ApiClient,
     handle: tokio::runtime::Handle,
@@ -855,7 +845,6 @@ fn run_interactive_blocking(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = TraceViewerApp::new(project, traces, limit, preview_length, print_queries);
     if let Some(parsed_url) = startup_trace_url {
         request_open_trace_for_parsed_url(&mut app, &client, &handle, parsed_url)?;
     }
@@ -2891,9 +2880,7 @@ fn extract_ttft_seconds(metrics: &Map<String, Value>) -> Option<f64> {
 }
 
 fn format_compact_duration(seconds: f64) -> String {
-    if seconds < 1.0 {
-        format!("{seconds:.2}s")
-    } else if seconds < 10.0 {
+    if seconds < 10.0 {
         format!("{seconds:.2}s")
     } else if seconds < 100.0 {
         format!("{seconds:.1}s")
@@ -3416,6 +3403,12 @@ fn push_text_lines_limited(
     (added, false)
 }
 
+#[derive(Clone, Copy)]
+struct MessagesListText<'a> {
+    empty_state_text: &'a str,
+    controls_text: &'a str,
+}
+
 fn draw_thread_messages_list(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
@@ -3430,8 +3423,11 @@ fn draw_thread_messages_list(
         detail_block,
         app.thread_selected_message,
         &app.thread_expanded,
-        "No messages returned by preprocessor.",
-        "Up/Down: select message  Enter: full view  v: full view  Left: span tree  t: span/thread",
+        MessagesListText {
+            empty_state_text: "No messages returned by preprocessor.",
+            controls_text:
+                "Up/Down: select message  Enter: full view  v: full view  Left: span tree  t: span/thread",
+        },
     );
 }
 
@@ -3449,8 +3445,11 @@ fn draw_span_messages_list(
         detail_block,
         app.span_detail_message_selected,
         &app.span_detail_message_expanded,
-        "No parseable messages found in span input/output.",
-        "Up/Down: select message  Enter: full view  v: full view  Left: span tree  Tab: raw",
+        MessagesListText {
+            empty_state_text: "No parseable messages found in span input/output.",
+            controls_text:
+                "Up/Down: select message  Enter: full view  v: full view  Left: span tree  Tab: raw",
+        },
     );
 }
 
@@ -3542,11 +3541,10 @@ fn draw_messages_list(
     detail_block: Block<'_>,
     selected_message: usize,
     expanded_set: &HashSet<usize>,
-    empty_state_text: &str,
-    controls_text: &str,
+    text: MessagesListText<'_>,
 ) {
     if messages.is_empty() {
-        let detail = Paragraph::new(empty_state_text)
+        let detail = Paragraph::new(text.empty_state_text)
             .block(detail_block)
             .wrap(Wrap { trim: false });
         frame.render_widget(detail, area);
@@ -3709,7 +3707,7 @@ fn draw_messages_list(
         .collect();
 
     let list = List::new(items)
-        .block(detail_block.title_bottom(controls_text))
+        .block(detail_block.title_bottom(text.controls_text))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -4983,8 +4981,10 @@ mod tests {
                     Block::default().title("Messages").borders(Borders::ALL),
                     0,
                     &expanded_set,
-                    "empty",
-                    "controls",
+                    MessagesListText {
+                        empty_state_text: "empty",
+                        controls_text: "controls",
+                    },
                 );
             })
             .expect("draw list");
