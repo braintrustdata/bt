@@ -284,6 +284,9 @@ async fn run_eval_files_once(
         EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
+    let files_json =
+        serde_json::to_string(&files).context("failed to serialize eval file list")?;
+    cmd.env("BT_EVAL_FILES", files_json);
     cmd.envs(build_env(base));
     if no_send_logs {
         cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
@@ -691,52 +694,46 @@ fn build_js_command(
         let resolved_runner = resolve_js_runner_command(explicit, files);
         if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files)
+            build_deno_js_command(resolved_runner.as_os_str(), &runner_script)
         } else {
             let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
             let mut command = Command::new(resolved_runner);
-            command.arg(runner_script).args(files);
+            command.arg(runner_script);
             command
         }
     } else if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            build_deno_js_command(auto_runner.as_os_str(), &runner_script, files)
+            build_deno_js_command(auto_runner.as_os_str(), &runner_script)
         } else {
             let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
             let mut command = Command::new(auto_runner);
-            command.arg(runner_script).args(files);
+            command.arg(runner_script);
             command
         }
     } else {
         let mut command = Command::new("npx");
-        command.arg("--yes").arg("tsx").arg(runner).args(files);
+        command.arg("--yes").arg("tsx").arg(runner);
         command
     };
 
     Ok(command)
 }
 
-fn build_deno_js_command(
-    deno_runner: impl AsRef<OsStr>,
-    runner: &Path,
-    files: &[String],
-) -> Command {
+fn build_deno_js_command(deno_runner: impl AsRef<OsStr>, runner: &Path) -> Command {
     let mut command = Command::new(deno_runner);
-    command.args(deno_js_command_args(runner, files));
+    command.args(deno_js_command_args(runner));
     command
 }
 
-fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
-    let mut args = vec![
+fn deno_js_command_args(runner: &Path) -> Vec<OsString> {
+    vec![
         OsString::from("run"),
         OsString::from("-A"),
         OsString::from("--node-modules-dir=auto"),
         OsString::from("--unstable-detect-cjs"),
         runner.as_os_str().to_os_string(),
-    ];
-    args.extend(files.iter().map(OsString::from));
-    args
+    ]
 }
 
 fn build_python_command(
@@ -1865,8 +1862,7 @@ mod tests {
     #[test]
     fn build_deno_js_command_includes_detect_cjs_flag() {
         let runner = PathBuf::from("/tmp/eval-runner.ts");
-        let files = vec!["tests/basic.eval.ts".to_string()];
-        let args: Vec<String> = deno_js_command_args(&runner, &files)
+        let args: Vec<String> = deno_js_command_args(&runner)
             .into_iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
@@ -1878,7 +1874,6 @@ mod tests {
                 "--node-modules-dir=auto",
                 "--unstable-detect-cjs",
                 "/tmp/eval-runner.ts",
-                "tests/basic.eval.ts",
             ]
         );
     }

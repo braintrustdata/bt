@@ -191,6 +191,23 @@ function readRunnerConfig(): RunnerConfig {
   };
 }
 
+function readEvalFiles(): string[] {
+  const raw = process.env.BT_EVAL_FILES;
+  if (raw) {
+    const parsed = JSON.parse(raw);
+    if (
+      !Array.isArray(parsed) ||
+      !parsed.every((f: unknown) => typeof f === "string")
+    ) {
+      throw new Error("BT_EVAL_FILES must be a JSON array of strings.");
+    }
+    return parsed;
+  }
+  // Fallback: read from argv for backwards compatibility (e.g., running
+  // the eval-runner directly outside of bt).
+  return process.argv.slice(2);
+}
+
 const runtimeRequire = createRequire(
   process.argv[1] ?? path.join(process.cwd(), "package.json"),
 );
@@ -1371,7 +1388,7 @@ async function createEvalRunner(config: RunnerConfig) {
 
 async function main() {
   const config = readRunnerConfig();
-  const files = process.argv.slice(2);
+  const files = readEvalFiles();
   if (files.length === 0) {
     console.error("No eval files provided.");
     process.exit(1);
@@ -1387,6 +1404,7 @@ async function main() {
   const braintrust = await loadBraintrust();
   propagateInheritedBraintrustState(braintrust);
   initRegistry();
+
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 
