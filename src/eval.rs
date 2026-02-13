@@ -57,13 +57,13 @@ struct EvalProcessOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DevEvalRequest {
+struct EvalRequest {
     name: String,
     #[serde(default)]
     parameters: Option<Value>,
     data: Value,
     #[serde(default)]
-    scores: Option<Vec<DevEvalScore>>,
+    scores: Option<Vec<EvalScore>>,
     #[serde(default)]
     experiment_name: Option<String>,
     #[serde(default)]
@@ -75,7 +75,7 @@ struct DevEvalRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DevEvalScore {
+struct EvalScore {
     name: String,
     function_id: Value,
 }
@@ -235,9 +235,10 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     };
 
     if args.dev {
+        let language = detect_eval_language(&args.files, args.language)?;
         let state = DevServerState {
             base: base.clone(),
-            language_override: args.language,
+            language_override: Some(language),
             runner_override: args.runner.clone(),
             files: args.files.clone(),
             no_send_logs: args.no_send_logs,
@@ -676,7 +677,7 @@ async fn authenticate_dev_request(
 async fn resolve_dataset_ref_for_eval_request(
     state: &DevServerState,
     auth: &DevAuthContext,
-    eval_request: &mut DevEvalRequest,
+    eval_request: &mut EvalRequest,
 ) -> std::result::Result<(), HttpResponse> {
     let data_obj = eval_request.data.as_object();
     let Some(data_obj) = data_obj else {
@@ -756,24 +757,22 @@ async fn resolve_dataset_ref_for_eval_request(
     Ok(())
 }
 
-fn make_remote_runner_env(
+fn make_dev_mode_env(
     auth: &DevAuthContext,
     state: &DevServerState,
-    request: Option<&DevEvalRequest>,
-    list_json: bool,
+    request: Option<&EvalRequest>,
+    dev_mode: &str,
 ) -> Result<Vec<(String, String)>> {
     let mut env = vec![
         ("BRAINTRUST_API_KEY".to_string(), auth.token.clone()),
         ("BRAINTRUST_ORG_NAME".to_string(), auth.org_name.clone()),
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
+        ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
-    if list_json {
-        env.push(("BT_EVAL_REMOTE_LIST_JSON".to_string(), "1".to_string()));
-    }
     if let Some(request) = request {
-        let serialized = serde_json::to_string(request)
-            .context("failed to serialize remote eval request payload")?;
-        env.push(("BT_EVAL_REMOTE_REQUEST_JSON".to_string(), serialized));
+        let serialized =
+            serde_json::to_string(request).context("failed to serialize eval request payload")?;
+        env.push(("BT_EVAL_DEV_REQUEST_JSON".to_string(), serialized));
     }
     Ok(env)
 }
@@ -826,7 +825,7 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         Ok(auth) => auth,
         Err(response) => return response,
     };
-    let extra_env = match make_remote_runner_env(&auth, &state, None, true) {
+    let extra_env = match make_dev_mode_env(&auth, &state, None, "list") {
         Ok(extra_env) => extra_env,
         Err(err) => {
             return json_error_response(
@@ -926,7 +925,7 @@ async fn dev_server_eval(
         Err(response) => return response,
     };
 
-    let mut eval_request: DevEvalRequest = match serde_json::from_slice(&body) {
+    let mut eval_request: EvalRequest = match serde_json::from_slice(&body) {
         Ok(eval_request) => eval_request,
         Err(err) => {
             return json_error_response(actix_web::http::StatusCode::BAD_REQUEST, &err.to_string());
@@ -938,7 +937,7 @@ async fn dev_server_eval(
         return response;
     }
     let stream_requested = eval_request.stream.unwrap_or(false);
-    let extra_env = match make_remote_runner_env(&auth, &state, Some(&eval_request), false) {
+    let extra_env = match make_dev_mode_env(&auth, &state, Some(&eval_request), "eval") {
         Ok(extra_env) => extra_env,
         Err(err) => {
             return json_error_response(

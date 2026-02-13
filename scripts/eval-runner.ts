@@ -92,21 +92,12 @@ type SerializedEvalFilter = {
   pattern: string;
 };
 
-type RunnerConfig = {
-  jsonl: boolean;
-  list: boolean;
-  terminateOnFailure: boolean;
-  filters: EvalFilter[];
-  remoteListJson: boolean;
-  remoteRequest: RemoteEvalRequest | null;
-};
-
-type RemoteScoreSpec = {
+type EvalScoreSpec = {
   name: string;
   function_id: Record<string, unknown>;
 };
 
-type RemoteEvalRequest = {
+type EvalRequest = {
   name: string;
   parameters?: Record<string, unknown>;
   parent?: unknown;
@@ -114,10 +105,38 @@ type RemoteEvalRequest = {
   project_id?: string;
   data:
     | { data: unknown[] }
-    | { project_id: string; dataset_name: string; _internal_btql?: unknown }
-    | { project_name: string; dataset_name: string; _internal_btql?: unknown };
-  scores?: RemoteScoreSpec[];
-  stream?: boolean;
+    | { project_name: string; dataset_name: string; _internal_btql?: unknown }
+    | { project_id: string; dataset_name: string; _internal_btql?: unknown };
+  scores?: EvalScoreSpec[];
+};
+
+type RunnerConfig = {
+  jsonl: boolean;
+  list: boolean;
+  terminateOnFailure: boolean;
+  filters: EvalFilter[];
+  devMode: "list" | "eval" | null;
+  devRequestJson: string | null;
+};
+
+type EvalRunner = {
+  Eval: EvalFunction;
+  sse: SseWriter | null;
+  login?: LoginFunction;
+  initDataset?: InitDatasetFunction;
+  invoke?: InvokeFunction;
+  runEval: (
+    projectName: string,
+    evaluator: Record<string, unknown>,
+    options?: EvalOptions,
+  ) => Promise<EvalResult>;
+  runRegisteredEvals: (evaluators: EvaluatorEntry[]) => Promise<boolean>;
+  makeEvalOptions: (
+    evaluatorName: string,
+    options?: EvalOptions,
+  ) => EvalOptions | undefined;
+  finish: (ok: boolean) => void;
+  noSendLogs: boolean;
 };
 
 declare global {
@@ -210,29 +229,14 @@ function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
   }
 }
 
-function parseRemoteEvalRequest(
-  serialized: string | undefined,
-): RemoteEvalRequest | null {
-  if (!serialized) {
+function parseDevMode(value: string | undefined): "list" | "eval" | null {
+  if (!value) {
     return null;
   }
-  try {
-    const parsed = JSON.parse(serialized);
-    if (!isObject(parsed)) {
-      throw new Error("BT_EVAL_REMOTE_REQUEST_JSON must be a JSON object.");
-    }
-    if (typeof parsed.name !== "string" || parsed.name.length === 0) {
-      throw new Error("Remote eval request must include a non-empty name.");
-    }
-    if (!isObject(parsed.data)) {
-      throw new Error("Remote eval request must include a data object.");
-    }
-    return parsed as RemoteEvalRequest;
-  } catch (err) {
-    throw new Error(
-      `Invalid BT_EVAL_REMOTE_REQUEST_JSON value: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  if (value === "list" || value === "eval") {
+    return value;
   }
+  throw new Error(`Invalid BT_EVAL_DEV_MODE value: ${value}`);
 }
 
 function readRunnerConfig(): RunnerConfig {
@@ -241,10 +245,8 @@ function readRunnerConfig(): RunnerConfig {
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
-    remoteListJson: envFlag("BT_EVAL_REMOTE_LIST_JSON"),
-    remoteRequest: parseRemoteEvalRequest(
-      process.env.BT_EVAL_REMOTE_REQUEST_JSON,
-    ),
+    devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
+    devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
   };
 }
 
@@ -939,18 +941,11 @@ function sendEvalProgress(
   });
 }
 
-function serializeError(err: unknown, status?: number) {
+function serializeError(err: unknown) {
   if (err instanceof Error) {
-    return {
-      message: err.message,
-      stack: err.stack,
-      ...(status !== undefined ? { status } : {}),
-    };
+    return { message: err.message, stack: err.stack };
   }
-  return {
-    message: String(err),
-    ...(status !== undefined ? { status } : {}),
-  };
+  return { message: String(err) };
 }
 
 function sendConsole(
@@ -1040,16 +1035,6 @@ function filterEvaluators(
   );
 }
 
-function sendRunnerError(sse: SseWriter | null, err: unknown, status?: number) {
-  if (sse) {
-    sse.send("error", serializeError(err, status));
-  } else if (err instanceof Error) {
-    console.error(err.message);
-  } else {
-    console.error(String(err));
-  }
-}
-
 function extractScoreName(score: unknown, idx: number): string {
   if (typeof score === "function" && typeof score.name === "string") {
     return score.name || `scorer_${idx}`;
@@ -1123,6 +1108,7 @@ async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
           name: extractScoreName(score, idx),
         }))
       : [];
+
     const parameters = await serializeEvaluatorParameters(
       entry.evaluator.parameters,
     );
@@ -1136,7 +1122,31 @@ async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
   return result;
 }
 
-function normalizeRemoteParent(parent: unknown): string | undefined {
+function parseEvalRequest(raw: string | null): EvalRequest {
+  if (!raw) {
+    throw new Error("Missing BT_EVAL_DEV_REQUEST_JSON");
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isObject(parsed)) {
+      throw new Error("BT_EVAL_DEV_REQUEST_JSON must be a JSON object.");
+    }
+    if (typeof parsed.name !== "string" || parsed.name.length === 0) {
+      throw new Error("Eval request must include a non-empty name.");
+    }
+    if (!isObject(parsed.data)) {
+      throw new Error("Eval request must include a data object.");
+    }
+    return parsed as EvalRequest;
+  } catch (err) {
+    if (err instanceof Error) {
+      throw err;
+    }
+    throw new Error(String(err));
+  }
+}
+
+function normalizeParent(parent: unknown): string | undefined {
   if (parent === undefined || parent === null) {
     return undefined;
   }
@@ -1146,15 +1156,26 @@ function normalizeRemoteParent(parent: unknown): string | undefined {
   return JSON.stringify(parent);
 }
 
-function resolveRemoteData(
-  data: RemoteEvalRequest["data"],
+function resolveEvalData(
+  data: EvalRequest["data"],
   initDataset: InitDatasetFunction | undefined,
 ): unknown {
   if ("data" in data) {
     return data.data;
   }
+  if ("project_name" in data && "dataset_name" in data) {
+    if (!initDataset) {
+      throw new Error(
+        "Unable to resolve dataset references: initDataset() is unavailable.",
+      );
+    }
+    return initDataset(data.project_name, {
+      dataset: data.dataset_name,
+      _internal_btql: data._internal_btql,
+    });
+  }
   if ("project_id" in data && "dataset_name" in data) {
-    if (typeof initDataset !== "function") {
+    if (!initDataset) {
       throw new Error(
         "Unable to resolve dataset references: initDataset() is unavailable.",
       );
@@ -1165,25 +1186,13 @@ function resolveRemoteData(
       _internal_btql: data._internal_btql,
     });
   }
-  if ("project_name" in data && "dataset_name" in data) {
-    if (typeof initDataset !== "function") {
-      throw new Error(
-        "Unable to resolve dataset references: initDataset() is unavailable.",
-      );
-    }
-    return initDataset(data.project_name, {
-      dataset: data.dataset_name,
-      _internal_btql: data._internal_btql,
-    });
-  }
-  throw new Error("Invalid remote eval data payload.");
+  throw new Error("Invalid eval data payload.");
 }
 
-function convertRemoteFunctionId(
+function convertFunctionId(
   functionId: Record<string, unknown>,
 ): Record<string, unknown> {
   const converted: Record<string, unknown> = {};
-
   if (functionId.function_id !== undefined) {
     converted.function_id = functionId.function_id;
   }
@@ -1208,18 +1217,17 @@ function convertRemoteFunctionId(
   if (typeof functionId.version === "string") {
     converted.version = functionId.version;
   }
-
   return converted;
 }
 
-function makeRemoteScorer(
+function makeEvalScorer(
   invoke: InvokeFunction,
-  score: RemoteScoreSpec,
+  score: EvalScoreSpec,
   projectId: string | undefined,
 ) {
   const scorer = async (args: Record<string, unknown>) => {
     return await invoke({
-      ...convertRemoteFunctionId(score.function_id),
+      ...convertFunctionId(score.function_id),
       input: {
         input: args.input,
         output: args.output,
@@ -1237,10 +1245,11 @@ function makeRemoteScorer(
     value: score.name,
     writable: false,
   });
+
   return scorer;
 }
 
-function inferRemoteErrorStatus(err: unknown): number {
+function inferEvalErrorStatus(err: unknown): number {
   if (!(err instanceof Error)) {
     return 500;
   }
@@ -1249,7 +1258,7 @@ function inferRemoteErrorStatus(err: unknown): number {
     message.includes("invalid parameter") ||
     message.includes("invalid parameters") ||
     message.includes("must include") ||
-    message.includes("invalid remote eval")
+    message.includes("invalid eval")
   ) {
     return 400;
   }
@@ -1259,97 +1268,96 @@ function inferRemoteErrorStatus(err: unknown): number {
   return 500;
 }
 
-type EvalRunner = {
-  Eval: EvalFunction;
-  initDataset?: InitDatasetFunction;
-  invoke?: InvokeFunction;
-  sse: SseWriter | null;
-  login?: LoginFunction;
-  runEval: (
-    projectName: string,
-    evaluator: Record<string, unknown>,
-    options?: EvalOptions,
-  ) => Promise<EvalResult>;
-  runRegisteredEvals: (evaluators: EvaluatorEntry[]) => Promise<boolean>;
-  makeEvalOptions: (
-    evaluatorName: string,
-    options?: EvalOptions,
-  ) => EvalOptions | undefined;
-  finish: (ok: boolean) => void;
-  noSendLogs: boolean;
-};
+function sendEvalError(sse: SseWriter | null, err: unknown, status?: number) {
+  const payload =
+    err instanceof Error
+      ? {
+          message: err.message,
+          stack: err.stack,
+          ...(status !== undefined ? { status } : {}),
+        }
+      : {
+          message: String(err),
+          ...(status !== undefined ? { status } : {}),
+        };
+  if (sse) {
+    sse.send("error", payload);
+  } else {
+    console.error(payload.message);
+  }
+}
 
-async function runRemoteEvalRequest(
-  runner: EvalRunner,
-  config: RunnerConfig,
-  request: RemoteEvalRequest,
-): Promise<boolean> {
-  const evaluators = filterEvaluators(getEvaluators(), config.filters);
-  const entry = evaluators.find(
+async function runRequestedEval(config: RunnerConfig, runner: EvalRunner) {
+  let request: EvalRequest;
+  try {
+    request = parseEvalRequest(config.devRequestJson);
+  } catch (err) {
+    sendEvalError(runner.sse, err, 400);
+    return;
+  }
+
+  const entry = getEvaluators().find(
     (candidate) => candidate.evaluator.evalName === request.name,
   );
   if (!entry) {
-    sendRunnerError(
+    sendEvalError(
       runner.sse,
       new Error(`Evaluator '${request.name}' not found`),
       404,
     );
-    return false;
-  }
-
-  if (typeof runner.invoke !== "function") {
-    sendRunnerError(
-      runner.sse,
-      new Error("Unable to run remote eval: invoke() is unavailable."),
-      500,
-    );
-    return false;
+    return;
   }
 
   try {
-    const data = resolveRemoteData(request.data, runner.initDataset);
+    const baseScores = Array.isArray(entry.evaluator.scores)
+      ? entry.evaluator.scores
+      : [];
+
+    if ((request.scores?.length ?? 0) > 0 && !runner.invoke) {
+      throw new Error(
+        "Unable to run scorer functions: invoke() is unavailable.",
+      );
+    }
+
     const extraScores = (request.scores ?? []).map((score) =>
-      makeRemoteScorer(
+      makeEvalScorer(
         runner.invoke as InvokeFunction,
         score,
         request.project_id,
       ),
     );
-    const mergedScores = Array.isArray(entry.evaluator.scores)
-      ? entry.evaluator.scores.concat(extraScores)
-      : extraScores;
 
     const evaluator = {
       ...entry.evaluator,
-      data,
-      scores: mergedScores,
+      data: resolveEvalData(request.data, runner.initDataset),
+      scores: baseScores.concat(extraScores),
       ...(request.experiment_name
         ? { experimentName: request.experiment_name }
         : {}),
       ...(request.project_id ? { projectId: request.project_id } : {}),
     };
 
+    const options: EvalOptions = {};
+    if (request.parameters) {
+      options.parameters = request.parameters;
+    }
+    if (request.parent !== undefined) {
+      options.parent = normalizeParent(request.parent);
+    }
+
     const reporters = getReporters();
     const resolvedReporter = resolveReporter(entry.reporter, reporters);
-    const options: EvalOptions = {
-      ...(request.parameters ? { parameters: request.parameters } : {}),
-      ...(request.parent !== undefined
-        ? { parent: normalizeRemoteParent(request.parent) }
-        : {}),
-      ...(resolvedReporter !== undefined ? { reporter: resolvedReporter } : {}),
-    };
-    const result = await runner.runEval(
+    if (resolvedReporter !== undefined) {
+      options.reporter = resolvedReporter;
+    }
+
+    await runner.runEval(
       entry.evaluator.projectName,
       evaluator,
-      options,
+      Object.keys(options).length > 0 ? options : undefined,
     );
-    const failingResults = result.results.filter(
-      (row: { error?: unknown }) => row.error !== undefined,
-    );
-    return failingResults.length === 0 || resolvedReporter !== undefined;
   } catch (err) {
-    sendRunnerError(runner.sse, err, inferRemoteErrorStatus(err));
-    return false;
+    sendEvalError(runner.sse, err, inferEvalErrorStatus(err));
   }
 }
 
@@ -1620,10 +1628,10 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
 
   return {
     Eval,
-    initDataset,
-    invoke,
     sse,
     login,
+    initDataset,
+    invoke,
     runEval,
     runRegisteredEvals,
     makeEvalOptions,
@@ -1692,14 +1700,15 @@ async function main() {
       discoveredEvaluators,
       config.filters,
     );
-    if (config.remoteListJson) {
+
+    if (config.devMode === "list") {
       const definitions = await buildEvaluatorDefinitions(filteredEvaluators);
       console.log(JSON.stringify(definitions));
       return;
     }
 
-    if (config.remoteRequest) {
-      ok = await runRemoteEvalRequest(runner, config, config.remoteRequest);
+    if (config.devMode === "eval") {
+      await runRequestedEval(config, runner);
       return;
     }
 
