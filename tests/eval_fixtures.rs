@@ -18,6 +18,7 @@ struct FixtureConfig {
     env: Option<BTreeMap<String, String>>,
     args: Option<Vec<String>>,
     expect_success: Option<bool>,
+    min_node_version: Option<u32>,
 }
 
 fn test_lock() -> MutexGuard<'static, ()> {
@@ -85,6 +86,14 @@ fn eval_fixtures() {
         if let Some(selected) = selected_runtimes.as_ref() {
             if !selected.contains(runtime) {
                 eprintln!("Skipping {fixture_name} (runtime {runtime} filtered out).");
+                continue;
+            }
+        }
+        if let Some(min_ver) = config.min_node_version {
+            if node_major_version().map_or(true, |v| v < min_ver) {
+                eprintln!(
+                    "Skipping {fixture_name} (requires node >= {min_ver})."
+                );
                 continue;
             }
         }
@@ -646,6 +655,20 @@ fn build_bt_binary(root: &Path) {
     if !status.success() {
         panic!("cargo build --bin bt failed");
     }
+}
+
+fn node_major_version() -> Option<u32> {
+    let output = Command::new("node")
+        .args(["-e", "process.stdout.write(process.versions.node.split('.')[0])"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn command_exists(command: &str) -> bool {

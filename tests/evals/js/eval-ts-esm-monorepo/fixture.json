@@ -1,4 +1,5 @@
 {
   "runner": "./run-node-ts",
-  "files": ["tests/basic.eval.ts"]
+  "files": ["tests/basic.eval.ts"],
+  "min_node_version": 22
 }
