@@ -37,10 +37,17 @@ type EvalFunction = (
 ) => Promise<EvalResult>;
 
 type LoginFunction = (options?: Record<string, unknown>) => Promise<unknown>;
+type InitDatasetFunction = (
+  projectOrOptions: string | Record<string, unknown>,
+  options?: Record<string, unknown>,
+) => unknown;
+type InvokeFunction = (options: Record<string, unknown>) => Promise<unknown>;
 
 type BraintrustModule = {
   Eval?: EvalFunction;
   login?: LoginFunction;
+  initDataset?: InitDatasetFunction;
+  invoke?: InvokeFunction;
   default?: BraintrustModule;
 };
 
@@ -85,11 +92,51 @@ type SerializedEvalFilter = {
   pattern: string;
 };
 
+type EvalScoreSpec = {
+  name: string;
+  function_id: Record<string, unknown>;
+};
+
+type EvalRequest = {
+  name: string;
+  parameters?: Record<string, unknown>;
+  parent?: unknown;
+  experiment_name?: string;
+  project_id?: string;
+  data:
+    | { data: unknown[] }
+    | { project_name: string; dataset_name: string; _internal_btql?: unknown }
+    | { project_id: string; dataset_name: string; _internal_btql?: unknown };
+  scores?: EvalScoreSpec[];
+};
+
 type RunnerConfig = {
   jsonl: boolean;
   list: boolean;
   terminateOnFailure: boolean;
   filters: EvalFilter[];
+  devMode: "list" | "eval" | null;
+  devRequestJson: string | null;
+};
+
+type EvalRunner = {
+  Eval: EvalFunction;
+  sse: SseWriter | null;
+  login?: LoginFunction;
+  initDataset?: InitDatasetFunction;
+  invoke?: InvokeFunction;
+  runEval: (
+    projectName: string,
+    evaluator: Record<string, unknown>,
+    options?: EvalOptions,
+  ) => Promise<EvalResult>;
+  runRegisteredEvals: (evaluators: EvaluatorEntry[]) => Promise<boolean>;
+  makeEvalOptions: (
+    evaluatorName: string,
+    options?: EvalOptions,
+  ) => EvalOptions | undefined;
+  finish: (ok: boolean) => void;
+  noSendLogs: boolean;
 };
 
 declare global {
@@ -182,12 +229,24 @@ function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
   }
 }
 
+function parseDevMode(value: string | undefined): "list" | "eval" | null {
+  if (!value) {
+    return null;
+  }
+  if (value === "list" || value === "eval") {
+    return value;
+  }
+  throw new Error(`Invalid BT_EVAL_DEV_MODE value: ${value}`);
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
+    devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
+    devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
   };
 }
 
@@ -976,6 +1035,332 @@ function filterEvaluators(
   );
 }
 
+function extractScoreName(score: unknown, idx: number): string {
+  if (typeof score === "function" && typeof score.name === "string") {
+    return score.name || `scorer_${idx}`;
+  }
+  return `scorer_${idx}`;
+}
+
+async function serializeEvaluatorParameters(
+  raw: unknown,
+): Promise<unknown | undefined> {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  const resolved = raw instanceof Promise ? await raw : raw;
+  if (!isObject(resolved)) {
+    return undefined;
+  }
+
+  const marker = Reflect.get(resolved, "__braintrust_parameters_marker");
+  if (marker === true) {
+    const schema = Reflect.get(resolved, "schema");
+    const source = {
+      parametersId: Reflect.get(resolved, "id"),
+      slug: Reflect.get(resolved, "slug"),
+      name: Reflect.get(resolved, "name"),
+      projectId: Reflect.get(resolved, "projectId"),
+      version: Reflect.get(resolved, "version"),
+    };
+    return {
+      type: "braintrust.parameters",
+      schema,
+      source,
+    };
+  }
+
+  const schema: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(resolved)) {
+    if (isObject(value) && value.type === "prompt") {
+      schema[name] = {
+        type: "prompt",
+        ...(value.default !== undefined ? { default: value.default } : {}),
+        ...(typeof value.description === "string"
+          ? { description: value.description }
+          : {}),
+      };
+    } else {
+      schema[name] = {
+        type: "data",
+        schema: {},
+      };
+    }
+  }
+
+  return {
+    type: "braintrust.staticParameters",
+    schema,
+    source: null,
+  };
+}
+
+async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
+  const result: Record<
+    string,
+    { parameters?: unknown; scores: Array<{ name: string }> }
+  > = {};
+
+  for (const entry of evaluators) {
+    const scores = Array.isArray(entry.evaluator.scores)
+      ? entry.evaluator.scores.map((score, idx) => ({
+          name: extractScoreName(score, idx),
+        }))
+      : [];
+
+    const parameters = await serializeEvaluatorParameters(
+      entry.evaluator.parameters,
+    );
+
+    result[entry.evaluator.evalName] = {
+      ...(parameters !== undefined ? { parameters } : {}),
+      scores,
+    };
+  }
+
+  return result;
+}
+
+function parseEvalRequest(raw: string | null): EvalRequest {
+  if (!raw) {
+    throw new Error("Missing BT_EVAL_DEV_REQUEST_JSON");
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isObject(parsed)) {
+      throw new Error("BT_EVAL_DEV_REQUEST_JSON must be a JSON object.");
+    }
+    if (typeof parsed.name !== "string" || parsed.name.length === 0) {
+      throw new Error("Eval request must include a non-empty name.");
+    }
+    if (!isObject(parsed.data)) {
+      throw new Error("Eval request must include a data object.");
+    }
+    return parsed as EvalRequest;
+  } catch (err) {
+    if (err instanceof Error) {
+      throw err;
+    }
+    throw new Error(String(err));
+  }
+}
+
+function normalizeParent(parent: unknown): string | undefined {
+  if (parent === undefined || parent === null) {
+    return undefined;
+  }
+  if (typeof parent === "string") {
+    return parent;
+  }
+  return JSON.stringify(parent);
+}
+
+function resolveEvalData(
+  data: EvalRequest["data"],
+  initDataset: InitDatasetFunction | undefined,
+): unknown {
+  if ("data" in data) {
+    return data.data;
+  }
+  if ("project_name" in data && "dataset_name" in data) {
+    if (!initDataset) {
+      throw new Error(
+        "Unable to resolve dataset references: initDataset() is unavailable.",
+      );
+    }
+    return initDataset(data.project_name, {
+      dataset: data.dataset_name,
+      _internal_btql: data._internal_btql,
+    });
+  }
+  if ("project_id" in data && "dataset_name" in data) {
+    if (!initDataset) {
+      throw new Error(
+        "Unable to resolve dataset references: initDataset() is unavailable.",
+      );
+    }
+    return initDataset({
+      projectId: data.project_id,
+      dataset: data.dataset_name,
+      _internal_btql: data._internal_btql,
+    });
+  }
+  throw new Error("Invalid eval data payload.");
+}
+
+function convertFunctionId(
+  functionId: Record<string, unknown>,
+): Record<string, unknown> {
+  const converted: Record<string, unknown> = {};
+  if (functionId.function_id !== undefined) {
+    converted.function_id = functionId.function_id;
+  }
+  if (typeof functionId.project_name === "string") {
+    converted.projectName = functionId.project_name;
+  }
+  if (typeof functionId.slug === "string") {
+    converted.slug = functionId.slug;
+  }
+  if (typeof functionId.global_function === "string") {
+    converted.globalFunction = functionId.global_function;
+  }
+  if (typeof functionId.function_type === "string") {
+    converted.functionType = functionId.function_type;
+  }
+  if (typeof functionId.prompt_session_id === "string") {
+    converted.promptSessionId = functionId.prompt_session_id;
+  }
+  if (typeof functionId.prompt_session_function_id === "string") {
+    converted.promptSessionFunctionId = functionId.prompt_session_function_id;
+  }
+  if (typeof functionId.version === "string") {
+    converted.version = functionId.version;
+  }
+  return converted;
+}
+
+function makeEvalScorer(
+  invoke: InvokeFunction,
+  score: EvalScoreSpec,
+  projectId: string | undefined,
+) {
+  const scorer = async (args: Record<string, unknown>) => {
+    return await invoke({
+      ...convertFunctionId(score.function_id),
+      input: {
+        input: args.input,
+        output: args.output,
+        expected: args.expected,
+        metadata: args.metadata,
+      },
+      stream: false,
+      mode: "auto",
+      strict: true,
+      ...(projectId ? { projectId } : {}),
+    });
+  };
+
+  Object.defineProperty(scorer, "name", {
+    value: score.name,
+    writable: false,
+  });
+
+  return scorer;
+}
+
+function inferEvalErrorStatus(err: unknown): number {
+  if (!(err instanceof Error)) {
+    return 500;
+  }
+  const message = err.message.toLowerCase();
+  if (
+    message.includes("invalid parameter") ||
+    message.includes("invalid parameters") ||
+    message.includes("must include") ||
+    message.includes("invalid eval")
+  ) {
+    return 400;
+  }
+  if (message.includes("not found")) {
+    return 404;
+  }
+  return 500;
+}
+
+function sendEvalError(sse: SseWriter | null, err: unknown, status?: number) {
+  const payload =
+    err instanceof Error
+      ? {
+          message: err.message,
+          stack: err.stack,
+          ...(status !== undefined ? { status } : {}),
+        }
+      : {
+          message: String(err),
+          ...(status !== undefined ? { status } : {}),
+        };
+  if (sse) {
+    sse.send("error", payload);
+  } else {
+    console.error(payload.message);
+  }
+}
+
+async function runRequestedEval(config: RunnerConfig, runner: EvalRunner) {
+  let request: EvalRequest;
+  try {
+    request = parseEvalRequest(config.devRequestJson);
+  } catch (err) {
+    sendEvalError(runner.sse, err, 400);
+    return;
+  }
+
+  const entry = getEvaluators().find(
+    (candidate) => candidate.evaluator.evalName === request.name,
+  );
+  if (!entry) {
+    sendEvalError(
+      runner.sse,
+      new Error(`Evaluator '${request.name}' not found`),
+      404,
+    );
+    return;
+  }
+
+  try {
+    const baseScores = Array.isArray(entry.evaluator.scores)
+      ? entry.evaluator.scores
+      : [];
+
+    if ((request.scores?.length ?? 0) > 0 && !runner.invoke) {
+      throw new Error(
+        "Unable to run scorer functions: invoke() is unavailable.",
+      );
+    }
+
+    const extraScores = (request.scores ?? []).map((score) =>
+      makeEvalScorer(
+        runner.invoke as InvokeFunction,
+        score,
+        request.project_id,
+      ),
+    );
+
+    const evaluator = {
+      ...entry.evaluator,
+      data: resolveEvalData(request.data, runner.initDataset),
+      scores: baseScores.concat(extraScores),
+      ...(request.experiment_name
+        ? { experimentName: request.experiment_name }
+        : {}),
+      ...(request.project_id ? { projectId: request.project_id } : {}),
+    };
+
+    const options: EvalOptions = {};
+    if (request.parameters) {
+      options.parameters = request.parameters;
+    }
+    if (request.parent !== undefined) {
+      options.parent = normalizeParent(request.parent);
+    }
+
+    const reporters = getReporters();
+    const resolvedReporter = resolveReporter(entry.reporter, reporters);
+    if (resolvedReporter !== undefined) {
+      options.reporter = resolvedReporter;
+    }
+
+    await runner.runEval(
+      entry.evaluator.projectName,
+      evaluator,
+      Object.keys(options).length > 0 ? options : undefined,
+    );
+  } catch (err) {
+    sendEvalError(runner.sse, err, inferEvalErrorStatus(err));
+  }
+}
+
 function extractBtEvalMain(mod: unknown): BtEvalMain | null {
   if (!mod || typeof mod !== "object") {
     return null;
@@ -1112,13 +1497,15 @@ function mergeProgress(
   };
 }
 
-async function createEvalRunner(config: RunnerConfig) {
+async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   const braintrust = await loadBraintrust();
   const Eval = braintrust.Eval;
   if (typeof Eval !== "function") {
     throw new Error("Unable to load Eval() from braintrust package.");
   }
   const login = braintrust.login;
+  const initDataset = braintrust.initDataset;
+  const invoke = braintrust.invoke;
 
   const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
@@ -1243,6 +1630,8 @@ async function createEvalRunner(config: RunnerConfig) {
     Eval,
     sse,
     login,
+    initDataset,
+    invoke,
     runEval,
     runRegisteredEvals,
     makeEvalOptions,
@@ -1311,6 +1700,18 @@ async function main() {
       discoveredEvaluators,
       config.filters,
     );
+
+    if (config.devMode === "list") {
+      const definitions = await buildEvaluatorDefinitions(filteredEvaluators);
+      console.log(JSON.stringify(definitions));
+      return;
+    }
+
+    if (config.devMode === "eval") {
+      await runRequestedEval(config, runner);
+      return;
+    }
+
     if (config.list) {
       for (const entry of filteredEvaluators) {
         console.log(entry.evaluator.evalName);
