@@ -44,11 +44,11 @@ pub struct FunctionArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum FunctionCommands {
-    /// List all
+    /// List all in the current project
     List,
-    /// View details
+    /// View details of a specific function
     View(ViewArgs),
-    /// Delete
+    /// Delete a function
     Delete(DeleteArgs),
 }
 
