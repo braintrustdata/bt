@@ -284,8 +284,7 @@ async fn run_eval_files_once(
         EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
-    let files_json =
-        serde_json::to_string(&files).context("failed to serialize eval file list")?;
+    let files_json = serde_json::to_string(&files).context("failed to serialize eval file list")?;
     cmd.env("BT_EVAL_FILES", files_json);
     cmd.envs(build_env(base));
     if no_send_logs {

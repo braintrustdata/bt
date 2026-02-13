@@ -90,10 +90,8 @@ fn eval_fixtures() {
             }
         }
         if let Some(min_ver) = config.min_node_version {
-            if node_major_version().map_or(true, |v| v < min_ver) {
-                eprintln!(
-                    "Skipping {fixture_name} (requires node >= {min_ver})."
-                );
+            if node_major_version().is_none_or(|v| v < min_ver) {
+                eprintln!("Skipping {fixture_name} (requires node >= {min_ver}).");
                 continue;
             }
         }
@@ -659,16 +657,16 @@ fn build_bt_binary(root: &Path) {
 
 fn node_major_version() -> Option<u32> {
     let output = Command::new("node")
-        .args(["-e", "process.stdout.write(process.versions.node.split('.')[0])"])
+        .args([
+            "-e",
+            "process.stdout.write(process.versions.node.split('.')[0])",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn command_exists(command: &str) -> bool {
