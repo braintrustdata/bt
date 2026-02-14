@@ -157,16 +157,17 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## `bt login` profiles
 
-- Save an API key to a named profile (stored in OS keychain):
+- Save an API key to a named profile (stored in secure credential store):
   - `bt login set --api-key <KEY> --profile work`
 - Save interactively (prompts for auth method first, profile name defaults to org name):
   - `bt login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
   - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
   - `bt` confirms the resolved API URL before saving.
-- Login with OAuth (browser-based, stores refresh token in OS keychain):
+- Login with OAuth (browser-based, stores refresh token in secure credential store):
   - `bt login set --oauth --profile work`
   - You can pass `--no-browser` to print the URL without auto-opening.
+  - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
   - If multiple profiles already exist, `bt` asks whether the new/updated profile should become the default instead of changing it automatically.
 - Switch active profile:
   - `bt login use work`
@@ -190,7 +191,7 @@ Auth resolution order for commands is:
 3. profile from config files (`.bt/config.json` over `~/.config/bt/config.json`)
 4. active saved profile
 
-On Linux, keychain storage uses `secret-tool` (libsecret). On macOS, it uses the `security` keychain utility.
+On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
 
 ## Roadmap / TODO
 
