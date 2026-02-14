@@ -23,6 +23,7 @@ const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
 
 pub struct LoginContext {
     pub login: LoginState,
@@ -59,6 +60,8 @@ struct AuthProfile {
     org_name: Option<String>,
     #[serde(default)]
     oauth_client_id: Option<String>,
+    #[serde(default)]
+    oauth_access_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -101,6 +104,8 @@ pub struct LoginArgs {
 enum LoginCommand {
     /// Save credentials to a profile and make it active
     Set(LoginSetArgs),
+    /// Force-refresh OAuth access token for a profile
+    Refresh(LoginRefreshArgs),
     /// List saved login profiles
     List,
     /// Switch active profile
@@ -163,6 +168,13 @@ struct LoginUseArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct LoginRefreshArgs {
+    /// Profile name (defaults to selected profile resolution order)
+    #[arg(long, short = 'n')]
+    profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct LoginDeleteArgs {
     /// Profile name
     profile: String,
@@ -176,6 +188,7 @@ pub async fn run(args: LoginArgs) -> Result<()> {
     match args.command {
         None => run_login_interactive_default().await,
         Some(LoginCommand::Set(set_args)) => run_login_set(set_args).await,
+        Some(LoginCommand::Refresh(refresh_args)) => run_login_refresh(refresh_args).await,
         Some(LoginCommand::List) => run_login_list(),
         Some(LoginCommand::Use(use_args)) => {
             run_login_use(&use_args.profile, use_args.local, use_args.global)
@@ -276,7 +289,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
 }
 
 pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
-    let store = load_auth_store()?;
+    let mut store = load_auth_store()?;
     let mut lookup_base = base.clone();
     if lookup_base.profile.is_none() {
         lookup_base.profile = load_selected_profile_from_config()?;
@@ -303,10 +316,19 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
             profile_name
         )
     })?;
+    let cached_expires_at = profile.oauth_access_expires_at;
     let api_url = auth
         .api_url
         .clone()
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+
+    if let Some(cached_access_token) =
+        load_valid_cached_oauth_access_token(profile_name, cached_expires_at)?
+    {
+        auth.api_key = Some(cached_access_token);
+        return Ok(auth);
+    }
+
     let refresh_token = load_profile_oauth_refresh_token(profile_name)?.ok_or_else(|| {
         anyhow::anyhow!(
             "oauth refresh token missing for profile '{}'; re-run `bt login set --oauth --profile {}`",
@@ -315,11 +337,16 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
         )
     })?;
     let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
-    if let Some(next_refresh_token) = refreshed.refresh_token {
-        if next_refresh_token != refresh_token {
-            save_profile_oauth_refresh_token(profile_name, &next_refresh_token)?;
+    save_profile_oauth_access_token(profile_name, &refreshed.access_token)?;
+    if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
+        if next_refresh_token != &refresh_token {
+            save_profile_oauth_refresh_token(profile_name, next_refresh_token)?;
         }
     }
+    if let Some(profile) = store.profiles.get_mut(profile_name) {
+        profile.oauth_access_expires_at = determine_oauth_access_expiry_epoch(&refreshed);
+    }
+    save_auth_store(&store)?;
     auth.api_key = Some(refreshed.access_token);
     Ok(auth)
 }
@@ -457,6 +484,7 @@ async fn run_login_set(args: LoginSetArgs) -> Result<()> {
 
     save_profile_secret(&profile_name, &api_key)?;
     let _ = delete_profile_oauth_refresh_token(&profile_name);
+    let _ = delete_profile_oauth_access_token(&profile_name);
 
     let stored_api_url = Some(selected_api_url.clone());
     let stored_app_url = args.app_url;
@@ -469,6 +497,7 @@ async fn run_login_set(args: LoginSetArgs) -> Result<()> {
             app_url: stored_app_url,
             org_name: selected_org.as_ref().map(|org| org.name.clone()),
             oauth_client_id: None,
+            oauth_access_expires_at: None,
         },
     );
     let made_default = update_default_profile_after_save(&mut store, &profile_name, interactive)?;
@@ -595,13 +624,15 @@ async fn run_login_oauth(args: LoginSetArgs) -> Result<()> {
         bail!("login cancelled");
     }
 
-    let refresh_token = oauth_tokens.refresh_token.ok_or_else(|| {
+    let refresh_token = oauth_tokens.refresh_token.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "oauth token response did not include a refresh_token; cannot create persistent oauth profile"
         )
     })?;
-    save_profile_oauth_refresh_token(&profile_name, &refresh_token)?;
+    save_profile_oauth_refresh_token(&profile_name, refresh_token)?;
+    save_profile_oauth_access_token(&profile_name, &oauth_tokens.access_token)?;
     let _ = delete_profile_secret(&profile_name);
+    let oauth_access_expires_at = determine_oauth_access_expiry_epoch(&oauth_tokens);
 
     store.profiles.insert(
         profile_name.to_string(),
@@ -611,6 +642,7 @@ async fn run_login_oauth(args: LoginSetArgs) -> Result<()> {
             app_url: Some(app_url.clone()),
             org_name: selected_org.as_ref().map(|org| org.name.clone()),
             oauth_client_id: Some(client_id.clone()),
+            oauth_access_expires_at,
         },
     );
     let made_default = update_default_profile_after_save(&mut store, &profile_name, true)?;
@@ -638,6 +670,122 @@ async fn run_login_oauth(args: LoginSetArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_login_refresh(args: LoginRefreshArgs) -> Result<()> {
+    let mut store = load_auth_store()?;
+    let (profile_name, source) =
+        resolve_selected_profile_name_for_debug(args.profile.as_deref(), &store)?;
+    let profile = store.profiles.get(profile_name.as_str()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "profile '{}' not found; run `bt login list` to see available profiles",
+            profile_name
+        )
+    })?;
+    if profile.auth_kind != AuthKind::Oauth {
+        bail!(
+            "profile '{}' uses api key auth; `bt login refresh` only applies to oauth profiles",
+            profile_name
+        );
+    }
+
+    let api_url = profile
+        .api_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let client_id = profile.oauth_client_id.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "oauth profile '{}' is missing client_id; re-run `bt login set --oauth --profile {}`",
+            profile_name,
+            profile_name
+        )
+    })?;
+    let previous_expires_at = profile.oauth_access_expires_at;
+    let refresh_token = load_profile_oauth_refresh_token(profile_name.as_str())?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "oauth refresh token missing for profile '{}'; re-run `bt login set --oauth --profile {}`",
+            profile_name,
+            profile_name
+        )
+    })?;
+
+    println!(
+        "Refreshing OAuth token for profile '{}' (source: {}, api_url: {})",
+        profile_name, source, api_url
+    );
+    if let Some(expires_at) = previous_expires_at {
+        let now = current_unix_timestamp();
+        let remaining = expires_at.saturating_sub(now);
+        println!(
+            "Cached access token expiry before refresh: {expires_at} (about {remaining}s remaining)"
+        );
+    } else {
+        println!("Cached access token expiry before refresh: unknown");
+    }
+
+    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &client_id).await?;
+    save_profile_oauth_access_token(profile_name.as_str(), &refreshed.access_token)?;
+    let mut refresh_rotated = false;
+    if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
+        if next_refresh_token != &refresh_token {
+            save_profile_oauth_refresh_token(profile_name.as_str(), next_refresh_token)?;
+            refresh_rotated = true;
+        }
+    }
+
+    let new_expires_at = determine_oauth_access_expiry_epoch(&refreshed);
+    if let Some(profile) = store.profiles.get_mut(profile_name.as_str()) {
+        profile.oauth_access_expires_at = new_expires_at;
+    }
+    save_auth_store(&store)?;
+
+    if let Some(expires_at) = new_expires_at {
+        let now = current_unix_timestamp();
+        let remaining = expires_at.saturating_sub(now);
+        println!("New access token expiry: {expires_at} (about {remaining}s remaining)");
+    } else {
+        println!("New access token expiry: unknown");
+    }
+    if refresh_rotated {
+        println!("Refresh token rotation: yes");
+    } else {
+        println!("Refresh token rotation: no");
+    }
+    println!("OAuth refresh complete.");
+
+    Ok(())
+}
+
+fn resolve_selected_profile_name_for_debug(
+    explicit_profile: Option<&str>,
+    store: &AuthStore,
+) -> Result<(String, &'static str)> {
+    if let Some(profile_name) = explicit_profile {
+        let profile_name = profile_name.trim();
+        if profile_name.is_empty() {
+            bail!("profile name cannot be empty");
+        }
+        return Ok((profile_name.to_string(), "--profile"));
+    }
+
+    if let Ok(profile_name) = std::env::var("BRAINTRUST_PROFILE") {
+        let profile_name = profile_name.trim();
+        if !profile_name.is_empty() {
+            return Ok((profile_name.to_string(), "BRAINTRUST_PROFILE"));
+        }
+    }
+
+    if let Some(profile_name) = load_selected_profile_from_config()? {
+        return Ok((profile_name, "config file"));
+    }
+
+    if let Some(profile_name) = store.active_profile.clone() {
+        return Ok((profile_name, "saved active profile"));
+    }
+
+    bail!(
+        "no profile selected; pass --profile <NAME>, set BRAINTRUST_PROFILE, or run `bt login use <NAME>`"
+    )
 }
 
 fn update_default_profile_after_save(
@@ -810,6 +958,9 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
     }
     if let Err(err) = delete_profile_oauth_refresh_token(profile_name) {
         eprintln!("warning: failed to delete oauth refresh token for '{profile_name}': {err}");
+    }
+    if let Err(err) = delete_profile_oauth_access_token(profile_name) {
+        eprintln!("warning: failed to delete oauth access token for '{profile_name}': {err}");
     }
 
     println!("Deleted profile '{profile_name}'");
@@ -1420,6 +1571,10 @@ fn oauth_refresh_secret_key(profile_name: &str) -> String {
     format!("oauth_refresh::{profile_name}")
 }
 
+fn oauth_access_secret_key(profile_name: &str) -> String {
+    format!("oauth_access::{profile_name}")
+}
+
 fn save_profile_oauth_refresh_token(profile_name: &str, refresh_token: &str) -> Result<()> {
     let key = oauth_refresh_secret_key(profile_name);
     save_profile_secret(&key, refresh_token)
@@ -1433,6 +1588,63 @@ fn load_profile_oauth_refresh_token(profile_name: &str) -> Result<Option<String>
 fn delete_profile_oauth_refresh_token(profile_name: &str) -> Result<()> {
     let key = oauth_refresh_secret_key(profile_name);
     delete_profile_secret(&key)
+}
+
+fn save_profile_oauth_access_token(profile_name: &str, access_token: &str) -> Result<()> {
+    let key = oauth_access_secret_key(profile_name);
+    save_profile_secret(&key, access_token)
+}
+
+fn load_profile_oauth_access_token(profile_name: &str) -> Result<Option<String>> {
+    let key = oauth_access_secret_key(profile_name);
+    load_profile_secret(&key)
+}
+
+fn delete_profile_oauth_access_token(profile_name: &str) -> Result<()> {
+    let key = oauth_access_secret_key(profile_name);
+    delete_profile_secret(&key)
+}
+
+fn load_valid_cached_oauth_access_token(
+    profile_name: &str,
+    expires_at: Option<u64>,
+) -> Result<Option<String>> {
+    let Some(expires_at) = expires_at else {
+        return Ok(None);
+    };
+    if !oauth_access_token_is_fresh(expires_at) {
+        return Ok(None);
+    }
+    load_profile_oauth_access_token(profile_name)
+}
+
+fn oauth_access_token_is_fresh(expires_at: u64) -> bool {
+    expires_at > current_unix_timestamp().saturating_add(OAUTH_REFRESH_SAFETY_WINDOW_SECONDS)
+}
+
+fn determine_oauth_access_expiry_epoch(tokens: &OAuthTokenResponse) -> Option<u64> {
+    if let Some(expires_in) = tokens.expires_in {
+        return Some(current_unix_timestamp().saturating_add(expires_in));
+    }
+    decode_jwt_exp_epoch(&tokens.access_token)
+}
+
+fn decode_jwt_exp_epoch(token: &str) -> Option<u64> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    payload.get("exp").and_then(|value| value.as_u64())
+}
+
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn load_selected_profile_from_config() -> Result<Option<String>> {
@@ -1721,6 +1933,7 @@ mod tests {
                 app_url: Some("https://www.example.com".to_string()),
                 org_name: Some("Example Org".to_string()),
                 oauth_client_id: None,
+                oauth_access_expires_at: None,
             },
         );
 
@@ -1747,6 +1960,7 @@ mod tests {
                 app_url: Some("https://www.example.com".to_string()),
                 org_name: Some("Example Org".to_string()),
                 oauth_client_id: None,
+                oauth_access_expires_at: None,
             },
         );
 
@@ -1776,6 +1990,7 @@ mod tests {
                 app_url: None,
                 org_name: None,
                 oauth_client_id: None,
+                oauth_access_expires_at: None,
             },
         );
 
@@ -1802,6 +2017,7 @@ mod tests {
                 app_url: Some("https://www.example.com".to_string()),
                 org_name: Some("Example Org".to_string()),
                 oauth_client_id: Some("bt_cli_work".to_string()),
+                oauth_access_expires_at: None,
             },
         );
 
@@ -1813,5 +2029,14 @@ mod tests {
         assert!(resolved.is_oauth);
         assert_eq!(resolved.api_key, None);
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn refresh_profile_selector_prefers_explicit_profile() {
+        let store = AuthStore::default();
+        let (profile_name, source) =
+            resolve_selected_profile_name_for_debug(Some(" work "), &store).expect("resolve");
+        assert_eq!(profile_name, "work");
+        assert_eq!(source, "--profile");
     }
 }

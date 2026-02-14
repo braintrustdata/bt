@@ -180,6 +180,8 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
   - `bt login logout`
 - Show current auth source/profile:
   - `bt login status`
+- Force-refresh OAuth access token for debugging:
+  - `bt login refresh --profile work`
 
 Auth resolution order for commands is:
 
