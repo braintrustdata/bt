@@ -159,15 +159,19 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 - Save an API key to a named profile (stored in OS keychain):
   - `bt login set --api-key <KEY> --profile work`
-- Save interactively (prompts for API key, profile defaults to `default`):
+- Save interactively (prompts for auth method first, profile name defaults to org name):
   - `bt login`
+  - First prompt chooses: `OAuth (browser)` (default) or `API key`.
   - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
   - `bt` confirms the resolved API URL before saving.
 - Login with OAuth (browser-based, stores refresh token in OS keychain):
-  - `bt login oauth --profile work`
+  - `bt login set --oauth --profile work`
   - You can pass `--no-browser` to print the URL without auto-opening.
+  - If multiple profiles already exist, `bt` asks whether the new/updated profile should become the default instead of changing it automatically.
 - Switch active profile:
   - `bt login use work`
+  - Persist per-project (when `.bt/` exists): `bt login use work --local`
+  - Persist globally: `bt login use work --global`
 - List profiles:
   - `bt login list`
 - Delete a profile:
@@ -181,7 +185,8 @@ Auth resolution order for commands is:
 
 1. `--api-key` or `BRAINTRUST_API_KEY`
 2. `--profile` or `BRAINTRUST_PROFILE`
-3. active saved profile
+3. profile from config files (`.bt/config.json` over `~/.config/bt/config.json`)
+4. active saved profile
 
 On Linux, keychain storage uses `secret-tool` (libsecret). On macOS, it uses the `security` keychain utility.
 
