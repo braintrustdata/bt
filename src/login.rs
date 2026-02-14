@@ -105,7 +105,7 @@ enum LoginCommand {
     /// Save credentials to a profile and make it active
     Set(LoginSetArgs),
     /// Force-refresh OAuth access token for a profile
-    Refresh(LoginRefreshArgs),
+    Refresh,
     /// List saved login profiles
     List,
     /// Switch active profile
@@ -120,26 +120,6 @@ enum LoginCommand {
 
 #[derive(Debug, Clone, Args)]
 struct LoginSetArgs {
-    /// API key to store
-    #[arg(long, value_name = "KEY")]
-    api_key: Option<String>,
-
-    /// Profile name
-    #[arg(long, short = 'n')]
-    profile: Option<String>,
-
-    /// API URL for this profile
-    #[arg(long, value_name = "URL")]
-    api_url: Option<String>,
-
-    /// App URL for this profile
-    #[arg(long, value_name = "URL")]
-    app_url: Option<String>,
-
-    /// Org name for multi-org API keys
-    #[arg(long, value_name = "ORG")]
-    org_name: Option<String>,
-
     /// Use OAuth login instead of API key login
     #[arg(long)]
     oauth: bool,
@@ -168,13 +148,6 @@ struct LoginUseArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct LoginRefreshArgs {
-    /// Profile name (defaults to selected profile resolution order)
-    #[arg(long, short = 'n')]
-    profile: Option<String>,
-}
-
-#[derive(Debug, Clone, Args)]
 struct LoginDeleteArgs {
     /// Profile name
     profile: String,
@@ -184,11 +157,11 @@ struct LoginDeleteArgs {
     force: bool,
 }
 
-pub async fn run(args: LoginArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: LoginArgs) -> Result<()> {
     match args.command {
-        None => run_login_interactive_default().await,
-        Some(LoginCommand::Set(set_args)) => run_login_set(set_args).await,
-        Some(LoginCommand::Refresh(refresh_args)) => run_login_refresh(refresh_args).await,
+        None => run_login_interactive_default(&base).await,
+        Some(LoginCommand::Set(set_args)) => run_login_set(&base, set_args).await,
+        Some(LoginCommand::Refresh) => run_login_refresh(&base).await,
         Some(LoginCommand::List) => run_login_list(),
         Some(LoginCommand::Use(use_args)) => {
             run_login_use(&use_args.profile, use_args.local, use_args.global)
@@ -197,24 +170,19 @@ pub async fn run(args: LoginArgs) -> Result<()> {
             run_login_delete(&delete_args.profile, delete_args.force)
         }
         Some(LoginCommand::Logout) => run_login_logout(),
-        Some(LoginCommand::Status) => run_login_status(),
+        Some(LoginCommand::Status) => run_login_status(&base),
     }
 }
 
 fn default_login_set_args() -> LoginSetArgs {
     LoginSetArgs {
-        api_key: None,
-        profile: None,
-        api_url: None,
-        app_url: None,
-        org_name: None,
         oauth: false,
         client_id: None,
         no_browser: false,
     }
 }
 
-async fn run_login_interactive_default() -> Result<()> {
+async fn run_login_interactive_default(base: &BaseArgs) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         bail!(
             "`bt login` requires an interactive terminal. Use `bt login set --api-key <KEY>` or `bt login set --oauth`"
@@ -225,7 +193,7 @@ async fn run_login_interactive_default() -> Result<()> {
     let selected = ui::fuzzy_select("Select login method", &methods)?;
     let mut args = default_login_set_args();
     args.oauth = selected == 0;
-    run_login_set(args).await
+    run_login_set(base, args).await
 }
 
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
@@ -439,30 +407,29 @@ where
     })
 }
 
-async fn run_login_set(args: LoginSetArgs) -> Result<()> {
+async fn run_login_set(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
     if args.oauth {
-        return run_login_oauth(args).await;
+        return run_login_oauth(base, args).await;
     }
     let interactive = std::io::stdin().is_terminal();
 
-    let api_key = match args.api_key {
+    let api_key = match base.api_key.clone() {
         Some(value) if !value.trim().is_empty() => value,
         Some(_) => bail!("api key cannot be empty"),
         None => prompt_api_key()?,
     };
 
-    let login_app_url = args
+    let login_app_url = base
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), args.org_name.as_deref(), interactive)?;
+    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), interactive)?;
     let selected_api_url =
-        resolve_profile_api_url(args.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
+        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let mut store = load_auth_store()?;
     let profile_name = resolve_profile_name(
-        args.profile.as_deref(),
-        &store,
+        base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
         interactive,
     )?;
@@ -487,7 +454,7 @@ async fn run_login_set(args: LoginSetArgs) -> Result<()> {
     let _ = delete_profile_oauth_access_token(&profile_name);
 
     let stored_api_url = Some(selected_api_url.clone());
-    let stored_app_url = args.app_url;
+    let stored_app_url = base.app_url.clone();
 
     store.profiles.insert(
         profile_name.to_string(),
@@ -526,23 +493,23 @@ async fn run_login_set(args: LoginSetArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_login_oauth(args: LoginSetArgs) -> Result<()> {
+async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         bail!("oauth login requires an interactive terminal");
     }
-    if args.api_key.is_some() {
+    if base.api_key.is_some() {
         bail!("--api-key cannot be used with --oauth");
     }
 
-    let api_url = args
+    let api_url = base
         .api_url
         .clone()
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-    let app_url = args
+    let app_url = base
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let provisional_profile = args
+    let provisional_profile = base
         .profile
         .as_deref()
         .map(str::trim)
@@ -600,13 +567,12 @@ async fn run_login_oauth(args: LoginSetArgs) -> Result<()> {
     }
 
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), args.org_name.as_deref(), true)?;
+    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
     let selected_api_url =
-        resolve_profile_api_url(args.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
+        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let mut store = load_auth_store()?;
     let profile_name = resolve_profile_name(
-        args.profile.as_deref(),
-        &store,
+        base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
         true,
     )?;
@@ -672,10 +638,9 @@ async fn run_login_oauth(args: LoginSetArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_login_refresh(args: LoginRefreshArgs) -> Result<()> {
+async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     let mut store = load_auth_store()?;
-    let (profile_name, source) =
-        resolve_selected_profile_name_for_debug(args.profile.as_deref(), &store)?;
+    let (profile_name, source) = resolve_selected_profile_name_for_debug(base, &store)?;
     let profile = store.profiles.get(profile_name.as_str()).ok_or_else(|| {
         anyhow::anyhow!(
             "profile '{}' not found; run `bt login list` to see available profiles",
@@ -757,21 +722,13 @@ async fn run_login_refresh(args: LoginRefreshArgs) -> Result<()> {
 }
 
 fn resolve_selected_profile_name_for_debug(
-    explicit_profile: Option<&str>,
+    base: &BaseArgs,
     store: &AuthStore,
 ) -> Result<(String, &'static str)> {
-    if let Some(profile_name) = explicit_profile {
-        let profile_name = profile_name.trim();
-        if profile_name.is_empty() {
-            bail!("profile name cannot be empty");
-        }
-        return Ok((profile_name.to_string(), "--profile"));
-    }
-
-    if let Ok(profile_name) = std::env::var("BRAINTRUST_PROFILE") {
+    if let Some(profile_name) = base.profile.as_deref() {
         let profile_name = profile_name.trim();
         if !profile_name.is_empty() {
-            return Ok((profile_name.to_string(), "BRAINTRUST_PROFILE"));
+            return Ok((profile_name.to_string(), "--profile/BRAINTRUST_PROFILE"));
         }
     }
 
@@ -825,7 +782,6 @@ fn update_default_profile_after_save(
 
 fn resolve_profile_name(
     explicit_profile: Option<&str>,
-    store: &AuthStore,
     suggested_org_name: Option<&str>,
     interactive: bool,
 ) -> Result<String> {
@@ -837,7 +793,6 @@ fn resolve_profile_name(
         return Ok(profile.to_string());
     }
 
-    let _ = store;
     let suggested = suggested_org_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
@@ -980,27 +935,40 @@ fn run_login_logout() -> Result<()> {
     Ok(())
 }
 
-fn run_login_status() -> Result<()> {
+fn run_login_status(base: &BaseArgs) -> Result<()> {
     let store = load_auth_store()?;
-    let env_api_key = std::env::var("BRAINTRUST_API_KEY")
-        .ok()
+    let has_override_api_key = base
+        .api_key
+        .as_deref()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
 
-    if env_api_key {
-        println!("Auth source: BRAINTRUST_API_KEY environment variable");
-        if let Ok(profile_name) = std::env::var("BRAINTRUST_PROFILE") {
-            println!("Requested profile via BRAINTRUST_PROFILE={profile_name}");
+    if has_override_api_key {
+        println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
+        if let Some(profile_name) = base.profile.as_deref() {
+            let profile_name = profile_name.trim();
+            if !profile_name.is_empty() {
+                println!("Requested profile via --profile/BRAINTRUST_PROFILE={profile_name}");
+            }
         } else if let Some(active_profile) = store.active_profile.as_deref() {
-            println!("Active saved profile (ignored while env key is set): {active_profile}");
+            println!(
+                "Active saved profile (ignored while API key override is set): {active_profile}"
+            );
         }
         return Ok(());
     }
 
-    let selected_profile = std::env::var("BRAINTRUST_PROFILE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|profile| (profile, "BRAINTRUST_PROFILE".to_string()))
+    let selected_profile = base
+        .profile
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|profile| {
+            (
+                profile.to_string(),
+                "--profile/BRAINTRUST_PROFILE".to_string(),
+            )
+        })
         .or_else(|| {
             load_selected_profile_from_config()
                 .ok()
@@ -2033,10 +2001,12 @@ mod tests {
 
     #[test]
     fn refresh_profile_selector_prefers_explicit_profile() {
+        let mut base = make_base();
+        base.profile = Some(" work ".to_string());
         let store = AuthStore::default();
         let (profile_name, source) =
-            resolve_selected_profile_name_for_debug(Some(" work "), &store).expect("resolve");
+            resolve_selected_profile_name_for_debug(&base, &store).expect("resolve");
         assert_eq!(profile_name, "work");
-        assert_eq!(source, "--profile");
+        assert_eq!(source, "--profile/BRAINTRUST_PROFILE");
     }
 }
