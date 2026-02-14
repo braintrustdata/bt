@@ -2,11 +2,17 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+use actix_web::dev::Service;
+use actix_web::http::header::{
+    HeaderName, HeaderValue, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
+    ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS,
+    ACCESS_CONTROL_MAX_AGE, ORIGIN, VARY,
+};
+use actix_web::{guard, web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use crossterm::queue;
@@ -37,6 +43,14 @@ use crate::args::BaseArgs;
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAIN_ORIGIN: &str = "https://www.braintrust.dev";
+const BRAINTRUSTDATA_ORIGIN: &str = "https://www.braintrustdata.com";
+const CORS_METHODS: &str = "GET, PATCH, POST, PUT, DELETE, OPTIONS";
+const CORS_ALLOWED_HEADERS: &str = "Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token, x-bt-auth-token, x-bt-parent, x-bt-org-name, x-bt-project-id, x-bt-stream-fmt, x-bt-use-cache, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch";
+const CORS_EXPOSED_HEADERS: &str =
+    "x-bt-cursor, x-bt-found-existing-experiment, x-bt-span-id, x-bt-span-export";
+const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
+static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct EvalRunOutput {
     status: ExitStatus,
@@ -398,10 +412,7 @@ async fn spawn_eval_runner(
         language == EvalLanguage::JavaScript && runner_override.is_none();
     let (js_runner, py_runner) = prepare_eval_runners()?;
 
-    let socket_path = build_sse_socket_path()?;
-    let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path).context("failed to bind SSE unix socket")?;
+    let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
@@ -820,6 +831,73 @@ async fn dev_server_index() -> HttpResponse {
     HttpResponse::Ok().body("Hello, world!")
 }
 
+async fn dev_server_options() -> HttpResponse {
+    HttpResponse::Ok().finish()
+}
+
+fn is_allowed_preview_origin(origin: &str) -> bool {
+    origin.starts_with("https://") && origin.ends_with(".preview.braintrust.dev")
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    if origin == MAIN_ORIGIN || origin == BRAINTRUSTDATA_ORIGIN || is_allowed_preview_origin(origin)
+    {
+        return true;
+    }
+    if std::env::var("WHITELISTED_ORIGIN")
+        .ok()
+        .is_some_and(|value| value == origin)
+    {
+        return true;
+    }
+    if std::env::var("BRAINTRUST_APP_URL")
+        .ok()
+        .is_some_and(|value| value == origin)
+    {
+        return true;
+    }
+    false
+}
+
+fn apply_cors_headers(
+    headers: &mut actix_web::http::header::HeaderMap,
+    request_origin: Option<&str>,
+    allow_private_network: bool,
+) {
+    if let Some(origin) = request_origin {
+        if is_allowed_origin(origin) {
+            if let Ok(origin_value) = HeaderValue::from_str(origin) {
+                headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
+                headers.insert(
+                    ACCESS_CONTROL_ALLOW_METHODS,
+                    HeaderValue::from_static(CORS_METHODS),
+                );
+                headers.insert(
+                    ACCESS_CONTROL_ALLOW_HEADERS,
+                    HeaderValue::from_static(CORS_ALLOWED_HEADERS),
+                );
+                headers.insert(
+                    ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static(CORS_EXPOSED_HEADERS),
+                );
+                headers.insert(
+                    ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    HeaderValue::from_static("true"),
+                );
+                headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+                headers.insert(VARY, HeaderValue::from_static("Origin"));
+            }
+        }
+    }
+
+    if allow_private_network {
+        headers.insert(
+            HeaderName::from_static("access-control-allow-private-network"),
+            HeaderValue::from_static("true"),
+        );
+    }
+}
+
 async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> HttpResponse {
     let auth = match authenticate_dev_request(&req, &state).await {
         Ok(auth) => auth,
@@ -1073,10 +1151,42 @@ async fn run_dev_server(state: DevServerState) -> Result<()> {
     let port = state.port;
     HttpServer::new(move || {
         App::new()
+            .wrap_fn(|req, srv| {
+                let request_origin = req
+                    .headers()
+                    .get(ORIGIN)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let allow_private_network = req
+                    .headers()
+                    .contains_key("access-control-request-private-network");
+                let fut = srv.call(req);
+                async move {
+                    let mut res = fut.await?;
+                    apply_cors_headers(
+                        res.headers_mut(),
+                        request_origin.as_deref(),
+                        allow_private_network,
+                    );
+                    Ok::<_, actix_web::Error>(res)
+                }
+            })
             .app_data(web::Data::new(state.clone()))
             .route("/", web::get().to(dev_server_index))
+            .route(
+                "/",
+                web::route().guard(guard::Options()).to(dev_server_options),
+            )
             .route("/list", web::get().to(dev_server_list))
+            .route(
+                "/list",
+                web::route().guard(guard::Options()).to(dev_server_options),
+            )
             .route("/eval", web::post().to(dev_server_eval))
+            .route(
+                "/eval",
+                web::route().guard(guard::Options()).to(dev_server_options),
+            )
     })
     .bind((host.as_str(), port))
     .with_context(|| format!("failed to bind eval dev server on {}:{}", host, port))?
@@ -1608,11 +1718,45 @@ fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
 
 fn build_sse_socket_path() -> Result<PathBuf> {
     let pid = std::process::id();
+    let serial = SSE_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("failed to read system time")?
-        .as_millis();
-    Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}.sock")))
+        .as_nanos();
+    Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}-{serial}.sock")))
+}
+
+fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
+    let mut last_bind_err: Option<std::io::Error> = None;
+    for _ in 0..SSE_SOCKET_BIND_MAX_ATTEMPTS {
+        let socket_path = build_sse_socket_path()?;
+        let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
+        let _ = std::fs::remove_file(&socket_path);
+        match UnixListener::bind(&socket_path) {
+            Ok(listener) => return Ok((listener, socket_path, socket_cleanup_guard)),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::AddrInUse
+                ) =>
+            {
+                last_bind_err = Some(err);
+                continue;
+            }
+            Err(err) => {
+                return Err(err).context("failed to bind SSE unix socket");
+            }
+        }
+    }
+    let err = last_bind_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "failed to allocate a unique SSE socket path",
+        )
+    });
+    Err(err).context(format!(
+        "failed to bind SSE unix socket after {SSE_SOCKET_BIND_MAX_ATTEMPTS} attempts"
+    ))
 }
 
 fn eval_runner_cache_dir() -> PathBuf {
@@ -2573,6 +2717,13 @@ mod tests {
                 "tests/basic.eval.ts",
             ]
         );
+    }
+
+    #[test]
+    fn build_sse_socket_path_is_unique_for_consecutive_calls() {
+        let first = build_sse_socket_path().expect("first socket path");
+        let second = build_sse_socket_path().expect("second socket path");
+        assert_ne!(first, second);
     }
 
     #[test]

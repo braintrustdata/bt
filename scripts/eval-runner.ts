@@ -139,6 +139,16 @@ type EvalRunner = {
   noSendLogs: boolean;
 };
 
+type ParameterContainerSerializer = (parameters: unknown) => unknown;
+type PromptDefinitionSerializer = (prompt: unknown) => unknown;
+type ZodSchemaSerializer = (schema: unknown) => Record<string, unknown>;
+
+type ParameterSerializationHelpers = {
+  sdkSerializeParameters: ParameterContainerSerializer | null;
+  promptDefinitionToPromptData: PromptDefinitionSerializer | null;
+  zodToJsonSchema: ZodSchemaSerializer | null;
+};
+
 declare global {
   // eslint-disable-next-line no-var
   var _evals: GlobalEvals | undefined;
@@ -796,6 +806,163 @@ async function loadBraintrust() {
   return normalizeBraintrustModule(mod);
 }
 
+function extractParameterSerializer(
+  mod: unknown,
+): ParameterContainerSerializer | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "serializeRemoteEvalParametersContainer");
+  if (typeof candidate === "function") {
+    return candidate as ParameterContainerSerializer;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(
+      defaultExport,
+      "serializeRemoteEvalParametersContainer",
+    );
+    if (typeof fromDefault === "function") {
+      return fromDefault as ParameterContainerSerializer;
+    }
+  }
+  return null;
+}
+
+function extractPromptDefinitionSerializer(
+  mod: unknown,
+): PromptDefinitionSerializer | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "promptDefinitionToPromptData");
+  if (typeof candidate === "function") {
+    return candidate as PromptDefinitionSerializer;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(
+      defaultExport,
+      "promptDefinitionToPromptData",
+    );
+    if (typeof fromDefault === "function") {
+      return fromDefault as PromptDefinitionSerializer;
+    }
+  }
+  return null;
+}
+
+function isZodV4Schema(schema: unknown): boolean {
+  return (
+    isObject(schema) &&
+    "_zod" in schema &&
+    Reflect.get(schema, "_zod") !== undefined
+  );
+}
+
+function normalizeJsonSchema(value: unknown): Record<string, unknown> {
+  if (isObject(value)) {
+    return value;
+  }
+  return {};
+}
+
+function loadZodSchemaSerializer(
+  braintrustResolvedPath: string,
+): ZodSchemaSerializer | null {
+  const requireFromBraintrust = createRequire(
+    pathToFileURL(braintrustResolvedPath).href,
+  );
+
+  let zodToJsonSchemaV3: ((schema: unknown) => unknown) | null = null;
+  try {
+    const zodToJsonSchemaModule: unknown =
+      requireFromBraintrust("zod-to-json-schema");
+    if (typeof zodToJsonSchemaModule === "function") {
+      zodToJsonSchemaV3 = zodToJsonSchemaModule as (schema: unknown) => unknown;
+    } else if (isObject(zodToJsonSchemaModule)) {
+      const direct = Reflect.get(zodToJsonSchemaModule, "zodToJsonSchema");
+      if (typeof direct === "function") {
+        zodToJsonSchemaV3 = direct as (schema: unknown) => unknown;
+      } else {
+        const nestedDefault = Reflect.get(zodToJsonSchemaModule, "default");
+        if (typeof nestedDefault === "function") {
+          zodToJsonSchemaV3 = nestedDefault as (schema: unknown) => unknown;
+        } else if (isObject(nestedDefault)) {
+          const fromDefault = Reflect.get(nestedDefault, "zodToJsonSchema");
+          if (typeof fromDefault === "function") {
+            zodToJsonSchemaV3 = fromDefault as (schema: unknown) => unknown;
+          }
+        }
+      }
+    }
+  } catch {
+    zodToJsonSchemaV3 = null;
+  }
+
+  let zodToJsonSchemaV4:
+    | ((schema: unknown, options?: { target?: string }) => unknown)
+    | null = null;
+  try {
+    const zodV4Module: unknown = requireFromBraintrust("zod/v4");
+    if (isObject(zodV4Module)) {
+      const direct = Reflect.get(zodV4Module, "toJSONSchema");
+      if (typeof direct === "function") {
+        zodToJsonSchemaV4 = direct as (
+          schema: unknown,
+          options?: { target?: string },
+        ) => unknown;
+      }
+    }
+  } catch {
+    zodToJsonSchemaV4 = null;
+  }
+
+  if (!zodToJsonSchemaV3 && !zodToJsonSchemaV4) {
+    return null;
+  }
+
+  return (schema: unknown): Record<string, unknown> => {
+    try {
+      if (isZodV4Schema(schema) && zodToJsonSchemaV4) {
+        return normalizeJsonSchema(
+          zodToJsonSchemaV4(schema, { target: "draft-7" }),
+        );
+      }
+      if (zodToJsonSchemaV3) {
+        return normalizeJsonSchema(zodToJsonSchemaV3(schema));
+      }
+      if (zodToJsonSchemaV4) {
+        return normalizeJsonSchema(
+          zodToJsonSchemaV4(schema, { target: "draft-7" }),
+        );
+      }
+      return {};
+    } catch {
+      return {};
+    }
+  };
+}
+
+async function loadParameterSerializationHelpers(): Promise<ParameterSerializationHelpers> {
+  const braintrustPath = resolveBraintrustPath();
+  const zodToJsonSchema = loadZodSchemaSerializer(braintrustPath);
+  try {
+    const mod: unknown = await import(pathToFileURL(braintrustPath).href);
+    return {
+      sdkSerializeParameters: extractParameterSerializer(mod),
+      promptDefinitionToPromptData: extractPromptDefinitionSerializer(mod),
+      zodToJsonSchema,
+    };
+  } catch {
+    return {
+      sdkSerializeParameters: null,
+      promptDefinitionToPromptData: null,
+      zodToJsonSchema,
+    };
+  }
+}
+
 function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
   const getter = (braintrust as Record<string, unknown>)
     ._internalGetGlobalState;
@@ -1044,6 +1211,7 @@ function extractScoreName(score: unknown, idx: number): string {
 
 async function serializeEvaluatorParameters(
   raw: unknown,
+  helpers?: ParameterSerializationHelpers,
 ): Promise<unknown | undefined> {
   if (raw === undefined || raw === null) {
     return undefined;
@@ -1052,6 +1220,14 @@ async function serializeEvaluatorParameters(
   const resolved = raw instanceof Promise ? await raw : raw;
   if (!isObject(resolved)) {
     return undefined;
+  }
+
+  if (helpers?.sdkSerializeParameters) {
+    try {
+      return helpers.sdkSerializeParameters(resolved);
+    } catch {
+      // Fallback to legacy serialization below when SDK internals are unavailable.
+    }
   }
 
   const marker = Reflect.get(resolved, "__braintrust_parameters_marker");
@@ -1074,17 +1250,37 @@ async function serializeEvaluatorParameters(
   const schema: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(resolved)) {
     if (isObject(value) && value.type === "prompt") {
+      let promptDefault = value.default;
+      if (
+        promptDefault !== undefined &&
+        helpers?.promptDefinitionToPromptData
+      ) {
+        try {
+          promptDefault = helpers.promptDefinitionToPromptData(promptDefault);
+        } catch {
+          // Keep raw prompt default when conversion utility is unavailable.
+        }
+      }
       schema[name] = {
         type: "prompt",
-        ...(value.default !== undefined ? { default: value.default } : {}),
+        ...(promptDefault !== undefined ? { default: promptDefault } : {}),
         ...(typeof value.description === "string"
           ? { description: value.description }
           : {}),
       };
     } else {
+      const jsonSchema = helpers?.zodToJsonSchema
+        ? helpers.zodToJsonSchema(value)
+        : {};
       schema[name] = {
         type: "data",
-        schema: {},
+        schema: jsonSchema,
+        ...(Object.prototype.hasOwnProperty.call(jsonSchema, "default")
+          ? { default: Reflect.get(jsonSchema, "default") }
+          : {}),
+        ...(typeof Reflect.get(jsonSchema, "description") === "string"
+          ? { description: Reflect.get(jsonSchema, "description") as string }
+          : {}),
       };
     }
   }
@@ -1097,6 +1293,7 @@ async function serializeEvaluatorParameters(
 }
 
 async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
+  const serializationHelpers = await loadParameterSerializationHelpers();
   const result: Record<
     string,
     { parameters?: unknown; scores: Array<{ name: string }> }
@@ -1111,6 +1308,7 @@ async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
 
     const parameters = await serializeEvaluatorParameters(
       entry.evaluator.parameters,
+      serializationHelpers,
     );
 
     result[entry.evaluator.evalName] = {
