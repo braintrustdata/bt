@@ -161,7 +161,11 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
   - `bt login set --api-key <KEY> --profile work`
 - Save interactively (prompts for API key, profile defaults to `default`):
   - `bt login`
-  - If your API key can access multiple orgs, `bt` prompts you to choose one and confirms the resolved API URL before saving.
+  - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
+  - `bt` confirms the resolved API URL before saving.
+- Login with OAuth (browser-based, stores refresh token in OS keychain):
+  - `bt login oauth --profile work`
+  - You can pass `--no-browser` to print the URL without auto-opening.
 - Switch active profile:
   - `bt login use work`
 - List profiles:

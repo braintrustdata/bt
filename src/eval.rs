@@ -285,7 +285,7 @@ async fn run_eval_files_once(
         EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
-    cmd.envs(build_env(base)?);
+    cmd.envs(build_env(base).await?);
     if no_send_logs {
         cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
         cmd.env("BT_EVAL_LOCAL", "1");
@@ -631,8 +631,8 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
-    let mut envs = resolved_auth_env(base)?;
+async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
+    let mut envs = resolved_auth_env(base).await?;
     if let Some(project) = base.project.as_ref() {
         envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
@@ -1224,7 +1224,7 @@ impl EvalUi {
                     }
                 }
                 if show_hint {
-                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt login set`, or use --no-send-logs for local evals.";
+                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt login set`/`bt login oauth`, or use --no-send-logs for local evals.";
                     let _ = self.progress.println(hint.dark_grey().to_string());
                 }
             }
