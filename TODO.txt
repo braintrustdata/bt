@@ -1,3 +1,0 @@
-- [ ] The interface for pull and push seems discontinguous with the --project selection thing. I feel like project selection should take https://github.com/braintrustdata/bt/pull/16 into account, and then let me cleanly specify experiments and datasets by name, etc.
-- [x] Would it be more efficient to store the generated output in multiple files?
-- [x] Can we use .jsonl instead of .ndjson as the extension

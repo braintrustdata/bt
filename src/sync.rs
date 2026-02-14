@@ -11,7 +11,7 @@ use backoff::future::retry_notify;
 use backoff::{Error as BackoffError, ExponentialBackoffBuilder};
 use braintrust_sdk_rust::Logs3BatchUploader;
 use clap::{Args, Subcommand, ValueEnum};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -440,7 +440,14 @@ async fn run_pull(
     };
 
     let spec_hash = spec_hash(&spec)?;
-    let spec_dir = spec_dir(&args.root, &object, DirectionArg::Pull, &scope, &spec_hash);
+    let spec_dir = resolve_spec_dir(
+        &args.root,
+        &object,
+        DirectionArg::Pull,
+        &scope,
+        &spec_hash,
+        !fresh,
+    )?;
     fs::create_dir_all(&spec_dir)
         .with_context(|| format!("failed to create {}", spec_dir.display()))?;
 
@@ -682,7 +689,9 @@ async fn pull_spans_mode(
     let baseline_roots_done = state.root_ids.len();
     let baseline_items_done = state.items_done;
     let baseline_bytes_written = state.bytes_written;
-    let pb = bounded_bar(limit as u64, "Fetching spans");
+    let ui = bounded_bar_with_status_line(limit as u64, "Fetching spans");
+    let pb = ui.main.clone();
+    let status_line = ui.status_line.clone();
     pb.set_position(state.items_done as u64);
     pb.set_message(pull_spans_progress_message_with_baseline(
         state,
@@ -690,11 +699,11 @@ async fn pull_spans_mode(
         baseline_roots_done,
         baseline_items_done,
         baseline_bytes_written,
+    ));
+    status_line.set_message(pull_status_line(
+        show_checkpoint_hint,
         btql_retry_tracker.summary_line().as_deref(),
     ));
-    if show_checkpoint_hint {
-        show_checkpoint_hint_line(&pb);
-    }
     let mut seen_roots: HashSet<String> = state.root_ids.iter().cloned().collect();
 
     let mut writer = open_jsonl_part_writer(output_dir, state.items_done > 0)?;
@@ -739,6 +748,9 @@ async fn pull_spans_mode(
             baseline_roots_done,
             baseline_items_done,
             baseline_bytes_written,
+        ));
+        status_line.set_message(pull_status_line(
+            show_checkpoint_hint,
             btql_retry_tracker.summary_line().as_deref(),
         ));
 
@@ -747,6 +759,7 @@ async fn pull_spans_mode(
         }
     }
 
+    status_line.finish_and_clear();
     pb.finish_and_clear();
     Ok(())
 }
@@ -781,7 +794,9 @@ async fn pull_traces_mode(
     let fetch_baseline_trace_progress = trace_progress_roots.lock().await.len();
     let fetch_baseline_items_done = state.items_done;
     let fetch_baseline_bytes_written = state.bytes_written;
-    let trace_fetch_bar = bounded_bar(state.limit as u64, "Syncing traces");
+    let ui = bounded_bar_with_status_line(state.limit as u64, "Syncing traces");
+    let trace_fetch_bar = ui.main.clone();
+    let status_line = ui.status_line.clone();
     trace_fetch_bar.set_position(fetch_baseline_trace_progress.min(state.limit) as u64);
     trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
         state,
@@ -790,11 +805,11 @@ async fn pull_traces_mode(
         fetch_baseline_trace_progress,
         fetch_baseline_items_done,
         fetch_baseline_bytes_written,
+    ));
+    status_line.set_message(pull_status_line(
+        show_checkpoint_hint,
         btql_retry_tracker.summary_line().as_deref(),
     ));
-    if show_checkpoint_hint {
-        show_checkpoint_hint_line(&trace_fetch_bar);
-    }
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(state.clone()));
     let shared_writer = Arc::new(tokio::sync::Mutex::new(open_jsonl_part_writer(
@@ -819,6 +834,7 @@ async fn pull_traces_mode(
         let active_chunks = Arc::clone(&active_chunks);
         let discovery_done = Arc::clone(&discovery_done);
         let progress = trace_fetch_bar.clone();
+        let status_line = status_line.clone();
         let page_size = spec.page_size;
         let btql_retry_tracker = Arc::clone(btql_retry_tracker);
         let trace_progress_roots = Arc::clone(&trace_progress_roots);
@@ -846,6 +862,8 @@ async fn pull_traces_mode(
                     &shared_state,
                     &shared_writer,
                     &progress,
+                    &status_line,
+                    show_checkpoint_hint,
                     fetch_phase_started_at,
                     fetch_baseline_trace_progress,
                     fetch_baseline_items_done,
@@ -912,6 +930,9 @@ async fn pull_traces_mode(
                     fetch_baseline_trace_progress,
                     fetch_baseline_items_done,
                     fetch_baseline_bytes_written,
+                ));
+                status_line.set_message(pull_status_line(
+                    show_checkpoint_hint,
                     btql_retry_tracker.summary_line().as_deref(),
                 ));
             }
@@ -940,6 +961,9 @@ async fn pull_traces_mode(
                 fetch_baseline_trace_progress,
                 fetch_baseline_items_done,
                 fetch_baseline_bytes_written,
+            ));
+            status_line.set_message(pull_status_line(
+                show_checkpoint_hint,
                 btql_retry_tracker.summary_line().as_deref(),
             ));
             if new_chunks > 0 {
@@ -964,6 +988,7 @@ async fn pull_traces_mode(
     }
     *state = shared_state.lock().await.clone();
 
+    status_line.finish_and_clear();
     trace_fetch_bar.finish_and_clear();
     Ok(())
 }
@@ -1111,6 +1136,8 @@ async fn process_trace_chunk(
     shared_state: &Arc<tokio::sync::Mutex<PullState>>,
     shared_writer: &Arc<tokio::sync::Mutex<JsonlPartWriter>>,
     progress: &ProgressBar,
+    status_line: &ProgressBar,
+    show_checkpoint_hint: bool,
     fetch_phase_started_at: u64,
     fetch_baseline_trace_progress: usize,
     fetch_baseline_items_done: usize,
@@ -1208,6 +1235,9 @@ async fn process_trace_chunk(
                     fetch_baseline_trace_progress,
                     fetch_baseline_items_done,
                     fetch_baseline_bytes_written,
+                ));
+                status_line.set_message(pull_status_line(
+                    show_checkpoint_hint,
                     btql_retry_tracker.summary_line().as_deref(),
                 ));
             }
@@ -1236,6 +1266,9 @@ async fn process_trace_chunk(
                 fetch_baseline_trace_progress,
                 fetch_baseline_items_done,
                 fetch_baseline_bytes_written,
+            ));
+            status_line.set_message(pull_status_line(
+                show_checkpoint_hint,
                 btql_retry_tracker.summary_line().as_deref(),
             ));
         }
@@ -1269,7 +1302,14 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         page_size: args.page_size,
     };
     let spec_hash = spec_hash(&spec)?;
-    let spec_dir = spec_dir(&args.root, &object, DirectionArg::Push, &scope, &spec_hash);
+    let spec_dir = resolve_spec_dir(
+        &args.root,
+        &object,
+        DirectionArg::Push,
+        &scope,
+        &spec_hash,
+        !args.fresh,
+    )?;
     fs::create_dir_all(&spec_dir)
         .with_context(|| format!("failed to create {}", spec_dir.display()))?;
 
@@ -1339,7 +1379,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
     } else {
         spinner_bar("Uploading rows")
     };
-    pb.set_prefix("Preparing rows".to_string());
+    pb.set_prefix("Uploading rows".to_string());
     if let Some(total) = upload_total {
         pb.set_position(state.items_done.min(total) as u64);
     }
@@ -1453,7 +1493,6 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
                     distinct_roots_done: batch_distinct_roots_done,
                 };
                 next_batch_index += 1;
-                pb.set_prefix("Uploading rows".to_string());
                 spawn_push_upload_task(
                     &mut join_set,
                     uploader_template.clone(),
@@ -1464,7 +1503,6 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
                 batch_distinct_roots_done = state.distinct_roots_done;
 
                 while join_set.len() >= worker_count {
-                    pb.set_prefix("Waiting uploads".to_string());
                     let result = join_set
                         .join_next()
                         .await
@@ -1484,7 +1522,6 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
                         push_baseline_bytes_sent,
                     )?;
                 }
-                pb.set_prefix("Preparing rows".to_string());
             }
         }
     }
@@ -1497,7 +1534,6 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
             distinct_roots_done: batch_distinct_roots_done,
         };
         next_batch_index += 1;
-        pb.set_prefix("Uploading rows".to_string());
         spawn_push_upload_task(
             &mut join_set,
             uploader_template.clone(),
@@ -1506,7 +1542,6 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         );
     }
 
-    pb.set_prefix("Finalizing uploads".to_string());
     while let Some(joined) = join_set.join_next().await {
         let result = joined.context("push upload worker join failed")??;
         pending_results.insert(result.batch_index, result);
@@ -1641,7 +1676,14 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
         page_size: args.page_size,
     };
     let spec_hash = spec_hash(&spec)?;
-    let spec_dir = spec_dir(&args.root, &object, args.direction, &scope, &spec_hash);
+    let spec_dir = resolve_spec_dir(
+        &args.root,
+        &object,
+        args.direction,
+        &scope,
+        &spec_hash,
+        true,
+    )?;
     let state_path = spec_dir.join("state.json");
     let manifest_path = spec_dir.join("manifest.json");
     let spec_path = spec_dir.join("spec.json");
@@ -2163,7 +2205,16 @@ fn sanitize_segment(value: &str) -> String {
     }
 }
 
-fn spec_dir(
+fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
+    let object_key = format!(
+        "{}_{}",
+        sanitize_segment(&object.object_type),
+        sanitize_segment(&object.object_name)
+    );
+    root.join(object_key).join(&hash[..12])
+}
+
+fn legacy_spec_dir(
     root: &Path,
     object: &ObjectRef,
     direction: DirectionArg,
@@ -2175,6 +2226,38 @@ fn spec_dir(
         .join(direction.as_str())
         .join(scope.as_str())
         .join(format!("spec_{}", &hash[..12]))
+}
+
+fn resolve_spec_dir(
+    root: &Path,
+    object: &ObjectRef,
+    direction: DirectionArg,
+    scope: &ScopeArg,
+    hash: &str,
+    reuse_existing: bool,
+) -> Result<PathBuf> {
+    let new_dir = spec_dir(root, object, hash);
+    if !reuse_existing {
+        return Ok(new_dir);
+    }
+
+    if new_dir.exists() {
+        return Ok(new_dir);
+    }
+
+    let old_dir = legacy_spec_dir(root, object, direction, scope, hash);
+    if !old_dir.exists() {
+        return Ok(new_dir);
+    }
+
+    if let Some(parent) = new_dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    match fs::rename(&old_dir, &new_dir) {
+        Ok(()) => Ok(new_dir),
+        Err(_) => Ok(old_dir),
+    }
 }
 
 fn spec_hash(spec: &SyncSpec) -> Result<String> {
@@ -2202,7 +2285,6 @@ fn pull_spans_progress_message_with_baseline(
     baseline_roots_done: usize,
     baseline_items_done: usize,
     baseline_bytes_written: u64,
-    retry_summary: Option<&str>,
 ) -> String {
     let elapsed = elapsed_seconds(phase_started_at);
     let traces_done = state.root_ids.len().saturating_sub(baseline_roots_done);
@@ -2216,7 +2298,7 @@ fn pull_spans_progress_message_with_baseline(
         state.limit,
         spans_per_sec,
     );
-    let mut message = format!(
+    format!(
         "{} traces ({:.2}/s) | {} spans ({:.2}/s) | {} ({}/s) | ETA {}",
         format_usize_commas(state.root_ids.len()),
         traces_per_sec,
@@ -2225,12 +2307,7 @@ fn pull_spans_progress_message_with_baseline(
         format_bytes(state.bytes_written as f64),
         format_bytes(bytes_per_sec),
         eta
-    );
-    if let Some(summary) = retry_summary.filter(|s| !s.is_empty()) {
-        message.push_str(" | ");
-        message.push_str(summary);
-    }
-    message
+    )
 }
 
 fn pull_trace_progress_message_with_baseline(
@@ -2240,7 +2317,6 @@ fn pull_trace_progress_message_with_baseline(
     baseline_trace_progress: usize,
     baseline_items_done: usize,
     baseline_bytes_written: u64,
-    retry_summary: Option<&str>,
 ) -> String {
     let elapsed = elapsed_seconds(phase_started_at);
     let traces_done = trace_progress_done.saturating_sub(baseline_trace_progress);
@@ -2254,7 +2330,7 @@ fn pull_trace_progress_message_with_baseline(
     let spans_per_sec = spans_done as f64 / elapsed;
     let bytes_per_sec = bytes_done as f64 / elapsed;
     let eta = format_eta(traces_done, total_traces, traces_per_sec);
-    let mut message = format!(
+    format!(
         "{} traces ({:.2}/s) | {} spans ({:.2}/s) | {} ({}/s) | ETA {}",
         format_usize_commas(trace_progress_done),
         traces_per_sec,
@@ -2263,12 +2339,7 @@ fn pull_trace_progress_message_with_baseline(
         format_bytes(state.bytes_written as f64),
         format_bytes(bytes_per_sec),
         eta
-    );
-    if let Some(summary) = retry_summary.filter(|s| !s.is_empty()) {
-        message.push_str(" | ");
-        message.push_str(summary);
-    }
-    message
+    )
 }
 
 fn push_progress_message_with_baseline(
@@ -2613,61 +2684,93 @@ fn update_manifest_from_push_state(
 }
 
 fn resolve_default_push_input(root: &Path, object: &ObjectRef) -> Result<PathBuf> {
-    let base = root
-        .join(sanitize_segment(&object.object_type))
-        .join(sanitize_segment(&object.object_name))
-        .join("pull");
-    if !base.exists() {
-        bail!(
-            "no pull data found under {}. run `bt sync pull {}:{} ...` first or pass --in",
-            base.display(),
-            object.object_type,
-            object.object_name
-        );
-    }
-
     let mut best: Option<(u64, PathBuf)> = None;
-    for scope_dir in
-        fs::read_dir(&base).with_context(|| format!("failed to read {}", base.display()))?
-    {
-        let scope_dir = scope_dir?;
-        if !scope_dir.file_type()?.is_dir() {
+    for spec_dir in collect_object_spec_dirs(root, object)? {
+        let manifest_path = spec_dir.join("manifest.json");
+        if !manifest_path.exists() {
             continue;
         }
-        for spec_dir in fs::read_dir(scope_dir.path())? {
-            let spec_dir = spec_dir?;
-            if !spec_dir.file_type()?.is_dir() {
-                continue;
-            }
-            let manifest_path = spec_dir.path().join("manifest.json");
-            if !manifest_path.exists() {
-                continue;
-            }
-            let manifest = read_json_file::<SyncManifest>(&manifest_path)?;
-            if manifest.status != RunStatus::Completed {
-                continue;
-            }
-            let output_path = match manifest.output_path {
-                Some(path) => PathBuf::from(path),
-                None => continue,
-            };
-            let updated_at = manifest.updated_at;
-            if best
-                .as_ref()
-                .map(|(best_time, _)| updated_at > *best_time)
-                .unwrap_or(true)
-            {
-                best = Some((updated_at, output_path));
-            }
+        let manifest = read_json_file::<SyncManifest>(&manifest_path)?;
+        if manifest.status != RunStatus::Completed || manifest.spec.direction != "pull" {
+            continue;
+        }
+        let output_path = manifest
+            .output_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+            .or_else(|| resolve_pull_spec_output_path(&spec_dir).ok().flatten());
+        let Some(output_path) = output_path else {
+            continue;
+        };
+        let updated_at = manifest.updated_at;
+        if best
+            .as_ref()
+            .map(|(best_time, _)| updated_at > *best_time)
+            .unwrap_or(true)
+        {
+            best = Some((updated_at, output_path));
         }
     }
 
     best.map(|(_, path)| path).ok_or_else(|| {
         anyhow!(
-            "no completed pull output found for object {}",
+            "no completed pull output found for object {}. run `bt sync pull {}:{} ...` first or pass --in",
+            object.object_name,
+            object.object_type,
             object.object_name
         )
     })
+}
+
+fn collect_object_spec_dirs(root: &Path, object: &ObjectRef) -> Result<Vec<PathBuf>> {
+    let mut spec_dirs = Vec::new();
+
+    let new_base = root.join(format!(
+        "{}_{}",
+        sanitize_segment(&object.object_type),
+        sanitize_segment(&object.object_name)
+    ));
+    if new_base.is_dir() {
+        for entry in fs::read_dir(&new_base)
+            .with_context(|| format!("failed to read {}", new_base.display()))?
+        {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                spec_dirs.push(entry.path());
+            }
+        }
+    }
+
+    let legacy_base = root
+        .join(sanitize_segment(&object.object_type))
+        .join(sanitize_segment(&object.object_name));
+    if legacy_base.is_dir() {
+        for direction_dir in fs::read_dir(&legacy_base)
+            .with_context(|| format!("failed to read {}", legacy_base.display()))?
+        {
+            let direction_dir = direction_dir?;
+            if !direction_dir.file_type()?.is_dir() {
+                continue;
+            }
+            for scope_dir in fs::read_dir(direction_dir.path())? {
+                let scope_dir = scope_dir?;
+                if !scope_dir.file_type()?.is_dir() {
+                    continue;
+                }
+                for spec_dir in fs::read_dir(scope_dir.path())? {
+                    let spec_dir = spec_dir?;
+                    if spec_dir.file_type()?.is_dir() {
+                        spec_dirs.push(spec_dir.path());
+                    }
+                }
+            }
+        }
+    }
+
+    spec_dirs.sort();
+    spec_dirs.dedup();
+    Ok(spec_dirs)
 }
 
 fn resolve_push_input_files(input_path: &Path) -> Result<Vec<PathBuf>> {
@@ -2681,10 +2784,30 @@ fn resolve_push_input_files(input_path: &Path) -> Result<Vec<PathBuf>> {
         );
     }
 
+    let mut files = collect_json_input_files(input_path)?;
+    if files.is_empty() {
+        if let Some(resolved_path) = resolve_pull_spec_output_path(input_path)? {
+            files = if resolved_path.is_file() {
+                vec![resolved_path]
+            } else if resolved_path.is_dir() {
+                collect_json_input_files(&resolved_path)?
+            } else {
+                Vec::new()
+            };
+        }
+    }
+    if files.is_empty() {
+        bail!(
+            "no .jsonl or .ndjson files found in input directory {}",
+            input_path.display()
+        );
+    }
+    Ok(files)
+}
+
+fn collect_json_input_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(input_path)
-        .with_context(|| format!("failed to read {}", input_path.display()))?
-    {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
@@ -2698,13 +2821,39 @@ fn resolve_push_input_files(input_path: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     files.sort();
-    if files.is_empty() {
-        bail!(
-            "no .jsonl or .ndjson files found in input directory {}",
-            input_path.display()
-        );
-    }
     Ok(files)
+}
+
+fn resolve_pull_spec_output_path(spec_dir: &Path) -> Result<Option<PathBuf>> {
+    let manifest_path = spec_dir.join("manifest.json");
+    if manifest_path.exists() {
+        let manifest = read_json_file::<SyncManifest>(&manifest_path)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        if let Some(path) = manifest.output_path {
+            let candidate = PathBuf::from(path);
+            if candidate.exists() {
+                return Ok(Some(candidate));
+            }
+            let joined = spec_dir.join(candidate);
+            if joined.exists() {
+                return Ok(Some(joined));
+            }
+        }
+    }
+
+    let data_dir = spec_dir.join("data");
+    if data_dir.is_dir() {
+        return Ok(Some(data_dir));
+    }
+    let legacy_jsonl = spec_dir.join("data.jsonl");
+    if legacy_jsonl.is_file() {
+        return Ok(Some(legacy_jsonl));
+    }
+    let legacy_ndjson = spec_dir.join("data.ndjson");
+    if legacy_ndjson.is_file() {
+        return Ok(Some(legacy_ndjson));
+    }
+    Ok(None)
 }
 
 fn upload_total_for_progress(
@@ -2830,6 +2979,60 @@ fn sql_quote(value: &str) -> String {
 fn show_checkpoint_hint_line(pb: &ProgressBar) {
     if std::io::stderr().is_terminal() {
         pb.println("  Ctrl+C safely checkpoints; rerun same command to resume (--fresh restarts).");
+    }
+}
+
+struct PullProgressUi {
+    _multi: Option<Arc<MultiProgress>>,
+    main: ProgressBar,
+    status_line: ProgressBar,
+}
+
+fn bounded_bar_with_status_line(total: u64, message: &str) -> PullProgressUi {
+    if !std::io::stderr().is_terminal() {
+        return PullProgressUi {
+            _multi: None,
+            main: ProgressBar::hidden(),
+            status_line: ProgressBar::hidden(),
+        };
+    }
+
+    let multi = Arc::new(MultiProgress::new());
+    let main = multi.add(ProgressBar::new(total));
+    main.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} {prefix} [{bar:40.cyan/blue}] {pos}/{len} ({percent:>3}%) | {msg}",
+        )
+        .unwrap(),
+    );
+    main.set_prefix(message.to_string());
+    main.enable_steady_tick(Duration::from_millis(80));
+
+    let status_line = multi.add(ProgressBar::new_spinner());
+    status_line.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+    status_line.enable_steady_tick(Duration::from_millis(300));
+
+    PullProgressUi {
+        _multi: Some(multi),
+        main,
+        status_line,
+    }
+}
+
+fn pull_status_line(show_checkpoint_hint: bool, retry_summary: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if show_checkpoint_hint {
+        parts.push(
+            "Ctrl+C checkpoints; rerun same command to resume (--fresh restarts).".to_string(),
+        );
+    }
+    if let Some(summary) = retry_summary.filter(|s| !s.is_empty()) {
+        parts.push(summary.to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("  ")
     }
 }
 
