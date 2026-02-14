@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -34,6 +34,7 @@ const ROOT_FETCH_CHUNK_SIZE: usize = 100;
 const BTQL_MAX_ATTEMPTS: usize = 5;
 const BTQL_RETRY_BASE_DELAY_MS: u64 = 300;
 const BTQL_MAX_BACKOFF_SECS: u64 = 8;
+const PULL_OUTPUT_PART_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
@@ -43,9 +44,9 @@ pub struct SyncArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum SyncCommand {
-    /// Download objects from Braintrust into local NDJSON files.
+    /// Download objects from Braintrust into local JSONL files/directories.
     Pull(PullArgs),
-    /// Upload local NDJSON rows back into Braintrust.
+    /// Upload local JSONL rows back into Braintrust.
     Push(PushArgs),
     /// Show the local state/manifest for a sync spec.
     Status(StatusArgs),
@@ -94,7 +95,7 @@ struct PushArgs {
     /// Object reference, format: object_type:object_id (e.g. project_logs:1234-uuid)
     object_ref: String,
 
-    /// Input NDJSON file. If omitted, bt sync uses the latest completed pull output.
+    /// Input JSONL/NDJSON file or directory of part files. If omitted, bt sync uses the latest completed pull output.
     #[arg(long = "in")]
     input: Option<PathBuf>,
 
@@ -191,6 +192,23 @@ impl ScopeArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RunStatus {
+    Running,
+    Interrupted,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PullPhase {
+    DiscoverRoots,
+    FetchRoots,
+    Spans,
+    Completed,
+}
+
 #[derive(Debug, Clone)]
 struct ObjectRef {
     object_type: String,
@@ -216,7 +234,7 @@ struct SyncManifest {
     spec_hash: String,
     spec: SyncSpec,
     last_run_id: String,
-    status: String,
+    status: RunStatus,
     items_done: usize,
     pages_done: usize,
     bytes_processed: u64,
@@ -232,8 +250,8 @@ struct SyncManifest {
 struct PullState {
     schema_version: u32,
     run_id: String,
-    status: String,
-    phase: String,
+    status: RunStatus,
+    phase: PullPhase,
     scope: String,
     limit: usize,
     filter: Option<String>,
@@ -267,7 +285,7 @@ struct TraceChunkState {
 struct PushState {
     schema_version: u32,
     run_id: String,
-    status: String,
+    status: RunStatus,
     scope: String,
     limit: Option<usize>,
     page_size: usize,
@@ -323,6 +341,65 @@ struct PushBatchResult {
     distinct_roots_done: usize,
 }
 
+#[derive(Debug, Default)]
+struct BtqlRetryTracker {
+    total_retries: AtomicUsize,
+    counts_by_type: Mutex<BTreeMap<String, usize>>,
+}
+
+impl BtqlRetryTracker {
+    fn record_status(&self, status_code: u16) {
+        self.record(format!("{status_code}"));
+    }
+
+    fn record_network(&self) {
+        self.record("network".to_string());
+    }
+
+    fn summary_line(&self) -> Option<String> {
+        let total = self.total_retries.load(Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+
+        let counts = match self.counts_by_type.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut entries: Vec<(String, usize)> =
+            counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let detail = entries
+            .into_iter()
+            .take(3)
+            .map(|(kind, count)| format!("{kind} x{}", format_usize_commas(count)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if detail.is_empty() {
+            Some(format!("Retries {}", format_usize_commas(total)))
+        } else {
+            Some(format!("Retries {} ({detail})", format_usize_commas(total)))
+        }
+    }
+
+    fn record(&self, kind: String) {
+        self.total_retries.fetch_add(1, Ordering::Relaxed);
+        let mut counts = match self.counts_by_type.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *counts.entry(kind).or_insert(0) += 1;
+    }
+}
+
+struct JsonlPartWriter {
+    base_dir: PathBuf,
+    part_index: usize,
+    current_bytes: u64,
+    writer: BufWriter<File>,
+}
+
 pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
     match args.command {
         SyncCommand::Pull(pull) => {
@@ -372,7 +449,7 @@ async fn run_pull(
 
     let state_path = spec_dir.join("state.json");
     let manifest_path = spec_dir.join("manifest.json");
-    let output_path = spec_dir.join("data.ndjson");
+    let output_path = spec_dir.join("data");
 
     let mut state = if fresh || !state_path.exists() {
         new_pull_state(
@@ -387,7 +464,14 @@ async fn run_pull(
         read_json_file::<PullState>(&state_path)?
     };
 
-    if state.status == "completed" && !fresh {
+    let suspicious_empty_trace_completion = !fresh
+        && state.status == RunStatus::Completed
+        && matches!(scope, ScopeArg::Traces)
+        && state.items_done == 0
+        && state.bytes_written == 0
+        && state.root_ids.is_empty();
+
+    if state.status == RunStatus::Completed && !fresh && !suspicious_empty_trace_completion {
         if json_output {
             println!(
                 "{}",
@@ -409,12 +493,76 @@ async fn run_pull(
         return Ok(());
     }
 
-    if fresh && output_path.exists() {
-        fs::remove_file(&output_path)
-            .with_context(|| format!("failed to remove {}", output_path.display()))?;
+    if suspicious_empty_trace_completion && !json_output {
+        eprintln!(
+            "warning: detected stale empty completed trace state for this spec; restarting discovery"
+        );
     }
 
-    state.status = "running".to_string();
+    if suspicious_empty_trace_completion {
+        state = new_pull_state(
+            &scope,
+            limit,
+            args.page_size,
+            spec.filter.clone(),
+            args.cursor.clone(),
+            output_path.to_string_lossy().to_string(),
+        );
+    }
+
+    let previous_output_path = state.output_path.clone();
+
+    let effective_fresh = fresh || suspicious_empty_trace_completion;
+
+    if effective_fresh && output_path.exists() {
+        if output_path.is_dir() {
+            fs::remove_dir_all(&output_path)
+                .with_context(|| format!("failed to remove {}", output_path.display()))?;
+        } else {
+            fs::remove_file(&output_path)
+                .with_context(|| format!("failed to remove {}", output_path.display()))?;
+        }
+    }
+    if effective_fresh {
+        let legacy_jsonl_path = spec_dir.join("data.jsonl");
+        if legacy_jsonl_path.exists() {
+            fs::remove_file(&legacy_jsonl_path)
+                .with_context(|| format!("failed to remove {}", legacy_jsonl_path.display()))?;
+        }
+        let legacy_output_path = spec_dir.join("data.ndjson");
+        if legacy_output_path.exists() {
+            fs::remove_file(&legacy_output_path)
+                .with_context(|| format!("failed to remove {}", legacy_output_path.display()))?;
+        }
+    } else {
+        let legacy_output_path = PathBuf::from(previous_output_path);
+        if legacy_output_path.is_file() {
+            fs::create_dir_all(&output_path)
+                .with_context(|| format!("failed to create {}", output_path.display()))?;
+            let migrated = output_part_path(&output_path, 1);
+            if !migrated.exists() {
+                fs::rename(&legacy_output_path, &migrated).with_context(|| {
+                    format!(
+                        "failed to migrate legacy output {} to {}",
+                        legacy_output_path.display(),
+                        migrated.display()
+                    )
+                })?;
+            }
+        }
+    }
+    if state.items_done == 0 && output_path.exists() {
+        if output_path.is_dir() {
+            fs::remove_dir_all(&output_path)
+                .with_context(|| format!("failed to remove {}", output_path.display()))?;
+        } else {
+            fs::remove_file(&output_path)
+                .with_context(|| format!("failed to remove {}", output_path.display()))?;
+        }
+    }
+    state.output_path = output_path.to_string_lossy().to_string();
+
+    state.status = RunStatus::Running;
     state.updated_at = epoch_seconds();
     write_json_atomic(&state_path, &state)?;
     update_manifest_from_pull_state(
@@ -422,8 +570,9 @@ async fn run_pull(
         &spec_hash,
         &spec,
         &state,
-        Some("running".to_string()),
+        Some(RunStatus::Running),
     )?;
+    let btql_retry_tracker = Arc::new(BtqlRetryTracker::default());
 
     match scope {
         ScopeArg::Spans => {
@@ -435,6 +584,7 @@ async fn run_pull(
                 &output_path,
                 &state_path,
                 &mut state,
+                &btql_retry_tracker,
                 !json_output,
             )
             .await?
@@ -449,6 +599,7 @@ async fn run_pull(
                 &state_path,
                 &mut state,
                 args.workers.max(1),
+                &btql_retry_tracker,
                 !json_output,
             )
             .await?
@@ -456,8 +607,8 @@ async fn run_pull(
         ScopeArg::All => bail!("invalid pull scope"),
     }
 
-    state.status = "completed".to_string();
-    state.phase = "completed".to_string();
+    state.status = RunStatus::Completed;
+    state.phase = PullPhase::Completed;
     state.completed_at = Some(epoch_seconds());
     state.updated_at = epoch_seconds();
     write_json_atomic(&state_path, &state)?;
@@ -466,7 +617,7 @@ async fn run_pull(
         &spec_hash,
         &spec,
         &state,
-        Some("completed".to_string()),
+        Some(RunStatus::Completed),
     )?;
 
     if json_output {
@@ -507,6 +658,9 @@ async fn run_pull(
             spans_per_sec,
             format_bytes(bytes_per_sec)
         );
+        if let Some(retry_summary) = btql_retry_tracker.summary_line() {
+            println!("  BTQL: {retry_summary}");
+        }
     }
     Ok(())
 }
@@ -517,9 +671,10 @@ async fn pull_spans_mode(
     ctx: &LoginContext,
     source_expr: &str,
     spec: &SyncSpec,
-    output_path: &Path,
+    output_dir: &Path,
     state_path: &Path,
     state: &mut PullState,
+    btql_retry_tracker: &Arc<BtqlRetryTracker>,
     show_checkpoint_hint: bool,
 ) -> Result<()> {
     let limit = state.limit;
@@ -535,13 +690,14 @@ async fn pull_spans_mode(
         baseline_roots_done,
         baseline_items_done,
         baseline_bytes_written,
+        btql_retry_tracker.summary_line().as_deref(),
     ));
     if show_checkpoint_hint {
         show_checkpoint_hint_line(&pb);
     }
     let mut seen_roots: HashSet<String> = state.root_ids.iter().cloned().collect();
 
-    let mut writer = open_ndjson_writer(output_path, state.items_done > 0)?;
+    let mut writer = open_jsonl_part_writer(output_dir, state.items_done > 0)?;
 
     while state.items_done < limit {
         let batch_limit = (limit - state.items_done).min(spec.page_size);
@@ -551,7 +707,8 @@ async fn pull_spans_mode(
             batch_limit,
             state.cursor.as_deref(),
         );
-        let response = execute_btql_query(client, ctx, &query).await?;
+        let response =
+            execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
         let batch_count = response.data.len();
 
         if batch_count == 0 {
@@ -560,14 +717,14 @@ async fn pull_spans_mode(
         }
 
         for row in &response.data {
-            if let Some(root_id) = value_as_string(row.get("root_span_id")) {
+            if let Some(root_id) = row_root_span_id(row) {
                 if !root_id.is_empty() && seen_roots.insert(root_id.clone()) {
                     state.root_ids.push(root_id);
                 }
             }
-            state.bytes_written += write_ndjson_row(&mut writer, row)? as u64;
+            state.bytes_written += write_jsonl_row(&mut writer, row)? as u64;
         }
-        writer.flush().context("failed to flush NDJSON output")?;
+        writer.flush().context("failed to flush JSONL output")?;
 
         state.items_done += batch_count;
         state.pages_done += 1;
@@ -582,6 +739,7 @@ async fn pull_spans_mode(
             baseline_roots_done,
             baseline_items_done,
             baseline_bytes_written,
+            btql_retry_tracker.summary_line().as_deref(),
         ));
 
         if state.cursor.is_none() {
@@ -599,14 +757,15 @@ async fn pull_traces_mode(
     ctx: &LoginContext,
     source_expr: &str,
     spec: &SyncSpec,
-    output_path: &Path,
+    output_dir: &Path,
     state_path: &Path,
     state: &mut PullState,
     workers: usize,
+    btql_retry_tracker: &Arc<BtqlRetryTracker>,
     show_checkpoint_hint: bool,
 ) -> Result<()> {
-    if state.phase == "spans" && state.current_root_index == 0 && state.items_done == 0 {
-        state.phase = "discover_roots".to_string();
+    if trace_state_needs_discovery(state) {
+        state.phase = PullPhase::DiscoverRoots;
     }
 
     let fetch_phase_started_at = epoch_seconds();
@@ -616,30 +775,35 @@ async fn pull_traces_mode(
     append_trace_chunks(state, ROOT_FETCH_CHUNK_SIZE, false);
     state.updated_at = epoch_seconds();
     write_json_atomic(state_path, state)?;
-    let fetch_baseline_completed_roots = completed_root_count(state);
+    let trace_progress_roots = Arc::new(tokio::sync::Mutex::new(trace_progress_roots_from_state(
+        state,
+    )));
+    let fetch_baseline_trace_progress = trace_progress_roots.lock().await.len();
     let fetch_baseline_items_done = state.items_done;
     let fetch_baseline_bytes_written = state.bytes_written;
     let trace_fetch_bar = bounded_bar(state.limit as u64, "Syncing traces");
-    trace_fetch_bar.set_position(completed_root_count(state).min(state.limit) as u64);
+    trace_fetch_bar.set_position(fetch_baseline_trace_progress.min(state.limit) as u64);
     trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
         state,
         fetch_phase_started_at,
-        fetch_baseline_completed_roots,
+        fetch_baseline_trace_progress,
+        fetch_baseline_trace_progress,
         fetch_baseline_items_done,
         fetch_baseline_bytes_written,
+        btql_retry_tracker.summary_line().as_deref(),
     ));
     if show_checkpoint_hint {
         show_checkpoint_hint_line(&trace_fetch_bar);
     }
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(state.clone()));
-    let shared_writer = Arc::new(tokio::sync::Mutex::new(open_ndjson_writer(
-        output_path,
+    let shared_writer = Arc::new(tokio::sync::Mutex::new(open_jsonl_part_writer(
+        output_dir,
         state.items_done > 0,
     )?));
     let work_notify = Arc::new(tokio::sync::Notify::new());
     let active_chunks = Arc::new(tokio::sync::Mutex::new(HashSet::<usize>::new()));
-    let needs_discovery = state.phase == "discover_roots";
+    let needs_discovery = state.phase == PullPhase::DiscoverRoots;
     let discovery_done = Arc::new(AtomicBool::new(!needs_discovery));
     let worker_count = workers.max(1);
     let mut join_set = tokio::task::JoinSet::new();
@@ -656,6 +820,8 @@ async fn pull_traces_mode(
         let discovery_done = Arc::clone(&discovery_done);
         let progress = trace_fetch_bar.clone();
         let page_size = spec.page_size;
+        let btql_retry_tracker = Arc::clone(btql_retry_tracker);
+        let trace_progress_roots = Arc::clone(&trace_progress_roots);
 
         join_set.spawn(async move {
             loop {
@@ -681,9 +847,11 @@ async fn pull_traces_mode(
                     &shared_writer,
                     &progress,
                     fetch_phase_started_at,
-                    fetch_baseline_completed_roots,
+                    fetch_baseline_trace_progress,
                     fetch_baseline_items_done,
                     fetch_baseline_bytes_written,
+                    &trace_progress_roots,
+                    &btql_retry_tracker,
                 )
                 .await;
 
@@ -710,14 +878,16 @@ async fn pull_traces_mode(
                 page_limit,
                 discovery_cursor.as_deref(),
             );
-            let response = execute_btql_query(client, ctx, &query).await?;
+            let response =
+                execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker)))
+                    .await?;
             let row_count = response.data.len();
 
             let new_chunks;
             {
                 let mut shared = shared_state.lock().await;
                 for row in response.data {
-                    if let Some(root_id) = value_as_string(row.get("root_span_id")) {
+                    if let Some(root_id) = row_root_span_id(&row) {
                         if !root_id.is_empty()
                             && seen.len() < shared.limit
                             && seen.insert(root_id.clone())
@@ -733,14 +903,16 @@ async fn pull_traces_mode(
                 new_chunks = append_trace_chunks(&mut shared, ROOT_FETCH_CHUNK_SIZE, false);
                 shared.updated_at = epoch_seconds();
                 write_json_atomic(state_path, &*shared)?;
-                trace_fetch_bar
-                    .set_position(completed_root_count(&shared).min(shared.limit) as u64);
+                let trace_progress_done = trace_progress_roots.lock().await.len();
+                trace_fetch_bar.set_position(trace_progress_done.min(shared.limit) as u64);
                 trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
                     &shared,
                     fetch_phase_started_at,
-                    fetch_baseline_completed_roots,
+                    trace_progress_done,
+                    fetch_baseline_trace_progress,
                     fetch_baseline_items_done,
                     fetch_baseline_bytes_written,
+                    btql_retry_tracker.summary_line().as_deref(),
                 ));
             }
             if new_chunks > 0 {
@@ -754,18 +926,21 @@ async fn pull_traces_mode(
 
         {
             let mut shared = shared_state.lock().await;
-            shared.phase = "fetch_roots".to_string();
+            shared.phase = PullPhase::FetchRoots;
             shared.root_discovery_cursor = None;
             let new_chunks = append_trace_chunks(&mut shared, ROOT_FETCH_CHUNK_SIZE, true);
             shared.updated_at = epoch_seconds();
             write_json_atomic(state_path, &*shared)?;
-            trace_fetch_bar.set_position(completed_root_count(&shared).min(shared.limit) as u64);
+            let trace_progress_done = trace_progress_roots.lock().await.len();
+            trace_fetch_bar.set_position(trace_progress_done.min(shared.limit) as u64);
             trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
                 &shared,
                 fetch_phase_started_at,
-                fetch_baseline_completed_roots,
+                trace_progress_done,
+                fetch_baseline_trace_progress,
                 fetch_baseline_items_done,
                 fetch_baseline_bytes_written,
+                btql_retry_tracker.summary_line().as_deref(),
             ));
             if new_chunks > 0 {
                 work_notify.notify_waiters();
@@ -785,12 +960,23 @@ async fn pull_traces_mode(
 
     {
         let mut writer = shared_writer.lock().await;
-        writer.flush().context("failed to flush NDJSON output")?;
+        writer.flush().context("failed to flush JSONL output")?;
     }
     *state = shared_state.lock().await.clone();
 
     trace_fetch_bar.finish_and_clear();
     Ok(())
+}
+
+fn trace_state_needs_discovery(state: &PullState) -> bool {
+    let no_trace_work = state.root_ids.is_empty() && state.trace_chunks.is_empty();
+    (state.phase == PullPhase::DiscoverRoots
+        || state.phase == PullPhase::Spans
+        || state.phase == PullPhase::FetchRoots
+        || state.phase == PullPhase::Completed)
+        && state.items_done == 0
+        && state.current_root_index == 0
+        && no_trace_work
 }
 
 fn initialize_trace_chunks(state: &mut PullState, chunk_size: usize) {
@@ -902,6 +1088,18 @@ fn completed_root_count(state: &PullState) -> usize {
         .sum()
 }
 
+fn trace_progress_roots_from_state(state: &PullState) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    for chunk in state.trace_chunks.iter().filter(|chunk| chunk.completed) {
+        let start = chunk.start.min(state.root_ids.len());
+        let end = chunk.end.min(state.root_ids.len());
+        for root_id in &state.root_ids[start..end] {
+            seen.insert(root_id.clone());
+        }
+    }
+    seen
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_trace_chunk(
     client: &ApiClient,
@@ -911,27 +1109,24 @@ async fn process_trace_chunk(
     state_path: &Path,
     chunk_idx: usize,
     shared_state: &Arc<tokio::sync::Mutex<PullState>>,
-    shared_writer: &Arc<tokio::sync::Mutex<BufWriter<File>>>,
+    shared_writer: &Arc<tokio::sync::Mutex<JsonlPartWriter>>,
     progress: &ProgressBar,
     fetch_phase_started_at: u64,
-    fetch_baseline_completed_roots: usize,
+    fetch_baseline_trace_progress: usize,
     fetch_baseline_items_done: usize,
     fetch_baseline_bytes_written: u64,
+    trace_progress_roots: &Arc<tokio::sync::Mutex<HashSet<String>>>,
+    btql_retry_tracker: &Arc<BtqlRetryTracker>,
 ) -> Result<()> {
     loop {
-        let (root_chunk, cursor, chunk_len, already_completed) = {
+        let (root_chunk, cursor, already_completed) = {
             let state = shared_state.lock().await;
             let chunk = state
                 .trace_chunks
                 .get(chunk_idx)
                 .ok_or_else(|| anyhow!("invalid trace chunk index {chunk_idx}"))?;
             let root_chunk = state.root_ids[chunk.start..chunk.end].to_vec();
-            (
-                root_chunk,
-                chunk.cursor.clone(),
-                chunk.end.saturating_sub(chunk.start),
-                chunk.completed,
-            )
+            (root_chunk, chunk.cursor.clone(), chunk.completed)
         };
 
         if already_completed || root_chunk.is_empty() {
@@ -939,9 +1134,19 @@ async fn process_trace_chunk(
         }
 
         let query = build_root_spans_query(source_expr, &root_chunk, page_size, cursor.as_deref());
-        let response = execute_btql_query(client, ctx, &query).await?;
+        let response =
+            execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
         let batch_count = response.data.len();
         let next_cursor = response.cursor.filter(|c| !c.is_empty());
+        let mut seen_roots_in_batch = HashSet::new();
+        for row in &response.data {
+            if let Some(root_id) = row_root_span_id(row) {
+                if !root_id.is_empty() {
+                    seen_roots_in_batch.insert(root_id);
+                }
+            }
+        }
+        let mut mark_chunk_roots_done = false;
 
         if batch_count > 0 {
             let mut bytes_written = 0u64;
@@ -960,58 +1165,78 @@ async fn process_trace_chunk(
                 let mut writer = shared_writer.lock().await;
                 for line in &serialized {
                     writer
-                        .write_all(line.as_bytes())
-                        .context("failed to write NDJSON row")?;
-                    writer
-                        .write_all(b"\n")
-                        .context("failed to write NDJSON newline")?;
+                        .write_line(line)
+                        .context("failed to write JSONL row")?;
                 }
-                writer.flush().context("failed to flush NDJSON output")?;
+                writer.flush().context("failed to flush JSONL output")?;
             }
 
             {
                 let mut state = shared_state.lock().await;
-                let was_completed = state.trace_chunks[chunk_idx].completed;
                 state.items_done += batch_count;
                 state.pages_done += 1;
                 state.bytes_written += bytes_written;
                 state.trace_chunks[chunk_idx].cursor = next_cursor.clone();
                 if next_cursor.is_none() {
                     state.trace_chunks[chunk_idx].completed = true;
+                    mark_chunk_roots_done = true;
                 }
                 state.current_root_index = completed_root_count(&state);
                 state.current_root_cursor = None;
                 state.updated_at = epoch_seconds();
                 write_json_atomic(state_path, &*state)?;
-                if !was_completed && state.trace_chunks[chunk_idx].completed {
-                    progress.inc(chunk_len as u64);
+                drop(state);
+                if !seen_roots_in_batch.is_empty() {
+                    let mut seen_roots = trace_progress_roots.lock().await;
+                    for root_id in seen_roots_in_batch {
+                        seen_roots.insert(root_id);
+                    }
                 }
+                if mark_chunk_roots_done {
+                    let mut seen_roots = trace_progress_roots.lock().await;
+                    for root_id in &root_chunk {
+                        seen_roots.insert(root_id.clone());
+                    }
+                }
+                let trace_progress_done = trace_progress_roots.lock().await.len();
+                let state = shared_state.lock().await;
+                progress.set_position(trace_progress_done.min(state.limit) as u64);
                 progress.set_message(pull_trace_progress_message_with_baseline(
                     &state,
                     fetch_phase_started_at,
-                    fetch_baseline_completed_roots,
+                    trace_progress_done,
+                    fetch_baseline_trace_progress,
                     fetch_baseline_items_done,
                     fetch_baseline_bytes_written,
+                    btql_retry_tracker.summary_line().as_deref(),
                 ));
             }
         } else {
             let mut state = shared_state.lock().await;
-            let was_completed = state.trace_chunks[chunk_idx].completed;
             state.trace_chunks[chunk_idx].cursor = None;
             state.trace_chunks[chunk_idx].completed = true;
             state.current_root_index = completed_root_count(&state);
             state.current_root_cursor = None;
             state.updated_at = epoch_seconds();
             write_json_atomic(state_path, &*state)?;
-            if !was_completed {
-                progress.inc(chunk_len as u64);
+            drop(state);
+            {
+                let mut seen_roots = trace_progress_roots.lock().await;
+                for root_id in &root_chunk {
+                    seen_roots.insert(root_id.clone());
+                }
             }
+            let trace_progress_done = trace_progress_roots.lock().await.len();
+            let state = shared_state.lock().await;
+            progress.set_position(trace_progress_done.min(state.limit) as u64);
             progress.set_message(pull_trace_progress_message_with_baseline(
                 &state,
                 fetch_phase_started_at,
-                fetch_baseline_completed_roots,
+                trace_progress_done,
+                fetch_baseline_trace_progress,
                 fetch_baseline_items_done,
                 fetch_baseline_bytes_written,
+                btql_retry_tracker.summary_line().as_deref(),
             ));
         }
 
@@ -1073,7 +1298,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         read_json_file::<PushState>(&state_path)?
     };
 
-    if state.status == "completed" && !args.fresh {
+    if state.status == RunStatus::Completed && !args.fresh {
         if json_output {
             println!(
                 "{}",
@@ -1094,7 +1319,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         return Ok(());
     }
 
-    state.status = "running".to_string();
+    state.status = RunStatus::Running;
     state.updated_at = epoch_seconds();
     write_json_atomic(&state_path, &state)?;
     update_manifest_from_push_state(
@@ -1102,11 +1327,12 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         &spec_hash,
         &spec,
         &state,
-        Some("running".to_string()),
+        Some(RunStatus::Running),
     )?;
 
     let project_id = object.object_name.clone();
-    let upload_total = upload_total_for_progress(&input_path, &scope, limit)?;
+    let input_files = resolve_push_input_files(&input_path)?;
+    let upload_total = upload_total_for_progress(&input_files, &scope, limit)?;
 
     let pb = if let Some(total) = upload_total {
         bounded_bar(total as u64, "Uploading rows")
@@ -1135,7 +1361,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
 
     let mut batch: Vec<Map<String, Value>> = Vec::with_capacity(args.page_size);
     let mut seen_roots: HashSet<String> = if state.line_offset > 0 {
-        collect_seen_roots_until_offset(&input_path, state.line_offset)?
+        collect_seen_roots_until_offset(&input_files, state.line_offset)?
     } else {
         HashSet::new()
     };
@@ -1167,94 +1393,99 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
     let mut pending_results: BTreeMap<usize, PushBatchResult> = BTreeMap::new();
     let mut join_set = tokio::task::JoinSet::new();
 
-    let file = File::open(&input_path)
-        .with_context(|| format!("failed to open input {}", input_path.display()))?;
-    let reader = BufReader::new(file);
+    let mut global_line_index = 0usize;
+    'files: for file_path in &input_files {
+        let file = File::open(file_path)
+            .with_context(|| format!("failed to open input {}", file_path.display()))?;
+        let reader = BufReader::new(file);
 
-    for (line_index, line) in reader.lines().enumerate() {
-        if interrupted.load(Ordering::SeqCst) {
-            break;
-        }
-        let line = line.with_context(|| format!("failed reading {}", input_path.display()))?;
-        if line_index < state.line_offset {
-            continue;
-        }
-
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "invalid JSON in {} at line {}",
-                input_path.display(),
-                line_index + 1
-            )
-        })?;
-
-        if let Some(max_spans) = limit.filter(|_| matches!(scope, ScopeArg::Spans)) {
-            if selected_count >= max_spans {
-                break;
+        for (line_index, line) in reader.lines().enumerate() {
+            if interrupted.load(Ordering::SeqCst) {
+                break 'files;
             }
-        }
-
-        let root_id = row_root_span_id(&row).unwrap_or_else(|| "__missing__".to_string());
-        if let Some(max_traces) = limit.filter(|_| matches!(scope, ScopeArg::Traces)) {
-            let is_new_root = !seen_roots.contains(&root_id);
-            if is_new_root && seen_roots.len() >= max_traces {
-                break;
+            let line = line.with_context(|| format!("failed reading {}", file_path.display()))?;
+            let current_line_offset = global_line_index;
+            global_line_index += 1;
+            if current_line_offset < state.line_offset {
+                continue;
             }
-        }
-        if !root_id.is_empty() {
-            seen_roots.insert(root_id);
-        }
 
-        prepare_row_for_upload(&mut row, &project_id, state.run_id.as_str(), selected_count);
-
-        selected_count += 1;
-        batch_end_line_offset = line_index + 1;
-        batch_distinct_roots_done = seen_roots.len();
-        batch.push(row);
-
-        if batch.len() >= args.page_size {
-            let work = PushBatchWork {
-                batch_index: next_batch_index,
-                rows: std::mem::take(&mut batch),
-                end_line_offset: batch_end_line_offset,
-                distinct_roots_done: batch_distinct_roots_done,
-            };
-            next_batch_index += 1;
-            pb.set_prefix("Uploading rows".to_string());
-            spawn_push_upload_task(
-                &mut join_set,
-                uploader_template.clone(),
-                work,
-                args.page_size,
-            );
-            batch_end_line_offset = state.line_offset;
-            batch_distinct_roots_done = state.distinct_roots_done;
-
-            while join_set.len() >= worker_count {
-                pb.set_prefix("Waiting uploads".to_string());
-                let result = join_set
-                    .join_next()
-                    .await
-                    .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
-                    .context("push upload worker join failed")??;
-                pending_results.insert(result.batch_index, result);
-                flush_ready_push_results(
-                    &mut pending_results,
-                    &mut next_commit_index,
-                    &mut state,
-                    &state_path,
-                    &pb,
-                    upload_total,
-                    push_phase_started_at,
-                    push_baseline_roots_done,
-                    push_baseline_items_done,
-                    push_baseline_bytes_sent,
-                )?;
+            if line.trim().is_empty() {
+                continue;
             }
-            pb.set_prefix("Preparing rows".to_string());
+            let mut row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
+                format!(
+                    "invalid JSON in {} at line {}",
+                    file_path.display(),
+                    line_index + 1
+                )
+            })?;
+
+            if let Some(max_spans) = limit.filter(|_| matches!(scope, ScopeArg::Spans)) {
+                if selected_count >= max_spans {
+                    break 'files;
+                }
+            }
+
+            let root_id = row_root_span_id(&row).unwrap_or_else(|| "__missing__".to_string());
+            if let Some(max_traces) = limit.filter(|_| matches!(scope, ScopeArg::Traces)) {
+                let is_new_root = !seen_roots.contains(&root_id);
+                if is_new_root && seen_roots.len() >= max_traces {
+                    break 'files;
+                }
+            }
+            if !root_id.is_empty() {
+                seen_roots.insert(root_id);
+            }
+
+            prepare_row_for_upload(&mut row, &project_id, state.run_id.as_str(), selected_count);
+
+            selected_count += 1;
+            batch_end_line_offset = current_line_offset + 1;
+            batch_distinct_roots_done = seen_roots.len();
+            batch.push(row);
+
+            if batch.len() >= args.page_size {
+                let work = PushBatchWork {
+                    batch_index: next_batch_index,
+                    rows: std::mem::take(&mut batch),
+                    end_line_offset: batch_end_line_offset,
+                    distinct_roots_done: batch_distinct_roots_done,
+                };
+                next_batch_index += 1;
+                pb.set_prefix("Uploading rows".to_string());
+                spawn_push_upload_task(
+                    &mut join_set,
+                    uploader_template.clone(),
+                    work,
+                    args.page_size,
+                );
+                batch_end_line_offset = state.line_offset;
+                batch_distinct_roots_done = state.distinct_roots_done;
+
+                while join_set.len() >= worker_count {
+                    pb.set_prefix("Waiting uploads".to_string());
+                    let result = join_set
+                        .join_next()
+                        .await
+                        .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
+                        .context("push upload worker join failed")??;
+                    pending_results.insert(result.batch_index, result);
+                    flush_ready_push_results(
+                        &mut pending_results,
+                        &mut next_commit_index,
+                        &mut state,
+                        &state_path,
+                        &pb,
+                        upload_total,
+                        push_phase_started_at,
+                        push_baseline_roots_done,
+                        push_baseline_items_done,
+                        push_baseline_bytes_sent,
+                    )?;
+                }
+                pb.set_prefix("Preparing rows".to_string());
+            }
         }
     }
 
@@ -1303,7 +1534,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
     ctrlc_task.abort();
 
     if was_interrupted {
-        state.status = "interrupted".to_string();
+        state.status = RunStatus::Interrupted;
         state.updated_at = epoch_seconds();
         write_json_atomic(&state_path, &state)?;
         update_manifest_from_push_state(
@@ -1311,7 +1542,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
             &spec_hash,
             &spec,
             &state,
-            Some("interrupted".to_string()),
+            Some(RunStatus::Interrupted),
         )?;
         pb.finish_and_clear();
 
@@ -1341,7 +1572,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         return Ok(());
     }
 
-    state.status = "completed".to_string();
+    state.status = RunStatus::Completed;
     state.completed_at = Some(epoch_seconds());
     state.updated_at = epoch_seconds();
     write_json_atomic(&state_path, &state)?;
@@ -1350,7 +1581,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         &spec_hash,
         &spec,
         &state,
-        Some("completed".to_string()),
+        Some(RunStatus::Completed),
     )?;
     pb.finish_and_clear();
 
@@ -1465,6 +1696,7 @@ async fn execute_btql_query(
     client: &ApiClient,
     ctx: &LoginContext,
     query: &str,
+    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
 ) -> Result<BtqlResponse> {
     let body = json!({
         "query": query,
@@ -1493,6 +1725,7 @@ async fn execute_btql_query(
             let api_key = api_key.clone();
             let org_name = org_name.clone();
             let attempt_counter = Arc::clone(&attempt_counter);
+            let btql_retry_tracker = btql_retry_tracker.clone();
 
             async move {
                 let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1517,6 +1750,9 @@ async fn execute_btql_query(
                         let body = response.text().await.unwrap_or_default();
                         let should_retry = status.is_server_error() || status.as_u16() == 413;
                         if should_retry && attempt < BTQL_MAX_ATTEMPTS {
+                            if let Some(tracker) = btql_retry_tracker.as_ref() {
+                                tracker.record_status(status.as_u16());
+                            }
                             Err(BackoffError::transient(anyhow!(
                                 "BTQL retryable failure ({status}) on attempt {attempt}/{BTQL_MAX_ATTEMPTS}: {body}"
                             )))
@@ -1528,6 +1764,9 @@ async fn execute_btql_query(
                     }
                     Err(err) => {
                         if attempt < BTQL_MAX_ATTEMPTS {
+                            if let Some(tracker) = btql_retry_tracker.as_ref() {
+                                tracker.record_network();
+                            }
                             Err(BackoffError::transient(anyhow!(
                                 "BTQL network error on attempt {attempt}/{BTQL_MAX_ATTEMPTS}: {err}"
                             )))
@@ -1540,11 +1779,7 @@ async fn execute_btql_query(
                 }
             }
         },
-        |err, delay| {
-            if std::io::stderr().is_terminal() {
-                eprintln!("Retrying BTQL in {delay:?}: {err}");
-            }
-        },
+        |_, _| {},
     )
     .await;
 
@@ -1582,7 +1817,7 @@ fn build_root_discovery_query(
     cursor: Option<&str>,
 ) -> String {
     let mut parts = vec![
-        "select: root_span_id".to_string(),
+        "select: root_span_id, span_id, id".to_string(),
         format!("from: {source_expr} spans"),
         format!("limit: {}", page_size),
         "sort: _pagination_key DESC".to_string(),
@@ -1603,14 +1838,15 @@ fn build_root_spans_query(
     cursor: Option<&str>,
 ) -> String {
     let root_filter = if root_span_ids.len() == 1 {
-        format!("root_span_id = {}", sql_quote(&root_span_ids[0]))
+        let quoted = sql_quote(&root_span_ids[0]);
+        format!("(root_span_id = {quoted} OR span_id = {quoted} OR id = {quoted})")
     } else {
         let joined = root_span_ids
             .iter()
             .map(|id| sql_quote(id))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("root_span_id IN [{joined}]")
+        format!("(root_span_id IN [{joined}] OR span_id IN [{joined}] OR id IN [{joined}])")
     };
 
     let mut parts = vec![
@@ -1966,6 +2202,7 @@ fn pull_spans_progress_message_with_baseline(
     baseline_roots_done: usize,
     baseline_items_done: usize,
     baseline_bytes_written: u64,
+    retry_summary: Option<&str>,
 ) -> String {
     let elapsed = elapsed_seconds(phase_started_at);
     let traces_done = state.root_ids.len().saturating_sub(baseline_roots_done);
@@ -1979,27 +2216,37 @@ fn pull_spans_progress_message_with_baseline(
         state.limit,
         spans_per_sec,
     );
-    format!(
-        "{:.2} traces/s | {:.2} spans/s | {}/s | ETA {}",
+    let mut message = format!(
+        "{} traces ({:.2}/s) | {} spans ({:.2}/s) | {} ({}/s) | ETA {}",
+        format_usize_commas(state.root_ids.len()),
         traces_per_sec,
+        format_usize_commas(state.items_done),
         spans_per_sec,
+        format_bytes(state.bytes_written as f64),
         format_bytes(bytes_per_sec),
         eta
-    )
+    );
+    if let Some(summary) = retry_summary.filter(|s| !s.is_empty()) {
+        message.push_str(" | ");
+        message.push_str(summary);
+    }
+    message
 }
 
 fn pull_trace_progress_message_with_baseline(
     state: &PullState,
     phase_started_at: u64,
-    baseline_completed_roots: usize,
+    trace_progress_done: usize,
+    baseline_trace_progress: usize,
     baseline_items_done: usize,
     baseline_bytes_written: u64,
+    retry_summary: Option<&str>,
 ) -> String {
     let elapsed = elapsed_seconds(phase_started_at);
-    let traces_done = completed_root_count(state).saturating_sub(baseline_completed_roots);
+    let traces_done = trace_progress_done.saturating_sub(baseline_trace_progress);
     let total_traces = state
         .limit
-        .saturating_sub(baseline_completed_roots)
+        .saturating_sub(baseline_trace_progress)
         .max(traces_done);
     let spans_done = state.items_done.saturating_sub(baseline_items_done);
     let bytes_done = state.bytes_written.saturating_sub(baseline_bytes_written);
@@ -2007,13 +2254,21 @@ fn pull_trace_progress_message_with_baseline(
     let spans_per_sec = spans_done as f64 / elapsed;
     let bytes_per_sec = bytes_done as f64 / elapsed;
     let eta = format_eta(traces_done, total_traces, traces_per_sec);
-    format!(
-        "{:.2} traces/s | {:.2} spans/s | {}/s | ETA {}",
+    let mut message = format!(
+        "{} traces ({:.2}/s) | {} spans ({:.2}/s) | {} ({}/s) | ETA {}",
+        format_usize_commas(trace_progress_done),
         traces_per_sec,
+        format_usize_commas(state.items_done),
         spans_per_sec,
+        format_bytes(state.bytes_written as f64),
         format_bytes(bytes_per_sec),
         eta
-    )
+    );
+    if let Some(summary) = retry_summary.filter(|s| !s.is_empty()) {
+        message.push_str(" | ");
+        message.push_str(summary);
+    }
+    message
 }
 
 fn push_progress_message_with_baseline(
@@ -2055,9 +2310,12 @@ fn push_progress_message_with_baseline(
     };
 
     format!(
-        "{:.2} traces/s | {:.2} spans/s | {}/s | ETA {}",
+        "{} traces ({:.2}/s) | {} spans ({:.2}/s) | {} ({}/s) | ETA {}",
+        format_usize_commas(state.distinct_roots_done),
         traces_per_sec,
+        format_usize_commas(state.items_done),
         spans_per_sec,
+        format_bytes(state.bytes_sent as f64),
         format_bytes(bytes_per_sec),
         eta
     )
@@ -2131,11 +2389,11 @@ fn new_pull_state(
     PullState {
         schema_version: STATE_SCHEMA_VERSION,
         run_id: format!("run-{}", now),
-        status: "running".to_string(),
+        status: RunStatus::Running,
         phase: if matches!(scope, ScopeArg::Traces) {
-            "discover_roots".to_string()
+            PullPhase::DiscoverRoots
         } else {
-            "spans".to_string()
+            PullPhase::Spans
         },
         scope: scope.as_str().to_string(),
         limit,
@@ -2167,7 +2425,7 @@ fn new_push_state(
     PushState {
         schema_version: STATE_SCHEMA_VERSION,
         run_id: format!("run-{}", now),
-        status: "running".to_string(),
+        status: RunStatus::Running,
         scope,
         limit,
         page_size,
@@ -2183,26 +2441,123 @@ fn new_push_state(
     }
 }
 
-fn open_ndjson_writer(path: &Path, append: bool) -> Result<BufWriter<File>> {
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-        .with_context(|| format!("failed to open output file {}", path.display()))?;
-    Ok(BufWriter::new(file))
+fn open_jsonl_part_writer(base_dir: &Path, append: bool) -> Result<JsonlPartWriter> {
+    JsonlPartWriter::new(base_dir, append)
 }
 
-fn write_ndjson_row(writer: &mut BufWriter<File>, row: &Map<String, Value>) -> Result<usize> {
-    let encoded = serde_json::to_string(row).context("failed to serialize row to NDJSON")?;
+fn write_jsonl_row(writer: &mut JsonlPartWriter, row: &Map<String, Value>) -> Result<usize> {
+    let encoded = serde_json::to_string(row).context("failed to serialize row to JSONL")?;
     writer
-        .write_all(encoded.as_bytes())
-        .context("failed to write NDJSON row")?;
-    writer
-        .write_all(b"\n")
-        .context("failed to write NDJSON newline")?;
-    Ok(encoded.len() + 1)
+        .write_line(&encoded)
+        .context("failed to write JSONL row")
+}
+
+impl JsonlPartWriter {
+    fn new(base_dir: &Path, append: bool) -> Result<Self> {
+        fs::create_dir_all(base_dir)
+            .with_context(|| format!("failed to create {}", base_dir.display()))?;
+
+        let mut part_indices = list_output_part_indices(base_dir)?;
+        let (part_index, current_bytes, writer) = if append && !part_indices.is_empty() {
+            part_indices.sort_unstable();
+            let idx = *part_indices.last().unwrap_or(&1usize);
+            let path = output_part_path(base_dir, idx);
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("failed to open output file {}", path.display()))?;
+            let bytes = file
+                .metadata()
+                .with_context(|| format!("failed to stat {}", path.display()))?
+                .len();
+            (idx, bytes, BufWriter::new(file))
+        } else {
+            let idx = 1usize;
+            let path = output_part_path(base_dir, idx);
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .with_context(|| format!("failed to open output file {}", path.display()))?;
+            (idx, 0u64, BufWriter::new(file))
+        };
+
+        Ok(Self {
+            base_dir: base_dir.to_path_buf(),
+            part_index,
+            current_bytes,
+            writer,
+        })
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<usize> {
+        let line_bytes = (line.len() + 1) as u64;
+        if self.current_bytes > 0 && self.current_bytes + line_bytes > PULL_OUTPUT_PART_MAX_BYTES {
+            self.rotate()?;
+        }
+        self.writer
+            .write_all(line.as_bytes())
+            .context("failed to write JSONL row")?;
+        self.writer
+            .write_all(b"\n")
+            .context("failed to write JSONL newline")?;
+        self.current_bytes += line_bytes;
+        Ok(line_bytes as usize)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush().context("failed to flush JSONL output")
+    }
+
+    fn rotate(&mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .context("failed to flush JSONL output")?;
+        self.part_index += 1;
+        let path = output_part_path(&self.base_dir, self.part_index);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .with_context(|| format!("failed to open output file {}", path.display()))?;
+        self.writer = BufWriter::new(file);
+        self.current_bytes = 0;
+        Ok(())
+    }
+}
+
+fn output_part_path(base_dir: &Path, part_index: usize) -> PathBuf {
+    base_dir.join(format!("part-{part_index:06}.jsonl"))
+}
+
+fn list_output_part_indices(base_dir: &Path) -> Result<Vec<usize>> {
+    if !base_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut indices = Vec::new();
+    for entry in
+        fs::read_dir(base_dir).with_context(|| format!("failed to read {}", base_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.starts_with("part-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let num = &name["part-".len()..name.len() - ".jsonl".len()];
+        if let Ok(idx) = num.parse::<usize>() {
+            indices.push(idx);
+        }
+    }
+    Ok(indices)
 }
 
 fn update_manifest_from_pull_state(
@@ -2210,14 +2565,14 @@ fn update_manifest_from_pull_state(
     spec_hash: &str,
     spec: &SyncSpec,
     state: &PullState,
-    status_override: Option<String>,
+    status_override: Option<RunStatus>,
 ) -> Result<()> {
     let manifest = SyncManifest {
         schema_version: STATE_SCHEMA_VERSION,
         spec_hash: spec_hash.to_string(),
         spec: spec.clone(),
         last_run_id: state.run_id.clone(),
-        status: status_override.unwrap_or_else(|| state.status.clone()),
+        status: status_override.unwrap_or(state.status),
         items_done: state.items_done,
         pages_done: state.pages_done,
         bytes_processed: state.bytes_written,
@@ -2236,14 +2591,14 @@ fn update_manifest_from_push_state(
     spec_hash: &str,
     spec: &SyncSpec,
     state: &PushState,
-    status_override: Option<String>,
+    status_override: Option<RunStatus>,
 ) -> Result<()> {
     let manifest = SyncManifest {
         schema_version: STATE_SCHEMA_VERSION,
         spec_hash: spec_hash.to_string(),
         spec: spec.clone(),
         last_run_id: state.run_id.clone(),
-        status: status_override.unwrap_or_else(|| state.status.clone()),
+        status: status_override.unwrap_or(state.status),
         items_done: state.items_done,
         pages_done: state.pages_done,
         bytes_processed: state.bytes_sent,
@@ -2289,7 +2644,7 @@ fn resolve_default_push_input(root: &Path, object: &ObjectRef) -> Result<PathBuf
                 continue;
             }
             let manifest = read_json_file::<SyncManifest>(&manifest_path)?;
-            if manifest.status != "completed" {
+            if manifest.status != RunStatus::Completed {
                 continue;
             }
             let output_path = match manifest.output_path {
@@ -2315,8 +2670,45 @@ fn resolve_default_push_input(root: &Path, object: &ObjectRef) -> Result<PathBuf
     })
 }
 
+fn resolve_push_input_files(input_path: &Path) -> Result<Vec<PathBuf>> {
+    if input_path.is_file() {
+        return Ok(vec![input_path.to_path_buf()]);
+    }
+    if !input_path.is_dir() {
+        bail!(
+            "input path is neither file nor directory: {}",
+            input_path.display()
+        );
+    }
+
+    let mut files = Vec::new();
+    for entry in fs::read_dir(input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if matches!(ext, "jsonl" | "ndjson") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        bail!(
+            "no .jsonl or .ndjson files found in input directory {}",
+            input_path.display()
+        );
+    }
+    Ok(files)
+}
+
 fn upload_total_for_progress(
-    input_path: &Path,
+    input_files: &[PathBuf],
     scope: &ScopeArg,
     limit: Option<usize>,
 ) -> Result<Option<usize>> {
@@ -2324,43 +2716,54 @@ fn upload_total_for_progress(
         return Ok(None);
     }
 
-    let total_lines = count_lines(input_path)?;
+    let total_lines = count_lines(input_files)?;
     let capped = limit.map(|l| l.min(total_lines)).unwrap_or(total_lines);
     Ok(Some(capped))
 }
 
-fn count_lines(path: &Path) -> Result<usize> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+fn count_lines(paths: &[PathBuf]) -> Result<usize> {
     let mut count = 0usize;
-    for line in reader.lines() {
-        line.with_context(|| format!("failed reading {}", path.display()))?;
-        count += 1;
+    for path in paths {
+        let file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            line.with_context(|| format!("failed reading {}", path.display()))?;
+            count += 1;
+        }
     }
     Ok(count)
 }
 
-fn collect_seen_roots_until_offset(path: &Path, line_offset: usize) -> Result<HashSet<String>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+fn collect_seen_roots_until_offset(
+    paths: &[PathBuf],
+    line_offset: usize,
+) -> Result<HashSet<String>> {
     let mut seen = HashSet::new();
-    for (line_index, line) in reader.lines().enumerate() {
-        if line_index >= line_offset {
-            break;
-        }
-        let line = line.with_context(|| format!("failed reading {}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "invalid JSON in {} at line {} while rebuilding trace resume state",
-                path.display(),
-                line_index + 1
-            )
-        })?;
-        if let Some(root_id) = row_root_span_id(&row) {
-            seen.insert(root_id);
+    let mut global_line_index = 0usize;
+
+    'files: for path in paths {
+        let file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = BufReader::new(file);
+        for (line_index, line) in reader.lines().enumerate() {
+            if global_line_index >= line_offset {
+                break 'files;
+            }
+            let line = line.with_context(|| format!("failed reading {}", path.display()))?;
+            if !line.trim().is_empty() {
+                let row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
+                    format!(
+                        "invalid JSON in {} at line {} while rebuilding trace resume state",
+                        path.display(),
+                        line_index + 1
+                    )
+                })?;
+                if let Some(root_id) = row_root_span_id(&row) {
+                    seen.insert(root_id);
+                }
+            }
+            global_line_index += 1;
         }
     }
     Ok(seen)
@@ -2467,12 +2870,8 @@ mod tests {
 
     #[test]
     fn push_checkpoint_line_offset_advances_only_after_commit() {
-        let mut state = new_push_state(
-            "traces".to_string(),
-            Some(10),
-            2,
-            "input.ndjson".to_string(),
-        );
+        let mut state =
+            new_push_state("traces".to_string(), Some(10), 2, "input.jsonl".to_string());
         assert_eq!(state.line_offset, 0);
 
         // Simulate scanning rows into an in-memory batch but getting interrupted before upload.
@@ -2495,7 +2894,7 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
-            "bt-sync-resume-root-rebuild-{}-{}.ndjson",
+            "bt-sync-resume-root-rebuild-{}-{}.jsonl",
             std::process::id(),
             unique
         ));
@@ -2505,7 +2904,7 @@ mod tests {
             "{\"root_span_id\":\"r1\"}\n{\"root_span_id\":\"r2\"}\n{\"root_span_id\":\"r3\"}\n",
         )?;
 
-        let seen = collect_seen_roots_until_offset(&path, 2)?;
+        let seen = collect_seen_roots_until_offset(&[path.clone()], 2)?;
         assert!(seen.contains("r1"));
         assert!(seen.contains("r2"));
         assert!(!seen.contains("r3"));
@@ -2526,8 +2925,7 @@ mod tests {
             unique
         ));
 
-        let mut state =
-            new_push_state("spans".to_string(), Some(10), 2, "input.ndjson".to_string());
+        let mut state = new_push_state("spans".to_string(), Some(10), 2, "input.jsonl".to_string());
         let mut pending = BTreeMap::new();
         let mut next_commit_index = 0usize;
         let pb = ProgressBar::hidden();
@@ -2592,5 +2990,27 @@ mod tests {
 
         let _ = fs::remove_file(&state_path);
         Ok(())
+    }
+
+    #[test]
+    fn trace_resume_with_empty_fetch_state_reenters_discovery() {
+        let mut state = new_pull_state(
+            &ScopeArg::Traces,
+            100,
+            200,
+            None,
+            None,
+            "out/data".to_string(),
+        );
+        state.phase = PullPhase::FetchRoots;
+        state.items_done = 0;
+        state.current_root_index = 0;
+        state.root_ids.clear();
+        state.trace_chunks.clear();
+
+        assert!(trace_state_needs_discovery(&state));
+
+        state.root_ids.push("r1".to_string());
+        assert!(!trace_state_needs_discovery(&state));
     }
 }
