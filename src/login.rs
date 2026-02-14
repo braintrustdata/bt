@@ -22,10 +22,11 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::{args::BaseArgs, ui};
+use crate::{
+    args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
+    ui,
+};
 
-const DEFAULT_API_URL: &str = "https://api.braintrust.dev";
-const DEFAULT_APP_URL: &str = "https://www.braintrust.dev";
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);

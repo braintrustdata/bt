@@ -1,6 +1,8 @@
 use clap::Args;
 use std::path::PathBuf;
 
+pub use braintrust_sdk_rust::{DEFAULT_API_URL, DEFAULT_APP_URL};
+
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
     /// Output as JSON

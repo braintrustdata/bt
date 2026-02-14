@@ -10,7 +10,7 @@ repository = "https://github.com/braintrustdata/bt"
 
 [dependencies]
 anyhow = "1.0.89"
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "33ee4c8b8c1e4cd11961f7572100298caa3a39d0" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "c8c7c7a8d9189164584adef71449a26d4ae8be2b" }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 indicatif = "0.17.8"
