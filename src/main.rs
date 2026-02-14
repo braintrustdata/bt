@@ -29,6 +29,8 @@ struct Cli {
 enum Commands {
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
+    /// Manage login profiles and persistent auth
+    Login(login::LoginArgs),
     /// View project traces in an interactive terminal UI
     #[command(visible_alias = "trace")]
     Traces(CLIArgs<traces::TracesArgs>),
@@ -52,6 +54,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
+        Commands::Login(args) => login::run(args).await?,
         Commands::Traces(cmd) => traces::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,

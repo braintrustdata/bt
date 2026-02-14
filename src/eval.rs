@@ -30,6 +30,7 @@ use ratatui::widgets::{Cell, Row, Table};
 use ratatui::Terminal;
 
 use crate::args::BaseArgs;
+use crate::login::resolved_auth_env;
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -284,7 +285,7 @@ async fn run_eval_files_once(
         EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
-    cmd.envs(build_env(base));
+    cmd.envs(build_env(base)?);
     if no_send_logs {
         cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
         cmd.env("BT_EVAL_LOCAL", "1");
@@ -630,18 +631,12 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
-    let mut envs = Vec::new();
-    if let Some(api_key) = base.api_key.as_ref() {
-        envs.push(("BRAINTRUST_API_KEY".to_string(), api_key.clone()));
-    }
-    if let Some(api_url) = base.api_url.as_ref() {
-        envs.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
-    }
+fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
+    let mut envs = resolved_auth_env(base)?;
     if let Some(project) = base.project.as_ref() {
         envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
-    envs
+    Ok(envs)
 }
 
 fn detect_eval_language(
@@ -1229,7 +1224,7 @@ impl EvalUi {
                     }
                 }
                 if show_hint {
-                    let hint = "Hint: pass --api-key or set BRAINTRUST_API_KEY, or use --no-send-logs for local evals.";
+                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt login set`, or use --no-send-logs for local evals.";
                     let _ = self.progress.println(hint.dark_grey().to_string());
                 }
             }

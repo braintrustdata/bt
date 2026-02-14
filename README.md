@@ -155,6 +155,32 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
   - Back: `Backspace` or `Esc` returns to trace table
   - Global: `q` to quit
 
+## `bt login` profiles
+
+- Save an API key to a named profile (stored in OS keychain):
+  - `bt login set --api-key <KEY> --profile work`
+- Save interactively (prompts for API key, profile defaults to `default`):
+  - `bt login`
+  - If your API key can access multiple orgs, `bt` prompts you to choose one and confirms the resolved API URL before saving.
+- Switch active profile:
+  - `bt login use work`
+- List profiles:
+  - `bt login list`
+- Delete a profile:
+  - `bt login delete work`
+- Clear active profile:
+  - `bt login logout`
+- Show current auth source/profile:
+  - `bt login status`
+
+Auth resolution order for commands is:
+
+1. `--api-key` or `BRAINTRUST_API_KEY`
+2. `--profile` or `BRAINTRUST_PROFILE`
+3. active saved profile
+
+On Linux, keychain storage uses `secret-tool` (libsecret). On macOS, it uses the `security` keychain utility.
+
 ## Roadmap / TODO
 
 - Add richer channel controls for self-update (for example pinned/branch canary selection).

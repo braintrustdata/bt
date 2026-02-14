@@ -7,9 +7,17 @@ pub struct BaseArgs {
     #[arg(short = 'j', long, global = true)]
     pub json: bool,
 
+    /// Use a saved login profile (or via BRAINTRUST_PROFILE)
+    #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
+    pub profile: Option<String>,
+
     /// Override active project
     #[arg(short = 'p', long, env = "BRAINTRUST_DEFAULT_PROJECT", global = true)]
     pub project: Option<String>,
+
+    /// Override organization selection (or via BRAINTRUST_ORG_NAME)
+    #[arg(long, env = "BRAINTRUST_ORG_NAME", global = true)]
+    pub org_name: Option<String>,
 
     /// Override stored API key (or via BRAINTRUST_API_KEY)
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true)]
