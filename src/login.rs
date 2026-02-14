@@ -10,9 +10,15 @@ use base64::Engine as _;
 use braintrust_sdk_rust::{BraintrustClient, LoginState};
 use clap::{Args, Subcommand};
 use dialoguer::{Confirm, Input, Password};
+use oauth2::basic::{BasicClient, BasicTokenType};
+use oauth2::reqwest::async_http_client;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EmptyExtraTokenFields, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, StandardTokenResponse, TokenResponse,
+    TokenUrl,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -520,8 +526,7 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_oauth_client_id(provisional_profile));
 
-    let code_verifier = generate_random_token(64)?;
-    let code_challenge = generate_pkce_challenge(&code_verifier);
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let state = generate_random_token(32)?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -532,8 +537,13 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         .context("failed to read callback listener address")?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
-    let authorize_url =
-        build_oauth_authorize_url(&api_url, &client_id, &redirect_uri, &state, &code_challenge);
+    let oauth_client = build_oauth_client(&api_url, &client_id, Some(&redirect_uri))?;
+    let (authorize_url, _) = oauth_client
+        .authorize_url(|| CsrfToken::new(state.clone()))
+        .add_scope(Scope::new(OAUTH_SCOPE.to_string()))
+        .set_pkce_challenge(pkce_challenge)
+        .url();
+    let authorize_url = authorize_url.to_string();
 
     println!("Opening browser for OAuth authorization...");
     println!("If it does not open, visit:\n{authorize_url}");
@@ -559,7 +569,7 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         &client_id,
         &redirect_uri,
         &auth_code,
-        &code_verifier,
+        pkce_verifier,
     )
     .await?;
     if let Some(expires_in) = oauth_tokens.expires_in {
@@ -1161,29 +1171,6 @@ fn generate_random_token(num_bytes: usize) -> Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn generate_pkce_challenge(code_verifier: &str) -> String {
-    let digest = Sha256::digest(code_verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn build_oauth_authorize_url(
-    api_url: &str,
-    client_id: &str,
-    redirect_uri: &str,
-    state: &str,
-    code_challenge: &str,
-) -> String {
-    format!(
-        "{}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
-        api_url.trim_end_matches('/'),
-        urlencoding::encode(client_id),
-        urlencoding::encode(redirect_uri),
-        urlencoding::encode(state),
-        urlencoding::encode(code_challenge),
-        urlencoding::encode(OAUTH_SCOPE),
-    )
-}
-
 #[derive(Debug)]
 struct OAuthCallbackParams {
     code: Option<String>,
@@ -1257,18 +1244,21 @@ async fn exchange_oauth_authorization_code(
     client_id: &str,
     redirect_uri: &str,
     code: &str,
-    code_verifier: &str,
+    code_verifier: PkceCodeVerifier,
 ) -> Result<OAuthTokenResponse> {
-    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "grant_type": "authorization_code",
-        "code": code,
-        "client_id": client_id,
-        "code_verifier": code_verifier,
-        "redirect_uri": redirect_uri,
-    });
-
-    exchange_oauth_token(&token_url, &body).await
+    let oauth_client = build_oauth_client(api_url, client_id, Some(redirect_uri))?;
+    let token_response = oauth_client
+        .exchange_code(AuthorizationCode::new(code.to_string()))
+        .set_pkce_verifier(code_verifier)
+        .request_async(async_http_client)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to call oauth token endpoint {}/oauth/token",
+                api_url.trim_end_matches('/')
+            )
+        })?;
+    Ok(to_oauth_token_response(token_response))
 }
 
 async fn refresh_oauth_access_token(
@@ -1276,38 +1266,55 @@ async fn refresh_oauth_access_token(
     refresh_token: &str,
     client_id: &str,
 ) -> Result<OAuthTokenResponse> {
-    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-    });
-    exchange_oauth_token(&token_url, &body).await
+    let oauth_client = build_oauth_client(api_url, client_id, None)?;
+    let token_response = oauth_client
+        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
+        .request_async(async_http_client)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to call oauth token endpoint {}/oauth/token",
+                api_url.trim_end_matches('/')
+            )
+        })?;
+    Ok(to_oauth_token_response(token_response))
 }
 
-async fn exchange_oauth_token(
-    token_url: &str,
-    body: &serde_json::Value,
-) -> Result<OAuthTokenResponse> {
-    let client = Client::builder()
-        .build()
-        .context("failed to initialize HTTP client")?;
-    let response = client
-        .post(token_url)
-        .header("Content-Type", "application/json")
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("failed to call oauth token endpoint {}", token_url))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("oauth token exchange failed ({status}): {body}");
+type OAuth2StdTokenResponse = StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType>;
+
+fn build_oauth_client(
+    api_url: &str,
+    client_id: &str,
+    redirect_uri: Option<&str>,
+) -> Result<BasicClient> {
+    let api_url = api_url.trim_end_matches('/');
+    let auth_url = AuthUrl::new(format!("{api_url}/oauth/authorize"))
+        .context("failed to construct oauth authorize URL")?;
+    let token_url = TokenUrl::new(format!("{api_url}/oauth/token"))
+        .context("failed to construct oauth token URL")?;
+    let client = BasicClient::new(
+        ClientId::new(client_id.to_string()),
+        None,
+        auth_url,
+        Some(token_url),
+    );
+    if let Some(redirect_uri) = redirect_uri {
+        let redirect_url =
+            RedirectUrl::new(redirect_uri.to_string()).context("invalid oauth redirect URI")?;
+        Ok(client.set_redirect_uri(redirect_url))
+    } else {
+        Ok(client)
     }
-    response
-        .json::<OAuthTokenResponse>()
-        .await
-        .context("failed to parse oauth token response")
+}
+
+fn to_oauth_token_response(tokens: OAuth2StdTokenResponse) -> OAuthTokenResponse {
+    OAuthTokenResponse {
+        access_token: tokens.access_token().secret().to_string(),
+        refresh_token: tokens
+            .refresh_token()
+            .map(|token| token.secret().to_string()),
+        expires_in: tokens.expires_in().map(|duration| duration.as_secs()),
+    }
 }
 
 fn prompt_api_key() -> Result<String> {
