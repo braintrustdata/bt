@@ -889,7 +889,7 @@ async fn pull_traces_mode(
         let mut discovery_cursor = state.root_discovery_cursor.clone();
 
         while seen.len() < state.limit {
-            let page_limit = (state.limit - seen.len()).min(ROOT_DISCOVERY_PAGE_SIZE);
+            let page_limit = ROOT_DISCOVERY_PAGE_SIZE;
             let query = build_root_discovery_query(
                 source_expr,
                 spec.filter.as_deref(),

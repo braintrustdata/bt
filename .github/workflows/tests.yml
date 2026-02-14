@@ -5,6 +5,33 @@ on:
   push:
 
 jobs:
+  login-tests:
+    name: login-tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git auth for private dependencies
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+      - name: Run login unit tests
+        run: cargo test login::tests -- --nocapture
+
   eval-tests-node:
     name: eval-tests-node (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
