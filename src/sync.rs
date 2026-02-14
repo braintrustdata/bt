@@ -370,17 +370,27 @@ impl BtqlRetryTracker {
             counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
         entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+        if entries.len() == 1 {
+            let (kind, count) = &entries[0];
+            return Some(format!(
+                "BTQL retries: {} ({})",
+                format_usize_commas(*count),
+                retry_kind_label(kind)
+            ));
+        }
+
         let detail = entries
-            .into_iter()
+            .iter()
             .take(3)
-            .map(|(kind, count)| format!("{kind} x{}", format_usize_commas(count)))
+            .map(|(kind, count)| {
+                format!("{} {}", retry_kind_label(kind), format_usize_commas(*count))
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        if detail.is_empty() {
-            Some(format!("Retries {}", format_usize_commas(total)))
-        } else {
-            Some(format!("Retries {} ({detail})", format_usize_commas(total)))
-        }
+        Some(format!(
+            "BTQL retries: {} total ({detail})",
+            format_usize_commas(total)
+        ))
     }
 
     fn record(&self, kind: String) {
@@ -390,6 +400,16 @@ impl BtqlRetryTracker {
             Err(poisoned) => poisoned.into_inner(),
         };
         *counts.entry(kind).or_insert(0) += 1;
+    }
+}
+
+fn retry_kind_label(kind: &str) -> String {
+    if kind == "network" {
+        "network".to_string()
+    } else if kind.chars().all(|ch| ch.is_ascii_digit()) {
+        format!("HTTP {kind}")
+    } else {
+        kind.to_string()
     }
 }
 
@@ -628,6 +648,19 @@ async fn run_pull(
     )?;
 
     if json_output {
+        let warning = if state.items_done == 0 {
+            Some(format!(
+                "no rows found for {} in org '{}'; verify object id and active credentials",
+                spec.object_ref,
+                if ctx.login.org_name.trim().is_empty() {
+                    "(default)".to_string()
+                } else {
+                    ctx.login.org_name.clone()
+                }
+            ))
+        } else {
+            None
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -638,7 +671,8 @@ async fn run_pull(
                 "pages_done": state.pages_done,
                 "bytes_written": state.bytes_written,
                 "scope": scope.as_str(),
-                "limit": limit
+                "limit": limit,
+                "warning": warning
             }))?
         );
     } else {
@@ -648,6 +682,17 @@ async fn run_pull(
         let traces_per_sec = traces_done as f64 / elapsed_secs as f64;
         let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
         let bytes_per_sec = state.bytes_written as f64 / elapsed_secs as f64;
+        if state.items_done == 0 {
+            let org_label = if ctx.login.org_name.trim().is_empty() {
+                "(default)".to_string()
+            } else {
+                ctx.login.org_name.clone()
+            };
+            println!(
+                "Warning: no rows found for {} in org '{}'; verify object id and active credentials.",
+                spec.object_ref, org_label
+            );
+        }
         println!("Pull complete");
         println!("  Output: {}", output_path.display());
         println!("  Time: {}", format_duration(elapsed_secs));
@@ -689,7 +734,7 @@ async fn pull_spans_mode(
     let baseline_roots_done = state.root_ids.len();
     let baseline_items_done = state.items_done;
     let baseline_bytes_written = state.bytes_written;
-    let ui = bounded_bar_with_status_line(limit as u64, "Fetching spans");
+    let ui = bounded_bar_with_status_line(limit as u64, "Fetching spans", "spans");
     let pb = ui.main.clone();
     let status_line = ui.status_line.clone();
     pb.set_position(state.items_done as u64);
@@ -794,7 +839,7 @@ async fn pull_traces_mode(
     let fetch_baseline_trace_progress = trace_progress_roots.lock().await.len();
     let fetch_baseline_items_done = state.items_done;
     let fetch_baseline_bytes_written = state.bytes_written;
-    let ui = bounded_bar_with_status_line(state.limit as u64, "Syncing traces");
+    let ui = bounded_bar_with_status_line(state.limit as u64, "Syncing traces", "traces");
     let trace_fetch_bar = ui.main.clone();
     let status_line = ui.status_line.clone();
     trace_fetch_bar.set_position(fetch_baseline_trace_progress.min(state.limit) as u64);
@@ -1375,7 +1420,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
     let upload_total = upload_total_for_progress(&input_files, &scope, limit)?;
 
     let pb = if let Some(total) = upload_total {
-        bounded_bar(total as u64, "Uploading rows")
+        bounded_bar(total as u64, "Uploading rows", "spans")
     } else {
         spinner_bar("Uploading rows")
     };
@@ -2988,7 +3033,7 @@ struct PullProgressUi {
     status_line: ProgressBar,
 }
 
-fn bounded_bar_with_status_line(total: u64, message: &str) -> PullProgressUi {
+fn bounded_bar_with_status_line(total: u64, message: &str, unit_label: &str) -> PullProgressUi {
     if !std::io::stderr().is_terminal() {
         return PullProgressUi {
             _multi: None,
@@ -2999,12 +3044,10 @@ fn bounded_bar_with_status_line(total: u64, message: &str) -> PullProgressUi {
 
     let multi = Arc::new(MultiProgress::new());
     let main = multi.add(ProgressBar::new(total));
-    main.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} {prefix} [{bar:40.cyan/blue}] {pos}/{len} ({percent:>3}%) | {msg}",
-        )
-        .unwrap(),
+    let template = format!(
+        "{{spinner:.cyan}} {{prefix}} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {unit_label} ({{percent:>3}}%) | {{msg}}"
     );
+    main.set_style(ProgressStyle::with_template(&template).unwrap());
     main.set_prefix(message.to_string());
     main.enable_steady_tick(Duration::from_millis(80));
 
@@ -3036,17 +3079,15 @@ fn pull_status_line(show_checkpoint_hint: bool, retry_summary: Option<&str>) -> 
     }
 }
 
-fn bounded_bar(total: u64, message: &str) -> ProgressBar {
+fn bounded_bar(total: u64, message: &str, unit_label: &str) -> ProgressBar {
     if !std::io::stderr().is_terminal() {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} {prefix} [{bar:40.cyan/blue}] {pos}/{len} ({percent:>3}%) | {msg}",
-        )
-        .unwrap(),
+    let template = format!(
+        "{{spinner:.cyan}} {{prefix}} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {unit_label} ({{percent:>3}}%) | {{msg}}"
     );
+    pb.set_style(ProgressStyle::with_template(&template).unwrap());
     pb.set_prefix(message.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
     pb
