@@ -3,6 +3,7 @@ use braintrust_sdk_rust::{BraintrustClient, LoginState};
 
 use crate::args::BaseArgs;
 
+#[derive(Clone)]
 pub struct LoginContext {
     pub login: LoginState,
     pub api_url: String,

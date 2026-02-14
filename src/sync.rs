@@ -1,0 +1,2596 @@
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Context, Result};
+use backoff::future::retry_notify;
+use backoff::{Error as BackoffError, ExponentialBackoffBuilder};
+use braintrust_sdk_rust::Logs3BatchUploader;
+use clap::{Args, Subcommand, ValueEnum};
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Client;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use urlencoding::encode;
+
+use crate::args::BaseArgs;
+use crate::http::ApiClient;
+use crate::login::{login, LoginContext};
+use crate::projects::api::list_projects;
+use crate::ui::fuzzy_select;
+
+const STATE_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_PULL_LIMIT: usize = 100;
+const DEFAULT_PAGE_SIZE: usize = 200;
+// BTQL currently enforces limit <= 1000.
+const ROOT_DISCOVERY_PAGE_SIZE: usize = 1000;
+const ROOT_FETCH_CHUNK_SIZE: usize = 100;
+const BTQL_MAX_ATTEMPTS: usize = 5;
+const BTQL_RETRY_BASE_DELAY_MS: u64 = 300;
+const BTQL_MAX_BACKOFF_SECS: u64 = 8;
+
+#[derive(Debug, Clone, Args)]
+pub struct SyncArgs {
+    #[command(subcommand)]
+    command: SyncCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SyncCommand {
+    /// Download objects from Braintrust into local NDJSON files.
+    Pull(PullArgs),
+    /// Upload local NDJSON rows back into Braintrust.
+    Push(PushArgs),
+    /// Show the local state/manifest for a sync spec.
+    Status(StatusArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct PullArgs {
+    /// Object reference, format: object_type:object_id (e.g. project_logs:1234-uuid)
+    object_ref: Option<String>,
+
+    /// SQL filter expression.
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Number of traces to fetch (default when no limit flag is set).
+    #[arg(long)]
+    traces: Option<usize>,
+
+    /// Number of spans to fetch.
+    #[arg(long)]
+    spans: Option<usize>,
+
+    /// Page size for BTQL pagination.
+    #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
+    page_size: usize,
+
+    /// Initial cursor for spans mode. Implies a fresh run.
+    #[arg(long)]
+    cursor: Option<String>,
+
+    /// Ignore previous state and start over for this spec.
+    #[arg(long)]
+    fresh: bool,
+
+    /// Root directory for sync artifacts.
+    #[arg(long, default_value = "bt-sync")]
+    root: PathBuf,
+
+    /// Number of concurrent workers for trace fetch mode.
+    #[arg(long, default_value_t = 8)]
+    workers: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+struct PushArgs {
+    /// Object reference, format: object_type:object_id (e.g. project_logs:1234-uuid)
+    object_ref: String,
+
+    /// Input NDJSON file. If omitted, bt sync uses the latest completed pull output.
+    #[arg(long = "in")]
+    input: Option<PathBuf>,
+
+    /// SQL filter expression (used in spec hashing / pull auto-resolution).
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Upload rows belonging to at most N distinct root traces.
+    #[arg(long)]
+    traces: Option<usize>,
+
+    /// Upload at most N span rows.
+    #[arg(long)]
+    spans: Option<usize>,
+
+    /// Rows per upload batch.
+    #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
+    page_size: usize,
+
+    /// Ignore previous state and start over for this spec.
+    #[arg(long)]
+    fresh: bool,
+
+    /// Root directory for sync artifacts.
+    #[arg(long, default_value = "bt-sync")]
+    root: PathBuf,
+
+    /// Number of concurrent workers for upload mode.
+    #[arg(long, default_value_t = 8)]
+    workers: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+struct StatusArgs {
+    /// Object reference, format: object_type:object_id (e.g. project_logs:1234-uuid)
+    object_ref: String,
+
+    /// Direction for status lookup.
+    #[arg(long, value_enum, default_value = "pull")]
+    direction: DirectionArg,
+
+    /// SQL filter expression.
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Trace limit for this spec.
+    #[arg(long)]
+    traces: Option<usize>,
+
+    /// Span limit for this spec.
+    #[arg(long)]
+    spans: Option<usize>,
+
+    /// Page size used in this spec.
+    #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
+    page_size: usize,
+
+    /// Root directory for sync artifacts.
+    #[arg(long, default_value = "bt-sync")]
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DirectionArg {
+    Pull,
+    Push,
+}
+
+impl DirectionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            DirectionArg::Pull => "pull",
+            DirectionArg::Push => "push",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScopeArg {
+    Traces,
+    Spans,
+    All,
+}
+
+impl ScopeArg {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ScopeArg::Traces => "traces",
+            ScopeArg::Spans => "spans",
+            ScopeArg::All => "all",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ObjectRef {
+    object_type: String,
+    object_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncSpec {
+    schema_version: u32,
+    object_ref: String,
+    object_type: String,
+    object_name: String,
+    direction: String,
+    scope: String,
+    filter: Option<String>,
+    limit: Option<usize>,
+    page_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncManifest {
+    schema_version: u32,
+    spec_hash: String,
+    spec: SyncSpec,
+    last_run_id: String,
+    status: String,
+    items_done: usize,
+    pages_done: usize,
+    bytes_processed: u64,
+    output_path: Option<String>,
+    input_path: Option<String>,
+    started_at: u64,
+    updated_at: u64,
+    completed_at: Option<u64>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PullState {
+    schema_version: u32,
+    run_id: String,
+    status: String,
+    phase: String,
+    scope: String,
+    limit: usize,
+    filter: Option<String>,
+    page_size: usize,
+    cursor: Option<String>,
+    root_discovery_cursor: Option<String>,
+    root_ids: Vec<String>,
+    current_root_index: usize,
+    current_root_cursor: Option<String>,
+    #[serde(default)]
+    trace_chunks: Vec<TraceChunkState>,
+    items_done: usize,
+    pages_done: usize,
+    bytes_written: u64,
+    output_path: String,
+    started_at: u64,
+    updated_at: u64,
+    completed_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TraceChunkState {
+    chunk_index: usize,
+    start: usize,
+    end: usize,
+    cursor: Option<String>,
+    completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PushState {
+    schema_version: u32,
+    run_id: String,
+    status: String,
+    scope: String,
+    limit: Option<usize>,
+    page_size: usize,
+    source_path: String,
+    line_offset: usize,
+    items_done: usize,
+    pages_done: usize,
+    bytes_sent: u64,
+    distinct_roots_done: usize,
+    started_at: u64,
+    updated_at: u64,
+    completed_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BtqlResponse {
+    data: Vec<Map<String, Value>>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NamedObject {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedObjectListResponse {
+    objects: Vec<NamedObject>,
+}
+
+#[derive(Debug, Clone)]
+struct InteractiveChoice {
+    label: String,
+    object_ref: String,
+}
+
+#[derive(Debug)]
+struct PushBatchWork {
+    batch_index: usize,
+    rows: Vec<Map<String, Value>>,
+    end_line_offset: usize,
+    distinct_roots_done: usize,
+}
+
+#[derive(Debug)]
+struct PushBatchResult {
+    batch_index: usize,
+    row_count: usize,
+    bytes_sent: u64,
+    end_line_offset: usize,
+    distinct_roots_done: usize,
+}
+
+pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
+    match args.command {
+        SyncCommand::Pull(pull) => {
+            let ctx = login(&base).await?;
+            let client = ApiClient::new(&ctx)?;
+            run_pull(base.json, &ctx, &client, pull).await
+        }
+        SyncCommand::Push(push) => {
+            let ctx = login(&base).await?;
+            run_push(base.json, &ctx, push).await
+        }
+        SyncCommand::Status(status) => run_status(base.json, status),
+    }
+}
+
+async fn run_pull(
+    json_output: bool,
+    ctx: &LoginContext,
+    client: &ApiClient,
+    args: PullArgs,
+) -> Result<()> {
+    let resolved_object_ref = resolve_pull_object_ref(client, args.object_ref.as_deref()).await?;
+    let object = parse_object_ref(&resolved_object_ref)?;
+    let source_expr = btql_source_expr(&object)?;
+    let (scope, limit) = resolve_pull_scope_and_limit(args.traces, args.spans)?;
+    let fresh = args.fresh || args.cursor.is_some();
+
+    let spec = SyncSpec {
+        schema_version: STATE_SCHEMA_VERSION,
+        object_ref: resolved_object_ref,
+        object_type: object.object_type.clone(),
+        object_name: object.object_name.clone(),
+        direction: DirectionArg::Pull.as_str().to_string(),
+        scope: scope.as_str().to_string(),
+        filter: trim_optional(args.filter.clone()),
+        limit: Some(limit),
+        page_size: args.page_size,
+    };
+
+    let spec_hash = spec_hash(&spec)?;
+    let spec_dir = spec_dir(&args.root, &object, DirectionArg::Pull, &scope, &spec_hash);
+    fs::create_dir_all(&spec_dir)
+        .with_context(|| format!("failed to create {}", spec_dir.display()))?;
+
+    let spec_path = spec_dir.join("spec.json");
+    write_json_atomic(&spec_path, &spec)?;
+
+    let state_path = spec_dir.join("state.json");
+    let manifest_path = spec_dir.join("manifest.json");
+    let output_path = spec_dir.join("data.ndjson");
+
+    let mut state = if fresh || !state_path.exists() {
+        new_pull_state(
+            &scope,
+            limit,
+            args.page_size,
+            spec.filter.clone(),
+            args.cursor.clone(),
+            output_path.to_string_lossy().to_string(),
+        )
+    } else {
+        read_json_file::<PullState>(&state_path)?
+    };
+
+    if state.status == "completed" && !fresh {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "completed",
+                    "message": "already completed for this spec",
+                    "spec_dir": spec_dir,
+                    "output_path": state.output_path,
+                    "items_done": state.items_done,
+                    "pages_done": state.pages_done
+                }))?
+            );
+        } else {
+            println!(
+                "Sync already completed for this spec. output={} items={} pages={}",
+                state.output_path, state.items_done, state.pages_done
+            );
+        }
+        return Ok(());
+    }
+
+    if fresh && output_path.exists() {
+        fs::remove_file(&output_path)
+            .with_context(|| format!("failed to remove {}", output_path.display()))?;
+    }
+
+    state.status = "running".to_string();
+    state.updated_at = epoch_seconds();
+    write_json_atomic(&state_path, &state)?;
+    update_manifest_from_pull_state(
+        &manifest_path,
+        &spec_hash,
+        &spec,
+        &state,
+        Some("running".to_string()),
+    )?;
+
+    match scope {
+        ScopeArg::Spans => {
+            pull_spans_mode(
+                client,
+                ctx,
+                &source_expr,
+                &spec,
+                &output_path,
+                &state_path,
+                &mut state,
+                !json_output,
+            )
+            .await?
+        }
+        ScopeArg::Traces => {
+            pull_traces_mode(
+                client,
+                ctx,
+                &source_expr,
+                &spec,
+                &output_path,
+                &state_path,
+                &mut state,
+                args.workers.max(1),
+                !json_output,
+            )
+            .await?
+        }
+        ScopeArg::All => bail!("invalid pull scope"),
+    }
+
+    state.status = "completed".to_string();
+    state.phase = "completed".to_string();
+    state.completed_at = Some(epoch_seconds());
+    state.updated_at = epoch_seconds();
+    write_json_atomic(&state_path, &state)?;
+    update_manifest_from_pull_state(
+        &manifest_path,
+        &spec_hash,
+        &spec,
+        &state,
+        Some("completed".to_string()),
+    )?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "completed",
+                "spec_dir": spec_dir,
+                "output_path": output_path,
+                "items_done": state.items_done,
+                "pages_done": state.pages_done,
+                "bytes_written": state.bytes_written,
+                "scope": scope.as_str(),
+                "limit": limit
+            }))?
+        );
+    } else {
+        let elapsed_secs = epoch_seconds().saturating_sub(state.started_at).max(1);
+        let traces_done = state.root_ids.len();
+        let spans_done = state.items_done;
+        let traces_per_sec = traces_done as f64 / elapsed_secs as f64;
+        let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
+        let bytes_per_sec = state.bytes_written as f64 / elapsed_secs as f64;
+        println!("Pull complete");
+        println!("  Output: {}", output_path.display());
+        println!("  Time: {}", format_duration(elapsed_secs));
+        println!("  Traces: {}", format_usize_commas(traces_done));
+        println!("  Spans: {}", format_usize_commas(spans_done));
+        println!("  Pages: {}", format_usize_commas(state.pages_done));
+        println!(
+            "  Data: {} ({} bytes)",
+            format_bytes(state.bytes_written as f64),
+            format_u64_commas(state.bytes_written)
+        );
+        println!(
+            "  Rates: {:.2} traces/s | {:.2} spans/s | {}/s",
+            traces_per_sec,
+            spans_per_sec,
+            format_bytes(bytes_per_sec)
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_spans_mode(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    source_expr: &str,
+    spec: &SyncSpec,
+    output_path: &Path,
+    state_path: &Path,
+    state: &mut PullState,
+    show_checkpoint_hint: bool,
+) -> Result<()> {
+    let limit = state.limit;
+    let phase_started_at = epoch_seconds();
+    let baseline_roots_done = state.root_ids.len();
+    let baseline_items_done = state.items_done;
+    let baseline_bytes_written = state.bytes_written;
+    let pb = bounded_bar(limit as u64, "Fetching spans");
+    pb.set_position(state.items_done as u64);
+    pb.set_message(pull_spans_progress_message_with_baseline(
+        state,
+        phase_started_at,
+        baseline_roots_done,
+        baseline_items_done,
+        baseline_bytes_written,
+    ));
+    if show_checkpoint_hint {
+        show_checkpoint_hint_line(&pb);
+    }
+    let mut seen_roots: HashSet<String> = state.root_ids.iter().cloned().collect();
+
+    let mut writer = open_ndjson_writer(output_path, state.items_done > 0)?;
+
+    while state.items_done < limit {
+        let batch_limit = (limit - state.items_done).min(spec.page_size);
+        let query = build_spans_query(
+            source_expr,
+            spec.filter.as_deref(),
+            batch_limit,
+            state.cursor.as_deref(),
+        );
+        let response = execute_btql_query(client, ctx, &query).await?;
+        let batch_count = response.data.len();
+
+        if batch_count == 0 {
+            state.cursor = None;
+            break;
+        }
+
+        for row in &response.data {
+            if let Some(root_id) = value_as_string(row.get("root_span_id")) {
+                if !root_id.is_empty() && seen_roots.insert(root_id.clone()) {
+                    state.root_ids.push(root_id);
+                }
+            }
+            state.bytes_written += write_ndjson_row(&mut writer, row)? as u64;
+        }
+        writer.flush().context("failed to flush NDJSON output")?;
+
+        state.items_done += batch_count;
+        state.pages_done += 1;
+        state.cursor = response.cursor.filter(|c| !c.is_empty());
+        state.updated_at = epoch_seconds();
+
+        write_json_atomic(state_path, state)?;
+        pb.set_position(state.items_done.min(limit) as u64);
+        pb.set_message(pull_spans_progress_message_with_baseline(
+            state,
+            phase_started_at,
+            baseline_roots_done,
+            baseline_items_done,
+            baseline_bytes_written,
+        ));
+
+        if state.cursor.is_none() {
+            break;
+        }
+    }
+
+    pb.finish_and_clear();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_traces_mode(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    source_expr: &str,
+    spec: &SyncSpec,
+    output_path: &Path,
+    state_path: &Path,
+    state: &mut PullState,
+    workers: usize,
+    show_checkpoint_hint: bool,
+) -> Result<()> {
+    if state.phase == "spans" && state.current_root_index == 0 && state.items_done == 0 {
+        state.phase = "discover_roots".to_string();
+    }
+
+    let fetch_phase_started_at = epoch_seconds();
+    if state.trace_chunks.is_empty() && !state.root_ids.is_empty() {
+        initialize_trace_chunks(state, ROOT_FETCH_CHUNK_SIZE);
+    }
+    append_trace_chunks(state, ROOT_FETCH_CHUNK_SIZE, false);
+    state.updated_at = epoch_seconds();
+    write_json_atomic(state_path, state)?;
+    let fetch_baseline_completed_roots = completed_root_count(state);
+    let fetch_baseline_items_done = state.items_done;
+    let fetch_baseline_bytes_written = state.bytes_written;
+    let trace_fetch_bar = bounded_bar(state.limit as u64, "Syncing traces");
+    trace_fetch_bar.set_position(completed_root_count(state).min(state.limit) as u64);
+    trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
+        state,
+        fetch_phase_started_at,
+        fetch_baseline_completed_roots,
+        fetch_baseline_items_done,
+        fetch_baseline_bytes_written,
+    ));
+    if show_checkpoint_hint {
+        show_checkpoint_hint_line(&trace_fetch_bar);
+    }
+
+    let shared_state = Arc::new(tokio::sync::Mutex::new(state.clone()));
+    let shared_writer = Arc::new(tokio::sync::Mutex::new(open_ndjson_writer(
+        output_path,
+        state.items_done > 0,
+    )?));
+    let work_notify = Arc::new(tokio::sync::Notify::new());
+    let active_chunks = Arc::new(tokio::sync::Mutex::new(HashSet::<usize>::new()));
+    let needs_discovery = state.phase == "discover_roots";
+    let discovery_done = Arc::new(AtomicBool::new(!needs_discovery));
+    let worker_count = workers.max(1);
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for _ in 0..worker_count {
+        let client = client.clone();
+        let ctx = ctx.clone();
+        let source_expr = source_expr.to_string();
+        let state_path = state_path.to_path_buf();
+        let shared_state = Arc::clone(&shared_state);
+        let shared_writer = Arc::clone(&shared_writer);
+        let work_notify = Arc::clone(&work_notify);
+        let active_chunks = Arc::clone(&active_chunks);
+        let discovery_done = Arc::clone(&discovery_done);
+        let progress = trace_fetch_bar.clone();
+        let page_size = spec.page_size;
+
+        join_set.spawn(async move {
+            loop {
+                let Some(chunk_idx) = claim_next_trace_chunk(
+                    &shared_state,
+                    &active_chunks,
+                    &discovery_done,
+                    &work_notify,
+                )
+                .await?
+                else {
+                    break;
+                };
+
+                let result = process_trace_chunk(
+                    &client,
+                    &ctx,
+                    &source_expr,
+                    page_size,
+                    &state_path,
+                    chunk_idx,
+                    &shared_state,
+                    &shared_writer,
+                    &progress,
+                    fetch_phase_started_at,
+                    fetch_baseline_completed_roots,
+                    fetch_baseline_items_done,
+                    fetch_baseline_bytes_written,
+                )
+                .await;
+
+                {
+                    let mut active = active_chunks.lock().await;
+                    active.remove(&chunk_idx);
+                }
+                work_notify.notify_waiters();
+                result?;
+            }
+            Result::<()>::Ok(())
+        });
+    }
+
+    if needs_discovery {
+        let mut seen = state.root_ids.iter().cloned().collect::<HashSet<String>>();
+        let mut discovery_cursor = state.root_discovery_cursor.clone();
+
+        while seen.len() < state.limit {
+            let page_limit = (state.limit - seen.len()).min(ROOT_DISCOVERY_PAGE_SIZE);
+            let query = build_root_discovery_query(
+                source_expr,
+                spec.filter.as_deref(),
+                page_limit,
+                discovery_cursor.as_deref(),
+            );
+            let response = execute_btql_query(client, ctx, &query).await?;
+            let row_count = response.data.len();
+
+            let new_chunks;
+            {
+                let mut shared = shared_state.lock().await;
+                for row in response.data {
+                    if let Some(root_id) = value_as_string(row.get("root_span_id")) {
+                        if !root_id.is_empty()
+                            && seen.len() < shared.limit
+                            && seen.insert(root_id.clone())
+                        {
+                            shared.root_ids.push(root_id);
+                        }
+                    }
+                }
+
+                shared.pages_done += 1;
+                discovery_cursor = response.cursor.filter(|c| !c.is_empty());
+                shared.root_discovery_cursor = discovery_cursor.clone();
+                new_chunks = append_trace_chunks(&mut shared, ROOT_FETCH_CHUNK_SIZE, false);
+                shared.updated_at = epoch_seconds();
+                write_json_atomic(state_path, &*shared)?;
+                trace_fetch_bar
+                    .set_position(completed_root_count(&shared).min(shared.limit) as u64);
+                trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
+                    &shared,
+                    fetch_phase_started_at,
+                    fetch_baseline_completed_roots,
+                    fetch_baseline_items_done,
+                    fetch_baseline_bytes_written,
+                ));
+            }
+            if new_chunks > 0 {
+                work_notify.notify_waiters();
+            }
+
+            if row_count == 0 || discovery_cursor.is_none() {
+                break;
+            }
+        }
+
+        {
+            let mut shared = shared_state.lock().await;
+            shared.phase = "fetch_roots".to_string();
+            shared.root_discovery_cursor = None;
+            let new_chunks = append_trace_chunks(&mut shared, ROOT_FETCH_CHUNK_SIZE, true);
+            shared.updated_at = epoch_seconds();
+            write_json_atomic(state_path, &*shared)?;
+            trace_fetch_bar.set_position(completed_root_count(&shared).min(shared.limit) as u64);
+            trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
+                &shared,
+                fetch_phase_started_at,
+                fetch_baseline_completed_roots,
+                fetch_baseline_items_done,
+                fetch_baseline_bytes_written,
+            ));
+            if new_chunks > 0 {
+                work_notify.notify_waiters();
+            }
+        }
+        discovery_done.store(true, Ordering::SeqCst);
+        work_notify.notify_waiters();
+    } else {
+        discovery_done.store(true, Ordering::SeqCst);
+        work_notify.notify_waiters();
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        let worker_result = join_result.context("trace fetch worker join failed")?;
+        worker_result?;
+    }
+
+    {
+        let mut writer = shared_writer.lock().await;
+        writer.flush().context("failed to flush NDJSON output")?;
+    }
+    *state = shared_state.lock().await.clone();
+
+    trace_fetch_bar.finish_and_clear();
+    Ok(())
+}
+
+fn initialize_trace_chunks(state: &mut PullState, chunk_size: usize) {
+    if !state.trace_chunks.is_empty() {
+        return;
+    }
+
+    let root_count = state.root_ids.len();
+    if root_count == 0 {
+        state.current_root_index = 0;
+        state.current_root_cursor = None;
+        return;
+    }
+
+    let legacy_index = state.current_root_index.min(root_count);
+    let legacy_cursor = state.current_root_cursor.clone();
+    let mut chunk_index = 0usize;
+    let mut chunks = Vec::new();
+
+    let mut start = 0usize;
+    while start < root_count {
+        let end = (start + chunk_size).min(root_count);
+        let mut chunk = TraceChunkState {
+            chunk_index,
+            start,
+            end,
+            cursor: None,
+            completed: end <= legacy_index,
+        };
+
+        if start == legacy_index {
+            chunk.cursor = legacy_cursor.clone();
+        }
+
+        chunks.push(chunk);
+        chunk_index += 1;
+        start = end;
+    }
+
+    state.trace_chunks = chunks;
+    state.current_root_index = completed_root_count(state);
+    state.current_root_cursor = None;
+}
+
+fn append_trace_chunks(state: &mut PullState, chunk_size: usize, flush_partial: bool) -> usize {
+    let mut next_start = state
+        .trace_chunks
+        .last()
+        .map(|chunk| chunk.end)
+        .unwrap_or(0);
+    let root_count = state.root_ids.len();
+    let mut added = 0usize;
+
+    while next_start < root_count {
+        let remaining = root_count - next_start;
+        if !flush_partial && remaining < chunk_size {
+            break;
+        }
+        let end = (next_start + chunk_size).min(root_count);
+        state.trace_chunks.push(TraceChunkState {
+            chunk_index: state.trace_chunks.len(),
+            start: next_start,
+            end,
+            cursor: None,
+            completed: false,
+        });
+        next_start = end;
+        added += 1;
+    }
+
+    state.current_root_index = completed_root_count(state);
+    state.current_root_cursor = None;
+    added
+}
+
+async fn claim_next_trace_chunk(
+    shared_state: &Arc<tokio::sync::Mutex<PullState>>,
+    active_chunks: &Arc<tokio::sync::Mutex<HashSet<usize>>>,
+    discovery_done: &Arc<AtomicBool>,
+    work_notify: &Arc<tokio::sync::Notify>,
+) -> Result<Option<usize>> {
+    loop {
+        {
+            let state = shared_state.lock().await;
+            let mut active = active_chunks.lock().await;
+            if let Some((chunk_idx, _)) = state
+                .trace_chunks
+                .iter()
+                .enumerate()
+                .find(|(idx, chunk)| !chunk.completed && !active.contains(idx))
+            {
+                active.insert(chunk_idx);
+                return Ok(Some(chunk_idx));
+            }
+            if discovery_done.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+        }
+        work_notify.notified().await;
+    }
+}
+
+fn completed_root_count(state: &PullState) -> usize {
+    state
+        .trace_chunks
+        .iter()
+        .filter(|chunk| chunk.completed)
+        .map(|chunk| chunk.end.saturating_sub(chunk.start))
+        .sum()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_trace_chunk(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    source_expr: &str,
+    page_size: usize,
+    state_path: &Path,
+    chunk_idx: usize,
+    shared_state: &Arc<tokio::sync::Mutex<PullState>>,
+    shared_writer: &Arc<tokio::sync::Mutex<BufWriter<File>>>,
+    progress: &ProgressBar,
+    fetch_phase_started_at: u64,
+    fetch_baseline_completed_roots: usize,
+    fetch_baseline_items_done: usize,
+    fetch_baseline_bytes_written: u64,
+) -> Result<()> {
+    loop {
+        let (root_chunk, cursor, chunk_len, already_completed) = {
+            let state = shared_state.lock().await;
+            let chunk = state
+                .trace_chunks
+                .get(chunk_idx)
+                .ok_or_else(|| anyhow!("invalid trace chunk index {chunk_idx}"))?;
+            let root_chunk = state.root_ids[chunk.start..chunk.end].to_vec();
+            (
+                root_chunk,
+                chunk.cursor.clone(),
+                chunk.end.saturating_sub(chunk.start),
+                chunk.completed,
+            )
+        };
+
+        if already_completed || root_chunk.is_empty() {
+            return Ok(());
+        }
+
+        let query = build_root_spans_query(source_expr, &root_chunk, page_size, cursor.as_deref());
+        let response = execute_btql_query(client, ctx, &query).await?;
+        let batch_count = response.data.len();
+        let next_cursor = response.cursor.filter(|c| !c.is_empty());
+
+        if batch_count > 0 {
+            let mut bytes_written = 0u64;
+            let serialized = response
+                .data
+                .iter()
+                .map(|row| {
+                    let line =
+                        serde_json::to_string(row).context("failed to serialize trace row")?;
+                    bytes_written += (line.len() + 1) as u64;
+                    Result::<String>::Ok(line)
+                })
+                .collect::<Result<Vec<String>>>()?;
+
+            {
+                let mut writer = shared_writer.lock().await;
+                for line in &serialized {
+                    writer
+                        .write_all(line.as_bytes())
+                        .context("failed to write NDJSON row")?;
+                    writer
+                        .write_all(b"\n")
+                        .context("failed to write NDJSON newline")?;
+                }
+                writer.flush().context("failed to flush NDJSON output")?;
+            }
+
+            {
+                let mut state = shared_state.lock().await;
+                let was_completed = state.trace_chunks[chunk_idx].completed;
+                state.items_done += batch_count;
+                state.pages_done += 1;
+                state.bytes_written += bytes_written;
+                state.trace_chunks[chunk_idx].cursor = next_cursor.clone();
+                if next_cursor.is_none() {
+                    state.trace_chunks[chunk_idx].completed = true;
+                }
+                state.current_root_index = completed_root_count(&state);
+                state.current_root_cursor = None;
+                state.updated_at = epoch_seconds();
+                write_json_atomic(state_path, &*state)?;
+                if !was_completed && state.trace_chunks[chunk_idx].completed {
+                    progress.inc(chunk_len as u64);
+                }
+                progress.set_message(pull_trace_progress_message_with_baseline(
+                    &state,
+                    fetch_phase_started_at,
+                    fetch_baseline_completed_roots,
+                    fetch_baseline_items_done,
+                    fetch_baseline_bytes_written,
+                ));
+            }
+        } else {
+            let mut state = shared_state.lock().await;
+            let was_completed = state.trace_chunks[chunk_idx].completed;
+            state.trace_chunks[chunk_idx].cursor = None;
+            state.trace_chunks[chunk_idx].completed = true;
+            state.current_root_index = completed_root_count(&state);
+            state.current_root_cursor = None;
+            state.updated_at = epoch_seconds();
+            write_json_atomic(state_path, &*state)?;
+            if !was_completed {
+                progress.inc(chunk_len as u64);
+            }
+            progress.set_message(pull_trace_progress_message_with_baseline(
+                &state,
+                fetch_phase_started_at,
+                fetch_baseline_completed_roots,
+                fetch_baseline_items_done,
+                fetch_baseline_bytes_written,
+            ));
+        }
+
+        if next_cursor.is_none() {
+            return Ok(());
+        }
+    }
+}
+
+async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Result<()> {
+    let object = parse_object_ref(&args.object_ref)?;
+    if object.object_type != "project_logs" {
+        bail!(
+            "push currently supports only project_logs:<project_id>; got {}:{}",
+            object.object_type,
+            object.object_name
+        );
+    }
+    let (scope, limit) = resolve_push_scope_and_limit(args.traces, args.spans)?;
+
+    let spec = SyncSpec {
+        schema_version: STATE_SCHEMA_VERSION,
+        object_ref: args.object_ref.clone(),
+        object_type: object.object_type.clone(),
+        object_name: object.object_name.clone(),
+        direction: DirectionArg::Push.as_str().to_string(),
+        scope: scope.as_str().to_string(),
+        filter: trim_optional(args.filter.clone()),
+        limit,
+        page_size: args.page_size,
+    };
+    let spec_hash = spec_hash(&spec)?;
+    let spec_dir = spec_dir(&args.root, &object, DirectionArg::Push, &scope, &spec_hash);
+    fs::create_dir_all(&spec_dir)
+        .with_context(|| format!("failed to create {}", spec_dir.display()))?;
+
+    let spec_path = spec_dir.join("spec.json");
+    let state_path = spec_dir.join("state.json");
+    let manifest_path = spec_dir.join("manifest.json");
+    write_json_atomic(&spec_path, &spec)?;
+
+    let input_path = if let Some(path) = args.input {
+        path
+    } else {
+        resolve_default_push_input(&args.root, &object)?
+    };
+    if !input_path.exists() {
+        bail!("input path does not exist: {}", input_path.display());
+    }
+
+    let mut state = if args.fresh || !state_path.exists() {
+        new_push_state(
+            scope.as_str().to_string(),
+            limit,
+            args.page_size,
+            input_path.to_string_lossy().to_string(),
+        )
+    } else {
+        read_json_file::<PushState>(&state_path)?
+    };
+
+    if state.status == "completed" && !args.fresh {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "completed",
+                    "message": "already completed for this spec",
+                    "source_path": state.source_path,
+                    "items_done": state.items_done,
+                    "pages_done": state.pages_done
+                }))?
+            );
+        } else {
+            println!(
+                "Sync already completed for this spec. input={} items={} pages={}",
+                state.source_path, state.items_done, state.pages_done
+            );
+        }
+        return Ok(());
+    }
+
+    state.status = "running".to_string();
+    state.updated_at = epoch_seconds();
+    write_json_atomic(&state_path, &state)?;
+    update_manifest_from_push_state(
+        &manifest_path,
+        &spec_hash,
+        &spec,
+        &state,
+        Some("running".to_string()),
+    )?;
+
+    let project_id = object.object_name.clone();
+    let upload_total = upload_total_for_progress(&input_path, &scope, limit)?;
+
+    let pb = if let Some(total) = upload_total {
+        bounded_bar(total as u64, "Uploading rows")
+    } else {
+        spinner_bar("Uploading rows")
+    };
+    pb.set_prefix("Preparing rows".to_string());
+    if let Some(total) = upload_total {
+        pb.set_position(state.items_done.min(total) as u64);
+    }
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_signal = Arc::clone(&interrupted);
+    let ctrlc_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            interrupted_signal.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let uploader_template = Logs3BatchUploader::new(
+        ctx.api_url.clone(),
+        ctx.login.api_key.clone(),
+        (!ctx.login.org_name.trim().is_empty()).then_some(ctx.login.org_name.clone()),
+    )
+    .context("failed to initialize logs3 uploader")?;
+
+    let mut batch: Vec<Map<String, Value>> = Vec::with_capacity(args.page_size);
+    let mut seen_roots: HashSet<String> = if state.line_offset > 0 {
+        collect_seen_roots_until_offset(&input_path, state.line_offset)?
+    } else {
+        HashSet::new()
+    };
+    if state.distinct_roots_done < seen_roots.len() {
+        state.distinct_roots_done = seen_roots.len();
+    }
+    let push_phase_started_at = epoch_seconds();
+    let push_baseline_roots_done = state.distinct_roots_done;
+    let push_baseline_items_done = state.items_done;
+    let push_baseline_bytes_sent = state.bytes_sent;
+    pb.set_message(push_progress_message_with_baseline(
+        &state,
+        push_phase_started_at,
+        push_baseline_roots_done,
+        push_baseline_items_done,
+        push_baseline_bytes_sent,
+        upload_total,
+    ));
+    if !json_output {
+        show_checkpoint_hint_line(&pb);
+    }
+
+    let worker_count = args.workers.max(1);
+    let mut selected_count: usize = state.items_done;
+    let mut batch_end_line_offset = state.line_offset;
+    let mut batch_distinct_roots_done = state.distinct_roots_done;
+    let mut next_batch_index = 0usize;
+    let mut next_commit_index = 0usize;
+    let mut pending_results: BTreeMap<usize, PushBatchResult> = BTreeMap::new();
+    let mut join_set = tokio::task::JoinSet::new();
+
+    let file = File::open(&input_path)
+        .with_context(|| format!("failed to open input {}", input_path.display()))?;
+    let reader = BufReader::new(file);
+
+    for (line_index, line) in reader.lines().enumerate() {
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+        let line = line.with_context(|| format!("failed reading {}", input_path.display()))?;
+        if line_index < state.line_offset {
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "invalid JSON in {} at line {}",
+                input_path.display(),
+                line_index + 1
+            )
+        })?;
+
+        if let Some(max_spans) = limit.filter(|_| matches!(scope, ScopeArg::Spans)) {
+            if selected_count >= max_spans {
+                break;
+            }
+        }
+
+        let root_id = row_root_span_id(&row).unwrap_or_else(|| "__missing__".to_string());
+        if let Some(max_traces) = limit.filter(|_| matches!(scope, ScopeArg::Traces)) {
+            let is_new_root = !seen_roots.contains(&root_id);
+            if is_new_root && seen_roots.len() >= max_traces {
+                break;
+            }
+        }
+        if !root_id.is_empty() {
+            seen_roots.insert(root_id);
+        }
+
+        prepare_row_for_upload(&mut row, &project_id, state.run_id.as_str(), selected_count);
+
+        selected_count += 1;
+        batch_end_line_offset = line_index + 1;
+        batch_distinct_roots_done = seen_roots.len();
+        batch.push(row);
+
+        if batch.len() >= args.page_size {
+            let work = PushBatchWork {
+                batch_index: next_batch_index,
+                rows: std::mem::take(&mut batch),
+                end_line_offset: batch_end_line_offset,
+                distinct_roots_done: batch_distinct_roots_done,
+            };
+            next_batch_index += 1;
+            pb.set_prefix("Uploading rows".to_string());
+            spawn_push_upload_task(
+                &mut join_set,
+                uploader_template.clone(),
+                work,
+                args.page_size,
+            );
+            batch_end_line_offset = state.line_offset;
+            batch_distinct_roots_done = state.distinct_roots_done;
+
+            while join_set.len() >= worker_count {
+                pb.set_prefix("Waiting uploads".to_string());
+                let result = join_set
+                    .join_next()
+                    .await
+                    .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
+                    .context("push upload worker join failed")??;
+                pending_results.insert(result.batch_index, result);
+                flush_ready_push_results(
+                    &mut pending_results,
+                    &mut next_commit_index,
+                    &mut state,
+                    &state_path,
+                    &pb,
+                    upload_total,
+                    push_phase_started_at,
+                    push_baseline_roots_done,
+                    push_baseline_items_done,
+                    push_baseline_bytes_sent,
+                )?;
+            }
+            pb.set_prefix("Preparing rows".to_string());
+        }
+    }
+
+    if !batch.is_empty() && !interrupted.load(Ordering::SeqCst) {
+        let work = PushBatchWork {
+            batch_index: next_batch_index,
+            rows: std::mem::take(&mut batch),
+            end_line_offset: batch_end_line_offset,
+            distinct_roots_done: batch_distinct_roots_done,
+        };
+        next_batch_index += 1;
+        pb.set_prefix("Uploading rows".to_string());
+        spawn_push_upload_task(
+            &mut join_set,
+            uploader_template.clone(),
+            work,
+            args.page_size,
+        );
+    }
+
+    pb.set_prefix("Finalizing uploads".to_string());
+    while let Some(joined) = join_set.join_next().await {
+        let result = joined.context("push upload worker join failed")??;
+        pending_results.insert(result.batch_index, result);
+        flush_ready_push_results(
+            &mut pending_results,
+            &mut next_commit_index,
+            &mut state,
+            &state_path,
+            &pb,
+            upload_total,
+            push_phase_started_at,
+            push_baseline_roots_done,
+            push_baseline_items_done,
+            push_baseline_bytes_sent,
+        )?;
+    }
+
+    if !pending_results.is_empty() || next_commit_index != next_batch_index {
+        bail!(
+            "push checkpoint mismatch: committed {next_commit_index} of {next_batch_index} batch(es)"
+        );
+    }
+
+    let was_interrupted = interrupted.load(Ordering::SeqCst);
+    ctrlc_task.abort();
+
+    if was_interrupted {
+        state.status = "interrupted".to_string();
+        state.updated_at = epoch_seconds();
+        write_json_atomic(&state_path, &state)?;
+        update_manifest_from_push_state(
+            &manifest_path,
+            &spec_hash,
+            &spec,
+            &state,
+            Some("interrupted".to_string()),
+        )?;
+        pb.finish_and_clear();
+
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "interrupted",
+                    "spec_dir": spec_dir,
+                    "input_path": input_path,
+                    "rows_uploaded": state.items_done,
+                    "pages_done": state.pages_done,
+                    "bytes_sent": state.bytes_sent,
+                    "message": "resume by rerunning the same command; use --fresh to restart"
+                }))?
+            );
+        } else {
+            println!("Push interrupted");
+            println!(
+                "  Uploaded so far: {} rows, {} batches, {} bytes",
+                format_usize_commas(state.items_done),
+                format_usize_commas(state.pages_done),
+                format_u64_commas(state.bytes_sent)
+            );
+            println!("  Resume: rerun the same command (use --fresh to restart)");
+        }
+        return Ok(());
+    }
+
+    state.status = "completed".to_string();
+    state.completed_at = Some(epoch_seconds());
+    state.updated_at = epoch_seconds();
+    write_json_atomic(&state_path, &state)?;
+    update_manifest_from_push_state(
+        &manifest_path,
+        &spec_hash,
+        &spec,
+        &state,
+        Some("completed".to_string()),
+    )?;
+    pb.finish_and_clear();
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "completed",
+                "spec_dir": spec_dir,
+                "input_path": input_path,
+                "rows_uploaded": state.items_done,
+                "pages_done": state.pages_done,
+                "bytes_sent": state.bytes_sent
+            }))?
+        );
+    } else {
+        let elapsed_secs = epoch_seconds().saturating_sub(state.started_at).max(1);
+        let traces_done = state.distinct_roots_done;
+        let spans_done = state.items_done;
+        let traces_per_sec = traces_done as f64 / elapsed_secs as f64;
+        let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
+        let bytes_per_sec = state.bytes_sent as f64 / elapsed_secs as f64;
+        println!("Push complete");
+        println!("  Input: {}", input_path.display());
+        println!("  Time: {}", format_duration(elapsed_secs));
+        println!("  Traces: {}", format_usize_commas(traces_done));
+        println!("  Spans: {}", format_usize_commas(spans_done));
+        println!("  Batches: {}", format_usize_commas(state.pages_done));
+        println!(
+            "  Data: {} ({} bytes)",
+            format_bytes(state.bytes_sent as f64),
+            format_u64_commas(state.bytes_sent)
+        );
+        println!(
+            "  Rates: {:.2} traces/s | {:.2} spans/s | {}/s",
+            traces_per_sec,
+            spans_per_sec,
+            format_bytes(bytes_per_sec)
+        );
+    }
+    Ok(())
+}
+
+fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
+    let object = parse_object_ref(&args.object_ref)?;
+    let (scope, limit) = resolve_status_scope_and_limit(args.traces, args.spans)?;
+
+    let spec = SyncSpec {
+        schema_version: STATE_SCHEMA_VERSION,
+        object_ref: args.object_ref.clone(),
+        object_type: object.object_type.clone(),
+        object_name: object.object_name.clone(),
+        direction: args.direction.as_str().to_string(),
+        scope: scope.as_str().to_string(),
+        filter: trim_optional(args.filter.clone()),
+        limit,
+        page_size: args.page_size,
+    };
+    let spec_hash = spec_hash(&spec)?;
+    let spec_dir = spec_dir(&args.root, &object, args.direction, &scope, &spec_hash);
+    let state_path = spec_dir.join("state.json");
+    let manifest_path = spec_dir.join("manifest.json");
+    let spec_path = spec_dir.join("spec.json");
+
+    if !spec_dir.exists() {
+        bail!("no sync state found for spec at {}", spec_dir.display());
+    }
+
+    let mut output = BTreeMap::<String, Value>::new();
+    output.insert(
+        "spec_dir".to_string(),
+        Value::String(spec_dir.display().to_string()),
+    );
+    output.insert("spec_hash".to_string(), Value::String(spec_hash));
+    output.insert(
+        "direction".to_string(),
+        Value::String(args.direction.as_str().to_string()),
+    );
+
+    if spec_path.exists() {
+        let spec_value: Value = read_json_file(&spec_path)?;
+        output.insert("spec".to_string(), spec_value);
+    }
+    if state_path.exists() {
+        let state_value: Value = read_json_file(&state_path)?;
+        output.insert("state".to_string(), state_value);
+    }
+    if manifest_path.exists() {
+        let manifest_value: Value = read_json_file(&manifest_path)?;
+        output.insert("manifest".to_string(), manifest_value);
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Spec: {}", spec_dir.display());
+        if let Some(state) = output.get("state") {
+            println!("State: {}", serde_json::to_string_pretty(state)?);
+        } else {
+            println!("State: (missing)");
+        }
+        if let Some(manifest) = output.get("manifest") {
+            println!("Manifest: {}", serde_json::to_string_pretty(manifest)?);
+        } else {
+            println!("Manifest: (missing)");
+        }
+    }
+    Ok(())
+}
+
+async fn execute_btql_query(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &str,
+) -> Result<BtqlResponse> {
+    let body = json!({
+        "query": query,
+        "fmt": "json",
+    });
+    let url = client.url("/btql");
+    let http = Client::new();
+    let api_key = ctx.login.api_key.clone();
+    let org_name = ctx.login.org_name.clone();
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+
+    let backoff = ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(BTQL_RETRY_BASE_DELAY_MS))
+        .with_multiplier(2.0)
+        .with_randomization_factor(0.2)
+        .with_max_interval(Duration::from_secs(BTQL_MAX_BACKOFF_SECS))
+        .with_max_elapsed_time(None)
+        .build();
+
+    let result = retry_notify(
+        backoff,
+        || {
+            let http = http.clone();
+            let url = url.clone();
+            let body = body.clone();
+            let api_key = api_key.clone();
+            let org_name = org_name.clone();
+            let attempt_counter = Arc::clone(&attempt_counter);
+
+            async move {
+                let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut request = http
+                    .post(&url)
+                    .bearer_auth(&api_key)
+                    .header("content-type", "application/json")
+                    .json(&body);
+                if !org_name.is_empty() {
+                    request = request.header("x-bt-org-name", org_name.clone());
+                }
+
+                match request.send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            return response.json::<BtqlResponse>().await.map_err(|err| {
+                                BackoffError::permanent(anyhow!("failed to parse BTQL response: {err}"))
+                            });
+                        }
+
+                        let body = response.text().await.unwrap_or_default();
+                        let should_retry = status.is_server_error() || status.as_u16() == 413;
+                        if should_retry && attempt < BTQL_MAX_ATTEMPTS {
+                            Err(BackoffError::transient(anyhow!(
+                                "BTQL retryable failure ({status}) on attempt {attempt}/{BTQL_MAX_ATTEMPTS}: {body}"
+                            )))
+                        } else {
+                            Err(BackoffError::permanent(anyhow!(
+                                "BTQL request failed ({status}) after {attempt} attempt(s): {body}"
+                            )))
+                        }
+                    }
+                    Err(err) => {
+                        if attempt < BTQL_MAX_ATTEMPTS {
+                            Err(BackoffError::transient(anyhow!(
+                                "BTQL network error on attempt {attempt}/{BTQL_MAX_ATTEMPTS}: {err}"
+                            )))
+                        } else {
+                            Err(BackoffError::permanent(anyhow!(
+                                "BTQL request failed after {attempt} attempt(s): {err}"
+                            )))
+                        }
+                    }
+                }
+            }
+        },
+        |err, delay| {
+            if std::io::stderr().is_terminal() {
+                eprintln!("Retrying BTQL in {delay:?}: {err}");
+            }
+        },
+    )
+    .await;
+
+    result.map_err(|err| {
+        let attempts = attempt_counter.load(Ordering::Relaxed).max(1);
+        anyhow!(err).context(format!("BTQL request failed after {attempts} attempt(s)"))
+    })
+}
+
+fn build_spans_query(
+    source_expr: &str,
+    filter: Option<&str>,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        "select: *".to_string(),
+        format!("from: {source_expr} spans"),
+        format!("limit: {}", page_size),
+        "sort: _pagination_key DESC".to_string(),
+    ];
+    if let Some(filter_expr) = filter.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("filter: {filter_expr}"));
+    }
+    if let Some(c) = cursor {
+        parts.push(format!("cursor: {}", btql_quote(c)));
+    }
+    parts.join(" | ")
+}
+
+fn build_root_discovery_query(
+    source_expr: &str,
+    filter: Option<&str>,
+    page_size: usize,
+    cursor: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        "select: root_span_id".to_string(),
+        format!("from: {source_expr} spans"),
+        format!("limit: {}", page_size),
+        "sort: _pagination_key DESC".to_string(),
+    ];
+    if let Some(filter_expr) = filter.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("filter: {filter_expr}"));
+    }
+    if let Some(c) = cursor {
+        parts.push(format!("cursor: {}", btql_quote(c)));
+    }
+    parts.join(" | ")
+}
+
+fn build_root_spans_query(
+    source_expr: &str,
+    root_span_ids: &[String],
+    page_size: usize,
+    cursor: Option<&str>,
+) -> String {
+    let root_filter = if root_span_ids.len() == 1 {
+        format!("root_span_id = {}", sql_quote(&root_span_ids[0]))
+    } else {
+        let joined = root_span_ids
+            .iter()
+            .map(|id| sql_quote(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("root_span_id IN [{joined}]")
+    };
+
+    let mut parts = vec![
+        "select: *".to_string(),
+        format!("from: {source_expr} spans"),
+        format!("filter: {root_filter}"),
+        format!("limit: {}", page_size),
+        "sort: _pagination_key ASC".to_string(),
+    ];
+    if let Some(c) = cursor {
+        parts.push(format!("cursor: {}", btql_quote(c)));
+    }
+    parts.join(" | ")
+}
+
+async fn submit_logs_batch(
+    uploader: &mut Logs3BatchUploader,
+    rows: &[Map<String, Value>],
+    page_size: usize,
+) -> Result<usize> {
+    let result = uploader
+        .upload_rows(rows, page_size)
+        .await
+        .context("logs3 upload failed")?;
+    Ok(result.bytes_processed)
+}
+
+fn spawn_push_upload_task(
+    join_set: &mut tokio::task::JoinSet<Result<PushBatchResult>>,
+    mut uploader: Logs3BatchUploader,
+    work: PushBatchWork,
+    page_size: usize,
+) {
+    join_set.spawn(async move {
+        let bytes = submit_logs_batch(&mut uploader, &work.rows, page_size).await?;
+        Ok(PushBatchResult {
+            batch_index: work.batch_index,
+            row_count: work.rows.len(),
+            bytes_sent: bytes as u64,
+            end_line_offset: work.end_line_offset,
+            distinct_roots_done: work.distinct_roots_done,
+        })
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_ready_push_results(
+    pending_results: &mut BTreeMap<usize, PushBatchResult>,
+    next_commit_index: &mut usize,
+    state: &mut PushState,
+    state_path: &Path,
+    pb: &ProgressBar,
+    upload_total: Option<usize>,
+    push_phase_started_at: u64,
+    push_baseline_roots_done: usize,
+    push_baseline_items_done: usize,
+    push_baseline_bytes_sent: u64,
+) -> Result<()> {
+    while let Some(result) = pending_results.remove(next_commit_index) {
+        commit_push_batch_state(
+            state,
+            result.row_count,
+            result.bytes_sent,
+            result.end_line_offset,
+            result.distinct_roots_done,
+        );
+        write_json_atomic(state_path, state)?;
+        if let Some(total) = upload_total {
+            pb.set_position(state.items_done.min(total) as u64);
+        }
+        pb.set_message(push_progress_message_with_baseline(
+            state,
+            push_phase_started_at,
+            push_baseline_roots_done,
+            push_baseline_items_done,
+            push_baseline_bytes_sent,
+            upload_total,
+        ));
+        *next_commit_index += 1;
+    }
+    Ok(())
+}
+
+fn prepare_row_for_upload(
+    row: &mut Map<String, Value>,
+    project_id: &str,
+    run_id: &str,
+    row_index: usize,
+) {
+    row.remove("_xact_id");
+    row.remove("_pagination_key");
+    row.remove("_async_scoring_state");
+    row.remove("org_id");
+    row.remove("created");
+
+    row.insert(
+        "project_id".to_string(),
+        Value::String(project_id.to_string()),
+    );
+    row.insert("log_id".to_string(), Value::String("g".to_string()));
+
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            row.get("span_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| format!("bt-sync-{run_id}-{row_index}"));
+    row.insert("id".to_string(), Value::String(id.clone()));
+
+    let span_id = row
+        .get("span_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| id.clone());
+    row.insert("span_id".to_string(), Value::String(span_id.clone()));
+
+    let root_span_id = row
+        .get("root_span_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| span_id.clone());
+    row.insert("root_span_id".to_string(), Value::String(root_span_id));
+
+    if !row.contains_key("span_parents") {
+        row.insert("span_parents".to_string(), Value::Array(Vec::new()));
+    }
+}
+
+fn commit_push_batch_state(
+    state: &mut PushState,
+    uploaded_rows: usize,
+    bytes_sent: u64,
+    batch_end_line_offset: usize,
+    distinct_roots_done: usize,
+) {
+    state.items_done += uploaded_rows;
+    state.pages_done += 1;
+    state.bytes_sent += bytes_sent;
+    state.line_offset = batch_end_line_offset;
+    state.distinct_roots_done = distinct_roots_done;
+    state.updated_at = epoch_seconds();
+}
+
+fn resolve_pull_scope_and_limit(
+    traces: Option<usize>,
+    spans: Option<usize>,
+) -> Result<(ScopeArg, usize)> {
+    match (traces, spans) {
+        (Some(_), Some(_)) => bail!("--traces and --spans are mutually exclusive"),
+        (Some(limit), None) => Ok((ScopeArg::Traces, nonzero(limit, "--traces")?)),
+        (None, Some(limit)) => Ok((ScopeArg::Spans, nonzero(limit, "--spans")?)),
+        (None, None) => Ok((ScopeArg::Traces, DEFAULT_PULL_LIMIT)),
+    }
+}
+
+fn resolve_push_scope_and_limit(
+    traces: Option<usize>,
+    spans: Option<usize>,
+) -> Result<(ScopeArg, Option<usize>)> {
+    match (traces, spans) {
+        (Some(_), Some(_)) => bail!("--traces and --spans are mutually exclusive"),
+        (Some(limit), None) => Ok((ScopeArg::Traces, Some(nonzero(limit, "--traces")?))),
+        (None, Some(limit)) => Ok((ScopeArg::Spans, Some(nonzero(limit, "--spans")?))),
+        (None, None) => Ok((ScopeArg::All, None)),
+    }
+}
+
+fn resolve_status_scope_and_limit(
+    traces: Option<usize>,
+    spans: Option<usize>,
+) -> Result<(ScopeArg, Option<usize>)> {
+    match (traces, spans) {
+        (Some(_), Some(_)) => bail!("--traces and --spans are mutually exclusive"),
+        (Some(limit), None) => Ok((ScopeArg::Traces, Some(nonzero(limit, "--traces")?))),
+        (None, Some(limit)) => Ok((ScopeArg::Spans, Some(nonzero(limit, "--spans")?))),
+        (None, None) => Ok((ScopeArg::All, None)),
+    }
+}
+
+fn nonzero(value: usize, flag: &str) -> Result<usize> {
+    if value == 0 {
+        bail!("{flag} must be > 0");
+    }
+    Ok(value)
+}
+
+async fn resolve_pull_object_ref(client: &ApiClient, object_ref: Option<&str>) -> Result<String> {
+    if let Some(value) = object_ref.map(str::trim).filter(|v| !v.is_empty()) {
+        return Ok(value.to_string());
+    }
+
+    if !std::io::stdin().is_terminal() {
+        bail!("OBJECT_REF is required in non-interactive mode");
+    }
+
+    let projects = list_projects(client).await?;
+    if projects.is_empty() {
+        bail!("no projects found for your organization");
+    }
+
+    let project_labels: Vec<String> = projects
+        .iter()
+        .map(|p| format!("{} ({})", p.name, p.id))
+        .collect();
+    let project_idx = fuzzy_select("Select project", &project_labels)?;
+    let project = &projects[project_idx];
+
+    let mut choices: Vec<InteractiveChoice> = vec![InteractiveChoice {
+        label: format!("project_logs:{}  [{}]", project.id, project.name),
+        object_ref: format!("project_logs:{}", project.id),
+    }];
+
+    match list_project_named_objects(client, "experiment", &project.id).await {
+        Ok(mut experiments) => {
+            experiments.sort_by(|a, b| a.name.cmp(&b.name));
+            choices.extend(experiments.into_iter().map(|obj| InteractiveChoice {
+                label: format!("experiment:{}  [{}]", obj.id, obj.name),
+                object_ref: format!("experiment:{}", obj.id),
+            }));
+        }
+        Err(err) => eprintln!(
+            "warning: failed to list experiments for {}: {err}",
+            project.name
+        ),
+    }
+
+    match list_project_named_objects(client, "dataset", &project.id).await {
+        Ok(mut datasets) => {
+            datasets.sort_by(|a, b| a.name.cmp(&b.name));
+            choices.extend(datasets.into_iter().map(|obj| InteractiveChoice {
+                label: format!("dataset:{}  [{}]", obj.id, obj.name),
+                object_ref: format!("dataset:{}", obj.id),
+            }));
+        }
+        Err(err) => eprintln!(
+            "warning: failed to list datasets for {}: {err}",
+            project.name
+        ),
+    }
+
+    let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
+    let object_idx = fuzzy_select("Select object", &labels)?;
+    Ok(choices[object_idx].object_ref.clone())
+}
+
+async fn list_project_named_objects(
+    client: &ApiClient,
+    object_type: &str,
+    project_id: &str,
+) -> Result<Vec<NamedObject>> {
+    let path = format!(
+        "/v1/{}?org_name={}&project_id={}",
+        encode(object_type),
+        encode(client.org_name()),
+        encode(project_id)
+    );
+    let response: NamedObjectListResponse = client.get(&path).await?;
+    Ok(response.objects)
+}
+
+fn parse_object_ref(value: &str) -> Result<ObjectRef> {
+    let parts: Vec<&str> = value.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        bail!(
+            "invalid object ref '{value}'. expected format object_type:object_id (for example: project_logs:<project_id>)"
+        );
+    }
+    let object_type = parts[0].trim();
+    let object_name = parts[1].trim();
+    if !matches!(object_type, "project_logs" | "experiment" | "dataset") {
+        bail!(
+            "unsupported object type '{object_type}'. supported types: project_logs, experiment, dataset"
+        );
+    }
+    if object_name.is_empty() {
+        bail!("object id cannot be empty in '{value}'");
+    }
+    Ok(ObjectRef {
+        object_type: object_type.to_string(),
+        object_name: object_name.to_string(),
+    })
+}
+
+fn btql_source_expr(object: &ObjectRef) -> Result<String> {
+    let source = match object.object_type.as_str() {
+        "project_logs" => "project_logs",
+        "experiment" => "experiment",
+        "dataset" => "dataset",
+        other => bail!(
+            "unsupported object type '{}' for pull. supported: project_logs, experiment, dataset",
+            other
+        ),
+    };
+    Ok(format!("{source}({})", sql_quote(&object.object_name)))
+}
+
+fn sanitize_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "_".to_string()
+    } else {
+        out
+    }
+}
+
+fn spec_dir(
+    root: &Path,
+    object: &ObjectRef,
+    direction: DirectionArg,
+    scope: &ScopeArg,
+    hash: &str,
+) -> PathBuf {
+    root.join(sanitize_segment(&object.object_type))
+        .join(sanitize_segment(&object.object_name))
+        .join(direction.as_str())
+        .join(scope.as_str())
+        .join(format!("spec_{}", &hash[..12]))
+}
+
+fn spec_hash(spec: &SyncSpec) -> Result<String> {
+    let canonical = serde_json::to_vec(spec).context("failed to serialize sync spec")?;
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Ok(out)
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+fn pull_spans_progress_message_with_baseline(
+    state: &PullState,
+    phase_started_at: u64,
+    baseline_roots_done: usize,
+    baseline_items_done: usize,
+    baseline_bytes_written: u64,
+) -> String {
+    let elapsed = elapsed_seconds(phase_started_at);
+    let traces_done = state.root_ids.len().saturating_sub(baseline_roots_done);
+    let spans_done = state.items_done.saturating_sub(baseline_items_done);
+    let bytes_done = state.bytes_written.saturating_sub(baseline_bytes_written);
+    let traces_per_sec = traces_done as f64 / elapsed;
+    let spans_per_sec = spans_done as f64 / elapsed;
+    let bytes_per_sec = bytes_done as f64 / elapsed;
+    let eta = format_eta(
+        state.items_done.min(state.limit),
+        state.limit,
+        spans_per_sec,
+    );
+    format!(
+        "{:.2} traces/s | {:.2} spans/s | {}/s | ETA {}",
+        traces_per_sec,
+        spans_per_sec,
+        format_bytes(bytes_per_sec),
+        eta
+    )
+}
+
+fn pull_trace_progress_message_with_baseline(
+    state: &PullState,
+    phase_started_at: u64,
+    baseline_completed_roots: usize,
+    baseline_items_done: usize,
+    baseline_bytes_written: u64,
+) -> String {
+    let elapsed = elapsed_seconds(phase_started_at);
+    let traces_done = completed_root_count(state).saturating_sub(baseline_completed_roots);
+    let total_traces = state
+        .limit
+        .saturating_sub(baseline_completed_roots)
+        .max(traces_done);
+    let spans_done = state.items_done.saturating_sub(baseline_items_done);
+    let bytes_done = state.bytes_written.saturating_sub(baseline_bytes_written);
+    let traces_per_sec = traces_done as f64 / elapsed;
+    let spans_per_sec = spans_done as f64 / elapsed;
+    let bytes_per_sec = bytes_done as f64 / elapsed;
+    let eta = format_eta(traces_done, total_traces, traces_per_sec);
+    format!(
+        "{:.2} traces/s | {:.2} spans/s | {}/s | ETA {}",
+        traces_per_sec,
+        spans_per_sec,
+        format_bytes(bytes_per_sec),
+        eta
+    )
+}
+
+fn push_progress_message_with_baseline(
+    state: &PushState,
+    phase_started_at: u64,
+    baseline_roots_done: usize,
+    baseline_items_done: usize,
+    baseline_bytes_sent: u64,
+    upload_total: Option<usize>,
+) -> String {
+    let elapsed = elapsed_seconds(phase_started_at);
+    let traces_done = state
+        .distinct_roots_done
+        .saturating_sub(baseline_roots_done);
+    let spans_done = state.items_done.saturating_sub(baseline_items_done);
+    let bytes_done = state.bytes_sent.saturating_sub(baseline_bytes_sent);
+    let traces_per_sec = traces_done as f64 / elapsed;
+    let spans_per_sec = spans_done as f64 / elapsed;
+    let bytes_per_sec = bytes_done as f64 / elapsed;
+
+    let eta = if let Some(total_spans) = upload_total {
+        format_eta(
+            state.items_done.min(total_spans),
+            total_spans,
+            spans_per_sec,
+        )
+    } else if state.scope == ScopeArg::Traces.as_str() {
+        match state.limit {
+            Some(trace_limit) => {
+                let total_traces = trace_limit
+                    .saturating_sub(baseline_roots_done)
+                    .max(traces_done);
+                format_eta(traces_done, total_traces, traces_per_sec)
+            }
+            None => "--:--".to_string(),
+        }
+    } else {
+        "--:--".to_string()
+    };
+
+    format!(
+        "{:.2} traces/s | {:.2} spans/s | {}/s | ETA {}",
+        traces_per_sec,
+        spans_per_sec,
+        format_bytes(bytes_per_sec),
+        eta
+    )
+}
+
+fn format_eta(done: usize, total: usize, rate_per_sec: f64) -> String {
+    let remaining = total.saturating_sub(done);
+    if remaining == 0 {
+        return "00:00".to_string();
+    }
+    if rate_per_sec <= 0.0 {
+        return "--:--".to_string();
+    }
+    let eta_secs = (remaining as f64 / rate_per_sec).ceil() as u64;
+    format_duration(eta_secs)
+}
+
+fn elapsed_seconds(started_at: u64) -> f64 {
+    let now = epoch_seconds();
+    let elapsed = now.saturating_sub(started_at).max(1);
+    elapsed as f64
+}
+
+fn format_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes.max(0.0);
+    let mut unit_idx = 0usize;
+    while value >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit_idx])
+}
+
+fn format_duration(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn format_usize_commas(value: usize) -> String {
+    format_u64_commas(value as u64)
+}
+
+fn format_u64_commas(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn new_pull_state(
+    scope: &ScopeArg,
+    limit: usize,
+    page_size: usize,
+    filter: Option<String>,
+    cursor: Option<String>,
+    output_path: String,
+) -> PullState {
+    let now = epoch_seconds();
+    PullState {
+        schema_version: STATE_SCHEMA_VERSION,
+        run_id: format!("run-{}", now),
+        status: "running".to_string(),
+        phase: if matches!(scope, ScopeArg::Traces) {
+            "discover_roots".to_string()
+        } else {
+            "spans".to_string()
+        },
+        scope: scope.as_str().to_string(),
+        limit,
+        filter,
+        page_size,
+        cursor,
+        root_discovery_cursor: None,
+        root_ids: Vec::new(),
+        current_root_index: 0,
+        current_root_cursor: None,
+        trace_chunks: Vec::new(),
+        items_done: 0,
+        pages_done: 0,
+        bytes_written: 0,
+        output_path,
+        started_at: now,
+        updated_at: now,
+        completed_at: None,
+    }
+}
+
+fn new_push_state(
+    scope: String,
+    limit: Option<usize>,
+    page_size: usize,
+    source_path: String,
+) -> PushState {
+    let now = epoch_seconds();
+    PushState {
+        schema_version: STATE_SCHEMA_VERSION,
+        run_id: format!("run-{}", now),
+        status: "running".to_string(),
+        scope,
+        limit,
+        page_size,
+        source_path,
+        line_offset: 0,
+        items_done: 0,
+        pages_done: 0,
+        bytes_sent: 0,
+        distinct_roots_done: 0,
+        started_at: now,
+        updated_at: now,
+        completed_at: None,
+    }
+}
+
+fn open_ndjson_writer(path: &Path, append: bool) -> Result<BufWriter<File>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(path)
+        .with_context(|| format!("failed to open output file {}", path.display()))?;
+    Ok(BufWriter::new(file))
+}
+
+fn write_ndjson_row(writer: &mut BufWriter<File>, row: &Map<String, Value>) -> Result<usize> {
+    let encoded = serde_json::to_string(row).context("failed to serialize row to NDJSON")?;
+    writer
+        .write_all(encoded.as_bytes())
+        .context("failed to write NDJSON row")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write NDJSON newline")?;
+    Ok(encoded.len() + 1)
+}
+
+fn update_manifest_from_pull_state(
+    path: &Path,
+    spec_hash: &str,
+    spec: &SyncSpec,
+    state: &PullState,
+    status_override: Option<String>,
+) -> Result<()> {
+    let manifest = SyncManifest {
+        schema_version: STATE_SCHEMA_VERSION,
+        spec_hash: spec_hash.to_string(),
+        spec: spec.clone(),
+        last_run_id: state.run_id.clone(),
+        status: status_override.unwrap_or_else(|| state.status.clone()),
+        items_done: state.items_done,
+        pages_done: state.pages_done,
+        bytes_processed: state.bytes_written,
+        output_path: Some(state.output_path.clone()),
+        input_path: None,
+        started_at: state.started_at,
+        updated_at: state.updated_at,
+        completed_at: state.completed_at,
+        message: None,
+    };
+    write_json_atomic(path, &manifest)
+}
+
+fn update_manifest_from_push_state(
+    path: &Path,
+    spec_hash: &str,
+    spec: &SyncSpec,
+    state: &PushState,
+    status_override: Option<String>,
+) -> Result<()> {
+    let manifest = SyncManifest {
+        schema_version: STATE_SCHEMA_VERSION,
+        spec_hash: spec_hash.to_string(),
+        spec: spec.clone(),
+        last_run_id: state.run_id.clone(),
+        status: status_override.unwrap_or_else(|| state.status.clone()),
+        items_done: state.items_done,
+        pages_done: state.pages_done,
+        bytes_processed: state.bytes_sent,
+        output_path: None,
+        input_path: Some(state.source_path.clone()),
+        started_at: state.started_at,
+        updated_at: state.updated_at,
+        completed_at: state.completed_at,
+        message: None,
+    };
+    write_json_atomic(path, &manifest)
+}
+
+fn resolve_default_push_input(root: &Path, object: &ObjectRef) -> Result<PathBuf> {
+    let base = root
+        .join(sanitize_segment(&object.object_type))
+        .join(sanitize_segment(&object.object_name))
+        .join("pull");
+    if !base.exists() {
+        bail!(
+            "no pull data found under {}. run `bt sync pull {}:{} ...` first or pass --in",
+            base.display(),
+            object.object_type,
+            object.object_name
+        );
+    }
+
+    let mut best: Option<(u64, PathBuf)> = None;
+    for scope_dir in
+        fs::read_dir(&base).with_context(|| format!("failed to read {}", base.display()))?
+    {
+        let scope_dir = scope_dir?;
+        if !scope_dir.file_type()?.is_dir() {
+            continue;
+        }
+        for spec_dir in fs::read_dir(scope_dir.path())? {
+            let spec_dir = spec_dir?;
+            if !spec_dir.file_type()?.is_dir() {
+                continue;
+            }
+            let manifest_path = spec_dir.path().join("manifest.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let manifest = read_json_file::<SyncManifest>(&manifest_path)?;
+            if manifest.status != "completed" {
+                continue;
+            }
+            let output_path = match manifest.output_path {
+                Some(path) => PathBuf::from(path),
+                None => continue,
+            };
+            let updated_at = manifest.updated_at;
+            if best
+                .as_ref()
+                .map(|(best_time, _)| updated_at > *best_time)
+                .unwrap_or(true)
+            {
+                best = Some((updated_at, output_path));
+            }
+        }
+    }
+
+    best.map(|(_, path)| path).ok_or_else(|| {
+        anyhow!(
+            "no completed pull output found for object {}",
+            object.object_name
+        )
+    })
+}
+
+fn upload_total_for_progress(
+    input_path: &Path,
+    scope: &ScopeArg,
+    limit: Option<usize>,
+) -> Result<Option<usize>> {
+    if matches!(scope, ScopeArg::Traces) {
+        return Ok(None);
+    }
+
+    let total_lines = count_lines(input_path)?;
+    let capped = limit.map(|l| l.min(total_lines)).unwrap_or(total_lines);
+    Ok(Some(capped))
+}
+
+fn count_lines(path: &Path) -> Result<usize> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut count = 0usize;
+    for line in reader.lines() {
+        line.with_context(|| format!("failed reading {}", path.display()))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn collect_seen_roots_until_offset(path: &Path, line_offset: usize) -> Result<HashSet<String>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut seen = HashSet::new();
+    for (line_index, line) in reader.lines().enumerate() {
+        if line_index >= line_offset {
+            break;
+        }
+        let line = line.with_context(|| format!("failed reading {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "invalid JSON in {} at line {} while rebuilding trace resume state",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        if let Some(root_id) = row_root_span_id(&row) {
+            seen.insert(root_id);
+        }
+    }
+    Ok(seen)
+}
+
+fn row_root_span_id(row: &Map<String, Value>) -> Option<String> {
+    value_as_string(row.get("root_span_id"))
+        .or_else(|| value_as_string(row.get("span_id")))
+        .or_else(|| value_as_string(row.get("id")))
+}
+
+fn value_as_string(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(s)) => Some(s.to_string()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let bytes = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "failed to move temporary file {} to {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn btql_quote(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")))
+}
+
+fn sql_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn show_checkpoint_hint_line(pb: &ProgressBar) {
+    if std::io::stderr().is_terminal() {
+        pb.println("  Ctrl+C safely checkpoints; rerun same command to resume (--fresh restarts).");
+    }
+}
+
+fn bounded_bar(total: u64, message: &str) -> ProgressBar {
+    if !std::io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} {prefix} [{bar:40.cyan/blue}] {pos}/{len} ({percent:>3}%) | {msg}",
+        )
+        .unwrap(),
+    );
+    pb.set_prefix(message.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
+fn spinner_bar(message: &str) -> ProgressBar {
+    if !std::io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {prefix} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "]),
+    );
+    pb.set_prefix(message.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_checkpoint_line_offset_advances_only_after_commit() {
+        let mut state = new_push_state(
+            "traces".to_string(),
+            Some(10),
+            2,
+            "input.ndjson".to_string(),
+        );
+        assert_eq!(state.line_offset, 0);
+
+        // Simulate scanning rows into an in-memory batch but getting interrupted before upload.
+        let _scanned_until = 2usize;
+        assert_eq!(state.line_offset, 0);
+
+        commit_push_batch_state(&mut state, 2, 128, 2, 1);
+
+        assert_eq!(state.items_done, 2);
+        assert_eq!(state.pages_done, 1);
+        assert_eq!(state.bytes_sent, 128);
+        assert_eq!(state.line_offset, 2);
+        assert_eq!(state.distinct_roots_done, 1);
+    }
+
+    #[test]
+    fn resume_root_rebuild_respects_committed_line_offset() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-resume-root-rebuild-{}-{}.ndjson",
+            std::process::id(),
+            unique
+        ));
+
+        fs::write(
+            &path,
+            "{\"root_span_id\":\"r1\"}\n{\"root_span_id\":\"r2\"}\n{\"root_span_id\":\"r3\"}\n",
+        )?;
+
+        let seen = collect_seen_roots_until_offset(&path, 2)?;
+        assert!(seen.contains("r1"));
+        assert!(seen.contains("r2"));
+        assert!(!seen.contains("r3"));
+
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn push_flush_results_commits_in_order() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let state_path = std::env::temp_dir().join(format!(
+            "bt-sync-push-state-{}-{}.json",
+            std::process::id(),
+            unique
+        ));
+
+        let mut state =
+            new_push_state("spans".to_string(), Some(10), 2, "input.ndjson".to_string());
+        let mut pending = BTreeMap::new();
+        let mut next_commit_index = 0usize;
+        let pb = ProgressBar::hidden();
+        let started_at = epoch_seconds();
+
+        pending.insert(
+            1,
+            PushBatchResult {
+                batch_index: 1,
+                row_count: 2,
+                bytes_sent: 200,
+                end_line_offset: 4,
+                distinct_roots_done: 2,
+            },
+        );
+        flush_ready_push_results(
+            &mut pending,
+            &mut next_commit_index,
+            &mut state,
+            &state_path,
+            &pb,
+            Some(10),
+            started_at,
+            0,
+            0,
+            0,
+        )?;
+        assert_eq!(next_commit_index, 0);
+        assert_eq!(state.items_done, 0);
+        assert_eq!(state.line_offset, 0);
+
+        pending.insert(
+            0,
+            PushBatchResult {
+                batch_index: 0,
+                row_count: 2,
+                bytes_sent: 100,
+                end_line_offset: 2,
+                distinct_roots_done: 1,
+            },
+        );
+        flush_ready_push_results(
+            &mut pending,
+            &mut next_commit_index,
+            &mut state,
+            &state_path,
+            &pb,
+            Some(10),
+            started_at,
+            0,
+            0,
+            0,
+        )?;
+
+        assert_eq!(next_commit_index, 2);
+        assert_eq!(state.items_done, 4);
+        assert_eq!(state.pages_done, 2);
+        assert_eq!(state.bytes_sent, 300);
+        assert_eq!(state.line_offset, 4);
+        assert_eq!(state.distinct_roots_done, 2);
+        assert!(pending.is_empty());
+
+        let _ = fs::remove_file(&state_path);
+        Ok(())
+    }
+}
