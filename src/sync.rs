@@ -23,7 +23,7 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::http::ApiClient;
 use crate::login::{login, LoginContext};
-use crate::projects::api::list_projects;
+use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::fuzzy_select;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -97,7 +97,10 @@ struct PullArgs {
 
 #[derive(Debug, Clone, Args)]
 struct PushArgs {
-    /// Object reference, format: object_type:object_id (e.g. project_logs:1234-uuid)
+    /// Destination object reference, format object_type:object_id_or_name.
+    /// Supported:
+    /// - project_logs:<project-id|project-name>
+    /// - experiment:<experiment-id|experiment-name> (requires --project for names)
     object_ref: String,
 
     /// Input JSONL/NDJSON file or directory of part files. If omitted, bt sync uses the latest completed pull output.
@@ -337,6 +340,14 @@ struct InteractiveChoice {
     object_ref: String,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedPushDestination {
+    object: ObjectRef,
+    object_ref: String,
+    project_id: String,
+    run_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct PushBatchWork {
     batch_index: usize,
@@ -453,7 +464,8 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
         }
         SyncCommand::Push(push) => {
             let ctx = login(&base).await?;
-            run_push(base.json, &ctx, push).await
+            let client = ApiClient::new(&ctx)?;
+            run_push(base.json, &ctx, &client, base.project.as_deref(), push).await
         }
         SyncCommand::Status(status) => run_status(base.json, status),
     }
@@ -1370,20 +1382,20 @@ async fn process_trace_chunk(
     }
 }
 
-async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Result<()> {
-    let object = parse_object_ref(&args.object_ref)?;
-    if object.object_type != "project_logs" {
-        bail!(
-            "push currently supports only project_logs:<project_id>; got {}:{}",
-            object.object_type,
-            object.object_name
-        );
-    }
+async fn run_push(
+    json_output: bool,
+    ctx: &LoginContext,
+    client: &ApiClient,
+    project_selector: Option<&str>,
+    args: PushArgs,
+) -> Result<()> {
+    let destination = resolve_push_destination(client, &args.object_ref, project_selector).await?;
+    let object = destination.object.clone();
     let (scope, limit) = resolve_push_scope_and_limit(args.traces, args.spans)?;
 
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
-        object_ref: args.object_ref.clone(),
+        object_ref: destination.object_ref.clone(),
         object_type: object.object_type.clone(),
         object_name: object.object_name.clone(),
         direction: DirectionArg::Push.as_str().to_string(),
@@ -1420,15 +1432,28 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
     }
 
     let mut state = if args.fresh || !state_path.exists() {
-        new_push_state(
+        let mut state = new_push_state(
             scope.as_str().to_string(),
             limit,
             args.page_size,
             input_path.to_string_lossy().to_string(),
-        )
+        );
+        if let Some(run_id) = destination.run_id.as_deref() {
+            state.run_id = run_id.to_string();
+        }
+        state
     } else {
         read_json_file::<PushState>(&state_path)?
     };
+    if let Some(run_id) = destination.run_id.as_deref() {
+        if state.run_id != run_id {
+            bail!(
+                "existing push state run_id '{}' does not match destination experiment id '{}'; rerun with --fresh",
+                state.run_id,
+                run_id
+            );
+        }
+    }
 
     if state.status == RunStatus::Completed && !args.fresh {
         if json_output {
@@ -1462,7 +1487,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         Some(RunStatus::Running),
     )?;
 
-    let project_id = object.object_name.clone();
+    let project_id = destination.project_id.clone();
     let input_files = resolve_push_input_files(&input_path)?;
     let upload_total = upload_total_for_progress(&input_files, &scope, limit)?;
 
@@ -2584,11 +2609,224 @@ async fn list_project_named_objects(
     Ok(response.objects)
 }
 
+async fn resolve_push_destination(
+    client: &ApiClient,
+    raw_object_ref: &str,
+    project_selector: Option<&str>,
+) -> Result<ResolvedPushDestination> {
+    let requested = parse_object_ref(raw_object_ref)?;
+    match requested.object_type.as_str() {
+        "project_logs" => {
+            let project_selector = requested.object_name.trim();
+            let projects = list_projects(client).await?;
+            let project = match find_project_by_selector(&projects, project_selector) {
+                Ok(project) => project.clone(),
+                Err(err) => {
+                    if is_uuid_like(project_selector) {
+                        return Err(err);
+                    }
+                    let created = create_project(client, project_selector).await.with_context(|| {
+                        format!(
+                            "project '{}' not found, and creating it failed",
+                            project_selector
+                        )
+                    })?;
+                    if std::io::stderr().is_terminal() {
+                        eprintln!(
+                            "Project '{}' not found; created new project '{}' ({}) for push.",
+                            project_selector, created.name, created.id
+                        );
+                    }
+                    created
+                }
+            };
+            let object = ObjectRef {
+                object_type: "project_logs".to_string(),
+                object_name: project.id.clone(),
+            };
+            Ok(ResolvedPushDestination {
+                object_ref: format!("project_logs:{}", project.id),
+                object,
+                project_id: project.id.clone(),
+                run_id: None,
+            })
+        }
+        "experiment" => {
+            let experiment_selector = requested.object_name.trim();
+            let project_selector = project_selector
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            let projects = list_projects(client).await?;
+            if let Some(project_selector) = project_selector {
+                let project = find_project_by_selector(&projects, project_selector)?;
+                let experiments = list_project_named_objects(client, "experiment", &project.id).await?;
+                let experiment = find_named_object_by_selector(
+                    &experiments,
+                    experiment_selector,
+                    "experiment",
+                    Some(&project.name),
+                )?;
+                let object = ObjectRef {
+                    object_type: "experiment".to_string(),
+                    object_name: experiment.id.clone(),
+                };
+                return Ok(ResolvedPushDestination {
+                    object_ref: format!("experiment:{}", experiment.id),
+                    object,
+                    project_id: project.id.clone(),
+                    run_id: Some(experiment.id.clone()),
+                });
+            }
+
+            for project in &projects {
+                let experiments = list_project_named_objects(client, "experiment", &project.id)
+                    .await
+                    .with_context(|| {
+                        format!("failed to list experiments for project '{}'", project.name)
+                    })?;
+                if let Some(experiment) = experiments.iter().find(|value| value.id == experiment_selector)
+                {
+                    let object = ObjectRef {
+                        object_type: "experiment".to_string(),
+                        object_name: experiment.id.clone(),
+                    };
+                    return Ok(ResolvedPushDestination {
+                        object_ref: format!("experiment:{}", experiment.id),
+                        object,
+                        project_id: project.id.clone(),
+                        run_id: Some(experiment.id.clone()),
+                    });
+                }
+            }
+            if is_uuid_like(experiment_selector) {
+                bail!(
+                    "experiment id '{}' not found in any accessible project in org '{}'",
+                    experiment_selector,
+                    client.org_name()
+                );
+            }
+            bail!(
+                "experiment '{}' was not found by id across accessible projects; if this is a name, pass --project <project-name> (or set BRAINTRUST_DEFAULT_PROJECT)",
+                experiment_selector
+            );
+        }
+        other => bail!(
+            "push destination type '{}' is unsupported. use project_logs:<project-id|project-name> or experiment:<experiment-id|experiment-name>",
+            other
+        ),
+    }
+}
+
+fn find_project_by_selector<'a>(projects: &'a [Project], selector: &str) -> Result<&'a Project> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("project selector cannot be empty");
+    }
+
+    let mut id_matches = projects.iter().filter(|project| project.id == selector);
+    if let Some(project) = id_matches.next() {
+        return Ok(project);
+    }
+
+    let exact_name_matches: Vec<&Project> = projects
+        .iter()
+        .filter(|project| project.name == selector)
+        .collect();
+    if exact_name_matches.len() == 1 {
+        return Ok(exact_name_matches[0]);
+    }
+    if exact_name_matches.len() > 1 {
+        bail!(
+            "project name '{}' matches {} projects; use project_logs:<project-id> or --project <project-id>",
+            selector,
+            exact_name_matches.len()
+        );
+    }
+
+    let casefold_matches: Vec<&Project> = projects
+        .iter()
+        .filter(|project| project.name.eq_ignore_ascii_case(selector))
+        .collect();
+    if casefold_matches.len() == 1 {
+        return Ok(casefold_matches[0]);
+    }
+    if casefold_matches.len() > 1 {
+        bail!(
+            "project selector '{}' is ambiguous; use a project id",
+            selector
+        );
+    }
+
+    bail!("project '{}' not found", selector);
+}
+
+fn find_named_object_by_selector<'a>(
+    objects: &'a [NamedObject],
+    selector: &str,
+    object_type: &str,
+    project_name: Option<&str>,
+) -> Result<&'a NamedObject> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("{object_type} selector cannot be empty");
+    }
+
+    let mut id_matches = objects.iter().filter(|object| object.id == selector);
+    if let Some(object) = id_matches.next() {
+        return Ok(object);
+    }
+
+    let exact_name_matches: Vec<&NamedObject> = objects
+        .iter()
+        .filter(|object| object.name == selector)
+        .collect();
+    if exact_name_matches.len() == 1 {
+        return Ok(exact_name_matches[0]);
+    }
+    if exact_name_matches.len() > 1 {
+        if let Some(project_name) = project_name {
+            bail!(
+                "{object_type} name '{}' is duplicated in project '{}'; use {object_type}:<id>",
+                selector,
+                project_name
+            );
+        }
+        bail!(
+            "{object_type} name '{}' is duplicated; use {object_type}:<id>",
+            selector
+        );
+    }
+
+    let casefold_matches: Vec<&NamedObject> = objects
+        .iter()
+        .filter(|object| object.name.eq_ignore_ascii_case(selector))
+        .collect();
+    if casefold_matches.len() == 1 {
+        return Ok(casefold_matches[0]);
+    }
+    if casefold_matches.len() > 1 {
+        bail!(
+            "{object_type} selector '{}' is ambiguous; use {object_type}:<id>",
+            selector
+        );
+    }
+
+    if let Some(project_name) = project_name {
+        bail!(
+            "{object_type} '{}' not found in project '{}'",
+            selector,
+            project_name
+        );
+    }
+    bail!("{object_type} '{}' not found", selector);
+}
+
 fn parse_object_ref(value: &str) -> Result<ObjectRef> {
     let parts: Vec<&str> = value.splitn(2, ':').collect();
     if parts.len() != 2 {
         bail!(
-            "invalid object ref '{value}'. expected format object_type:object_id (for example: project_logs:<project_id>)"
+            "invalid object ref '{value}'. expected format object_type:object_selector (for example: project_logs:<project_id>)"
         );
     }
     let object_type = parts[0].trim();
@@ -2599,12 +2837,32 @@ fn parse_object_ref(value: &str) -> Result<ObjectRef> {
         );
     }
     if object_name.is_empty() {
-        bail!("object id cannot be empty in '{value}'");
+        bail!("object selector cannot be empty in '{value}'");
     }
     Ok(ObjectRef {
         object_type: object_type.to_string(),
         object_name: object_name.to_string(),
     })
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (idx, b) in bytes.iter().enumerate() {
+        let is_hyphen = matches!(idx, 8 | 13 | 18 | 23);
+        if is_hyphen {
+            if *b != b'-' {
+                return false;
+            }
+        } else if !(*b as char).is_ascii_hexdigit() {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn btql_source_expr(object: &ObjectRef) -> Result<String> {
@@ -3737,6 +3995,75 @@ mod tests {
             .ok_or_else(|| anyhow!("expected serialized spec object"))?;
         assert_eq!(obj.get("include_vectors"), Some(&Value::Bool(true)));
         Ok(())
+    }
+
+    #[test]
+    fn find_project_by_selector_supports_id_and_name() -> Result<()> {
+        let projects = vec![
+            Project {
+                id: "p1".to_string(),
+                name: "Alpha".to_string(),
+                org_id: "o1".to_string(),
+                description: None,
+            },
+            Project {
+                id: "p2".to_string(),
+                name: "Beta".to_string(),
+                org_id: "o1".to_string(),
+                description: None,
+            },
+        ];
+
+        assert_eq!(find_project_by_selector(&projects, "p1")?.name, "Alpha");
+        assert_eq!(find_project_by_selector(&projects, "Beta")?.id, "p2");
+        Ok(())
+    }
+
+    #[test]
+    fn find_project_by_selector_rejects_ambiguous_casefold_match() {
+        let projects = vec![
+            Project {
+                id: "p1".to_string(),
+                name: "Alpha".to_string(),
+                org_id: "o1".to_string(),
+                description: None,
+            },
+            Project {
+                id: "p2".to_string(),
+                name: "ALPHA".to_string(),
+                org_id: "o1".to_string(),
+                description: None,
+            },
+        ];
+
+        let err = find_project_by_selector(&projects, "alpha").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn find_named_object_by_selector_rejects_duplicate_names() {
+        let objects = vec![
+            NamedObject {
+                id: "e1".to_string(),
+                name: "Daily Eval".to_string(),
+            },
+            NamedObject {
+                id: "e2".to_string(),
+                name: "Daily Eval".to_string(),
+            },
+        ];
+
+        let err =
+            find_named_object_by_selector(&objects, "Daily Eval", "experiment", Some("Alpha"))
+                .unwrap_err();
+        assert!(err.to_string().contains("duplicated"));
+    }
+
+    #[test]
+    fn is_uuid_like_only_accepts_uuid_shape() {
+        assert!(is_uuid_like("d341311b-2103-4065-a607-34f2263dd548"));
+        assert!(!is_uuid_like("not-a-uuid"));
+        assert!(!is_uuid_like("d341311b21034065a60734f2263dd548"));
     }
 
     #[test]
