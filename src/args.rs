@@ -25,6 +25,10 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true)]
     pub api_key: Option<String>,
 
+    /// Prefer profile credentials even if BRAINTRUST_API_KEY/--api-key is set.
+    #[arg(long, global = true)]
+    pub prefer_profile: bool,
+
     /// Override API URL (or via BRAINTRUST_API_URL)
     #[arg(long, env = "BRAINTRUST_API_URL", global = true)]
     pub api_url: Option<String>,
