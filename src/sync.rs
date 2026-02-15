@@ -491,14 +491,7 @@ async fn run_pull(
         read_json_file::<PullState>(&state_path)?
     };
 
-    let suspicious_empty_trace_completion = !fresh
-        && state.status == RunStatus::Completed
-        && matches!(scope, ScopeArg::Traces)
-        && state.items_done == 0
-        && state.bytes_written == 0
-        && state.root_ids.is_empty();
-
-    if state.status == RunStatus::Completed && !fresh && !suspicious_empty_trace_completion {
+    if state.status == RunStatus::Completed && !fresh {
         if json_output {
             println!(
                 "{}",
@@ -520,26 +513,9 @@ async fn run_pull(
         return Ok(());
     }
 
-    if suspicious_empty_trace_completion && !json_output {
-        eprintln!(
-            "warning: detected stale empty completed trace state for this spec; restarting discovery"
-        );
-    }
-
-    if suspicious_empty_trace_completion {
-        state = new_pull_state(
-            &scope,
-            limit,
-            args.page_size,
-            spec.filter.clone(),
-            args.cursor.clone(),
-            output_path.to_string_lossy().to_string(),
-        );
-    }
-
     let previous_output_path = state.output_path.clone();
 
-    let effective_fresh = fresh || suspicious_empty_trace_completion;
+    let effective_fresh = fresh;
 
     if effective_fresh && output_path.exists() {
         if output_path.is_dir() {
@@ -881,6 +857,7 @@ async fn pull_traces_mode(
         let progress = trace_fetch_bar.clone();
         let status_line = status_line.clone();
         let page_size = spec.page_size;
+        let fetch_filter = spec.filter.clone();
         let btql_retry_tracker = Arc::clone(btql_retry_tracker);
         let trace_progress_roots = Arc::clone(&trace_progress_roots);
 
@@ -901,6 +878,7 @@ async fn pull_traces_mode(
                     &client,
                     &ctx,
                     &source_expr,
+                    fetch_filter.as_deref(),
                     page_size,
                     &state_path,
                     chunk_idx,
@@ -1175,6 +1153,7 @@ async fn process_trace_chunk(
     client: &ApiClient,
     ctx: &LoginContext,
     source_expr: &str,
+    fetch_filter: Option<&str>,
     page_size: usize,
     state_path: &Path,
     chunk_idx: usize,
@@ -1205,7 +1184,13 @@ async fn process_trace_chunk(
             return Ok(());
         }
 
-        let query = build_root_spans_query(source_expr, &root_chunk, page_size, cursor.as_deref());
+        let query = build_root_spans_query(
+            source_expr,
+            &root_chunk,
+            fetch_filter,
+            page_size,
+            cursor.as_deref(),
+        );
         let response =
             execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
         let batch_count = response.data.len();
@@ -1921,6 +1906,7 @@ fn build_root_discovery_query(
 fn build_root_spans_query(
     source_expr: &str,
     root_span_ids: &[String],
+    filter: Option<&str>,
     page_size: usize,
     cursor: Option<&str>,
 ) -> String {
@@ -1936,10 +1922,17 @@ fn build_root_spans_query(
         format!("(root_span_id IN [{joined}] OR span_id IN [{joined}] OR id IN [{joined}])")
     };
 
+    let combined_filter = if let Some(filter_expr) = filter.map(str::trim).filter(|s| !s.is_empty())
+    {
+        format!("({root_filter}) AND ({filter_expr})")
+    } else {
+        root_filter
+    };
+
     let mut parts = vec![
         "select: *".to_string(),
         format!("from: {source_expr} spans"),
-        format!("filter: {root_filter}"),
+        format!("filter: {combined_filter}"),
         format!("limit: {}", page_size),
         "sort: _pagination_key ASC".to_string(),
     ];
@@ -3256,5 +3249,21 @@ mod tests {
 
         state.root_ids.push("r1".to_string());
         assert!(!trace_state_needs_discovery(&state));
+    }
+
+    #[test]
+    fn root_spans_query_applies_user_filter() {
+        let roots = vec!["root-1".to_string(), "root-2".to_string()];
+        let query = build_root_spans_query(
+            "project_logs('p')",
+            &roots,
+            Some("span_attributes.purpose != 'scorer'"),
+            200,
+            None,
+        );
+
+        assert!(query.contains("filter: ("));
+        assert!(query.contains("root_span_id IN ["));
+        assert!(query.contains(") AND (span_attributes.purpose != 'scorer')"));
     }
 }
