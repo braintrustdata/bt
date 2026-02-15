@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use braintrust_sdk_rust::{BraintrustClient, LoginState};
 use clap::{Args, Subcommand};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
 use oauth2::basic::{BasicClient, BasicTokenType};
 use oauth2::reqwest::async_http_client;
@@ -569,6 +570,9 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
     let auth_code = callback
         .code
         .ok_or_else(|| anyhow::anyhow!("no authorization code received"))?;
+    if callback.state.is_none() {
+        bail!("oauth callback missing state; paste the full callback URL (or code=...&state=...)");
+    }
     if callback.state.as_deref() != Some(state.as_str()) {
         bail!("oauth state mismatch; please try again");
     }
@@ -1236,15 +1240,18 @@ async fn collect_oauth_callback(
     prefer_manual: bool,
 ) -> Result<OAuthCallbackParams> {
     if !prefer_manual {
-        return wait_for_oauth_callback(listener).await;
+        return wait_for_oauth_callback_or_stdin(listener).await;
     }
 
     println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
     println!(
-        "After approving access, copy the final callback URL from the browser address bar and paste it below."
+        "After approving access, your browser may show a localhost connection error on remote hosts."
+    );
+    println!(
+        "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
     );
     let pasted = Input::<String>::new()
-        .with_prompt("Callback URL (press Enter to wait for automatic callback)")
+        .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
         .allow_empty(true)
         .interact_text()
         .context("failed to read callback URL")?;
@@ -1254,10 +1261,68 @@ async fn collect_oauth_callback(
     parse_oauth_callback_input(&pasted)
 }
 
+async fn wait_for_oauth_callback_or_stdin(listener: TcpListener) -> Result<OAuthCallbackParams> {
+    println!("Waiting for OAuth callback...");
+    println!("If localhost callback does not complete, paste code=...&state=... and press Enter.");
+
+    let callback_fut = wait_for_oauth_callback(listener);
+    tokio::pin!(callback_fut);
+    let mut manual_buffer = String::new();
+
+    loop {
+        tokio::select! {
+            callback = &mut callback_fut => return callback,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if let Some(input) = poll_manual_oauth_input(&mut manual_buffer)? {
+                    return parse_oauth_callback_input(&input);
+                }
+            }
+        }
+    }
+}
+
+fn poll_manual_oauth_input(buffer: &mut String) -> Result<Option<String>> {
+    while event::poll(Duration::from_millis(0)).context("failed to poll stdin events")? {
+        match event::read().context("failed reading stdin events")? {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        let input = buffer.trim().to_string();
+                        buffer.clear();
+                        if !input.is_empty() {
+                            return Ok(Some(input));
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(ch) => {
+                        buffer.push(ch);
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                buffer.push_str(text.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
 fn parse_oauth_callback_input(input: &str) -> Result<OAuthCallbackParams> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         bail!("callback URL cannot be empty");
+    }
+
+    if trimmed.starts_with('{') {
+        return parse_oauth_callback_json(trimmed);
     }
 
     let parsed = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -1265,16 +1330,32 @@ fn parse_oauth_callback_input(input: &str) -> Result<OAuthCallbackParams> {
     } else if trimmed.starts_with('/') {
         reqwest::Url::parse(&format!("http://127.0.0.1{trimmed}"))
             .context("invalid callback path")?
+    } else if trimmed.starts_with('?') {
+        reqwest::Url::parse(&format!("http://127.0.0.1/callback{trimmed}"))
+            .context("invalid callback query")?
+    } else if trimmed.starts_with('#') {
+        reqwest::Url::parse(&format!("http://127.0.0.1/callback{trimmed}"))
+            .context("invalid callback fragment")?
     } else if trimmed.contains("code=") || trimmed.contains("error=") {
         reqwest::Url::parse(&format!("http://127.0.0.1/callback?{trimmed}"))
             .context("invalid callback query")?
     } else {
-        bail!("expected a callback URL, callback path, or query string with code/state");
+        bail!(
+            "expected a callback URL, callback path, callback query, or callback JSON with code/state"
+        );
     };
 
-    Ok(parse_oauth_callback_query(
-        parsed.query().unwrap_or_default(),
-    ))
+    let query_params = parse_oauth_callback_query(parsed.query().unwrap_or_default());
+    if query_params.code.is_some() || query_params.error.is_some() {
+        return Ok(query_params);
+    }
+
+    let fragment_params = parse_oauth_callback_query(parsed.fragment().unwrap_or_default());
+    if fragment_params.code.is_some() || fragment_params.error.is_some() {
+        return Ok(fragment_params);
+    }
+
+    bail!("callback input did not include code or error");
 }
 
 fn parse_oauth_callback_query(query: &str) -> OAuthCallbackParams {
@@ -1297,6 +1378,33 @@ fn parse_oauth_callback_query(query: &str) -> OAuthCallbackParams {
         }
     }
     OAuthCallbackParams { code, state, error }
+}
+
+fn parse_oauth_callback_json(input: &str) -> Result<OAuthCallbackParams> {
+    #[derive(Debug, Deserialize)]
+    struct CallbackJson {
+        code: Option<String>,
+        state: Option<String>,
+        error: Option<String>,
+    }
+
+    let payload: CallbackJson =
+        serde_json::from_str(input).context("invalid callback JSON payload")?;
+    let params = OAuthCallbackParams {
+        code: payload.code.map(|value| value.trim().to_string()),
+        state: payload.state.map(|value| value.trim().to_string()),
+        error: payload.error.map(|value| value.trim().to_string()),
+    };
+    if params.code.as_deref().is_some_and(str::is_empty) {
+        bail!("callback JSON contains an empty code");
+    }
+    if params.error.as_deref().is_some_and(str::is_empty) {
+        bail!("callback JSON contains an empty error");
+    }
+    if params.code.is_none() && params.error.is_none() {
+        bail!("callback JSON must include code or error");
+    }
+    Ok(params)
 }
 
 fn is_ssh_session() -> bool {
@@ -2258,5 +2366,33 @@ mod tests {
             resolve_selected_profile_name_for_debug(&base, &store).expect("resolve");
         assert_eq!(profile_name, "work");
         assert_eq!(source, "--profile/BRAINTRUST_PROFILE");
+    }
+
+    #[test]
+    fn parse_oauth_callback_input_accepts_json_payload() {
+        let parsed =
+            parse_oauth_callback_input(r#"{"code":"abc123","state":"state123","error":null}"#)
+                .expect("parse");
+        assert_eq!(parsed.code.as_deref(), Some("abc123"));
+        assert_eq!(parsed.state.as_deref(), Some("state123"));
+        assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn parse_oauth_callback_input_accepts_fragment_payload() {
+        let parsed = parse_oauth_callback_input("#code=abc123&state=state123").expect("parse");
+        assert_eq!(parsed.code.as_deref(), Some("abc123"));
+        assert_eq!(parsed.state.as_deref(), Some("state123"));
+        assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn parse_oauth_callback_input_requires_code_or_error() {
+        let err = parse_oauth_callback_input("https://localhost/callback?state=only-state")
+            .expect_err("should fail");
+        assert!(
+            err.to_string().contains("did not include code or error"),
+            "unexpected error: {err}"
+        );
     }
 }
