@@ -698,7 +698,7 @@ async fn run_pull(
             );
         }
         println!("Pull complete");
-        println!("  Output: {}", output_path.display());
+        println!("  Output: {}", spec_dir.display());
         println!("  Time: {}", format_duration(elapsed_secs));
         println!("  Traces: {}", format_usize_commas(traces_done));
         println!("  Spans: {}", format_usize_commas(spans_done));
