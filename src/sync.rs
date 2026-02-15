@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::future::retry_notify;
 use backoff::{Error as BackoffError, ExponentialBackoffBuilder};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use braintrust_sdk_rust::Logs3BatchUploader;
 use clap::{Args, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -88,6 +89,10 @@ struct PullArgs {
     /// Number of concurrent workers for trace fetch mode.
     #[arg(long, default_value_t = 8)]
     workers: usize,
+
+    /// Include stored vectors in pulled rows so a subsequent push can re-ingest them.
+    #[arg(long)]
+    include_vectors: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -156,6 +161,10 @@ struct StatusArgs {
     /// Root directory for sync artifacts.
     #[arg(long, default_value = "bt-sync")]
     root: PathBuf,
+
+    /// Include vector-aware pull specs when resolving status (pull direction only).
+    #[arg(long)]
+    include_vectors: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize)]
@@ -226,6 +235,8 @@ struct SyncSpec {
     filter: Option<String>,
     limit: Option<usize>,
     page_size: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    include_vectors: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +267,8 @@ struct PullState {
     limit: usize,
     filter: Option<String>,
     page_size: usize,
+    #[serde(default)]
+    include_vectors: bool,
     cursor: Option<String>,
     root_discovery_cursor: Option<String>,
     root_ids: Vec<String>,
@@ -339,6 +352,17 @@ struct PushBatchResult {
     bytes_sent: u64,
     end_line_offset: usize,
     distinct_roots_done: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct VectorSpec {
+    facet_name: String,
+    model: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VectorPullCache {
+    models_by_facet: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -457,6 +481,7 @@ async fn run_pull(
         filter: trim_optional(args.filter.clone()),
         limit: Some(limit),
         page_size: args.page_size,
+        include_vectors: args.include_vectors,
     };
 
     let spec_hash = spec_hash(&spec)?;
@@ -485,6 +510,7 @@ async fn run_pull(
             args.page_size,
             spec.filter.clone(),
             args.cursor.clone(),
+            args.include_vectors,
             output_path.to_string_lossy().to_string(),
         )
     } else {
@@ -587,6 +613,7 @@ async fn run_pull(
                 &output_path,
                 &state_path,
                 &mut state,
+                args.include_vectors,
                 &btql_retry_tracker,
                 !json_output,
             )
@@ -601,6 +628,7 @@ async fn run_pull(
                 &output_path,
                 &state_path,
                 &mut state,
+                args.include_vectors,
                 args.workers.max(1),
                 &btql_retry_tracker,
                 !json_output,
@@ -702,6 +730,7 @@ async fn pull_spans_mode(
     output_dir: &Path,
     state_path: &Path,
     state: &mut PullState,
+    include_vectors: bool,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
     show_checkpoint_hint: bool,
 ) -> Result<()> {
@@ -726,6 +755,7 @@ async fn pull_spans_mode(
         btql_retry_tracker.summary_line().as_deref(),
     ));
     let mut seen_roots: HashSet<String> = state.root_ids.iter().cloned().collect();
+    let mut vector_cache = include_vectors.then_some(VectorPullCache::default());
 
     let mut writer = open_jsonl_part_writer(output_dir, state.items_done > 0)?;
 
@@ -737,16 +767,30 @@ async fn pull_spans_mode(
             batch_limit,
             state.cursor.as_deref(),
         );
-        let response =
+        let BtqlResponse { data, cursor } =
             execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
-        let batch_count = response.data.len();
+        let mut rows = data;
+        let batch_count = rows.len();
 
         if batch_count == 0 {
             state.cursor = None;
             break;
         }
 
-        for row in &response.data {
+        if let Some(cache) = vector_cache.as_mut() {
+            enrich_rows_with_vectors(
+                client,
+                ctx,
+                source_expr,
+                spec.filter.as_deref(),
+                &mut rows,
+                cache,
+                btql_retry_tracker,
+            )
+            .await?;
+        }
+
+        for row in &rows {
             if let Some(root_id) = row_root_span_id(row) {
                 if !root_id.is_empty() && seen_roots.insert(root_id.clone()) {
                     state.root_ids.push(root_id);
@@ -758,7 +802,7 @@ async fn pull_spans_mode(
 
         state.items_done += batch_count;
         state.pages_done += 1;
-        state.cursor = response.cursor.filter(|c| !c.is_empty());
+        state.cursor = cursor.filter(|c| !c.is_empty());
         state.updated_at = epoch_seconds();
 
         write_json_atomic(state_path, state)?;
@@ -794,6 +838,7 @@ async fn pull_traces_mode(
     output_dir: &Path,
     state_path: &Path,
     state: &mut PullState,
+    include_vectors: bool,
     workers: usize,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
     show_checkpoint_hint: bool,
@@ -858,6 +903,7 @@ async fn pull_traces_mode(
         let status_line = status_line.clone();
         let page_size = spec.page_size;
         let fetch_filter = spec.filter.clone();
+        let mut vector_cache = include_vectors.then_some(VectorPullCache::default());
         let btql_retry_tracker = Arc::clone(btql_retry_tracker);
         let trace_progress_roots = Arc::clone(&trace_progress_roots);
 
@@ -884,6 +930,7 @@ async fn pull_traces_mode(
                     chunk_idx,
                     &shared_state,
                     &shared_writer,
+                    &mut vector_cache,
                     &progress,
                     &status_line,
                     show_checkpoint_hint,
@@ -1159,6 +1206,7 @@ async fn process_trace_chunk(
     chunk_idx: usize,
     shared_state: &Arc<tokio::sync::Mutex<PullState>>,
     shared_writer: &Arc<tokio::sync::Mutex<JsonlPartWriter>>,
+    vector_cache: &mut Option<VectorPullCache>,
     progress: &ProgressBar,
     status_line: &ProgressBar,
     show_checkpoint_hint: bool,
@@ -1191,12 +1239,26 @@ async fn process_trace_chunk(
             page_size,
             cursor.as_deref(),
         );
-        let response =
+        let BtqlResponse { data, cursor } =
             execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
-        let batch_count = response.data.len();
-        let next_cursor = response.cursor.filter(|c| !c.is_empty());
+        let mut rows = data;
+        let batch_count = rows.len();
+        let next_cursor = cursor.filter(|c| !c.is_empty());
+
+        if let Some(cache) = vector_cache.as_mut() {
+            enrich_rows_with_vectors(
+                client,
+                ctx,
+                source_expr,
+                fetch_filter,
+                &mut rows,
+                cache,
+                btql_retry_tracker,
+            )
+            .await?;
+        }
         let mut seen_roots_in_batch = HashSet::new();
-        for row in &response.data {
+        for row in &rows {
             if let Some(root_id) = row_root_span_id(row) {
                 if !root_id.is_empty() {
                     seen_roots_in_batch.insert(root_id);
@@ -1207,8 +1269,7 @@ async fn process_trace_chunk(
 
         if batch_count > 0 {
             let mut bytes_written = 0u64;
-            let serialized = response
-                .data
+            let serialized = rows
                 .iter()
                 .map(|row| {
                     let line =
@@ -1330,6 +1391,7 @@ async fn run_push(json_output: bool, ctx: &LoginContext, args: PushArgs) -> Resu
         filter: trim_optional(args.filter.clone()),
         limit,
         page_size: args.page_size,
+        include_vectors: false,
     };
     let spec_hash = spec_hash(&spec)?;
     let spec_dir = resolve_spec_dir(
@@ -1704,6 +1766,7 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
         filter: trim_optional(args.filter.clone()),
         limit,
         page_size: args.page_size,
+        include_vectors: matches!(args.direction, DirectionArg::Pull) && args.include_vectors,
     };
     let spec_hash = spec_hash(&spec)?;
     let spec_dir = resolve_spec_dir(
@@ -1859,6 +1922,336 @@ async fn execute_btql_query(
         let attempts = attempt_counter.load(Ordering::Relaxed).max(1);
         anyhow!(err).context(format!("BTQL request failed after {attempts} attempt(s)"))
     })
+}
+
+async fn enrich_rows_with_vectors(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    source_expr: &str,
+    filter: Option<&str>,
+    rows: &mut [Map<String, Value>],
+    cache: &mut VectorPullCache,
+    btql_retry_tracker: &Arc<BtqlRetryTracker>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let new_facets = collect_new_facet_names(rows, cache);
+    for facet_name in new_facets {
+        let models = discover_facet_vector_models(
+            client,
+            ctx,
+            source_expr,
+            filter,
+            &facet_name,
+            btql_retry_tracker,
+        )
+        .await?;
+        cache.models_by_facet.insert(facet_name, models);
+    }
+
+    let vector_specs = vector_specs_from_cache(cache);
+    if vector_specs.is_empty() {
+        return Ok(());
+    }
+
+    let fetched_rows = fetch_vector_columns_for_rows(
+        client,
+        ctx,
+        source_expr,
+        filter,
+        rows,
+        &vector_specs,
+        btql_retry_tracker,
+    )
+    .await?;
+    if fetched_rows.is_empty() {
+        return Ok(());
+    }
+
+    for row in rows {
+        let Some(xact_key) = row_xact_key(row) else {
+            continue;
+        };
+        let Some(vector_row) = fetched_rows.get(&xact_key) else {
+            continue;
+        };
+
+        let mut vector_entries = match row.remove("vectors") {
+            Some(Value::Array(existing)) => existing,
+            _ => Vec::new(),
+        };
+
+        for (idx, spec) in vector_specs.iter().enumerate() {
+            let alias = vector_alias(idx);
+            let Some(value) = vector_row.get(&alias) else {
+                continue;
+            };
+            let Some(vector_b64) = vector_value_to_base64(value).with_context(|| {
+                format!(
+                    "failed to encode vector for facets.{}.{}",
+                    spec.facet_name, spec.model
+                )
+            })?
+            else {
+                continue;
+            };
+
+            let path = vec![
+                Value::String("facets".to_string()),
+                Value::String(spec.facet_name.clone()),
+                Value::String(spec.model.clone()),
+            ];
+            let mut entry = Map::new();
+            entry.insert("path".to_string(), Value::Array(path));
+            entry.insert("vector".to_string(), Value::String(vector_b64));
+            vector_entries.push(Value::Object(entry));
+        }
+
+        if !vector_entries.is_empty() {
+            row.insert("vectors".to_string(), Value::Array(vector_entries));
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_new_facet_names(rows: &[Map<String, Value>], cache: &VectorPullCache) -> Vec<String> {
+    let mut names = HashSet::new();
+    for row in rows {
+        let Some(facets) = row.get("facets").and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, value) in facets {
+            if value.is_null() || cache.models_by_facet.contains_key(name) {
+                continue;
+            }
+            names.insert(name.clone());
+        }
+    }
+    let mut sorted = names.into_iter().collect::<Vec<_>>();
+    sorted.sort();
+    sorted
+}
+
+async fn discover_facet_vector_models(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    source_expr: &str,
+    filter: Option<&str>,
+    facet_name: &str,
+    btql_retry_tracker: &Arc<BtqlRetryTracker>,
+) -> Result<Vec<String>> {
+    let facet_path = btql_identifier_path(["facets", facet_name]);
+    let facet_filter = format!("{facet_path} IS NOT NULL");
+    let combined_filter = combine_sql_filters(filter, &facet_filter);
+    let mut models = HashSet::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let mut query_parts = vec![
+            format!("select: vector_keys({facet_path}) as models"),
+            format!("from: {source_expr} spans"),
+            format!("filter: {combined_filter}"),
+            format!("limit: {}", ROOT_DISCOVERY_PAGE_SIZE),
+            "sort: _pagination_key DESC".to_string(),
+        ];
+        if let Some(c) = cursor.as_deref() {
+            query_parts.push(format!("cursor: {}", btql_quote(c)));
+        }
+        let query = query_parts.join(" | ");
+        let response =
+            execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
+
+        for row in &response.data {
+            let Some(items) = row.get("models").and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let Some(model) = item.as_str() else {
+                    continue;
+                };
+                if model.is_empty() {
+                    continue;
+                }
+                models.insert(model.to_string());
+            }
+        }
+
+        if response.data.is_empty() {
+            break;
+        }
+        cursor = response.cursor.filter(|c| !c.is_empty());
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut sorted = models.into_iter().collect::<Vec<_>>();
+    sorted.sort();
+    Ok(sorted)
+}
+
+fn vector_specs_from_cache(cache: &VectorPullCache) -> Vec<VectorSpec> {
+    let mut specs = Vec::new();
+    for (facet_name, models) in &cache.models_by_facet {
+        for model in models {
+            specs.push(VectorSpec {
+                facet_name: facet_name.clone(),
+                model: model.clone(),
+            });
+        }
+    }
+    specs.sort();
+    specs.dedup();
+    specs
+}
+
+async fn fetch_vector_columns_for_rows(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    source_expr: &str,
+    filter: Option<&str>,
+    rows: &[Map<String, Value>],
+    vector_specs: &[VectorSpec],
+    btql_retry_tracker: &Arc<BtqlRetryTracker>,
+) -> Result<BTreeMap<String, Map<String, Value>>> {
+    if rows.is_empty() || vector_specs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let xact_literals = collect_xact_id_literals(rows);
+    if xact_literals.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let xact_filter = if xact_literals.len() == 1 {
+        format!("_xact_id = {}", xact_literals[0])
+    } else {
+        format!("_xact_id IN [{}]", xact_literals.join(", "))
+    };
+    let combined_filter = combine_sql_filters(filter, &xact_filter);
+
+    let mut select_columns = vec!["_xact_id".to_string()];
+    for (idx, spec) in vector_specs.iter().enumerate() {
+        select_columns.push(format!(
+            "vector({}) as {}",
+            vector_spec_btql_path(spec),
+            vector_alias(idx)
+        ));
+    }
+
+    let query = format!(
+        "select: {} | from: {source_expr} spans | filter: {combined_filter} | limit: {}",
+        select_columns.join(", "),
+        xact_literals.len()
+    );
+    let response =
+        execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
+
+    let mut by_xact = BTreeMap::new();
+    for row in response.data {
+        let Some(xact_key) = row_xact_key(&row) else {
+            continue;
+        };
+        by_xact.insert(xact_key, row);
+    }
+    Ok(by_xact)
+}
+
+fn collect_xact_id_literals(rows: &[Map<String, Value>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(value) = row.get("_xact_id") else {
+            continue;
+        };
+        let Some(literal) = sql_literal_from_json(value) else {
+            continue;
+        };
+        if seen.insert(literal.clone()) {
+            out.push(literal);
+        }
+    }
+    out
+}
+
+fn combine_sql_filters(filter: Option<&str>, extra_clause: &str) -> String {
+    if let Some(filter_expr) = filter.map(str::trim).filter(|s| !s.is_empty()) {
+        format!("({extra_clause}) AND ({filter_expr})")
+    } else {
+        extra_clause.to_string()
+    }
+}
+
+fn row_xact_key(row: &Map<String, Value>) -> Option<String> {
+    value_as_string(row.get("_xact_id"))
+}
+
+fn sql_literal_from_json(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(sql_quote(s)),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
+        _ => None,
+    }
+}
+
+fn btql_identifier_path<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    segments
+        .into_iter()
+        .map(btql_identifier_segment)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn btql_identifier_segment(segment: &str) -> String {
+    if is_plain_btql_identifier(segment) {
+        segment.to_string()
+    } else {
+        format!("\"{}\"", segment.replace('\"', "\"\""))
+    }
+}
+
+fn is_plain_btql_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn vector_spec_btql_path(spec: &VectorSpec) -> String {
+    btql_identifier_path(["facets", spec.facet_name.as_str(), spec.model.as_str()])
+}
+
+fn vector_alias(index: usize) -> String {
+    format!("__vector_{index}")
+}
+
+fn vector_value_to_base64(value: &Value) -> Result<Option<String>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        Value::Array(values) => {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("vector value contains non-numeric entry"))?;
+                let f32_value = number as f32;
+                bytes.extend_from_slice(&f32_value.to_le_bytes());
+            }
+            Ok(Some(BASE64_STANDARD.encode(bytes)))
+        }
+        _ => Err(anyhow!(
+            "unexpected vector value type: expected array, string, or null"
+        )),
+    }
 }
 
 fn build_spans_query(
@@ -2492,6 +2885,7 @@ fn new_pull_state(
     page_size: usize,
     filter: Option<String>,
     cursor: Option<String>,
+    include_vectors: bool,
     output_path: String,
 ) -> PullState {
     let now = epoch_seconds();
@@ -2508,6 +2902,7 @@ fn new_pull_state(
         limit,
         filter,
         page_size,
+        include_vectors,
         cursor,
         root_discovery_cursor: None,
         root_ids: Vec::new(),
@@ -3005,6 +3400,10 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn btql_quote(value: &str) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|_| format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")))
@@ -3237,6 +3636,7 @@ mod tests {
             200,
             None,
             None,
+            false,
             "out/data".to_string(),
         );
         state.phase = PullPhase::FetchRoots;
@@ -3265,5 +3665,101 @@ mod tests {
         assert!(query.contains("filter: ("));
         assert!(query.contains("root_span_id IN ["));
         assert!(query.contains(") AND (span_attributes.purpose != 'scorer')"));
+    }
+
+    #[test]
+    fn vector_spec_btql_path_quotes_special_segments() {
+        let spec = VectorSpec {
+            facet_name: "Issues and bugs".to_string(),
+            model: "text-embedding-3-small".to_string(),
+        };
+        let path = vector_spec_btql_path(&spec);
+        assert_eq!(
+            path,
+            "facets.\"Issues and bugs\".\"text-embedding-3-small\""
+        );
+    }
+
+    #[test]
+    fn vector_value_to_base64_encodes_f32_little_endian() -> Result<()> {
+        let value = Value::Array(vec![Value::from(1.0), Value::from(-2.5)]);
+        let encoded = vector_value_to_base64(&value)?;
+        let expected = BASE64_STANDARD.encode(
+            [
+                1.0f32.to_le_bytes().as_slice(),
+                (-2.5f32).to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(encoded, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn sync_spec_omits_include_vectors_when_false() -> Result<()> {
+        let spec = SyncSpec {
+            schema_version: STATE_SCHEMA_VERSION,
+            object_ref: "project_logs:pid".to_string(),
+            object_type: "project_logs".to_string(),
+            object_name: "pid".to_string(),
+            direction: "pull".to_string(),
+            scope: "traces".to_string(),
+            filter: None,
+            limit: Some(10),
+            page_size: 200,
+            include_vectors: false,
+        };
+        let serialized = serde_json::to_value(&spec)?;
+        let obj = serialized
+            .as_object()
+            .ok_or_else(|| anyhow!("expected serialized spec object"))?;
+        assert!(!obj.contains_key("include_vectors"));
+        Ok(())
+    }
+
+    #[test]
+    fn sync_spec_serializes_include_vectors_when_true() -> Result<()> {
+        let spec = SyncSpec {
+            schema_version: STATE_SCHEMA_VERSION,
+            object_ref: "project_logs:pid".to_string(),
+            object_type: "project_logs".to_string(),
+            object_name: "pid".to_string(),
+            direction: "pull".to_string(),
+            scope: "traces".to_string(),
+            filter: None,
+            limit: Some(10),
+            page_size: 200,
+            include_vectors: true,
+        };
+        let serialized = serde_json::to_value(&spec)?;
+        let obj = serialized
+            .as_object()
+            .ok_or_else(|| anyhow!("expected serialized spec object"))?;
+        assert_eq!(obj.get("include_vectors"), Some(&Value::Bool(true)));
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_row_for_upload_preserves_vectors() {
+        let mut row = Map::new();
+        row.insert("id".to_string(), Value::String("row-1".to_string()));
+        row.insert(
+            "vectors".to_string(),
+            Value::Array(vec![Value::Object(Map::from_iter([
+                (
+                    "path".to_string(),
+                    Value::Array(vec![
+                        Value::String("facets".to_string()),
+                        Value::String("Issues".to_string()),
+                        Value::String("baseten".to_string()),
+                    ]),
+                ),
+                ("vector".to_string(), Value::String("AAAAAA==".to_string())),
+            ]))]),
+        );
+
+        prepare_row_for_upload(&mut row, "project-1", "run-1", 0);
+
+        assert!(row.get("vectors").is_some());
     }
 }
