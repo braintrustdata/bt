@@ -12,6 +12,7 @@ mod projects;
 mod prompts;
 mod self_update;
 mod sql;
+mod sync;
 mod traces;
 mod ui;
 mod utils;
@@ -44,6 +45,8 @@ enum Commands {
     SelfCommand(self_update::SelfArgs),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
+    /// Synchronize project logs between Braintrust and local NDJSON files
+    Sync(CLIArgs<sync::SyncArgs>),
 }
 
 #[tokio::main]
@@ -61,6 +64,7 @@ async fn main() -> Result<()> {
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
+        Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())

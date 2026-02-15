@@ -21,3 +21,5 @@ tests/evals/js/eval-bun/test-data.txt
 .bt/
 
 __pycache__
+
+bt-sync

@@ -32,6 +32,7 @@ const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
 
+#[derive(Clone)]
 pub struct LoginContext {
     pub login: LoginState,
     pub api_url: String,
