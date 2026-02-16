@@ -61,9 +61,17 @@ struct AgentsSetupArgs {
     #[arg(long)]
     with_mcp: bool,
 
+    /// Workflow docs to prefetch (repeatable)
+    #[arg(long = "workflow", value_enum)]
+    workflows: Vec<WorkflowArg>,
+
     /// Skip confirmation prompts and use defaults
     #[arg(long, short = 'y')]
     yes: bool,
+
+    /// Do not auto-fetch workflow docs during setup
+    #[arg(long)]
+    no_fetch_docs: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -200,6 +208,7 @@ struct SetupJsonReport {
     detected_agents: Vec<DetectionSignal>,
     results: Vec<AgentInstallResult>,
     warnings: Vec<String>,
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -227,9 +236,18 @@ struct DocsFetchJsonReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct DocsFetchResult {
+    discovered: usize,
+    written: usize,
+    failed: usize,
+    files: Vec<DocsFileResult>,
+    warnings: Vec<String>,
+}
+
 pub async fn run(base: BaseArgs, args: AgentsArgs) -> Result<()> {
     match args.command {
-        Some(AgentsSubcommand::Setup(setup)) => run_setup(base, setup),
+        Some(AgentsSubcommand::Setup(setup)) => run_setup(base, setup).await,
         Some(AgentsSubcommand::Docs(docs)) => run_docs(base, docs).await,
         None => {
             bail!("subcommand required. Use: `bt agents setup --local|--global [--agent ...]`")
@@ -241,7 +259,7 @@ pub async fn run_skills_compat(base: BaseArgs, args: SkillsCompatArgs) -> Result
     if !args.install {
         bail!("`bt skills` compatibility mode requires --install");
     }
-    run_setup(base, args.setup)
+    run_setup(base, args.setup).await
 }
 
 async fn run_docs(base: BaseArgs, args: AgentsDocsArgs) -> Result<()> {
@@ -253,6 +271,68 @@ async fn run_docs(base: BaseArgs, args: AgentsDocsArgs) -> Result<()> {
 
 async fn run_docs_fetch(base: BaseArgs, args: AgentsDocsFetchArgs) -> Result<()> {
     let selected_workflows = resolve_workflow_selection(&args.workflows);
+    let fetch_result = fetch_docs_pages(&args, &selected_workflows).await?;
+
+    if base.json {
+        let report = DocsFetchJsonReport {
+            llms_url: args.llms_url,
+            output_dir: args.output_dir.display().to_string(),
+            dry_run: args.dry_run,
+            discovered: fetch_result.discovered,
+            written: fetch_result.written,
+            failed: fetch_result.failed,
+            workflows: selected_workflows
+                .iter()
+                .map(|workflow| workflow.as_str().to_string())
+                .collect(),
+            files: fetch_result.files.clone(),
+            warnings: fetch_result.warnings.clone(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize docs report")?
+        );
+    } else {
+        let workflow_set: BTreeSet<&str> = selected_workflows.iter().map(|w| w.as_str()).collect();
+        println!("Fetched docs index: {}", args.llms_url);
+        println!(
+            "Workflows: {}",
+            workflow_set.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        println!(
+            "Discovered {} page(s), wrote {} page(s){}",
+            fetch_result.discovered,
+            fetch_result.written,
+            if args.dry_run { " (dry-run)" } else { "" }
+        );
+        for file in &fetch_result.files {
+            match &file.path {
+                Some(path) => println!("  - {} [{}] -> {}", file.title, file.workflow, path),
+                None => println!("  - {} [{}] -> {}", file.title, file.workflow, file.url),
+            }
+        }
+        if !fetch_result.warnings.is_empty() {
+            println!("Warnings:");
+            for warning in &fetch_result.warnings {
+                println!("  - {warning}");
+            }
+        }
+    }
+
+    if args.strict && fetch_result.failed > 0 {
+        bail!(
+            "{} docs page(s) failed to download in strict mode",
+            fetch_result.failed
+        );
+    }
+
+    Ok(())
+}
+
+async fn fetch_docs_pages(
+    args: &AgentsDocsFetchArgs,
+    selected_workflows: &[WorkflowArg],
+) -> Result<DocsFetchResult> {
     let workflow_set: BTreeSet<&str> = selected_workflows.iter().map(|w| w.as_str()).collect();
     let workflow_link_re =
         Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").context("failed to build markdown link regex")?;
@@ -435,59 +515,16 @@ async fn run_docs_fetch(base: BaseArgs, args: AgentsDocsFetchArgs) -> Result<()>
         )?;
     }
 
-    if base.json {
-        let report = DocsFetchJsonReport {
-            llms_url: args.llms_url,
-            output_dir: args.output_dir.display().to_string(),
-            dry_run: args.dry_run,
-            discovered: file_results.len(),
-            written,
-            failed,
-            workflows: selected_workflows
-                .iter()
-                .map(|workflow| workflow.as_str().to_string())
-                .collect(),
-            files: file_results,
-            warnings: warnings.clone(),
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("failed to serialize docs report")?
-        );
-    } else {
-        println!("Fetched docs index: {}", args.llms_url);
-        println!(
-            "Workflows: {}",
-            workflow_set.into_iter().collect::<Vec<_>>().join(", ")
-        );
-        println!(
-            "Discovered {} page(s), wrote {} page(s){}",
-            file_results.len(),
-            written,
-            if args.dry_run { " (dry-run)" } else { "" }
-        );
-        for file in &file_results {
-            match &file.path {
-                Some(path) => println!("  - {} [{}] -> {}", file.title, file.workflow, path),
-                None => println!("  - {} [{}] -> {}", file.title, file.workflow, file.url),
-            }
-        }
-        if !warnings.is_empty() {
-            println!("Warnings:");
-            for warning in &warnings {
-                println!("  - {warning}");
-            }
-        }
-    }
-
-    if args.strict && failed > 0 {
-        bail!("{} docs page(s) failed to download in strict mode", failed);
-    }
-
-    Ok(())
+    Ok(DocsFetchResult {
+        discovered: file_results.len(),
+        written,
+        failed,
+        files: file_results,
+        warnings,
+    })
 }
 
-fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
+async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
     let scope = resolve_scope(&args)?;
     let local_root = if matches!(scope, InstallScope::Local) {
         Some(find_git_root().ok_or_else(|| {
@@ -507,7 +544,9 @@ fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
         bail!("no agents selected for installation");
     }
 
+    let selected_workflows = select_setup_workflows(&args)?;
     let mut warnings = Vec::new();
+    let mut notes = Vec::new();
     let mut results = Vec::new();
 
     for agent in selected_agents.iter().copied() {
@@ -543,6 +582,42 @@ fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
         .filter(|r| matches!(r.status, InstallStatus::Installed))
         .count();
 
+    if installed_count == 0 {
+        notes.push("Skipped workflow docs prefetch (no agents installed).".to_string());
+    } else if args.no_fetch_docs {
+        notes.push("Skipped workflow docs prefetch (`--no-fetch-docs`).".to_string());
+    } else if selected_workflows.is_empty() {
+        notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
+    } else {
+        let docs_output_dir = setup_docs_output_dir(scope, local_root.as_deref(), &home)?;
+        let docs_args = AgentsDocsFetchArgs {
+            llms_url: DEFAULT_DOCS_LLMS_URL.to_string(),
+            output_dir: docs_output_dir.clone(),
+            workflows: selected_workflows.clone(),
+            dry_run: false,
+            strict: false,
+        };
+        match fetch_docs_pages(&docs_args, &selected_workflows).await {
+            Ok(fetch_result) => {
+                notes.push(format!(
+                    "Prefetched workflow docs ({}) to {} ({} written, {} failed).",
+                    selected_workflows
+                        .iter()
+                        .map(|workflow| workflow.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    docs_output_dir.display(),
+                    fetch_result.written,
+                    fetch_result.failed
+                ));
+                warnings.extend(fetch_result.warnings);
+            }
+            Err(err) => {
+                warnings.push(format!("workflow docs prefetch failed: {err}"));
+            }
+        }
+    }
+
     if base.json {
         let report = SetupJsonReport {
             scope: scope.as_str().to_string(),
@@ -550,13 +625,21 @@ fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
             detected_agents: detected,
             results: results.clone(),
             warnings,
+            notes,
         };
         println!(
             "{}",
             serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
         );
     } else {
-        print_human_report(scope, &selected_agents, &detected, &results);
+        print_human_report(
+            scope,
+            &selected_agents,
+            &detected,
+            &results,
+            &warnings,
+            &notes,
+        );
     }
 
     if installed_count == 0 {
@@ -640,6 +723,41 @@ fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
         }
     }
     out.into_iter().collect()
+}
+
+fn select_setup_workflows(args: &AgentsSetupArgs) -> Result<Vec<WorkflowArg>> {
+    if args.no_fetch_docs {
+        return Ok(Vec::new());
+    }
+
+    let inferred = resolve_workflow_selection(&args.workflows);
+    if !args.workflows.is_empty() || args.yes || !std::io::stdin().is_terminal() {
+        return Ok(inferred);
+    }
+
+    let all = [
+        WorkflowArg::Instrument,
+        WorkflowArg::Observe,
+        WorkflowArg::Annotate,
+        WorkflowArg::Evaluate,
+        WorkflowArg::Deploy,
+    ];
+    let labels = all
+        .iter()
+        .map(|workflow| workflow.as_str())
+        .collect::<Vec<_>>();
+    let defaults = vec![true; all.len()];
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select workflows to prefetch docs for")
+        .items(&labels)
+        .defaults(&defaults)
+        .interact()?;
+
+    let mut out = Vec::with_capacity(selected.len());
+    for index in selected {
+        out.push(all[index]);
+    }
+    Ok(out)
 }
 
 fn workflow_from_url(url: &str) -> Option<&'static str> {
@@ -1196,6 +1314,38 @@ fn render_cursor_rule() -> String {
     )
 }
 
+fn setup_docs_output_dir(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Result<PathBuf> {
+    match scope {
+        InstallScope::Local => {
+            let root = scope_root(scope, local_root, home)?;
+            Ok(root.join("skills").join("docs"))
+        }
+        InstallScope::Global => Ok(global_bt_config_dir(home).join("skills").join("docs")),
+    }
+}
+
+fn global_bt_config_dir(home: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            return PathBuf::from(app_data).join("bt");
+        }
+        home.join(".config").join("bt")
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg_config_home).join("bt");
+        }
+        home.join(".config").join("bt")
+    }
+}
+
 fn scope_root<'a>(
     scope: InstallScope,
     local_root: Option<&'a Path>,
@@ -1259,6 +1409,8 @@ fn print_human_report(
     selected_agents: &[Agent],
     detected: &[DetectionSignal],
     results: &[AgentInstallResult],
+    warnings: &[String],
+    notes: &[String],
 ) {
     println!("Configuring coding agents for Braintrust");
     println!("Scope: {}", scope.as_str());
@@ -1292,6 +1444,20 @@ fn print_human_report(
         );
         for path in &result.paths {
             println!("      path: {path}");
+        }
+    }
+
+    if !notes.is_empty() {
+        println!("Notes:");
+        for note in notes {
+            println!("  - {note}");
+        }
+    }
+
+    if !warnings.is_empty() {
+        println!("Warnings:");
+        for warning in warnings {
+            println!("  - {warning}");
         }
     }
 }
@@ -1438,5 +1604,38 @@ mod tests {
     fn workflow_relative_path_handles_workflow_root_page() {
         let rel = workflow_relative_path("https://www.braintrust.dev/docs/observe", "observe");
         assert_eq!(rel, PathBuf::from("index.md"));
+    }
+
+    #[test]
+    fn select_setup_workflows_honors_no_fetch_docs() {
+        let args = AgentsSetupArgs {
+            agents: vec![],
+            local: true,
+            global: false,
+            with_mcp: false,
+            workflows: vec![WorkflowArg::Evaluate],
+            yes: true,
+            no_fetch_docs: true,
+        };
+        let selected = select_setup_workflows(&args).expect("select workflows");
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn select_setup_workflows_resolves_explicit_values() {
+        let args = AgentsSetupArgs {
+            agents: vec![],
+            local: true,
+            global: false,
+            with_mcp: false,
+            workflows: vec![WorkflowArg::Evaluate, WorkflowArg::Instrument],
+            yes: true,
+            no_fetch_docs: false,
+        };
+        let selected = select_setup_workflows(&args).expect("select workflows");
+        assert_eq!(
+            selected,
+            vec![WorkflowArg::Instrument, WorkflowArg::Evaluate]
+        );
     }
 }

@@ -200,6 +200,10 @@ Use `bt agents setup` to configure coding agents for Braintrust.
   - `bt agents setup --global`
 - Configure a specific agent set:
   - `bt agents setup --local --agent claude --agent codex`
+- Prefetch specific workflow docs during setup:
+  - `bt agents setup --local --workflow instrument --workflow evaluate`
+- Skip docs prefetch during setup:
+  - `bt agents setup --local --no-fetch-docs`
 - Include MCP config (optional, off by default):
   - `bt agents setup --local --with-mcp`
 - Non-interactive runs should pass an explicit scope:
@@ -214,8 +218,11 @@ Current behavior:
 - Supported agents: `claude`, `codex`, `cursor`, `opencode`.
 - If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
 - In interactive TTY mode, `bt agents setup` shows a checklist so you can select/deselect agents before install.
+- In interactive TTY mode, setup also shows a workflow checklist and prefetches those docs automatically.
+- If `--workflow` is omitted in non-interactive mode, setup defaults to all workflows.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
+- Setup-time docs prefetch writes to `skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `skills/docs/README.md` and per-workflow `skills/docs/<workflow>/_index.md`.
 
 Compatibility alias:
