@@ -32,9 +32,8 @@ enum Commands {
     Sql(CLIArgs<sql::SqlArgs>),
     /// Manage login profiles and persistent auth
     Login(CLIArgs<login::LoginArgs>),
-    /// View project traces in an interactive terminal UI
-    #[command(visible_alias = "trace")]
-    Traces(CLIArgs<traces::TracesArgs>),
+    /// View logs, traces, and spans
+    View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
@@ -58,7 +57,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
         Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
-        Commands::Traces(cmd) => traces::run(cmd.base, cmd.args).await?,
+        Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,

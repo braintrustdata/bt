@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{Args, Subcommand, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -64,30 +64,186 @@ type TraceLoadResult = (String, Result<Vec<Map<String, Value>>>);
 type FullSpanLoadResult = (String, Result<Option<Map<String, Value>>>);
 
 #[derive(Debug, Clone, Args)]
-pub struct TracesArgs {
+pub struct ViewArgs {
+    #[command(subcommand)]
+    command: Option<ViewCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ViewCommand {
+    /// List logs (summary or spans mode)
+    Logs(LogsArgs),
+    /// Fetch spans for a single trace (root span id)
+    Trace(TraceArgs),
+    /// Fetch a single span by row id (or from a URL)
+    Span(SpanArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ListMode {
+    Summary,
+    Spans,
+}
+
+#[derive(Debug, Clone, Args)]
+struct LogsArgs {
     /// Project ID to query (overrides -p/--project)
     #[arg(long)]
-    pub project_id: Option<String>,
+    project_id: Option<String>,
+
+    /// Object reference, format: object_type:object_selector (project_logs|experiment|dataset)
+    #[arg(long)]
+    object_ref: Option<String>,
 
     /// Braintrust app URL to open directly (parses org/project/r/s/tvt)
     #[arg(long)]
-    pub url: Option<String>,
+    url: Option<String>,
 
     /// Braintrust app URL to open directly (same as --url)
     #[arg(value_name = "URL")]
-    pub url_arg: Option<String>,
+    url_arg: Option<String>,
 
-    /// Number of traces to show in the main table
+    /// Number of rows to fetch
     #[arg(long, default_value_t = 50)]
-    pub limit: usize,
+    limit: usize,
 
-    /// Preview length used in summary rows
+    /// Cursor returned from a previous list call
+    #[arg(long)]
+    cursor: Option<String>,
+
+    /// Preview length for list rows
     #[arg(long, default_value_t = 125)]
-    pub preview_length: usize,
+    preview_length: usize,
+
+    /// List mode
+    #[arg(long, value_enum, default_value = "summary")]
+    list_mode: ListMode,
+
+    /// Free-text search term
+    #[arg(long)]
+    search: Option<String>,
+
+    /// Additional BTQL filter expression
+    #[arg(long)]
+    filter: Option<String>,
+
+    /// Relative time window (e.g. 1h, 30m, 1d)
+    #[arg(long, default_value = "1h")]
+    window: String,
+
+    /// Absolute lower bound timestamp (overrides --window)
+    #[arg(long)]
+    since: Option<String>,
+
+    /// Force non-interactive mode
+    #[arg(long)]
+    non_interactive: bool,
 
     /// Print each BTQL query and invoke payload before execution
     #[arg(long)]
-    pub print_queries: bool,
+    print_queries: bool,
+}
+
+impl Default for LogsArgs {
+    fn default() -> Self {
+        Self {
+            project_id: None,
+            object_ref: None,
+            url: None,
+            url_arg: None,
+            limit: 50,
+            cursor: None,
+            preview_length: 125,
+            list_mode: ListMode::Summary,
+            search: None,
+            filter: None,
+            window: "1h".to_string(),
+            since: None,
+            non_interactive: false,
+            print_queries: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+struct TraceArgs {
+    /// Object reference, format: object_type:object_selector (project_logs|experiment|dataset)
+    #[arg(long)]
+    object_ref: Option<String>,
+
+    /// Project ID to query (overrides -p/--project for project_logs)
+    #[arg(long)]
+    project_id: Option<String>,
+
+    /// Root span id for the trace
+    #[arg(long = "trace-id", alias = "root-span-id")]
+    trace_id: Option<String>,
+
+    /// Braintrust app URL to resolve to a trace
+    #[arg(long)]
+    url: Option<String>,
+
+    /// Braintrust app URL (same as --url)
+    #[arg(value_name = "URL")]
+    url_arg: Option<String>,
+
+    /// Number of spans to fetch
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+
+    /// Cursor returned from a previous trace fetch
+    #[arg(long)]
+    cursor: Option<String>,
+
+    /// Preview length for span rows
+    #[arg(long, default_value_t = 125)]
+    preview_length: usize,
+
+    /// Print each BTQL query and invoke payload before execution
+    #[arg(long)]
+    print_queries: bool,
+
+    /// Force non-interactive mode
+    #[arg(long)]
+    non_interactive: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct SpanArgs {
+    /// Object reference, format: object_type:object_selector (project_logs|experiment|dataset)
+    #[arg(long)]
+    object_ref: Option<String>,
+
+    /// Project ID to query (overrides -p/--project for project_logs)
+    #[arg(long)]
+    project_id: Option<String>,
+
+    /// Span row id
+    #[arg(long)]
+    id: Option<String>,
+
+    /// Braintrust app URL to resolve to a span
+    #[arg(long)]
+    url: Option<String>,
+
+    /// Braintrust app URL (same as --url)
+    #[arg(value_name = "URL")]
+    url_arg: Option<String>,
+
+    /// Print each BTQL query before execution
+    #[arg(long)]
+    print_queries: bool,
+
+    /// Force non-interactive mode
+    #[arg(long)]
+    non_interactive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObjectRef {
+    object_type: String,
+    object_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -177,6 +333,9 @@ enum SpanDetailTab {
 
 struct TraceViewerApp {
     project: ProjectSelection,
+    source_expr: String,
+    list_mode: ListMode,
+    base_filter: String,
     traces: Vec<TraceSummaryRow>,
     selected_trace: usize,
     trace_search_query: String,
@@ -238,17 +397,28 @@ struct TraceViewerApp {
 impl TraceViewerApp {
     fn new(
         project: ProjectSelection,
+        source_expr: String,
+        list_mode: ListMode,
+        base_filter: String,
         traces: Vec<TraceSummaryRow>,
         limit: usize,
         preview_length: usize,
         print_queries: bool,
     ) -> Self {
         let trace_count = traces.len();
+        let noun = if list_mode == ListMode::Spans {
+            "spans"
+        } else {
+            "traces"
+        };
         let status = format!(
-            "Loaded {trace_count} traces. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit"
+            "Loaded {trace_count} {noun}. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit"
         );
         Self {
             project,
+            source_expr,
+            list_mode,
+            base_filter,
             traces,
             selected_trace: 0,
             trace_search_query: String::new(),
@@ -675,68 +845,496 @@ impl TraceViewerApp {
     }
 }
 
-pub async fn run(base: BaseArgs, args: TracesArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
+    let ctx = login(&base).await?;
+    let client = ApiClient::new(&ctx)?;
+
+    match args
+        .command
+        .unwrap_or(ViewCommand::Logs(LogsArgs::default()))
+    {
+        ViewCommand::Logs(logs) => run_logs_command(base, client, logs).await,
+        ViewCommand::Trace(trace) => run_trace_command(base, client, trace).await,
+        ViewCommand::Span(span) => run_span_command(base, client, span).await,
+    }
+}
+
+async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> Result<()> {
     if args.limit == 0 {
         bail!("--limit must be greater than 0");
+    }
+    if args.preview_length == 0 {
+        bail!("--preview-length must be greater than 0");
+    }
+    if args.object_ref.is_some() && args.project_id.is_some() {
+        bail!("--object-ref and --project-id are mutually exclusive");
     }
 
     let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
     let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
+    let project_from_url = parsed_startup_url
+        .as_ref()
+        .and_then(|u| u.project.as_deref());
 
-    let ctx = login(&base).await?;
-    let client = ApiClient::new(&ctx)?;
-
-    let project = resolve_project(
+    let (object_ref, project_for_ui) = resolve_object_ref_for_view(
         &client,
-        base.project.as_deref(),
+        &base,
+        args.object_ref.as_deref(),
         args.project_id.as_deref(),
-        parsed_startup_url
-            .as_ref()
-            .and_then(|u| u.project.as_deref()),
+        project_from_url,
+    )
+    .await?;
+    let source_expr = btql_source_expr(&object_ref)?;
+    let base_filter = build_base_filter_clause(
+        args.since.as_deref(),
+        args.window.as_str(),
+        args.filter.as_deref(),
+    )?;
+    let search_query = args.search.unwrap_or_default();
+
+    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+
+    if interactive {
+        if args.cursor.is_some() {
+            bail!("--cursor is only available in non-interactive mode");
+        }
+        if object_ref.object_type != "project_logs" {
+            bail!("interactive logs view currently supports only project_logs sources");
+        }
+
+        let project = project_for_ui.unwrap_or(ProjectSelection {
+            id: object_ref.object_name.clone(),
+            name: None,
+        });
+        let skip_initial_rows = parsed_startup_url.is_some();
+        let initial_rows = if skip_initial_rows {
+            Vec::new()
+        } else {
+            with_spinner(
+                "Loading logs...",
+                fetch_summary_rows(
+                    &client,
+                    &source_expr,
+                    args.list_mode,
+                    args.preview_length,
+                    args.limit,
+                    if search_query.trim().is_empty() {
+                        None
+                    } else {
+                        Some(search_query.as_str())
+                    },
+                    &base_filter,
+                    args.print_queries,
+                ),
+            )
+            .await?
+        };
+        let traces = parse_summary_rows(initial_rows);
+        return run_interactive(
+            project,
+            source_expr,
+            args.list_mode,
+            base_filter,
+            search_query,
+            traces,
+            args.limit,
+            args.preview_length,
+            args.print_queries,
+            parsed_startup_url,
+            client,
+        )
+        .await;
+    }
+
+    let response = with_spinner(
+        "Loading logs...",
+        fetch_logs_page(
+            &client,
+            &source_expr,
+            args.list_mode,
+            args.preview_length,
+            args.limit,
+            args.cursor.as_deref(),
+            if search_query.trim().is_empty() {
+                None
+            } else {
+                Some(search_query.as_str())
+            },
+            &base_filter,
+            args.print_queries,
+        ),
+    )
+    .await?;
+    let next_cursor = response.cursor.clone().filter(|c| !c.is_empty());
+    let has_more = next_cursor.is_some();
+    let rows = parse_summary_rows(response.data);
+    let object_ref_arg = format_object_ref_arg(&object_ref);
+    let profile_flag = base.profile.as_deref();
+
+    if base.json {
+        let payload = json!({
+            "meta": {
+                "command": "view logs",
+                "source": object_ref,
+                "list_mode": args.list_mode,
+                "limit": args.limit,
+                "preview_length": args.preview_length,
+                "truncated": true,
+            },
+            "paging": {
+                "cursor_in": args.cursor,
+                "next_cursor": next_cursor.clone(),
+                "has_more": has_more,
+            },
+            "items": rows,
+            "hints": logs_hints(
+                has_more,
+                &object_ref_arg,
+                next_cursor.as_deref(),
+                profile_flag,
+            ),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_logs_text(
+            &rows,
+            args.list_mode,
+            &object_ref_arg,
+            profile_flag,
+            args.limit,
+            args.preview_length,
+            next_cursor.as_deref(),
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -> Result<()> {
+    if args.limit == 0 {
+        bail!("--limit must be greater than 0");
+    }
+    if args.preview_length == 0 {
+        bail!("--preview-length must be greater than 0");
+    }
+    if args.object_ref.is_some() && args.project_id.is_some() {
+        bail!("--object-ref and --project-id are mutually exclusive");
+    }
+    let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
+    let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
+    let project_from_url = parsed_startup_url
+        .as_ref()
+        .and_then(|u| u.project.as_deref());
+
+    let (mut object_ref, project_for_url) = resolve_object_ref_for_view(
+        &client,
+        &base,
+        args.object_ref.as_deref(),
+        args.project_id.as_deref(),
+        project_from_url,
     )
     .await?;
 
-    let interactive_startup = !base.json && std::io::stdin().is_terminal();
-    let skip_initial_summary = interactive_startup && parsed_startup_url.is_some();
-    let initial_rows = if skip_initial_summary {
-        Vec::new()
-    } else {
-        with_spinner(
-            "Loading traces...",
-            fetch_summary_rows(
-                &client,
-                &project.id,
-                args.preview_length,
-                args.limit,
-                None,
-                args.print_queries,
-            ),
-        )
-        .await?
-    };
-    let traces = parse_summary_rows(initial_rows);
+    let mut trace_id = args
+        .trace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
 
-    if base.json || !std::io::stdin().is_terminal() {
-        let payload = json!({
-            "project": project,
-            "limit": args.limit,
-            "preview_length": args.preview_length,
-            "rows": traces,
+    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    if interactive {
+        if object_ref.object_type != "project_logs" {
+            bail!("interactive trace view currently supports only project_logs sources");
+        }
+
+        let project = project_for_url.unwrap_or(ProjectSelection {
+            id: object_ref.object_name.clone(),
+            name: None,
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
+        let startup_target = if let Some(parsed) = parsed_startup_url.clone() {
+            parsed
+        } else {
+            let trace_id = trace_id.clone().context(
+                "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>",
+            )?;
+            ParsedTraceUrl {
+                org: Some(client.org_name().to_string()),
+                project: Some(project.id.clone()),
+                page: Some("logs".to_string()),
+                row_ref: Some(trace_id.clone()),
+                span_id: Some(trace_id),
+                trace_view_type: None,
+            }
+        };
+        let source_expr = btql_source_expr(&object_ref)?;
+        let base_filter = build_base_filter_clause(None, "1h", None)?;
+        return run_interactive(
+            project,
+            source_expr,
+            ListMode::Summary,
+            base_filter,
+            String::new(),
+            Vec::new(),
+            args.limit,
+            args.preview_length,
+            args.print_queries,
+            Some(startup_target),
+            client,
+        )
+        .await;
     }
 
-    run_interactive(
-        project,
-        traces,
-        args.limit,
-        args.preview_length,
-        args.print_queries,
-        parsed_startup_url,
-        client,
+    if trace_id.is_none() {
+        let parsed = parsed_startup_url.as_ref().with_context(|| {
+            "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>"
+        })?;
+
+        if object_ref.object_type != "project_logs" {
+            bail!("URL trace resolution currently supports only project_logs sources");
+        }
+        let current_project = project_for_url.clone().unwrap_or(ProjectSelection {
+            id: object_ref.object_name.clone(),
+            name: None,
+        });
+        let target = with_spinner(
+            "Resolving trace URL...",
+            resolve_trace_target_for_url(&client, &current_project, parsed, args.print_queries),
+        )
+        .await?;
+        trace_id = Some(target.root_span_id.clone());
+        object_ref = ObjectRef {
+            object_type: "project_logs".to_string(),
+            object_name: target.project.id.clone(),
+        };
+    }
+
+    let trace_id = trace_id.context("trace id resolution failed")?;
+    let source_expr = btql_source_expr(&object_ref)?;
+    let response = with_spinner(
+        "Loading trace spans...",
+        fetch_trace_spans_page(
+            &client,
+            &source_expr,
+            &trace_id,
+            args.preview_length,
+            args.limit,
+            args.cursor.as_deref(),
+            args.print_queries,
+        ),
     )
-    .await
+    .await?;
+    let next_cursor = response.cursor.clone().filter(|c| !c.is_empty());
+    let has_more = next_cursor.is_some();
+    let object_ref_arg = format_object_ref_arg(&object_ref);
+    let profile_flag = base.profile.as_deref();
+
+    if base.json {
+        let payload = json!({
+            "meta": {
+                "command": "view trace",
+                "source": object_ref,
+                "trace_id": trace_id,
+                "limit": args.limit,
+                "preview_length": args.preview_length,
+                "truncated": true,
+            },
+            "paging": {
+                "cursor_in": args.cursor,
+                "next_cursor": next_cursor.clone(),
+                "has_more": has_more,
+            },
+            "items": response.data,
+            "hints": trace_hints(
+                has_more,
+                &object_ref_arg,
+                &trace_id,
+                next_cursor.as_deref(),
+                profile_flag,
+            ),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_trace_text(
+            &trace_id,
+            &response.data,
+            &object_ref_arg,
+            profile_flag,
+            args.limit,
+            args.preview_length,
+            next_cursor.as_deref(),
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> Result<()> {
+    if args.object_ref.is_some() && args.project_id.is_some() {
+        bail!("--object-ref and --project-id are mutually exclusive");
+    }
+    let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
+    let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
+    let project_from_url = parsed_startup_url
+        .as_ref()
+        .and_then(|u| u.project.as_deref());
+
+    let (object_ref, _project_for_url) = resolve_object_ref_for_view(
+        &client,
+        &base,
+        args.object_ref.as_deref(),
+        args.project_id.as_deref(),
+        project_from_url,
+    )
+    .await?;
+
+    let mut row_id = args
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let mut span_id_from_url: Option<String> = None;
+
+    if row_id.is_none() {
+        if let Some(parsed) = parsed_startup_url.as_ref() {
+            if let Some(s) = parsed.span_id.as_deref().filter(|v| !v.is_empty()) {
+                span_id_from_url = Some(s.to_string());
+            } else if let Some(r) = parsed.row_ref.as_deref().filter(|v| !v.is_empty()) {
+                row_id = Some(r.to_string());
+            }
+        }
+    }
+    if row_id.is_none() && span_id_from_url.is_none() {
+        bail!("span selector required. Pass --id <row-id> or --url <trace-url>");
+    }
+
+    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    if interactive {
+        if object_ref.object_type != "project_logs" {
+            bail!("interactive span view currently supports only project_logs sources");
+        }
+
+        let project = ProjectSelection {
+            id: object_ref.object_name.clone(),
+            name: None,
+        };
+        let startup_target = if let Some(mut parsed) = parsed_startup_url.clone() {
+            if parsed.span_id.is_none() {
+                parsed.span_id = parsed.row_ref.clone();
+            }
+            parsed
+        } else {
+            ParsedTraceUrl {
+                org: Some(client.org_name().to_string()),
+                project: Some(project.id.clone()),
+                page: Some("logs".to_string()),
+                row_ref: row_id.clone(),
+                span_id: row_id.clone().or(span_id_from_url.clone()),
+                trace_view_type: None,
+            }
+        };
+        let source_expr = btql_source_expr(&object_ref)?;
+        let base_filter = build_base_filter_clause(None, "1h", None)?;
+        return run_interactive(
+            project,
+            source_expr,
+            ListMode::Summary,
+            base_filter,
+            String::new(),
+            Vec::new(),
+            50,
+            125,
+            args.print_queries,
+            Some(startup_target),
+            client,
+        )
+        .await;
+    }
+
+    let source_expr = btql_source_expr(&object_ref)?;
+    let item = if let Some(id) = row_id.as_deref() {
+        let query = build_full_span_query_by_id(&source_expr, id);
+        maybe_print_query(args.print_queries, "span-full-id", &query);
+        let response = with_spinner("Loading span...", async {
+            execute_query(&client, &query)
+                .await
+                .with_context(|| format!("BTQL query failed: {query}"))
+        })
+        .await?;
+        response.data.into_iter().next()
+    } else {
+        let query = build_full_span_query_by_span_id(
+            &source_expr,
+            span_id_from_url
+                .as_deref()
+                .expect("URL span id should be present when row_id is absent"),
+        );
+        maybe_print_query(args.print_queries, "span-full-span-id", &query);
+        let response = with_spinner("Loading span...", async {
+            execute_query(&client, &query)
+                .await
+                .with_context(|| format!("BTQL query failed: {query}"))
+        })
+        .await?;
+        response.data.into_iter().next()
+    };
+
+    if base.json {
+        let payload = json!({
+            "meta": {
+                "command": "view span",
+                "source": object_ref,
+                "id": row_id,
+                "span_id": span_id_from_url,
+                "full": true,
+                "truncated": false,
+            },
+            "item": item,
+            "hints": ["Single span fetch returns full content. Write to a file if needed."],
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_span_text(item.as_ref());
+    }
+
+    Ok(())
+}
+
+async fn resolve_object_ref_for_view(
+    client: &ApiClient,
+    base: &BaseArgs,
+    object_ref: Option<&str>,
+    project_id: Option<&str>,
+    project_name_from_url: Option<&str>,
+) -> Result<(ObjectRef, Option<ProjectSelection>)> {
+    if let Some(raw) = object_ref {
+        let parsed = parse_object_ref(raw)?;
+        let project_for_ui = if parsed.object_type == "project_logs" {
+            Some(ProjectSelection {
+                id: parsed.object_name.clone(),
+                name: None,
+            })
+        } else {
+            None
+        };
+        return Ok((parsed, project_for_ui));
+    }
+
+    let project = resolve_project(
+        client,
+        base.project.as_deref(),
+        project_id,
+        project_name_from_url,
+    )
+    .await?;
+    Ok((
+        ObjectRef {
+            object_type: "project_logs".to_string(),
+            object_name: project.id.clone(),
+        },
+        Some(project),
+    ))
 }
 
 async fn resolve_project(
@@ -821,6 +1419,10 @@ async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<Pr
 
 async fn run_interactive(
     project: ProjectSelection,
+    source_expr: String,
+    list_mode: ListMode,
+    base_filter: String,
+    initial_search_query: String,
     traces: Vec<TraceSummaryRow>,
     limit: usize,
     preview_length: usize,
@@ -829,7 +1431,18 @@ async fn run_interactive(
     client: ApiClient,
 ) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    let app = TraceViewerApp::new(project, traces, limit, preview_length, print_queries);
+    let mut app = TraceViewerApp::new(
+        project,
+        source_expr,
+        list_mode,
+        base_filter,
+        traces,
+        limit,
+        preview_length,
+        print_queries,
+    );
+    app.trace_search_query = initial_search_query.clone();
+    app.trace_search_input = initial_search_query;
     tokio::task::block_in_place(|| run_interactive_blocking(app, startup_trace_url, client, handle))
 }
 
@@ -1585,7 +2198,9 @@ fn start_summary_load(
 ) {
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
-    let project_id = app.project.id.clone();
+    let source_expr = app.source_expr.clone();
+    let list_mode = app.list_mode;
+    let base_filter = app.base_filter.clone();
     let preview_length = app.preview_length;
     let limit = app.limit;
     let print_queries = app.print_queries;
@@ -1600,10 +2215,12 @@ fn start_summary_load(
         };
         let result = fetch_summary_rows(
             &client,
-            &project_id,
+            &source_expr,
+            list_mode,
             preview_length,
             limit,
             search_opt,
+            &base_filter,
             print_queries,
         )
         .await;
@@ -1615,10 +2232,15 @@ fn start_summary_load(
     app.summary_spinner_tick = 0;
     app.summary_load_rx = Some(rx);
     if app.screen == Screen::Traces {
-        if search_query.is_empty() {
-            app.set_status("Refreshing trace table...");
+        let noun = if app.list_mode == ListMode::Spans {
+            "span"
         } else {
-            app.set_status(format!("Searching traces for '{search_query}'..."));
+            "trace"
+        };
+        if search_query.is_empty() {
+            app.set_status(format!("Refreshing {noun} table..."));
+        } else {
+            app.set_status(format!("Searching {noun}s for '{search_query}'..."));
         }
     }
 }
@@ -1633,10 +2255,15 @@ fn apply_summary_rows(
     if app.traces.is_empty() {
         app.selected_trace = 0;
         if app.screen == Screen::Traces {
-            if search_query.trim().is_empty() {
-                app.set_status("No traces found for the selected project");
+            let noun = if app.list_mode == ListMode::Spans {
+                "spans"
             } else {
-                app.set_status(format!("No traces found for search '{search_query}'"));
+                "traces"
+            };
+            if search_query.trim().is_empty() {
+                app.set_status(format!("No {noun} found for the selected project"));
+            } else {
+                app.set_status(format!("No {noun} found for search '{search_query}'"));
             }
         }
         return;
@@ -1653,15 +2280,22 @@ fn apply_summary_rows(
     }
 
     if app.screen == Screen::Traces {
+        let noun = if app.list_mode == ListMode::Spans {
+            "spans"
+        } else {
+            "traces"
+        };
         if search_query.trim().is_empty() {
             app.set_status(format!(
-                "Loaded {} traces. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit",
-                app.traces.len()
+                "Loaded {} {}. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh  q: quit",
+                app.traces.len(),
+                noun
             ));
         } else {
             app.set_status(format!(
-                "Loaded {} traces for '{search_query}'. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh",
-                app.traces.len()
+                "Loaded {} {} for '{search_query}'. Up/Down: move  Enter: open trace  /: search  Ctrl+k: open URL  r: refresh",
+                app.traces.len(),
+                noun
             ));
         }
     }
@@ -1897,6 +2531,7 @@ fn start_trace_load_for_root_span(
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
     let project_id = app.project.id.clone();
+    let preview_length = app.preview_length;
     let print_queries = app.print_queries;
     let root_span_id_for_task = root_span_id.clone();
 
@@ -1905,6 +2540,7 @@ fn start_trace_load_for_root_span(
             &client,
             &project_id,
             &root_span_id_for_task,
+            preview_length,
             MAX_TRACE_SPANS,
             print_queries,
         )
@@ -2100,7 +2736,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &TraceViewerApp) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title("bt traces"),
+            .title("bt view logs"),
     );
     frame.render_widget(header, chunks[0]);
 
@@ -2212,7 +2848,12 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
     let search_widget = Paragraph::new(search_line).block(search_block);
     frame.render_widget(search_widget, chunks[0]);
 
-    let header = Row::new(vec!["Created", "Trace", "Input", "Duration"]).style(
+    let id_header = if app.list_mode == ListMode::Spans {
+        "Span"
+    } else {
+        "Trace"
+    };
+    let header = Row::new(vec!["Created", id_header, "Input", "Duration"]).style(
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -2223,7 +2864,11 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
         .iter()
         .map(|trace| {
             let created = preview_string(trace.row.get("created"), 24);
-            let trace_id = preview_string(Some(&Value::String(trace.root_span_id.clone())), 24);
+            let trace_id = if app.list_mode == ListMode::Spans {
+                preview_string(trace.row.get("span_id"), 24)
+            } else {
+                preview_string(Some(&Value::String(trace.root_span_id.clone())), 24)
+            };
             let input = preview_string(trace.row.get("input"), 80);
             let duration = format_duration(trace.row.get("metrics"));
 
@@ -2249,7 +2894,13 @@ fn draw_traces_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &T
     .block(
         Block::default()
             .title(if app.trace_search_query.trim().is_empty() {
-                "Recent Traces"
+                if app.list_mode == ListMode::Spans {
+                    "Recent Spans"
+                } else {
+                    "Recent Traces"
+                }
+            } else if app.list_mode == ListMode::Spans {
+                "Recent Spans [filtered]"
             } else {
                 "Recent Traces [filtered]"
             })
@@ -4146,6 +4797,262 @@ fn project_label(project: &ProjectSelection) -> String {
     }
 }
 
+fn logs_hints(
+    has_more: bool,
+    object_ref: &str,
+    next_cursor: Option<&str>,
+    profile: Option<&str>,
+) -> Vec<String> {
+    let mut hints = vec![
+        "Rows are truncated by preview_length; fetch a single span for full content.".to_string(),
+        "Use --json to get machine-readable envelopes for agent workflows.".to_string(),
+        "Write large responses to a file to preserve full output context.".to_string(),
+    ];
+    if has_more {
+        if let Some(cursor) = next_cursor {
+            hints.push(format!(
+                "Next page: bt view logs{} --object-ref {object_ref} --cursor {cursor}",
+                profile_flag_suffix(profile)
+            ));
+        } else {
+            hints.push(format!(
+                "Use --cursor <next_cursor> with --object-ref {object_ref} to fetch the next page."
+            ));
+        }
+    }
+    hints
+}
+
+fn trace_hints(
+    has_more: bool,
+    object_ref: &str,
+    trace_id: &str,
+    next_cursor: Option<&str>,
+    profile: Option<&str>,
+) -> Vec<String> {
+    let mut hints = vec![
+        format!(
+            "Trace fetch returns truncated span rows; use `bt view span{} --object-ref {object_ref} --id <row-id>` for full single-span payloads.",
+            profile_flag_suffix(profile)
+        ),
+        "Write output to a file for long traces.".to_string(),
+    ];
+    if has_more {
+        if let Some(cursor) = next_cursor {
+            hints.push(format!(
+                "Next page: bt view trace{} --object-ref {object_ref} --trace-id {trace_id} --cursor {cursor}",
+                profile_flag_suffix(profile)
+            ));
+        } else {
+            hints.push(format!(
+                "Use --cursor <next_cursor> with --object-ref {object_ref} and --trace-id {trace_id}."
+            ));
+        }
+    }
+    hints
+}
+
+fn list_mode_label(list_mode: ListMode) -> &'static str {
+    match list_mode {
+        ListMode::Summary => "summary",
+        ListMode::Spans => "spans",
+    }
+}
+
+fn print_logs_text(
+    rows: &[TraceSummaryRow],
+    list_mode: ListMode,
+    object_ref: &str,
+    profile: Option<&str>,
+    limit: usize,
+    preview_length: usize,
+    next_cursor: Option<&str>,
+) {
+    println!(
+        "bt view logs [{}]: returned {} row(s) (object_ref={}, limit={}, preview_length={})",
+        list_mode_label(list_mode),
+        rows.len(),
+        object_ref,
+        limit,
+        preview_length
+    );
+    for (idx, row) in rows.iter().enumerate() {
+        let created = preview_string(row.row.get("created"), 24);
+        let span_id = value_as_string(row.row.get("span_id")).unwrap_or_else(|| "-".to_string());
+        let input = preview_string(row.row.get("input"), 70);
+        println!(
+            "{:>3}. created={} root_span_id={} id={} span_id={} input={}",
+            idx + 1,
+            created,
+            row.root_span_id,
+            value_as_string(row.row.get("id")).unwrap_or_else(|| "-".to_string()),
+            span_id,
+            input
+        );
+    }
+    println!("\nTruncated fields use preview_length={preview_length}.");
+    if let Some(cursor) = next_cursor {
+        println!("next_cursor: {cursor}");
+        println!(
+            "next: bt view logs{} --object-ref {object_ref} --cursor {cursor} --non-interactive",
+            profile_flag_suffix(profile)
+        );
+    } else {
+        println!("No additional rows.");
+    }
+}
+
+fn print_trace_text(
+    trace_id: &str,
+    rows: &[Map<String, Value>],
+    object_ref: &str,
+    profile: Option<&str>,
+    limit: usize,
+    preview_length: usize,
+    next_cursor: Option<&str>,
+) {
+    println!(
+        "bt view trace: object_ref={} trace_id={} rows={} (limit={}, preview_length={})",
+        object_ref,
+        trace_id,
+        rows.len(),
+        limit,
+        preview_length
+    );
+    for (idx, row) in rows.iter().enumerate() {
+        let span_id = value_as_string(row.get("span_id")).unwrap_or_else(|| "-".to_string());
+        let created = preview_string(row.get("created"), 24);
+        let input = preview_string(row.get("input"), 70);
+        println!(
+            "{:>3}. created={} id={} span_id={} input={}",
+            idx + 1,
+            created,
+            value_as_string(row.get("id")).unwrap_or_else(|| "-".to_string()),
+            span_id,
+            input
+        );
+    }
+    println!(
+        "\nTrace output is truncated. Use `bt view span{} --object-ref {} --id <row-id>` for full span data.",
+        profile_flag_suffix(profile),
+        object_ref
+    );
+    if let Some(cursor) = next_cursor {
+        println!("next_cursor: {cursor}");
+        println!(
+            "next: bt view trace{} --object-ref {} --trace-id {} --cursor {} --non-interactive",
+            profile_flag_suffix(profile),
+            object_ref,
+            trace_id,
+            cursor
+        );
+    } else {
+        println!("No additional rows.");
+    }
+}
+
+fn print_span_text(item: Option<&Map<String, Value>>) {
+    match item {
+        Some(row) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(row)
+                    .unwrap_or_else(|_| Value::Object(row.clone()).to_string())
+            );
+        }
+        None => println!("No span found."),
+    }
+}
+
+fn parse_duration_to_seconds(input: &str) -> Result<u64> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("duration cannot be empty");
+    }
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Ok(seconds);
+    }
+
+    let (num_str, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
+    let value: u64 = num_str
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid duration '{input}'"))?;
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
+    };
+    Ok(value.saturating_mul(multiplier))
+}
+
+fn build_base_filter_clause(
+    since: Option<&str>,
+    window: &str,
+    extra_filter: Option<&str>,
+) -> Result<String> {
+    let time_clause = if let Some(ts) = since.map(str::trim).filter(|s| !s.is_empty()) {
+        format!("created >= {}", btql_quote(ts))
+    } else {
+        let seconds = parse_duration_to_seconds(window)?;
+        format!("created >= NOW() - INTERVAL {seconds} SECOND")
+    };
+
+    if let Some(extra) = extra_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        Ok(format!("({time_clause}) AND ({extra})"))
+    } else {
+        Ok(time_clause)
+    }
+}
+
+fn parse_object_ref(value: &str) -> Result<ObjectRef> {
+    let parts: Vec<&str> = value.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        bail!(
+            "invalid object ref '{value}'. expected format object_type:object_selector (for example: project_logs:<project_id>)"
+        );
+    }
+    let object_type = parts[0].trim();
+    let object_name = parts[1].trim();
+    if !matches!(object_type, "project_logs" | "experiment" | "dataset") {
+        bail!(
+            "unsupported object type '{object_type}'. supported types: project_logs, experiment, dataset"
+        );
+    }
+    if object_name.is_empty() {
+        bail!("object selector cannot be empty in '{value}'");
+    }
+    Ok(ObjectRef {
+        object_type: object_type.to_string(),
+        object_name: object_name.to_string(),
+    })
+}
+
+fn btql_source_expr(object_ref: &ObjectRef) -> Result<String> {
+    let source = match object_ref.object_type.as_str() {
+        "project_logs" => "project_logs",
+        "experiment" => "experiment",
+        "dataset" => "dataset",
+        other => bail!(
+            "unsupported object type '{other}'. supported types: project_logs, experiment, dataset"
+        ),
+    };
+    Ok(format!("{source}({})", sql_quote(&object_ref.object_name)))
+}
+
+fn format_object_ref_arg(object_ref: &ObjectRef) -> String {
+    format!("{}:{}", object_ref.object_type, object_ref.object_name)
+}
+
+fn profile_flag_suffix(profile: Option<&str>) -> String {
+    match profile.filter(|p| !p.trim().is_empty()) {
+        Some(profile) => format!(" --profile {}", btql_quote(profile)),
+        None => String::new(),
+    }
+}
+
 fn select_startup_url(
     long_url: Option<&str>,
     positional_url: Option<&str>,
@@ -4404,30 +5311,30 @@ fn build_url_lookup_by_span_id_query(project_id: &str, span_id: &str) -> String 
 }
 
 fn build_summary_query(
-    project_id: &str,
+    source_expr: &str,
+    list_mode: ListMode,
     preview_length: usize,
     limit: usize,
     cursor: Option<&str>,
     search_query: Option<&str>,
+    base_filter: &str,
 ) -> String {
     let cursor_clause = cursor
         .map(|c| format!(" | cursor: {}", btql_quote(c)))
         .unwrap_or_default();
-    let filter_clause = build_summary_filter(search_query);
+    let filter_clause = build_summary_filter(base_filter, search_query);
+    let mode = match list_mode {
+        ListMode::Summary => "summary",
+        ListMode::Spans => "spans",
+    };
     format!(
-        "select: * | from: project_logs({}) summary | filter: {} | preview_length: {} | sort: _pagination_key DESC | limit: {}{}",
-        sql_quote(project_id),
-        filter_clause,
-        preview_length,
-        limit,
-        cursor_clause,
+        "select: * | from: {source_expr} {mode} | filter: {filter_clause} | preview_length: {preview_length} | sort: _pagination_key DESC | limit: {limit}{cursor_clause}",
     )
 }
 
-fn build_summary_filter(search_query: Option<&str>) -> String {
-    let base = "created >= NOW() - INTERVAL 3 DAY";
+fn build_summary_filter(base_filter: &str, search_query: Option<&str>) -> String {
     let Some(search) = search_query.map(str::trim).filter(|s| !s.is_empty()) else {
-        return base.to_string();
+        return base_filter.to_string();
     };
 
     let match_term = sql_quote(search);
@@ -4437,12 +5344,13 @@ fn build_summary_filter(search_query: Option<&str>) -> String {
         .collect::<Vec<_>>()
         .join(" OR ");
 
-    format!("{base} AND ({match_clause})")
+    format!("({base_filter}) AND ({match_clause})")
 }
 
 fn build_spans_query(
     project_id: &str,
     root_span_id: &str,
+    preview_length: usize,
     limit: usize,
     cursor: Option<&str>,
 ) -> String {
@@ -4450,19 +5358,50 @@ fn build_spans_query(
         .map(|c| format!(" | cursor: {}", btql_quote(c)))
         .unwrap_or_default();
     format!(
-        "select: id, span_id, root_span_id, _pagination_key, _xact_id, created, span_parents, span_attributes, metadata.model, error, scores, metrics | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: 125 | sort: _pagination_key ASC | limit: {}{}",
+        "select: id, span_id, root_span_id, _pagination_key, _xact_id, created, span_parents, span_attributes, metadata.model, error, scores, metrics | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: {} | sort: _pagination_key ASC | limit: {}{}",
         sql_quote(project_id),
         sql_quote(root_span_id),
+        preview_length,
+        limit,
+        cursor_clause,
+    )
+}
+
+fn build_trace_spans_query(
+    source_expr: &str,
+    root_span_id: &str,
+    preview_length: usize,
+    limit: usize,
+    cursor: Option<&str>,
+) -> String {
+    let cursor_clause = cursor
+        .map(|c| format!(" | cursor: {}", btql_quote(c)))
+        .unwrap_or_default();
+    format!(
+        "select: * | from: {source_expr} spans | filter: root_span_id = {} | preview_length: {} | sort: _pagination_key ASC | limit: {}{}",
+        sql_quote(root_span_id),
+        preview_length,
         limit,
         cursor_clause,
     )
 }
 
 fn build_full_span_query(project_id: &str, span_row_id: &str) -> String {
+    let source_expr = format!("project_logs({})", sql_quote(project_id));
+    build_full_span_query_by_id(&source_expr, span_row_id)
+}
+
+fn build_full_span_query_by_id(source_expr: &str, span_row_id: &str) -> String {
     format!(
-        "select: * | from: project_logs({}) spans | filter: id = {} | preview_length: -1 | limit: 1",
-        sql_quote(project_id),
+        "select: * | from: {source_expr} spans | filter: id = {} | preview_length: -1 | limit: 1",
         sql_quote(span_row_id),
+    )
+}
+
+fn build_full_span_query_by_span_id(source_expr: &str, span_id: &str) -> String {
+    format!(
+        "select: * | from: {source_expr} spans | filter: span_id = {} | preview_length: -1 | limit: 1",
+        sql_quote(span_id),
     )
 }
 
@@ -4487,7 +5426,7 @@ fn compact_json(value: &Value) -> String {
 
 fn maybe_print_query(enabled: bool, label: &str, query: &str) {
     if enabled {
-        eprintln!("bt traces [{label}] BTQL:\n{query}\n");
+        eprintln!("bt view [{label}] BTQL:\n{query}\n");
     }
 }
 
@@ -4495,7 +5434,7 @@ fn maybe_print_invoke(enabled: bool, label: &str, request: &Value) {
     if enabled {
         let formatted =
             serde_json::to_string_pretty(request).unwrap_or_else(|_| compact_json(request));
-        eprintln!("bt traces [{label}] INVOKE /function/invoke:\n{formatted}\n");
+        eprintln!("bt view [{label}] INVOKE /function/invoke:\n{formatted}\n");
     }
 }
 
@@ -4537,10 +5476,12 @@ fn sql_quote(value: &str) -> String {
 
 async fn fetch_summary_rows(
     client: &ApiClient,
-    project_id: &str,
+    source_expr: &str,
+    list_mode: ListMode,
     preview_length: usize,
     total_limit: usize,
     search_query: Option<&str>,
+    base_filter: &str,
     print_queries: bool,
 ) -> Result<Vec<Map<String, Value>>> {
     let mut rows: Vec<Map<String, Value>> = Vec::new();
@@ -4549,11 +5490,13 @@ async fn fetch_summary_rows(
     while rows.len() < total_limit {
         let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
         let query = build_summary_query(
-            project_id,
+            source_expr,
+            list_mode,
             preview_length,
             page_limit,
             cursor.as_deref(),
             search_query,
+            base_filter,
         );
         maybe_print_query(print_queries, "summary", &query);
 
@@ -4578,10 +5521,53 @@ async fn fetch_summary_rows(
     Ok(rows)
 }
 
+async fn fetch_logs_page(
+    client: &ApiClient,
+    source_expr: &str,
+    list_mode: ListMode,
+    preview_length: usize,
+    limit: usize,
+    cursor: Option<&str>,
+    search_query: Option<&str>,
+    base_filter: &str,
+    print_queries: bool,
+) -> Result<BtqlResponse> {
+    let query = build_summary_query(
+        source_expr,
+        list_mode,
+        preview_length,
+        limit,
+        cursor,
+        search_query,
+        base_filter,
+    );
+    maybe_print_query(print_queries, "logs", &query);
+    execute_query(client, &query)
+        .await
+        .with_context(|| format!("BTQL query failed: {query}"))
+}
+
+async fn fetch_trace_spans_page(
+    client: &ApiClient,
+    source_expr: &str,
+    root_span_id: &str,
+    preview_length: usize,
+    limit: usize,
+    cursor: Option<&str>,
+    print_queries: bool,
+) -> Result<BtqlResponse> {
+    let query = build_trace_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
+    maybe_print_query(print_queries, "trace", &query);
+    execute_query(client, &query)
+        .await
+        .with_context(|| format!("BTQL query failed: {query}"))
+}
+
 async fn fetch_trace_span_rows_for_tree(
     client: &ApiClient,
     project_id: &str,
     root_span_id: &str,
+    preview_length: usize,
     total_limit: usize,
     print_queries: bool,
 ) -> Result<Vec<Map<String, Value>>> {
@@ -4590,7 +5576,13 @@ async fn fetch_trace_span_rows_for_tree(
 
     while rows.len() < total_limit {
         let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
-        let query = build_spans_query(project_id, root_span_id, page_limit, cursor.as_deref());
+        let query = build_spans_query(
+            project_id,
+            root_span_id,
+            preview_length,
+            page_limit,
+            cursor.as_deref(),
+        );
         maybe_print_query(print_queries, "spans-tree", &query);
 
         let response = execute_query(client, &query)
@@ -5028,5 +6020,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_duration_to_seconds_supports_units() {
+        assert_eq!(parse_duration_to_seconds("90").expect("seconds"), 90);
+        assert_eq!(parse_duration_to_seconds("15m").expect("minutes"), 900);
+        assert_eq!(parse_duration_to_seconds("2h").expect("hours"), 7_200);
+        assert_eq!(parse_duration_to_seconds("1d").expect("days"), 86_400);
+    }
+
+    #[test]
+    fn build_base_filter_clause_uses_window_or_since() {
+        let from_window = build_base_filter_clause(None, "1h", Some("metadata.model IS NOT NULL"))
+            .expect("window filter");
+        assert!(from_window.contains("INTERVAL 3600 SECOND"));
+        assert!(from_window.contains("metadata.model IS NOT NULL"));
+
+        let from_since = build_base_filter_clause(Some("2025-01-01T00:00:00Z"), "1h", None)
+            .expect("since filter");
+        assert!(from_since.contains("created >= \"2025-01-01T00:00:00Z\""));
+    }
+
+    #[test]
+    fn build_summary_query_switches_summary_vs_spans_mode() {
+        let summary_query = build_summary_query(
+            "project_logs('p1')",
+            ListMode::Summary,
+            125,
+            10,
+            None,
+            Some("hello"),
+            "created >= NOW() - INTERVAL 3600 SECOND",
+        );
+        assert!(summary_query.contains("from: project_logs('p1') summary"));
+        assert!(summary_query.contains("preview_length: 125"));
+
+        let spans_query = build_summary_query(
+            "project_logs('p1')",
+            ListMode::Spans,
+            50,
+            5,
+            Some("abc"),
+            None,
+            "created >= NOW() - INTERVAL 3600 SECOND",
+        );
+        assert!(spans_query.contains("from: project_logs('p1') spans"));
+        assert!(spans_query.contains("cursor: \"abc\""));
+        assert!(spans_query.contains("preview_length: 50"));
+    }
+
+    #[test]
+    fn parse_object_ref_validates_type_and_selector() {
+        let parsed = parse_object_ref("project_logs:123").expect("valid object ref");
+        assert_eq!(parsed.object_type, "project_logs");
+        assert_eq!(parsed.object_name, "123");
+
+        let err = parse_object_ref("badformat").expect_err("should fail");
+        assert!(err.to_string().contains("invalid object ref"));
+
+        let err = parse_object_ref("foo:123").expect_err("should fail");
+        assert!(err.to_string().contains("unsupported object type"));
+    }
+
+    #[test]
+    fn trace_and_span_queries_follow_truncation_policy() {
+        let trace_query = build_trace_spans_query("project_logs('p1')", "root-1", 125, 10, None);
+        assert!(trace_query.contains("preview_length: 125"));
+        assert!(trace_query.contains("from: project_logs('p1') spans"));
+        assert!(trace_query.contains("filter: root_span_id = 'root-1'"));
+
+        let full_by_row = build_full_span_query_by_id("project_logs('p1')", "row-1");
+        assert!(full_by_row.contains("preview_length: -1"));
+        assert!(full_by_row.contains("filter: id = 'row-1'"));
+
+        let full_by_span_id = build_full_span_query_by_span_id("project_logs('p1')", "span-1");
+        assert!(full_by_span_id.contains("preview_length: -1"));
+        assert!(full_by_span_id.contains("filter: span_id = 'span-1'"));
     }
 }
