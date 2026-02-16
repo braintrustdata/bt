@@ -11,6 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: write
   issues: write
   pull-requests: write
@@ -64,17 +65,18 @@ jobs:
           fi
 
           short_sha="${GITHUB_SHA::12}"
+          pkg_version="$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)"
+          if [ -z "$pkg_version" ]; then
+            echo "Failed to determine package version from Cargo.toml" >&2
+            exit 1
+          fi
+
           if [ "${GITHUB_REF_NAME}" = "main" ]; then
             canary_tag="canary-$short_sha"
             alias_tag="canary"
           else
             canary_tag="canary-${branch_slug}-$short_sha"
             alias_tag="canary-${branch_slug}"
-          fi
-          pkg_version="$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)"
-          if [ -z "$pkg_version" ]; then
-            echo "Failed to determine package version from Cargo.toml" >&2
-            exit 1
           fi
           dist_tag="v${pkg_version}"
 
@@ -234,7 +236,7 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    if: ${{ always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ github.ref_name == 'main' && always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -334,8 +336,9 @@ jobs:
   comment-pr-install:
     needs:
       - plan
-      - announce
-    if: ${{ github.event_name == 'push' && needs.announce.result == 'success' }}
+      - build-local-artifacts
+      - build-global-artifacts
+    if: ${{ github.event_name == 'push' && github.ref_name != 'main' && always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -343,7 +346,7 @@ jobs:
       OWNER: ${{ github.repository_owner }}
       BRANCH_NAME: ${{ github.ref_name }}
       SHORT_SHA: ${{ needs.plan.outputs.short-sha }}
-      ALIAS_TAG: ${{ needs.plan.outputs.alias-tag }}
+      RUN_ID: ${{ github.run_id }}
     steps:
       - name: Upsert PR install comment
         shell: bash
@@ -356,15 +359,32 @@ jobs:
           fi
 
           marker="<!-- bt-pr-canary-install-comment -->"
+          run_url="https://github.com/${REPO}/actions/runs/${RUN_ID}"
+          artifacts="$(gh api --method GET "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" | jq -r '.artifacts[] | select(.expired == false) | .name' | sed 's/^/- `&`/' || true)"
+          if [ -z "$artifacts" ]; then
+            artifacts="- (no artifacts found)"
+          fi
+
           body_file="$RUNNER_TEMP/pr-canary-install-comment.md"
-          cat > "$body_file" <<EOF
+          {
+            cat <<EOF
           ${marker}
-          Latest install commands for this PR (updated for commit \`${SHORT_SHA}\`):
+          Latest downloadable build artifacts for this PR commit \`${SHORT_SHA}\`:
 
-          - Unix: \`curl -fsSL https://github.com/${REPO}/releases/download/${ALIAS_TAG}/bt-installer.sh | sh\`
-          - Windows: \`powershell -ExecutionPolicy Bypass -c "irm https://github.com/${REPO}/releases/download/${ALIAS_TAG}/bt-installer.ps1 | iex"\`
+          - Workflow run: ${run_url}
+          - Download all artifacts (GitHub CLI): \`gh run download ${RUN_ID} --repo ${REPO}\`
+          - Installers are published as GitHub releases from \`main\`; PR commits are available as run artifacts only.
+
+          <details>
+          <summary>Available artifact names</summary>
+
           EOF
+            printf '%s\n' "$artifacts"
+            cat <<EOF
 
+          </details>
+          EOF
+          } > "$body_file"
           payload_file="$RUNNER_TEMP/pr-comment-payload.json"
           jq -n --arg body "$(cat "$body_file")" '{body:$body}' > "$payload_file"
 
@@ -397,8 +417,8 @@ jobs:
         shell: bash
         run: |
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-          bt --version
-          bt self update --help
+          bt --version | grep -i canary
+          bt self update --check
 
   smoke-install-macos:
     needs:
@@ -420,8 +440,8 @@ jobs:
         shell: bash
         run: |
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-          bt --version
-          bt self update --help
+          bt --version | grep -i canary
+          bt self update --check
 
   smoke-install-windows:
     needs:
@@ -447,6 +467,9 @@ jobs:
           if (!(Test-Path $btExe)) {
             throw "bt.exe not found at $btExe"
           }
-          & $btExe --version
+          $version = & $btExe --version
+          if ($version -notmatch "canary") {
+            throw "expected canary version string, got: $version"
+          }
           $env:PATH = "$(Join-Path $cargoHome 'bin');$env:PATH"
-          & $btExe self update --help
+          & $btExe self update --check
