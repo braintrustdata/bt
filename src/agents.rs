@@ -6,12 +6,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use regex::Regex;
+use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::args::BaseArgs;
 
 const SHARED_SKILL_BODY: &str = include_str!("../skills/shared/braintrust-cli-body.md");
+const SHARED_WORKFLOW_GUIDE: &str = include_str!("../skills/shared/workflows.md");
+const BT_README: &str = include_str!("../README.md");
+const DEFAULT_DOCS_LLMS_URL: &str = "https://www.braintrust.dev/docs/llms.txt";
+const DEFAULT_DOCS_LLMS_FULL_URL: &str = "https://www.braintrust.dev/docs/llms-full.txt";
 
 #[derive(Debug, Clone, Args)]
 pub struct AgentsArgs {
@@ -23,6 +29,8 @@ pub struct AgentsArgs {
 enum AgentsSubcommand {
     /// Configure coding agents to use Braintrust
     Setup(AgentsSetupArgs),
+    /// Fetch docs markdown for workflow-oriented agent skills
+    Docs(AgentsDocsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -58,6 +66,41 @@ struct AgentsSetupArgs {
     yes: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+struct AgentsDocsArgs {
+    #[command(subcommand)]
+    command: Option<AgentsDocsSubcommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AgentsDocsSubcommand {
+    /// Download workflow docs markdown from Mintlify llms index
+    Fetch(AgentsDocsFetchArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct AgentsDocsFetchArgs {
+    /// llms index URL (Mintlify markdown index)
+    #[arg(long, default_value = DEFAULT_DOCS_LLMS_URL)]
+    llms_url: String,
+
+    /// Output directory for downloaded docs
+    #[arg(long, default_value = "skills/docs")]
+    output_dir: PathBuf,
+
+    /// Workflow(s) to include (repeatable)
+    #[arg(long = "workflow", value_enum)]
+    workflows: Vec<WorkflowArg>,
+
+    /// Discover links only; do not write files
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Fail command if any page download fails
+    #[arg(long)]
+    strict: bool,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, ValueEnum, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum AgentArg {
@@ -84,6 +127,30 @@ impl Agent {
             Agent::Codex => "codex",
             Agent::Cursor => "cursor",
             Agent::Opencode => "opencode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum WorkflowArg {
+    Instrument,
+    Observe,
+    Annotate,
+    Evaluate,
+    Deploy,
+    All,
+}
+
+impl WorkflowArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkflowArg::Instrument => "instrument",
+            WorkflowArg::Observe => "observe",
+            WorkflowArg::Annotate => "annotate",
+            WorkflowArg::Evaluate => "evaluate",
+            WorkflowArg::Deploy => "deploy",
+            WorkflowArg::All => "all",
         }
     }
 }
@@ -135,9 +202,35 @@ struct SetupJsonReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DocsFileResult {
+    title: String,
+    url: String,
+    workflow: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DocsFetchJsonReport {
+    llms_url: String,
+    output_dir: String,
+    dry_run: bool,
+    discovered: usize,
+    written: usize,
+    failed: usize,
+    workflows: Vec<String>,
+    files: Vec<DocsFileResult>,
+    warnings: Vec<String>,
+}
+
 pub async fn run(base: BaseArgs, args: AgentsArgs) -> Result<()> {
     match args.command {
         Some(AgentsSubcommand::Setup(setup)) => run_setup(base, setup),
+        Some(AgentsSubcommand::Docs(docs)) => run_docs(base, docs).await,
         None => {
             bail!("subcommand required. Use: `bt agents setup --local|--global [--agent ...]`")
         }
@@ -149,6 +242,249 @@ pub async fn run_skills_compat(base: BaseArgs, args: SkillsCompatArgs) -> Result
         bail!("`bt skills` compatibility mode requires --install");
     }
     run_setup(base, args.setup)
+}
+
+async fn run_docs(base: BaseArgs, args: AgentsDocsArgs) -> Result<()> {
+    match args.command {
+        Some(AgentsDocsSubcommand::Fetch(fetch)) => run_docs_fetch(base, fetch).await,
+        None => bail!("subcommand required. Use: `bt agents docs fetch [--workflow ...]`"),
+    }
+}
+
+async fn run_docs_fetch(base: BaseArgs, args: AgentsDocsFetchArgs) -> Result<()> {
+    let selected_workflows = resolve_workflow_selection(&args.workflows);
+    let workflow_set: BTreeSet<&str> = selected_workflows.iter().map(|w| w.as_str()).collect();
+    let workflow_link_re =
+        Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").context("failed to build markdown link regex")?;
+    let bare_url_re =
+        Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).context("failed to build URL regex")?;
+    let llms_base = reqwest::Url::parse(&args.llms_url)
+        .with_context(|| format!("invalid llms URL: {}", args.llms_url))?;
+    let client = Client::builder()
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let index_response = client
+        .get(&args.llms_url)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch llms index {}", args.llms_url))?;
+    if !index_response.status().is_success() {
+        let status = index_response.status();
+        let body = index_response.text().await.unwrap_or_default();
+        bail!("failed to fetch llms index ({status}): {body}");
+    }
+    let index_body = index_response
+        .text()
+        .await
+        .context("failed to read llms index response body")?;
+
+    let mut discovered = collect_docs_links(
+        &index_body,
+        &workflow_set,
+        &workflow_link_re,
+        &bare_url_re,
+        &llms_base,
+    );
+    if discovered.is_empty() && args.llms_url == DEFAULT_DOCS_LLMS_URL {
+        let fallback_response = client
+            .get(DEFAULT_DOCS_LLMS_FULL_URL)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to fetch fallback index {}",
+                    DEFAULT_DOCS_LLMS_FULL_URL
+                )
+            })?;
+        if fallback_response.status().is_success() {
+            let fallback_body = fallback_response
+                .text()
+                .await
+                .context("failed to read fallback llms-full response body")?;
+            if let Ok(fallback_base) = reqwest::Url::parse(DEFAULT_DOCS_LLMS_FULL_URL) {
+                discovered = collect_docs_links(
+                    &fallback_body,
+                    &workflow_set,
+                    &workflow_link_re,
+                    &bare_url_re,
+                    &fallback_base,
+                );
+            }
+        }
+    }
+
+    let mut written = 0usize;
+    let mut failed = 0usize;
+    let mut file_results = Vec::new();
+    let mut warnings = Vec::new();
+    let mut seen_targets = BTreeSet::new();
+
+    if !args.dry_run {
+        fs::create_dir_all(&args.output_dir).with_context(|| {
+            format!(
+                "failed to create output directory {}",
+                args.output_dir.display()
+            )
+        })?;
+    }
+
+    for (title, workflow, url) in discovered {
+        if args.dry_run {
+            file_results.push(DocsFileResult {
+                title,
+                url,
+                workflow,
+                status: "discovered".to_string(),
+                path: None,
+                error: None,
+            });
+            continue;
+        }
+
+        let workflow_dir = args.output_dir.join(&workflow);
+        fs::create_dir_all(&workflow_dir).with_context(|| {
+            format!(
+                "failed to create workflow directory {}",
+                workflow_dir.display()
+            )
+        })?;
+        let rel_path = workflow_relative_path(&url, &workflow);
+        let target = workflow_dir.join(&rel_path);
+        let target_key = target.to_string_lossy().to_ascii_lowercase();
+        if !seen_targets.insert(target_key) {
+            let warning = format!(
+                "skipping duplicate output path for {} [{}] -> {}",
+                title,
+                workflow,
+                target.display()
+            );
+            warnings.push(warning);
+            file_results.push(DocsFileResult {
+                title,
+                url,
+                workflow,
+                status: "skipped".to_string(),
+                path: None,
+                error: Some("duplicate output path".to_string()),
+            });
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create docs subdirectory {}", parent.display())
+            })?;
+        }
+
+        let fetch_result = async {
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("failed to fetch docs page {url}"))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                bail!("docs page returned error ({status}): {body}");
+            }
+            let content = response
+                .text()
+                .await
+                .with_context(|| format!("failed to read docs page body {url}"))?;
+            write_text_file(&target, &content)?;
+            Result::<()>::Ok(())
+        }
+        .await;
+
+        match fetch_result {
+            Ok(()) => {
+                written += 1;
+                file_results.push(DocsFileResult {
+                    title,
+                    url,
+                    workflow,
+                    status: "written".to_string(),
+                    path: Some(target.display().to_string()),
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                let warning = format!("failed to fetch {url}: {err}");
+                warnings.push(warning.clone());
+                file_results.push(DocsFileResult {
+                    title,
+                    url,
+                    workflow,
+                    status: "failed".to_string(),
+                    path: None,
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+    }
+
+    if !args.dry_run {
+        write_docs_indexes(
+            &args.output_dir,
+            selected_workflows
+                .iter()
+                .map(|workflow| workflow.as_str())
+                .collect::<Vec<_>>(),
+            &file_results,
+        )?;
+    }
+
+    if base.json {
+        let report = DocsFetchJsonReport {
+            llms_url: args.llms_url,
+            output_dir: args.output_dir.display().to_string(),
+            dry_run: args.dry_run,
+            discovered: file_results.len(),
+            written,
+            failed,
+            workflows: selected_workflows
+                .iter()
+                .map(|workflow| workflow.as_str().to_string())
+                .collect(),
+            files: file_results,
+            warnings: warnings.clone(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize docs report")?
+        );
+    } else {
+        println!("Fetched docs index: {}", args.llms_url);
+        println!(
+            "Workflows: {}",
+            workflow_set.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        println!(
+            "Discovered {} page(s), wrote {} page(s){}",
+            file_results.len(),
+            written,
+            if args.dry_run { " (dry-run)" } else { "" }
+        );
+        for file in &file_results {
+            match &file.path {
+                Some(path) => println!("  - {} [{}] -> {}", file.title, file.workflow, path),
+                None => println!("  - {} [{}] -> {}", file.title, file.workflow, file.url),
+            }
+        }
+        if !warnings.is_empty() {
+            println!("Warnings:");
+            for warning in &warnings {
+                println!("  - {warning}");
+            }
+        }
+    }
+
+    if args.strict && failed > 0 {
+        bail!("{} docs page(s) failed to download in strict mode", failed);
+    }
+
+    Ok(())
 }
 
 fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
@@ -284,6 +620,245 @@ fn resolve_selected_agents(requested: &[AgentArg], detected: &[DetectionSignal])
         }
     }
     out.into_iter().collect()
+}
+
+fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
+    if requested.is_empty() || requested.contains(&WorkflowArg::All) {
+        return vec![
+            WorkflowArg::Instrument,
+            WorkflowArg::Observe,
+            WorkflowArg::Annotate,
+            WorkflowArg::Evaluate,
+            WorkflowArg::Deploy,
+        ];
+    }
+
+    let mut out = BTreeSet::new();
+    for workflow in requested {
+        if !matches!(workflow, WorkflowArg::All) {
+            out.insert(*workflow);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn workflow_from_url(url: &str) -> Option<&'static str> {
+    let canonical = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    for workflow in ["instrument", "observe", "annotate", "evaluate", "deploy"] {
+        if canonical.contains(&format!("/docs/{workflow}/"))
+            || canonical.ends_with(&format!("/docs/{workflow}.md"))
+            || canonical.ends_with(&format!("/docs/{workflow}"))
+        {
+            return Some(workflow);
+        }
+    }
+    None
+}
+
+fn slug_for_url(url: &str) -> String {
+    let canonical = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let mut slug = canonical.rsplit('/').next().unwrap_or("index").to_string();
+    if let Some(stripped) = slug.strip_suffix(".md") {
+        slug = stripped.to_string();
+    }
+    if slug.ends_with(".html") {
+        slug = slug.trim_end_matches(".html").to_string();
+    }
+    if slug.is_empty() {
+        slug = "index".to_string();
+    }
+    slug.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn collect_docs_links(
+    body: &str,
+    workflow_set: &BTreeSet<&str>,
+    workflow_link_re: &Regex,
+    bare_url_re: &Regex,
+    base_url: &reqwest::Url,
+) -> Vec<(String, String, String)> {
+    let mut discovered = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for capture in workflow_link_re.captures_iter(body) {
+        let title = capture
+            .get(1)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        let raw_url = capture
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        let Some(url) = absolutize_url(&raw_url, base_url) else {
+            continue;
+        };
+        let Some(workflow) = workflow_from_url(&url) else {
+            continue;
+        };
+        if !workflow_set.contains(workflow) {
+            continue;
+        }
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        discovered.push((title, workflow.to_string(), url));
+    }
+
+    for capture in bare_url_re.captures_iter(body) {
+        let url = capture
+            .get(1)
+            .map(|m| {
+                m.as_str()
+                    .trim()
+                    .trim_end_matches([',', '.', ';', ')'])
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let Some(workflow) = workflow_from_url(&url) else {
+            continue;
+        };
+        if !workflow_set.contains(workflow) {
+            continue;
+        }
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        discovered.push((slug_for_url(&url), workflow.to_string(), url));
+    }
+
+    discovered
+}
+
+fn absolutize_url(raw: &str, base_url: &reqwest::Url) -> Option<String> {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    base_url.join(raw).ok().map(|url| url.to_string())
+}
+
+fn workflow_relative_path(url: &str, workflow: &str) -> PathBuf {
+    let canonical = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let marker = format!("/docs/{workflow}/");
+    let tail = if let Some(idx) = canonical.find(&marker) {
+        canonical[idx + marker.len()..].to_string()
+    } else if canonical.ends_with(&format!("/docs/{workflow}")) {
+        "index.md".to_string()
+    } else if canonical.ends_with(&format!("/docs/{workflow}.md")) {
+        "index.md".to_string()
+    } else {
+        format!("{}.md", slug_for_url(url))
+    };
+
+    let mut clean_segments = Vec::new();
+    for segment in tail.split('/') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        clean_segments.push(sanitize_path_segment(segment));
+    }
+    if clean_segments.is_empty() {
+        clean_segments.push("index.md".to_string());
+    }
+
+    let mut rel = PathBuf::new();
+    for segment in clean_segments {
+        rel.push(segment);
+    }
+    if rel.extension().is_none() {
+        rel.set_extension("md");
+    }
+    rel
+}
+
+fn sanitize_path_segment(segment: &str) -> String {
+    let mut out = String::new();
+    for ch in segment.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "index".to_string()
+    } else {
+        out
+    }
+}
+
+fn write_docs_indexes(
+    output_dir: &Path,
+    workflows: Vec<&str>,
+    files: &[DocsFileResult],
+) -> Result<()> {
+    let mut top_lines = Vec::new();
+    top_lines.push("# Braintrust Workflow Docs".to_string());
+    top_lines.push(String::new());
+    top_lines.push("Generated by `bt agents docs fetch`.".to_string());
+    top_lines.push(String::new());
+
+    for workflow in workflows {
+        let workflow_files = files
+            .iter()
+            .filter(|file| file.workflow == workflow && file.status == "written")
+            .collect::<Vec<_>>();
+
+        top_lines.push(format!("## {}", workflow));
+        if workflow_files.is_empty() {
+            top_lines.push("- no pages downloaded".to_string());
+            top_lines.push(String::new());
+            continue;
+        }
+
+        let mut workflow_index_lines = Vec::new();
+        workflow_index_lines.push(format!("# {} Docs", workflow));
+        workflow_index_lines.push(String::new());
+
+        for file in workflow_files {
+            let Some(path) = file.path.as_deref() else {
+                continue;
+            };
+            let workflow_dir = output_dir.join(workflow);
+            let relative = Path::new(path)
+                .strip_prefix(&workflow_dir)
+                .unwrap_or_else(|_| Path::new(path))
+                .display()
+                .to_string();
+            workflow_index_lines.push(format!("- [{}]({})", file.title, relative));
+            workflow_index_lines.push(format!("  source: `{}`", file.url));
+            top_lines.push(format!("- [{}]({}/{})", file.title, workflow, relative));
+        }
+
+        let workflow_index = output_dir.join(workflow).join("_index.md");
+        write_text_file(&workflow_index, &workflow_index_lines.join("\n"))?;
+        top_lines.push(format!("- [_index]({}/_index.md)", workflow));
+        top_lines.push(String::new());
+    }
+
+    let top_index = output_dir.join("README.md");
+    write_text_file(&top_index, &top_lines.join("\n"))?;
+    Ok(())
 }
 
 fn select_agents(args: &AgentsSetupArgs, detected: &[DetectionSignal]) -> Result<Vec<Agent>> {
@@ -607,8 +1182,10 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
 
 fn render_braintrust_skill() -> String {
     format!(
-        "---\nname: braintrust-cli\nversion: 1.0.0\ndescription: Use the Braintrust `bt` CLI for projects, traces, prompts, and sync workflows.\n---\n\n{}",
-        SHARED_SKILL_BODY.trim()
+        "---\nname: braintrust-cli\nversion: 1.0.0\ndescription: Use the Braintrust `bt` CLI for projects, traces, prompts, and key Braintrust workflows.\n---\n\n## Purpose\n\n{}\n\n## Key Workflows\n\n{}\n\n## bt CLI Reference (Inlined README)\n\n{}",
+        SHARED_SKILL_BODY.trim(),
+        SHARED_WORKFLOW_GUIDE.trim(),
+        BT_README.trim()
     )
 }
 
@@ -795,5 +1372,71 @@ mod tests {
             .expect("canonical detected path");
         let expected = root.canonicalize().expect("canonical expected path");
         assert_eq!(detected, expected);
+    }
+
+    #[test]
+    fn resolve_workflow_selection_defaults_to_all() {
+        let resolved = resolve_workflow_selection(&[]);
+        assert_eq!(
+            resolved,
+            vec![
+                WorkflowArg::Instrument,
+                WorkflowArg::Observe,
+                WorkflowArg::Annotate,
+                WorkflowArg::Evaluate,
+                WorkflowArg::Deploy
+            ]
+        );
+    }
+
+    #[test]
+    fn workflow_from_url_detects_expected_sections() {
+        assert_eq!(
+            workflow_from_url("https://www.braintrust.dev/docs/evaluate/overview.md"),
+            Some("evaluate")
+        );
+        assert_eq!(
+            workflow_from_url("https://www.braintrust.dev/docs/observe.md"),
+            Some("observe")
+        );
+        assert_eq!(
+            workflow_from_url("https://www.braintrust.dev/docs/changelog.md"),
+            None
+        );
+        assert_eq!(
+            workflow_from_url("https://www.braintrust.dev/docs/instrument"),
+            Some("instrument")
+        );
+    }
+
+    #[test]
+    fn slug_for_url_handles_suffixes_and_query_params() {
+        assert_eq!(
+            slug_for_url("https://www.braintrust.dev/docs/evaluate/overview.md?x=1#y"),
+            "overview"
+        );
+        assert_eq!(
+            slug_for_url("https://www.braintrust.dev/docs/evaluate/custom-scorers.md"),
+            "custom-scorers"
+        );
+        assert_eq!(
+            slug_for_url("https://www.braintrust.dev/docs/evaluate/overview.html"),
+            "overview"
+        );
+    }
+
+    #[test]
+    fn workflow_relative_path_preserves_nested_structure() {
+        let rel = workflow_relative_path(
+            "https://www.braintrust.dev/docs/evaluate/models/custom-scorers.md",
+            "evaluate",
+        );
+        assert_eq!(rel, PathBuf::from("models/custom-scorers.md"));
+    }
+
+    #[test]
+    fn workflow_relative_path_handles_workflow_root_page() {
+        let rel = workflow_relative_path("https://www.braintrust.dev/docs/observe", "observe");
+        assert_eq!(rel, PathBuf::from("index.md"));
     }
 }

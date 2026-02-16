@@ -204,13 +204,19 @@ Use `bt agents setup` to configure coding agents for Braintrust.
   - `bt agents setup --local --with-mcp`
 - Non-interactive runs should pass an explicit scope:
   - `bt agents setup --global --yes`
+- Sync workflow docs markdown from Braintrust Docs (Mintlify `llms.txt`):
+  - `bt agents docs fetch --workflow instrument --workflow evaluate`
+  - `bt agents docs fetch --dry-run`
+  - `bt agents docs fetch --strict` (fail if any page download fails)
 
 Current behavior:
 
 - Supported agents: `claude`, `codex`, `cursor`, `opencode`.
 - If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
+- In interactive TTY mode, `bt agents setup` shows a checklist so you can select/deselect agents before install.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
+- Docs fetch writes LLM-friendly local indexes: `skills/docs/README.md` and per-workflow `skills/docs/<workflow>/_index.md`.
 
 Compatibility alias:
 

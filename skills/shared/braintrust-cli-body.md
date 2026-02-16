@@ -1,18 +1,24 @@
 Use the Braintrust `bt` CLI for projects, traces, prompts, and sync workflows.
 
-Prefer using the local `bt` CLI for Braintrust workflows.
+## When To Use
 
-Common commands:
+- The user asks to inspect traces, prompts, projects, or sync state.
+- You need reliable auth/profile behavior without manually handling API tokens.
+- You are automating CLI workflows where `--json` output can be piped to other tools.
 
-- `bt login status`
-- `bt projects list`
-- `bt prompts list --project <name>`
-- `bt view logs --project <name>`
-- `bt view trace --object-ref <ref> --trace-id <id>`
-- `bt sync status --spec <name>`
+## How To Use
 
-Guidelines:
+1. Confirm auth and context:
+   - `bt login status`
+   - `bt projects list`
+2. Run the smallest command that answers the question:
+   - `bt prompts list --project <name>`
+   - `bt view logs --project <name>`
+   - `bt view trace --object-ref <ref> --trace-id <id>`
+3. Prefer machine-readable output for follow-up:
+   - add `--json` when results need further parsing.
 
-- Prefer CLI output (`--json`) for structured follow-up processing.
+## Guardrails
+
+- Prefer `bt` commands over direct API calls when both can accomplish the task.
 - Respect existing login/profile settings from `bt login`.
-- Avoid direct API calls when `bt` already supports the operation.
