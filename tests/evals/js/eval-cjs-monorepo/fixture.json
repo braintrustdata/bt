@@ -1,0 +1,4 @@
+{
+  "files": ["tests/basic.eval.ts"],
+  "runner": "ts-node"
+}
