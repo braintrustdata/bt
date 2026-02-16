@@ -124,27 +124,34 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - If eval execution fails with ESM/top-level-await related errors, retry with:
   - `bt eval --runner vite-node tutorial.eval.ts`
 
-## `bt traces`
+## `bt view`
 
-- Open an interactive terminal trace viewer for a project:
-  - `bt -p <project-name> traces`
-  - `bt traces --project-id <project-id>`
-  - `bt trace <braintrust-url>` (alias that opens a trace URL directly)
-- Optional flags:
-  - `--limit <N>`: number of summary traces to load (default `50`)
-  - `--preview-length <N>`: preview length used in summary rows (default `125`)
-  - `--url <braintrust-url>`: open a Braintrust URL directly (`r`/`s`/`tvt` parsed)
-  - `--print-queries`: print each BTQL query and invoke payload before execution
-- Controls:
-  - Trace table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
-  - Search bar: `/` to edit search text, `Enter` to apply, `Esc` to cancel, `Ctrl+u` to clear input
-  - Open URL: `Ctrl+k` to paste a Braintrust URL, `Enter` to open, `Esc` to cancel
-  - Detail view: `t` toggles between span detail and thread view (project default preprocessor)
-  - Split-pane focus: `Right` focuses detail pane, `Left` focuses span tree
-  - Span/detail nav: with tree focus `Up/Down` selects spans; in span detail focus `Up/Down` scrolls (`PgUp/PgDn` also scroll)
-  - Thread blocks: in thread detail focus, `Up/Down` selects messages and `Enter` expands/collapses (collapsed by default)
-  - Back: `Backspace` or `Esc` returns to trace table
-  - Global: `q` to quit
+- List logs (interactive on TTY by default, non-interactive otherwise):
+  - `bt view logs`
+  - `bt view logs --object-ref project_logs:<project-id>`
+  - `bt view logs --list-mode spans` (one row per span)
+- Fetch one trace (returns truncated span rows by default):
+  - `bt view trace --object-ref project_logs:<project-id> --trace-id <root-span-id>`
+  - `bt view trace --url <braintrust-trace-url>`
+- Fetch one span (full payload):
+  - `bt view span --object-ref project_logs:<project-id> --id <row-id>`
+- Common flags:
+  - `--limit <N>`: max rows per request/page
+  - `--cursor <CURSOR>`: continue pagination explicitly
+  - `--preview-length <N>`: truncation length for non-single-span fetches
+  - `--print-queries`: print BTQL/invoke payloads before execution
+  - `-j, --json`: machine-readable envelope output
+- `logs` filter flags:
+  - `--search <TEXT>`
+  - `--filter <BTQL_EXPR>`
+  - `--window <DURATION>` (default `1h`)
+  - `--since <TIMESTAMP>` (overrides `--window`)
+- Interactive controls (`bt view logs` TUI):
+  - Table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
+  - Search: `/` edit, `Enter` apply, `Esc` cancel, `Ctrl+u` clear
+  - Open URL: `Ctrl+k`, then `Enter`
+  - Detail view: `t` span/thread, `Left/Right` switch panes, `Backspace`/`Esc` back
+  - Global: `q` quit
 
 ## `bt login` profiles
 

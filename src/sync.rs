@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -55,7 +56,11 @@ enum SyncCommand {
 
 #[derive(Debug, Clone, Args)]
 struct PullArgs {
-    /// Object reference, format: object_type:object_id (e.g. project_logs:1234-uuid)
+    /// Source object reference, format object_type:object_id_or_name.
+    /// Supported:
+    /// - project_logs:<project-id|project-name>
+    /// - experiment:<experiment-id|experiment-name> (requires --project for names)
+    /// - dataset:<dataset-id|dataset-name> (requires --project for names)
     object_ref: Option<String>,
 
     /// SQL filter expression.
@@ -186,6 +191,30 @@ impl DirectionArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ObjectType {
+    ProjectLogs,
+    Experiment,
+    Dataset,
+}
+
+impl ObjectType {
+    fn as_str(self) -> &'static str {
+        match self {
+            ObjectType::ProjectLogs => "project_logs",
+            ObjectType::Experiment => "experiment",
+            ObjectType::Dataset => "dataset",
+        }
+    }
+}
+
+impl fmt::Display for ObjectType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ScopeArg {
@@ -223,7 +252,7 @@ enum PullPhase {
 
 #[derive(Debug, Clone)]
 struct ObjectRef {
-    object_type: String,
+    object_type: ObjectType,
     object_name: String,
 }
 
@@ -231,7 +260,7 @@ struct ObjectRef {
 struct SyncSpec {
     schema_version: u32,
     object_ref: String,
-    object_type: String,
+    object_type: ObjectType,
     object_name: String,
     direction: String,
     scope: String,
@@ -348,6 +377,32 @@ struct ResolvedPushDestination {
     run_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedDestination {
+    object: ObjectRef,
+    object_ref: String,
+    project_id: String,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedNamedObjectTarget {
+    object_id: String,
+    project_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DestinationMode {
+    Pull,
+    Push,
+}
+
+impl DestinationMode {
+    fn allows_project_creation(self) -> bool {
+        matches!(self, DestinationMode::Push)
+    }
+}
+
 #[derive(Debug)]
 struct PushBatchWork {
     batch_index: usize,
@@ -460,7 +515,7 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
         SyncCommand::Pull(pull) => {
             let ctx = login(&base).await?;
             let client = ApiClient::new(&ctx)?;
-            run_pull(base.json, &ctx, &client, pull).await
+            run_pull(base.json, &ctx, &client, base.project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
             let ctx = login(&base).await?;
@@ -475,9 +530,11 @@ async fn run_pull(
     json_output: bool,
     ctx: &LoginContext,
     client: &ApiClient,
+    project_selector: Option<&str>,
     args: PullArgs,
 ) -> Result<()> {
-    let resolved_object_ref = resolve_pull_object_ref(client, args.object_ref.as_deref()).await?;
+    let resolved_object_ref =
+        resolve_pull_object_ref(client, args.object_ref.as_deref(), project_selector).await?;
     let object = parse_object_ref(&resolved_object_ref)?;
     let source_expr = btql_source_expr(&object)?;
     let (scope, limit) = resolve_pull_scope_and_limit(args.traces, args.spans)?;
@@ -486,7 +543,7 @@ async fn run_pull(
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
         object_ref: resolved_object_ref,
-        object_type: object.object_type.clone(),
+        object_type: object.object_type,
         object_name: object.object_name.clone(),
         direction: DirectionArg::Pull.as_str().to_string(),
         scope: scope.as_str().to_string(),
@@ -1396,7 +1453,7 @@ async fn run_push(
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
         object_ref: destination.object_ref.clone(),
-        object_type: object.object_type.clone(),
+        object_type: object.object_type,
         object_name: object.object_name.clone(),
         direction: DirectionArg::Push.as_str().to_string(),
         scope: scope.as_str().to_string(),
@@ -1784,7 +1841,7 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
         object_ref: args.object_ref.clone(),
-        object_type: object.object_type.clone(),
+        object_type: object.object_type,
         object_name: object.object_name.clone(),
         direction: args.direction.as_str().to_string(),
         scope: scope.as_str().to_string(),
@@ -2535,9 +2592,13 @@ fn nonzero(value: usize, flag: &str) -> Result<usize> {
     Ok(value)
 }
 
-async fn resolve_pull_object_ref(client: &ApiClient, object_ref: Option<&str>) -> Result<String> {
+async fn resolve_pull_object_ref(
+    client: &ApiClient,
+    object_ref: Option<&str>,
+    project_selector: Option<&str>,
+) -> Result<String> {
     if let Some(value) = object_ref.map(str::trim).filter(|v| !v.is_empty()) {
-        return Ok(value.to_string());
+        return resolve_pull_destination(client, value, project_selector).await;
     }
 
     if !std::io::stdin().is_terminal() {
@@ -2561,7 +2622,7 @@ async fn resolve_pull_object_ref(client: &ApiClient, object_ref: Option<&str>) -
         object_ref: format!("project_logs:{}", project.id),
     }];
 
-    match list_project_named_objects(client, "experiment", &project.id).await {
+    match list_project_named_objects(client, ObjectType::Experiment, &project.id).await {
         Ok(mut experiments) => {
             experiments.sort_by(|a, b| a.name.cmp(&b.name));
             choices.extend(experiments.into_iter().map(|obj| InteractiveChoice {
@@ -2575,7 +2636,7 @@ async fn resolve_pull_object_ref(client: &ApiClient, object_ref: Option<&str>) -
         ),
     }
 
-    match list_project_named_objects(client, "dataset", &project.id).await {
+    match list_project_named_objects(client, ObjectType::Dataset, &project.id).await {
         Ok(mut datasets) => {
             datasets.sort_by(|a, b| a.name.cmp(&b.name));
             choices.extend(datasets.into_iter().map(|obj| InteractiveChoice {
@@ -2594,14 +2655,192 @@ async fn resolve_pull_object_ref(client: &ApiClient, object_ref: Option<&str>) -
     Ok(choices[object_idx].object_ref.clone())
 }
 
+async fn resolve_pull_destination(
+    client: &ApiClient,
+    raw_object_ref: &str,
+    project_selector: Option<&str>,
+) -> Result<String> {
+    let resolved = resolve_destination(
+        client,
+        raw_object_ref,
+        project_selector,
+        DestinationMode::Pull,
+    )
+    .await?;
+    Ok(resolved.object_ref)
+}
+
+async fn resolve_destination(
+    client: &ApiClient,
+    raw_object_ref: &str,
+    project_selector: Option<&str>,
+    mode: DestinationMode,
+) -> Result<ResolvedDestination> {
+    let requested = parse_object_ref(raw_object_ref)?;
+    match requested.object_type {
+        ObjectType::ProjectLogs => {
+            let project =
+                resolve_project_logs_target(client, requested.object_name.trim(), mode).await?;
+            let object = ObjectRef {
+                object_type: ObjectType::ProjectLogs,
+                object_name: project.id.clone(),
+            };
+            Ok(ResolvedDestination {
+                object_ref: format!("project_logs:{}", project.id),
+                object,
+                project_id: project.id,
+                run_id: None,
+            })
+        }
+        ObjectType::Experiment => {
+            let resolved = resolve_named_object_target(
+                client,
+                ObjectType::Experiment,
+                requested.object_name.trim(),
+                project_selector,
+            )
+            .await?;
+            let run_id = if matches!(mode, DestinationMode::Push) {
+                Some(resolved.object_id.clone())
+            } else {
+                None
+            };
+            let object = ObjectRef {
+                object_type: ObjectType::Experiment,
+                object_name: resolved.object_id.clone(),
+            };
+            Ok(ResolvedDestination {
+                object_ref: format!("experiment:{}", resolved.object_id),
+                object,
+                project_id: resolved.project_id,
+                run_id,
+            })
+        }
+        ObjectType::Dataset => {
+            if matches!(mode, DestinationMode::Push) {
+                bail!(
+                    "push destination type '{}' is unsupported. use project_logs:<project-id|project-name> or experiment:<experiment-id|experiment-name>",
+                    ObjectType::Dataset
+                );
+            }
+            let resolved = resolve_named_object_target(
+                client,
+                ObjectType::Dataset,
+                requested.object_name.trim(),
+                project_selector,
+            )
+            .await?;
+            let object = ObjectRef {
+                object_type: ObjectType::Dataset,
+                object_name: resolved.object_id.clone(),
+            };
+            Ok(ResolvedDestination {
+                object_ref: format!("dataset:{}", resolved.object_id),
+                object,
+                project_id: resolved.project_id,
+                run_id: None,
+            })
+        }
+    }
+}
+
+async fn resolve_project_logs_target(
+    client: &ApiClient,
+    project_selector: &str,
+    mode: DestinationMode,
+) -> Result<Project> {
+    let projects = list_projects(client).await?;
+    match find_project_by_selector(&projects, project_selector) {
+        Ok(project) => Ok(project.clone()),
+        Err(err) => {
+            if !mode.allows_project_creation() || is_uuid_like(project_selector) {
+                return Err(err);
+            }
+            let created = create_project(client, project_selector)
+                .await
+                .with_context(|| {
+                    format!(
+                        "project '{}' not found, and creating it failed",
+                        project_selector
+                    )
+                })?;
+            if std::io::stderr().is_terminal() {
+                eprintln!(
+                    "Project '{}' not found; created new project '{}' ({}) for push.",
+                    project_selector, created.name, created.id
+                );
+            }
+            Ok(created)
+        }
+    }
+}
+
+async fn resolve_named_object_target(
+    client: &ApiClient,
+    object_type: ObjectType,
+    object_selector: &str,
+    project_selector: Option<&str>,
+) -> Result<ResolvedNamedObjectTarget> {
+    let project_selector = project_selector
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let projects = list_projects(client).await?;
+
+    if let Some(project_selector) = project_selector {
+        let project = find_project_by_selector(&projects, project_selector)?;
+        let objects = list_project_named_objects(client, object_type, &project.id).await?;
+        let object = find_named_object_by_selector(
+            &objects,
+            object_selector,
+            object_type.as_str(),
+            Some(&project.name),
+        )?;
+        return Ok(ResolvedNamedObjectTarget {
+            object_id: object.id.clone(),
+            project_id: project.id.clone(),
+        });
+    }
+
+    for project in &projects {
+        let objects = list_project_named_objects(client, object_type, &project.id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to list {object_type}s for project '{}'",
+                    project.name
+                )
+            })?;
+        if let Some(object) = objects.iter().find(|value| value.id == object_selector) {
+            return Ok(ResolvedNamedObjectTarget {
+                object_id: object.id.clone(),
+                project_id: project.id.clone(),
+            });
+        }
+    }
+
+    if is_uuid_like(object_selector) {
+        bail!(
+            "{} id '{}' not found in any accessible project in org '{}'",
+            object_type,
+            object_selector,
+            client.org_name()
+        );
+    }
+    bail!(
+        "{} '{}' was not found by id across accessible projects; if this is a name, pass --project <project-name> (or set BRAINTRUST_DEFAULT_PROJECT)",
+        object_type,
+        object_selector
+    );
+}
+
 async fn list_project_named_objects(
     client: &ApiClient,
-    object_type: &str,
+    object_type: ObjectType,
     project_id: &str,
 ) -> Result<Vec<NamedObject>> {
     let path = format!(
         "/v1/{}?org_name={}&project_id={}",
-        encode(object_type),
+        encode(object_type.as_str()),
         encode(client.org_name()),
         encode(project_id)
     );
@@ -2614,108 +2853,19 @@ async fn resolve_push_destination(
     raw_object_ref: &str,
     project_selector: Option<&str>,
 ) -> Result<ResolvedPushDestination> {
-    let requested = parse_object_ref(raw_object_ref)?;
-    match requested.object_type.as_str() {
-        "project_logs" => {
-            let project_selector = requested.object_name.trim();
-            let projects = list_projects(client).await?;
-            let project = match find_project_by_selector(&projects, project_selector) {
-                Ok(project) => project.clone(),
-                Err(err) => {
-                    if is_uuid_like(project_selector) {
-                        return Err(err);
-                    }
-                    let created = create_project(client, project_selector).await.with_context(|| {
-                        format!(
-                            "project '{}' not found, and creating it failed",
-                            project_selector
-                        )
-                    })?;
-                    if std::io::stderr().is_terminal() {
-                        eprintln!(
-                            "Project '{}' not found; created new project '{}' ({}) for push.",
-                            project_selector, created.name, created.id
-                        );
-                    }
-                    created
-                }
-            };
-            let object = ObjectRef {
-                object_type: "project_logs".to_string(),
-                object_name: project.id.clone(),
-            };
-            Ok(ResolvedPushDestination {
-                object_ref: format!("project_logs:{}", project.id),
-                object,
-                project_id: project.id.clone(),
-                run_id: None,
-            })
-        }
-        "experiment" => {
-            let experiment_selector = requested.object_name.trim();
-            let project_selector = project_selector
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-
-            let projects = list_projects(client).await?;
-            if let Some(project_selector) = project_selector {
-                let project = find_project_by_selector(&projects, project_selector)?;
-                let experiments = list_project_named_objects(client, "experiment", &project.id).await?;
-                let experiment = find_named_object_by_selector(
-                    &experiments,
-                    experiment_selector,
-                    "experiment",
-                    Some(&project.name),
-                )?;
-                let object = ObjectRef {
-                    object_type: "experiment".to_string(),
-                    object_name: experiment.id.clone(),
-                };
-                return Ok(ResolvedPushDestination {
-                    object_ref: format!("experiment:{}", experiment.id),
-                    object,
-                    project_id: project.id.clone(),
-                    run_id: Some(experiment.id.clone()),
-                });
-            }
-
-            for project in &projects {
-                let experiments = list_project_named_objects(client, "experiment", &project.id)
-                    .await
-                    .with_context(|| {
-                        format!("failed to list experiments for project '{}'", project.name)
-                    })?;
-                if let Some(experiment) = experiments.iter().find(|value| value.id == experiment_selector)
-                {
-                    let object = ObjectRef {
-                        object_type: "experiment".to_string(),
-                        object_name: experiment.id.clone(),
-                    };
-                    return Ok(ResolvedPushDestination {
-                        object_ref: format!("experiment:{}", experiment.id),
-                        object,
-                        project_id: project.id.clone(),
-                        run_id: Some(experiment.id.clone()),
-                    });
-                }
-            }
-            if is_uuid_like(experiment_selector) {
-                bail!(
-                    "experiment id '{}' not found in any accessible project in org '{}'",
-                    experiment_selector,
-                    client.org_name()
-                );
-            }
-            bail!(
-                "experiment '{}' was not found by id across accessible projects; if this is a name, pass --project <project-name> (or set BRAINTRUST_DEFAULT_PROJECT)",
-                experiment_selector
-            );
-        }
-        other => bail!(
-            "push destination type '{}' is unsupported. use project_logs:<project-id|project-name> or experiment:<experiment-id|experiment-name>",
-            other
-        ),
-    }
+    let resolved = resolve_destination(
+        client,
+        raw_object_ref,
+        project_selector,
+        DestinationMode::Push,
+    )
+    .await?;
+    Ok(ResolvedPushDestination {
+        object: resolved.object,
+        object_ref: resolved.object_ref,
+        project_id: resolved.project_id,
+        run_id: resolved.run_id,
+    })
 }
 
 fn find_project_by_selector<'a>(projects: &'a [Project], selector: &str) -> Result<&'a Project> {
@@ -2831,18 +2981,25 @@ fn parse_object_ref(value: &str) -> Result<ObjectRef> {
     }
     let object_type = parts[0].trim();
     let object_name = parts[1].trim();
-    if !matches!(object_type, "project_logs" | "experiment" | "dataset") {
-        bail!(
-            "unsupported object type '{object_type}'. supported types: project_logs, experiment, dataset"
-        );
-    }
+    let object_type = parse_object_type(object_type)?;
     if object_name.is_empty() {
         bail!("object selector cannot be empty in '{value}'");
     }
     Ok(ObjectRef {
-        object_type: object_type.to_string(),
+        object_type,
         object_name: object_name.to_string(),
     })
+}
+
+fn parse_object_type(value: &str) -> Result<ObjectType> {
+    match value {
+        "project_logs" => Ok(ObjectType::ProjectLogs),
+        "experiment" => Ok(ObjectType::Experiment),
+        "dataset" => Ok(ObjectType::Dataset),
+        _ => bail!(
+            "unsupported object type '{value}'. supported types: project_logs, experiment, dataset"
+        ),
+    }
 }
 
 fn is_uuid_like(value: &str) -> bool {
@@ -2866,15 +3023,7 @@ fn is_uuid_like(value: &str) -> bool {
 }
 
 fn btql_source_expr(object: &ObjectRef) -> Result<String> {
-    let source = match object.object_type.as_str() {
-        "project_logs" => "project_logs",
-        "experiment" => "experiment",
-        "dataset" => "dataset",
-        other => bail!(
-            "unsupported object type '{}' for pull. supported: project_logs, experiment, dataset",
-            other
-        ),
-    };
+    let source = object.object_type.as_str();
     Ok(format!("{source}({})", sql_quote(&object.object_name)))
 }
 
@@ -2897,7 +3046,7 @@ fn sanitize_segment(value: &str) -> String {
 fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
     let object_key = format!(
         "{}_{}",
-        sanitize_segment(&object.object_type),
+        sanitize_segment(object.object_type.as_str()),
         sanitize_segment(&object.object_name)
     );
     root.join(object_key).join(&hash[..12])
@@ -2910,7 +3059,7 @@ fn legacy_spec_dir(
     scope: &ScopeArg,
     hash: &str,
 ) -> PathBuf {
-    root.join(sanitize_segment(&object.object_type))
+    root.join(sanitize_segment(object.object_type.as_str()))
         .join(sanitize_segment(&object.object_name))
         .join(direction.as_str())
         .join(scope.as_str())
@@ -3419,7 +3568,7 @@ fn collect_object_spec_dirs(root: &Path, object: &ObjectRef) -> Result<Vec<PathB
 
     let new_base = root.join(format!(
         "{}_{}",
-        sanitize_segment(&object.object_type),
+        sanitize_segment(object.object_type.as_str()),
         sanitize_segment(&object.object_name)
     ));
     if new_base.is_dir() {
@@ -3434,7 +3583,7 @@ fn collect_object_spec_dirs(root: &Path, object: &ObjectRef) -> Result<Vec<PathB
     }
 
     let legacy_base = root
-        .join(sanitize_segment(&object.object_type))
+        .join(sanitize_segment(object.object_type.as_str()))
         .join(sanitize_segment(&object.object_name));
     if legacy_base.is_dir() {
         for direction_dir in fs::read_dir(&legacy_base)
@@ -3958,7 +4107,7 @@ mod tests {
         let spec = SyncSpec {
             schema_version: STATE_SCHEMA_VERSION,
             object_ref: "project_logs:pid".to_string(),
-            object_type: "project_logs".to_string(),
+            object_type: ObjectType::ProjectLogs,
             object_name: "pid".to_string(),
             direction: "pull".to_string(),
             scope: "traces".to_string(),
@@ -3980,7 +4129,7 @@ mod tests {
         let spec = SyncSpec {
             schema_version: STATE_SCHEMA_VERSION,
             object_ref: "project_logs:pid".to_string(),
-            object_type: "project_logs".to_string(),
+            object_type: ObjectType::ProjectLogs,
             object_name: "pid".to_string(),
             direction: "pull".to_string(),
             scope: "traces".to_string(),
