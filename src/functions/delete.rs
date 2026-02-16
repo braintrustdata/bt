@@ -5,6 +5,7 @@ use dialoguer::Confirm;
 
 use crate::{
     http::ApiClient,
+    projects::api::Project,
     ui::{self, print_command_status, with_spinner, CommandStatus},
 };
 
@@ -15,7 +16,7 @@ use super::{
 
 pub async fn run(
     client: &ApiClient,
-    project_id: &str,
+    project: &Project,
     slug: Option<&str>,
     force: bool,
     kind: &FunctionKind,
@@ -26,6 +27,8 @@ pub async fn run(
             kind.plural
         );
     }
+
+    let project_id = &project.id;
 
     let function = match slug {
         Some(s) => api::get_function_by_slug(client, project_id, s)
@@ -47,7 +50,7 @@ pub async fn run(
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete {} '{}' from {}?",
-                kind.type_name, &function.name, project_id
+                kind.type_name, &function.name, &project.name
             ))
             .default(false)
             .interact()?;

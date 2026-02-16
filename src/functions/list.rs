@@ -5,6 +5,7 @@ use dialoguer::console;
 
 use crate::{
     http::ApiClient,
+    projects::api::Project,
     ui::{apply_column_padding, header, print_with_pager, styled_table, truncate, with_spinner},
     utils::pluralize,
 };
@@ -13,11 +14,13 @@ use super::{api, FunctionKind};
 
 pub async fn run(
     client: &ApiClient,
-    project_id: &str,
+    project: &Project,
     org: &str,
     json: bool,
     kind: &FunctionKind,
 ) -> Result<()> {
+    let project_id = &project.id;
+
     let functions = with_spinner(
         &format!("Loading {}...", kind.plural),
         api::list_functions(client, project_id, Some(kind.function_type)),
@@ -39,7 +42,7 @@ pub async fn run(
             console::style(count),
             console::style(org).bold(),
             console::style("/").dim().bold(),
-            console::style(project_id).bold()
+            console::style(&project.name).bold()
         )?;
 
         let mut table = styled_table();

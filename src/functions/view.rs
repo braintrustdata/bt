@@ -6,6 +6,7 @@ use dialoguer::console;
 use urlencoding::encode;
 
 use crate::http::ApiClient;
+use crate::projects::api::Project;
 use crate::ui::prompt_render::{
     render_content_lines, render_message, render_options, render_tools,
 };
@@ -17,7 +18,7 @@ use super::{api, delete, FunctionKind};
 pub async fn run(
     client: &ApiClient,
     app_url: &str,
-    project_id: &str,
+    project: &Project,
     org_name: &str,
     slug: Option<&str>,
     json: bool,
@@ -25,6 +26,7 @@ pub async fn run(
     verbose: bool,
     kind: &FunctionKind,
 ) -> Result<()> {
+    let project_id = &project.id;
     let function = match slug {
         Some(s) => with_spinner(
             &format!("Loading {}...", kind.type_name),
@@ -49,7 +51,7 @@ pub async fn run(
             "{}/app/{}/p/{}/{}/{}",
             app_url.trim_end_matches('/'),
             encode(org_name),
-            encode(project_id),
+            encode(&project.name),
             kind.url_segment,
             encode(&function.id)
         );

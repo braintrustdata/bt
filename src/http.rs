@@ -49,6 +49,7 @@ impl ApiClient {
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.url(path);
+        eprintln!("[DEBUG] GET {url}");
         let response = self
             .http
             .get(&url)
@@ -68,6 +69,7 @@ impl ApiClient {
 
     pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = self.url(path);
+        eprintln!("[DEBUG] POST {url}");
         let response = self
             .http
             .post(&url)
@@ -97,6 +99,7 @@ impl ApiClient {
         B: Serialize,
     {
         let url = self.url(path);
+        eprintln!("[DEBUG] POST {url} (with headers)");
         let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
 
         for (key, value) in headers {
@@ -116,6 +119,7 @@ impl ApiClient {
 
     pub async fn delete(&self, path: &str) -> Result<()> {
         let url = self.url(path);
+        eprintln!("[DEBUG] DELETE {url}");
         let response = self
             .http
             .delete(&url)
@@ -134,6 +138,7 @@ impl ApiClient {
     }
 
     pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
+        eprintln!("[DEBUG] BTQL: {query}");
         let body = json!({
             "query": query,
             "fmt": "json",

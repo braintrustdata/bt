@@ -4,6 +4,10 @@ use urlencoding::encode;
 
 use crate::http::ApiClient;
 
+fn escape_sql(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub id: String,
@@ -31,11 +35,13 @@ pub async fn list_functions(
     project_id: &str,
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
+    let pid = escape_sql(project_id);
     let query = match function_type {
         Some(ft) => {
-            format!("SELECT * FROM project_functions('{project_id}') WHERE function_type = '{ft}'")
+            let ft = escape_sql(ft);
+            format!("SELECT * FROM project_functions('{pid}') WHERE function_type = '{ft}'")
         }
-        None => format!("SELECT * FROM project_functions('{project_id}')"),
+        None => format!("SELECT * FROM project_functions('{pid}')"),
     };
     let response = client.btql::<Function>(&query).await?;
 
@@ -47,7 +53,9 @@ pub async fn get_function_by_slug(
     project_id: &str,
     slug: &str,
 ) -> Result<Option<Function>> {
-    let query = format!("SELECT * FROM project_functions('{project_id}') WHERE slug = '{slug}'");
+    let pid = escape_sql(project_id);
+    let slug = escape_sql(slug);
+    let query = format!("SELECT * FROM project_functions('{pid}') WHERE slug = '{slug}'");
     let response = client.btql(&query).await?;
 
     Ok(response.data.into_iter().next())

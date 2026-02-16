@@ -56,7 +56,6 @@ enum Commands {
     /// Manage scorers
     Scorers(CLIArgs<scorers::ScorersArgs>),
     /// Manage experiments
-    #[command(visible_alias = "exp")]
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
 }
 

@@ -115,17 +115,16 @@ pub async fn run(base: BaseArgs, args: FunctionArgs, kind: &FunctionKind) -> Res
     let resolved_project = get_project_by_name(&client, &project)
         .await?
         .ok_or_else(|| anyhow!("project '{project}' not found"))?;
-    let project_id = &resolved_project.id;
 
     match args.command {
         None | Some(FunctionCommands::List) => {
-            list::run(&client, project_id, &org_name, base.json, kind).await
+            list::run(&client, &resolved_project, &org_name, base.json, kind).await
         }
         Some(FunctionCommands::View(v)) => {
             view::run(
                 &client,
                 &ctx.app_url,
-                project_id,
+                &resolved_project,
                 &org_name,
                 v.slug(),
                 base.json,
@@ -136,7 +135,7 @@ pub async fn run(base: BaseArgs, args: FunctionArgs, kind: &FunctionKind) -> Res
             .await
         }
         Some(FunctionCommands::Delete(d)) => {
-            delete::run(&client, project_id, d.slug(), d.force, kind).await
+            delete::run(&client, &resolved_project, d.slug(), d.force, kind).await
         }
     }
 }
