@@ -394,17 +394,44 @@ struct TraceViewerApp {
     print_queries: bool,
 }
 
+struct TraceViewerInit {
+    project: ProjectSelection,
+    source_expr: String,
+    list_mode: ListMode,
+    base_filter: String,
+    traces: Vec<TraceSummaryRow>,
+    limit: usize,
+    preview_length: usize,
+    print_queries: bool,
+}
+
+struct InteractiveRunArgs {
+    init: TraceViewerInit,
+    initial_search_query: String,
+    startup_trace_url: Option<ParsedTraceUrl>,
+}
+
+#[derive(Debug, Clone)]
+struct LogsQueryContext {
+    source_expr: String,
+    list_mode: ListMode,
+    preview_length: usize,
+    base_filter: String,
+    print_queries: bool,
+}
+
 impl TraceViewerApp {
-    fn new(
-        project: ProjectSelection,
-        source_expr: String,
-        list_mode: ListMode,
-        base_filter: String,
-        traces: Vec<TraceSummaryRow>,
-        limit: usize,
-        preview_length: usize,
-        print_queries: bool,
-    ) -> Self {
+    fn new(init: TraceViewerInit) -> Self {
+        let TraceViewerInit {
+            project,
+            source_expr,
+            list_mode,
+            base_filter,
+            traces,
+            limit,
+            preview_length,
+            print_queries,
+        } = init;
         let trace_count = traces.len();
         let noun = if list_mode == ListMode::Spans {
             "spans"
@@ -890,6 +917,13 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
         args.window.as_str(),
         args.filter.as_deref(),
     )?;
+    let logs_query_ctx = LogsQueryContext {
+        source_expr: source_expr.clone(),
+        list_mode: args.list_mode,
+        preview_length: args.preview_length,
+        base_filter: base_filter.clone(),
+        print_queries: args.print_queries,
+    };
     let search_query = args.search.unwrap_or_default();
 
     let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
@@ -914,33 +948,33 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
                 "Loading logs...",
                 fetch_summary_rows(
                     &client,
-                    &source_expr,
-                    args.list_mode,
-                    args.preview_length,
+                    &logs_query_ctx,
                     args.limit,
                     if search_query.trim().is_empty() {
                         None
                     } else {
                         Some(search_query.as_str())
                     },
-                    &base_filter,
-                    args.print_queries,
                 ),
             )
             .await?
         };
         let traces = parse_summary_rows(initial_rows);
         return run_interactive(
-            project,
-            source_expr,
-            args.list_mode,
-            base_filter,
-            search_query,
-            traces,
-            args.limit,
-            args.preview_length,
-            args.print_queries,
-            parsed_startup_url,
+            InteractiveRunArgs {
+                init: TraceViewerInit {
+                    project,
+                    source_expr,
+                    list_mode: args.list_mode,
+                    base_filter,
+                    traces,
+                    limit: args.limit,
+                    preview_length: args.preview_length,
+                    print_queries: args.print_queries,
+                },
+                initial_search_query: search_query,
+                startup_trace_url: parsed_startup_url,
+            },
             client,
         )
         .await;
@@ -950,9 +984,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
         "Loading logs...",
         fetch_logs_page(
             &client,
-            &source_expr,
-            args.list_mode,
-            args.preview_length,
+            &logs_query_ctx,
             args.limit,
             args.cursor.as_deref(),
             if search_query.trim().is_empty() {
@@ -960,8 +992,6 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
             } else {
                 Some(search_query.as_str())
             },
-            &base_filter,
-            args.print_queries,
         ),
     )
     .await?;
@@ -1070,16 +1100,20 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
         let source_expr = btql_source_expr(&object_ref)?;
         let base_filter = build_base_filter_clause(None, "1h", None)?;
         return run_interactive(
-            project,
-            source_expr,
-            ListMode::Summary,
-            base_filter,
-            String::new(),
-            Vec::new(),
-            args.limit,
-            args.preview_length,
-            args.print_queries,
-            Some(startup_target),
+            InteractiveRunArgs {
+                init: TraceViewerInit {
+                    project,
+                    source_expr,
+                    list_mode: ListMode::Summary,
+                    base_filter,
+                    traces: Vec::new(),
+                    limit: args.limit,
+                    preview_length: args.preview_length,
+                    print_queries: args.print_queries,
+                },
+                initial_search_query: String::new(),
+                startup_trace_url: Some(startup_target),
+            },
             client,
         )
         .await;
@@ -1237,16 +1271,20 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
         let source_expr = btql_source_expr(&object_ref)?;
         let base_filter = build_base_filter_clause(None, "1h", None)?;
         return run_interactive(
-            project,
-            source_expr,
-            ListMode::Summary,
-            base_filter,
-            String::new(),
-            Vec::new(),
-            50,
-            125,
-            args.print_queries,
-            Some(startup_target),
+            InteractiveRunArgs {
+                init: TraceViewerInit {
+                    project,
+                    source_expr,
+                    list_mode: ListMode::Summary,
+                    base_filter,
+                    traces: Vec::new(),
+                    limit: 50,
+                    preview_length: 125,
+                    print_queries: args.print_queries,
+                },
+                initial_search_query: String::new(),
+                startup_trace_url: Some(startup_target),
+            },
             client,
         )
         .await;
@@ -1417,30 +1455,14 @@ async fn get_project_by_name(client: &ApiClient, name: &str) -> Result<Option<Pr
     Ok(response.objects.into_iter().next())
 }
 
-async fn run_interactive(
-    project: ProjectSelection,
-    source_expr: String,
-    list_mode: ListMode,
-    base_filter: String,
-    initial_search_query: String,
-    traces: Vec<TraceSummaryRow>,
-    limit: usize,
-    preview_length: usize,
-    print_queries: bool,
-    startup_trace_url: Option<ParsedTraceUrl>,
-    client: ApiClient,
-) -> Result<()> {
+async fn run_interactive(args: InteractiveRunArgs, client: ApiClient) -> Result<()> {
+    let InteractiveRunArgs {
+        init,
+        initial_search_query,
+        startup_trace_url,
+    } = args;
     let handle = tokio::runtime::Handle::current();
-    let mut app = TraceViewerApp::new(
-        project,
-        source_expr,
-        list_mode,
-        base_filter,
-        traces,
-        limit,
-        preview_length,
-        print_queries,
-    );
+    let mut app = TraceViewerApp::new(init);
     app.trace_search_query = initial_search_query.clone();
     app.trace_search_input = initial_search_query;
     tokio::task::block_in_place(|| run_interactive_blocking(app, startup_trace_url, client, handle))
@@ -2198,12 +2220,14 @@ fn start_summary_load(
 ) {
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
-    let source_expr = app.source_expr.clone();
-    let list_mode = app.list_mode;
-    let base_filter = app.base_filter.clone();
-    let preview_length = app.preview_length;
+    let logs_query_ctx = LogsQueryContext {
+        source_expr: app.source_expr.clone(),
+        list_mode: app.list_mode,
+        preview_length: app.preview_length,
+        base_filter: app.base_filter.clone(),
+        print_queries: app.print_queries,
+    };
     let limit = app.limit;
-    let print_queries = app.print_queries;
     let search_for_task = search_query.clone();
     let previous_root_for_task = previous_root.clone();
 
@@ -2213,17 +2237,7 @@ fn start_summary_load(
         } else {
             Some(search_for_task.as_str())
         };
-        let result = fetch_summary_rows(
-            &client,
-            &source_expr,
-            list_mode,
-            preview_length,
-            limit,
-            search_opt,
-            &base_filter,
-            print_queries,
-        )
-        .await;
+        let result = fetch_summary_rows(&client, &logs_query_ctx, limit, search_opt).await;
         let _ = tx.send((search_for_task, previous_root_for_task, result));
     });
 
@@ -5476,13 +5490,9 @@ fn sql_quote(value: &str) -> String {
 
 async fn fetch_summary_rows(
     client: &ApiClient,
-    source_expr: &str,
-    list_mode: ListMode,
-    preview_length: usize,
+    query_ctx: &LogsQueryContext,
     total_limit: usize,
     search_query: Option<&str>,
-    base_filter: &str,
-    print_queries: bool,
 ) -> Result<Vec<Map<String, Value>>> {
     let mut rows: Vec<Map<String, Value>> = Vec::new();
     let mut cursor: Option<String> = None;
@@ -5490,15 +5500,15 @@ async fn fetch_summary_rows(
     while rows.len() < total_limit {
         let page_limit = (total_limit - rows.len()).min(MAX_BTQL_PAGE_LIMIT);
         let query = build_summary_query(
-            source_expr,
-            list_mode,
-            preview_length,
+            &query_ctx.source_expr,
+            query_ctx.list_mode,
+            query_ctx.preview_length,
             page_limit,
             cursor.as_deref(),
             search_query,
-            base_filter,
+            &query_ctx.base_filter,
         );
-        maybe_print_query(print_queries, "summary", &query);
+        maybe_print_query(query_ctx.print_queries, "summary", &query);
 
         let response = execute_query(client, &query)
             .await
@@ -5523,25 +5533,21 @@ async fn fetch_summary_rows(
 
 async fn fetch_logs_page(
     client: &ApiClient,
-    source_expr: &str,
-    list_mode: ListMode,
-    preview_length: usize,
+    query_ctx: &LogsQueryContext,
     limit: usize,
     cursor: Option<&str>,
     search_query: Option<&str>,
-    base_filter: &str,
-    print_queries: bool,
 ) -> Result<BtqlResponse> {
     let query = build_summary_query(
-        source_expr,
-        list_mode,
-        preview_length,
+        &query_ctx.source_expr,
+        query_ctx.list_mode,
+        query_ctx.preview_length,
         limit,
         cursor,
         search_query,
-        base_filter,
+        &query_ctx.base_filter,
     );
-    maybe_print_query(print_queries, "logs", &query);
+    maybe_print_query(query_ctx.print_queries, "logs", &query);
     execute_query(client, &query)
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
