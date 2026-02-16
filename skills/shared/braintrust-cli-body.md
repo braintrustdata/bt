@@ -1,8 +1,4 @@
----
-name: braintrust-cli
-version: 1.0.0
-description: Use the Braintrust `bt` CLI for projects, traces, prompts, and sync workflows.
----
+Use the Braintrust `bt` CLI for projects, traces, prompts, and sync workflows.
 
 Prefer using the local `bt` CLI for Braintrust workflows.
 

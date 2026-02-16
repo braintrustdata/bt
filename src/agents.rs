@@ -11,8 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::args::BaseArgs;
 
-const BRAINTRUST_AGENT_SKILL: &str = include_str!("../skills/braintrust/SKILL.md");
-const CURSOR_RULE: &str = include_str!("../skills/cursor/braintrust.mdc");
+const SHARED_SKILL_BODY: &str = include_str!("../skills/shared/braintrust-cli-body.md");
 
 #[derive(Debug, Clone, Args)]
 pub struct AgentsArgs {
@@ -406,7 +405,8 @@ fn install_claude(
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".claude/skills/braintrust/SKILL.md");
-    write_text_file(&skill_path, BRAINTRUST_AGENT_SKILL)?;
+    let skill_content = render_braintrust_skill();
+    write_text_file(&skill_path, &skill_content)?;
 
     let mut paths = vec![skill_path.display().to_string()];
     if with_mcp {
@@ -438,7 +438,8 @@ fn install_codex(
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
-    write_text_file(&skill_path, BRAINTRUST_AGENT_SKILL)?;
+    let skill_content = render_braintrust_skill();
+    write_text_file(&skill_path, &skill_content)?;
 
     let mut paths = vec![skill_path.display().to_string()];
 
@@ -471,7 +472,8 @@ fn install_opencode(
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
-    write_text_file(&skill_path, BRAINTRUST_AGENT_SKILL)?;
+    let skill_content = render_braintrust_skill();
+    write_text_file(&skill_path, &skill_content)?;
 
     let mut paths = vec![skill_path.display().to_string()];
     if with_mcp {
@@ -513,7 +515,8 @@ fn install_cursor(
 
     let root = scope_root(scope, local_root, _home)?;
     let rule_path = root.join(".cursor/rules/braintrust.mdc");
-    write_text_file(&rule_path, CURSOR_RULE)?;
+    let cursor_rule = render_cursor_rule();
+    write_text_file(&rule_path, &cursor_rule)?;
 
     let mut paths = vec![rule_path.display().to_string()];
     if with_mcp {
@@ -600,6 +603,20 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
     }
     fs::write(path, format!("{}\n", content.trim_end()))
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn render_braintrust_skill() -> String {
+    format!(
+        "---\nname: braintrust-cli\nversion: 1.0.0\ndescription: Use the Braintrust `bt` CLI for projects, traces, prompts, and sync workflows.\n---\n\n{}",
+        SHARED_SKILL_BODY.trim()
+    )
+}
+
+fn render_cursor_rule() -> String {
+    format!(
+        "---\ndescription: Braintrust CLI workflow\nalwaysApply: false\n---\n\n{}",
+        SHARED_SKILL_BODY.trim()
+    )
 }
 
 fn scope_root<'a>(
