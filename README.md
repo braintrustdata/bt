@@ -190,6 +190,32 @@ Auth resolution order for commands is:
 
 On Linux, keychain storage uses `secret-tool` (libsecret). On macOS, it uses the `security` keychain utility.
 
+## `bt agents setup`
+
+Use `bt agents setup` to configure coding agents for Braintrust.
+
+- Configure all detected agents in the current repo:
+  - `bt agents setup --local`
+- Configure all detected agents globally:
+  - `bt agents setup --global`
+- Configure a specific agent set:
+  - `bt agents setup --local --agent claude --agent codex`
+- Include MCP config (optional, off by default):
+  - `bt agents setup --local --with-mcp`
+- Non-interactive runs should pass an explicit scope:
+  - `bt agents setup --global --yes`
+
+Current behavior:
+
+- Supported agents: `claude`, `codex`, `cursor`, `opencode`.
+- If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
+- `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
+- Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
+
+Compatibility alias:
+
+- `bt skills --install ...` maps to `bt agents setup ...`.
+
 ## Roadmap / TODO
 
 - Add richer channel controls for self-update (for example pinned/branch canary selection).

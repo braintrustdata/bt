@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 
+mod agents;
 mod args;
 mod env;
 #[cfg(unix)]
@@ -34,6 +35,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Configure coding agents for Braintrust
+    Agents(CLIArgs<agents::AgentsArgs>),
+    /// Compatibility alias for `bt agents setup`
+    Skills(CLIArgs<agents::SkillsCompatArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     /// Manage login profiles and persistent auth
@@ -61,6 +66,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(argv);
 
     match cli.command {
+        Commands::Agents(cmd) => agents::run(cmd.base, cmd.args).await?,
+        Commands::Skills(cmd) => agents::run_skills_compat(cmd.base, cmd.args).await?,
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
         Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
         Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
