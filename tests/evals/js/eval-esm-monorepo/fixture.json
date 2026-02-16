@@ -1,0 +1,4 @@
+{
+  "files": ["tests/basic.eval.ts"],
+  "runners": ["tsx", "bun", "deno"]
+}
