@@ -23,7 +23,12 @@ mod utils;
 use crate::args::CLIArgs;
 
 #[derive(Debug, Parser)]
-#[command(name = "bt", about = "Braintrust CLI", version)]
+#[command(
+    name = "bt",
+    about = "Braintrust CLI",
+    version,
+    after_help = "Docs: https://braintrust.dev/docs"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

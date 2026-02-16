@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::login::LoginContext;
 
@@ -11,6 +12,11 @@ pub struct ApiClient {
     base_url: String,
     api_key: String,
     org_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BtqlResponse<T> {
+    pub data: Vec<T>,
 }
 
 impl ApiClient {
@@ -125,5 +131,21 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
+        let body = json!({
+            "query": query,
+            "fmt": "json",
+        });
+
+        let org_name = self.org_name();
+        let headers = if !org_name.is_empty() {
+            vec![("x-bt-org-name", org_name)]
+        } else {
+            Vec::new()
+        };
+
+        self.post_with_headers("/btql", &body, &headers).await
     }
 }

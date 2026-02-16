@@ -15,7 +15,7 @@ use super::{
 
 pub async fn run(
     client: &ApiClient,
-    project: &str,
+    project_id: &str,
     slug: Option<&str>,
     force: bool,
     kind: &FunctionKind,
@@ -28,7 +28,7 @@ pub async fn run(
     }
 
     let function = match slug {
-        Some(s) => api::get_function_by_slug(client, project, s, Some(kind.function_type))
+        Some(s) => api::get_function_by_slug(client, project_id, s)
             .await?
             .ok_or_else(|| anyhow!("{} with slug '{s}' not found", kind.type_name))?,
         None => {
@@ -39,7 +39,7 @@ pub async fn run(
                     kind.plural
                 );
             }
-            select_function_interactive(client, project, kind).await?
+            select_function_interactive(client, project_id, kind).await?
         }
     };
 
@@ -47,7 +47,7 @@ pub async fn run(
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete {} '{}' from {}?",
-                kind.type_name, &function.name, project
+                kind.type_name, &function.name, project_id
             ))
             .default(false)
             .interact()?;

@@ -26,51 +26,31 @@ pub struct Function {
     pub created: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListResponse {
-    objects: Vec<Function>,
-}
-
 pub async fn list_functions(
     client: &ApiClient,
-    project: &str,
+    project_id: &str,
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
-    let path = format!(
-        "/v1/function?org_name={}&project_name={}",
-        encode(client.org_name()),
-        encode(project)
-    );
-    let list: ListResponse = client.get(&path).await?;
+    let query = match function_type {
+        Some(ft) => {
+            format!("SELECT * FROM project_functions('{project_id}') WHERE function_type = '{ft}'")
+        }
+        None => format!("SELECT * FROM project_functions('{project_id}')"),
+    };
+    let response = client.btql::<Function>(&query).await?;
 
-    Ok(match function_type {
-        Some(ft) => list
-            .objects
-            .into_iter()
-            .filter(|f| f.function_type.as_deref() == Some(ft))
-            .collect(),
-        None => list.objects,
-    })
+    Ok(response.data)
 }
 
 pub async fn get_function_by_slug(
     client: &ApiClient,
-    project: &str,
+    project_id: &str,
     slug: &str,
-    function_type: Option<&str>,
 ) -> Result<Option<Function>> {
-    let path = format!(
-        "/v1/function?org_name={}&project_name={}&slug={}",
-        encode(client.org_name()),
-        encode(project),
-        encode(slug)
-    );
-    let list: ListResponse = client.get(&path).await?;
+    let query = format!("SELECT * FROM project_functions('{project_id}') WHERE slug = '{slug}'");
+    let response = client.btql(&query).await?;
 
-    Ok(list.objects.into_iter().find(|f| match function_type {
-        Some(ft) => f.function_type.as_deref() == Some(ft),
-        None => true,
-    }))
+    Ok(response.data.into_iter().next())
 }
 
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {

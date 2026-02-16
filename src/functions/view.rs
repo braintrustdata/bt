@@ -17,7 +17,7 @@ use super::{api, delete, FunctionKind};
 pub async fn run(
     client: &ApiClient,
     app_url: &str,
-    project: &str,
+    project_id: &str,
     org_name: &str,
     slug: Option<&str>,
     json: bool,
@@ -28,7 +28,7 @@ pub async fn run(
     let function = match slug {
         Some(s) => with_spinner(
             &format!("Loading {}...", kind.type_name),
-            api::get_function_by_slug(client, project, s, Some(kind.function_type)),
+            api::get_function_by_slug(client, project_id, s),
         )
         .await?
         .ok_or_else(|| anyhow!("{} with slug '{s}' not found", kind.type_name))?,
@@ -40,7 +40,7 @@ pub async fn run(
                     kind.plural
                 );
             }
-            delete::select_function_interactive(client, project, kind).await?
+            delete::select_function_interactive(client, project_id, kind).await?
         }
     };
 
@@ -49,7 +49,7 @@ pub async fn run(
             "{}/app/{}/p/{}/{}/{}",
             app_url.trim_end_matches('/'),
             encode(org_name),
-            encode(project),
+            encode(project_id),
             kind.url_segment,
             encode(&function.id)
         );

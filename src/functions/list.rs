@@ -13,14 +13,14 @@ use super::{api, FunctionKind};
 
 pub async fn run(
     client: &ApiClient,
-    project: &str,
+    project_id: &str,
     org: &str,
     json: bool,
     kind: &FunctionKind,
 ) -> Result<()> {
     let functions = with_spinner(
         &format!("Loading {}...", kind.plural),
-        api::list_functions(client, project, Some(kind.function_type)),
+        api::list_functions(client, project_id, Some(kind.function_type)),
     )
     .await?;
 
@@ -39,7 +39,7 @@ pub async fn run(
             console::style(count),
             console::style(org).bold(),
             console::style("/").dim().bold(),
-            console::style(project).bold()
+            console::style(project_id).bold()
         )?;
 
         let mut table = styled_table();
