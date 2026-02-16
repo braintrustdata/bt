@@ -1309,8 +1309,10 @@ fn render_braintrust_skill() -> String {
 
 fn render_cursor_rule() -> String {
     format!(
-        "---\ndescription: Braintrust CLI workflow\nalwaysApply: false\n---\n\n{}",
-        SHARED_SKILL_BODY.trim()
+        "---\ndescription: Braintrust CLI workflow\nalwaysApply: false\n---\n\n## Purpose\n\n{}\n\n## Key Workflows\n\n{}\n\n## bt CLI Reference (Inlined README)\n\n{}",
+        SHARED_SKILL_BODY.trim(),
+        SHARED_WORKFLOW_GUIDE.trim(),
+        BT_README.trim()
     )
 }
 

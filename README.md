@@ -222,6 +222,7 @@ Current behavior:
 - If `--workflow` is omitted in non-interactive mode, setup defaults to all workflows.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
+- Cursor integration installs `.cursor/rules/braintrust.mdc` with the same workflow guidance and inlined CLI README content as the Braintrust skill.
 - Setup-time docs prefetch writes to `skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `skills/docs/README.md` and per-workflow `skills/docs/<workflow>/_index.md`.
 
