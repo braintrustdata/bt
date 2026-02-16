@@ -48,6 +48,7 @@ type BraintrustModule = {
   login?: LoginFunction;
   initDataset?: InitDatasetFunction;
   invoke?: InvokeFunction;
+  _internalGetGlobalState?: () => unknown;
   default?: BraintrustModule;
 };
 
@@ -137,11 +138,14 @@ type EvalRunner = {
   ) => EvalOptions | undefined;
   finish: (ok: boolean) => void;
   noSendLogs: boolean;
+  parseParent: ParseParentFunction | null;
+  getState: (() => unknown) | null;
 };
 
 type ParameterContainerSerializer = (parameters: unknown) => unknown;
 type PromptDefinitionSerializer = (prompt: unknown) => unknown;
 type ZodSchemaSerializer = (schema: unknown) => Record<string, unknown>;
+type ParseParentFunction = (parent: unknown) => string | undefined;
 
 type ParameterSerializationHelpers = {
   sdkSerializeParameters: ParameterContainerSerializer | null;
@@ -963,6 +967,55 @@ async function loadParameterSerializationHelpers(): Promise<ParameterSerializati
   }
 }
 
+function extractParseParent(mod: unknown): ParseParentFunction | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "parseParent");
+  if (typeof candidate === "function") {
+    return candidate as ParseParentFunction;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(defaultExport, "parseParent");
+    if (typeof fromDefault === "function") {
+      return fromDefault as ParseParentFunction;
+    }
+  }
+  return null;
+}
+
+function extractGlobalStateGetter(mod: unknown): (() => unknown) | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "_internalGetGlobalState");
+  if (typeof candidate === "function") {
+    return candidate as () => unknown;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(defaultExport, "_internalGetGlobalState");
+    if (typeof fromDefault === "function") {
+      return fromDefault as () => unknown;
+    }
+  }
+  return null;
+}
+
+function loadBraintrustUtilParseParent(): ParseParentFunction | null {
+  const braintrustPath = resolveBraintrustPath();
+  const requireFromBraintrust = createRequire(
+    pathToFileURL(braintrustPath).href,
+  );
+  try {
+    const utilMod: unknown = requireFromBraintrust("braintrust/util");
+    return extractParseParent(utilMod);
+  } catch {
+    return null;
+  }
+}
+
 function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
   const getter = (braintrust as Record<string, unknown>)
     ._internalGetGlobalState;
@@ -1344,14 +1397,29 @@ function parseEvalRequest(raw: string | null): EvalRequest {
   }
 }
 
-function normalizeParent(parent: unknown): string | undefined {
+function normalizeParent(
+  parent: unknown,
+  parseParent: ParseParentFunction | null,
+): string | undefined {
   if (parent === undefined || parent === null) {
     return undefined;
   }
   if (typeof parent === "string") {
     return parent;
   }
-  return JSON.stringify(parent);
+  if (parseParent) {
+    try {
+      const parsed = parseParent(parent);
+      if (typeof parsed === "string" || parsed === undefined) {
+        return parsed;
+      }
+    } catch {
+      // Fall through and return a validation error below.
+    }
+  }
+  throw new Error(
+    "Invalid parent payload: expected a serialized parent string or a valid parent object.",
+  );
 }
 
 function resolveEvalData(
@@ -1525,6 +1593,7 @@ async function runRequestedEval(config: RunnerConfig, runner: EvalRunner) {
       ),
     );
 
+    const state = runner.getState ? runner.getState() : undefined;
     const evaluator = {
       ...entry.evaluator,
       data: resolveEvalData(request.data, runner.initDataset),
@@ -1533,6 +1602,7 @@ async function runRequestedEval(config: RunnerConfig, runner: EvalRunner) {
         ? { experimentName: request.experiment_name }
         : {}),
       ...(request.project_id ? { projectId: request.project_id } : {}),
+      ...(state !== undefined && state !== null ? { state } : {}),
     };
 
     const options: EvalOptions = {};
@@ -1540,7 +1610,7 @@ async function runRequestedEval(config: RunnerConfig, runner: EvalRunner) {
       options.parameters = request.parameters;
     }
     if (request.parent !== undefined) {
-      options.parent = normalizeParent(request.parent);
+      options.parent = normalizeParent(request.parent, runner.parseParent);
     }
 
     const reporters = getReporters();
@@ -1603,6 +1673,40 @@ function getEvaluatorName(
     return candidate;
   }
   return fallback;
+}
+
+function wrapTaskForStreamingProgress(
+  evaluator: Record<string, unknown>,
+): Record<string, unknown> {
+  const task = evaluator.task;
+  if (typeof task !== "function") {
+    return evaluator;
+  }
+
+  const wrappedTask = async (input: unknown, hooks: unknown) => {
+    const result = await task(input, hooks);
+    if (isObject(hooks)) {
+      const reportProgress = Reflect.get(hooks, "reportProgress");
+      if (typeof reportProgress === "function") {
+        try {
+          reportProgress({
+            format: "code",
+            output_type: "completion",
+            event: "json_delta",
+            data: JSON.stringify(result),
+          });
+        } catch {
+          // Progress updates should not fail the evaluator run.
+        }
+      }
+    }
+    return result;
+  };
+
+  return {
+    ...evaluator,
+    task: wrappedTask,
+  };
 }
 
 function mergeEvalOptions(
@@ -1707,6 +1811,8 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
 
   const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
+  const parseParent = loadBraintrustUtilParseParent();
+  const getState = extractGlobalStateGetter(braintrust);
 
   const makeEvalOptions = (
     evaluatorName: string,
@@ -1748,7 +1854,8 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     const opts = makeEvalOptions(evaluatorName, options);
-    const result = await Eval(projectName, evaluator, opts);
+    const wrappedEvaluator = wrapTaskForStreamingProgress(evaluator);
+    const result = await Eval(projectName, wrappedEvaluator, opts);
     const failingResults = result.results.filter(
       (r: { error?: unknown }) => r.error !== undefined,
     );
@@ -1835,6 +1942,8 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     makeEvalOptions,
     finish,
     noSendLogs,
+    parseParent,
+    getState,
   };
 }
 

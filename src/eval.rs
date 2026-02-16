@@ -792,6 +792,12 @@ fn serialize_sse_event(event: &str, data: &str) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+fn is_eval_progress_payload(progress: &SseProgressEventData) -> bool {
+    serde_json::from_str::<EvalProgressData>(&progress.data)
+        .map(|payload| payload.kind_type == "eval_progress")
+        .unwrap_or(false)
+}
+
 fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
     match event {
         EvalEvent::Start(summary) => serde_json::to_string(summary)
@@ -800,12 +806,16 @@ fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
         EvalEvent::Summary(summary) => serde_json::to_string(summary)
             .ok()
             .map(|data| serialize_sse_event("summary", &data)),
-        EvalEvent::Progress(progress) => serde_json::to_string(progress)
-            .ok()
-            .map(|data| serialize_sse_event("progress", &data)),
-        EvalEvent::Dependencies { files } => serde_json::to_string(&json!({ "files": files }))
-            .ok()
-            .map(|data| serialize_sse_event("dependencies", &data)),
+        EvalEvent::Progress(progress) => {
+            if is_eval_progress_payload(progress) {
+                None
+            } else {
+                serde_json::to_string(progress)
+                    .ok()
+                    .map(|data| serialize_sse_event("progress", &data))
+            }
+        }
+        EvalEvent::Dependencies { .. } => None,
         EvalEvent::Done => Some(serialize_sse_event("done", "")),
         EvalEvent::Error {
             message,
@@ -818,12 +828,7 @@ fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
         }))
         .ok()
         .map(|data| serialize_sse_event("error", &data)),
-        EvalEvent::Console { stream, message } => serde_json::to_string(&json!({
-            "stream": stream,
-            "message": message,
-        }))
-        .ok()
-        .map(|data| serialize_sse_event("console", &data)),
+        EvalEvent::Console { .. } => None,
     }
 }
 
@@ -2724,6 +2729,40 @@ mod tests {
         let first = build_sse_socket_path().expect("first socket path");
         let second = build_sse_socket_path().expect("second socket path");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn encode_eval_event_for_http_filters_internal_eval_progress() {
+        let event = EvalEvent::Progress(SseProgressEventData {
+            id: "id-1".to_string(),
+            object_type: "task".to_string(),
+            origin: None,
+            format: "global".to_string(),
+            output_type: "any".to_string(),
+            name: "My evaluation".to_string(),
+            event: "progress".to_string(),
+            data: r#"{"type":"eval_progress","kind":"start","total":1}"#.to_string(),
+        });
+
+        assert!(encode_eval_event_for_http(&event).is_none());
+    }
+
+    #[test]
+    fn encode_eval_event_for_http_keeps_external_progress_events() {
+        let event = EvalEvent::Progress(SseProgressEventData {
+            id: "id-2".to_string(),
+            object_type: "task".to_string(),
+            origin: None,
+            format: "code".to_string(),
+            output_type: "completion".to_string(),
+            name: "My evaluation".to_string(),
+            event: "json_delta".to_string(),
+            data: "\"China\"".to_string(),
+        });
+
+        let encoded = encode_eval_event_for_http(&event).expect("progress should be forwarded");
+        assert!(encoded.contains("event: progress"));
+        assert!(encoded.contains("json_delta"));
     }
 
     #[test]
