@@ -5,11 +5,11 @@ use crate::args::BaseArgs;
 use crate::http::ApiClient;
 use crate::login::login;
 
-mod api;
+pub mod api;
 mod create;
 mod delete;
 mod list;
-mod switch;
+pub mod switch;
 mod view;
 
 #[derive(Debug, Clone, Args)]
@@ -61,6 +61,10 @@ impl ViewArgs {
 struct DeleteArgs {
     /// Name of the project to delete
     name: Option<String>,
+
+    /// Skip confirmation prompt (requires name)
+    #[arg(long, short = 'f')]
+    force: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -82,7 +86,7 @@ pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
         Some(ProjectsCommands::View(a)) => {
             view::run(&client, &ctx.app_url, &ctx.login.org_name, a.name()).await
         }
-        Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref()).await,
+        Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref(), a.force).await,
         Some(ProjectsCommands::Switch(a)) => switch::run(&client, a.name.as_deref()).await,
     }
 }

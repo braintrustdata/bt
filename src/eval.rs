@@ -40,6 +40,7 @@ use ratatui::widgets::{Cell, Row, Table};
 use ratatui::Terminal;
 
 use crate::args::BaseArgs;
+use crate::login::resolved_auth_env;
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -445,7 +446,7 @@ async fn spawn_eval_runner(
         EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
     };
 
-    cmd.envs(build_env(base));
+    cmd.envs(build_env(base).await?);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1433,18 +1434,12 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-fn build_env(base: &BaseArgs) -> Vec<(String, String)> {
-    let mut envs = Vec::new();
-    if let Some(api_key) = base.api_key.as_ref() {
-        envs.push(("BRAINTRUST_API_KEY".to_string(), api_key.clone()));
-    }
-    if let Some(api_url) = base.api_url.as_ref() {
-        envs.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
-    }
+async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
+    let mut envs = resolved_auth_env(base).await?;
     if let Some(project) = base.project.as_ref() {
         envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
-    envs
+    Ok(envs)
 }
 
 fn detect_eval_language(
@@ -1472,9 +1467,7 @@ fn detect_eval_language(
         if let Some(existing) = detected {
             if existing != current {
                 anyhow::bail!(
-                    "Mixed eval file types are not supported yet (found {:?} and {:?}).",
-                    existing,
-                    current
+                    "Mixed eval file types are not supported yet (found {existing:?} and {current:?})."
                 );
             }
         } else {
@@ -2072,7 +2065,7 @@ impl EvalUi {
                     }
                 }
                 if show_hint {
-                    let hint = "Hint: pass --api-key or set BRAINTRUST_API_KEY, or use --no-send-logs for local evals.";
+                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt login`/`bt login set --oauth`, or use --no-send-logs for local evals.";
                     let _ = self.progress.println(hint.dark_grey().to_string());
                 }
             }
@@ -2295,9 +2288,9 @@ fn format_regressions_line(value: i64) -> Line<'static> {
 
 fn format_metric_value(metric: f64, unit: &str) -> String {
     let formatted = if metric.fract() == 0.0 {
-        format!("{:.0}", metric)
+        format!("{metric:.0}")
     } else {
-        format!("{:.2}", metric)
+        format!("{metric:.2}")
     };
     if unit == "$" {
         format!("{unit}{formatted}")
