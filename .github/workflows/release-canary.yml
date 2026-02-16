@@ -372,7 +372,6 @@ jobs:
           Latest downloadable build artifacts for this PR commit \`${SHORT_SHA}\`:
 
           - Workflow run: ${run_url}
-          - Install directly with bt: \`bt self update --pr ${run_url}\`
           - Download all artifacts (GitHub CLI): \`gh run download ${RUN_ID} --repo ${REPO}\`
           - Installers are published as GitHub releases from \`main\`; PR commits are available as run artifacts only.
 
