@@ -360,7 +360,7 @@ jobs:
 
           marker="<!-- bt-pr-canary-install-comment -->"
           run_url="https://github.com/${REPO}/actions/runs/${RUN_ID}"
-          artifacts="$(gh api --method GET "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' | sed 's/^/- `&`/' || true)"
+          artifacts="$(gh api --method GET "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" | jq -r '.artifacts[] | select(.expired == false) | .name' | sed 's/^/- `&`/' || true)"
           if [ -z "$artifacts" ]; then
             artifacts="- (no artifacts found)"
           fi
@@ -372,12 +372,19 @@ jobs:
           Latest downloadable build artifacts for this PR commit \`${SHORT_SHA}\`:
 
           - Workflow run: ${run_url}
+          - Install directly with bt: \`bt self update --pr ${run_url}\`
           - Download all artifacts (GitHub CLI): \`gh run download ${RUN_ID} --repo ${REPO}\`
           - Installers are published as GitHub releases from \`main\`; PR commits are available as run artifacts only.
 
-          Available artifact names:
+          <details>
+          <summary>Available artifact names</summary>
+
           EOF
             printf '%s\n' "$artifacts"
+            cat <<EOF
+
+          </details>
+          EOF
           } > "$body_file"
           payload_file="$RUNNER_TEMP/pr-comment-payload.json"
           jq -n --arg body "$(cat "$body_file")" '{body:$body}' > "$payload_file"

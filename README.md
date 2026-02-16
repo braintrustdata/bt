@@ -86,6 +86,9 @@ bt self update --check
 
 # switch/update to latest mainline canary
 bt self update --channel canary
+
+# install from a PR build (run URL copied from PR comment)
+bt self update --pr https://github.com/braintrustdata/bt/actions/runs/<run-id>
 ```
 
 If `bt` was installed via another package manager (Homebrew, apt, choco, etc), use that package manager to update instead.
@@ -112,6 +115,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 - If `bt` is not found after install, start a new shell or add `${CARGO_HOME:-$HOME/.cargo}/bin` to your `PATH`.
 - If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
+- If `bt self update --pr ...` cannot download artifacts, set `GITHUB_TOKEN` (for example a PAT with `repo` scope for private repos).
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 
 ## `bt eval` runners
