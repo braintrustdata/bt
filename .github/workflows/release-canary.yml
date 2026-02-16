@@ -236,7 +236,7 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    if: ${{ github.ref_name == 'main' && always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ (github.ref_name == 'main' || github.event_name == 'workflow_dispatch') && always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -333,6 +333,38 @@ jobs:
             --notes-file "$RUNNER_TEMP/canary-latest-notes.md" \
             artifacts/*
 
+      - name: Print install commands
+        shell: bash
+        run: |
+          exact_unix="curl -fsSL https://github.com/${REPO}/releases/download/${CANARY_TAG}/bt-installer.sh | sh"
+          exact_windows="powershell -ExecutionPolicy Bypass -c \"irm https://github.com/${REPO}/releases/download/${CANARY_TAG}/bt-installer.ps1 | iex\""
+          latest_unix="curl -fsSL https://github.com/${REPO}/releases/download/${ALIAS_TAG}/bt-installer.sh | sh"
+          latest_windows="powershell -ExecutionPolicy Bypass -c \"irm https://github.com/${REPO}/releases/download/${ALIAS_TAG}/bt-installer.ps1 | iex\""
+
+          echo "Install exact build (Unix): $exact_unix"
+          echo "Install exact build (Windows): $exact_windows"
+          echo "Install latest branch canary (Unix): $latest_unix"
+          echo "Install latest branch canary (Windows): $latest_windows"
+
+          {
+            echo "## Canary Install Commands"
+            echo ""
+            echo "Branch: \`${BRANCH_NAME}\`"
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo "Exact tag: \`${CANARY_TAG}\`"
+            echo "Latest branch tag: \`${ALIAS_TAG}\`"
+            echo ""
+            echo "Exact build (Unix):"
+            echo '```bash'
+            echo "$exact_unix"
+            echo '```'
+            echo ""
+            echo "Latest branch canary (Unix):"
+            echo '```bash'
+            echo "$latest_unix"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   comment-pr-install:
     needs:
       - plan
@@ -373,7 +405,7 @@ jobs:
 
           - Workflow run: ${run_url}
           - Download all artifacts (GitHub CLI): \`gh run download ${RUN_ID} --repo ${REPO}\`
-          - Installers are published as GitHub releases from \`main\`; PR commits are available as run artifacts only.
+          - Installers are published from \`main\` automatically. To publish one for a PR branch, run \`release-canary\` manually via \`workflow_dispatch\`.
 
           <details>
           <summary>Available artifact names</summary>
