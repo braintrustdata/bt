@@ -19,9 +19,10 @@ mod utils;
 
 use crate::args::CLIArgs;
 
+const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
     Some(version) => version,
-    None => env!("CARGO_PKG_VERSION"),
+    None => DEFAULT_CANARY_VERSION,
 };
 
 #[derive(Debug, Parser)]

@@ -84,8 +84,7 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
     ensure_installer_managed_install()?;
     let channel = args
         .channel
-        .or_else(|| parse_update_channel(BUILD_UPDATE_CHANNEL))
-        .unwrap_or(UpdateChannel::Stable);
+        .unwrap_or_else(|| inferred_update_channel(BUILD_UPDATE_CHANNEL));
 
     if args.check {
         check_for_update(channel).await?;
@@ -319,6 +318,10 @@ fn parse_update_channel(raw: Option<&str>) -> Option<UpdateChannel> {
     }
 }
 
+fn inferred_update_channel(raw: Option<&str>) -> UpdateChannel {
+    parse_update_channel(raw).unwrap_or(UpdateChannel::Canary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +417,26 @@ mod tests {
     fn parse_update_channel_rejects_unknown_values() {
         assert_eq!(parse_update_channel(Some("nightly")), None);
         assert_eq!(parse_update_channel(None), None);
+    }
+
+    #[test]
+    fn inferred_update_channel_defaults_to_canary() {
+        assert_eq!(inferred_update_channel(None), UpdateChannel::Canary);
+        assert_eq!(
+            inferred_update_channel(Some("nightly")),
+            UpdateChannel::Canary
+        );
+    }
+
+    #[test]
+    fn inferred_update_channel_accepts_stable_and_canary() {
+        assert_eq!(
+            inferred_update_channel(Some("stable")),
+            UpdateChannel::Stable
+        );
+        assert_eq!(
+            inferred_update_channel(Some("canary")),
+            UpdateChannel::Canary
+        );
     }
 }

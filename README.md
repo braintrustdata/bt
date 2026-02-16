@@ -61,6 +61,7 @@ bt --version
 ```
 
 Canary builds include a canary suffix in the reported version string.
+Local/dev builds default to `-canary.<shortsha>` when git metadata is available (fallback: `-canary.dev`).
 
 On first install, open a new shell if `bt` is not found immediately.
 
@@ -77,7 +78,7 @@ shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 `bt` can self-update when installed via the official installer.
 
 ```bash
-# update on the current build channel (stable for releases, canary for canary installs)
+# update on the current build channel (canary for local/dev builds, stable for official releases)
 bt self update
 
 # check without installing

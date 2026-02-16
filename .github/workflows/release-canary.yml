@@ -29,7 +29,6 @@ jobs:
       canary-tag: ${{ steps.meta.outputs.canary_tag }}
       alias-tag: ${{ steps.meta.outputs.alias_tag }}
       dist-tag: ${{ steps.meta.outputs.dist_tag }}
-      version-string: ${{ steps.meta.outputs.version_string }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -75,11 +74,9 @@ jobs:
           if [ "${GITHUB_REF_NAME}" = "main" ]; then
             canary_tag="canary-$short_sha"
             alias_tag="canary"
-            version_string="${pkg_version}-canary.${short_sha}"
           else
             canary_tag="canary-${branch_slug}-$short_sha"
             alias_tag="canary-${branch_slug}"
-            version_string="${pkg_version}-canary.${branch_slug}.${short_sha}"
           fi
           dist_tag="v${pkg_version}"
 
@@ -88,7 +85,6 @@ jobs:
           echo "canary_tag=$canary_tag" >> "$GITHUB_OUTPUT"
           echo "alias_tag=$alias_tag" >> "$GITHUB_OUTPUT"
           echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
-          echo "version_string=$version_string" >> "$GITHUB_OUTPUT"
 
       - id: plan
         shell: bash
@@ -159,8 +155,6 @@ jobs:
       - name: Build artifacts
         shell: bash
         run: |
-          BT_UPDATE_CHANNEL=canary \
-          BT_VERSION_STRING="${{ needs.plan.outputs.version-string }}" \
           dist build --tag="${{ needs.plan.outputs.dist-tag }}" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
@@ -222,8 +216,6 @@ jobs:
       - id: dist-files
         shell: bash
         run: |
-          BT_UPDATE_CHANNEL=canary \
-          BT_VERSION_STRING="${{ needs.plan.outputs.version-string }}" \
           dist build --tag="${{ needs.plan.outputs.dist-tag }}" --output-format=json --artifacts=global > dist-manifest.json
           echo "dist ran successfully"
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
