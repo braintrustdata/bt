@@ -19,8 +19,13 @@ mod utils;
 
 use crate::args::CLIArgs;
 
+const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Debug, Parser)]
-#[command(name = "bt", about = "Braintrust CLI", version)]
+#[command(name = "bt", about = "Braintrust CLI", version = CLI_VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

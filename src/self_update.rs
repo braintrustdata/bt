@@ -25,9 +25,9 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub check: bool,
 
-    /// Update channel
-    #[arg(long, value_enum, default_value_t = UpdateChannel::Stable)]
-    pub channel: UpdateChannel,
+    /// Update channel (defaults to the build channel)
+    #[arg(long, value_enum)]
+    pub channel: Option<UpdateChannel>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -67,6 +67,8 @@ impl UpdateChannel {
     }
 }
 
+const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -80,14 +82,18 @@ pub async fn run(args: SelfArgs) -> Result<()> {
 
 async fn run_update(args: UpdateArgs) -> Result<()> {
     ensure_installer_managed_install()?;
+    let channel = args
+        .channel
+        .or_else(|| parse_update_channel(BUILD_UPDATE_CHANNEL))
+        .unwrap_or(UpdateChannel::Stable);
 
     if args.check {
-        check_for_update(args.channel).await?;
+        check_for_update(channel).await?;
         return Ok(());
     }
 
-    if args.channel == UpdateChannel::Stable {
-        match fetch_release(args.channel).await {
+    if channel == UpdateChannel::Stable {
+        match fetch_release(channel).await {
             Ok(release) => {
                 let current = env!("CARGO_PKG_VERSION");
                 if stable_is_up_to_date(current, &release.tag_name) {
@@ -103,7 +109,7 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(args.channel)?;
+    run_installer(channel)?;
     Ok(())
 }
 
@@ -305,6 +311,14 @@ fn canary_check_message(release_tag: &str) -> String {
     )
 }
 
+fn parse_update_channel(raw: Option<&str>) -> Option<UpdateChannel> {
+    match raw {
+        Some(channel) if channel.eq_ignore_ascii_case("stable") => Some(UpdateChannel::Stable),
+        Some(channel) if channel.eq_ignore_ascii_case("canary") => Some(UpdateChannel::Canary),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +392,27 @@ mod tests {
         let msg = canary_check_message("canary-deadbeef");
         assert!(msg.contains("canary-deadbeef"));
         assert!(msg.contains("bt self update --channel canary"));
+    }
+
+    #[test]
+    fn parse_update_channel_handles_expected_values() {
+        assert_eq!(
+            parse_update_channel(Some("stable")),
+            Some(UpdateChannel::Stable)
+        );
+        assert_eq!(
+            parse_update_channel(Some("canary")),
+            Some(UpdateChannel::Canary)
+        );
+        assert_eq!(
+            parse_update_channel(Some("CANARY")),
+            Some(UpdateChannel::Canary)
+        );
+    }
+
+    #[test]
+    fn parse_update_channel_rejects_unknown_values() {
+        assert_eq!(parse_update_channel(Some("nightly")), None);
+        assert_eq!(parse_update_channel(None), None);
     }
 }
