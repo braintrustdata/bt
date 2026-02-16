@@ -97,3 +97,29 @@ Pre-commit runs:
 
 - `cargo fmt --all`
 - `cargo clippy --all-targets --all-features -- -D warnings`
+
+## Publishing PR Canary Releases
+
+Use the `release-canary` workflow when you need a one-off installer build from a PR branch.
+
+### GitHub UI
+
+1. Open **Actions** in `braintrustdata/bt`.
+2. Select **release-canary**.
+3. Click **Run workflow**.
+4. Choose the PR branch in the branch/ref selector.
+5. Run the workflow and wait for the `announce` job to complete.
+6. Open the run summary and copy the install command from **Canary Install Commands**.
+
+### GitHub CLI
+
+```bash
+gh workflow run release-canary.yml --repo braintrustdata/bt --ref <pr-branch>
+```
+
+Then open the run in Actions and copy the install command from the summary.
+
+Notes:
+
+- The workflow publishes an immutable tag: `canary-<branch-slug>-<short-sha>`.
+- It also updates a moving branch tag: `canary-<branch-slug>` when the run is for the latest commit on that branch.
