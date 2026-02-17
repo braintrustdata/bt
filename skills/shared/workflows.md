@@ -20,3 +20,7 @@ Category entry pages:
 
 When uncertain, prefer precise `bt` CLI commands for local operations, and use docs context to
 explain product concepts and recommended patterns.
+
+Core reference docs are also prefetched, including SQL reference:
+
+- `https://www.braintrust.dev/docs/reference/sql`

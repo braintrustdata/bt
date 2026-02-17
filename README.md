@@ -124,6 +124,20 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - If eval execution fails with ESM/top-level-await related errors, retry with:
   - `bt eval --runner vite-node tutorial.eval.ts`
 
+## `bt sql`
+
+- Runs interactively on TTY by default.
+- Runs non-interactively when stdin is not a TTY, when `--non-interactive` is set, or when a query argument is provided.
+- Braintrust SQL queries should include a `FROM` clause against a Braintrust table function (for example `project_logs(...)`).
+- In non-interactive mode, provide SQL via:
+  - Positional query: `bt sql "SELECT id FROM project_logs('<PROJECT_ID>') LIMIT 1"`
+  - stdin pipe: `echo "SELECT id FROM project_logs('<PROJECT_ID>') LIMIT 1" | bt sql`
+- Quick guidance:
+  - Prefer filtering with `WHERE`; use `HAVING` only after aggregation.
+  - Unsupported SQL features include joins, subqueries, unions/intersections, and window functions.
+  - Use explicit aliases for computed fields and cast timestamps/JSON values when needed.
+  - Full reference: `https://www.braintrust.dev/docs/reference/sql`
+
 ## `bt view`
 
 - List logs (interactive on TTY by default, non-interactive otherwise):
@@ -231,9 +245,10 @@ Current behavior:
 - Use `--refresh-docs` in setup (or `bt docs fetch --refresh`) to clear old docs before re-fetching.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
-- Cursor integration installs `.cursor/rules/braintrust.mdc` with the same workflow guidance and inlined CLI README content as the Braintrust skill.
+- Cursor integration installs `.cursor/rules/braintrust.mdc` with the same shared Braintrust guidance plus an auto-generated command-reference excerpt from this README.
 - Setup-time docs prefetch writes to `skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
-- Docs fetch writes LLM-friendly local indexes: `skills/docs/README.md` and per-workflow `skills/docs/<workflow>/_index.md`.
+- Docs fetch writes LLM-friendly local indexes: `skills/docs/README.md` and per-section `skills/docs/<section>/_index.md`.
+- Setup/docs prefetch always includes SQL reference docs at `skills/docs/reference/sql.md`.
 
 Skill smoke-test harness:
 
