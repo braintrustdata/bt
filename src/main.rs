@@ -35,10 +35,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Configure coding agents for Braintrust
-    Agents(CLIArgs<agents::AgentsArgs>),
-    /// Compatibility alias for `bt agents setup`
-    Skills(CLIArgs<agents::SkillsCompatArgs>),
+    /// Configure Braintrust setup flows
+    Setup(CLIArgs<agents::SetupArgs>),
+    /// Manage workflow docs for coding agents
+    Docs(CLIArgs<agents::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     /// Manage login profiles and persistent auth
@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(argv);
 
     match cli.command {
-        Commands::Agents(cmd) => agents::run(cmd.base, cmd.args).await?,
-        Commands::Skills(cmd) => agents::run_skills_compat(cmd.base, cmd.args).await?,
+        Commands::Setup(cmd) => agents::run_setup_top(cmd.base, cmd.args).await?,
+        Commands::Docs(cmd) => agents::run_docs_top(cmd.base, cmd.args).await?,
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
         Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
         Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,

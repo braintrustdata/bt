@@ -190,45 +190,55 @@ Auth resolution order for commands is:
 
 On Linux, keychain storage uses `secret-tool` (libsecret). On macOS, it uses the `security` keychain utility.
 
-## `bt agents setup`
+## `bt setup` and `bt docs`
 
-Use `bt agents setup` to configure coding agents for Braintrust.
+Use setup/docs commands to configure coding-agent skills and workflow docs for Braintrust.
 
-- Configure all detected agents in the current repo:
-  - `bt agents setup --local`
-- Configure all detected agents globally:
-  - `bt agents setup --global`
-- Configure a specific agent set:
-  - `bt agents setup --local --agent claude --agent codex`
+- Configure skills with default setup flow:
+  - `bt setup --local`
+  - `bt setup --global`
+- Explicit skills subcommand:
+  - `bt setup skills --local --agent claude --agent codex`
+- Configure MCP:
+  - `bt setup mcp --local --agent claude --agent codex`
+  - `bt setup mcp --global --yes`
+- Diagnose setup:
+  - `bt setup doctor`
+  - `bt setup doctor --local`
+  - `bt setup doctor --global`
 - Prefetch specific workflow docs during setup:
-  - `bt agents setup --local --workflow instrument --workflow evaluate`
+  - `bt setup skills --local --workflow instrument --workflow evaluate`
 - Skip docs prefetch during setup:
-  - `bt agents setup --local --no-fetch-docs`
-- Include MCP config (optional, off by default):
-  - `bt agents setup --local --with-mcp`
+  - `bt setup skills --local --no-fetch-docs`
+- Force-refresh prefetched docs during setup (clears existing docs output first):
+  - `bt setup skills --local --refresh-docs`
 - Non-interactive runs should pass an explicit scope:
-  - `bt agents setup --global --yes`
+  - `bt setup skills --global --yes`
 - Sync workflow docs markdown from Braintrust Docs (Mintlify `llms.txt`):
-  - `bt agents docs fetch --workflow instrument --workflow evaluate`
-  - `bt agents docs fetch --dry-run`
-  - `bt agents docs fetch --strict` (fail if any page download fails)
+  - `bt docs fetch --workflow instrument --workflow evaluate`
+  - `bt docs fetch --refresh` (clear output dir first to avoid stale pages)
+  - `bt docs fetch --dry-run`
+  - `bt docs fetch --strict` (fail if any page download fails)
 
 Current behavior:
 
 - Supported agents: `claude`, `codex`, `cursor`, `opencode`.
 - If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
-- In interactive TTY mode, `bt agents setup` shows a checklist so you can select/deselect agents before install.
+- In interactive TTY mode, skills setup shows a checklist so you can select/deselect agents before install.
 - In interactive TTY mode, setup also shows a workflow checklist and prefetches those docs automatically.
+- In setup wizards, press `Esc` to go back to the previous step.
 - If `--workflow` is omitted in non-interactive mode, setup defaults to all workflows.
+- Use `--refresh-docs` in setup (or `bt docs fetch --refresh`) to clear old docs before re-fetching.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
 - Cursor integration installs `.cursor/rules/braintrust.mdc` with the same workflow guidance and inlined CLI README content as the Braintrust skill.
 - Setup-time docs prefetch writes to `skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `skills/docs/README.md` and per-workflow `skills/docs/<workflow>/_index.md`.
 
-Compatibility alias:
+Skill smoke-test harness:
 
-- `bt skills --install ...` maps to `bt agents setup ...`.
+- `scripts/skill-smoke-test.sh --agent codex --bt-bin ./target/debug/bt`
+- The script scaffolds a demo repo, installs the selected agent skill, writes `AGENT_TASK.md`, and verifies that post-agent changes include both tracing and an eval file.
 
 ## Roadmap / TODO
 

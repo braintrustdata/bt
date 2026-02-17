@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect, MultiSelect};
 use regex::Regex;
 use reqwest::Client;
 use serde::Serialize;
@@ -20,27 +20,37 @@ const DEFAULT_DOCS_LLMS_URL: &str = "https://www.braintrust.dev/docs/llms.txt";
 const DEFAULT_DOCS_LLMS_FULL_URL: &str = "https://www.braintrust.dev/docs/llms-full.txt";
 
 #[derive(Debug, Clone, Args)]
-pub struct AgentsArgs {
+pub struct SetupArgs {
     #[command(subcommand)]
-    command: Option<AgentsSubcommand>,
+    command: Option<SetupSubcommand>,
+
+    #[command(flatten)]
+    agents: AgentsSetupArgs,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum AgentsSubcommand {
-    /// Configure coding agents to use Braintrust
-    Setup(AgentsSetupArgs),
-    /// Fetch docs markdown for workflow-oriented agent skills
-    Docs(AgentsDocsArgs),
+enum SetupSubcommand {
+    /// Configure coding-agent skills to use Braintrust
+    Skills(AgentsSetupArgs),
+    /// Configure MCP server settings for coding agents
+    Mcp(AgentsMcpSetupArgs),
+    /// Diagnose coding-agent setup for Braintrust
+    Doctor(AgentsDoctorArgs),
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct SkillsCompatArgs {
-    /// Install coding-agent integrations
-    #[arg(long)]
-    install: bool,
+pub struct DocsArgs {
+    #[command(subcommand)]
+    command: Option<DocsSubcommand>,
 
     #[command(flatten)]
-    setup: AgentsSetupArgs,
+    fetch: AgentsDocsFetchArgs,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum DocsSubcommand {
+    /// Download workflow docs markdown from Mintlify llms index
+    Fetch(AgentsDocsFetchArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -57,10 +67,6 @@ struct AgentsSetupArgs {
     #[arg(long)]
     global: bool,
 
-    /// Also configure MCP server settings
-    #[arg(long)]
-    with_mcp: bool,
-
     /// Workflow docs to prefetch (repeatable)
     #[arg(long = "workflow", value_enum)]
     workflows: Vec<WorkflowArg>,
@@ -72,18 +78,40 @@ struct AgentsSetupArgs {
     /// Do not auto-fetch workflow docs during setup
     #[arg(long)]
     no_fetch_docs: bool,
+
+    /// Refresh prefetched docs by clearing existing output before download
+    #[arg(long, conflicts_with = "no_fetch_docs")]
+    refresh_docs: bool,
 }
 
 #[derive(Debug, Clone, Args)]
-struct AgentsDocsArgs {
-    #[command(subcommand)]
-    command: Option<AgentsDocsSubcommand>,
+struct AgentsMcpSetupArgs {
+    /// Agent(s) to configure MCP for (repeatable)
+    #[arg(long = "agent", value_enum)]
+    agents: Vec<AgentArg>,
+
+    /// Configure MCP in the current git repo root
+    #[arg(long, conflicts_with = "global")]
+    local: bool,
+
+    /// Configure MCP in user-wide state
+    #[arg(long)]
+    global: bool,
+
+    /// Skip confirmation prompts and use defaults
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
-#[derive(Debug, Clone, Subcommand)]
-enum AgentsDocsSubcommand {
-    /// Download workflow docs markdown from Mintlify llms index
-    Fetch(AgentsDocsFetchArgs),
+#[derive(Debug, Clone, Args)]
+struct AgentsDoctorArgs {
+    /// Diagnose local repo setup
+    #[arg(long, conflicts_with = "global")]
+    local: bool,
+
+    /// Diagnose user-wide setup
+    #[arg(long)]
+    global: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -107,6 +135,10 @@ struct AgentsDocsFetchArgs {
     /// Fail command if any page download fails
     #[arg(long)]
     strict: bool,
+
+    /// Refresh docs by clearing output directory before download
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, ValueEnum, Serialize)]
@@ -212,6 +244,29 @@ struct SetupJsonReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct DoctorAgentStatus {
+    agent: Agent,
+    detected: bool,
+    detected_signals: Vec<String>,
+    configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_path: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorJsonReport {
+    scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+    docs_path: String,
+    docs_present: bool,
+    agents: Vec<DoctorAgentStatus>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct DocsFileResult {
     title: String,
     url: String,
@@ -245,27 +300,38 @@ struct DocsFetchResult {
     warnings: Vec<String>,
 }
 
-pub async fn run(base: BaseArgs, args: AgentsArgs) -> Result<()> {
+struct SetupSelection {
+    scope: InstallScope,
+    local_root: Option<PathBuf>,
+    detected: Vec<DetectionSignal>,
+    selected_agents: Vec<Agent>,
+    selected_workflows: Vec<WorkflowArg>,
+}
+
+struct McpSelection {
+    scope: InstallScope,
+    local_root: Option<PathBuf>,
+    detected: Vec<DetectionSignal>,
+    selected_agents: Vec<Agent>,
+}
+
+pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
     match args.command {
-        Some(AgentsSubcommand::Setup(setup)) => run_setup(base, setup).await,
-        Some(AgentsSubcommand::Docs(docs)) => run_docs(base, docs).await,
-        None => {
-            bail!("subcommand required. Use: `bt agents setup --local|--global [--agent ...]`")
-        }
+        Some(SetupSubcommand::Skills(setup)) => run_setup(base, setup).await,
+        Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp),
+        Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
+        None => run_setup(base, args.agents).await,
     }
 }
 
-pub async fn run_skills_compat(base: BaseArgs, args: SkillsCompatArgs) -> Result<()> {
-    if !args.install {
-        bail!("`bt skills` compatibility mode requires --install");
-    }
-    run_setup(base, args.setup).await
+pub async fn run_docs_top(base: BaseArgs, args: DocsArgs) -> Result<()> {
+    run_docs(base, args).await
 }
 
-async fn run_docs(base: BaseArgs, args: AgentsDocsArgs) -> Result<()> {
+async fn run_docs(base: BaseArgs, args: DocsArgs) -> Result<()> {
     match args.command {
-        Some(AgentsDocsSubcommand::Fetch(fetch)) => run_docs_fetch(base, fetch).await,
-        None => bail!("subcommand required. Use: `bt agents docs fetch [--workflow ...]`"),
+        Some(DocsSubcommand::Fetch(fetch)) => run_docs_fetch(base, fetch).await,
+        None => run_docs_fetch(base, args.fetch).await,
     }
 }
 
@@ -401,6 +467,14 @@ async fn fetch_docs_pages(
     let mut seen_targets = BTreeSet::new();
 
     if !args.dry_run {
+        if args.refresh && args.output_dir.exists() {
+            fs::remove_dir_all(&args.output_dir).with_context(|| {
+                format!(
+                    "failed to clear output directory {}",
+                    args.output_dir.display()
+                )
+            })?;
+        }
         fs::create_dir_all(&args.output_dir).with_context(|| {
             format!(
                 "failed to create output directory {}",
@@ -525,36 +599,23 @@ async fn fetch_docs_pages(
 }
 
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
-    let scope = resolve_scope(&args)?;
-    let local_root = if matches!(scope, InstallScope::Local) {
-        Some(find_git_root().ok_or_else(|| {
-            anyhow!(
-                "--local requires running inside a git repository (could not find .git in parent chain)"
-            )
-        })?)
-    } else {
-        None
-    };
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-
-    let detected = detect_agents(local_root.as_deref(), &home);
-    let selected_agents = select_agents(&args, &detected)?;
-
-    if selected_agents.is_empty() {
-        bail!("no agents selected for installation");
-    }
-
-    let selected_workflows = select_setup_workflows(&args)?;
+    let selection = resolve_setup_selection(&args, &home)?;
+    let scope = selection.scope;
+    let local_root = selection.local_root;
+    let detected = selection.detected;
+    let selected_agents = selection.selected_agents;
+    let selected_workflows = selection.selected_workflows;
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut results = Vec::new();
 
     for agent in selected_agents.iter().copied() {
         let result = match agent {
-            Agent::Claude => install_claude(scope, local_root.as_deref(), &home, args.with_mcp),
-            Agent::Codex => install_codex(scope, local_root.as_deref(), &home, args.with_mcp),
-            Agent::Cursor => install_cursor(scope, local_root.as_deref(), &home, args.with_mcp),
-            Agent::Opencode => install_opencode(scope, local_root.as_deref(), &home, args.with_mcp),
+            Agent::Claude => install_claude(scope, local_root.as_deref(), &home),
+            Agent::Codex => install_codex(scope, local_root.as_deref(), &home),
+            Agent::Cursor => install_cursor(scope, local_root.as_deref(), &home),
+            Agent::Opencode => install_opencode(scope, local_root.as_deref(), &home),
         };
 
         match result {
@@ -596,6 +657,7 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
             workflows: selected_workflows.clone(),
             dry_run: false,
             strict: false,
+            refresh: args.refresh_docs,
         };
         match fetch_docs_pages(&docs_args, &selected_workflows).await {
             Ok(fetch_result) => {
@@ -649,6 +711,515 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
+    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let selection = resolve_mcp_selection(&args, &home)?;
+    let scope = selection.scope;
+    let local_root = selection.local_root;
+    let detected = selection.detected;
+    let selected_agents = selection.selected_agents;
+
+    let mut warnings = Vec::new();
+    let mut results = Vec::new();
+
+    for agent in selected_agents.iter().copied() {
+        let result = install_mcp_for_agent(agent, scope, local_root.as_deref(), &home);
+        match result {
+            Ok(r) => {
+                if matches!(r.status, InstallStatus::Skipped)
+                    && r.message.to_ascii_lowercase().contains("warning")
+                {
+                    warnings.push(r.message.clone());
+                }
+                results.push(r);
+            }
+            Err(err) => {
+                results.push(AgentInstallResult {
+                    agent,
+                    status: InstallStatus::Failed,
+                    message: format!("install failed: {err}"),
+                    paths: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let installed_count = results
+        .iter()
+        .filter(|r| matches!(r.status, InstallStatus::Installed))
+        .count();
+
+    if base.json {
+        let report = SetupJsonReport {
+            scope: scope.as_str().to_string(),
+            selected_agents,
+            detected_agents: detected,
+            results,
+            warnings,
+            notes: vec!["Configured MCP only (`bt setup mcp`).".to_string()],
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .context("failed to serialize MCP setup report")?
+        );
+    } else {
+        print_mcp_human_report(scope, &selected_agents, &detected, &results, &warnings);
+    }
+
+    if installed_count == 0 {
+        bail!("no MCP configurations were installed successfully");
+    }
+
+    Ok(())
+}
+
+fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupSelection> {
+    let mut scope = initial_setup_scope(args);
+    let interactive = std::io::stdin().is_terminal() && !args.yes;
+    let mut prompted_agents: Option<Vec<Agent>> = None;
+    let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs {
+        Some(Vec::new())
+    } else {
+        None
+    };
+
+    if interactive {
+        #[derive(Clone, Copy)]
+        enum SetupWizardStep {
+            Scope,
+            Agents,
+            Workflows,
+        }
+
+        let mut steps = Vec::new();
+        if scope.is_none() {
+            steps.push(SetupWizardStep::Scope);
+        }
+        if args.agents.is_empty() {
+            steps.push(SetupWizardStep::Agents);
+        }
+        if !args.no_fetch_docs && args.workflows.is_empty() {
+            steps.push(SetupWizardStep::Workflows);
+        }
+
+        let mut idx = 0usize;
+        while idx < steps.len() {
+            match steps[idx] {
+                SetupWizardStep::Scope => match prompt_scope_selection("Select install scope")? {
+                    Some(selected) => {
+                        scope = Some(selected);
+                        idx += 1;
+                    }
+                    None => {
+                        if idx == 0 {
+                            bail!("setup cancelled by user");
+                        }
+                        idx -= 1;
+                    }
+                },
+                SetupWizardStep::Agents => {
+                    let current_scope = scope.ok_or_else(|| anyhow!("scope not selected"))?;
+                    let local_root = resolve_local_root_for_scope(current_scope)?;
+                    let detected = detect_agents(local_root.as_deref(), home);
+                    let defaults = resolve_selected_agents(&[], &detected);
+                    match prompt_agents_selection(&defaults)? {
+                        Some(selected) => {
+                            prompted_agents = Some(selected);
+                            idx += 1;
+                        }
+                        None => {
+                            if idx == 0 {
+                                bail!("setup cancelled by user");
+                            }
+                            idx -= 1;
+                        }
+                    }
+                }
+                SetupWizardStep::Workflows => {
+                    let defaults = resolve_workflow_selection(&[]);
+                    match prompt_workflows_selection(&defaults)? {
+                        Some(selected) => {
+                            prompted_workflows = Some(selected);
+                            idx += 1;
+                        }
+                        None => {
+                            if idx == 0 {
+                                bail!("setup cancelled by user");
+                            }
+                            idx -= 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let scope = match scope {
+        Some(value) => value,
+        None => resolve_scope(args)?,
+    };
+    let local_root = resolve_local_root_for_scope(scope)?;
+    let detected = detect_agents(local_root.as_deref(), home);
+    let selected_agents = match prompted_agents {
+        Some(value) => value,
+        None => resolve_selected_agents(&args.agents, &detected),
+    };
+    if selected_agents.is_empty() {
+        bail!("no agents selected for installation");
+    }
+
+    let selected_workflows = if args.no_fetch_docs {
+        Vec::new()
+    } else if let Some(value) = prompted_workflows {
+        value
+    } else {
+        resolve_workflow_selection(&args.workflows)
+    };
+
+    Ok(SetupSelection {
+        scope,
+        local_root,
+        detected,
+        selected_agents,
+        selected_workflows,
+    })
+}
+
+fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSelection> {
+    let mut scope = initial_mcp_scope(args);
+    let interactive = std::io::stdin().is_terminal() && !args.yes;
+    let mut prompted_agents: Option<Vec<Agent>> = None;
+
+    if interactive {
+        #[derive(Clone, Copy)]
+        enum McpWizardStep {
+            Scope,
+            Agents,
+        }
+
+        let mut steps = Vec::new();
+        if scope.is_none() {
+            steps.push(McpWizardStep::Scope);
+        }
+        if args.agents.is_empty() {
+            steps.push(McpWizardStep::Agents);
+        }
+
+        let mut idx = 0usize;
+        while idx < steps.len() {
+            match steps[idx] {
+                McpWizardStep::Scope => match prompt_scope_selection("Select MCP setup scope")? {
+                    Some(selected) => {
+                        scope = Some(selected);
+                        idx += 1;
+                    }
+                    None => {
+                        if idx == 0 {
+                            bail!("MCP setup cancelled by user");
+                        }
+                        idx -= 1;
+                    }
+                },
+                McpWizardStep::Agents => {
+                    let current_scope = scope.ok_or_else(|| anyhow!("scope not selected"))?;
+                    let local_root = resolve_local_root_for_scope(current_scope)?;
+                    let detected = detect_agents(local_root.as_deref(), home);
+                    let defaults = resolve_selected_agents(&[], &detected);
+                    match prompt_agents_selection(&defaults)? {
+                        Some(selected) => {
+                            prompted_agents = Some(selected);
+                            idx += 1;
+                        }
+                        None => {
+                            if idx == 0 {
+                                bail!("MCP setup cancelled by user");
+                            }
+                            idx -= 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let scope = match scope {
+        Some(value) => value,
+        None => resolve_mcp_scope(args)?,
+    };
+    let local_root = resolve_local_root_for_scope(scope)?;
+    let detected = detect_agents(local_root.as_deref(), home);
+    let selected_agents = match prompted_agents {
+        Some(value) => value,
+        None => resolve_selected_agents(&args.agents, &detected),
+    };
+    if selected_agents.is_empty() {
+        bail!("no agents selected for MCP setup");
+    }
+
+    Ok(McpSelection {
+        scope,
+        local_root,
+        detected,
+        selected_agents,
+    })
+}
+
+fn run_doctor(base: BaseArgs, args: AgentsDoctorArgs) -> Result<()> {
+    let (scope, local_root) = resolve_doctor_scope(&args)?;
+    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let docs_output_dir = setup_docs_output_dir(scope, local_root.as_deref(), &home)?;
+    let detected = detect_agents(local_root.as_deref(), &home);
+
+    let mut warnings = Vec::new();
+    let agents = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode]
+        .iter()
+        .map(|agent| doctor_agent_status(*agent, scope, local_root.as_deref(), &home, &detected))
+        .collect::<Vec<_>>();
+
+    if matches!(scope, InstallScope::Global) {
+        warnings.push("cursor is local-only in this setup flow".to_string());
+    }
+
+    if base.json {
+        let report = DoctorJsonReport {
+            scope: scope.as_str().to_string(),
+            root: local_root.as_ref().map(|p| p.display().to_string()),
+            docs_path: docs_output_dir.display().to_string(),
+            docs_present: docs_output_dir.exists(),
+            agents,
+            warnings,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize doctor report")?
+        );
+        return Ok(());
+    }
+
+    println!("Braintrust Setup Doctor");
+    println!("Scope: {}", scope.as_str());
+    if let Some(root) = &local_root {
+        println!("Root: {}", root.display());
+    }
+    println!(
+        "Docs cache: {} ({})",
+        docs_output_dir.display(),
+        if docs_output_dir.exists() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!("Agents:");
+    for status in &agents {
+        println!(
+            "  - {}: {}{}",
+            status.agent.as_str(),
+            if status.configured {
+                "configured"
+            } else {
+                "not configured"
+            },
+            if status.detected { " (detected)" } else { "" }
+        );
+        if let Some(path) = &status.config_path {
+            println!("      path: {path}");
+        }
+        for signal in &status.detected_signals {
+            println!("      signal: {signal}");
+        }
+        for note in &status.notes {
+            println!("      note: {note}");
+        }
+    }
+    if !warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &warnings {
+            println!("  - {warning}");
+        }
+    }
+    Ok(())
+}
+
+fn resolve_doctor_scope(args: &AgentsDoctorArgs) -> Result<(InstallScope, Option<PathBuf>)> {
+    if args.local {
+        let root = find_git_root().ok_or_else(|| {
+            anyhow!(
+                "--local requires running inside a git repository (could not find .git in parent chain)"
+            )
+        })?;
+        return Ok((InstallScope::Local, Some(root)));
+    }
+    if args.global {
+        return Ok((InstallScope::Global, None));
+    }
+    if let Some(root) = find_git_root() {
+        return Ok((InstallScope::Local, Some(root)));
+    }
+    Ok((InstallScope::Global, None))
+}
+
+fn doctor_agent_status(
+    agent: Agent,
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    detected: &[DetectionSignal],
+) -> DoctorAgentStatus {
+    let detected_signals = detected
+        .iter()
+        .filter(|signal| signal.agent == agent)
+        .map(|signal| signal.reason.clone())
+        .collect::<Vec<_>>();
+    let detected_any = !detected_signals.is_empty();
+
+    let mut notes = Vec::new();
+    let config_path = match (agent, scope) {
+        (Agent::Claude, InstallScope::Local) => local_root
+            .map(|root| root.join(".claude/skills/braintrust/SKILL.md"))
+            .map(|p| p.display().to_string()),
+        (Agent::Claude, InstallScope::Global) => Some(
+            home.join(".claude/skills/braintrust/SKILL.md")
+                .display()
+                .to_string(),
+        ),
+        (Agent::Codex, InstallScope::Local) | (Agent::Opencode, InstallScope::Local) => local_root
+            .map(|root| root.join(".agents/skills/braintrust/SKILL.md"))
+            .map(|p| p.display().to_string()),
+        (Agent::Codex, InstallScope::Global) | (Agent::Opencode, InstallScope::Global) => Some(
+            home.join(".agents/skills/braintrust/SKILL.md")
+                .display()
+                .to_string(),
+        ),
+        (Agent::Cursor, InstallScope::Local) => local_root
+            .map(|root| root.join(".cursor/rules/braintrust.mdc"))
+            .map(|p| p.display().to_string()),
+        (Agent::Cursor, InstallScope::Global) => {
+            notes.push("cursor currently supports local-only setup in this flow".to_string());
+            None
+        }
+    };
+
+    let configured = config_path
+        .as_deref()
+        .map(|p| Path::new(p).exists())
+        .unwrap_or(false);
+
+    DoctorAgentStatus {
+        agent,
+        detected: detected_any,
+        detected_signals,
+        configured,
+        config_path,
+        notes,
+    }
+}
+
+fn initial_setup_scope(args: &AgentsSetupArgs) -> Option<InstallScope> {
+    if args.local {
+        Some(InstallScope::Local)
+    } else if args.global || args.yes {
+        Some(InstallScope::Global)
+    } else {
+        None
+    }
+}
+
+fn initial_mcp_scope(args: &AgentsMcpSetupArgs) -> Option<InstallScope> {
+    if args.local {
+        Some(InstallScope::Local)
+    } else if args.global || args.yes {
+        Some(InstallScope::Global)
+    } else {
+        None
+    }
+}
+
+fn resolve_local_root_for_scope(scope: InstallScope) -> Result<Option<PathBuf>> {
+    if matches!(scope, InstallScope::Local) {
+        return Ok(Some(find_git_root().ok_or_else(|| {
+            anyhow!(
+                "--local requires running inside a git repository (could not find .git in parent chain)"
+            )
+        })?));
+    }
+    Ok(None)
+}
+
+fn prompt_scope_selection(prompt: &str) -> Result<Option<InstallScope>> {
+    let choices = ["local (current git repo)", "global (user-wide)"];
+    let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .items(&choices)
+        .default(0)
+        .interact_opt()?;
+    Ok(idx.map(|i| {
+        if i == 0 {
+            InstallScope::Local
+        } else {
+            InstallScope::Global
+        }
+    }))
+}
+
+fn prompt_agents_selection(defaults: &[Agent]) -> Result<Option<Vec<Agent>>> {
+    let all = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode];
+    let default_set: BTreeSet<Agent> = defaults.iter().copied().collect();
+    let labels = all.iter().map(|agent| agent.as_str()).collect::<Vec<_>>();
+    let default_flags = all
+        .iter()
+        .map(|agent| default_set.contains(agent))
+        .collect::<Vec<_>>();
+
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select agents to configure (Esc: back)")
+        .items(&labels)
+        .defaults(&default_flags)
+        .interact_opt()?;
+
+    Ok(selected.map(|indexes| {
+        indexes
+            .into_iter()
+            .map(|index| all[index])
+            .collect::<Vec<_>>()
+    }))
+}
+
+fn prompt_workflows_selection(defaults: &[WorkflowArg]) -> Result<Option<Vec<WorkflowArg>>> {
+    let all = [
+        WorkflowArg::Instrument,
+        WorkflowArg::Observe,
+        WorkflowArg::Annotate,
+        WorkflowArg::Evaluate,
+        WorkflowArg::Deploy,
+    ];
+    let default_set: BTreeSet<WorkflowArg> = defaults.iter().copied().collect();
+    let labels = all
+        .iter()
+        .map(|workflow| workflow.as_str())
+        .collect::<Vec<_>>();
+    let default_flags = all
+        .iter()
+        .map(|workflow| default_set.contains(workflow))
+        .collect::<Vec<_>>();
+
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt(
+            "Select the workflows you are interested in (will prefetch docs for them) (Esc: back)",
+        )
+        .items(&labels)
+        .defaults(&default_flags)
+        .interact_opt()?;
+
+    Ok(selected.map(|indexes| {
+        indexes
+            .into_iter()
+            .map(|index| all[index])
+            .collect::<Vec<_>>()
+    }))
+}
+
 fn resolve_scope(args: &AgentsSetupArgs) -> Result<InstallScope> {
     if args.local {
         return Ok(InstallScope::Local);
@@ -666,6 +1237,30 @@ fn resolve_scope(args: &AgentsSetupArgs) -> Result<InstallScope> {
 
     let choices = ["local (current git repo)", "global (user-wide)"];
     let idx = crate::ui::fuzzy_select("Select install scope", &choices)?;
+    Ok(if idx == 0 {
+        InstallScope::Local
+    } else {
+        InstallScope::Global
+    })
+}
+
+fn resolve_mcp_scope(args: &AgentsMcpSetupArgs) -> Result<InstallScope> {
+    if args.local {
+        return Ok(InstallScope::Local);
+    }
+    if args.global {
+        return Ok(InstallScope::Global);
+    }
+    if args.yes {
+        return Ok(InstallScope::Global);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        bail!("scope required in non-interactive mode: pass --local or --global");
+    }
+
+    let choices = ["local (current git repo)", "global (user-wide)"];
+    let idx = crate::ui::fuzzy_select("Select MCP setup scope", &choices)?;
     Ok(if idx == 0 {
         InstallScope::Local
     } else {
@@ -723,41 +1318,6 @@ fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
         }
     }
     out.into_iter().collect()
-}
-
-fn select_setup_workflows(args: &AgentsSetupArgs) -> Result<Vec<WorkflowArg>> {
-    if args.no_fetch_docs {
-        return Ok(Vec::new());
-    }
-
-    let inferred = resolve_workflow_selection(&args.workflows);
-    if !args.workflows.is_empty() || args.yes || !std::io::stdin().is_terminal() {
-        return Ok(inferred);
-    }
-
-    let all = [
-        WorkflowArg::Instrument,
-        WorkflowArg::Observe,
-        WorkflowArg::Annotate,
-        WorkflowArg::Evaluate,
-        WorkflowArg::Deploy,
-    ];
-    let labels = all
-        .iter()
-        .map(|workflow| workflow.as_str())
-        .collect::<Vec<_>>();
-    let defaults = vec![true; all.len()];
-    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select workflows to prefetch docs for")
-        .items(&labels)
-        .defaults(&defaults)
-        .interact()?;
-
-    let mut out = Vec::with_capacity(selected.len());
-    for index in selected {
-        out.push(all[index]);
-    }
-    Ok(out)
 }
 
 fn workflow_from_url(url: &str) -> Option<&'static str> {
@@ -933,7 +1493,7 @@ fn write_docs_indexes(
     let mut top_lines = Vec::new();
     top_lines.push("# Braintrust Workflow Docs".to_string());
     top_lines.push(String::new());
-    top_lines.push("Generated by `bt agents docs fetch`.".to_string());
+    top_lines.push("Generated by `bt docs fetch`.".to_string());
     top_lines.push(String::new());
 
     for workflow in workflows {
@@ -977,44 +1537,6 @@ fn write_docs_indexes(
     let top_index = output_dir.join("README.md");
     write_text_file(&top_index, &top_lines.join("\n"))?;
     Ok(())
-}
-
-fn select_agents(args: &AgentsSetupArgs, detected: &[DetectionSignal]) -> Result<Vec<Agent>> {
-    let inferred = resolve_selected_agents(&args.agents, detected);
-    if !args.agents.is_empty() || args.yes || !std::io::stdin().is_terminal() {
-        return Ok(inferred);
-    }
-
-    let all = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode];
-    let defaults: BTreeSet<Agent> = inferred.into_iter().collect();
-    let mut labels = Vec::with_capacity(all.len());
-    let mut default_flags = Vec::with_capacity(all.len());
-
-    for agent in all {
-        let detected_count = detected
-            .iter()
-            .filter(|signal| signal.agent == agent)
-            .count();
-        if detected_count > 0 {
-            labels.push(format!("{} (detected: {detected_count})", agent.as_str()));
-        } else {
-            labels.push(agent.as_str().to_string());
-        }
-        default_flags.push(defaults.contains(&agent));
-    }
-
-    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agents to configure")
-        .items(&labels)
-        .defaults(&default_flags)
-        .interact()?;
-
-    let mut out = Vec::with_capacity(selected.len());
-    for index in selected {
-        out.push(all[index]);
-    }
-
-    Ok(out)
 }
 
 fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal> {
@@ -1094,32 +1616,17 @@ fn install_claude(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
-    with_mcp: bool,
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".claude/skills/braintrust/SKILL.md");
     let skill_content = render_braintrust_skill();
     write_text_file(&skill_path, &skill_content)?;
 
-    let mut paths = vec![skill_path.display().to_string()];
-    if with_mcp {
-        let mcp_path = match scope {
-            InstallScope::Local => root.join(".mcp.json"),
-            InstallScope::Global => home.join(".mcp.json"),
-        };
-        merge_mcp_config(&mcp_path)?;
-        paths.push(mcp_path.display().to_string());
-    }
-
     Ok(AgentInstallResult {
         agent: Agent::Claude,
         status: InstallStatus::Installed,
-        message: if with_mcp {
-            "installed skill and MCP config".to_string()
-        } else {
-            "installed skill".to_string()
-        },
-        paths,
+        message: "installed skill".to_string(),
+        paths: vec![skill_path.display().to_string()],
     })
 }
 
@@ -1127,33 +1634,17 @@ fn install_codex(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
-    with_mcp: bool,
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
     let skill_content = render_braintrust_skill();
     write_text_file(&skill_path, &skill_content)?;
 
-    let mut paths = vec![skill_path.display().to_string()];
-
-    if with_mcp {
-        let mcp_path = match scope {
-            InstallScope::Local => root.join(".mcp.json"),
-            InstallScope::Global => home.join(".mcp.json"),
-        };
-        merge_mcp_config(&mcp_path)?;
-        paths.push(mcp_path.display().to_string());
-    }
-
     Ok(AgentInstallResult {
         agent: Agent::Codex,
         status: InstallStatus::Installed,
-        message: if with_mcp {
-            "installed skill and MCP config".to_string()
-        } else {
-            "installed skill".to_string()
-        },
-        paths,
+        message: "installed skill".to_string(),
+        paths: vec![skill_path.display().to_string()],
     })
 }
 
@@ -1161,32 +1652,17 @@ fn install_opencode(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
-    with_mcp: bool,
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
     let skill_content = render_braintrust_skill();
     write_text_file(&skill_path, &skill_content)?;
 
-    let mut paths = vec![skill_path.display().to_string()];
-    if with_mcp {
-        let mcp_path = match scope {
-            InstallScope::Local => root.join(".mcp.json"),
-            InstallScope::Global => home.join(".mcp.json"),
-        };
-        merge_mcp_config(&mcp_path)?;
-        paths.push(mcp_path.display().to_string());
-    }
-
     Ok(AgentInstallResult {
         agent: Agent::Opencode,
         status: InstallStatus::Installed,
-        message: if with_mcp {
-            "installed skill and MCP config".to_string()
-        } else {
-            "installed skill".to_string()
-        },
-        paths,
+        message: "installed skill".to_string(),
+        paths: vec![skill_path.display().to_string()],
     })
 }
 
@@ -1194,13 +1670,12 @@ fn install_cursor(
     scope: InstallScope,
     local_root: Option<&Path>,
     _home: &Path,
-    with_mcp: bool,
 ) -> Result<AgentInstallResult> {
     if matches!(scope, InstallScope::Global) {
         return Ok(AgentInstallResult {
             agent: Agent::Cursor,
             status: InstallStatus::Skipped,
-            message: "warning: cursor currently supports only --local in bt agents setup"
+            message: "warning: cursor currently supports only --local in bt setup skills"
                 .to_string(),
             paths: Vec::new(),
         });
@@ -1211,22 +1686,50 @@ fn install_cursor(
     let cursor_rule = render_cursor_rule();
     write_text_file(&rule_path, &cursor_rule)?;
 
-    let mut paths = vec![rule_path.display().to_string()];
-    if with_mcp {
-        let mcp_path = root.join(".cursor/mcp.json");
-        merge_mcp_config(&mcp_path)?;
-        paths.push(mcp_path.display().to_string());
-    }
-
     Ok(AgentInstallResult {
         agent: Agent::Cursor,
         status: InstallStatus::Installed,
-        message: if with_mcp {
-            "installed rule and MCP config".to_string()
-        } else {
-            "installed rule".to_string()
-        },
-        paths,
+        message: "installed rule".to_string(),
+        paths: vec![rule_path.display().to_string()],
+    })
+}
+
+fn install_mcp_for_agent(
+    agent: Agent,
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Result<AgentInstallResult> {
+    let path = match agent {
+        Agent::Cursor => {
+            if matches!(scope, InstallScope::Global) {
+                return Ok(AgentInstallResult {
+                    agent,
+                    status: InstallStatus::Skipped,
+                    message: "warning: cursor currently supports only --local in bt setup mcp"
+                        .to_string(),
+                    paths: Vec::new(),
+                });
+            }
+            let root = scope_root(scope, local_root, home)?;
+            root.join(".cursor/mcp.json")
+        }
+        Agent::Claude | Agent::Codex | Agent::Opencode => {
+            let root = scope_root(scope, local_root, home)?;
+            match scope {
+                InstallScope::Local => root.join(".mcp.json"),
+                InstallScope::Global => home.join(".mcp.json"),
+            }
+        }
+    };
+
+    merge_mcp_config(&path)?;
+
+    Ok(AgentInstallResult {
+        agent,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec![path.display().to_string()],
     })
 }
 
@@ -1464,6 +1967,56 @@ fn print_human_report(
     }
 }
 
+fn print_mcp_human_report(
+    scope: InstallScope,
+    selected_agents: &[Agent],
+    detected: &[DetectionSignal],
+    results: &[AgentInstallResult],
+    warnings: &[String],
+) {
+    println!("Configuring MCP for Braintrust");
+    println!("Scope: {}", scope.as_str());
+
+    let selected = selected_agents
+        .iter()
+        .map(|a| a.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Selected agents: {selected}");
+
+    if !detected.is_empty() {
+        println!("Detected signals:");
+        for signal in detected {
+            println!("  - {}: {}", signal.agent.as_str(), signal.reason);
+        }
+    }
+
+    println!("Results:");
+    for result in results {
+        let status = match result.status {
+            InstallStatus::Installed => "installed",
+            InstallStatus::Skipped => "skipped",
+            InstallStatus::Failed => "failed",
+        };
+        println!(
+            "  - {}: {} ({})",
+            result.agent.as_str(),
+            status,
+            result.message
+        );
+        for path in &result.paths {
+            println!("      path: {path}");
+        }
+    }
+
+    if !warnings.is_empty() {
+        println!("Warnings:");
+        for warning in warnings {
+            println!("  - {warning}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1609,35 +2162,86 @@ mod tests {
     }
 
     #[test]
-    fn select_setup_workflows_honors_no_fetch_docs() {
+    fn resolve_setup_selection_honors_no_fetch_docs() {
         let args = AgentsSetupArgs {
-            agents: vec![],
-            local: true,
-            global: false,
-            with_mcp: false,
+            agents: vec![AgentArg::Codex],
+            local: false,
+            global: true,
             workflows: vec![WorkflowArg::Evaluate],
             yes: true,
             no_fetch_docs: true,
+            refresh_docs: false,
         };
-        let selected = select_setup_workflows(&args).expect("select workflows");
-        assert!(selected.is_empty());
+        let home = std::env::temp_dir();
+        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
+        assert!(selection.selected_workflows.is_empty());
     }
 
     #[test]
-    fn select_setup_workflows_resolves_explicit_values() {
-        let args = AgentsSetupArgs {
-            agents: vec![],
-            local: true,
-            global: false,
-            with_mcp: false,
-            workflows: vec![WorkflowArg::Evaluate, WorkflowArg::Instrument],
-            yes: true,
-            no_fetch_docs: false,
-        };
-        let selected = select_setup_workflows(&args).expect("select workflows");
+    fn resolve_workflow_selection_resolves_explicit_values() {
+        let selected =
+            resolve_workflow_selection(&[WorkflowArg::Evaluate, WorkflowArg::Instrument]);
         assert_eq!(
             selected,
             vec![WorkflowArg::Instrument, WorkflowArg::Evaluate]
         );
+    }
+
+    #[test]
+    fn resolve_doctor_scope_respects_global_flag() {
+        let args = AgentsDoctorArgs {
+            local: false,
+            global: true,
+        };
+        let (scope, root) = resolve_doctor_scope(&args).expect("resolve doctor scope");
+        assert!(matches!(scope, InstallScope::Global));
+        assert!(root.is_none());
+    }
+
+    #[test]
+    fn doctor_agent_status_marks_cursor_global_as_local_only() {
+        let home = std::env::temp_dir();
+        let status = doctor_agent_status(Agent::Cursor, InstallScope::Global, None, &home, &[]);
+        assert!(!status.configured);
+        assert!(status.config_path.is_none());
+        assert!(status.notes.iter().any(|note| note.contains("local-only")));
+    }
+
+    #[test]
+    fn resolve_mcp_scope_respects_global_flag() {
+        let args = AgentsMcpSetupArgs {
+            agents: vec![],
+            local: false,
+            global: true,
+            yes: false,
+        };
+        let scope = resolve_mcp_scope(&args).expect("resolve mcp scope");
+        assert!(matches!(scope, InstallScope::Global));
+    }
+
+    #[test]
+    fn install_mcp_for_agent_writes_local_mcp_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-mcp-local-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let result = install_mcp_for_agent(Agent::Codex, InstallScope::Local, Some(&root), &home)
+            .expect("install local mcp");
+        assert!(matches!(result.status, InstallStatus::Installed));
+
+        let mcp_path = root.join(".mcp.json");
+        assert!(mcp_path.exists());
+        let parsed: Value =
+            serde_json::from_str(&fs::read_to_string(&mcp_path).expect("read mcp")).expect("json");
+        let servers = parsed
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .expect("servers object");
+        assert!(servers.contains_key("braintrust"));
     }
 }
