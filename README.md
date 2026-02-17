@@ -124,6 +124,14 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - If eval execution fails with ESM/top-level-await related errors, retry with:
   - `bt eval --runner vite-node tutorial.eval.ts`
 
+## `bt sql`
+
+- Runs interactively on TTY by default.
+- Runs non-interactively when stdin is not a TTY, when `--non-interactive` is set, or when a query argument is provided.
+- In non-interactive mode, provide SQL via:
+  - Positional query: `bt sql "SELECT 1"`
+  - stdin pipe: `echo "SELECT 1" | bt sql`
+
 ## `bt view`
 
 - List logs (interactive on TTY by default, non-interactive otherwise):
