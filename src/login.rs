@@ -30,12 +30,10 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         .or_else(|| base.api_url.clone())
         .unwrap_or_else(|| "https://api.braintrust.dev".to_string());
 
-    // Derive app_url from api_url (api.braintrust.dev -> www.braintrust.dev)
-    let app_url = base.app_url.clone().unwrap_or_else(|| {
-        api_url
-            .replace("api.braintrust", "www.braintrust")
-            .replace("api.braintrustdata", "www.braintrustdata")
-    });
+    let app_url = base
+        .app_url
+        .clone()
+        .unwrap_or_else(|| "https://braintrust.dev".to_string());
 
     Ok(LoginContext {
         login,
