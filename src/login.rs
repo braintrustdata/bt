@@ -3,12 +3,14 @@ use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use braintrust_sdk_rust::{BraintrustClient, LoginState};
 use clap::{Args, Subcommand};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
 use oauth2::basic::{BasicClient, BasicTokenType};
 use oauth2::reqwest::async_http_client;
@@ -31,6 +33,7 @@ const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
+static SECRET_STORE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub struct LoginContext {
@@ -54,6 +57,12 @@ struct AuthStore {
     active_profile: Option<String>,
     #[serde(default)]
     profiles: BTreeMap<String, AuthProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SecretStore {
+    #[serde(default)]
+    secrets: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,7 +544,7 @@ async fn run_login_set(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         );
     }
     println!(
-        "Saved profile metadata at {} and credential in OS keychain",
+        "Saved profile metadata at {} and credential in secure store (OS keychain when available; plaintext fallback otherwise)",
         auth_store_path()?.display()
     );
     if made_default {
@@ -600,13 +609,16 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         }
     }
 
-    let callback = wait_for_oauth_callback(listener).await?;
+    let callback = collect_oauth_callback(listener, args.no_browser || is_ssh_session()).await?;
     if let Some(error) = callback.error {
         bail!("oauth authorization failed: {error}");
     }
     let auth_code = callback
         .code
         .ok_or_else(|| anyhow::anyhow!("no authorization code received"))?;
+    if callback.state.is_none() {
+        bail!("oauth callback missing state; paste the full callback URL (or code=...&state=...)");
+    }
     if callback.state.as_deref() != Some(state.as_str()) {
         bail!("oauth state mismatch; please try again");
     }
@@ -683,7 +695,7 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         );
     }
     println!(
-        "Saved profile metadata at {} and refresh token in OS keychain",
+        "Saved profile metadata at {} and refresh token in secure store (OS keychain when available; plaintext fallback otherwise)",
         auth_store_path()?.display()
     );
     if made_default {
@@ -1256,6 +1268,150 @@ async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallbackP
     }
 
     let query = path.split_once('?').map(|(_, query)| query).unwrap_or("");
+    let params = parse_oauth_callback_query(query);
+
+    let body = if params.error.is_some() {
+        "<html><body><h1>Authorization Failed</h1><p>You can close this window.</p></body></html>"
+    } else {
+        "<html><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>"
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("failed writing oauth callback response")?;
+
+    Ok(params)
+}
+
+async fn collect_oauth_callback(
+    listener: TcpListener,
+    prefer_manual: bool,
+) -> Result<OAuthCallbackParams> {
+    if !prefer_manual {
+        return wait_for_oauth_callback_or_stdin(listener).await;
+    }
+
+    println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
+    println!(
+        "After approving access, your browser may show a localhost connection error on remote hosts."
+    );
+    println!(
+        "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
+    );
+    let pasted = Input::<String>::new()
+        .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
+        .allow_empty(true)
+        .interact_text()
+        .context("failed to read callback URL")?;
+    if pasted.trim().is_empty() {
+        return wait_for_oauth_callback(listener).await;
+    }
+    parse_oauth_callback_input(&pasted)
+}
+
+async fn wait_for_oauth_callback_or_stdin(listener: TcpListener) -> Result<OAuthCallbackParams> {
+    println!("Waiting for OAuth callback...");
+    println!("If localhost callback does not complete, paste code=...&state=... and press Enter.");
+
+    let callback_fut = wait_for_oauth_callback(listener);
+    tokio::pin!(callback_fut);
+    let mut manual_buffer = String::new();
+
+    loop {
+        tokio::select! {
+            callback = &mut callback_fut => return callback,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if let Some(input) = poll_manual_oauth_input(&mut manual_buffer)? {
+                    return parse_oauth_callback_input(&input);
+                }
+            }
+        }
+    }
+}
+
+fn poll_manual_oauth_input(buffer: &mut String) -> Result<Option<String>> {
+    while event::poll(Duration::from_millis(0)).context("failed to poll stdin events")? {
+        match event::read().context("failed reading stdin events")? {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        let input = buffer.trim().to_string();
+                        buffer.clear();
+                        if !input.is_empty() {
+                            return Ok(Some(input));
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(ch) => {
+                        buffer.push(ch);
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                buffer.push_str(text.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_oauth_callback_input(input: &str) -> Result<OAuthCallbackParams> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("callback URL cannot be empty");
+    }
+
+    if trimmed.starts_with('{') {
+        return parse_oauth_callback_json(trimmed);
+    }
+
+    let parsed = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        reqwest::Url::parse(trimmed).context("invalid callback URL")?
+    } else if trimmed.starts_with('/') {
+        reqwest::Url::parse(&format!("http://127.0.0.1{trimmed}"))
+            .context("invalid callback path")?
+    } else if trimmed.starts_with('?') {
+        reqwest::Url::parse(&format!("http://127.0.0.1/callback{trimmed}"))
+            .context("invalid callback query")?
+    } else if trimmed.starts_with('#') {
+        reqwest::Url::parse(&format!("http://127.0.0.1/callback{trimmed}"))
+            .context("invalid callback fragment")?
+    } else if trimmed.contains("code=") || trimmed.contains("error=") {
+        reqwest::Url::parse(&format!("http://127.0.0.1/callback?{trimmed}"))
+            .context("invalid callback query")?
+    } else {
+        bail!(
+            "expected a callback URL, callback path, callback query, or callback JSON with code/state"
+        );
+    };
+
+    let query_params = parse_oauth_callback_query(parsed.query().unwrap_or_default());
+    if query_params.code.is_some() || query_params.error.is_some() {
+        return Ok(query_params);
+    }
+
+    let fragment_params = parse_oauth_callback_query(parsed.fragment().unwrap_or_default());
+    if fragment_params.code.is_some() || fragment_params.error.is_some() {
+        return Ok(fragment_params);
+    }
+
+    bail!("callback input did not include code or error");
+}
+
+fn parse_oauth_callback_query(query: &str) -> OAuthCallbackParams {
     let mut code = None;
     let mut state = None;
     let mut error = None;
@@ -1274,23 +1430,38 @@ async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallbackP
             _ => {}
         }
     }
+    OAuthCallbackParams { code, state, error }
+}
 
-    let body = if error.is_some() {
-        "<html><body><h1>Authorization Failed</h1><p>You can close this window.</p></body></html>"
-    } else {
-        "<html><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>"
+fn parse_oauth_callback_json(input: &str) -> Result<OAuthCallbackParams> {
+    #[derive(Debug, Deserialize)]
+    struct CallbackJson {
+        code: Option<String>,
+        state: Option<String>,
+        error: Option<String>,
+    }
+
+    let payload: CallbackJson =
+        serde_json::from_str(input).context("invalid callback JSON payload")?;
+    let params = OAuthCallbackParams {
+        code: payload.code.map(|value| value.trim().to_string()),
+        state: payload.state.map(|value| value.trim().to_string()),
+        error: payload.error.map(|value| value.trim().to_string()),
     };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .context("failed writing oauth callback response")?;
+    if params.code.as_deref().is_some_and(str::is_empty) {
+        bail!("callback JSON contains an empty code");
+    }
+    if params.error.as_deref().is_some_and(str::is_empty) {
+        bail!("callback JSON contains an empty error");
+    }
+    if params.code.is_none() && params.error.is_none() {
+        bail!("callback JSON must include code or error");
+    }
+    Ok(params)
+}
 
-    Ok(OAuthCallbackParams { code, state, error })
+fn is_ssh_session() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
 
 async fn exchange_oauth_authorization_code(
@@ -1389,7 +1560,172 @@ fn prompt_api_key() -> Result<String> {
     Ok(api_key)
 }
 
+#[cfg(target_os = "linux")]
+fn linux_secret_tool_exec_error(err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!(
+            "`secret-tool` is not installed. Install `libsecret-tools` (Debian/Ubuntu) or your distro's equivalent package, or use BRAINTRUST_API_KEY/--api-key for non-persistent auth."
+        )
+    } else {
+        anyhow::anyhow!("failed to execute Linux keychain utility `secret-tool`: {err}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_secret_service_unavailable(stderr: &str) -> bool {
+    stderr.contains("org.freedesktop.secrets was not provided by any .service files")
+        || stderr.contains("Cannot autolaunch D-Bus without X11")
+        || stderr.contains("org.freedesktop.Secret.Service")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_secret_service_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no Secret Service provider is running. Start a Secret Service daemon (for example gnome-keyring or keepassxc with Secret Service enabled), or use BRAINTRUST_API_KEY/--api-key for non-persistent auth."
+    )
+}
+
 fn save_profile_secret(profile_name: &str, api_key: &str) -> Result<()> {
+    match save_profile_secret_keychain(profile_name, api_key) {
+        Ok(()) => {
+            let _ = delete_profile_secret_plaintext(profile_name);
+            Ok(())
+        }
+        Err(err) => {
+            save_profile_secret_plaintext(profile_name, api_key)?;
+            warn_secret_store_plaintext_fallback(&err);
+            Ok(())
+        }
+    }
+}
+
+fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
+    match load_profile_secret_keychain(profile_name) {
+        Ok(Some(secret)) => Ok(Some(secret)),
+        Ok(None) => load_profile_secret_plaintext(profile_name),
+        Err(_) => load_profile_secret_plaintext(profile_name),
+    }
+}
+
+fn delete_profile_secret(profile_name: &str) -> Result<()> {
+    let keychain_err = delete_profile_secret_keychain(profile_name).err();
+    let plaintext_err = delete_profile_secret_plaintext(profile_name).err();
+    if keychain_err.is_none() || plaintext_err.is_none() {
+        return Ok(());
+    }
+    Err(keychain_err.expect("checked is_some"))
+}
+
+fn warn_secret_store_plaintext_fallback(err: &anyhow::Error) {
+    if SECRET_STORE_FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    match secret_store_path() {
+        Ok(path) => eprintln!(
+            "warning: secure credential store unavailable ({err}); falling back to plaintext credential file at {} (permissions: 0600).",
+            path.display()
+        ),
+        Err(_) => eprintln!(
+            "warning: secure credential store unavailable ({err}); falling back to plaintext credential storage."
+        ),
+    }
+}
+
+fn save_profile_secret_plaintext(profile_name: &str, api_key: &str) -> Result<()> {
+    let mut store = load_secret_store()?;
+    store
+        .secrets
+        .insert(profile_name.to_string(), api_key.to_string());
+    save_secret_store(&store)
+}
+
+fn load_profile_secret_plaintext(profile_name: &str) -> Result<Option<String>> {
+    let store = load_secret_store()?;
+    Ok(store.secrets.get(profile_name).cloned())
+}
+
+fn delete_profile_secret_plaintext(profile_name: &str) -> Result<()> {
+    let path = secret_store_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut store = load_secret_store()?;
+    store.secrets.remove(profile_name);
+    save_secret_store(&store)
+}
+
+fn load_secret_store() -> Result<SecretStore> {
+    let path = secret_store_path()?;
+    if !path.exists() {
+        return Ok(SecretStore::default());
+    }
+
+    let data = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read secret store {}", path.display()))?;
+    serde_json::from_str(&data)
+        .with_context(|| format!("failed to parse secret store {}", path.display()))
+}
+
+fn save_secret_store(store: &SecretStore) -> Result<()> {
+    let path = secret_store_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let data = serde_json::to_string_pretty(store).context("failed to serialize secret store")?;
+    let temp_path = path.with_extension("tmp");
+    let mut file = fs::File::create(&temp_path)
+        .with_context(|| format!("failed to write temp secret store {}", temp_path.display()))?;
+    file.write_all(data.as_bytes())
+        .with_context(|| format!("failed to write temp secret store {}", temp_path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to write temp secret store {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush temp secret store {}", temp_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to set permissions on temp secret store {}",
+                temp_path.display()
+            )
+        })?;
+    }
+
+    fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to move temp secret store {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to set permissions on secret store {}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn secret_store_path() -> Result<PathBuf> {
+    let mut path = auth_store_path()?;
+    path.set_file_name("secrets.json");
+    Ok(path)
+}
+
+fn save_profile_secret_keychain(profile_name: &str, api_key: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("security")
@@ -1431,7 +1767,7 @@ fn save_profile_secret(profile_name: &str, api_key: &str) -> Result<()> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .context("failed to execute Linux keychain utility `secret-tool`")?;
+            .map_err(linux_secret_tool_exec_error)?;
 
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
@@ -1448,10 +1784,14 @@ fn save_profile_secret(profile_name: &str, api_key: &str) -> Result<()> {
         if output.status.success() {
             return Ok(());
         }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if linux_secret_service_unavailable(&stderr) {
+            return Err(linux_secret_service_error());
+        }
 
         bail!(
             "failed to store credential in Linux keychain: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
 
@@ -1463,7 +1803,7 @@ fn save_profile_secret(profile_name: &str, api_key: &str) -> Result<()> {
     }
 }
 
-fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
+fn load_profile_secret_keychain(profile_name: &str) -> Result<Option<String>> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("security")
@@ -1509,7 +1849,7 @@ fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
                 profile_name,
             ])
             .output()
-            .context("failed to execute Linux keychain utility `secret-tool`")?;
+            .map_err(linux_secret_tool_exec_error)?;
 
         if output.status.success() {
             let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1519,13 +1859,18 @@ fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
             return Ok(Some(secret));
         }
 
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if linux_secret_service_unavailable(&stderr) {
+            return Err(linux_secret_service_error());
+        }
+
         if output.status.code() == Some(1) {
             return Ok(None);
         }
 
         bail!(
             "failed to load credential from Linux keychain: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
 
@@ -1536,7 +1881,7 @@ fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
     }
 }
 
-fn delete_profile_secret(profile_name: &str) -> Result<()> {
+fn delete_profile_secret_keychain(profile_name: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("security")
@@ -1577,7 +1922,12 @@ fn delete_profile_secret(profile_name: &str) -> Result<()> {
                 profile_name,
             ])
             .output()
-            .context("failed to execute Linux keychain utility `secret-tool`")?;
+            .map_err(linux_secret_tool_exec_error)?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if linux_secret_service_unavailable(&stderr) {
+            return Err(linux_secret_service_error());
+        }
 
         if output.status.success() || output.status.code() == Some(1) {
             return Ok(());
@@ -1585,7 +1935,7 @@ fn delete_profile_secret(profile_name: &str) -> Result<()> {
 
         bail!(
             "failed to delete credential from Linux keychain: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
 
@@ -2101,6 +2451,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_oauth_callback_input_accepts_json_payload() {
+        let parsed =
+            parse_oauth_callback_input(r#"{"code":"abc123","state":"state123","error":null}"#)
+                .expect("parse");
+        assert_eq!(parsed.code.as_deref(), Some("abc123"));
+        assert_eq!(parsed.state.as_deref(), Some("state123"));
+        assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn parse_oauth_callback_input_accepts_fragment_payload() {
+        let parsed = parse_oauth_callback_input("#code=abc123&state=state123").expect("parse");
+        assert_eq!(parsed.code.as_deref(), Some("abc123"));
+        assert_eq!(parsed.state.as_deref(), Some("state123"));
+        assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn parse_oauth_callback_input_requires_code_or_error() {
+        let err = parse_oauth_callback_input("https://localhost/callback?state=only-state")
+            .expect_err("should fail");
+        assert!(
+            err.to_string().contains("did not include code or error"),
+            "unexpected error: {err}"
+        );
+    }
+
     fn oauth_ignored_api_key_warning_is_none_without_api_key() {
         let base = make_base();
         assert_eq!(oauth_ignored_api_key_warning(&base), None);
