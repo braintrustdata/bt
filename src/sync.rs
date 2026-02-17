@@ -30,6 +30,7 @@ use crate::ui::fuzzy_select;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
 const DEFAULT_PAGE_SIZE: usize = 200;
+pub(crate) const DEFAULT_WORKERS: usize = 8;
 // BTQL currently enforces limit <= 1000.
 const ROOT_DISCOVERY_PAGE_SIZE: usize = 1000;
 const ROOT_FETCH_CHUNK_SIZE: usize = 100;
@@ -92,7 +93,7 @@ struct PullArgs {
     root: PathBuf,
 
     /// Number of concurrent workers for trace fetch mode.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = DEFAULT_WORKERS)]
     workers: usize,
 
     /// Include stored vectors in pulled rows so a subsequent push can re-ingest them.
@@ -137,7 +138,7 @@ struct PushArgs {
     root: PathBuf,
 
     /// Number of concurrent workers for upload mode.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = DEFAULT_WORKERS)]
     workers: usize,
 }
 

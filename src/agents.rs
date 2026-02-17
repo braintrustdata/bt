@@ -12,6 +12,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::args::BaseArgs;
+use crate::sync::DEFAULT_WORKERS;
+use crate::ui::with_spinner;
 
 const SHARED_SKILL_BODY: &str = include_str!("../skills/shared/braintrust-cli-body.md");
 const SHARED_WORKFLOW_GUIDE: &str = include_str!("../skills/shared/workflows.md");
@@ -91,6 +93,10 @@ struct AgentsSetupArgs {
     /// Refresh prefetched docs by clearing existing output before download
     #[arg(long, conflicts_with = "no_fetch_docs")]
     refresh_docs: bool,
+
+    /// Number of concurrent workers for docs prefetch/download.
+    #[arg(long, default_value_t = DEFAULT_WORKERS)]
+    workers: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -148,6 +154,10 @@ struct AgentsDocsFetchArgs {
     /// Refresh docs by clearing output directory before download
     #[arg(long)]
     refresh: bool,
+
+    /// Number of concurrent workers for docs downloads.
+    #[arg(long, default_value_t = DEFAULT_WORKERS)]
+    workers: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, ValueEnum, Serialize)]
@@ -408,6 +418,14 @@ async fn fetch_docs_pages(
     args: &AgentsDocsFetchArgs,
     selected_workflows: &[WorkflowArg],
 ) -> Result<DocsFetchResult> {
+    struct DownloadJob {
+        index: usize,
+        title: String,
+        workflow: String,
+        url: String,
+        target: PathBuf,
+    }
+
     let workflow_set: BTreeSet<&str> = selected_workflows.iter().map(|w| w.as_str()).collect();
     let workflow_link_re =
         Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").context("failed to build markdown link regex")?;
@@ -472,7 +490,6 @@ async fn fetch_docs_pages(
 
     let mut written = 0usize;
     let mut failed = 0usize;
-    let mut file_results = Vec::new();
     let mut warnings = Vec::new();
     let mut seen_targets = BTreeSet::new();
 
@@ -493,16 +510,19 @@ async fn fetch_docs_pages(
         })?;
     }
 
+    let mut ordered_results: Vec<Option<DocsFileResult>> = Vec::new();
+    let mut download_jobs = Vec::new();
+
     for (title, workflow, url) in discovered {
         if args.dry_run {
-            file_results.push(DocsFileResult {
+            ordered_results.push(Some(DocsFileResult {
                 title,
                 url,
                 workflow,
                 status: "discovered".to_string(),
                 path: None,
                 error: None,
-            });
+            }));
             continue;
         }
 
@@ -524,14 +544,14 @@ async fn fetch_docs_pages(
                 target.display()
             );
             warnings.push(warning);
-            file_results.push(DocsFileResult {
+            ordered_results.push(Some(DocsFileResult {
                 title,
                 url,
                 workflow,
                 status: "skipped".to_string(),
                 path: None,
                 error: Some("duplicate output path".to_string()),
-            });
+            }));
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -540,53 +560,117 @@ async fn fetch_docs_pages(
             })?;
         }
 
-        let fetch_result = async {
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("failed to fetch docs page {url}"))?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                bail!("docs page returned error ({status}): {body}");
-            }
-            let content = response
-                .text()
-                .await
-                .with_context(|| format!("failed to read docs page body {url}"))?;
-            write_text_file(&target, &content)?;
-            Result::<()>::Ok(())
-        }
-        .await;
+        let index = ordered_results.len();
+        ordered_results.push(None);
+        download_jobs.push(DownloadJob {
+            index,
+            title,
+            workflow,
+            url,
+            target,
+        });
+    }
 
-        match fetch_result {
-            Ok(()) => {
-                written += 1;
-                file_results.push(DocsFileResult {
-                    title,
-                    url,
-                    workflow,
-                    status: "written".to_string(),
-                    path: Some(target.display().to_string()),
-                    error: None,
+    if !args.dry_run {
+        let worker_count = args.workers.max(1);
+        let mut next_job = 0usize;
+        let mut in_flight = tokio::task::JoinSet::new();
+
+        while next_job < download_jobs.len() || !in_flight.is_empty() {
+            while next_job < download_jobs.len() && in_flight.len() < worker_count {
+                let job = DownloadJob {
+                    index: download_jobs[next_job].index,
+                    title: download_jobs[next_job].title.clone(),
+                    workflow: download_jobs[next_job].workflow.clone(),
+                    url: download_jobs[next_job].url.clone(),
+                    target: download_jobs[next_job].target.clone(),
+                };
+                let client = client.clone();
+                in_flight.spawn(async move {
+                    let result = async {
+                        let response =
+                            client.get(&job.url).send().await.with_context(|| {
+                                format!("failed to fetch docs page {}", job.url)
+                            })?;
+                        if !response.status().is_success() {
+                            let status = response.status();
+                            let body = response.text().await.unwrap_or_default();
+                            bail!("docs page returned error ({status}): {body}");
+                        }
+                        let content = response.text().await.with_context(|| {
+                            format!("failed to read docs page body {}", job.url)
+                        })?;
+                        write_text_file(&job.target, &content)?;
+                        Result::<()>::Ok(())
+                    }
+                    .await;
+                    (job, result.err().map(|err| err.to_string()))
                 });
+                next_job += 1;
             }
-            Err(err) => {
-                failed += 1;
-                let warning = format!("failed to fetch {url}: {err}");
-                warnings.push(warning.clone());
-                file_results.push(DocsFileResult {
-                    title,
-                    url,
-                    workflow,
-                    status: "failed".to_string(),
-                    path: None,
-                    error: Some(err.to_string()),
-                });
+
+            let Some(join_result) = in_flight.join_next().await else {
+                break;
+            };
+            let (job, error) = join_result.context("docs fetch worker task failed")?;
+            match error {
+                None => {
+                    written += 1;
+                    ordered_results[job.index] = Some(DocsFileResult {
+                        title: job.title,
+                        url: job.url,
+                        workflow: job.workflow,
+                        status: "written".to_string(),
+                        path: Some(job.target.display().to_string()),
+                        error: None,
+                    });
+                }
+                Some(err) => {
+                    failed += 1;
+                    warnings.push(format!("failed to fetch {}: {}", job.url, err));
+                    ordered_results[job.index] = Some(DocsFileResult {
+                        title: job.title,
+                        url: job.url,
+                        workflow: job.workflow,
+                        status: "failed".to_string(),
+                        path: None,
+                        error: Some(err),
+                    });
+                }
             }
         }
     }
+
+    for (idx, slot) in ordered_results.iter_mut().enumerate() {
+        if slot.is_none() {
+            failed += 1;
+            let fallback = download_jobs
+                .iter()
+                .find(|job| job.index == idx)
+                .map(|job| (job.title.clone(), job.workflow.clone(), job.url.clone()))
+                .unwrap_or_else(|| {
+                    (
+                        "unknown".to_string(),
+                        "unknown".to_string(),
+                        "unknown".to_string(),
+                    )
+                });
+            warnings.push(format!(
+                "failed to fetch {}: worker exited unexpectedly",
+                fallback.2
+            ));
+            *slot = Some(DocsFileResult {
+                title: fallback.0,
+                url: fallback.2,
+                workflow: fallback.1,
+                status: "failed".to_string(),
+                path: None,
+                error: Some("worker exited unexpectedly".to_string()),
+            });
+        }
+    }
+
+    let file_results = ordered_results.into_iter().flatten().collect::<Vec<_>>();
 
     if !args.dry_run {
         let sections = docs_index_sections(selected_workflows, &file_results);
@@ -613,6 +697,11 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut results = Vec::new();
+    let show_progress = !base.json;
+
+    if show_progress {
+        println!("Configuring coding agents for Braintrust");
+    }
 
     for agent in selected_agents.iter().copied() {
         let result = match agent {
@@ -655,31 +744,50 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
         notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
     } else {
         let docs_output_dir = setup_docs_output_dir(scope, local_root.as_deref(), &home)?;
-        let docs_args = AgentsDocsFetchArgs {
-            llms_url: DEFAULT_DOCS_LLMS_URL.to_string(),
-            output_dir: docs_output_dir.clone(),
-            workflows: selected_workflows.clone(),
-            dry_run: false,
-            strict: false,
-            refresh: args.refresh_docs,
-        };
-        match fetch_docs_pages(&docs_args, &selected_workflows).await {
-            Ok(fetch_result) => {
-                notes.push(format!(
-                    "Prefetched workflow docs ({}) to {} ({} written, {} failed).",
-                    selected_workflows
-                        .iter()
-                        .map(|workflow| workflow.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    docs_output_dir.display(),
-                    fetch_result.written,
-                    fetch_result.failed
-                ));
-                warnings.extend(fetch_result.warnings);
-            }
-            Err(err) => {
-                warnings.push(format!("workflow docs prefetch failed: {err}"));
+        if !args.refresh_docs
+            && docs_cache_has_required_files(&docs_output_dir, &selected_workflows)
+        {
+            notes.push(format!(
+                "Skipped workflow docs prefetch (already present at {}; use --refresh-docs to refresh).",
+                docs_output_dir.display()
+            ));
+        } else {
+            let docs_args = AgentsDocsFetchArgs {
+                llms_url: DEFAULT_DOCS_LLMS_URL.to_string(),
+                output_dir: docs_output_dir.clone(),
+                workflows: selected_workflows.clone(),
+                dry_run: false,
+                strict: false,
+                refresh: args.refresh_docs,
+                workers: args.workers,
+            };
+            let fetch_result = if show_progress {
+                with_spinner(
+                    "Prefetching workflow docs...",
+                    fetch_docs_pages(&docs_args, &selected_workflows),
+                )
+                .await
+            } else {
+                fetch_docs_pages(&docs_args, &selected_workflows).await
+            };
+            match fetch_result {
+                Ok(fetch_result) => {
+                    notes.push(format!(
+                        "Prefetched workflow docs ({}) to {} ({} written, {} failed).",
+                        selected_workflows
+                            .iter()
+                            .map(|workflow| workflow.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        docs_output_dir.display(),
+                        fetch_result.written,
+                        fetch_result.failed
+                    ));
+                    warnings.extend(fetch_result.warnings);
+                }
+                Err(err) => {
+                    warnings.push(format!("workflow docs prefetch failed: {err}"));
+                }
             }
         }
     }
@@ -698,14 +806,7 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
             serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
         );
     } else {
-        print_human_report(
-            scope,
-            &selected_agents,
-            &detected,
-            &results,
-            &warnings,
-            &notes,
-        );
+        print_human_report(false, scope, &selected_agents, &results, &warnings, &notes);
     }
 
     if installed_count == 0 {
@@ -768,7 +869,7 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
                 .context("failed to serialize MCP setup report")?
         );
     } else {
-        print_mcp_human_report(scope, &selected_agents, &detected, &results, &warnings);
+        print_mcp_human_report(scope, &selected_agents, &results, &warnings);
     }
 
     if installed_count == 0 {
@@ -1396,7 +1497,8 @@ fn collect_docs_links(
         if !workflow_set.contains(workflow) {
             continue;
         }
-        if !seen.insert(url.clone()) {
+        let canonical = canonical_docs_url(&url);
+        if !seen.insert(canonical) {
             continue;
         }
         discovered.push((title, workflow.to_string(), url));
@@ -1418,7 +1520,8 @@ fn collect_docs_links(
         if !workflow_set.contains(workflow) {
             continue;
         }
-        if !seen.insert(url.clone()) {
+        let canonical = canonical_docs_url(&url);
+        if !seen.insert(canonical) {
             continue;
         }
         discovered.push((slug_for_url(&url), workflow.to_string(), url));
@@ -1450,10 +1553,18 @@ fn canonical_docs_url(url: &str) -> String {
         .unwrap_or(url)
         .trim_end_matches('/')
         .to_ascii_lowercase();
+    if let Some(stripped) = canonical.strip_prefix("https://www.braintrust.dev/") {
+        canonical = format!("https://braintrust.dev/{stripped}");
+    } else if let Some(stripped) = canonical.strip_prefix("http://www.braintrust.dev/") {
+        canonical = format!("http://braintrust.dev/{stripped}");
+    }
     if canonical.ends_with(".md") {
         canonical.truncate(canonical.len() - 3);
     } else if canonical.ends_with(".html") {
         canonical.truncate(canonical.len() - 5);
+    }
+    if canonical.ends_with("/index") {
+        canonical.truncate(canonical.len() - "/index".len());
     }
     canonical
 }
@@ -1674,12 +1785,20 @@ fn install_claude(
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".claude/skills/braintrust/SKILL.md");
     let skill_content = render_braintrust_skill();
-    write_text_file(&skill_path, &skill_content)?;
+    let changed = write_text_file_if_changed(&skill_path, &skill_content)?;
 
     Ok(AgentInstallResult {
         agent: Agent::Claude,
-        status: InstallStatus::Installed,
-        message: "installed skill".to_string(),
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
         paths: vec![skill_path.display().to_string()],
     })
 }
@@ -1692,12 +1811,20 @@ fn install_codex(
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
     let skill_content = render_braintrust_skill();
-    write_text_file(&skill_path, &skill_content)?;
+    let changed = write_text_file_if_changed(&skill_path, &skill_content)?;
 
     Ok(AgentInstallResult {
         agent: Agent::Codex,
-        status: InstallStatus::Installed,
-        message: "installed skill".to_string(),
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
         paths: vec![skill_path.display().to_string()],
     })
 }
@@ -1710,12 +1837,20 @@ fn install_opencode(
     let root = scope_root(scope, local_root, home)?;
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
     let skill_content = render_braintrust_skill();
-    write_text_file(&skill_path, &skill_content)?;
+    let changed = write_text_file_if_changed(&skill_path, &skill_content)?;
 
     Ok(AgentInstallResult {
         agent: Agent::Opencode,
-        status: InstallStatus::Installed,
-        message: "installed skill".to_string(),
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
         paths: vec![skill_path.display().to_string()],
     })
 }
@@ -1738,12 +1873,20 @@ fn install_cursor(
     let root = scope_root(scope, local_root, _home)?;
     let rule_path = root.join(".cursor/rules/braintrust.mdc");
     let cursor_rule = render_cursor_rule();
-    write_text_file(&rule_path, &cursor_rule)?;
+    let changed = write_text_file_if_changed(&rule_path, &cursor_rule)?;
 
     Ok(AgentInstallResult {
         agent: Agent::Cursor,
-        status: InstallStatus::Installed,
-        message: "installed rule".to_string(),
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed rule".to_string()
+        } else {
+            "already configured".to_string()
+        },
         paths: vec![rule_path.display().to_string()],
     })
 }
@@ -1855,6 +1998,17 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+fn write_text_file_if_changed(path: &Path, content: &str) -> Result<bool> {
+    let normalized = format!("{}\n", content.trim_end());
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == normalized {
+            return Ok(false);
+        }
+    }
+    write_text_file(path, content)?;
+    Ok(true)
+}
+
 fn render_braintrust_skill() -> String {
     render_skill_document(SKILL_FRONTMATTER)
 }
@@ -1934,6 +2088,22 @@ fn setup_docs_output_dir(
     }
 }
 
+fn docs_cache_has_required_files(output_dir: &Path, workflows: &[WorkflowArg]) -> bool {
+    if !output_dir.join("README.md").exists() {
+        return false;
+    }
+    for workflow in workflows {
+        if !output_dir
+            .join(workflow.as_str())
+            .join("_index.md")
+            .exists()
+        {
+            return false;
+        }
+    }
+    output_dir.join("reference").join("sql.md").exists()
+}
+
 fn global_bt_config_dir(home: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -2011,14 +2181,16 @@ fn command_exists(binary: &str) -> bool {
 }
 
 fn print_human_report(
+    include_header: bool,
     scope: InstallScope,
     selected_agents: &[Agent],
-    detected: &[DetectionSignal],
     results: &[AgentInstallResult],
     warnings: &[String],
     notes: &[String],
 ) {
-    println!("Configuring coding agents for Braintrust");
+    if include_header {
+        println!("Configuring coding agents for Braintrust");
+    }
     println!("Scope: {}", scope.as_str());
 
     let selected = selected_agents
@@ -2027,13 +2199,6 @@ fn print_human_report(
         .collect::<Vec<_>>()
         .join(", ");
     println!("Selected agents: {selected}");
-
-    if !detected.is_empty() {
-        println!("Detected signals:");
-        for signal in detected {
-            println!("  - {}: {}", signal.agent.as_str(), signal.reason);
-        }
-    }
 
     println!("Results:");
     for result in results {
@@ -2071,7 +2236,6 @@ fn print_human_report(
 fn print_mcp_human_report(
     scope: InstallScope,
     selected_agents: &[Agent],
-    detected: &[DetectionSignal],
     results: &[AgentInstallResult],
     warnings: &[String],
 ) {
@@ -2084,13 +2248,6 @@ fn print_mcp_human_report(
         .collect::<Vec<_>>()
         .join(", ");
     println!("Selected agents: {selected}");
-
-    if !detected.is_empty() {
-        println!("Detected signals:");
-        for signal in detected {
-            println!("  - {}: {}", signal.agent.as_str(), signal.reason);
-        }
-    }
 
     println!("Results:");
     for result in results {
@@ -2298,6 +2455,46 @@ mod tests {
     }
 
     #[test]
+    fn canonical_docs_url_normalizes_www_and_index_aliases() {
+        assert_eq!(
+            canonical_docs_url("https://www.braintrust.dev/docs/evaluate/index.md"),
+            "https://braintrust.dev/docs/evaluate"
+        );
+        assert_eq!(
+            canonical_docs_url("https://braintrust.dev/docs/evaluate"),
+            "https://braintrust.dev/docs/evaluate"
+        );
+        assert_eq!(
+            canonical_docs_url("https://braintrust.dev/docs/deploy/ai-proxy.md"),
+            "https://braintrust.dev/docs/deploy/ai-proxy"
+        );
+        assert_eq!(
+            canonical_docs_url("https://www.braintrust.dev/docs/deploy/ai-proxy"),
+            "https://braintrust.dev/docs/deploy/ai-proxy"
+        );
+    }
+
+    #[test]
+    fn collect_docs_links_dedupes_canonical_url_variants() {
+        let body = r#"
+- [Evaluate](https://www.braintrust.dev/docs/evaluate)
+- [Evaluate system](https://braintrust.dev/docs/evaluate/index.md)
+- [AI proxy](https://www.braintrust.dev/docs/deploy/ai-proxy)
+- [AI proxy alt](https://braintrust.dev/docs/deploy/ai-proxy.md)
+"#;
+        let workflow_set = ["evaluate", "deploy"].into_iter().collect::<BTreeSet<_>>();
+        let link_re = Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").expect("link regex");
+        let bare_re = Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).expect("url regex");
+        let base = reqwest::Url::parse("https://www.braintrust.dev/docs/llms.txt").expect("base");
+        let links = collect_docs_links(body, &workflow_set, &link_re, &bare_re, &base);
+
+        let evaluate_count = links.iter().filter(|(_, w, _)| w == "evaluate").count();
+        let deploy_count = links.iter().filter(|(_, w, _)| w == "deploy").count();
+        assert_eq!(evaluate_count, 1);
+        assert_eq!(deploy_count, 1);
+    }
+
+    #[test]
     fn extract_readme_sections_includes_only_agent_command_sections() {
         let readme = r#"
 # Title
@@ -2340,6 +2537,7 @@ mod tests {
             yes: true,
             no_fetch_docs: true,
             refresh_docs: false,
+            workers: DEFAULT_WORKERS,
         };
         let home = std::env::temp_dir();
         let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
@@ -2412,5 +2610,44 @@ mod tests {
             .and_then(|v| v.as_object())
             .expect("servers object");
         assert!(servers.contains_key("braintrust"));
+    }
+
+    #[test]
+    fn install_codex_is_idempotent_when_skill_is_unchanged() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-codex-idempotent-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let first = install_codex(InstallScope::Local, Some(&root), &home).expect("first install");
+        assert!(matches!(first.status, InstallStatus::Installed));
+
+        let second =
+            install_codex(InstallScope::Local, Some(&root), &home).expect("second install");
+        assert!(matches!(second.status, InstallStatus::Skipped));
+        assert!(second.message.contains("already configured"));
+    }
+
+    #[test]
+    fn docs_cache_has_required_files_checks_workflows_and_sql_reference() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-docs-cache-{unique}"));
+        fs::create_dir_all(root.join("evaluate")).expect("create evaluate dir");
+        fs::create_dir_all(root.join("reference")).expect("create reference dir");
+        fs::write(root.join("README.md"), "# docs\n").expect("write readme");
+        fs::write(root.join("evaluate").join("_index.md"), "# evaluate\n").expect("write index");
+        fs::write(root.join("reference").join("sql.md"), "# sql\n").expect("write sql");
+
+        assert!(docs_cache_has_required_files(
+            &root,
+            &[WorkflowArg::Evaluate]
+        ));
     }
 }
