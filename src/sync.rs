@@ -30,7 +30,7 @@ use crate::ui::fuzzy_select;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
 const DEFAULT_PAGE_SIZE: usize = 200;
-pub(crate) const DEFAULT_WORKERS: usize = 8;
+const DEFAULT_WORKERS_FALLBACK: usize = 8;
 // BTQL currently enforces limit <= 1000.
 const ROOT_DISCOVERY_PAGE_SIZE: usize = 1000;
 const ROOT_FETCH_CHUNK_SIZE: usize = 100;
@@ -38,6 +38,12 @@ const BTQL_MAX_ATTEMPTS: usize = 5;
 const BTQL_RETRY_BASE_DELAY_MS: u64 = 300;
 const BTQL_MAX_BACKOFF_SECS: u64 = 8;
 const PULL_OUTPUT_PART_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+pub(crate) fn default_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(DEFAULT_WORKERS_FALLBACK)
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct SyncArgs {
@@ -93,7 +99,7 @@ struct PullArgs {
     root: PathBuf,
 
     /// Number of concurrent workers for trace fetch mode.
-    #[arg(long, default_value_t = DEFAULT_WORKERS)]
+    #[arg(long, default_value_t = default_workers())]
     workers: usize,
 
     /// Include stored vectors in pulled rows so a subsequent push can re-ingest them.
@@ -138,7 +144,7 @@ struct PushArgs {
     root: PathBuf,
 
     /// Number of concurrent workers for upload mode.
-    #[arg(long, default_value_t = DEFAULT_WORKERS)]
+    #[arg(long, default_value_t = default_workers())]
     workers: usize,
 }
 

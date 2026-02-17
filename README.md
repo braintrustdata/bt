@@ -246,9 +246,9 @@ Current behavior:
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
 - Cursor integration installs `.cursor/rules/braintrust.mdc` with the same shared Braintrust guidance plus an auto-generated command-reference excerpt from this README.
-- Setup-time docs prefetch writes to `skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
-- Docs fetch writes LLM-friendly local indexes: `skills/docs/README.md` and per-section `skills/docs/<section>/_index.md`.
-- Setup/docs prefetch always includes SQL reference docs at `skills/docs/reference/sql.md`.
+- Setup-time docs prefetch writes to `.bt/skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
+- Docs fetch writes LLM-friendly local indexes: `.bt/skills/docs/README.md` and per-section `.bt/skills/docs/<section>/_index.md` (or the global equivalents under `~/.config/bt/skills/docs`).
+- Setup/docs prefetch always includes SQL reference docs at `.bt/skills/docs/reference/sql.md` (or `~/.config/bt/skills/docs/reference/sql.md` for global setup).
 
 Skill smoke-test harness:
 

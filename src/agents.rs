@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::args::BaseArgs;
-use crate::sync::DEFAULT_WORKERS;
+use crate::sync::default_workers;
 use crate::ui::with_spinner;
 
 const SHARED_SKILL_BODY: &str = include_str!("../skills/shared/braintrust-cli-body.md");
@@ -25,7 +25,7 @@ const DEFAULT_DOCS_LLMS_URL: &str = "https://www.braintrust.dev/docs/llms.txt";
 const DEFAULT_DOCS_LLMS_FULL_URL: &str = "https://www.braintrust.dev/docs/llms-full.txt";
 const CORE_REFERENCE_WORKFLOW: &str = "reference";
 const SQL_REFERENCE_DOC_TITLE: &str = "SQL queries";
-const SQL_REFERENCE_DOC_URL: &str = "https://www.braintrust.dev/docs/reference/sql";
+const SQL_REFERENCE_DOC_URL: &str = "https://www.braintrust.dev/docs/reference/sql.md";
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
     "bt eval", "bt sql", "bt view", "bt login", "bt setup", "bt docs",
 ];
@@ -95,7 +95,7 @@ struct AgentsSetupArgs {
     refresh_docs: bool,
 
     /// Number of concurrent workers for docs prefetch/download.
-    #[arg(long, default_value_t = DEFAULT_WORKERS)]
+    #[arg(long, default_value_t = default_workers())]
     workers: usize,
 }
 
@@ -136,7 +136,7 @@ struct AgentsDocsFetchArgs {
     llms_url: String,
 
     /// Output directory for downloaded docs
-    #[arg(long, default_value = "skills/docs")]
+    #[arg(long, default_value = ".bt/skills/docs")]
     output_dir: PathBuf,
 
     /// Workflow(s) to include (repeatable)
@@ -156,7 +156,7 @@ struct AgentsDocsFetchArgs {
     refresh: bool,
 
     /// Number of concurrent workers for docs downloads.
-    #[arg(long, default_value_t = DEFAULT_WORKERS)]
+    #[arg(long, default_value_t = default_workers())]
     workers: usize,
 }
 
@@ -1476,8 +1476,8 @@ fn collect_docs_links(
     bare_url_re: &Regex,
     base_url: &reqwest::Url,
 ) -> Vec<(String, String, String)> {
-    let mut discovered = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut discovered: Vec<(String, String, String)> = Vec::new();
+    let mut by_canonical: BTreeMap<String, usize> = BTreeMap::new();
 
     for capture in workflow_link_re.captures_iter(body) {
         let title = capture
@@ -1498,9 +1498,13 @@ fn collect_docs_links(
             continue;
         }
         let canonical = canonical_docs_url(&url);
-        if !seen.insert(canonical) {
+        if let Some(existing_idx) = by_canonical.get(&canonical).copied() {
+            if should_replace_docs_url(&discovered[existing_idx].2, &url) {
+                discovered[existing_idx] = (title, workflow.to_string(), url);
+            }
             continue;
         }
+        by_canonical.insert(canonical, discovered.len());
         discovered.push((title, workflow.to_string(), url));
     }
 
@@ -1521,9 +1525,13 @@ fn collect_docs_links(
             continue;
         }
         let canonical = canonical_docs_url(&url);
-        if !seen.insert(canonical) {
+        if let Some(existing_idx) = by_canonical.get(&canonical).copied() {
+            if should_replace_docs_url(&discovered[existing_idx].2, &url) {
+                discovered[existing_idx] = (slug_for_url(&url), workflow.to_string(), url);
+            }
             continue;
         }
+        by_canonical.insert(canonical, discovered.len());
         discovered.push((slug_for_url(&url), workflow.to_string(), url));
     }
 
@@ -1567,6 +1575,28 @@ fn canonical_docs_url(url: &str) -> String {
         canonical.truncate(canonical.len() - "/index".len());
     }
     canonical
+}
+
+fn docs_url_preference_score(url: &str) -> i32 {
+    let canonical = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if canonical.ends_with("/index.md") {
+        return 3;
+    }
+    if canonical.ends_with(".md") {
+        return 2;
+    }
+    if canonical.ends_with(".html") {
+        return 0;
+    }
+    1
+}
+
+fn should_replace_docs_url(existing_url: &str, candidate_url: &str) -> bool {
+    docs_url_preference_score(candidate_url) > docs_url_preference_score(existing_url)
 }
 
 fn absolutize_url(raw: &str, base_url: &reqwest::Url) -> Option<String> {
@@ -2082,7 +2112,7 @@ fn setup_docs_output_dir(
     match scope {
         InstallScope::Local => {
             let root = scope_root(scope, local_root, home)?;
-            Ok(root.join("skills").join("docs"))
+            Ok(root.join(".bt").join("skills").join("docs"))
         }
         InstallScope::Global => Ok(global_bt_config_dir(home).join("skills").join("docs")),
     }
@@ -2444,7 +2474,7 @@ mod tests {
             url: "https://www.braintrust.dev/docs/reference/sql".to_string(),
             workflow: "reference".to_string(),
             status: "written".to_string(),
-            path: Some("skills/docs/reference/sql.md".to_string()),
+            path: Some(".bt/skills/docs/reference/sql.md".to_string()),
             error: None,
         }];
         let sections = docs_index_sections(&[WorkflowArg::Evaluate], &files);
@@ -2495,6 +2525,35 @@ mod tests {
     }
 
     #[test]
+    fn collect_docs_links_prefers_markdown_url_variants() {
+        let body = r#"
+- [Evaluate](https://www.braintrust.dev/docs/evaluate)
+- [Evaluate system](https://braintrust.dev/docs/evaluate/index.md)
+- [AI proxy](https://www.braintrust.dev/docs/deploy/ai-proxy)
+- [AI proxy alt](https://braintrust.dev/docs/deploy/ai-proxy.md)
+"#;
+        let workflow_set = ["evaluate", "deploy"].into_iter().collect::<BTreeSet<_>>();
+        let link_re = Regex::new(r"\[([^\]]+)\]\(([^)\s]+)\)").expect("link regex");
+        let bare_re = Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).expect("url regex");
+        let base = reqwest::Url::parse("https://www.braintrust.dev/docs/llms.txt").expect("base");
+        let links = collect_docs_links(body, &workflow_set, &link_re, &bare_re, &base);
+
+        let evaluate_url = links
+            .iter()
+            .find(|(_, workflow, _)| workflow == "evaluate")
+            .map(|(_, _, url)| url.clone())
+            .expect("evaluate url");
+        assert!(evaluate_url.ends_with("/index.md"));
+
+        let deploy_url = links
+            .iter()
+            .find(|(_, workflow, _)| workflow == "deploy")
+            .map(|(_, _, url)| url.clone())
+            .expect("deploy url");
+        assert!(deploy_url.ends_with(".md"));
+    }
+
+    #[test]
     fn extract_readme_sections_includes_only_agent_command_sections() {
         let readme = r#"
 # Title
@@ -2537,7 +2596,7 @@ mod tests {
             yes: true,
             no_fetch_docs: true,
             refresh_docs: false,
-            workers: DEFAULT_WORKERS,
+            workers: default_workers(),
         };
         let home = std::env::temp_dir();
         let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
