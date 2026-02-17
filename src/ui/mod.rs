@@ -1,3 +1,4 @@
+pub mod highlight;
 mod pager;
 pub mod prompt_render;
 mod select;
