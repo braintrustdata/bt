@@ -26,14 +26,16 @@ pub const TOOL: FunctionKind = FunctionKind {
     type_name: "tool",
     plural: "tools",
     function_type: "tool",
-    url_segment: "tools",
+    // include query params `pr=` prefix since tools use a query param to open in a modal/dialog window
+    url_segment: "tools?pr=",
 };
 
 pub const SCORER: FunctionKind = FunctionKind {
     type_name: "scorer",
     plural: "scorers",
     function_type: "scorer",
-    url_segment: "scorers",
+    // includes `/` since scorers use a route to open in a in a full-page
+    url_segment: "scorers/",
 };
 
 #[derive(Debug, Clone, Args)]

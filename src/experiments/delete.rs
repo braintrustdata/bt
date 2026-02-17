@@ -5,25 +5,32 @@ use dialoguer::Confirm;
 
 use crate::{
     http::ApiClient,
+    projects::api::Project,
     ui::{self, print_command_status, with_spinner, CommandStatus},
 };
 
 use super::api::{self, Experiment};
 
-pub async fn run(client: &ApiClient, project: &str, name: Option<&str>, force: bool) -> Result<()> {
+pub async fn run(
+    client: &ApiClient,
+    project: &Project,
+    name: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let project_name = &project.name;
     if force && name.is_none() {
         bail!("name required when using --force. Use: bt experiments delete <name> --force");
     }
 
     let experiment = match name {
-        Some(n) => api::get_experiment_by_name(client, project, n)
+        Some(n) => api::get_experiment_by_name(client, project_name, n)
             .await?
             .ok_or_else(|| anyhow!("experiment '{n}' not found"))?,
         None => {
             if !std::io::stdin().is_terminal() {
                 bail!("experiment name required. Use: bt experiments delete <name>");
             }
-            select_experiment_interactive(client, project).await?
+            select_experiment_interactive(client, project_name).await?
         }
     };
 
@@ -31,7 +38,7 @@ pub async fn run(client: &ApiClient, project: &str, name: Option<&str>, force: b
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete experiment '{}' from {}?",
-                &experiment.name, project
+                &experiment.name, &project_name
             ))
             .default(false)
             .interact()?;

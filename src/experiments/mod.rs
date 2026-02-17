@@ -87,19 +87,19 @@ pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 
-    get_project_by_name(&client, &project)
+    let resolved_project = get_project_by_name(&client, &project)
         .await?
         .ok_or_else(|| anyhow!("project '{project}' not found"))?;
 
     match args.command {
         None | Some(ExperimentsCommands::List) => {
-            list::run(&client, &project, &org_name, base.json).await
+            list::run(&client, &resolved_project, &org_name, base.json).await
         }
         Some(ExperimentsCommands::View(v)) => {
             view::run(
                 &client,
                 &ctx.app_url,
-                &project,
+                &resolved_project,
                 &org_name,
                 v.name(),
                 base.json,
@@ -108,7 +108,7 @@ pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
             .await
         }
         Some(ExperimentsCommands::Delete(d)) => {
-            delete::run(&client, &project, d.name(), d.force).await
+            delete::run(&client, &resolved_project, d.name(), d.force).await
         }
     }
 }

@@ -5,16 +5,18 @@ use dialoguer::console;
 
 use crate::{
     http::ApiClient,
+    projects::api::Project,
     ui::{apply_column_padding, header, print_with_pager, styled_table, truncate, with_spinner},
     utils::pluralize,
 };
 
 use super::api;
 
-pub async fn run(client: &ApiClient, project: &str, org: &str, json: bool) -> Result<()> {
+pub async fn run(client: &ApiClient, project: &Project, org: &str, json: bool) -> Result<()> {
+    let project_name = &project.name;
     let experiments = with_spinner(
         "Loading experiments...",
-        api::list_experiments(client, project),
+        api::list_experiments(client, project_name),
     )
     .await?;
 
@@ -33,7 +35,7 @@ pub async fn run(client: &ApiClient, project: &str, org: &str, json: bool) -> Re
             console::style(count),
             console::style(org).bold(),
             console::style("/").dim().bold(),
-            console::style(project).bold()
+            console::style(project_name).bold()
         )?;
 
         let mut table = styled_table();

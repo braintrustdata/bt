@@ -8,7 +8,7 @@ use urlencoding::encode;
 use crate::http::ApiClient;
 use crate::projects::api::Project;
 use crate::ui::prompt_render::{
-    render_content_lines, render_message, render_options, render_tools,
+    render_code_lines, render_content_lines, render_message, render_options, render_tools,
 };
 use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
 
@@ -48,7 +48,7 @@ pub async fn run(
 
     if web {
         let url = format!(
-            "{}/app/{}/p/{}/{}/{}",
+            "{}/app/{}/p/{}/{}{}",
             app_url.trim_end_matches('/'),
             encode(org_name),
             encode(&project.name),
@@ -122,18 +122,101 @@ pub async fn run(
         if let Some(fd_type) = fd.get("type").and_then(|t| t.as_str()) {
             match fd_type {
                 "code" => {
-                    writeln!(output, "{} code", console::style("Function:").dim())?;
                     if let Some(data) = fd.get("data") {
-                        if let Some(rt) = data
-                            .get("runtime_context")
-                            .and_then(|r| r.get("runtime"))
-                            .and_then(|r| r.as_str())
-                        {
-                            writeln!(output, "  {} {}", console::style("Runtime:").dim(), rt)?;
+                        let data_type = data.get("type").and_then(|t| t.as_str());
+
+                        if let Some(runtime) = data.get("runtime_context").and_then(|rc| {
+                            let rt = rc.get("runtime").and_then(|r| r.as_str())?;
+                            let ver = rc.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                            Some(if ver.is_empty() {
+                                rt.to_string()
+                            } else {
+                                format!("{rt} {ver}")
+                            })
+                        }) {
+                            writeln!(output, "{} {}", console::style("Runtime:").dim(), runtime)?;
                         }
-                        if let Some(loc) = data.get("location") {
-                            let lt = loc.get("type").and_then(|t| t.as_str()).unwrap_or("?");
-                            writeln!(output, "  {} {}", console::style("Location:").dim(), lt)?;
+
+                        match data_type {
+                            Some("inline") => {
+                                if let Some(code) = data.get("code").and_then(|c| c.as_str()) {
+                                    if !code.is_empty() {
+                                        writeln!(output)?;
+                                        writeln!(output, "{}", console::style("Code:").dim())?;
+                                        render_code_lines(&mut output, code)?;
+                                    }
+                                }
+                            }
+                            Some("bundle") => {
+                                match data.get("preview").and_then(|p| p.as_str()) {
+                                    Some(p) if !p.is_empty() => {
+                                        writeln!(output)?;
+                                        writeln!(
+                                            output,
+                                            "{}",
+                                            console::style("Code (preview):").dim()
+                                        )?;
+                                        render_code_lines(&mut output, p)?;
+                                    }
+                                    _ => {
+                                        writeln!(
+                                            output,
+                                            "  {}",
+                                            console::style("Code bundle — preview not available")
+                                                .dim()
+                                        )?;
+                                    }
+                                }
+
+                                if verbose {
+                                    if let Some(bid) =
+                                        data.get("bundle_id").and_then(|b| b.as_str())
+                                    {
+                                        writeln!(
+                                            output,
+                                            "  {} {}",
+                                            console::style("Bundle ID:").dim(),
+                                            bid
+                                        )?;
+                                    }
+                                    if let Some(loc) = data.get("location") {
+                                        let loc_str = match loc.get("type").and_then(|t| t.as_str())
+                                        {
+                                            Some("experiment") => {
+                                                let eval_name = loc
+                                                    .get("eval_name")
+                                                    .and_then(|e| e.as_str())
+                                                    .unwrap_or("?");
+                                                let pos_type = loc
+                                                    .get("position")
+                                                    .and_then(|p| p.get("type"))
+                                                    .and_then(|t| t.as_str())
+                                                    .unwrap_or("?");
+                                                format!("experiment/{eval_name}/{pos_type}")
+                                            }
+                                            Some("function") => {
+                                                let index = loc
+                                                    .get("index")
+                                                    .and_then(|i| i.as_u64())
+                                                    .map(|i| i.to_string())
+                                                    .unwrap_or_else(|| "?".to_string());
+                                                format!("function/{index}")
+                                            }
+                                            Some(other) => other.to_string(),
+                                            None => "?".to_string(),
+                                        };
+                                        writeln!(
+                                            output,
+                                            "  {} {}",
+                                            console::style("Location:").dim(),
+                                            loc_str
+                                        )?;
+                                    }
+                                }
+                            }
+                            _ => {
+                                writeln!(output, "{} code", console::style("Function:").dim())?;
+                            }
                         }
                     }
                 }

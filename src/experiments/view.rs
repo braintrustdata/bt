@@ -6,6 +6,7 @@ use dialoguer::console;
 use urlencoding::encode;
 
 use crate::http::ApiClient;
+use crate::projects::api::Project;
 use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
 
 use super::{api, delete};
@@ -13,16 +14,17 @@ use super::{api, delete};
 pub async fn run(
     client: &ApiClient,
     app_url: &str,
-    project: &str,
+    project: &Project,
     org_name: &str,
     name: Option<&str>,
     json: bool,
     web: bool,
 ) -> Result<()> {
+    let project_name = &project.name;
     let experiment = match name {
         Some(n) => with_spinner(
             "Loading experiment...",
-            api::get_experiment_by_name(client, project, n),
+            api::get_experiment_by_name(client, project_name, n),
         )
         .await?
         .ok_or_else(|| anyhow!("experiment '{n}' not found"))?,
@@ -30,7 +32,7 @@ pub async fn run(
             if !std::io::stdin().is_terminal() {
                 bail!("experiment name required. Use: bt experiments view <name>");
             }
-            delete::select_experiment_interactive(client, project).await?
+            delete::select_experiment_interactive(client, project_name).await?
         }
     };
 
@@ -39,8 +41,8 @@ pub async fn run(
             "{}/app/{}/p/{}/experiments/{}",
             app_url.trim_end_matches('/'),
             encode(org_name),
-            encode(project),
-            encode(&experiment.id)
+            encode(project_name),
+            encode(&experiment.name)
         );
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));

@@ -33,7 +33,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     let app_url = base
         .app_url
         .clone()
-        .unwrap_or_else(|| "https://braintrust.dev".to_string());
+        .unwrap_or_else(|| "https://www.braintrust.dev".to_string());
 
     Ok(LoginContext {
         login,

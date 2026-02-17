@@ -80,6 +80,22 @@ pub fn render_content_lines(output: &mut String, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Render code with line numbers. Each line is indented and prefixed with a dim line number and │.
+pub fn render_code_lines(output: &mut String, code: &str) -> Result<()> {
+    let lines: Vec<&str> = code.lines().collect();
+    let width = lines.len().to_string().len();
+    for (i, line) in lines.iter().enumerate() {
+        writeln!(
+            output,
+            "  {} {} {}",
+            console::style(format!("{:>width$}", i + 1)).dim(),
+            console::style("│").dim(),
+            line
+        )?;
+    }
+    Ok(())
+}
+
 fn highlight_template_vars(line: &str) -> String {
     let re = &*TEMPLATE_VAR_RE;
     let mut result = String::new();
