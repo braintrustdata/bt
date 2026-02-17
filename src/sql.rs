@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::io;
+use std::io::IsTerminal;
+use std::io::Read;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Args;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
@@ -29,6 +31,10 @@ use crate::ui::with_spinner;
 pub struct SqlArgs {
     /// SQL query to execute
     pub query: Option<String>,
+
+    /// Force non-interactive mode
+    #[arg(long)]
+    pub non_interactive: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,14 +69,46 @@ struct RealtimeState {
 pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
+    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let query = read_non_interactive_query(&args.query, interactive)?;
 
-    if let Some(query) = args.query {
+    if let Some(query) = query {
         let response = with_spinner("Running query...", execute_query(&client, &query)).await?;
         print_response(&response, base.json)?;
         return Ok(());
     }
 
+    if !interactive {
+        bail!(
+            "query is required in non-interactive mode. Pass `bt sql \"SELECT 1\"` or pipe SQL via stdin."
+        );
+    }
+
     run_interactive(base, client).await
+}
+
+fn read_non_interactive_query(
+    query_arg: &Option<String>,
+    interactive: bool,
+) -> Result<Option<String>> {
+    if let Some(query) = query_arg.as_deref() {
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+
+    if interactive {
+        return Ok(None);
+    }
+
+    let mut stdin_query = String::new();
+    io::stdin().read_to_string(&mut stdin_query)?;
+    let trimmed = stdin_query.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 async fn run_interactive(base: BaseArgs, client: ApiClient) -> Result<()> {

@@ -35,6 +35,7 @@ const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
 static SECRET_STORE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone)]
 pub struct LoginContext {
     pub login: LoginState,
     pub api_url: String,
@@ -213,6 +214,7 @@ async fn run_login_interactive_default(base: &BaseArgs) -> Result<()> {
 }
 
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
+    maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
     let api_key = auth.api_key.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -270,6 +272,50 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         api_url,
         app_url,
     })
+}
+
+fn maybe_warn_api_key_override(base: &BaseArgs) {
+    if base.json || !std::io::stderr().is_terminal() {
+        return;
+    }
+    if resolve_api_key_override(base).is_none() {
+        return;
+    }
+
+    let ignored_profile = base
+        .profile
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| load_selected_profile_from_config().ok().flatten())
+        .or_else(|| {
+            load_auth_store()
+                .ok()
+                .and_then(|store| store.active_profile)
+        });
+
+    if let Some(profile_name) = ignored_profile {
+        eprintln!(
+            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
+            profile_name,
+        );
+    } else {
+        eprintln!(
+            "Warning: using --api-key/BRAINTRUST_API_KEY credentials for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY."
+        );
+    }
+}
+
+fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
+    if base.prefer_profile {
+        return None;
+    }
+    let value = base.api_key.as_deref()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
@@ -367,7 +413,7 @@ fn resolve_auth_from_store_with_secret_lookup<F>(
 where
     F: Fn(&str) -> Result<Option<String>>,
 {
-    if let Some(api_key) = base.api_key.clone() {
+    if let Some(api_key) = resolve_api_key_override(base) {
         return Ok(ResolvedAuth {
             api_key: Some(api_key),
             api_url: base.api_url.clone(),
@@ -513,8 +559,8 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         bail!("oauth login requires an interactive terminal");
     }
-    if base.api_key.is_some() {
-        bail!("--api-key cannot be used with --oauth");
+    if let Some(warning) = oauth_ignored_api_key_warning(base) {
+        eprintln!("{warning}");
     }
 
     let api_url = base
@@ -659,6 +705,18 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn oauth_ignored_api_key_warning(base: &BaseArgs) -> Option<String> {
+    let api_key = base.api_key.as_deref()?.trim();
+    if api_key.is_empty() {
+        return None;
+    }
+
+    Some(
+        "warning: --api-key/BRAINTRUST_API_KEY is set; ignoring it because --oauth was requested"
+            .to_string(),
+    )
 }
 
 async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
@@ -960,13 +1018,7 @@ fn run_login_logout() -> Result<()> {
 
 fn run_login_status(base: &BaseArgs) -> Result<()> {
     let store = load_auth_store()?;
-    let has_override_api_key = base
-        .api_key
-        .as_deref()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-
-    if has_override_api_key {
+    if resolve_api_key_override(base).is_some() {
         println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
         if let Some(profile_name) = base.profile.as_deref() {
             let profile_name = profile_name.trim();
@@ -978,6 +1030,7 @@ fn run_login_status(base: &BaseArgs) -> Result<()> {
                 "Active saved profile (ignored while API key override is set): {active_profile}"
             );
         }
+        println!("Tip: pass --prefer-profile or unset BRAINTRUST_API_KEY.");
         return Ok(());
     }
 
@@ -2228,6 +2281,7 @@ mod tests {
             project: None,
             org_name: None,
             api_key: None,
+            prefer_profile: false,
             api_url: None,
             app_url: None,
             env_file: None,
@@ -2330,6 +2384,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_auth_prefer_profile_ignores_api_key_override() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".to_string());
+        base.prefer_profile = true;
+        base.profile = Some("work".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: None,
+                org_name: Some("Example Org".to_string()),
+                oauth_client_id: None,
+                oauth_access_expires_at: None,
+            },
+        );
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(&base, &store, |_| {
+            Ok(Some("profile-key".to_string()))
+        })
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
     fn resolve_auth_marks_oauth_profiles() {
         let mut base = make_base();
         base.profile = Some("work".to_string());
@@ -2394,5 +2476,19 @@ mod tests {
             err.to_string().contains("did not include code or error"),
             "unexpected error: {err}"
         );
+    }
+
+    fn oauth_ignored_api_key_warning_is_none_without_api_key() {
+        let base = make_base();
+        assert_eq!(oauth_ignored_api_key_warning(&base), None);
+    }
+
+    #[test]
+    fn oauth_ignored_api_key_warning_is_some_with_api_key() {
+        let mut base = make_base();
+        base.api_key = Some("secret".to_string());
+        let warning = oauth_ignored_api_key_warning(&base).expect("warning");
+        assert!(warning.contains("ignoring it"));
+        assert!(warning.contains("--oauth"));
     }
 }

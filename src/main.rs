@@ -12,14 +12,21 @@ mod projects;
 mod prompts;
 mod self_update;
 mod sql;
+mod sync;
 mod traces;
 mod ui;
 mod utils;
 
 use crate::args::CLIArgs;
 
+const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
+const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
+    Some(version) => version,
+    None => DEFAULT_CANARY_VERSION,
+};
+
 #[derive(Debug, Parser)]
-#[command(name = "bt", about = "Braintrust CLI", version)]
+#[command(name = "bt", about = "Braintrust CLI", version = CLI_VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -31,9 +38,8 @@ enum Commands {
     Sql(CLIArgs<sql::SqlArgs>),
     /// Manage login profiles and persistent auth
     Login(CLIArgs<login::LoginArgs>),
-    /// View project traces in an interactive terminal UI
-    #[command(visible_alias = "trace")]
-    Traces(CLIArgs<traces::TracesArgs>),
+    /// View logs, traces, and spans
+    View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
@@ -44,6 +50,8 @@ enum Commands {
     SelfCommand(self_update::SelfArgs),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
+    /// Synchronize project logs between Braintrust and local NDJSON files
+    Sync(CLIArgs<sync::SyncArgs>),
 }
 
 #[tokio::main]
@@ -55,12 +63,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
         Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
-        Commands::Traces(cmd) => traces::run(cmd.base, cmd.args).await?,
+        Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
+        Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())

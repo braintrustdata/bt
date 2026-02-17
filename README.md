@@ -34,43 +34,34 @@ Windows (PowerShell):
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1 | iex"
 ```
 
-### Canary (specific branch)
+### Canary (exact `main` commit build)
 
-Branch canary aliases are published as `canary-<branch-slug>`, where `<branch-slug>` is:
-
-- lowercased branch name
-- non-alphanumeric runs replaced with `-`
-- leading/trailing `-` removed
-- truncated to 40 chars
-
-Example for branch `feature/sql-v2`: alias tag `canary-feature-sql-v2`.
+Exact `main` canary builds are published as `canary-<shortsha>`.
 
 Unix-like systems:
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary-<branch-slug>/bt-installer.sh | sh
+curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary-<shortsha>/bt-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary-<branch-slug>/bt-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary-<shortsha>/bt-installer.ps1 | iex"
 ```
 
-### Canary (exact commit build)
+### PR/branch builds (no release)
 
-Exact canary builds are published as:
-
-- `canary-<shortsha>` for `main`
-- `canary-<branch-slug>-<shortsha>` for non-main branches
-
-Use those tags in `/releases/download/<tag>/...` to pin an install.
+Non-`main` branch builds are available as GitHub Actions run artifacts (download from the workflow run page or with `gh run download`). They are not published as GitHub Releases.
 
 ## Verify
 
 ```bash
 bt --version
 ```
+
+Canary builds include a canary suffix in the reported version string.
+Local/dev builds default to `-canary.<shortsha>` when git metadata is available (fallback: `-canary.dev`).
 
 On first install, open a new shell if `bt` is not found immediately.
 
@@ -87,7 +78,7 @@ shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 `bt` can self-update when installed via the official installer.
 
 ```bash
-# install latest stable
+# update on the current build channel (canary for local/dev builds, stable for official releases)
 bt self update
 
 # check without installing
@@ -133,27 +124,42 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - If eval execution fails with ESM/top-level-await related errors, retry with:
   - `bt eval --runner vite-node tutorial.eval.ts`
 
-## `bt traces`
+## `bt sql`
 
-- Open an interactive terminal trace viewer for a project:
-  - `bt -p <project-name> traces`
-  - `bt traces --project-id <project-id>`
-  - `bt trace <braintrust-url>` (alias that opens a trace URL directly)
-- Optional flags:
-  - `--limit <N>`: number of summary traces to load (default `50`)
-  - `--preview-length <N>`: preview length used in summary rows (default `125`)
-  - `--url <braintrust-url>`: open a Braintrust URL directly (`r`/`s`/`tvt` parsed)
-  - `--print-queries`: print each BTQL query and invoke payload before execution
-- Controls:
-  - Trace table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
-  - Search bar: `/` to edit search text, `Enter` to apply, `Esc` to cancel, `Ctrl+u` to clear input
-  - Open URL: `Ctrl+k` to paste a Braintrust URL, `Enter` to open, `Esc` to cancel
-  - Detail view: `t` toggles between span detail and thread view (project default preprocessor)
-  - Split-pane focus: `Right` focuses detail pane, `Left` focuses span tree
-  - Span/detail nav: with tree focus `Up/Down` selects spans; in span detail focus `Up/Down` scrolls (`PgUp/PgDn` also scroll)
-  - Thread blocks: in thread detail focus, `Up/Down` selects messages and `Enter` expands/collapses (collapsed by default)
-  - Back: `Backspace` or `Esc` returns to trace table
-  - Global: `q` to quit
+- Runs interactively on TTY by default.
+- Runs non-interactively when stdin is not a TTY, when `--non-interactive` is set, or when a query argument is provided.
+- In non-interactive mode, provide SQL via:
+  - Positional query: `bt sql "SELECT 1"`
+  - stdin pipe: `echo "SELECT 1" | bt sql`
+
+## `bt view`
+
+- List logs (interactive on TTY by default, non-interactive otherwise):
+  - `bt view logs`
+  - `bt view logs --object-ref project_logs:<project-id>`
+  - `bt view logs --list-mode spans` (one row per span)
+- Fetch one trace (returns truncated span rows by default):
+  - `bt view trace --object-ref project_logs:<project-id> --trace-id <root-span-id>`
+  - `bt view trace --url <braintrust-trace-url>`
+- Fetch one span (full payload):
+  - `bt view span --object-ref project_logs:<project-id> --id <row-id>`
+- Common flags:
+  - `--limit <N>`: max rows per request/page
+  - `--cursor <CURSOR>`: continue pagination explicitly
+  - `--preview-length <N>`: truncation length for non-single-span fetches
+  - `--print-queries`: print BTQL/invoke payloads before execution
+  - `-j, --json`: machine-readable envelope output
+- `logs` filter flags:
+  - `--search <TEXT>`
+  - `--filter <BTQL_EXPR>`
+  - `--window <DURATION>` (default `1h`)
+  - `--since <TIMESTAMP>` (overrides `--window`)
+- Interactive controls (`bt view logs` TUI):
+  - Table: `Up/Down` to select, `Enter` to open trace, `r` to refresh
+  - Search: `/` edit, `Enter` apply, `Esc` cancel, `Ctrl+u` clear
+  - Open URL: `Ctrl+k`, then `Enter`
+  - Detail view: `t` span/thread, `Left/Right` switch panes, `Backspace`/`Esc` back
+  - Global: `q` quit
 
 ## `bt login` profiles
 
