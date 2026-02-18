@@ -179,6 +179,12 @@ enum InstallScope {
     Global,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum YesScopeDefault {
+    Global,
+    LocalIfGit,
+}
+
 impl InstallScope {
     fn as_str(self) -> &'static str {
         match self {
@@ -464,7 +470,12 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
 }
 
 fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupSelection> {
-    let mut scope = initial_scope(args.local, args.global, args.yes);
+    let mut scope = initial_scope(
+        args.local,
+        args.global,
+        args.yes,
+        YesScopeDefault::LocalIfGit,
+    );
     let interactive = std::io::stdin().is_terminal() && !args.yes;
     let mut prompted_agents: Option<Vec<Agent>> = None;
     let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs {
@@ -546,9 +557,13 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
 
     let scope = match scope {
         Some(value) => value,
-        None => {
-            resolve_scope_from_flags(args.local, args.global, args.yes, "Select install scope")?
-        }
+        None => resolve_scope_from_flags(
+            args.local,
+            args.global,
+            args.yes,
+            "Select install scope",
+            YesScopeDefault::LocalIfGit,
+        )?,
     };
     let local_root = resolve_local_root_for_scope(scope)?;
     let detected = detect_agents(local_root.as_deref(), home);
@@ -578,7 +593,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
 }
 
 fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSelection> {
-    let mut scope = initial_scope(args.local, args.global, args.yes);
+    let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
     let interactive = std::io::stdin().is_terminal() && !args.yes;
     let mut prompted_agents: Option<Vec<Agent>> = None;
 
@@ -636,9 +651,13 @@ fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSe
 
     let scope = match scope {
         Some(value) => value,
-        None => {
-            resolve_scope_from_flags(args.local, args.global, args.yes, "Select MCP setup scope")?
-        }
+        None => resolve_scope_from_flags(
+            args.local,
+            args.global,
+            args.yes,
+            "Select MCP setup scope",
+            YesScopeDefault::Global,
+        )?,
     };
     let local_root = resolve_local_root_for_scope(scope)?;
     let detected = detect_agents(local_root.as_deref(), home);
@@ -809,13 +828,33 @@ fn doctor_agent_status(
     }
 }
 
-fn initial_scope(local: bool, global: bool, yes: bool) -> Option<InstallScope> {
+fn initial_scope(
+    local: bool,
+    global: bool,
+    yes: bool,
+    yes_scope_default: YesScopeDefault,
+) -> Option<InstallScope> {
     if local {
         Some(InstallScope::Local)
-    } else if global || yes {
+    } else if global {
         Some(InstallScope::Global)
+    } else if yes {
+        Some(resolve_yes_scope(yes_scope_default))
     } else {
         None
+    }
+}
+
+fn resolve_yes_scope(default: YesScopeDefault) -> InstallScope {
+    match default {
+        YesScopeDefault::Global => InstallScope::Global,
+        YesScopeDefault::LocalIfGit => {
+            if find_git_root().is_some() {
+                InstallScope::Local
+            } else {
+                InstallScope::Global
+            }
+        }
     }
 }
 
@@ -903,6 +942,7 @@ fn resolve_scope_from_flags(
     global: bool,
     yes: bool,
     prompt: &str,
+    yes_scope_default: YesScopeDefault,
 ) -> Result<InstallScope> {
     if local {
         return Ok(InstallScope::Local);
@@ -911,7 +951,7 @@ fn resolve_scope_from_flags(
         return Ok(InstallScope::Global);
     }
     if yes {
-        return Ok(InstallScope::Global);
+        return Ok(resolve_yes_scope(yes_scope_default));
     }
 
     if !std::io::stdin().is_terminal() {
@@ -1696,8 +1736,50 @@ mod tests {
 
     #[test]
     fn resolve_scope_from_flags_respects_global_flag() {
-        let scope = resolve_scope_from_flags(false, true, false, "ignored")
-            .expect("resolve scope from flags");
+        let scope =
+            resolve_scope_from_flags(false, true, false, "ignored", YesScopeDefault::LocalIfGit)
+                .expect("resolve scope from flags");
+        assert!(matches!(scope, InstallScope::Global));
+    }
+
+    #[test]
+    fn resolve_scope_from_flags_yes_defaults_to_local_in_git_repo() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-setup-yes-local-{unique}"));
+        let nested = root.join("a/b/c");
+
+        fs::create_dir_all(&nested).expect("create nested");
+        fs::write(root.join(".git"), "gitdir: /tmp/fake").expect("write git file");
+
+        let old = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&nested).expect("cd nested");
+        let scope =
+            resolve_scope_from_flags(false, false, true, "ignored", YesScopeDefault::LocalIfGit)
+                .expect("resolve scope");
+        std::env::set_current_dir(old).expect("restore cwd");
+
+        assert!(matches!(scope, InstallScope::Local));
+    }
+
+    #[test]
+    fn resolve_scope_from_flags_yes_falls_back_to_global_outside_git_repo() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-setup-yes-global-{unique}"));
+        fs::create_dir_all(&root).expect("create root");
+
+        let old = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("cd root");
+        let scope =
+            resolve_scope_from_flags(false, false, true, "ignored", YesScopeDefault::LocalIfGit)
+                .expect("resolve scope");
+        std::env::set_current_dir(old).expect("restore cwd");
+
         assert!(matches!(scope, InstallScope::Global));
     }
 
