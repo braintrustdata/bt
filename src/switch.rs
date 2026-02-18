@@ -67,17 +67,25 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    // Clear org_name when we resolved a profile from it — the raw identifier (e.g. "staging")
-    // may differ from the profile's actual org (e.g. "staging-org"). Letting org_name stay
-    // would override the profile's stored org_name in resolve_auth_from_store and pass the
-    // wrong hint to BraintrustClient.
+    // When we resolved a profile from an org identifier, clear org_name — the raw identifier
+    // (e.g. "staging") may differ from the profile's actual org (e.g. "staging-org"). Letting
+    // org_name stay would override the profile's stored org_name in resolve_auth_from_store.
+    //
+    // When no org was specified (project-only switch), load the current config org so
+    // resolve_auth can find the right profile for authentication.
     let login_base = match &profile_name {
         Some(profile) if base.profile.is_none() => BaseArgs {
             profile: Some(profile.clone()),
             org_name: None,
             ..base.clone()
         },
-        _ => base.clone(),
+        _ => {
+            let mut b = base.clone();
+            if b.org_name.is_none() && b.profile.is_none() {
+                b.org_name = config::load().ok().and_then(|c| c.org);
+            }
+            b
+        }
     };
 
     let ctx = login(&login_base).await?;
@@ -86,7 +94,6 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let project_name = match resolved_project {
         Some(p) => Some(validate_or_create_project(&client, &p).await?),
-        None if resolved_org.is_some() => None,
         None => {
             if !std::io::stdin().is_terminal() {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
@@ -95,16 +102,9 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    if let Some(ref profile) = profile_name {
-        auth::set_active_profile(profile)?;
-    }
-
     let mut cfg = config::load_file(&path);
     cfg.org = Some(org_name.to_string());
     cfg.project = project_name.clone();
-    if let Some(ref profile) = profile_name {
-        cfg.profile = Some(profile.clone());
-    }
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 

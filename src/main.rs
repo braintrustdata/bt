@@ -76,8 +76,14 @@ async fn main() -> Result<()> {
     let cfg = config::load().unwrap_or_default();
 
     match cli.command {
-        Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
-        Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
+        Commands::Auth(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            auth::run(base, args).await?
+        }
+        Commands::View(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            traces::run(base, args).await?
+        }
         Commands::Init(cmd) => {
             // Don't merge config - init should prompt for project interactively
             init::run(cmd.base, cmd.args).await?
@@ -95,8 +101,14 @@ async fn main() -> Result<()> {
             let (base, args) = cmd.with_config(&cfg);
             projects::run(base, args).await?
         }
-        Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
-        Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
+        Commands::Prompts(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            prompts::run(base, args).await?
+        }
+        Commands::Sync(cmd) => {
+            let (base, args) = cmd.with_config(&cfg);
+            sync::run(base, args).await?
+        }
         Commands::SelfCommand(args) => self_update::run(args).await?,
         Commands::Switch(cmd) => {
             // Don't merge config - switch command inspects config directly

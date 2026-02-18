@@ -21,12 +21,11 @@ pub struct Config {
     pub project: Option<String>,
     pub api_url: Option<String>,
     pub app_url: Option<String>,
-    pub profile: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["org", "project", "api_url", "app_url", "profile"];
+pub const KNOWN_KEYS: &[&str] = &["org", "project", "api_url", "app_url"];
 
 impl Config {
     pub fn get_field(&self, key: &str) -> Option<&str> {
@@ -35,7 +34,6 @@ impl Config {
             "project" => self.project.as_deref(),
             "api_url" => self.api_url.as_deref(),
             "app_url" => self.app_url.as_deref(),
-            "profile" => self.profile.as_deref(),
             _ => None,
         }
     }
@@ -46,7 +44,6 @@ impl Config {
             "project" => self.project = Some(value),
             "api_url" => self.api_url = Some(value),
             "app_url" => self.app_url = Some(value),
-            "profile" => self.profile = Some(value),
             _ => return false,
         }
         true
@@ -58,7 +55,6 @@ impl Config {
             "project" => self.project = None,
             "api_url" => self.api_url = None,
             "app_url" => self.app_url = None,
-            "profile" => self.profile = None,
             _ => return false,
         }
         true
@@ -77,7 +73,6 @@ impl Config {
             project: other.project.clone().or_else(|| self.project.clone()),
             api_url: other.api_url.clone().or_else(|| self.api_url.clone()),
             app_url: other.app_url.clone().or_else(|| self.app_url.clone()),
-            profile: other.profile.clone().or_else(|| self.profile.clone()),
             extra: Default::default(),
         }
     }
