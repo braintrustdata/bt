@@ -145,8 +145,6 @@ enum AuthCommand {
     Refresh,
     /// List saved auth profiles
     List,
-    /// Delete a saved profile
-    Delete(AuthDeleteArgs),
     /// Log out by removing a saved profile
     Logout(AuthLogoutArgs),
     /// Show current auth status
@@ -169,20 +167,14 @@ struct AuthLoginArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct AuthDeleteArgs {
-    /// Profile name
-    profile: String,
-
-    /// Skip confirmation prompt
-    #[arg(long, short = 'f')]
-    force: bool,
-}
-
-#[derive(Debug, Clone, Args)]
 struct AuthLogoutArgs {
     /// Profile name to log out of (interactive picker if omitted)
     #[arg(long)]
     profile: Option<String>,
+
+    /// Skip confirmation prompt
+    #[arg(long, short = 'f')]
+    force: bool,
 }
 
 pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
@@ -205,9 +197,6 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
         Some(AuthCommand::Login(login_args)) => run_login_set(&base, login_args).await,
         Some(AuthCommand::Refresh) => run_login_refresh(&base).await,
         Some(AuthCommand::List) => run_login_list(),
-        Some(AuthCommand::Delete(delete_args)) => {
-            run_login_delete(&delete_args.profile, delete_args.force)
-        }
         Some(AuthCommand::Logout(logout_args)) => run_login_logout(base, logout_args),
         Some(AuthCommand::Status) => run_login_status(&base),
     }
@@ -972,7 +961,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         bail!("multiple profiles exist. Use --profile <NAME> to specify which one.");
     };
 
-    run_login_delete(&profile_name, false)
+    run_login_delete(&profile_name, args.force)
 }
 
 fn run_login_status(base: &BaseArgs) -> Result<()> {
