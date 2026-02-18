@@ -55,8 +55,6 @@ pub struct ResolvedAuth {
 pub struct ProfileInfo {
     pub name: String,
     pub org_name: Option<String>,
-    pub api_url: Option<String>,
-    pub app_url: Option<String>,
 }
 
 pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
@@ -67,8 +65,6 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
         .map(|(name, p)| ProfileInfo {
             name: name.clone(),
             org_name: p.org_name.clone(),
-            api_url: p.api_url.clone(),
-            app_url: p.app_url.clone(),
         })
         .collect())
 }
