@@ -76,17 +76,17 @@ async fn main() -> Result<()> {
     let cfg = config::load().unwrap_or_default();
 
     match cli.command {
-        Commands::Auth(cmd) => {
-            let (base, args) = cmd.with_config(&cfg);
-            auth::run(base, args).await?
-        }
+        Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
         Commands::View(cmd) => {
             let (base, args) = cmd.with_config(&cfg);
             traces::run(base, args).await?
         }
         Commands::Init(cmd) => {
-            // Don't merge config - init should prompt for project interactively
-            init::run(cmd.base, cmd.args).await?
+            // Merge config for auth resolution (org, api_url, etc.) but clear project
+            // since init should prompt for project interactively
+            let mut base = cmd.base.with_config_defaults(&cfg);
+            base.project = None;
+            init::run(base, cmd.args).await?
         }
         Commands::Sql(cmd) => {
             let (base, args) = cmd.with_config(&cfg);

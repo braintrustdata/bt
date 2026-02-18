@@ -2246,6 +2246,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn oauth_ignored_api_key_warning_is_none_without_api_key() {
         let base = make_base();
         assert_eq!(oauth_ignored_api_key_warning(&base), None);

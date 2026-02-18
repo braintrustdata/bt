@@ -47,13 +47,19 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
         if let Some(ref o) = org {
             if let Ok(profiles) = auth::list_profiles() {
-                let matched: Vec<&str> = profiles
-                    .iter()
-                    .filter(|p| p.org_name.as_deref() == Some(o.as_str()))
-                    .map(|p| p.name.as_str())
-                    .collect();
-                if matched.len() == 1 {
-                    println!("profile: {}", matched[0]);
+                let matched = profiles.iter().find(|p| p.name == *o).or_else(|| {
+                    let by_org: Vec<_> = profiles
+                        .iter()
+                        .filter(|p| p.org_name.as_deref() == Some(o.as_str()))
+                        .collect();
+                    if by_org.len() == 1 {
+                        Some(by_org[0])
+                    } else {
+                        None
+                    }
+                });
+                if let Some(p) = matched {
+                    println!("profile: {}", p.name);
                 }
             }
         }

@@ -15,6 +15,12 @@ use crate::{
 pub struct InitArgs {}
 
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
+    let bt_dir = std::env::current_dir()?.join(".bt");
+    if bt_dir.join("config.json").exists() {
+        print_command_status(CommandStatus::Warning, "Already Initialized");
+        return Ok(());
+    }
+
     eprintln!("Link to a Braintrust project...");
 
     let (org, project) = if let (Some(o), Some(p)) = (&base.org_name, &base.project) {
@@ -30,14 +36,6 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
 
         (org, project)
     };
-
-    let bt_dir = std::env::current_dir()?.join(".bt");
-    let bt_config = &bt_dir.join("config.json");
-
-    if bt_config.exists() {
-        print_command_status(CommandStatus::Warning, "Already Initialized");
-        return Ok(());
-    }
 
     let cfg = config::Config {
         org: Some(org.clone()),

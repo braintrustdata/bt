@@ -84,6 +84,12 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
             if b.org_name.is_none() && b.profile.is_none() {
                 b.org_name = config::load().ok().and_then(|c| c.org);
             }
+            if b.org_name.is_none() && b.profile.is_none() {
+                let profiles = auth::list_profiles()?;
+                if profiles.len() > 1 {
+                    bail!("multiple auth profiles found; use --org to specify which one");
+                }
+            }
             b
         }
     };
@@ -176,7 +182,7 @@ fn select_org_profile_interactive() -> Result<Option<String>> {
         bail!("no auth profiles found. Run `bt auth login` to create one.");
     }
     if profiles.len() == 1 {
-        return Ok(None);
+        return Ok(Some(profiles[0].name.clone()));
     }
 
     let labels: Vec<String> = profiles
