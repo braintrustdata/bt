@@ -3,13 +3,13 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 
 mod args;
+mod auth;
 mod config;
 mod env;
 #[cfg(unix)]
 mod eval;
 mod http;
 mod init;
-mod login;
 mod projects;
 mod prompts;
 mod self_update;
@@ -42,8 +42,8 @@ enum Commands {
     Init(CLIArgs<init::InitArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
-    /// Manage login profiles and persistent auth
-    Login(CLIArgs<login::LoginArgs>),
+    /// Manage authentication profiles
+    Auth(CLIArgs<auth::AuthArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     let cfg = config::load().unwrap_or_default();
 
     match cli.command {
-        Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
+        Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
         Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
         Commands::Init(cmd) => {
             // Don't merge config - init should prompt for project interactively
@@ -105,10 +105,6 @@ async fn main() -> Result<()> {
         Commands::Status(cmd) => {
             // Don't merge config - status command inspects config directly
             status::run(cmd.base, cmd.args).await?
-        }
-        Commands::Switch(cmd) => {
-            let (base, args) = cmd.with_config(&cfg);
-            switch::run(base, args).await?
         }
         Commands::Config(cmd) => config::run(cmd.base, cmd.args)?,
     }

@@ -34,8 +34,8 @@ use unicode_width::UnicodeWidthStr;
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
+use crate::auth::login;
 use crate::http::ApiClient;
-use crate::login::login;
 use crate::ui::{fuzzy_select, with_spinner};
 
 const MAX_TRACE_SPANS: usize = 5000;

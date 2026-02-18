@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::args::BaseArgs;
+use crate::auth::login;
 use crate::http::ApiClient;
-use crate::login::login;
 
 pub(crate) mod api;
 mod create;

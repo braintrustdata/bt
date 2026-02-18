@@ -5,9 +5,9 @@ use clap::Args;
 
 use crate::{
     args::BaseArgs,
+    auth::login,
     config,
     http::ApiClient,
-    login::login,
     ui::{print_command_status, select_project_interactive, CommandStatus},
 };
 

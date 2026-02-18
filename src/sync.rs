@@ -22,8 +22,8 @@ use sha2::{Digest, Sha256};
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
+use crate::auth::{login, LoginContext};
 use crate::http::ApiClient;
-use crate::login::{login, LoginContext};
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::fuzzy_select;
 
@@ -2759,10 +2759,7 @@ async fn resolve_project_logs_target(
             let created = create_project(client, project_selector)
                 .await
                 .with_context(|| {
-                    format!(
-                        "project '{}' not found, and creating it failed",
-                        project_selector
-                    )
+                    format!("project '{project_selector}' not found, and creating it failed")
                 })?;
             if std::io::stderr().is_terminal() {
                 eprintln!(
@@ -2827,9 +2824,7 @@ async fn resolve_named_object_target(
         );
     }
     bail!(
-        "{} '{}' was not found by id across accessible projects; if this is a name, pass --project <project-name> (or set BRAINTRUST_DEFAULT_PROJECT)",
-        object_type,
-        object_selector
+        "{object_type} '{object_selector}' was not found by id across accessible projects; if this is a name, pass --project <project-name> (or set BRAINTRUST_DEFAULT_PROJECT)"
     );
 }
 
@@ -2902,13 +2897,10 @@ fn find_project_by_selector<'a>(projects: &'a [Project], selector: &str) -> Resu
         return Ok(casefold_matches[0]);
     }
     if casefold_matches.len() > 1 {
-        bail!(
-            "project selector '{}' is ambiguous; use a project id",
-            selector
-        );
+        bail!("project selector '{selector}' is ambiguous; use a project id");
     }
 
-    bail!("project '{}' not found", selector);
+    bail!("project '{selector}' not found");
 }
 
 fn find_named_object_by_selector<'a>(
@@ -2937,15 +2929,10 @@ fn find_named_object_by_selector<'a>(
     if exact_name_matches.len() > 1 {
         if let Some(project_name) = project_name {
             bail!(
-                "{object_type} name '{}' is duplicated in project '{}'; use {object_type}:<id>",
-                selector,
-                project_name
+                "{object_type} name '{selector}' is duplicated in project '{project_name}'; use {object_type}:<id>"
             );
         }
-        bail!(
-            "{object_type} name '{}' is duplicated; use {object_type}:<id>",
-            selector
-        );
+        bail!("{object_type} name '{selector}' is duplicated; use {object_type}:<id>");
     }
 
     let casefold_matches: Vec<&NamedObject> = objects
@@ -2956,20 +2943,13 @@ fn find_named_object_by_selector<'a>(
         return Ok(casefold_matches[0]);
     }
     if casefold_matches.len() > 1 {
-        bail!(
-            "{object_type} selector '{}' is ambiguous; use {object_type}:<id>",
-            selector
-        );
+        bail!("{object_type} selector '{selector}' is ambiguous; use {object_type}:<id>");
     }
 
     if let Some(project_name) = project_name {
-        bail!(
-            "{object_type} '{}' not found in project '{}'",
-            selector,
-            project_name
-        );
+        bail!("{object_type} '{selector}' not found in project '{project_name}'");
     }
-    bail!("{object_type} '{}' not found", selector);
+    bail!("{object_type} '{selector}' not found");
 }
 
 fn parse_object_ref(value: &str) -> Result<ObjectRef> {
@@ -3298,7 +3278,7 @@ fn new_pull_state(
     let now = epoch_seconds();
     PullState {
         schema_version: STATE_SCHEMA_VERSION,
-        run_id: format!("run-{}", now),
+        run_id: format!("run-{now}"),
         status: RunStatus::Running,
         phase: if matches!(scope, ScopeArg::Traces) {
             PullPhase::DiscoverRoots
@@ -3335,7 +3315,7 @@ fn new_push_state(
     let now = epoch_seconds();
     PushState {
         schema_version: STATE_SCHEMA_VERSION,
-        run_id: format!("run-{}", now),
+        run_id: format!("run-{now}"),
         status: RunStatus::Running,
         scope,
         limit,

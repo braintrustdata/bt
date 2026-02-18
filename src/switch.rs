@@ -4,9 +4,9 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 
 use crate::args::BaseArgs;
+use crate::auth::login;
 use crate::config;
 use crate::http::ApiClient;
-use crate::login::login;
 use crate::projects::api;
 use crate::ui::{print_command_status, select_project_interactive, with_spinner, CommandStatus};
 

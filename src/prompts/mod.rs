@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::{
-    args::BaseArgs, http::ApiClient, login::login, projects::api::get_project_by_name,
+    args::BaseArgs, auth::login, http::ApiClient, projects::api::get_project_by_name,
     ui::select_project_interactive,
 };
 

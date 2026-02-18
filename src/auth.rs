@@ -112,31 +112,31 @@ struct OAuthTokenResponse {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct LoginArgs {
+pub struct AuthArgs {
     #[command(subcommand)]
-    command: Option<LoginCommand>,
+    command: Option<AuthCommand>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum LoginCommand {
-    /// Save credentials to a profile and make it active
-    Set(LoginSetArgs),
+enum AuthCommand {
+    /// Authenticate with Braintrust (OAuth or API key)
+    Login(AuthLoginArgs),
     /// Force-refresh OAuth access token for a profile
     Refresh,
-    /// List saved login profiles
+    /// List saved auth profiles
     List,
     /// Switch active profile
-    Use(LoginUseArgs),
+    Use(AuthUseArgs),
     /// Delete a saved profile
-    Delete(LoginDeleteArgs),
+    Delete(AuthDeleteArgs),
     /// Clear the active profile
     Logout,
-    /// Show current login status
+    /// Show current auth status
     Status,
 }
 
 #[derive(Debug, Clone, Args)]
-struct LoginSetArgs {
+struct AuthLoginArgs {
     /// Use OAuth login instead of API key login
     #[arg(long)]
     oauth: bool,
@@ -151,7 +151,7 @@ struct LoginSetArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct LoginUseArgs {
+struct AuthUseArgs {
     /// Profile name
     profile: String,
 
@@ -165,7 +165,7 @@ struct LoginUseArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct LoginDeleteArgs {
+struct AuthDeleteArgs {
     /// Profile name
     profile: String,
 
@@ -174,25 +174,39 @@ struct LoginDeleteArgs {
     force: bool,
 }
 
-pub async fn run(base: BaseArgs, args: LoginArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     match args.command {
-        None => run_login_interactive_default(&base).await,
-        Some(LoginCommand::Set(set_args)) => run_login_set(&base, set_args).await,
-        Some(LoginCommand::Refresh) => run_login_refresh(&base).await,
-        Some(LoginCommand::List) => run_login_list(),
-        Some(LoginCommand::Use(use_args)) => {
+        None => {
+            let has_api_key = resolve_api_key_override(&base).is_some();
+            let has_profile = load_auth_store()
+                .ok()
+                .and_then(|s| s.active_profile)
+                .is_some();
+
+            if has_api_key || has_profile {
+                run_login_status(&base)?;
+                println!("\nRun `bt auth login` to re-authenticate or `bt auth --help` for all commands.");
+                Ok(())
+            } else {
+                run_login_interactive_default(&base).await
+            }
+        }
+        Some(AuthCommand::Login(login_args)) => run_login_set(&base, login_args).await,
+        Some(AuthCommand::Refresh) => run_login_refresh(&base).await,
+        Some(AuthCommand::List) => run_login_list(),
+        Some(AuthCommand::Use(use_args)) => {
             run_login_use(&use_args.profile, use_args.local, use_args.global)
         }
-        Some(LoginCommand::Delete(delete_args)) => {
+        Some(AuthCommand::Delete(delete_args)) => {
             run_login_delete(&delete_args.profile, delete_args.force)
         }
-        Some(LoginCommand::Logout) => run_login_logout(),
-        Some(LoginCommand::Status) => run_login_status(&base),
+        Some(AuthCommand::Logout) => run_login_logout(),
+        Some(AuthCommand::Status) => run_login_status(&base),
     }
 }
 
-fn default_login_set_args() -> LoginSetArgs {
-    LoginSetArgs {
+fn default_login_set_args() -> AuthLoginArgs {
+    AuthLoginArgs {
         oauth: false,
         client_id: None,
         no_browser: false,
@@ -202,7 +216,7 @@ fn default_login_set_args() -> LoginSetArgs {
 async fn run_login_interactive_default(base: &BaseArgs) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         bail!(
-            "`bt login` requires an interactive terminal. Use `bt login set --api-key <KEY>` or `bt login set --oauth`"
+            "`bt auth login` requires an interactive terminal. Use `bt auth login --api-key <KEY>` or `bt auth login --oauth`"
         );
     }
 
@@ -218,7 +232,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     let auth = resolve_auth(base).await?;
     let api_key = auth.api_key.clone().ok_or_else(|| {
         anyhow::anyhow!(
-            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt login set`"
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
         )
     })?;
 
@@ -297,8 +311,7 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
 
     if let Some(profile_name) = ignored_profile {
         eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
-            profile_name,
+            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
         );
     } else {
         eprintln!(
@@ -338,12 +351,10 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     let profile = store
         .profiles
         .get(profile_name)
-        .ok_or_else(|| anyhow::anyhow!("profile '{}' not found", profile_name))?;
+        .ok_or_else(|| anyhow::anyhow!("profile '{profile_name}' not found"))?;
     let client_id = profile.oauth_client_id.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth profile '{}' is missing client_id; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
         )
     })?;
     let cached_expires_at = profile.oauth_access_expires_at;
@@ -361,9 +372,7 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
 
     let refresh_token = load_profile_oauth_refresh_token(profile_name)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth refresh token missing for profile '{}'; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
         )
     })?;
     let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
@@ -433,9 +442,7 @@ where
     if let Some(profile_name) = selected_profile_name {
         let profile = store.profiles.get(profile_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "profile '{}' not found; run `bt login list` or `bt login set --profile {}`",
-                profile_name,
-                profile_name
+                "profile '{profile_name}' not found; run `bt auth list` or `bt auth login --profile {profile_name}`"
             )
         })?;
         let is_oauth = profile.auth_kind == AuthKind::Oauth;
@@ -444,9 +451,7 @@ where
         } else {
             Some(load_secret(profile_name)?.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no keychain credential found for profile '{}'; re-run `bt login set --profile {}`",
-                    profile_name,
-                    profile_name
+                    "no keychain credential found for profile '{profile_name}'; re-run `bt auth login --profile {profile_name}`"
                 )
             })?)
         };
@@ -469,7 +474,7 @@ where
     })
 }
 
-async fn run_login_set(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
+async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if args.oauth {
         return run_login_oauth(base, args).await;
     }
@@ -538,10 +543,7 @@ async fn run_login_set(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
             org.name, profile_name
         );
     } else {
-        println!(
-            "Logged in with no default org (cross-org) using profile '{}'",
-            profile_name
-        );
+        println!("Logged in with no default org (cross-org) using profile '{profile_name}'");
     }
     println!(
         "Saved profile metadata at {} and credential in secure store (OS keychain when available; plaintext fallback otherwise)",
@@ -555,7 +557,7 @@ async fn run_login_set(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
+async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         bail!("oauth login requires an interactive terminal");
     }
@@ -690,8 +692,7 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         );
     } else {
         println!(
-            "Logged in with OAuth and no default org (cross-org) using profile '{}'",
-            profile_name
+            "Logged in with OAuth and no default org (cross-org) using profile '{profile_name}'"
         );
     }
     println!(
@@ -724,14 +725,12 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     let (profile_name, source) = resolve_selected_profile_name_for_debug(base, &store)?;
     let profile = store.profiles.get(profile_name.as_str()).ok_or_else(|| {
         anyhow::anyhow!(
-            "profile '{}' not found; run `bt login list` to see available profiles",
-            profile_name
+            "profile '{profile_name}' not found; run `bt auth list` to see available profiles"
         )
     })?;
     if profile.auth_kind != AuthKind::Oauth {
         bail!(
-            "profile '{}' uses api key auth; `bt login refresh` only applies to oauth profiles",
-            profile_name
+            "profile '{profile_name}' uses api key auth; `bt auth refresh` only applies to oauth profiles"
         );
     }
 
@@ -741,23 +740,18 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let client_id = profile.oauth_client_id.clone().ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth profile '{}' is missing client_id; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
         )
     })?;
     let previous_expires_at = profile.oauth_access_expires_at;
     let refresh_token = load_profile_oauth_refresh_token(profile_name.as_str())?.ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth refresh token missing for profile '{}'; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
         )
     })?;
 
     println!(
-        "Refreshing OAuth token for profile '{}' (source: {}, api_url: {})",
-        profile_name, source, api_url
+        "Refreshing OAuth token for profile '{profile_name}' (source: {source}, api_url: {api_url})"
     );
     if let Some(expires_at) = previous_expires_at {
         let now = current_unix_timestamp();
@@ -822,7 +816,7 @@ fn resolve_selected_profile_name_for_debug(
     }
 
     bail!(
-        "no profile selected; pass --profile <NAME>, set BRAINTRUST_PROFILE, or run `bt login use <NAME>`"
+        "no profile selected; pass --profile <NAME>, set BRAINTRUST_PROFILE, or run `bt auth use <NAME>`"
     )
 }
 
@@ -898,7 +892,7 @@ fn resolve_profile_name(
 fn run_login_list() -> Result<()> {
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
-        println!("No saved login profiles. Run `bt login set` to create one.");
+        println!("No saved login profiles. Run `bt auth login` to create one.");
         return Ok(());
     }
 
@@ -936,10 +930,7 @@ fn run_login_use(profile_name: &str, local: bool, global: bool) -> Result<()> {
 
     let mut store = load_auth_store()?;
     if !store.profiles.contains_key(profile_name) {
-        bail!(
-            "profile '{}' not found; run `bt login list` to see available profiles",
-            profile_name
-        );
+        bail!("profile '{profile_name}' not found; run `bt auth list` to see available profiles");
     }
 
     store.active_profile = Some(profile_name.to_string());
@@ -967,10 +958,7 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
 
     let mut store = load_auth_store()?;
     if !store.profiles.contains_key(profile_name) {
-        bail!(
-            "profile '{}' not found; run `bt login list` to see available profiles",
-            profile_name
-        );
+        bail!("profile '{profile_name}' not found; run `bt auth list` to see available profiles");
     }
 
     if !force && std::io::stdin().is_terminal() {
@@ -1078,7 +1066,7 @@ fn run_login_status(base: &BaseArgs) -> Result<()> {
     }
 
     println!("No active profile.");
-    println!("Run `bt login set`, `bt login set --oauth`, or set BRAINTRUST_API_KEY.");
+    println!("Run `bt auth login`, `bt auth login --oauth`, or set BRAINTRUST_API_KEY.");
     Ok(())
 }
 
@@ -1093,7 +1081,7 @@ async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgIn
         .header("Content-Type", "application/json")
         .send()
         .await
-        .with_context(|| format!("failed to call login endpoint {}", login_url))?;
+        .with_context(|| format!("failed to call login endpoint {login_url}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1144,9 +1132,7 @@ fn select_login_org(
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::anyhow!(
-                "organization '{}' not found for this API key. Available organizations: {}",
-                name,
-                available
+                "organization '{name}' not found for this API key. Available organizations: {available}"
             )
         });
     }
