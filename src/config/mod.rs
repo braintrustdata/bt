@@ -20,21 +20,17 @@ mod set;
 pub struct Config {
     pub org: Option<String>,
     pub project: Option<String>,
-    pub api_url: Option<String>,
-    pub app_url: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["org", "project", "api_url", "app_url"];
+pub const KNOWN_KEYS: &[&str] = &["org", "project"];
 
 impl Config {
     pub fn get_field(&self, key: &str) -> Option<&str> {
         match key {
             "org" => self.org.as_deref(),
             "project" => self.project.as_deref(),
-            "api_url" => self.api_url.as_deref(),
-            "app_url" => self.app_url.as_deref(),
             _ => None,
         }
     }
@@ -43,8 +39,6 @@ impl Config {
         match key {
             "org" => self.org = Some(value),
             "project" => self.project = Some(value),
-            "api_url" => self.api_url = Some(value),
-            "app_url" => self.app_url = Some(value),
             _ => return false,
         }
         true
@@ -54,8 +48,6 @@ impl Config {
         match key {
             "org" => self.org = None,
             "project" => self.project = None,
-            "api_url" => self.api_url = None,
-            "app_url" => self.app_url = None,
             _ => return false,
         }
         true
@@ -74,8 +66,6 @@ impl Config {
         Config {
             org: other.org.clone().or_else(|| self.org.clone()),
             project: other.project.clone().or_else(|| self.project.clone()),
-            api_url: other.api_url.clone().or_else(|| self.api_url.clone()),
-            app_url: other.app_url.clone().or_else(|| self.app_url.clone()),
             extra,
         }
     }
@@ -254,14 +244,14 @@ enum ConfigCommands {
     },
     /// Get a config value
     Get {
-        /// Config key (org, project, api_url, app_url)
+        /// Config key (org, project)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,
     },
     /// Set a config value
     Set {
-        /// Config key (org, project, api_url, app_url)
+        /// Config key (org, project)
         key: String,
         /// Value to set
         value: String,
@@ -270,7 +260,7 @@ enum ConfigCommands {
     },
     /// Remove a config value
     Unset {
-        /// Config key (org, project, api_url, app_url)
+        /// Config key (org, project)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,
@@ -395,8 +385,6 @@ mod tests {
         let original = Config {
             org: Some("test-org".into()),
             project: Some("test-project".into()),
-            api_url: Some("https://api.example.com".into()),
-            app_url: Some("https://app.example.com".into()),
             ..Default::default()
         };
 
@@ -405,8 +393,6 @@ mod tests {
 
         assert_eq!(loaded.org, original.org);
         assert_eq!(loaded.project, original.project);
-        assert_eq!(loaded.api_url, original.api_url);
-        assert_eq!(loaded.app_url, original.app_url);
     }
 
     #[test]

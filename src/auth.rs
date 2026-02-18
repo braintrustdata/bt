@@ -124,6 +124,27 @@ pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Res
     }
 }
 
+pub fn select_profile_interactive() -> Result<Option<String>> {
+    let profiles = list_profiles()?;
+    if profiles.is_empty() {
+        bail!("no auth profiles found. Run `bt auth login` to create one.");
+    }
+    if profiles.len() == 1 {
+        return Ok(Some(profiles[0].name.clone()));
+    }
+
+    let labels: Vec<String> = profiles
+        .iter()
+        .map(|p| match &p.org_name {
+            Some(org) if org != &p.name => format!("{} (profile: {})", org, p.name),
+            _ => p.name.clone(),
+        })
+        .collect();
+
+    let idx = crate::ui::fuzzy_select("Select org", &labels)?;
+    Ok(Some(profiles[idx].name.clone()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthStore {
     #[serde(default)]

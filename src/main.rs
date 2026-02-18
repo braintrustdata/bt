@@ -82,11 +82,8 @@ async fn main() -> Result<()> {
             traces::run(base, args).await?
         }
         Commands::Init(cmd) => {
-            // Merge config for auth resolution (org, api_url, etc.) but clear project
-            // since init should prompt for project interactively
-            let mut base = cmd.base.with_config_defaults(&cfg);
-            base.project = None;
-            init::run(base, cmd.args).await?
+            // Don't merge config — init always prompts for org and project
+            init::run(cmd.base, cmd.args).await?
         }
         Commands::Sql(cmd) => {
             let (base, args) = cmd.with_config(&cfg);

@@ -5,7 +5,7 @@ use clap::Args;
 
 use crate::{
     args::BaseArgs,
-    auth::login,
+    auth::{self, login},
     config,
     http::ApiClient,
     ui::{print_command_status, select_project_interactive, CommandStatus},
@@ -28,7 +28,13 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
     } else if !std::io::stdin().is_terminal() {
         bail!("--org and --project required in non-interactive mode");
     } else {
-        let ctx = login(&base).await?;
+        let mut login_base = base.clone();
+        if login_base.org_name.is_none() && login_base.profile.is_none() {
+            if let Some(profile) = auth::select_profile_interactive()? {
+                login_base.profile = Some(profile);
+            }
+        }
+        let ctx = login(&login_base).await?;
         let client = ApiClient::new(&ctx)?;
 
         let org = client.org_name().to_string();

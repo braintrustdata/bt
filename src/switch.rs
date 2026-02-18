@@ -8,9 +8,7 @@ use crate::auth::{self, login};
 use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
-use crate::ui::{
-    self, print_command_status, select_project_interactive, with_spinner, CommandStatus,
-};
+use crate::ui::{print_command_status, select_project_interactive, with_spinner, CommandStatus};
 
 #[derive(Debug, Clone, Args)]
 pub struct SwitchArgs {
@@ -60,7 +58,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
         None => {
             if resolved_project.is_none() && std::io::stdin().is_terminal() {
-                select_org_profile_interactive()?
+                auth::select_profile_interactive()?
             } else {
                 None
             }
@@ -127,27 +125,6 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     eprintln!("Wrote to {}", path.display());
 
     Ok(())
-}
-
-fn select_org_profile_interactive() -> Result<Option<String>> {
-    let profiles = auth::list_profiles()?;
-    if profiles.is_empty() {
-        bail!("no auth profiles found. Run `bt auth login` to create one.");
-    }
-    if profiles.len() == 1 {
-        return Ok(Some(profiles[0].name.clone()));
-    }
-
-    let labels: Vec<String> = profiles
-        .iter()
-        .map(|p| match &p.org_name {
-            Some(org) if org != &p.name => format!("{} (profile: {})", org, p.name),
-            _ => p.name.clone(),
-        })
-        .collect();
-
-    let idx = ui::fuzzy_select("Select org", &labels)?;
-    Ok(Some(profiles[idx].name.clone()))
 }
 
 async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<String> {
