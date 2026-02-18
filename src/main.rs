@@ -14,13 +14,21 @@ mod projects;
 mod prompts;
 mod scorers;
 mod self_update;
+mod setup;
 mod sql;
+mod sync;
 mod tools;
 mod traces;
 mod ui;
 mod utils;
 
 use crate::args::CLIArgs;
+
+const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
+const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
+    Some(version) => version,
+    None => DEFAULT_CANARY_VERSION,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,11 +44,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Configure Braintrust setup flows
+    Setup(CLIArgs<setup::SetupArgs>),
+    /// Manage workflow docs for coding agents
+    Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
-    /// View project traces in an interactive terminal UI
-    #[command(visible_alias = "trace")]
-    Traces(CLIArgs<traces::TracesArgs>),
+    /// Manage login profiles and persistent auth
+    Login(CLIArgs<login::LoginArgs>),
+    /// View logs, traces, and spans
+    View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
@@ -57,6 +70,8 @@ enum Commands {
     Scorers(CLIArgs<scorers::ScorersArgs>),
     /// Manage experiments
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
+    /// Synchronize project logs between Braintrust and local NDJSON files
+    Sync(CLIArgs<sync::SyncArgs>),
 }
 
 #[tokio::main]
@@ -66,8 +81,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(argv);
 
     match cli.command {
+        Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
+        Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
-        Commands::Traces(cmd) => traces::run(cmd.base, cmd.args).await?,
+        Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
+        Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
@@ -76,6 +94,7 @@ async fn main() -> Result<()> {
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
+        Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())

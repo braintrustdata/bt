@@ -10,7 +10,8 @@ repository = "https://github.com/braintrustdata/bt"
 
 [dependencies]
 anyhow = "1.0.89"
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "33ee4c8b8c1e4cd11961f7572100298caa3a39d0" }
+backoff = { version = "0.4.0", features = ["tokio"] }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "c8c7c7a8d9189164584adef71449a26d4ae8be2b" }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 indicatif = "0.17.8"
@@ -18,8 +19,9 @@ ratatui = "0.29.0"
 reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
+sha2 = "0.10.8"
 strip-ansi-escapes = "0.2.0"
-tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "process", "net"] }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "process", "net", "signal"] }
 unicode-width = "0.1.13"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 dotenvy = "0.15"
@@ -29,6 +31,9 @@ urlencoding = "2"
 lingua = { git = "https://github.com/braintrustdata/lingua", rev = "3c79f2c427d12d3e2fe104910ef3c0768ad83770" }
 comfy-table = "7.2.2"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+base64 = "0.22"
+oauth2 = { version = "4.4", default-features = false, features = ["reqwest", "rustls-tls"] }
+getrandom = "0.3"
 
 [profile.dist]
 inherits = "release"
