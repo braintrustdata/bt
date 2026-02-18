@@ -4,11 +4,13 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 
 use crate::args::BaseArgs;
-use crate::auth::login;
+use crate::auth::{self, login, ProfileInfo};
 use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
-use crate::ui::{print_command_status, select_project_interactive, with_spinner, CommandStatus};
+use crate::ui::{
+    self, print_command_status, select_project_interactive, with_spinner, CommandStatus,
+};
 
 #[derive(Debug, Clone, Args)]
 pub struct SwitchArgs {
@@ -45,43 +47,148 @@ impl SwitchArgs {
 
 pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let path = config::resolve_write_path(args.global, args.local)?;
+    let (resolved_org, resolved_project) = args.resolve_target(&base);
 
-    let ctx = login(&base).await?;
-    let client = ApiClient::new(&ctx)?;
-    // For now, always use org from API client
-    // We use the org_name from the client to ensure user's can't override it
-    // accidentally when switching until we have multi-org oauth setup
-    let org_name = &client.org_name();
-
-    // TODO: get `resolved_org` available when multi-org auth is ready
-    let (_, resolved_project) = args.resolve_target(&base);
-
-    let project_name = match resolved_project {
-        Some(p) => validate_or_create_project(&client, &p).await?,
-        None => {
-            if !std::io::stdin().is_terminal() {
-                bail!("project required. Use: bt switch <target> or bt switch --project <name>");
+    let profile_name = match &resolved_org {
+        Some(org_or_profile) => {
+            if base.profile.is_some() {
+                None
+            } else {
+                let profiles = auth::list_profiles()?;
+                Some(resolve_org_to_profile(org_or_profile, &profiles)?)
             }
-            select_project_interactive(&client, None).await?
+        }
+        None => {
+            if resolved_project.is_none() && std::io::stdin().is_terminal() {
+                select_org_profile_interactive()?
+            } else {
+                None
+            }
         }
     };
 
-    let mut cfg = config::load_file(&path);
-    // TODO: use `resolved_org` in place of `org_name` to support switching when multi-org auth is ready
-    cfg.org = Some(org_name.to_string());
-    cfg.project = Some(project_name.clone());
+    // Clear org_name when we resolved a profile from it — the raw identifier (e.g. "staging")
+    // may differ from the profile's actual org (e.g. "staging-org"). Letting org_name stay
+    // would override the profile's stored org_name in resolve_auth_from_store and pass the
+    // wrong hint to BraintrustClient.
+    let login_base = match &profile_name {
+        Some(profile) if base.profile.is_none() => BaseArgs {
+            profile: Some(profile.clone()),
+            org_name: None,
+            ..base.clone()
+        },
+        _ => base.clone(),
+    };
 
+    let ctx = login(&login_base).await?;
+    let client = ApiClient::new(&ctx)?;
+    let org_name = client.org_name();
+
+    let project_name = match resolved_project {
+        Some(p) => Some(validate_or_create_project(&client, &p).await?),
+        None if resolved_org.is_some() => None,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
+            }
+            Some(select_project_interactive(&client, None).await?)
+        }
+    };
+
+    if let Some(ref profile) = profile_name {
+        auth::set_active_profile(profile)?;
+    }
+
+    let mut cfg = config::load_file(&path);
+    cfg.org = Some(org_name.to_string());
+    cfg.project = project_name.clone();
+    if let Some(ref profile) = profile_name {
+        cfg.profile = Some(profile.clone());
+    }
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 
-    print_command_status(
-        CommandStatus::Success,
-        &format!("Switched to {org_name}/{project_name}"),
-    );
+    let display = match &project_name {
+        Some(p) => format!("{org_name}/{p}"),
+        None => org_name.to_string(),
+    };
+    print_command_status(CommandStatus::Success, &format!("Switched to {display}"));
     // TODO: Only show in --verbose mode
     eprintln!("Wrote to {}", path.display());
 
     Ok(())
+}
+
+fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Result<String> {
+    if profiles.is_empty() {
+        bail!("no auth profiles found. Run `bt auth login` to create one.");
+    }
+
+    if let Some(p) = profiles.iter().find(|p| p.name == identifier) {
+        return Ok(p.name.clone());
+    }
+
+    let matches: Vec<&ProfileInfo> = profiles
+        .iter()
+        .filter(|p| p.org_name.as_deref() == Some(identifier))
+        .collect();
+
+    match matches.len() {
+        0 => {
+            let available: Vec<String> = profiles
+                .iter()
+                .filter_map(|p| {
+                    p.org_name
+                        .as_ref()
+                        .map(|org| format!("  {} (profile: {})", org, p.name))
+                })
+                .collect();
+            bail!(
+                "no profile found for '{identifier}'.\nAvailable:\n{}",
+                available.join("\n")
+            );
+        }
+        1 => Ok(matches[0].name.clone()),
+        _ => {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "multiple profiles for org '{identifier}': {}. Use --profile to disambiguate.",
+                    matches
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            let names: Vec<&str> = matches.iter().map(|p| p.name.as_str()).collect();
+            let idx = ui::fuzzy_select(
+                &format!("Multiple profiles for '{identifier}'. Select one"),
+                &names,
+            )?;
+            Ok(matches[idx].name.clone())
+        }
+    }
+}
+
+fn select_org_profile_interactive() -> Result<Option<String>> {
+    let profiles = auth::list_profiles()?;
+    if profiles.is_empty() {
+        bail!("no auth profiles found. Run `bt auth login` to create one.");
+    }
+    if profiles.len() == 1 {
+        return Ok(None);
+    }
+
+    let labels: Vec<String> = profiles
+        .iter()
+        .map(|p| match &p.org_name {
+            Some(org) if org != &p.name => format!("{} (profile: {})", org, p.name),
+            _ => p.name.clone(),
+        })
+        .collect();
+
+    let idx = ui::fuzzy_select("Select org", &labels)?;
+    Ok(Some(profiles[idx].name.clone()))
 }
 
 async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<String> {
@@ -133,6 +240,17 @@ mod tests {
             env_file: None,
         }
     }
+
+    fn profile_info(name: &str, org_name: Option<&str>) -> ProfileInfo {
+        ProfileInfo {
+            name: name.to_string(),
+            org_name: org_name.map(String::from),
+            api_url: None,
+            app_url: None,
+        }
+    }
+
+    // --- resolve_target tests (unchanged) ---
 
     #[test]
     fn no_args_returns_none() {
@@ -224,5 +342,98 @@ mod tests {
             args.resolve_target(&base),
             (Some("x".into()), Some("y".into()))
         );
+    }
+
+    // --- resolve_org_to_profile tests ---
+
+    #[test]
+    fn resolve_by_exact_profile_name() {
+        let profiles = vec![profile_info("acme", Some("acme-corp"))];
+        assert_eq!(resolve_org_to_profile("acme", &profiles).unwrap(), "acme");
+    }
+
+    #[test]
+    fn resolve_by_org_name_when_profile_name_differs() {
+        let profiles = vec![profile_info("work", Some("acme-corp"))];
+        assert_eq!(
+            resolve_org_to_profile("acme-corp", &profiles).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn resolve_no_match_errors() {
+        let profiles = vec![profile_info("work", Some("acme-corp"))];
+        assert!(resolve_org_to_profile("unknown", &profiles).is_err());
+    }
+
+    #[test]
+    fn resolve_empty_profiles_errors() {
+        let profiles: Vec<ProfileInfo> = vec![];
+        let err = resolve_org_to_profile("anything", &profiles).unwrap_err();
+        assert!(err.to_string().contains("no auth profiles found"));
+    }
+
+    #[test]
+    fn resolve_prefers_profile_name_over_org_name() {
+        let profiles = vec![
+            profile_info("acme", Some("other")),
+            profile_info("x", Some("acme")),
+        ];
+        assert_eq!(resolve_org_to_profile("acme", &profiles).unwrap(), "acme");
+    }
+
+    #[test]
+    fn resolve_profile_without_org() {
+        let profiles = vec![profile_info("default", None)];
+        assert_eq!(
+            resolve_org_to_profile("default", &profiles).unwrap(),
+            "default"
+        );
+    }
+
+    // --- login_base org_name clearing tests ---
+
+    #[test]
+    fn login_base_clears_org_name_when_profile_resolved() {
+        let base = BaseArgs {
+            org_name: Some("staging".into()),
+            ..base_args(None, Some("foobar"))
+        };
+        let profile_name = Some("staging".to_string());
+
+        let login_base = match &profile_name {
+            Some(profile) if base.profile.is_none() => BaseArgs {
+                profile: Some(profile.clone()),
+                org_name: None,
+                ..base.clone()
+            },
+            _ => base.clone(),
+        };
+
+        assert_eq!(login_base.profile, Some("staging".into()));
+        assert_eq!(login_base.org_name, None);
+    }
+
+    #[test]
+    fn login_base_preserves_org_when_explicit_profile_flag() {
+        let base = BaseArgs {
+            profile: Some("staging".into()),
+            org_name: Some("custom-org".into()),
+            ..base_args(None, Some("foobar"))
+        };
+        let profile_name: Option<String> = None;
+
+        let login_base = match &profile_name {
+            Some(profile) if base.profile.is_none() => BaseArgs {
+                profile: Some(profile.clone()),
+                org_name: None,
+                ..base.clone()
+            },
+            _ => base.clone(),
+        };
+
+        assert_eq!(login_base.profile, Some("staging".into()));
+        assert_eq!(login_base.org_name, Some("custom-org".into()));
     }
 }

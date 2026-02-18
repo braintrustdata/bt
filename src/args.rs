@@ -52,6 +52,9 @@ impl BaseArgs {
         if self.project.is_none() {
             self.project = cfg.project.clone();
         }
+        if self.profile.is_none() {
+            self.profile = cfg.profile.clone();
+        }
         if self.api_url.is_none() {
             self.api_url = cfg.api_url.clone();
         }
@@ -142,6 +145,35 @@ mod tests {
 
         assert_eq!(result.org_name, Some("cli-org".into()));
         assert_eq!(result.project, Some("cfg-proj".into()));
+    }
+
+    #[test]
+    fn profile_filled_from_config() {
+        let args = empty_args();
+        let cfg = Config {
+            profile: Some("staging".into()),
+            ..config(None, None)
+        };
+
+        let result = args.with_config_defaults(&cfg);
+
+        assert_eq!(result.profile, Some("staging".into()));
+    }
+
+    #[test]
+    fn existing_profile_not_overwritten() {
+        let args = BaseArgs {
+            profile: Some("cli-profile".into()),
+            ..empty_args()
+        };
+        let cfg = Config {
+            profile: Some("config-profile".into()),
+            ..config(None, None)
+        };
+
+        let result = args.with_config_defaults(&cfg);
+
+        assert_eq!(result.profile, Some("cli-profile".into()));
     }
 
     #[test]

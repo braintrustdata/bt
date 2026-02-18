@@ -51,6 +51,42 @@ pub struct ResolvedAuth {
     pub is_oauth: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProfileInfo {
+    pub name: String,
+    pub org_name: Option<String>,
+    pub api_url: Option<String>,
+    pub app_url: Option<String>,
+}
+
+pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
+    let store = load_auth_store()?;
+    Ok(store
+        .profiles
+        .iter()
+        .map(|(name, p)| ProfileInfo {
+            name: name.clone(),
+            org_name: p.org_name.clone(),
+            api_url: p.api_url.clone(),
+            app_url: p.app_url.clone(),
+        })
+        .collect())
+}
+
+pub fn active_profile_name() -> Result<Option<String>> {
+    let store = load_auth_store()?;
+    Ok(store.active_profile)
+}
+
+pub fn set_active_profile(profile_name: &str) -> Result<()> {
+    let mut store = load_auth_store()?;
+    if !store.profiles.contains_key(profile_name) {
+        bail!("profile '{profile_name}' not found");
+    }
+    store.active_profile = Some(profile_name.to_string());
+    save_auth_store(&store)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthStore {
     #[serde(default)]

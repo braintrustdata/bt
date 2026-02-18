@@ -16,6 +16,7 @@ pub struct StatusArgs {
 struct StatusOutput {
     org: Option<String>,
     project: Option<String>,
+    profile: Option<String>,
     source: Option<String>,
 }
 
@@ -29,13 +30,14 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         .unwrap_or_default();
 
     // Resolve values with priority: CLI > local > global
-    let (org, project, source) =
+    let (org, project, profile, source) =
         resolve_config(&base, &global_cfg, &local_cfg, &local_path, &global_path);
 
     if base.json {
         let output = StatusOutput {
             org,
             project,
+            profile,
             source,
         };
         // send json to stdout so it can be piped to other tools
@@ -46,6 +48,9 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
     if args.verbose {
         println!("org: {}", org.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
+        if let Some(p) = &profile {
+            println!("profile: {p}");
+        }
         if let Some(src) = source {
             println!("source: {src}");
         }
@@ -65,7 +70,12 @@ pub(crate) fn resolve_config(
     local: &config::Config,
     local_path: &Option<std::path::PathBuf>,
     global_path: &Option<std::path::PathBuf>,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     // Priority: CLI flags > local config > global config
     let org = base
         .org_name
@@ -79,6 +89,12 @@ pub(crate) fn resolve_config(
         .or_else(|| local.project.clone())
         .or_else(|| global.project.clone());
 
+    let profile = base
+        .profile
+        .clone()
+        .or_else(|| local.profile.clone())
+        .or_else(|| global.profile.clone());
+
     // Determine source based on where the values came from
     let source = if base.org_name.is_some() || base.project.is_some() {
         Some("cli".to_string())
@@ -90,7 +106,7 @@ pub(crate) fn resolve_config(
         None
     };
 
-    (org, project, source)
+    (org, project, profile, source)
 }
 
 #[cfg(test)]
@@ -128,7 +144,7 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
+        let (org, project, _profile, source) =
             resolve_config(&base, &global, &local, &local_path, &global_path);
 
         assert_eq!(org, Some("cli-org".into()));
@@ -144,7 +160,7 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
+        let (org, project, _profile, source) =
             resolve_config(&base, &global, &local, &local_path, &global_path);
 
         assert_eq!(org, Some("local-org".into()));
@@ -160,7 +176,7 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
+        let (org, project, _profile, source) =
             resolve_config(&base, &global, &local, &local_path, &global_path);
 
         assert_eq!(org, Some("global-org".into()));
@@ -176,7 +192,7 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
+        let (org, project, _profile, source) =
             resolve_config(&base, &global, &local, &local_path, &global_path);
 
         assert_eq!(org, None);
@@ -192,7 +208,7 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
+        let (org, project, _profile, source) =
             resolve_config(&base, &global, &local, &local_path, &global_path);
 
         assert_eq!(org, Some("cli-org".into()));
@@ -209,12 +225,52 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
+        let (org, project, _profile, source) =
             resolve_config(&base, &global, &local, &local_path, &global_path);
 
         assert_eq!(org, Some("global-org".into()));
         assert_eq!(project, Some("local-proj".into()));
         // Source reports local since that's where the highest-priority non-empty value came from
         assert_eq!(source, Some("/project/.bt/config.json".into()));
+    }
+
+    #[test]
+    fn profile_resolved_from_config() {
+        let base = base_args(None, None);
+        let global = config::Config {
+            profile: Some("global-profile".into()),
+            ..Default::default()
+        };
+        let local = config::Config {
+            profile: Some("local-profile".into()),
+            ..Default::default()
+        };
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (_org, _project, profile, _source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(profile, Some("local-profile".into()));
+    }
+
+    #[test]
+    fn cli_profile_overrides_config() {
+        let base = BaseArgs {
+            profile: Some("cli-profile".into()),
+            ..base_args(None, None)
+        };
+        let global = config::Config {
+            profile: Some("global-profile".into()),
+            ..Default::default()
+        };
+        let local = config(None, None);
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (_org, _project, profile, _source) =
+            resolve_config(&base, &global, &local, &local_path, &global_path);
+
+        assert_eq!(profile, Some("cli-profile".into()));
     }
 }
