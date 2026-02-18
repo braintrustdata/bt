@@ -5,12 +5,13 @@ use crate::{http::ApiClient, resource_cmd::print_named_resource_list, ui::with_s
 use super::api;
 
 pub async fn run(client: &ApiClient, project: &str, org: &str, json: bool) -> Result<()> {
-    let prompts = with_spinner("Loading prompts...", api::list_prompts(client, project)).await?;
+    let functions =
+        with_spinner("Loading functions...", api::list_functions(client, project)).await?;
 
     if json {
-        println!("{}", serde_json::to_string(&prompts)?);
+        println!("{}", serde_json::to_string(&functions)?);
     } else {
-        print_named_resource_list(&prompts, "prompt", org, project, false)?;
+        print_named_resource_list(&functions, "function", org, project, true)?;
     }
 
     Ok(())

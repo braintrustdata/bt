@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use urlencoding::encode;
 
 use crate::http::ApiClient;
+use crate::resource_cmd::NamedResource;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prompt {
@@ -14,6 +15,20 @@ pub struct Prompt {
     pub description: Option<String>,
     #[serde(default)]
     pub prompt_data: Option<serde_json::Value>,
+}
+
+impl NamedResource for Prompt {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    fn slug(&self) -> &str {
+        &self.slug
+    }
 }
 
 #[derive(Debug, Deserialize)]

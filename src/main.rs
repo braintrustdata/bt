@@ -6,10 +6,13 @@ mod args;
 mod env;
 #[cfg(unix)]
 mod eval;
+mod functions;
 mod http;
 mod login;
+mod project_command;
 mod projects;
 mod prompts;
+mod resource_cmd;
 mod self_update;
 mod setup;
 mod sql;
@@ -41,6 +44,8 @@ enum Commands {
     Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
+    /// Manage project functions
+    Functions(CLIArgs<functions::FunctionsArgs>),
     /// Manage login profiles and persistent auth
     Login(CLIArgs<login::LoginArgs>),
     /// View logs, traces, and spans
@@ -69,6 +74,7 @@ async fn main() -> Result<()> {
         Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
         Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
+        Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
         Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
         Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]

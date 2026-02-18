@@ -6,7 +6,8 @@ use dialoguer::Confirm;
 use crate::{
     http::ApiClient,
     prompts::api::{self, Prompt},
-    ui::{self, print_command_status, with_spinner, CommandStatus},
+    resource_cmd::select_named_resource_interactive,
+    ui::{print_command_status, with_spinner, CommandStatus},
 };
 
 pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: bool) -> Result<()> {
@@ -60,15 +61,6 @@ pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: b
 }
 
 pub async fn select_prompt_interactive(client: &ApiClient, project: &str) -> Result<Prompt> {
-    let mut prompts =
-        with_spinner("Loading prompts...", api::list_prompts(client, project)).await?;
-    if prompts.is_empty() {
-        bail!("no prompts found");
-    }
-
-    prompts.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
-
-    let selection = ui::fuzzy_select("Select prompt", &names)?;
-    Ok(prompts[selection].clone())
+    let prompts = with_spinner("Loading prompts...", api::list_prompts(client, project)).await?;
+    select_named_resource_interactive(prompts, "no prompts found", "Select prompt")
 }

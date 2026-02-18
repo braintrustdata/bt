@@ -9,38 +9,30 @@ mod list;
 mod view;
 
 #[derive(Debug, Clone, Args)]
-pub struct PromptsArgs {
+pub struct FunctionsArgs {
     #[command(subcommand)]
-    command: Option<PromptsCommands>,
+    command: Option<FunctionsCommands>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum PromptsCommands {
-    /// List all prompts
+enum FunctionsCommands {
+    /// List all functions
     List,
-    /// View a prompt's content
+    /// View a function's details
     View(ViewArgs),
-    /// Delete a prompt
+    /// Delete a function
     Delete(DeleteArgs),
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct ViewArgs {
-    /// Prompt slug (positional)
+    /// Function slug (positional)
     #[arg(value_name = "SLUG")]
     slug_positional: Option<String>,
 
-    /// Prompt slug (flag)
+    /// Function slug (flag)
     #[arg(long = "slug", short = 's')]
     slug_flag: Option<String>,
-
-    /// Open in browser instead of showing in terminal
-    #[arg(long)]
-    web: bool,
-
-    /// Show all model parameters and configuration
-    #[arg(long)]
-    verbose: bool,
 }
 
 impl ViewArgs {
@@ -53,11 +45,11 @@ impl ViewArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DeleteArgs {
-    /// Prompt slug (positional) of the prompt to delete
+    /// Function slug (positional) of the function to delete
     #[arg(value_name = "SLUG")]
     slug_positional: Option<String>,
 
-    /// Prompt slug (flag) of the prompt to delete
+    /// Function slug (flag) of the function to delete
     #[arg(long = "slug", short = 's')]
     slug_flag: Option<String>,
 
@@ -74,28 +66,16 @@ impl DeleteArgs {
     }
 }
 
-pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     let ctx = resolve_project_command_context(&base).await?;
     let client = &ctx.client;
     let project = &ctx.project;
 
     match args.command {
-        None | Some(PromptsCommands::List) => {
+        None | Some(FunctionsCommands::List) => {
             list::run(client, project, &ctx.login.login.org_name, base.json).await
         }
-        Some(PromptsCommands::View(p)) => {
-            view::run(
-                client,
-                &ctx.login.app_url,
-                project,
-                &ctx.login.login.org_name,
-                p.slug(),
-                base.json,
-                p.web,
-                p.verbose,
-            )
-            .await
-        }
-        Some(PromptsCommands::Delete(p)) => delete::run(client, project, p.slug(), p.force).await,
+        Some(FunctionsCommands::View(f)) => view::run(client, project, f.slug(), base.json).await,
+        Some(FunctionsCommands::Delete(f)) => delete::run(client, project, f.slug(), f.force).await,
     }
 }
