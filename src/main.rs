@@ -42,7 +42,7 @@ enum Commands {
     Init(CLIArgs<init::InitArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
-    /// Manage authentication profiles
+    /// Authenticate bt with Braintrust
     Auth(CLIArgs<auth::AuthArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),

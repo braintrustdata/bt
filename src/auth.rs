@@ -134,7 +134,7 @@ struct OAuthTokenResponse {
 #[derive(Debug, Clone, Args)]
 pub struct AuthArgs {
     #[command(subcommand)]
-    command: Option<AuthCommand>,
+    command: AuthCommand,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -179,49 +179,12 @@ struct AuthLogoutArgs {
 
 pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     match args.command {
-        None => {
-            let has_api_key = resolve_api_key_override(&base).is_some();
-            let has_profile = load_auth_store()
-                .ok()
-                .map(|s| !s.profiles.is_empty())
-                .unwrap_or(false);
-
-            if has_api_key || has_profile {
-                run_login_status(&base)?;
-                println!("\nRun `bt auth login` to re-authenticate or `bt auth --help` for all commands.");
-                Ok(())
-            } else {
-                run_login_interactive_default(&base).await
-            }
-        }
-        Some(AuthCommand::Login(login_args)) => run_login_set(&base, login_args).await,
-        Some(AuthCommand::Refresh) => run_login_refresh(&base).await,
-        Some(AuthCommand::List) => run_login_list(),
-        Some(AuthCommand::Logout(logout_args)) => run_login_logout(base, logout_args),
-        Some(AuthCommand::Status) => run_login_status(&base),
+        AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
+        AuthCommand::Refresh => run_login_refresh(&base).await,
+        AuthCommand::List => run_login_list(),
+        AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args),
+        AuthCommand::Status => run_login_status(&base),
     }
-}
-
-fn default_login_set_args() -> AuthLoginArgs {
-    AuthLoginArgs {
-        oauth: false,
-        client_id: None,
-        no_browser: false,
-    }
-}
-
-async fn run_login_interactive_default(base: &BaseArgs) -> Result<()> {
-    if !std::io::stdin().is_terminal() {
-        bail!(
-            "`bt auth login` requires an interactive terminal. Use `bt auth login --api-key <KEY>` or `bt auth login --oauth`"
-        );
-    }
-
-    let methods = ["OAuth (browser)", "API key"];
-    let selected = ui::fuzzy_select("Select login method", &methods)?;
-    let mut args = default_login_set_args();
-    args.oauth = selected == 0;
-    run_login_set(base, args).await
 }
 
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
@@ -507,6 +470,17 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if args.oauth {
         return run_login_oauth(base, args).await;
     }
+
+    let has_explicit_api_key = base.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
+
+    if !has_explicit_api_key && std::io::stdin().is_terminal() {
+        let methods = ["OAuth (browser)", "API key"];
+        let selected = ui::fuzzy_select("Select login method", &methods)?;
+        if selected == 0 {
+            return run_login_oauth(base, args).await;
+        }
+    }
+
     let interactive = std::io::stdin().is_terminal();
 
     let api_key = match base.api_key.clone() {
