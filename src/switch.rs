@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 
 use crate::args::BaseArgs;
-use crate::auth::{self, login, ProfileInfo};
+use crate::auth::{self, login};
 use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
@@ -55,7 +55,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
                 None
             } else {
                 let profiles = auth::list_profiles()?;
-                Some(resolve_org_to_profile(org_or_profile, &profiles)?)
+                Some(auth::resolve_org_to_profile(org_or_profile, &profiles)?)
             }
         }
         None => {
@@ -87,7 +87,11 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
             if b.org_name.is_none() && b.profile.is_none() {
                 let profiles = auth::list_profiles()?;
                 if profiles.len() > 1 {
-                    bail!("multiple auth profiles found; use --org to specify which one");
+                    let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+                    bail!(
+                        "multiple auth profiles found: {}. Use --profile to disambiguate.",
+                        names.join(", ")
+                    );
                 }
             }
             b
@@ -123,57 +127,6 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     eprintln!("Wrote to {}", path.display());
 
     Ok(())
-}
-
-fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Result<String> {
-    if profiles.is_empty() {
-        bail!("no auth profiles found. Run `bt auth login` to create one.");
-    }
-
-    if let Some(p) = profiles.iter().find(|p| p.name == identifier) {
-        return Ok(p.name.clone());
-    }
-
-    let matches: Vec<&ProfileInfo> = profiles
-        .iter()
-        .filter(|p| p.org_name.as_deref() == Some(identifier))
-        .collect();
-
-    match matches.len() {
-        0 => {
-            let available: Vec<String> = profiles
-                .iter()
-                .filter_map(|p| {
-                    p.org_name
-                        .as_ref()
-                        .map(|org| format!("  {} (profile: {})", org, p.name))
-                })
-                .collect();
-            bail!(
-                "no profile found for '{identifier}'.\nAvailable:\n{}",
-                available.join("\n")
-            );
-        }
-        1 => Ok(matches[0].name.clone()),
-        _ => {
-            if !std::io::stdin().is_terminal() {
-                bail!(
-                    "multiple profiles for org '{identifier}': {}. Use --profile to disambiguate.",
-                    matches
-                        .iter()
-                        .map(|p| p.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            let names: Vec<&str> = matches.iter().map(|p| p.name.as_str()).collect();
-            let idx = ui::fuzzy_select(
-                &format!("Multiple profiles for '{identifier}'. Select one"),
-                &names,
-            )?;
-            Ok(matches[idx].name.clone())
-        }
-    }
 }
 
 fn select_org_profile_interactive() -> Result<Option<String>> {
@@ -224,6 +177,7 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{resolve_org_to_profile, ProfileInfo};
 
     fn switch_args(target: Option<&str>) -> SwitchArgs {
         SwitchArgs {

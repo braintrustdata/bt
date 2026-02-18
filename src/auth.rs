@@ -73,6 +73,57 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
         .collect())
 }
 
+pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Result<String> {
+    if profiles.is_empty() {
+        bail!("no auth profiles found. Run `bt auth login` to create one.");
+    }
+
+    if let Some(p) = profiles.iter().find(|p| p.name == identifier) {
+        return Ok(p.name.clone());
+    }
+
+    let matches: Vec<&ProfileInfo> = profiles
+        .iter()
+        .filter(|p| p.org_name.as_deref() == Some(identifier))
+        .collect();
+
+    match matches.len() {
+        0 => {
+            let available: Vec<String> = profiles
+                .iter()
+                .filter_map(|p| {
+                    p.org_name
+                        .as_ref()
+                        .map(|org| format!("  {} (profile: {})", org, p.name))
+                })
+                .collect();
+            bail!(
+                "no profile found for '{identifier}'.\nAvailable:\n{}",
+                available.join("\n")
+            );
+        }
+        1 => Ok(matches[0].name.clone()),
+        _ => {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "multiple profiles for org '{identifier}': {}. Use --profile to disambiguate.",
+                    matches
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            let names: Vec<&str> = matches.iter().map(|p| p.name.as_str()).collect();
+            let idx = crate::ui::fuzzy_select(
+                &format!("Multiple profiles for '{identifier}'. Select one"),
+                &names,
+            )?;
+            Ok(matches[idx].name.clone())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthStore {
     #[serde(default)]
@@ -144,7 +195,7 @@ enum AuthCommand {
     /// Force-refresh OAuth access token for a profile
     Refresh,
     /// List saved auth profiles
-    List,
+    Profiles,
     /// Log out by removing a saved profile
     Logout(AuthLogoutArgs),
     /// Show current auth status
@@ -181,7 +232,7 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     match args.command {
         AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
-        AuthCommand::List => run_login_list(),
+        AuthCommand::Profiles => run_login_list(),
         AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args),
         AuthCommand::Status => run_login_status(&base),
     }

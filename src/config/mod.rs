@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 use std::{
-    env, fs, io,
+    env, fs,
+    io::{self, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -68,12 +69,14 @@ impl Config {
     }
 
     fn merge(&self, other: &Config) -> Config {
+        let mut extra = self.extra.clone();
+        extra.extend(other.extra.clone());
         Config {
             org: other.org.clone().or_else(|| self.org.clone()),
             project: other.project.clone().or_else(|| self.project.clone()),
             api_url: other.api_url.clone().or_else(|| self.api_url.clone()),
             app_url: other.app_url.clone().or_else(|| self.app_url.clone()),
-            extra: Default::default(),
+            extra,
         }
     }
 }
@@ -144,7 +147,12 @@ pub fn save_file(path: &Path, config: &Config) -> Result<()> {
     }
 
     let json = serde_json::to_string_pretty(config)?;
-    fs::write(path, json)?;
+    let temp_path = path.with_extension("tmp");
+    let mut file = fs::File::create(&temp_path)?;
+    file.write_all(json.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temp_path, path)?;
 
     Ok(())
 }
