@@ -4,6 +4,7 @@ use std::ffi::OsString;
 
 mod args;
 mod auth;
+#[allow(dead_code)]
 mod config;
 mod env;
 #[cfg(unix)]
@@ -13,6 +14,7 @@ mod init;
 mod projects;
 mod prompts;
 mod self_update;
+mod setup;
 mod sql;
 mod status;
 mod switch;
@@ -40,6 +42,10 @@ struct Cli {
 enum Commands {
     /// Initialize .bt config directory and files
     Init(CLIArgs<init::InitArgs>),
+    /// Configure Braintrust setup flows
+    Setup(CLIArgs<setup::SetupArgs>),
+    /// Manage workflow docs for coding agents
+    Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     /// Authenticate bt with Braintrust
@@ -89,6 +95,8 @@ async fn main() -> Result<()> {
             let (base, args) = cmd.with_config(&cfg);
             sql::run(base, args).await?
         }
+        Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
+        Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => {
             let (base, args) = cmd.with_config(&cfg);

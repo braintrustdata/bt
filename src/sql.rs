@@ -80,7 +80,7 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
 
     if !interactive {
         bail!(
-            "query is required in non-interactive mode. Pass `bt sql \"SELECT 1\"` or pipe SQL via stdin."
+            "query is required in non-interactive mode. Pass `bt sql \"SELECT * FROM project_logs('<PROJECT_ID>') LIMIT 1\"` or pipe SQL via stdin."
         );
     }
 
