@@ -17,7 +17,7 @@ pub struct InitArgs {}
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
     eprintln!("Link to a Braintrust project...");
 
-    let (org, project) = if let (Some(o), Some(p)) = (&base.org, &base.project) {
+    let (org, project) = if let (Some(o), Some(p)) = (&base.org_name, &base.project) {
         (o.clone(), p.clone())
     } else if !std::io::stdin().is_terminal() {
         bail!("--org and --project required in non-interactive mode");

@@ -15,17 +15,13 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
     pub profile: Option<String>,
 
-    /// Override active org
-    #[arg(short = 'o', long, env = "BRAINTRUST_DEFAULT_ORG")]
-    pub org: Option<String>,
+    /// Override active org (or via BRAINTRUST_ORG_NAME)
+    #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
+    pub org_name: Option<String>,
 
     /// Override active project
     #[arg(short = 'p', long, env = "BRAINTRUST_DEFAULT_PROJECT", global = true)]
     pub project: Option<String>,
-
-    /// Override organization selection (or via BRAINTRUST_ORG_NAME)
-    #[arg(long, env = "BRAINTRUST_ORG_NAME", global = true)]
-    pub org_name: Option<String>,
 
     /// Override stored API key (or via BRAINTRUST_API_KEY)
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true)]
@@ -50,8 +46,8 @@ pub struct BaseArgs {
 
 impl BaseArgs {
     pub fn with_config_defaults(mut self, cfg: &Config) -> Self {
-        if self.org.is_none() {
-            self.org = cfg.org.clone();
+        if self.org_name.is_none() {
+            self.org_name = cfg.org.clone();
         }
         if self.project.is_none() {
             self.project = cfg.project.clone();
@@ -88,9 +84,11 @@ mod tests {
     fn empty_args() -> BaseArgs {
         BaseArgs {
             json: false,
-            org: None,
+            profile: None,
+            org_name: None,
             project: None,
             api_key: None,
+            prefer_profile: false,
             api_url: None,
             app_url: None,
             env_file: None,
@@ -112,14 +110,14 @@ mod tests {
 
         let result = args.with_config_defaults(&cfg);
 
-        assert_eq!(result.org, Some("cfg-org".into()));
+        assert_eq!(result.org_name, Some("cfg-org".into()));
         assert_eq!(result.project, Some("cfg-proj".into()));
     }
 
     #[test]
     fn existing_args_not_overwritten() {
         let args = BaseArgs {
-            org: Some("cli-org".into()),
+            org_name: Some("cli-org".into()),
             project: Some("cli-proj".into()),
             ..empty_args()
         };
@@ -127,14 +125,14 @@ mod tests {
 
         let result = args.with_config_defaults(&cfg);
 
-        assert_eq!(result.org, Some("cli-org".into()));
+        assert_eq!(result.org_name, Some("cli-org".into()));
         assert_eq!(result.project, Some("cli-proj".into()));
     }
 
     #[test]
     fn partial_fill_org_set_project_from_config() {
         let args = BaseArgs {
-            org: Some("cli-org".into()),
+            org_name: Some("cli-org".into()),
             project: None,
             ..empty_args()
         };
@@ -142,14 +140,14 @@ mod tests {
 
         let result = args.with_config_defaults(&cfg);
 
-        assert_eq!(result.org, Some("cli-org".into()));
+        assert_eq!(result.org_name, Some("cli-org".into()));
         assert_eq!(result.project, Some("cfg-proj".into()));
     }
 
     #[test]
     fn empty_config_leaves_args_unchanged() {
         let args = BaseArgs {
-            org: Some("cli-org".into()),
+            org_name: Some("cli-org".into()),
             project: None,
             ..empty_args()
         };
@@ -157,7 +155,7 @@ mod tests {
 
         let result = args.with_config_defaults(&cfg);
 
-        assert_eq!(result.org, Some("cli-org".into()));
+        assert_eq!(result.org_name, Some("cli-org".into()));
         assert_eq!(result.project, None);
     }
 }

@@ -68,7 +68,7 @@ pub(crate) fn resolve_config(
 ) -> (Option<String>, Option<String>, Option<String>) {
     // Priority: CLI flags > local config > global config
     let org = base
-        .org
+        .org_name
         .clone()
         .or_else(|| local.org.clone())
         .or_else(|| global.org.clone());
@@ -80,7 +80,7 @@ pub(crate) fn resolve_config(
         .or_else(|| global.project.clone());
 
     // Determine source based on where the values came from
-    let source = if base.org.is_some() || base.project.is_some() {
+    let source = if base.org_name.is_some() || base.project.is_some() {
         Some("cli".to_string())
     } else if local.org.is_some() || local.project.is_some() {
         local_path.as_ref().map(|p| p.display().to_string())
@@ -101,9 +101,11 @@ mod tests {
     fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
         BaseArgs {
             json: false,
-            org: org.map(String::from),
+            profile: None,
+            org_name: org.map(String::from),
             project: project.map(String::from),
             api_key: None,
+            prefer_profile: false,
             api_url: None,
             app_url: None,
             env_file: None,

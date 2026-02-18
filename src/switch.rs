@@ -36,7 +36,7 @@ impl SwitchArgs {
             Some(t) => (None, Some(t.clone())),
         };
 
-        let org = base.org.clone().or(pos_org);
+        let org = base.org_name.clone().or(pos_org);
         let project = base.project.clone().or(pos_project);
 
         (org, project)
@@ -123,9 +123,11 @@ mod tests {
     fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
         BaseArgs {
             json: false,
-            org: org.map(String::from),
+            profile: None,
+            org_name: org.map(String::from),
             project: project.map(String::from),
             api_key: None,
+            prefer_profile: false,
             api_url: None,
             app_url: None,
             env_file: None,
