@@ -11,6 +11,7 @@ mod login;
 mod projects;
 mod prompts;
 mod self_update;
+mod setup;
 mod sql;
 mod sync;
 mod traces;
@@ -34,6 +35,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Configure Braintrust setup flows
+    Setup(CLIArgs<setup::SetupArgs>),
+    /// Manage workflow docs for coding agents
+    Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     /// Manage login profiles and persistent auth
@@ -61,6 +66,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(argv);
 
     match cli.command {
+        Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
+        Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
         Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
         Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
         Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
