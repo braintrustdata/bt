@@ -47,7 +47,15 @@ impl SwitchArgs {
 }
 
 pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
-    let path = config::resolve_write_path(args.global, args.local)?;
+    let path = if args.local {
+        config::local_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No local .bt directory found. Use bt init to initialize this directory."
+            )
+        })?
+    } else {
+        config::global_path()?
+    };
     let current_cfg = config::load().unwrap_or_default();
     let (resolved_org, resolved_project) = args.resolve_target(&base);
 
