@@ -2621,7 +2621,7 @@ async fn resolve_pull_object_ref(
         .iter()
         .map(|p| format!("{} ({})", p.name, p.id))
         .collect();
-    let project_idx = fuzzy_select("Select project", &project_labels)?;
+    let project_idx = fuzzy_select("Select project", &project_labels, 0)?;
     let project = &projects[project_idx];
 
     let mut choices: Vec<InteractiveChoice> = vec![InteractiveChoice {
@@ -2658,7 +2658,7 @@ async fn resolve_pull_object_ref(
     }
 
     let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
-    let object_idx = fuzzy_select("Select object", &labels)?;
+    let object_idx = fuzzy_select("Select object", &labels, 0)?;
     Ok(choices[object_idx].object_ref.clone())
 }
 

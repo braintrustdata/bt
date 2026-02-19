@@ -30,7 +30,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
     } else {
         let mut login_base = base.clone();
         if login_base.org_name.is_none() && login_base.profile.is_none() {
-            if let Some(profile) = auth::select_profile_interactive()? {
+            if let Some(profile) = auth::select_profile_interactive(None)? {
                 login_base.profile = Some(profile);
             }
         }
@@ -38,7 +38,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         let client = ApiClient::new(&ctx)?;
 
         let org = client.org_name().to_string();
-        let project = select_project_interactive(&client, Some("Link to project")).await?;
+        let project = select_project_interactive(&client, Some("Link to project"), None).await?;
 
         (org, project)
     };

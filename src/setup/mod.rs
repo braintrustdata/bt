@@ -959,7 +959,7 @@ fn resolve_scope_from_flags(
     }
 
     let choices = ["local (current git repo)", "global (user-wide)"];
-    let idx = crate::ui::fuzzy_select(prompt, &choices)?;
+    let idx = crate::ui::fuzzy_select(prompt, &choices, 0)?;
     Ok(if idx == 0 {
         InstallScope::Local
     } else {

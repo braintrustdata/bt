@@ -1427,7 +1427,7 @@ async fn resolve_project(
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     let names: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
-    let selected = fuzzy_select("Select project", &names)?;
+    let selected = fuzzy_select("Select project", &names, 0)?;
     let project = projects
         .get(selected)
         .context("project selection out of range")?

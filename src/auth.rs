@@ -114,13 +114,14 @@ pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Res
             let idx = crate::ui::fuzzy_select(
                 &format!("Multiple profiles for '{identifier}'. Select one"),
                 &names,
+                0,
             )?;
             Ok(matches[idx].name.clone())
         }
     }
 }
 
-pub fn select_profile_interactive() -> Result<Option<String>> {
+pub fn select_profile_interactive(current: Option<&str>) -> Result<Option<String>> {
     let profiles = list_profiles()?;
     if profiles.is_empty() {
         bail!("no auth profiles found. Run `bt auth login` to create one.");
@@ -137,7 +138,14 @@ pub fn select_profile_interactive() -> Result<Option<String>> {
         })
         .collect();
 
-    let idx = crate::ui::fuzzy_select("Select org", &labels)?;
+    let default = current
+        .and_then(|c| {
+            profiles
+                .iter()
+                .position(|p| p.name == c || p.org_name.as_deref() == Some(c))
+        })
+        .unwrap_or(0);
+    let idx = crate::ui::fuzzy_select("Select org", &labels, default)?;
     Ok(Some(profiles[idx].name.clone()))
 }
 
@@ -549,7 +557,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
 
     if !has_explicit_api_key && std::io::stdin().is_terminal() {
         let methods = ["OAuth (browser)", "API key"];
-        let selected = ui::fuzzy_select("Select login method", &methods)?;
+        let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
         if selected == 0 {
             return run_login_oauth(base, args).await;
         }
@@ -884,7 +892,7 @@ fn resolve_selected_profile_name_for_debug(
     }
 
     if store.profiles.len() > 1 && std::io::stdin().is_terminal() {
-        if let Some(name) = select_profile_interactive()? {
+        if let Some(name) = select_profile_interactive(None)? {
             return Ok((name, "interactive selection"));
         }
     }
@@ -1009,7 +1017,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         store.profiles.keys().next().unwrap().clone()
     } else if std::io::stdin().is_terminal() {
         let names: Vec<&str> = store.profiles.keys().map(|k| k.as_str()).collect();
-        let idx = crate::ui::fuzzy_select("Select profile to log out", &names)?;
+        let idx = crate::ui::fuzzy_select("Select profile to log out", &names, 0)?;
         names[idx].to_string()
     } else {
         bail!("multiple profiles exist. Use --profile <NAME> to specify which one.");
@@ -1193,7 +1201,7 @@ fn select_login_org(
         format!("{} [{}] ({})", org.name, org.id, api_url)
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let selection = ui::fuzzy_select("Select organization", &label_refs)?;
+    let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
     if selection == 0 {
         return Ok(None);
     }

@@ -84,7 +84,9 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let client = ApiClient::new(&ctx)?;
     let project = match base.project {
         Some(p) => p,
-        None if std::io::stdin().is_terminal() => select_project_interactive(&client, None).await?,
+        None if std::io::stdin().is_terminal() => {
+            select_project_interactive(&client, None, None).await?
+        }
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 

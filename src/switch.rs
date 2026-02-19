@@ -48,6 +48,7 @@ impl SwitchArgs {
 
 pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let path = config::resolve_write_path(args.global, args.local)?;
+    let current_cfg = config::load().unwrap_or_default();
     let (resolved_org, resolved_project) = args.resolve_target(&base);
 
     let profile_name = match &resolved_org {
@@ -61,7 +62,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
         None => {
             if resolved_project.is_none() && std::io::stdin().is_terminal() {
-                auth::select_profile_interactive()?
+                auth::select_profile_interactive(current_cfg.org.as_deref())?
             } else {
                 None
             }
@@ -109,7 +110,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
             if !std::io::stdin().is_terminal() {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
-            Some(select_project_interactive(&client, None).await?)
+            Some(select_project_interactive(&client, None, current_cfg.project.as_deref()).await?)
         }
     };
 

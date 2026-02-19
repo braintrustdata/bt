@@ -69,6 +69,6 @@ pub async fn select_prompt_interactive(client: &ApiClient, project: &str) -> Res
     prompts.sort_by(|a, b| a.name.cmp(&b.name));
     let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
 
-    let selection = ui::fuzzy_select("Select prompt", &names)?;
+    let selection = ui::fuzzy_select("Select prompt", &names, 0)?;
     Ok(prompts[selection].clone())
 }
