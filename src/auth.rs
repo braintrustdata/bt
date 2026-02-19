@@ -216,7 +216,13 @@ enum AuthCommand {
     /// Log out by removing a saved profile
     Logout(AuthLogoutArgs),
     /// Show current auth status
-    Status,
+    Status(AuthStatusArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct AuthStatusArgs {
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -251,7 +257,7 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
         AuthCommand::Refresh => run_login_refresh(&base).await,
         AuthCommand::Profiles => run_login_list(),
         AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args),
-        AuthCommand::Status => run_login_status(&base),
+        AuthCommand::Status(status_args) => run_login_status(&base, status_args).await,
     }
 }
 
@@ -877,6 +883,12 @@ fn resolve_selected_profile_name_for_debug(
         return Ok((name, "only profile"));
     }
 
+    if store.profiles.len() > 1 && std::io::stdin().is_terminal() {
+        if let Some(name) = select_profile_interactive()? {
+            return Ok((name, "interactive selection"));
+        }
+    }
+
     bail!("no profile selected; pass --profile <NAME>, set BRAINTRUST_PROFILE, or configure an org")
 }
 
@@ -1006,7 +1018,45 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
     run_login_delete(&profile_name, args.force)
 }
 
-fn run_login_status(base: &BaseArgs) -> Result<()> {
+enum CredentialStatus {
+    Ok,
+    Missing,
+    Expired,
+    Error(String),
+}
+
+fn check_profile_credential(name: &str, profile: &AuthProfile) -> CredentialStatus {
+    match profile.auth_kind {
+        AuthKind::ApiKey => match load_profile_secret(name) {
+            Ok(Some(_)) => CredentialStatus::Ok,
+            Ok(None) => CredentialStatus::Missing,
+            Err(e) => CredentialStatus::Error(e.to_string()),
+        },
+        AuthKind::Oauth => match load_profile_oauth_refresh_token(name) {
+            Ok(Some(_)) => match profile.oauth_access_expires_at {
+                Some(ts) if !oauth_access_token_is_fresh(ts) => CredentialStatus::Expired,
+                _ => CredentialStatus::Ok,
+            },
+            Ok(None) => CredentialStatus::Missing,
+            Err(e) => CredentialStatus::Error(e.to_string()),
+        },
+    }
+}
+
+fn format_profile_line(name: &str, profile: &AuthProfile) -> String {
+    let kind = match profile.auth_kind {
+        AuthKind::ApiKey => "api_key",
+        AuthKind::Oauth => "oauth",
+    };
+    let org = profile
+        .org_name
+        .as_deref()
+        .map(|o| format!(" — org: {o}"))
+        .unwrap_or_default();
+    format!("{name} — {kind}{org}")
+}
+
+async fn run_login_status(base: &BaseArgs, args: AuthStatusArgs) -> Result<()> {
     let store = load_auth_store()?;
     if resolve_api_key_override(base).is_some() {
         println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
@@ -1020,29 +1070,42 @@ fn run_login_status(base: &BaseArgs) -> Result<()> {
         return Ok(());
     }
 
-    let selected_profile = resolve_selected_profile_name_for_debug(base, &store).ok();
-
-    if let Some((profile_name, source)) = selected_profile {
-        println!("Selected profile: {profile_name} (source: {source})");
-        if let Some(profile) = store.profiles.get(profile_name.as_str()) {
-            let auth_method = match profile.auth_kind {
-                AuthKind::ApiKey => "api_key",
-                AuthKind::Oauth => "oauth",
-            };
-            println!("Auth method: {auth_method}");
-            if let Some(org_name) = &profile.org_name {
-                println!("Org: {org_name}");
-            }
-            if let Some(api_url) = &profile.api_url {
-                println!("API URL: {api_url}");
-            }
-        }
-        println!("Credentials file: {}", auth_store_path()?.display());
+    if store.profiles.is_empty() {
+        println!("No profiles. Run `bt auth login` to create one.");
         return Ok(());
     }
 
-    println!("No profile resolved.");
-    println!("Run `bt auth login`, `bt auth login --oauth`, or set BRAINTRUST_API_KEY.");
+    for (name, profile) in &store.profiles {
+        let status = check_profile_credential(name, profile);
+        let line = format_profile_line(name, profile);
+        match status {
+            CredentialStatus::Ok => {
+                crate::ui::print_command_status(crate::ui::CommandStatus::Success, &line);
+            }
+            CredentialStatus::Missing => {
+                crate::ui::print_command_status(
+                    crate::ui::CommandStatus::Error,
+                    &format!("{line} — credential missing"),
+                );
+            }
+            CredentialStatus::Expired => {
+                crate::ui::print_command_status(
+                    crate::ui::CommandStatus::Warning,
+                    &format!("{line} — token expired"),
+                );
+            }
+            CredentialStatus::Error(msg) => {
+                crate::ui::print_command_status(
+                    crate::ui::CommandStatus::Error,
+                    &format!("{line} — {msg}"),
+                );
+            }
+        }
+    }
+
+    if args.verbose {
+        println!("Credentials file: {}", auth_store_path()?.display());
+    }
     Ok(())
 }
 
