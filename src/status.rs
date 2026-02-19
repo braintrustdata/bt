@@ -17,6 +17,7 @@ pub struct StatusArgs {
 struct StatusOutput {
     org: Option<String>,
     project: Option<String>,
+    profile: Option<String>,
     source: Option<String>,
 }
 
@@ -31,11 +32,13 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
 
     let (org, project, source) =
         resolve_config(&base, &global_cfg, &local_cfg, &local_path, &global_path);
+    let profile = resolve_profile(org.as_deref());
 
     if base.json {
         let output = StatusOutput {
             org,
             project,
+            profile,
             source,
         };
         println!("{}", serde_json::to_string(&output)?);
@@ -45,23 +48,8 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
     if args.verbose {
         println!("org: {}", org.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
-        if let Some(ref o) = org {
-            if let Ok(profiles) = auth::list_profiles() {
-                let matched = profiles.iter().find(|p| p.name == *o).or_else(|| {
-                    let by_org: Vec<_> = profiles
-                        .iter()
-                        .filter(|p| p.org_name.as_deref() == Some(o.as_str()))
-                        .collect();
-                    if by_org.len() == 1 {
-                        Some(by_org[0])
-                    } else {
-                        None
-                    }
-                });
-                if let Some(p) = matched {
-                    println!("profile: {}", p.name);
-                }
-            }
+        if let Some(ref p) = profile {
+            println!("profile: {p}");
         }
         if let Some(src) = source {
             println!("source: {src}");
@@ -106,6 +94,22 @@ pub(crate) fn resolve_config(
     };
 
     (org, project, source)
+}
+
+fn resolve_profile(org: Option<&str>) -> Option<String> {
+    let o = org?;
+    let profiles = auth::list_profiles().ok()?;
+    profiles
+        .iter()
+        .find(|p| p.name == o)
+        .or_else(|| {
+            let by_org: Vec<_> = profiles
+                .iter()
+                .filter(|p| p.org_name.as_deref() == Some(o))
+                .collect();
+            (by_org.len() == 1).then(|| by_org[0])
+        })
+        .map(|p| p.name.clone())
 }
 
 #[cfg(test)]
@@ -212,7 +216,6 @@ mod tests {
 
         assert_eq!(org, Some("cli-org".into()));
         assert_eq!(project, Some("local-proj".into()));
-        // Source reports CLI since at least one value came from CLI
         assert_eq!(source, Some("cli".into()));
     }
 
