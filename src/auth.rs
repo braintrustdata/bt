@@ -1033,24 +1033,6 @@ enum CredentialStatus {
     Error(String),
 }
 
-fn check_profile_credential(name: &str, profile: &AuthProfile) -> CredentialStatus {
-    match profile.auth_kind {
-        AuthKind::ApiKey => match load_profile_secret(name) {
-            Ok(Some(_)) => CredentialStatus::Ok,
-            Ok(None) => CredentialStatus::Missing,
-            Err(e) => CredentialStatus::Error(e.to_string()),
-        },
-        AuthKind::Oauth => match load_profile_oauth_refresh_token(name) {
-            Ok(Some(_)) => match profile.oauth_access_expires_at {
-                Some(ts) if !oauth_access_token_is_fresh(ts) => CredentialStatus::Expired,
-                _ => CredentialStatus::Ok,
-            },
-            Ok(None) => CredentialStatus::Missing,
-            Err(e) => CredentialStatus::Error(e.to_string()),
-        },
-    }
-}
-
 fn format_profile_line(name: &str, profile: &AuthProfile) -> String {
     let kind = match profile.auth_kind {
         AuthKind::ApiKey => "api_key",
@@ -1084,8 +1066,9 @@ async fn run_login_status(base: &BaseArgs, args: AuthStatusArgs) -> Result<()> {
     }
 
     for (name, profile) in &store.profiles {
-        let status = check_profile_credential(name, profile);
         let line = format_profile_line(name, profile);
+        let app_url = profile.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+        let status = verify_profile(name, profile, app_url).await;
         match status {
             CredentialStatus::Ok => {
                 crate::ui::print_command_status(crate::ui::CommandStatus::Success, &line);
@@ -1115,6 +1098,43 @@ async fn run_login_status(base: &BaseArgs, args: AuthStatusArgs) -> Result<()> {
         println!("Credentials file: {}", auth_store_path()?.display());
     }
     Ok(())
+}
+
+async fn verify_profile(name: &str, profile: &AuthProfile, app_url: &str) -> CredentialStatus {
+    let api_key = match profile.auth_kind {
+        AuthKind::ApiKey => match load_profile_secret(name) {
+            Ok(Some(k)) => k,
+            Ok(None) => return CredentialStatus::Missing,
+            Err(e) => return CredentialStatus::Error(e.to_string()),
+        },
+        AuthKind::Oauth => {
+            if let Some(ts) = profile.oauth_access_expires_at {
+                if !oauth_access_token_is_fresh(ts) {
+                    return CredentialStatus::Expired;
+                }
+            }
+            match load_profile_oauth_access_token(name) {
+                Ok(Some(k)) => k,
+                Ok(None) => return CredentialStatus::Missing,
+                Err(e) => return CredentialStatus::Error(e.to_string()),
+            }
+        }
+    };
+    match fetch_login_orgs(&api_key, app_url).await {
+        Ok(_) => CredentialStatus::Ok,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("401") || msg.contains("Unauthorized") {
+                if profile.auth_kind == AuthKind::Oauth {
+                    CredentialStatus::Expired
+                } else {
+                    CredentialStatus::Error("invalid API key".to_string())
+                }
+            } else {
+                CredentialStatus::Error(msg)
+            }
+        }
+    }
 }
 
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
