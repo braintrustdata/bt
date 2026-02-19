@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use dialoguer::{console, theme::ColorfulTheme, Select};
 
 use crate::args::BaseArgs;
 use crate::auth::{self, login};
@@ -47,17 +48,9 @@ impl SwitchArgs {
 }
 
 pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
-    let path = if args.local {
-        config::local_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No local .bt directory found. Use bt init to initialize this directory."
-            )
-        })?
-    } else {
-        config::global_path()?
-    };
     let current_cfg = config::load().unwrap_or_default();
     let (resolved_org, resolved_project) = args.resolve_target(&base);
+    let mut interactive = false;
 
     let profile_name = match &resolved_org {
         Some(org_or_profile) => {
@@ -70,6 +63,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
         None => {
             if resolved_project.is_none() && std::io::stdin().is_terminal() {
+                interactive = true;
                 auth::select_profile_interactive(current_cfg.org.as_deref())?
             } else {
                 None
@@ -118,8 +112,23 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
             if !std::io::stdin().is_terminal() {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
+            interactive = true;
             Some(select_project_interactive(&client, None, current_cfg.project.as_deref()).await?)
         }
+    };
+
+    let path = if args.local {
+        config::local_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No local .bt directory found. Use bt init to initialize this directory."
+            )
+        })?
+    } else if args.global {
+        config::global_path()?
+    } else if interactive && config::local_path().is_some() {
+        select_scope()?
+    } else {
+        config::global_path()?
     };
 
     let mut cfg = config::load_file(&path);
@@ -138,6 +147,58 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn select_scope() -> Result<std::path::PathBuf> {
+    let global = config::global_path()?;
+    let local = config::local_path().unwrap();
+    let options = [
+        format!(
+            "Global ({})",
+            console::style(
+                dirs::home_dir()
+                    .and_then(|home| global
+                        .parent()
+                        .unwrap()
+                        .strip_prefix(&home)
+                        .ok()
+                        .map(|rel| format!("~/{}", rel.display())))
+                    .unwrap_or_else(|| global.parent().unwrap().display().to_string())
+            )
+            .dim()
+        ),
+        format!(
+            "Local ({})",
+            console::style(format!(
+                "{}/{}",
+                local
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy(),
+                local
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+            ))
+            .dim()
+        ),
+    ];
+    let idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Save to")
+        .items(&options)
+        .default(1)
+        .interact()?;
+    if idx == 0 {
+        Ok(global)
+    } else {
+        Ok(local)
+    }
 }
 
 async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<String> {
