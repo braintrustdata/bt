@@ -254,6 +254,9 @@ mod tests {
         ProfileInfo {
             name: name.to_string(),
             org_name: org_name.map(String::from),
+            user_name: None,
+            email: None,
+            api_key_hint: None,
         }
     }
 
