@@ -839,6 +839,8 @@ fn resolve_instrument_invocation(
             program: "claude".to_string(),
             args: vec![
                 "-p".to_string(),
+                "--permission-mode".to_string(),
+                "acceptEdits".to_string(),
                 "--verbose".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
@@ -910,9 +912,11 @@ fn render_instrument_task(repo_root: &Path, workflows: &[WorkflowArg]) -> String
 Requirements:
 1. Review the Braintrust instrumentation docs in `{}`.
 2. Focus on these workflow docs: {}.
-3. Add tracing/instrumentation to the application code.
-4. Keep behavior intact; avoid unrelated refactors.
-5. If tests exist, run the smallest relevant tests after instrumentation.
+3. Use the installed Braintrust agent skills in this repo and prefer local `bt` CLI commands to verify setup.
+4. Do not rely on the Braintrust MCP server for this setup flow.
+5. Add tracing/instrumentation to the application code.
+6. Keep behavior intact; avoid unrelated refactors.
+7. If tests exist, run the smallest relevant tests after instrumentation.
 
 Output:
 - Updated source files with Braintrust instrumentation.
@@ -2289,6 +2293,15 @@ mod tests {
     }
 
     #[test]
+    fn render_instrument_task_includes_local_cli_and_no_mcp_guidance() {
+        let root = PathBuf::from("/tmp/repo");
+        let task = render_instrument_task(&root, &[WorkflowArg::Instrument, WorkflowArg::Observe]);
+        assert!(task.contains("Use the installed Braintrust agent skills"));
+        assert!(task.contains("prefer local `bt` CLI commands"));
+        assert!(task.contains("Do not rely on the Braintrust MCP server"));
+    }
+
+    #[test]
     fn pick_agent_mode_target_prefers_codex() {
         let selected = pick_agent_mode_target(&[Agent::Claude, Agent::Codex, Agent::Cursor]);
         assert_eq!(selected, Some(Agent::Codex));
@@ -2331,6 +2344,8 @@ mod tests {
                     args,
                     vec![
                         "-p".to_string(),
+                        "--permission-mode".to_string(),
+                        "acceptEdits".to_string(),
                         "--verbose".to_string(),
                         "--output-format".to_string(),
                         "stream-json".to_string(),
