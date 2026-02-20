@@ -1,12 +1,10 @@
-use std::io::IsTerminal;
-
 use anyhow::{anyhow, bail, Result};
 use dialoguer::Confirm;
 
 use crate::{
     http::ApiClient,
     prompts::api::{self, Prompt},
-    ui::{self, print_command_status, with_spinner, CommandStatus},
+    ui::{self, is_interactive, print_command_status, with_spinner, CommandStatus},
 };
 
 pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: bool) -> Result<()> {
@@ -19,14 +17,14 @@ pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: b
             .await?
             .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!("prompt slug required. Use: bt prompts delete <slug>");
             }
             select_prompt_interactive(client, project).await?
         }
     };
 
-    if !force && std::io::stdin().is_terminal() {
+    if !force && is_interactive() {
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete prompt '{}' from {}?",

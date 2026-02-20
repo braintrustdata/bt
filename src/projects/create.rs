@@ -1,11 +1,12 @@
-use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use dialoguer::Input;
 
 use crate::http::ApiClient;
-use crate::ui::{print_command_status, with_spinner, with_spinner_visible, CommandStatus};
+use crate::ui::{
+    is_interactive, print_command_status, with_spinner, with_spinner_visible, CommandStatus,
+};
 
 use super::api;
 
@@ -13,7 +14,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
     let name = match name {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!("project name required. Use: bt projects create <name>");
             }
             Input::new().with_prompt("Project name").interact_text()?

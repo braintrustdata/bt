@@ -77,6 +77,14 @@ async fn main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
+    if std::env::var_os("NO_COLOR").is_some() {
+        dialoguer::console::set_colors_enabled(false);
+        dialoguer::console::set_colors_enabled_stderr(false);
+    }
+    if argv.iter().any(|a| a == "--no-input") {
+        ui::set_no_input(true);
+    }
+
     let cli = Cli::parse_from(argv);
 
     match cli.command {

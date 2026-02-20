@@ -1,5 +1,3 @@
-use std::io::IsTerminal;
-
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use dialoguer::{console, theme::ColorfulTheme, Select};
@@ -9,7 +7,9 @@ use crate::auth::{self, login};
 use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
-use crate::ui::{print_command_status, select_project_interactive, with_spinner, CommandStatus};
+use crate::ui::{
+    is_interactive, print_command_status, select_project_interactive, with_spinner, CommandStatus,
+};
 
 #[derive(Debug, Clone, Args)]
 pub struct SwitchArgs {
@@ -62,7 +62,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
             }
         }
         None => {
-            if resolved_project.is_none() && std::io::stdin().is_terminal() {
+            if resolved_project.is_none() && is_interactive() {
                 interactive = true;
                 auth::select_profile_interactive(current_cfg.org.as_deref())?
             } else {
@@ -109,7 +109,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let project_name = match resolved_project {
         Some(p) => Some(validate_or_create_project(&client, &p).await?),
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
@@ -205,7 +205,7 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<St
         return Ok(name.to_string());
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !is_interactive() {
         bail!("project '{name}' not found");
     }
 
@@ -244,6 +244,7 @@ mod tests {
             project: project.map(String::from),
             api_key: None,
             prefer_profile: false,
+            no_input: false,
             api_url: None,
             app_url: None,
             env_file: None,

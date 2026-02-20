@@ -106,7 +106,7 @@ pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Res
         }
         1 => Ok(matches[0].name.clone()),
         _ => {
-            if !std::io::stdin().is_terminal() {
+            if !ui::is_interactive() {
                 bail!(
                     "multiple profiles for org '{identifier}': {}. Use --profile to disambiguate.",
                     matches
@@ -573,7 +573,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
 
     let has_explicit_api_key = base.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
 
-    if !has_explicit_api_key && std::io::stdin().is_terminal() {
+    if !has_explicit_api_key && ui::is_interactive() {
         let methods = ["OAuth (browser)", "API key"];
         let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
         if selected == 0 {
@@ -581,7 +581,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         }
     }
 
-    let interactive = std::io::stdin().is_terminal();
+    let interactive = ui::is_interactive();
 
     let api_key = match base.api_key.clone() {
         Some(value) if !value.trim().is_empty() => value,
@@ -606,10 +606,10 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
 
     if interactive {
         match selected_org.as_ref() {
-            Some(org) => println!("Selected org: {}", org.name),
-            None => println!("Selected org: (none, cross-org mode)"),
+            Some(org) => eprintln!("Selected org: {}", org.name),
+            None => eprintln!("Selected org: (none, cross-org mode)"),
         }
-        println!("Resolved API URL: {selected_api_url}");
+        eprintln!("Resolved API URL: {selected_api_url}");
         let confirmed = Confirm::new()
             .with_prompt("Use this API URL?")
             .default(true)
@@ -643,14 +643,20 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     save_auth_store(&store)?;
 
     if let Some(org) = selected_org.as_ref() {
-        println!(
-            "Logged in to org '{}' with profile '{}'",
-            org.name, profile_name
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!(
+                "Logged in to org '{}' with profile '{}'",
+                org.name, profile_name
+            ),
         );
     } else {
-        println!("Logged in with no default org (cross-org) using profile '{profile_name}'");
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!("Logged in with no default org (cross-org) using profile '{profile_name}'"),
+        );
     }
-    println!(
+    eprintln!(
         "Saved profile metadata at {} and credential in secure store (OS keychain when available; plaintext fallback otherwise)",
         auth_store_path()?.display()
     );
@@ -658,7 +664,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
 }
 
 async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
-    if !std::io::stdin().is_terminal() {
+    if !ui::is_interactive() {
         bail!("oauth login requires an interactive terminal");
     }
     if let Some(warning) = oauth_ignored_api_key_warning(base) {
@@ -703,8 +709,8 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .url();
     let authorize_url = authorize_url.to_string();
 
-    println!("Opening browser for OAuth authorization...");
-    println!("If it does not open, visit:\n{authorize_url}");
+    eprintln!("Opening browser for OAuth authorization...");
+    eprintln!("If it does not open, visit:\n{authorize_url}");
     if !args.no_browser {
         if let Err(err) = open::that(&authorize_url) {
             eprintln!("warning: failed to open browser automatically: {err}");
@@ -734,7 +740,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )
     .await?;
     if let Some(expires_in) = oauth_tokens.expires_in {
-        println!("Received OAuth access token (expires in {expires_in}s).");
+        eprintln!("Received OAuth access token (expires in {expires_in}s).");
     }
 
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
@@ -749,10 +755,10 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )?;
 
     match selected_org.as_ref() {
-        Some(org) => println!("Selected org: {}", org.name),
-        None => println!("Selected org: (none, cross-org mode)"),
+        Some(org) => eprintln!("Selected org: {}", org.name),
+        None => eprintln!("Selected org: (none, cross-org mode)"),
     }
-    println!("Resolved API URL: {selected_api_url}");
+    eprintln!("Resolved API URL: {selected_api_url}");
     let confirmed = Confirm::new()
         .with_prompt("Use this API URL?")
         .default(true)
@@ -789,16 +795,20 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     save_auth_store(&store)?;
 
     if let Some(org) = selected_org.as_ref() {
-        println!(
-            "Logged in with OAuth to org '{}' with profile '{}'",
-            org.name, profile_name
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!(
+                "Logged in with OAuth to org '{}' with profile '{}'",
+                org.name, profile_name
+            ),
         );
     } else {
-        println!(
-            "Logged in with OAuth and no default org (cross-org) using profile '{profile_name}'"
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!("Logged in with OAuth and no default org (cross-org) using profile '{profile_name}'"),
         );
     }
-    println!(
+    eprintln!(
         "Saved profile metadata at {} and refresh token in secure store (OS keychain when available; plaintext fallback otherwise)",
         auth_store_path()?.display()
     );
@@ -916,7 +926,7 @@ fn resolve_selected_profile_name_for_debug(
         return Ok((name, "only profile"));
     }
 
-    if store.profiles.len() > 1 && std::io::stdin().is_terminal() {
+    if store.profiles.len() > 1 && ui::is_interactive() {
         if let Some(name) = select_profile_interactive(None)? {
             return Ok((name, "interactive selection"));
         }
@@ -962,7 +972,7 @@ fn resolve_profile_name(
 async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
     if resolve_api_key_override(base).is_some() {
         println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
-        println!("Tip: pass --prefer-profile or unset BRAINTRUST_API_KEY to use profiles.");
+        eprintln!("Tip: pass --prefer-profile or unset BRAINTRUST_API_KEY to use profiles.");
         return Ok(());
     }
 
@@ -998,7 +1008,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
 
     if args.verbose {
         if let Ok(path) = auth_store_path() {
-            println!("\nCredentials: {}", path.display());
+            eprintln!("\nCredentials: {}", path.display());
         }
     }
 
@@ -1018,13 +1028,13 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
         );
     }
 
-    if !force && std::io::stdin().is_terminal() {
+    if !force && ui::is_interactive() {
         let confirmed = Confirm::new()
             .with_prompt(format!("Delete profile '{profile_name}'?"))
             .default(false)
             .interact()?;
         if !confirmed {
-            println!("Cancelled");
+            eprintln!("Cancelled");
             return Ok(());
         }
     }
@@ -1041,7 +1051,10 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
         eprintln!("warning: failed to delete oauth access token for '{profile_name}': {err}");
     }
 
-    println!("Deleted profile '{profile_name}'");
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format!("Deleted profile '{profile_name}'"),
+    );
     Ok(())
 }
 
@@ -1060,7 +1073,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         p
     } else if store.profiles.len() == 1 {
         store.profiles.keys().next().unwrap().clone()
-    } else if std::io::stdin().is_terminal() {
+    } else if ui::is_interactive() {
         let names: Vec<&str> = store.profiles.keys().map(|k| k.as_str()).collect();
         let idx = crate::ui::fuzzy_select("Select profile to log out", &names, 0)?;
         names[idx].to_string()
@@ -1745,7 +1758,7 @@ fn to_oauth_token_response(tokens: OAuth2StdTokenResponse) -> OAuthTokenResponse
 }
 
 fn prompt_api_key() -> Result<String> {
-    if !std::io::stdin().is_terminal() {
+    if !ui::is_interactive() {
         bail!("--api-key is required in non-interactive mode");
     }
 
@@ -2373,6 +2386,7 @@ mod tests {
             org_name: None,
             api_key: None,
             prefer_profile: false,
+            no_input: false,
             api_url: None,
             app_url: None,
             env_file: None,

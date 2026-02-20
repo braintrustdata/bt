@@ -163,6 +163,7 @@ mod tests {
             project: project.map(String::from),
             api_key: None,
             prefer_profile: false,
+            no_input: false,
             api_url: None,
             app_url: None,
             env_file: None,

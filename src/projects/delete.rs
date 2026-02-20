@@ -1,10 +1,10 @@
-use std::io::IsTerminal;
-
 use anyhow::{bail, Result};
 use dialoguer::Confirm;
 
 use crate::http::ApiClient;
-use crate::ui::{print_command_status, select_project_interactive, with_spinner, CommandStatus};
+use crate::ui::{
+    is_interactive, print_command_status, select_project_interactive, with_spinner, CommandStatus,
+};
 
 use super::api;
 
@@ -18,7 +18,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<
             .await?
             .ok_or_else(|| anyhow::anyhow!("project '{n}' not found"))?,
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!("project name required. Use: bt projects delete <name>");
             }
             let name = select_project_interactive(client, None, None).await?;
@@ -31,7 +31,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<
         }
     };
 
-    if !force && std::io::stdin().is_terminal() {
+    if !force && is_interactive() {
         let confirm = Confirm::new()
             .with_prompt(format!("Delete project '{}'?", project.name))
             .default(false)

@@ -1,11 +1,12 @@
-use std::io::IsTerminal;
-
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::{
-    args::BaseArgs, auth::login, http::ApiClient, projects::api::get_project_by_name,
-    ui::select_project_interactive,
+    args::BaseArgs,
+    auth::login,
+    http::ApiClient,
+    projects::api::get_project_by_name,
+    ui::{is_interactive, select_project_interactive},
 };
 
 mod api;
@@ -87,9 +88,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         .or_else(|| crate::config::load().ok().and_then(|c| c.project))
     {
         Some(p) => p,
-        None if std::io::stdin().is_terminal() => {
-            select_project_interactive(&client, None, None).await?
-        }
+        None if is_interactive() => select_project_interactive(&client, None, None).await?,
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 

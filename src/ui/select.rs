@@ -1,5 +1,3 @@
-use std::io::IsTerminal;
-
 use anyhow::{bail, Result};
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 
@@ -7,7 +5,7 @@ use crate::{http::ApiClient, projects::api, ui::with_spinner};
 
 /// Fuzzy select from a list of items. Requires TTY.
 pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> Result<usize> {
-    if !std::io::stdin().is_terminal() {
+    if !super::is_interactive() {
         bail!("interactive mode requires TTY");
     }
 
