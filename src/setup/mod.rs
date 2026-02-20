@@ -864,6 +864,20 @@ fn resolve_instrument_invocation(
             prompt_file_arg: Some(task_path.to_path_buf()),
         });
     }
+    if matches!(agent, Agent::Cursor) {
+        return Ok(InstrumentInvocation::Program {
+            program: "cursor-agent".to_string(),
+            args: vec![
+                "-p".to_string(),
+                "-f".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--stream-partial-output".to_string(),
+            ],
+            stdin_file: None,
+            prompt_file_arg: Some(task_path.to_path_buf()),
+        });
+    }
 
     bail!(
         "no default command for agent `{}`; pass `--agent-cmd '<command>'`",
@@ -2520,6 +2534,37 @@ mod tests {
             } => {
                 assert_eq!(program, "opencode");
                 assert_eq!(args, vec!["run".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn cursor_instrument_invocation_uses_print_with_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation = resolve_instrument_invocation(Agent::Cursor, None, &task_path)
+            .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+            } => {
+                assert_eq!(program, "cursor-agent");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-p".to_string(),
+                        "-f".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--stream-partial-output".to_string(),
+                    ]
+                );
                 assert_eq!(stdin_file, None);
                 assert_eq!(prompt_file_arg, Some(task_path));
             }
