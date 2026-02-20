@@ -832,16 +832,14 @@ fn resolve_instrument_invocation(
         return Ok(InstrumentInvocation::Shell(trimmed.to_string()));
     }
 
-    if matches!(agent, Agent::Codex) {
-        return Ok(InstrumentInvocation::Program {
+    let invocation = match agent {
+        Agent::Codex => InstrumentInvocation::Program {
             program: "codex".to_string(),
             args: vec!["exec".to_string(), "-".to_string()],
             stdin_file: Some(task_path.to_path_buf()),
             prompt_file_arg: None,
-        });
-    }
-    if matches!(agent, Agent::Claude) {
-        return Ok(InstrumentInvocation::Program {
+        },
+        Agent::Claude => InstrumentInvocation::Program {
             program: "claude".to_string(),
             args: vec![
                 "-p".to_string(),
@@ -854,18 +852,14 @@ fn resolve_instrument_invocation(
             ],
             stdin_file: Some(task_path.to_path_buf()),
             prompt_file_arg: None,
-        });
-    }
-    if matches!(agent, Agent::Opencode) {
-        return Ok(InstrumentInvocation::Program {
+        },
+        Agent::Opencode => InstrumentInvocation::Program {
             program: "opencode".to_string(),
             args: vec!["run".to_string()],
             stdin_file: None,
             prompt_file_arg: Some(task_path.to_path_buf()),
-        });
-    }
-    if matches!(agent, Agent::Cursor) {
-        return Ok(InstrumentInvocation::Program {
+        },
+        Agent::Cursor => InstrumentInvocation::Program {
             program: "cursor-agent".to_string(),
             args: vec![
                 "-p".to_string(),
@@ -876,13 +870,9 @@ fn resolve_instrument_invocation(
             ],
             stdin_file: None,
             prompt_file_arg: Some(task_path.to_path_buf()),
-        });
-    }
-
-    bail!(
-        "no default command for agent `{}`; pass `--agent-cmd '<command>'`",
-        agent.as_str()
-    )
+        },
+    };
+    Ok(invocation)
 }
 
 async fn run_agent_invocation(
