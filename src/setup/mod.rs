@@ -613,7 +613,7 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
         task_path.display()
     ));
 
-    let status = run_agent_invocation(&root, &invocation).await?;
+    let status = run_agent_invocation(&root, &invocation, !base.json).await?;
     if status.success() {
         results.push(AgentInstallResult {
             agent: selected,
@@ -834,6 +834,19 @@ fn resolve_instrument_invocation(
             stdin_file: Some(task_path.to_path_buf()),
         });
     }
+    if matches!(agent, Agent::Claude) {
+        return Ok(InstrumentInvocation::Program {
+            program: "claude".to_string(),
+            args: vec![
+                "-p".to_string(),
+                "--verbose".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--include-partial-messages".to_string(),
+            ],
+            stdin_file: Some(task_path.to_path_buf()),
+        });
+    }
 
     bail!(
         "no default command for agent `{}`; pass `--agent-cmd '<command>'`",
@@ -844,34 +857,44 @@ fn resolve_instrument_invocation(
 async fn run_agent_invocation(
     root: &Path,
     invocation: &InstrumentInvocation,
+    show_output: bool,
 ) -> Result<std::process::ExitStatus> {
-    let mut command = match invocation {
+    match invocation {
+        InstrumentInvocation::Shell(command_text) => {
+            let mut command = Command::new("bash");
+            command.arg("-lc").arg(command_text);
+            command.current_dir(root);
+            if !show_output {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+            command
+                .status()
+                .await
+                .with_context(|| format!("failed to run agent command in {}", root.display()))
+        }
         InstrumentInvocation::Program {
             program,
             args,
             stdin_file,
         } => {
             let mut command = Command::new(program);
-            command.args(args);
+            command.args(args).current_dir(root);
             if let Some(path) = stdin_file {
                 let file = fs::File::open(path).with_context(|| {
                     format!("failed to open task prompt file {}", path.display())
                 })?;
                 command.stdin(Stdio::from(file));
             }
+
+            if !show_output {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
             command
+                .status()
+                .await
+                .with_context(|| format!("failed to run agent command in {}", root.display()))
         }
-        InstrumentInvocation::Shell(command_text) => {
-            let mut command = Command::new("bash");
-            command.arg("-lc").arg(command_text);
-            command
-        }
-    };
-    command.current_dir(root);
-    command
-        .status()
-        .await
-        .with_context(|| format!("failed to run agent command in {}", root.display()))
+    }
 }
 
 fn render_instrument_task(repo_root: &Path, workflows: &[WorkflowArg]) -> String {
@@ -2285,6 +2308,35 @@ mod tests {
             } => {
                 assert_eq!(program, "codex");
                 assert_eq!(args, vec!["exec".to_string(), "-".to_string()]);
+                assert_eq!(stdin_file, Some(task_path));
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn claude_instrument_invocation_uses_print_with_stdin_prompt() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation = resolve_instrument_invocation(Agent::Claude, None, &task_path)
+            .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+            } => {
+                assert_eq!(program, "claude");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-p".to_string(),
+                        "--verbose".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--include-partial-messages".to_string(),
+                    ]
+                );
                 assert_eq!(stdin_file, Some(task_path));
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),

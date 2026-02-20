@@ -247,7 +247,7 @@ Current behavior:
 - Running bare `bt setup` opens a top-level setup wizard with: `instrument`, `skills`, `mcp`, and `doctor`.
 - `bt setup instrument` always targets the local git repo, reuses the `skills` setup flow, and guarantees `instrument` docs are included.
 - In interactive mode, `bt setup instrument` always includes `instrument` and lets you multi-select additional docs for `observe` and/or `evaluate`.
-- `bt setup instrument` defaults to `codex` when no agent is specified; for non-codex agents, pass `--agent-cmd`.
+- `bt setup instrument` defaults to `codex` when no agent is specified; pass `--agent-cmd` for agents without a built-in default command.
 - In setup wizards, press `Esc` to go back to the previous step.
 - If `--workflow` is omitted in non-interactive mode, setup defaults to all workflows.
 - Use `--refresh-docs` in setup (or `bt docs fetch --refresh`) to clear old docs before re-fetching.
