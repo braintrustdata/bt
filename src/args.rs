@@ -3,8 +3,6 @@ use std::path::PathBuf;
 
 pub use braintrust_sdk_rust::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
-use crate::config::Config;
-
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
     /// Output as JSON
@@ -44,18 +42,6 @@ pub struct BaseArgs {
     pub env_file: Option<PathBuf>,
 }
 
-impl BaseArgs {
-    pub fn with_config_defaults(mut self, cfg: &Config) -> Self {
-        if self.org_name.is_none() {
-            self.org_name = cfg.org.clone();
-        }
-        if self.project.is_none() {
-            self.project = cfg.project.clone();
-        }
-        self
-    }
-}
-
 #[derive(Debug, Clone, Args)]
 pub struct CLIArgs<T: Args> {
     #[command(flatten)]
@@ -63,93 +49,4 @@ pub struct CLIArgs<T: Args> {
 
     #[command(flatten)]
     pub args: T,
-}
-
-impl<T: Args> CLIArgs<T> {
-    pub fn with_config(self, cfg: &Config) -> (BaseArgs, T) {
-        (self.base.with_config_defaults(cfg), self.args)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn empty_args() -> BaseArgs {
-        BaseArgs {
-            json: false,
-            profile: None,
-            org_name: None,
-            project: None,
-            api_key: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            env_file: None,
-        }
-    }
-
-    fn config(org: Option<&str>, project: Option<&str>) -> Config {
-        Config {
-            org: org.map(String::from),
-            project: project.map(String::from),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn empty_args_filled_from_config() {
-        let args = empty_args();
-        let cfg = config(Some("cfg-org"), Some("cfg-proj"));
-
-        let result = args.with_config_defaults(&cfg);
-
-        assert_eq!(result.org_name, Some("cfg-org".into()));
-        assert_eq!(result.project, Some("cfg-proj".into()));
-    }
-
-    #[test]
-    fn existing_args_not_overwritten() {
-        let args = BaseArgs {
-            org_name: Some("cli-org".into()),
-            project: Some("cli-proj".into()),
-            ..empty_args()
-        };
-        let cfg = config(Some("cfg-org"), Some("cfg-proj"));
-
-        let result = args.with_config_defaults(&cfg);
-
-        assert_eq!(result.org_name, Some("cli-org".into()));
-        assert_eq!(result.project, Some("cli-proj".into()));
-    }
-
-    #[test]
-    fn partial_fill_org_set_project_from_config() {
-        let args = BaseArgs {
-            org_name: Some("cli-org".into()),
-            project: None,
-            ..empty_args()
-        };
-        let cfg = config(Some("cfg-org"), Some("cfg-proj"));
-
-        let result = args.with_config_defaults(&cfg);
-
-        assert_eq!(result.org_name, Some("cli-org".into()));
-        assert_eq!(result.project, Some("cfg-proj".into()));
-    }
-
-    #[test]
-    fn empty_config_leaves_args_unchanged() {
-        let args = BaseArgs {
-            org_name: Some("cli-org".into()),
-            project: None,
-            ..empty_args()
-        };
-        let cfg = config(None, None);
-
-        let result = args.with_config_defaults(&cfg);
-
-        assert_eq!(result.org_name, Some("cli-org".into()));
-        assert_eq!(result.project, None);
-    }
 }

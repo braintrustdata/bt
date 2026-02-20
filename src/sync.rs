@@ -518,16 +518,20 @@ struct JsonlPartWriter {
 }
 
 pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
+    let project = base
+        .project
+        .clone()
+        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
     match args.command {
         SyncCommand::Pull(pull) => {
             let ctx = login(&base).await?;
             let client = ApiClient::new(&ctx)?;
-            run_pull(base.json, &ctx, &client, base.project.as_deref(), pull).await
+            run_pull(base.json, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
             let ctx = login(&base).await?;
             let client = ApiClient::new(&ctx)?;
-            run_push(base.json, &ctx, &client, base.project.as_deref(), push).await
+            run_push(base.json, &ctx, &client, project.as_deref(), push).await
         }
         SyncCommand::Status(status) => run_status(base.json, status),
     }

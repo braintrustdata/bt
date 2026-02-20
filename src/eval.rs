@@ -633,7 +633,11 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
 
 async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
     let mut envs = resolved_auth_env(base).await?;
-    if let Some(project) = base.project.as_ref() {
+    let project = base
+        .project
+        .clone()
+        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
+    if let Some(project) = &project {
         envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
     Ok(envs)

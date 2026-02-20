@@ -1359,9 +1359,10 @@ async fn resolve_object_ref_for_view(
         return Ok((parsed, project_for_ui));
     }
 
+    let cfg_project = crate::config::load().ok().and_then(|c| c.project);
     let project = resolve_project(
         client,
-        base.project.as_deref(),
+        base.project.as_deref().or(cfg_project.as_deref()),
         project_id,
         project_name_from_url,
     )

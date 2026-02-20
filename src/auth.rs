@@ -291,7 +291,11 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     if let Some(org_name) = &auth.org_name {
         builder = builder.org_name(org_name);
     }
-    if let Some(project) = &base.project {
+    let project = base
+        .project
+        .clone()
+        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
+    if let Some(project) = &project {
         builder = builder.default_project(project);
     }
 
@@ -368,20 +372,18 @@ fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
 
 pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     let mut store = load_auth_store()?;
-    let mut auth = resolve_auth_from_store(base, &store)?;
+    let cfg_org = crate::config::load().ok().and_then(|c| c.org);
+    let mut auth = resolve_auth_from_store_with_cfg(base, &store, &cfg_org)?;
     if !auth.is_oauth {
         return Ok(auth);
     }
 
+    let effective_org = base.org_name.as_deref().or(cfg_org.as_deref());
     let profile_name = base
         .profile
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            base.org_name
-                .as_deref()
-                .and_then(|org| resolve_profile_for_org(org, &store))
-        })
+        .or_else(|| effective_org.and_then(|org| resolve_profile_for_org(org, &store)))
         .or_else(|| {
             (store.profiles.len() == 1).then(|| store.profiles.keys().next().unwrap().as_str())
         })
@@ -475,14 +477,19 @@ fn resolve_profile_for_org<'a>(org: &str, store: &'a AuthStore) -> Option<&'a st
     }
 }
 
-fn resolve_auth_from_store(base: &BaseArgs, store: &AuthStore) -> Result<ResolvedAuth> {
-    resolve_auth_from_store_with_secret_lookup(base, store, load_profile_secret)
+fn resolve_auth_from_store_with_cfg(
+    base: &BaseArgs,
+    store: &AuthStore,
+    cfg_org: &Option<String>,
+) -> Result<ResolvedAuth> {
+    resolve_auth_from_store_with_secret_lookup(base, store, load_profile_secret, cfg_org)
 }
 
 fn resolve_auth_from_store_with_secret_lookup<F>(
     base: &BaseArgs,
     store: &AuthStore,
     load_secret: F,
+    cfg_org: &Option<String>,
 ) -> Result<ResolvedAuth>
 where
     F: Fn(&str) -> Result<Option<String>>,
@@ -503,9 +510,11 @@ where
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
 
+    let effective_org = base.org_name.as_deref().or(cfg_org.as_deref());
+
     let selected_profile_name = if let Some(profile) = requested_profile {
         Some(profile)
-    } else if let Some(org) = base.org_name.as_deref() {
+    } else if let Some(org) = effective_org {
         resolve_profile_for_org(org, store)
     } else if store.profiles.len() == 1 {
         store.profiles.keys().next().map(|k| k.as_str())
@@ -543,7 +552,7 @@ where
         api_key: None,
         api_url: base.api_url.clone(),
         app_url: base.app_url.clone(),
-        org_name: base.org_name.clone(),
+        org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
         is_oauth: false,
     })
 }
@@ -2246,9 +2255,12 @@ mod tests {
             },
         );
 
-        let resolved = resolve_auth_from_store_with_secret_lookup(&base, &store, |_| {
-            Ok(Some("profile-key".to_string()))
-        })
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.api_url.as_deref(), Some("https://api.example.com"));
@@ -2275,7 +2287,13 @@ mod tests {
             },
         );
 
-        let resolved = resolve_auth_from_store(&base, &store).expect("resolve");
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
+        .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
         assert_eq!(
             resolved.api_url.as_deref(),
@@ -2304,9 +2322,12 @@ mod tests {
             },
         );
 
-        let resolved = resolve_auth_from_store_with_secret_lookup(&base, &store, |_| {
-            Ok(Some("profile-key".to_string()))
-        })
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
@@ -2330,9 +2351,12 @@ mod tests {
             },
         );
 
-        let resolved = resolve_auth_from_store_with_secret_lookup(&base, &store, |_| {
-            Ok(Some("should-not-be-used".to_string()))
-        })
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("should-not-be-used".to_string())),
+            &None,
+        )
         .expect("resolve");
 
         assert!(resolved.is_oauth);
@@ -2468,9 +2492,12 @@ mod tests {
             },
         );
 
-        let resolved = resolve_auth_from_store_with_secret_lookup(&base, &store, |_| {
-            Ok(Some("profile-key".into()))
-        })
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".into())),
+            &None,
+        )
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));
@@ -2499,9 +2526,12 @@ mod tests {
             },
         );
 
-        let resolved = resolve_auth_from_store_with_secret_lookup(&base, &store, |_| {
-            Ok(Some("other-key".into()))
-        })
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("other-key".into())),
+            &None,
+        )
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("other-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));

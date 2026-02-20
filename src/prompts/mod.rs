@@ -82,7 +82,10 @@ impl DeleteArgs {
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let project = match base.project {
+    let project = match base
+        .project
+        .or_else(|| crate::config::load().ok().and_then(|c| c.project))
+    {
         Some(p) => p,
         None if std::io::stdin().is_terminal() => {
             select_project_interactive(&client, None, None).await?

@@ -86,7 +86,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         _ => {
             let mut b = base.clone();
             if b.org_name.is_none() && b.profile.is_none() {
-                b.org_name = config::load().ok().and_then(|c| c.org);
+                b.org_name = current_cfg.org.clone();
             }
             if b.org_name.is_none() && b.profile.is_none() {
                 let profiles = auth::list_profiles()?;
@@ -169,23 +169,20 @@ fn select_scope() -> Result<std::path::PathBuf> {
         ),
         format!(
             "Local ({})",
-            console::style(format!(
-                "{}/{}",
+            console::style(
                 local
                     .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy(),
-                local
-                    .parent()
-                    .unwrap()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-            ))
+                    .and_then(|bt| {
+                        let bt_name = bt.file_name()?;
+                        let parent_name = bt.parent()?.file_name()?;
+                        Some(format!(
+                            "{}/{}",
+                            parent_name.to_string_lossy(),
+                            bt_name.to_string_lossy()
+                        ))
+                    })
+                    .unwrap_or_else(|| local.parent().unwrap().display().to_string()),
+            )
             .dim()
         ),
     ];
