@@ -22,8 +22,6 @@ const SHARED_SKILL_BODY: &str = include_str!("../../skills/shared/braintrust-cli
 const SHARED_WORKFLOW_GUIDE: &str = include_str!("../../skills/shared/workflows.md");
 const SHARED_SKILL_TEMPLATE: &str = include_str!("../../skills/shared/skill_template.md");
 const SKILL_FRONTMATTER: &str = include_str!("../../skills/shared/skill_frontmatter.md");
-const CURSOR_RULE_FRONTMATTER: &str =
-    include_str!("../../skills/shared/cursor_rule_frontmatter.md");
 const BT_README: &str = include_str!("../../README.md");
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
     "bt eval", "bt sql", "bt view", "bt login", "bt setup", "bt docs",
@@ -304,6 +302,12 @@ struct SkillsSetupOutcome {
     warnings: Vec<String>,
     notes: Vec<String>,
     successful_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SkillsAliasResult {
+    changed: bool,
+    path: PathBuf,
 }
 
 pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
@@ -1203,15 +1207,11 @@ fn run_doctor(base: BaseArgs, args: AgentsDoctorArgs) -> Result<()> {
     let docs_output_dir = setup_docs_output_dir(scope, local_root.as_deref(), &home)?;
     let detected = detect_agents(local_root.as_deref(), &home);
 
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let agents = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode]
         .iter()
         .map(|agent| doctor_agent_status(*agent, scope, local_root.as_deref(), &home, &detected))
         .collect::<Vec<_>>();
-
-    if matches!(scope, InstallScope::Global) {
-        warnings.push("cursor is local-only in this setup flow".to_string());
-    }
 
     if base.json {
         let report = DoctorJsonReport {
@@ -1306,7 +1306,6 @@ fn doctor_agent_status(
         .collect::<Vec<_>>();
     let detected_any = !detected_signals.is_empty();
 
-    let mut notes = Vec::new();
     let config_path = match (agent, scope) {
         (Agent::Claude, InstallScope::Local) => local_root
             .map(|root| root.join(".claude/skills/braintrust/SKILL.md"))
@@ -1325,12 +1324,13 @@ fn doctor_agent_status(
                 .to_string(),
         ),
         (Agent::Cursor, InstallScope::Local) => local_root
-            .map(|root| root.join(".cursor/rules/braintrust.mdc"))
+            .map(|root| root.join(".cursor/skills/braintrust/SKILL.md"))
             .map(|p| p.display().to_string()),
-        (Agent::Cursor, InstallScope::Global) => {
-            notes.push("cursor currently supports local-only setup in this flow".to_string());
-            None
-        }
+        (Agent::Cursor, InstallScope::Global) => Some(
+            home.join(".cursor/skills/braintrust/SKILL.md")
+                .display()
+                .to_string(),
+        ),
     };
 
     let configured = config_path
@@ -1344,7 +1344,7 @@ fn doctor_agent_status(
         detected_signals,
         configured,
         config_path,
-        notes,
+        notes: Vec::new(),
     }
 }
 
@@ -1593,6 +1593,9 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
     if home.join(".claude").exists() {
         add_signal(&mut by_agent, Agent::Claude, "~/.claude exists");
     }
+    if home.join(".cursor").exists() {
+        add_signal(&mut by_agent, Agent::Cursor, "~/.cursor exists");
+    }
     if home.join(".codex").exists() {
         add_signal(&mut by_agent, Agent::Codex, "~/.codex exists");
     }
@@ -1629,23 +1632,47 @@ fn add_signal(map: &mut BTreeMap<Agent, BTreeSet<String>>, agent: Agent, reason:
     map.entry(agent).or_default().insert(reason.to_string());
 }
 
-fn install_skill_for_agent(
-    agent: Agent,
+fn install_claude(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
-    let skill_path = match agent {
-        Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
-        Agent::Codex | Agent::Opencode => root.join(".agents/skills/braintrust/SKILL.md"),
-        Agent::Cursor => bail!("cursor uses rule-based config, not shared skills"),
-    };
     let skill_content = render_braintrust_skill();
-    let changed = write_text_file_if_changed(&skill_path, &skill_content)?;
+    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let alias = ensure_agent_skills_alias(root, ".claude", &skill_content)?;
+    let changed = skill_changed || alias.changed;
 
     Ok(AgentInstallResult {
-        agent,
+        agent: Agent::Claude,
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
+        paths: vec![
+            skill_path.display().to_string(),
+            alias.path.display().to_string(),
+        ],
+    })
+}
+
+fn install_codex(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Result<AgentInstallResult> {
+    let root = scope_root(scope, local_root, home)?;
+    let skill_content = render_braintrust_skill();
+    let (changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Codex,
         status: if changed {
             InstallStatus::Installed
         } else {
@@ -1660,49 +1687,41 @@ fn install_skill_for_agent(
     })
 }
 
-fn install_claude(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    install_skill_for_agent(Agent::Claude, scope, local_root, home)
-}
-
-fn install_codex(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    install_skill_for_agent(Agent::Codex, scope, local_root, home)
-}
-
 fn install_opencode(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
 ) -> Result<AgentInstallResult> {
-    install_skill_for_agent(Agent::Opencode, scope, local_root, home)
+    let root = scope_root(scope, local_root, home)?;
+    let skill_content = render_braintrust_skill();
+    let (changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Opencode,
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
+        paths: vec![skill_path.display().to_string()],
+    })
 }
 
 fn install_cursor(
     scope: InstallScope,
     local_root: Option<&Path>,
-    _home: &Path,
+    home: &Path,
 ) -> Result<AgentInstallResult> {
-    if matches!(scope, InstallScope::Global) {
-        return Ok(AgentInstallResult {
-            agent: Agent::Cursor,
-            status: InstallStatus::Skipped,
-            message: "warning: cursor currently supports only --local in bt setup skills"
-                .to_string(),
-            paths: Vec::new(),
-        });
-    }
-
-    let root = scope_root(scope, local_root, _home)?;
-    let rule_path = root.join(".cursor/rules/braintrust.mdc");
-    let cursor_rule = render_cursor_rule();
-    let changed = write_text_file_if_changed(&rule_path, &cursor_rule)?;
+    let root = scope_root(scope, local_root, home)?;
+    let skill_content = render_braintrust_skill();
+    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let alias = ensure_agent_skills_alias(root, ".cursor", &skill_content)?;
+    let changed = skill_changed || alias.changed;
 
     Ok(AgentInstallResult {
         agent: Agent::Cursor,
@@ -1712,12 +1731,118 @@ fn install_cursor(
             InstallStatus::Skipped
         },
         message: if changed {
-            "installed rule".to_string()
+            "installed skill".to_string()
         } else {
             "already configured".to_string()
         },
-        paths: vec![rule_path.display().to_string()],
+        paths: vec![
+            skill_path.display().to_string(),
+            alias.path.display().to_string(),
+        ],
     })
+}
+
+fn install_canonical_skill(root: &Path, skill_content: &str) -> Result<(bool, PathBuf)> {
+    let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
+    let changed = write_text_file_if_changed(&skill_path, skill_content)?;
+    Ok((changed, skill_path))
+}
+
+fn ensure_agent_skills_alias(
+    root: &Path,
+    agent_dir: &str,
+    skill_content: &str,
+) -> Result<SkillsAliasResult> {
+    let canonical_skills_dir = root.join(".agents/skills");
+    fs::create_dir_all(&canonical_skills_dir).with_context(|| {
+        format!(
+            "failed to create canonical skills directory {}",
+            canonical_skills_dir.display()
+        )
+    })?;
+
+    let alias_path = root.join(agent_dir).join("skills");
+    if let Some(parent) = alias_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    if let Ok(metadata) = fs::symlink_metadata(&alias_path) {
+        if metadata.file_type().is_symlink() {
+            if symlink_points_to(&alias_path, &canonical_skills_dir) {
+                return Ok(SkillsAliasResult {
+                    changed: false,
+                    path: alias_path,
+                });
+            }
+            fs::remove_file(&alias_path)
+                .with_context(|| format!("failed to replace symlink {}", alias_path.display()))?;
+        } else {
+            let mirror_skill_path = alias_path.join("braintrust/SKILL.md");
+            let changed = write_text_file_if_changed(&mirror_skill_path, skill_content)?;
+            return Ok(SkillsAliasResult {
+                changed,
+                path: mirror_skill_path,
+            });
+        }
+    }
+
+    match create_dir_symlink(&canonical_skills_dir, &alias_path) {
+        Ok(()) => Ok(SkillsAliasResult {
+            changed: true,
+            path: alias_path,
+        }),
+        Err(_) => {
+            let mirror_skill_path = alias_path.join("braintrust/SKILL.md");
+            let changed = write_text_file_if_changed(&mirror_skill_path, skill_content)?;
+            Ok(SkillsAliasResult {
+                changed,
+                path: mirror_skill_path,
+            })
+        }
+    }
+}
+
+fn symlink_points_to(link_path: &Path, target: &Path) -> bool {
+    let Ok(link_target) = fs::read_link(link_path) else {
+        return false;
+    };
+    let resolved_link_target = if link_target.is_absolute() {
+        link_target
+    } else {
+        link_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(link_target)
+    };
+    match (resolved_link_target.canonicalize(), target.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn create_dir_symlink(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_dir_symlink(target: &Path, link: &Path) -> Result<()> {
+    std::os::windows::fs::symlink_dir(target, link).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn install_mcp_for_agent(
@@ -1840,10 +1965,6 @@ fn write_text_file_if_changed(path: &Path, content: &str) -> Result<bool> {
 
 fn render_braintrust_skill() -> String {
     render_skill_document(SKILL_FRONTMATTER)
-}
-
-fn render_cursor_rule() -> String {
-    render_skill_document(CURSOR_RULE_FRONTMATTER)
 }
 
 fn render_skill_document(frontmatter: &str) -> String {
@@ -2370,12 +2491,12 @@ mod tests {
     }
 
     #[test]
-    fn doctor_agent_status_marks_cursor_global_as_local_only() {
+    fn doctor_agent_status_reports_cursor_global_skill_path() {
         let home = std::env::temp_dir();
         let status = doctor_agent_status(Agent::Cursor, InstallScope::Global, None, &home, &[]);
         assert!(!status.configured);
-        assert!(status.config_path.is_none());
-        assert!(status.notes.iter().any(|note| note.contains("local-only")));
+        assert!(status.config_path.is_some());
+        assert!(status.notes.is_empty());
     }
 
     #[test]
@@ -2471,6 +2592,24 @@ mod tests {
             install_codex(InstallScope::Local, Some(&root), &home).expect("second install");
         assert!(matches!(second.status, InstallStatus::Skipped));
         assert!(second.message.contains("already configured"));
+    }
+
+    #[test]
+    fn install_cursor_uses_canonical_agents_skill_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-cursor-skill-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let result =
+            install_cursor(InstallScope::Local, Some(&root), &home).expect("install cursor");
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
+        assert!(root.join(".cursor/skills").exists());
     }
 
     #[test]
