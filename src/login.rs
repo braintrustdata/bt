@@ -297,8 +297,7 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
 
     if let Some(profile_name) = ignored_profile {
         eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
-            profile_name,
+            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
         );
     } else {
         eprintln!(
@@ -338,12 +337,10 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     let profile = store
         .profiles
         .get(profile_name)
-        .ok_or_else(|| anyhow::anyhow!("profile '{}' not found", profile_name))?;
+        .ok_or_else(|| anyhow::anyhow!("profile '{profile_name}' not found"))?;
     let client_id = profile.oauth_client_id.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth profile '{}' is missing client_id; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth profile '{profile_name}' is missing client_id; re-run `bt login set --oauth --profile {profile_name}`"
         )
     })?;
     let cached_expires_at = profile.oauth_access_expires_at;
@@ -361,9 +358,7 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
 
     let refresh_token = load_profile_oauth_refresh_token(profile_name)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth refresh token missing for profile '{}'; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth refresh token missing for profile '{profile_name}'; re-run `bt login set --oauth --profile {profile_name}`"
         )
     })?;
     let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
@@ -433,9 +428,7 @@ where
     if let Some(profile_name) = selected_profile_name {
         let profile = store.profiles.get(profile_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "profile '{}' not found; run `bt login list` or `bt login set --profile {}`",
-                profile_name,
-                profile_name
+                "profile '{profile_name}' not found; run `bt login list` or `bt login set --profile {profile_name}`"
             )
         })?;
         let is_oauth = profile.auth_kind == AuthKind::Oauth;
@@ -444,9 +437,7 @@ where
         } else {
             Some(load_secret(profile_name)?.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no keychain credential found for profile '{}'; re-run `bt login set --profile {}`",
-                    profile_name,
-                    profile_name
+                    "no keychain credential found for profile '{profile_name}'; re-run `bt login set --profile {profile_name}`"
                 )
             })?)
         };
@@ -538,10 +529,7 @@ async fn run_login_set(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
             org.name, profile_name
         );
     } else {
-        println!(
-            "Logged in with no default org (cross-org) using profile '{}'",
-            profile_name
-        );
+        println!("Logged in with no default org (cross-org) using profile '{profile_name}'");
     }
     println!(
         "Saved profile metadata at {} and credential in secure store (OS keychain when available; plaintext fallback otherwise)",
@@ -690,8 +678,7 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginSetArgs) -> Result<()> {
         );
     } else {
         println!(
-            "Logged in with OAuth and no default org (cross-org) using profile '{}'",
-            profile_name
+            "Logged in with OAuth and no default org (cross-org) using profile '{profile_name}'"
         );
     }
     println!(
@@ -724,14 +711,12 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     let (profile_name, source) = resolve_selected_profile_name_for_debug(base, &store)?;
     let profile = store.profiles.get(profile_name.as_str()).ok_or_else(|| {
         anyhow::anyhow!(
-            "profile '{}' not found; run `bt login list` to see available profiles",
-            profile_name
+            "profile '{profile_name}' not found; run `bt login list` to see available profiles"
         )
     })?;
     if profile.auth_kind != AuthKind::Oauth {
         bail!(
-            "profile '{}' uses api key auth; `bt login refresh` only applies to oauth profiles",
-            profile_name
+            "profile '{profile_name}' uses api key auth; `bt login refresh` only applies to oauth profiles"
         );
     }
 
@@ -741,23 +726,18 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let client_id = profile.oauth_client_id.clone().ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth profile '{}' is missing client_id; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth profile '{profile_name}' is missing client_id; re-run `bt login set --oauth --profile {profile_name}`"
         )
     })?;
     let previous_expires_at = profile.oauth_access_expires_at;
     let refresh_token = load_profile_oauth_refresh_token(profile_name.as_str())?.ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth refresh token missing for profile '{}'; re-run `bt login set --oauth --profile {}`",
-            profile_name,
-            profile_name
+            "oauth refresh token missing for profile '{profile_name}'; re-run `bt login set --oauth --profile {profile_name}`"
         )
     })?;
 
     println!(
-        "Refreshing OAuth token for profile '{}' (source: {}, api_url: {})",
-        profile_name, source, api_url
+        "Refreshing OAuth token for profile '{profile_name}' (source: {source}, api_url: {api_url})"
     );
     if let Some(expires_at) = previous_expires_at {
         let now = current_unix_timestamp();
@@ -936,10 +916,7 @@ fn run_login_use(profile_name: &str, local: bool, global: bool) -> Result<()> {
 
     let mut store = load_auth_store()?;
     if !store.profiles.contains_key(profile_name) {
-        bail!(
-            "profile '{}' not found; run `bt login list` to see available profiles",
-            profile_name
-        );
+        bail!("profile '{profile_name}' not found; run `bt login list` to see available profiles");
     }
 
     store.active_profile = Some(profile_name.to_string());
@@ -967,10 +944,7 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
 
     let mut store = load_auth_store()?;
     if !store.profiles.contains_key(profile_name) {
-        bail!(
-            "profile '{}' not found; run `bt login list` to see available profiles",
-            profile_name
-        );
+        bail!("profile '{profile_name}' not found; run `bt login list` to see available profiles");
     }
 
     if !force && std::io::stdin().is_terminal() {
@@ -1093,7 +1067,7 @@ async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgIn
         .header("Content-Type", "application/json")
         .send()
         .await
-        .with_context(|| format!("failed to call login endpoint {}", login_url))?;
+        .with_context(|| format!("failed to call login endpoint {login_url}"))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1144,9 +1118,7 @@ fn select_login_org(
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::anyhow!(
-                "organization '{}' not found for this API key. Available organizations: {}",
-                name,
-                available
+                "organization '{name}' not found for this API key. Available organizations: {available}"
             )
         });
     }
@@ -2279,6 +2251,7 @@ mod tests {
             json: false,
             profile: None,
             project: None,
+            org: None,
             org_name: None,
             api_key: None,
             prefer_profile: false,

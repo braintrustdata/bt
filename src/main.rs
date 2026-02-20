@@ -6,14 +6,18 @@ mod args;
 mod env;
 #[cfg(unix)]
 mod eval;
+mod experiments;
+mod functions;
 mod http;
 mod login;
 mod projects;
 mod prompts;
+mod scorers;
 mod self_update;
 mod setup;
 mod sql;
 mod sync;
+mod tools;
 mod traces;
 mod ui;
 mod utils;
@@ -27,7 +31,12 @@ const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "bt", about = "Braintrust CLI", version = CLI_VERSION)]
+#[command(
+    name = "bt",
+    about = "Braintrust CLI",
+    version,
+    after_help = "Docs: https://braintrust.dev/docs"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -55,6 +64,12 @@ enum Commands {
     SelfCommand(self_update::SelfArgs),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
+    /// Manage tools
+    Tools(CLIArgs<tools::ToolsArgs>),
+    /// Manage scorers
+    Scorers(CLIArgs<scorers::ScorersArgs>),
+    /// Manage experiments
+    Experiments(CLIArgs<experiments::ExperimentsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
 }
@@ -76,6 +91,9 @@ async fn main() -> Result<()> {
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
+        Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
+        Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
+        Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
     }
 
