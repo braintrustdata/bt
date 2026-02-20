@@ -34,8 +34,8 @@ use unicode_width::UnicodeWidthStr;
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
+use crate::auth::login;
 use crate::http::ApiClient;
-use crate::login::login;
 use crate::ui::{fuzzy_select, with_spinner};
 
 const MAX_TRACE_SPANS: usize = 5000;
@@ -1359,9 +1359,10 @@ async fn resolve_object_ref_for_view(
         return Ok((parsed, project_for_ui));
     }
 
+    let cfg_project = crate::config::load().ok().and_then(|c| c.project);
     let project = resolve_project(
         client,
-        base.project.as_deref(),
+        base.project.as_deref().or(cfg_project.as_deref()),
         project_id,
         project_name_from_url,
     )
@@ -1427,7 +1428,7 @@ async fn resolve_project(
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     let names: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
-    let selected = fuzzy_select("Select project", &names)?;
+    let selected = fuzzy_select("Select project", &names, 0)?;
     let project = projects
         .get(selected)
         .context("project selection out of range")?

@@ -1,13 +1,12 @@
-use std::io::IsTerminal;
-
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::{
     args::BaseArgs,
+    auth::login,
     http::ApiClient,
-    login::login,
-    projects::{api::get_project_by_name, switch::select_project_interactive},
+    projects::api::get_project_by_name,
+    ui::{is_interactive, select_project_interactive},
 };
 
 mod api;
@@ -84,9 +83,12 @@ impl DeleteArgs {
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let project = match base.project {
+    let project = match base
+        .project
+        .or_else(|| crate::config::load().ok().and_then(|c| c.project))
+    {
         Some(p) => p,
-        None if std::io::stdin().is_terminal() => select_project_interactive(&client).await?,
+        None if is_interactive() => select_project_interactive(&client, None, None).await?,
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 

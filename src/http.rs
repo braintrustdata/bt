@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::login::LoginContext;
+use crate::auth::LoginContext;
 
 #[derive(Clone)]
 pub struct ApiClient {

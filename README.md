@@ -114,6 +114,22 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 
+## Commands
+
+| Command          | Description                                                        |
+| ---------------- | ------------------------------------------------------------------ |
+| `bt init`        | Initialize `.bt/` config directory and link to a project           |
+| `bt auth`        | Authenticate with Braintrust                                       |
+| `bt switch`      | Switch org and project context                                     |
+| `bt status`      | Show current org and project context                               |
+| `bt eval`        | Run eval files (Unix only)                                         |
+| `bt sql`         | Run SQL queries against Braintrust                                 |
+| `bt view`        | View logs, traces, and spans                                       |
+| `bt projects`    | Manage projects (list, create, view, delete)                       |
+| `bt prompts`     | Manage prompts (list, view, delete)                                |
+| `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt self update` | Update bt in-place                                                 |
+
 ## `bt eval` runners
 
 - By default, `bt eval` auto-detects a JavaScript runner from your project (`tsx`, `vite-node`, `ts-node`, then `ts-node-esm`).
@@ -167,43 +183,53 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
   - Detail view: `t` span/thread, `Left/Right` switch panes, `Backspace`/`Esc` back
   - Global: `q` quit
 
-## `bt login` profiles
+## `bt auth`
 
-- Save an API key to a named profile (stored in secure credential store):
-  - `bt login set --api-key <KEY> --profile work`
-- Save interactively (prompts for auth method first, profile name defaults to org name):
-  - `bt login`
+- Authenticate interactively (prompts for auth method, profile name defaults to org name):
+  - `bt auth login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
   - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
   - `bt` confirms the resolved API URL before saving.
 - Login with OAuth (browser-based, stores refresh token in secure credential store):
-  - `bt login set --oauth --profile work`
+  - `bt auth login --oauth --profile work`
   - You can pass `--no-browser` to print the URL without auto-opening.
   - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
-  - If multiple profiles already exist, `bt` asks whether the new/updated profile should become the default instead of changing it automatically.
-- Switch active profile:
-  - `bt login use work`
-  - Persist per-project (when `.bt/` exists): `bt login use work --local`
-  - Persist globally: `bt login use work --global`
 - List profiles:
-  - `bt login list`
-- Delete a profile:
-  - `bt login delete work`
-- Clear active profile:
-  - `bt login logout`
+  - `bt auth profiles`
+- Log out (remove a saved profile):
+  - `bt auth logout`
+  - `bt auth logout --force` (skip confirmation)
 - Show current auth source/profile:
-  - `bt login status`
+  - `bt auth status`
 - Force-refresh OAuth access token for debugging:
-  - `bt login refresh --profile work`
+  - `bt auth refresh --profile work`
 
 Auth resolution order for commands is:
 
-1. `--api-key` or `BRAINTRUST_API_KEY`
+1. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
 2. `--profile` or `BRAINTRUST_PROFILE`
-3. profile from config files (`.bt/config.json` over `~/.config/bt/config.json`)
-4. active saved profile
+3. Org-based profile match (profile whose org matches `--org`/config org)
+4. Single-profile auto-select (if only one profile exists)
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
+
+## `bt switch`
+
+Interactively switch org and project context:
+
+- `bt switch` — interactive picker for org and project
+- `bt switch myproject` — switch to a project by name
+- `bt switch myorg/myproject` — switch to a specific org and project
+- `bt switch --global` — persist to global config (`~/.config/bt/config.json`)
+- `bt switch --local` — persist to local config (`.bt/config.json`)
+
+## `bt status`
+
+Show current org and project context:
+
+- `bt status` — display current org, project, and config source
+- `bt status --verbose` — show detailed config resolution
+- `bt status -j` — JSON output
 
 ## `bt setup` and `bt docs`
 
