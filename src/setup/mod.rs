@@ -814,6 +814,7 @@ enum InstrumentInvocation {
         program: String,
         args: Vec<String>,
         stdin_file: Option<PathBuf>,
+        prompt_file_arg: Option<PathBuf>,
     },
     Shell(String),
 }
@@ -836,6 +837,7 @@ fn resolve_instrument_invocation(
             program: "codex".to_string(),
             args: vec!["exec".to_string(), "-".to_string()],
             stdin_file: Some(task_path.to_path_buf()),
+            prompt_file_arg: None,
         });
     }
     if matches!(agent, Agent::Claude) {
@@ -851,6 +853,15 @@ fn resolve_instrument_invocation(
                 "--include-partial-messages".to_string(),
             ],
             stdin_file: Some(task_path.to_path_buf()),
+            prompt_file_arg: None,
+        });
+    }
+    if matches!(agent, Agent::Opencode) {
+        return Ok(InstrumentInvocation::Program {
+            program: "opencode".to_string(),
+            args: vec!["run".to_string()],
+            stdin_file: None,
+            prompt_file_arg: Some(task_path.to_path_buf()),
         });
     }
 
@@ -882,9 +893,20 @@ async fn run_agent_invocation(
             program,
             args,
             stdin_file,
+            prompt_file_arg,
         } => {
             let mut command = Command::new(program);
             command.args(args).current_dir(root);
+            if let Some(path) = prompt_file_arg {
+                let prompt = fs::read_to_string(path).with_context(|| {
+                    format!("failed to read task prompt file {}", path.display())
+                })?;
+                let prompt = prompt.trim();
+                if prompt.is_empty() {
+                    bail!("task prompt file is empty: {}", path.display());
+                }
+                command.arg(prompt);
+            }
             if let Some(path) = stdin_file {
                 let file = fs::File::open(path).with_context(|| {
                     format!("failed to open task prompt file {}", path.display())
@@ -2439,10 +2461,12 @@ mod tests {
                 program,
                 args,
                 stdin_file,
+                prompt_file_arg,
             } => {
                 assert_eq!(program, "codex");
                 assert_eq!(args, vec!["exec".to_string(), "-".to_string()]);
                 assert_eq!(stdin_file, Some(task_path));
+                assert_eq!(prompt_file_arg, None);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
@@ -2459,6 +2483,7 @@ mod tests {
                 program,
                 args,
                 stdin_file,
+                prompt_file_arg,
             } => {
                 assert_eq!(program, "claude");
                 assert_eq!(
@@ -2474,6 +2499,29 @@ mod tests {
                     ]
                 );
                 assert_eq!(stdin_file, Some(task_path));
+                assert_eq!(prompt_file_arg, None);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn opencode_instrument_invocation_uses_run_with_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation = resolve_instrument_invocation(Agent::Opencode, None, &task_path)
+            .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+            } => {
+                assert_eq!(program, "opencode");
+                assert_eq!(args, vec!["run".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
