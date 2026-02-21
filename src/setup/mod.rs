@@ -2,12 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, MultiSelect};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use tokio::process::Command;
 
 use crate::args::BaseArgs;
 use crate::ui::with_spinner;
@@ -46,6 +48,8 @@ pub struct SetupArgs {
 enum SetupSubcommand {
     /// Configure coding-agent skills to use Braintrust
     Skills(AgentsSetupArgs),
+    /// Download instrumentation docs and run a coding agent to instrument this repo
+    Instrument(InstrumentSetupArgs),
     /// Configure MCP server settings for coding agents
     Mcp(AgentsMcpSetupArgs),
     /// Diagnose coding-agent setup for Braintrust
@@ -104,6 +108,33 @@ struct AgentsMcpSetupArgs {
     /// Skip confirmation prompts and use defaults
     #[arg(long, short = 'y')]
     yes: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct InstrumentSetupArgs {
+    /// Agent to run for instrumentation
+    #[arg(long = "agent", value_enum)]
+    agent: Option<InstrumentAgentArg>,
+
+    /// Command to run the selected agent (overrides built-in defaults)
+    #[arg(long)]
+    agent_cmd: Option<String>,
+
+    /// Workflow docs to prefetch alongside instrument (repeatable; always includes instrument)
+    #[arg(long = "workflow", value_enum)]
+    workflows: Vec<WorkflowArg>,
+
+    /// Skip confirmation prompts and use defaults
+    #[arg(long, short = 'y')]
+    yes: bool,
+
+    /// Refresh prefetched docs by clearing existing output before download
+    #[arg(long)]
+    refresh_docs: bool,
+
+    /// Number of concurrent workers for docs prefetch/download.
+    #[arg(long, default_value_t = crate::sync::default_workers())]
+    workers: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -263,6 +294,16 @@ struct McpSelection {
     selected_agents: Vec<Agent>,
 }
 
+struct SkillsSetupOutcome {
+    scope: InstallScope,
+    selected_agents: Vec<Agent>,
+    detected_agents: Vec<DetectionSignal>,
+    results: Vec<AgentInstallResult>,
+    warnings: Vec<String>,
+    notes: Vec<String>,
+    successful_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct SkillsAliasResult {
     changed: bool,
@@ -272,17 +313,95 @@ struct SkillsAliasResult {
 pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
     match args.command {
         Some(SetupSubcommand::Skills(setup)) => run_setup(base, setup).await,
+        Some(SetupSubcommand::Instrument(instrument)) => {
+            run_instrument_setup(base, instrument).await
+        }
         Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp),
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
-        None => run_setup(base, args.agents).await,
+        None => {
+            if should_prompt_setup_action(&base, &args.agents) {
+                match prompt_setup_action()? {
+                    Some(SetupAction::Instrument) => {
+                        run_instrument_setup(
+                            base,
+                            InstrumentSetupArgs {
+                                agent: None,
+                                agent_cmd: None,
+                                workflows: Vec::new(),
+                                yes: false,
+                                refresh_docs: false,
+                                workers: crate::sync::default_workers(),
+                            },
+                        )
+                        .await
+                    }
+                    Some(SetupAction::Skills) => run_setup(base, args.agents).await,
+                    Some(SetupAction::Mcp) => run_mcp_setup(
+                        base,
+                        AgentsMcpSetupArgs {
+                            agents: Vec::new(),
+                            local: false,
+                            global: false,
+                            yes: false,
+                        },
+                    ),
+                    Some(SetupAction::Doctor) => run_doctor(
+                        base,
+                        AgentsDoctorArgs {
+                            local: false,
+                            global: false,
+                        },
+                    ),
+                    None => bail!("setup cancelled by user"),
+                }
+            } else {
+                run_setup(base, args.agents).await
+            }
+        }
     }
 }
 
 pub use docs::run_docs_top;
 
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
+    let outcome = execute_skills_setup(&base, &args).await?;
+    if base.json {
+        let report = SetupJsonReport {
+            scope: outcome.scope.as_str().to_string(),
+            selected_agents: outcome.selected_agents,
+            detected_agents: outcome.detected_agents,
+            results: outcome.results,
+            warnings: outcome.warnings,
+            notes: outcome.notes,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
+        );
+    } else {
+        print_human_report(
+            false,
+            outcome.scope,
+            &outcome.selected_agents,
+            &outcome.results,
+            &outcome.warnings,
+            &outcome.notes,
+        );
+    }
+
+    if outcome.successful_count == 0 {
+        bail!("no agents were configured successfully");
+    }
+
+    Ok(())
+}
+
+async fn execute_skills_setup(
+    base: &BaseArgs,
+    args: &AgentsSetupArgs,
+) -> Result<SkillsSetupOutcome> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let selection = resolve_setup_selection(&args, &home)?;
+    let selection = resolve_setup_selection(args, &home)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
     let detected = selection.detected;
@@ -325,71 +444,200 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
         }
     }
 
-    let installed_count = results
+    let successful_count = results
         .iter()
-        .filter(|r| matches!(r.status, InstallStatus::Installed))
+        .filter(|r| !matches!(r.status, InstallStatus::Failed))
         .count();
 
-    if installed_count == 0 {
-        notes.push("Skipped workflow docs prefetch (no agents installed).".to_string());
+    if successful_count == 0 {
+        notes.push(
+            "Skipped workflow docs prefetch (no agents configured successfully).".to_string(),
+        );
     } else if args.no_fetch_docs {
         notes.push("Skipped workflow docs prefetch (`--no-fetch-docs`).".to_string());
     } else if selected_workflows.is_empty() {
         notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
     } else {
-        let docs_output_dir = setup_docs_output_dir(scope, local_root.as_deref(), &home)?;
-        if !args.refresh_docs
-            && docs_cache_has_required_files(&docs_output_dir, &selected_workflows)
-        {
-            notes.push(format!(
-                "Skipped workflow docs prefetch (already present at {}; use --refresh-docs to refresh).",
-                docs_output_dir.display()
-            ));
-        } else {
-            let docs_args = docs::DocsFetchArgs {
-                llms_url: docs::DEFAULT_DOCS_LLMS_URL.to_string(),
-                output_dir: docs_output_dir.clone(),
-                workflows: selected_workflows.clone(),
-                dry_run: false,
-                strict: false,
-                refresh: args.refresh_docs,
-                workers: args.workers,
-            };
-            let fetch_result = if show_progress {
-                with_spinner(
-                    "Prefetching workflow docs...",
-                    docs::fetch_docs_pages(&docs_args, &selected_workflows),
-                )
-                .await
-            } else {
-                docs::fetch_docs_pages(&docs_args, &selected_workflows).await
-            };
-            match fetch_result {
-                Ok(fetch_result) => {
-                    notes.push(format!(
-                        "Prefetched workflow docs ({}) to {} ({} written, {} failed).",
-                        selected_workflows
-                            .iter()
-                            .map(|workflow| workflow.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        docs_output_dir.display(),
-                        fetch_result.written,
-                        fetch_result.failed
-                    ));
-                    warnings.extend(fetch_result.warnings);
-                }
-                Err(err) => {
-                    warnings.push(format!("workflow docs prefetch failed: {err}"));
-                }
-            }
+        prefetch_workflow_docs(
+            show_progress,
+            scope,
+            local_root.as_deref(),
+            &home,
+            &selected_workflows,
+            args.refresh_docs,
+            args.workers,
+            &mut notes,
+            &mut warnings,
+        )
+        .await?;
+    }
+
+    Ok(SkillsSetupOutcome {
+        scope,
+        selected_agents,
+        detected_agents: detected,
+        results,
+        warnings,
+        notes,
+        successful_count,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SetupAction {
+    Instrument,
+    Skills,
+    Mcp,
+    Doctor,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum InstrumentAgentArg {
+    Claude,
+    Codex,
+    Cursor,
+    Opencode,
+}
+
+fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
+    if base.json || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    args.agents.is_empty()
+        && !args.local
+        && !args.global
+        && args.workflows.is_empty()
+        && !args.yes
+        && !args.no_fetch_docs
+        && !args.refresh_docs
+        && args.workers == crate::sync::default_workers()
+}
+
+fn prompt_setup_action() -> Result<Option<SetupAction>> {
+    let choices = [
+        "instrument (setup skills + use a coding agent to install Braintrust)",
+        "skills (just setup skills)",
+        "mcp (configure MCP)",
+        "doctor (diagnose setup)",
+    ];
+    let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select setup action")
+        .items(&choices)
+        .default(0)
+        .interact_opt()?;
+    Ok(idx.map(|value| match value {
+        0 => SetupAction::Instrument,
+        1 => SetupAction::Skills,
+        2 => SetupAction::Mcp,
+        _ => SetupAction::Doctor,
+    }))
+}
+
+async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Result<()> {
+    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let root = find_git_root().ok_or_else(|| {
+        anyhow!(
+            "instrument setup requires running inside a git repository (could not find .git in parent chain)"
+        )
+    })?;
+    let mut detected = detect_agents(Some(&root), &home);
+
+    let mut selected = if let Some(agent_arg) = args.agent {
+        map_instrument_agent_arg(agent_arg)
+    } else {
+        pick_agent_mode_target(&resolve_selected_agents(&[], &detected))
+            .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
+    };
+
+    if args.agent.is_none() && std::io::stdin().is_terminal() && !args.yes {
+        selected = prompt_instrument_agent(selected)?;
+    }
+
+    let selected_workflows = resolve_instrument_workflow_selection(&args)?;
+    let show_progress = !base.json;
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+    let mut results = Vec::new();
+    let skill_path = skill_config_path(selected, InstallScope::Local, Some(&root), &home)?;
+
+    if skill_path.exists() {
+        results.push(AgentInstallResult {
+            agent: selected,
+            status: InstallStatus::Skipped,
+            message: "already configured".to_string(),
+            paths: vec![skill_path.display().to_string()],
+        });
+        notes.push("Skipped skills setup (already configured).".to_string());
+        prefetch_workflow_docs(
+            show_progress,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            &selected_workflows,
+            args.refresh_docs,
+            args.workers,
+            &mut notes,
+            &mut warnings,
+        )
+        .await?;
+    } else {
+        let setup_args = AgentsSetupArgs {
+            agents: vec![map_agent_to_agent_arg(selected)],
+            local: true,
+            global: false,
+            workflows: selected_workflows.clone(),
+            yes: true,
+            no_fetch_docs: false,
+            refresh_docs: args.refresh_docs,
+            workers: args.workers,
+        };
+        let outcome = execute_skills_setup(&base, &setup_args).await?;
+        detected = outcome.detected_agents;
+        results.extend(outcome.results);
+        warnings.extend(outcome.warnings);
+        notes.extend(outcome.notes);
+        if outcome.successful_count == 0 {
+            bail!("failed to configure skills for instrumentation");
         }
+    }
+
+    let task_path = root
+        .join(".bt")
+        .join("skills")
+        .join("AGENT_TASK.instrument.md");
+    write_text_file(
+        &task_path,
+        &render_instrument_task(&root, &selected_workflows),
+    )?;
+
+    let invocation =
+        resolve_instrument_invocation(selected, args.agent_cmd.as_deref(), &task_path)?;
+    notes.push(format!(
+        "Instrumentation task prompt written to {}.",
+        task_path.display()
+    ));
+
+    let status = run_agent_invocation(&root, &invocation, !base.json).await?;
+    if status.success() {
+        results.push(AgentInstallResult {
+            agent: selected,
+            status: InstallStatus::Installed,
+            message: "agent instrumentation command completed".to_string(),
+            paths: vec![task_path.display().to_string()],
+        });
+    } else {
+        results.push(AgentInstallResult {
+            agent: selected,
+            status: InstallStatus::Failed,
+            message: format!("agent command exited with status {status}"),
+            paths: vec![task_path.display().to_string()],
+        });
     }
 
     if base.json {
         let report = SetupJsonReport {
-            scope: scope.as_str().to_string(),
-            selected_agents,
+            scope: InstallScope::Local.as_str().to_string(),
+            selected_agents: vec![selected],
             detected_agents: detected,
             results: results.clone(),
             warnings,
@@ -400,14 +648,312 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
             serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
         );
     } else {
-        print_human_report(false, scope, &selected_agents, &results, &warnings, &notes);
+        print_human_report(
+            true,
+            InstallScope::Local,
+            &[selected],
+            &results,
+            &warnings,
+            &notes,
+        );
     }
 
-    if installed_count == 0 {
-        bail!("no agents were installed successfully");
+    if !status.success() {
+        bail!("agent instrumentation command failed");
+    }
+    Ok(())
+}
+
+fn resolve_instrument_workflow_selection(args: &InstrumentSetupArgs) -> Result<Vec<WorkflowArg>> {
+    if !args.workflows.is_empty() {
+        let mut selected = resolve_workflow_selection(&args.workflows);
+        if !selected.contains(&WorkflowArg::Instrument) {
+            selected.push(WorkflowArg::Instrument);
+            selected.sort();
+            selected.dedup();
+        }
+        return Ok(selected);
+    }
+
+    if std::io::stdin().is_terminal() && !args.yes {
+        let Some(selected) = prompt_instrument_workflow_selection()? else {
+            bail!("instrument setup cancelled by user");
+        };
+        return Ok(selected);
+    }
+
+    Ok(vec![WorkflowArg::Instrument])
+}
+
+fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
+    let choices = ["observe", "evaluate"];
+    let defaults = [true, false];
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select additional workflow docs to prefetch (instrument is always included)")
+        .items(&choices)
+        .defaults(&defaults)
+        .interact_opt()?;
+    Ok(selected.map(|indexes| {
+        let mut workflows = vec![WorkflowArg::Instrument];
+        for index in indexes {
+            match index {
+                0 => workflows.push(WorkflowArg::Observe),
+                1 => workflows.push(WorkflowArg::Evaluate),
+                _ => {}
+            }
+        }
+        workflows
+    }))
+}
+
+fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
+    match agent {
+        Agent::Claude => AgentArg::Claude,
+        Agent::Codex => AgentArg::Codex,
+        Agent::Cursor => AgentArg::Cursor,
+        Agent::Opencode => AgentArg::Opencode,
+    }
+}
+
+fn skill_config_path(
+    agent: Agent,
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Result<PathBuf> {
+    let root = scope_root(scope, local_root, home)?;
+    let path = match agent {
+        Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
+        Agent::Codex | Agent::Opencode => root.join(".agents/skills/braintrust/SKILL.md"),
+        Agent::Cursor => root.join(".cursor/rules/braintrust.mdc"),
+    };
+    Ok(path)
+}
+
+async fn prefetch_workflow_docs(
+    show_progress: bool,
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    selected_workflows: &[WorkflowArg],
+    refresh_docs: bool,
+    workers: usize,
+    notes: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let docs_output_dir = setup_docs_output_dir(scope, local_root, home)?;
+    if !refresh_docs && docs_cache_has_required_files(&docs_output_dir, selected_workflows) {
+        notes.push(format!(
+            "Skipped workflow docs prefetch (already present at {}; use --refresh-docs to refresh).",
+            docs_output_dir.display()
+        ));
+        return Ok(());
+    }
+
+    let docs_args = docs::DocsFetchArgs {
+        llms_url: docs::DEFAULT_DOCS_LLMS_URL.to_string(),
+        output_dir: docs_output_dir.clone(),
+        workflows: selected_workflows.to_vec(),
+        dry_run: false,
+        strict: false,
+        refresh: refresh_docs,
+        workers,
+    };
+    let fetch_result = if show_progress {
+        with_spinner(
+            "Prefetching workflow docs...",
+            docs::fetch_docs_pages(&docs_args, selected_workflows),
+        )
+        .await
+    } else {
+        docs::fetch_docs_pages(&docs_args, selected_workflows).await
+    };
+    match fetch_result {
+        Ok(fetch_result) => {
+            notes.push(format!(
+                "Prefetched workflow docs ({}) to {} ({} written, {} failed).",
+                selected_workflows
+                    .iter()
+                    .map(|workflow| workflow.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                docs_output_dir.display(),
+                fetch_result.written,
+                fetch_result.failed
+            ));
+            warnings.extend(fetch_result.warnings);
+        }
+        Err(err) => warnings.push(format!("workflow docs prefetch failed: {err}")),
     }
 
     Ok(())
+}
+
+fn prompt_instrument_agent(default_agent: Agent) -> Result<Agent> {
+    let choices = ALL_AGENTS
+        .iter()
+        .map(|agent| agent.as_str())
+        .collect::<Vec<_>>();
+    let default_index = ALL_AGENTS
+        .iter()
+        .position(|agent| *agent == default_agent)
+        .unwrap_or(0);
+    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select agent to instrument this repo")
+        .items(&choices)
+        .default(default_index)
+        .interact_opt()?;
+    let Some(index) = selection else {
+        bail!("instrument setup cancelled by user");
+    };
+    Ok(ALL_AGENTS[index])
+}
+
+enum InstrumentInvocation {
+    Program {
+        program: String,
+        args: Vec<String>,
+        stdin_file: Option<PathBuf>,
+        prompt_file_arg: Option<PathBuf>,
+    },
+    Shell(String),
+}
+
+fn resolve_instrument_invocation(
+    agent: Agent,
+    agent_cmd: Option<&str>,
+    task_path: &Path,
+) -> Result<InstrumentInvocation> {
+    if let Some(command) = agent_cmd {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            bail!("`--agent-cmd` cannot be empty");
+        }
+        return Ok(InstrumentInvocation::Shell(trimmed.to_string()));
+    }
+
+    let invocation = match agent {
+        Agent::Codex => InstrumentInvocation::Program {
+            program: "codex".to_string(),
+            args: vec!["exec".to_string(), "-".to_string()],
+            stdin_file: Some(task_path.to_path_buf()),
+            prompt_file_arg: None,
+        },
+        Agent::Claude => InstrumentInvocation::Program {
+            program: "claude".to_string(),
+            args: vec![
+                "-p".to_string(),
+                "--permission-mode".to_string(),
+                "acceptEdits".to_string(),
+                "--verbose".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--include-partial-messages".to_string(),
+            ],
+            stdin_file: Some(task_path.to_path_buf()),
+            prompt_file_arg: None,
+        },
+        Agent::Opencode => InstrumentInvocation::Program {
+            program: "opencode".to_string(),
+            args: vec!["run".to_string()],
+            stdin_file: None,
+            prompt_file_arg: Some(task_path.to_path_buf()),
+        },
+        Agent::Cursor => InstrumentInvocation::Program {
+            program: "cursor-agent".to_string(),
+            args: vec![
+                "-p".to_string(),
+                "-f".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--stream-partial-output".to_string(),
+            ],
+            stdin_file: None,
+            prompt_file_arg: Some(task_path.to_path_buf()),
+        },
+    };
+    Ok(invocation)
+}
+
+async fn run_agent_invocation(
+    root: &Path,
+    invocation: &InstrumentInvocation,
+    show_output: bool,
+) -> Result<std::process::ExitStatus> {
+    match invocation {
+        InstrumentInvocation::Shell(command_text) => {
+            let mut command = Command::new("bash");
+            command.arg("-lc").arg(command_text);
+            command.current_dir(root);
+            if !show_output {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+            command
+                .status()
+                .await
+                .with_context(|| format!("failed to run agent command in {}", root.display()))
+        }
+        InstrumentInvocation::Program {
+            program,
+            args,
+            stdin_file,
+            prompt_file_arg,
+        } => {
+            let mut command = Command::new(program);
+            command.args(args).current_dir(root);
+            if let Some(path) = prompt_file_arg {
+                let prompt = fs::read_to_string(path).with_context(|| {
+                    format!("failed to read task prompt file {}", path.display())
+                })?;
+                let prompt = prompt.trim();
+                if prompt.is_empty() {
+                    bail!("task prompt file is empty: {}", path.display());
+                }
+                command.arg(prompt);
+            }
+            if let Some(path) = stdin_file {
+                let file = fs::File::open(path).with_context(|| {
+                    format!("failed to open task prompt file {}", path.display())
+                })?;
+                command.stdin(Stdio::from(file));
+            }
+
+            if !show_output {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+            command
+                .status()
+                .await
+                .with_context(|| format!("failed to run agent command in {}", root.display()))
+        }
+    }
+}
+
+fn render_instrument_task(repo_root: &Path, workflows: &[WorkflowArg]) -> String {
+    let docs_output_dir = repo_root.join(".bt").join("skills").join("docs");
+    let workflow_list = workflows
+        .iter()
+        .map(|workflow| workflow.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"Instrument this repository with Braintrust tracing.
+
+Requirements:
+1. Review the Braintrust instrumentation docs in `{}`.
+2. Focus on these workflow docs: {}.
+3. Use the installed Braintrust agent skills in this repo and prefer local `bt` CLI commands to verify setup.
+4. Do not rely on the Braintrust MCP server for this setup flow.
+5. Add tracing/instrumentation to the application code.
+6. Keep behavior intact; avoid unrelated refactors.
+7. If tests exist, run the smallest relevant tests after instrumentation.
+
+Output:
+- Updated source files with Braintrust instrumentation.
+- A short summary of what was instrumented and why."#,
+        docs_output_dir.display(),
+        workflow_list
+    )
 }
 
 fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
@@ -997,6 +1543,29 @@ fn resolve_selected_agents(requested: &[AgentArg], detected: &[DetectionSignal])
         }
     }
     out.into_iter().collect()
+}
+
+fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
+    match agent {
+        InstrumentAgentArg::Claude => Agent::Claude,
+        InstrumentAgentArg::Codex => Agent::Codex,
+        InstrumentAgentArg::Cursor => Agent::Cursor,
+        InstrumentAgentArg::Opencode => Agent::Opencode,
+    }
+}
+
+fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // Prefer Codex for instrumentation defaults when multiple agents are detected.
+    let priority = [Agent::Codex, Agent::Claude, Agent::Cursor, Agent::Opencode];
+    for preferred in priority {
+        if candidates.contains(&preferred) {
+            return Some(preferred);
+        }
+    }
+    candidates.first().copied()
 }
 
 fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
@@ -1833,6 +2402,164 @@ mod tests {
             selected,
             vec![WorkflowArg::Instrument, WorkflowArg::Evaluate]
         );
+    }
+
+    #[test]
+    fn resolve_instrument_workflows_forces_instrument() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: vec![WorkflowArg::Evaluate],
+            yes: true,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+        };
+
+        let selected =
+            resolve_instrument_workflow_selection(&args).expect("resolve instrument workflows");
+        assert_eq!(
+            selected,
+            vec![WorkflowArg::Instrument, WorkflowArg::Evaluate]
+        );
+    }
+
+    #[test]
+    fn resolve_instrument_workflows_default_to_instrument() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            yes: true,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+        };
+
+        let selected =
+            resolve_instrument_workflow_selection(&args).expect("resolve instrument workflows");
+        assert_eq!(selected, vec![WorkflowArg::Instrument]);
+    }
+
+    #[test]
+    fn render_instrument_task_includes_local_cli_and_no_mcp_guidance() {
+        let root = PathBuf::from("/tmp/repo");
+        let task = render_instrument_task(&root, &[WorkflowArg::Instrument, WorkflowArg::Observe]);
+        assert!(task.contains("Use the installed Braintrust agent skills"));
+        assert!(task.contains("prefer local `bt` CLI commands"));
+        assert!(task.contains("Do not rely on the Braintrust MCP server"));
+    }
+
+    #[test]
+    fn pick_agent_mode_target_prefers_codex() {
+        let selected = pick_agent_mode_target(&[Agent::Claude, Agent::Codex, Agent::Cursor]);
+        assert_eq!(selected, Some(Agent::Codex));
+    }
+
+    #[test]
+    fn codex_instrument_invocation_uses_exec_with_stdin_prompt() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation = resolve_instrument_invocation(Agent::Codex, None, &task_path)
+            .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+            } => {
+                assert_eq!(program, "codex");
+                assert_eq!(args, vec!["exec".to_string(), "-".to_string()]);
+                assert_eq!(stdin_file, Some(task_path));
+                assert_eq!(prompt_file_arg, None);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn claude_instrument_invocation_uses_print_with_stdin_prompt() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation = resolve_instrument_invocation(Agent::Claude, None, &task_path)
+            .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+            } => {
+                assert_eq!(program, "claude");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-p".to_string(),
+                        "--permission-mode".to_string(),
+                        "acceptEdits".to_string(),
+                        "--verbose".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--include-partial-messages".to_string(),
+                    ]
+                );
+                assert_eq!(stdin_file, Some(task_path));
+                assert_eq!(prompt_file_arg, None);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn opencode_instrument_invocation_uses_run_with_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation = resolve_instrument_invocation(Agent::Opencode, None, &task_path)
+            .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+            } => {
+                assert_eq!(program, "opencode");
+                assert_eq!(args, vec!["run".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn cursor_instrument_invocation_uses_print_with_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation = resolve_instrument_invocation(Agent::Cursor, None, &task_path)
+            .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+            } => {
+                assert_eq!(program, "cursor-agent");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-p".to_string(),
+                        "-f".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--stream-partial-output".to_string(),
+                    ]
+                );
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
     }
 
     #[test]

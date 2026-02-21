@@ -240,6 +240,9 @@ Use setup/docs commands to configure coding-agent skills and workflow docs for B
   - `bt setup --global`
 - Explicit skills subcommand:
   - `bt setup skills --local --agent claude --agent codex`
+- Instrument a repo with an agent:
+  - `bt setup instrument --agent codex`
+  - `bt setup instrument --agent claude --agent-cmd '<your claude command>'`
 - Configure MCP:
   - `bt setup mcp --local --agent claude --agent codex`
   - `bt setup mcp --global --yes`
@@ -267,6 +270,10 @@ Current behavior:
 - If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
 - In interactive TTY mode, skills setup shows a checklist so you can select/deselect agents before install.
 - In interactive TTY mode, setup also shows a workflow checklist and prefetches those docs automatically.
+- Running bare `bt setup` opens a top-level setup wizard with: `instrument`, `skills`, `mcp`, and `doctor`.
+- `bt setup instrument` always targets the local git repo, reuses the `skills` setup flow, and guarantees `instrument` docs are included.
+- In interactive mode, `bt setup instrument` always includes `instrument` and lets you multi-select additional docs for `observe` and/or `evaluate`.
+- `bt setup instrument` defaults to `codex` when no agent is specified; pass `--agent-cmd` for agents without a built-in default command.
 - In setup wizards, press `Esc` to go back to the previous step.
 - If `--workflow` is omitted in non-interactive mode, setup defaults to all workflows.
 - Use `--refresh-docs` in setup (or `bt docs fetch --refresh`) to clear old docs before re-fetching.
