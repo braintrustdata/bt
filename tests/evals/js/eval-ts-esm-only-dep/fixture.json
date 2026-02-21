@@ -1,0 +1,5 @@
+{
+  "runners": ["tsx"],
+  "files": ["tests/basic.eval.ts"],
+  "expect_success": true
+}
