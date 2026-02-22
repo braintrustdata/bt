@@ -10,11 +10,11 @@ import socket
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Any, Callable
 from pathlib import PurePosixPath
+from typing import Any, Callable
 
 try:
-    from braintrust import login
+    from braintrust import init_dataset, invoke, login
     from braintrust.framework import (
         BaseExperiment,
         EvaluatorInstance,
@@ -24,6 +24,7 @@ try:
         set_thread_pool_max_workers,
     )
     from braintrust.logger import Dataset
+    from braintrust.parameters import parameters_to_json_schema, validate_parameters
     from braintrust.util import eprint
 except Exception as exc:  # pragma: no cover - runtime guard
     print(
@@ -58,6 +59,8 @@ class RunnerConfig:
     terminate_on_failure: bool
     num_workers: int | None
     filters: list[EvalFilter]
+    dev_mode: str | None
+    dev_request_json: str | None
 
 
 @dataclass
@@ -131,6 +134,14 @@ def parse_serialized_filters(serialized: str | None) -> list[EvalFilter]:
     return filters
 
 
+def parse_dev_mode(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if value in {"list", "eval"}:
+        return value
+    raise ValueError(f"Invalid BT_EVAL_DEV_MODE value: {value}")
+
+
 def read_runner_config() -> RunnerConfig:
     num_workers_value = os.getenv("BT_EVAL_NUM_WORKERS")
     num_workers = int(num_workers_value) if num_workers_value else None
@@ -140,6 +151,8 @@ def read_runner_config() -> RunnerConfig:
         terminate_on_failure=env_flag("BT_EVAL_TERMINATE_ON_FAILURE"),
         num_workers=num_workers,
         filters=parse_serialized_filters(os.getenv("BT_EVAL_FILTER_PARSED")),
+        dev_mode=parse_dev_mode(os.getenv("BT_EVAL_DEV_MODE")),
+        dev_request_json=os.getenv("BT_EVAL_DEV_REQUEST_JSON"),
     )
 
 
@@ -222,11 +235,133 @@ def create_progress_reporter(sse: SseWriter | None, evaluator_name: str) -> Call
     return report
 
 
-def serialize_error(message: str, stack: str | None = None) -> dict[str, Any]:
+def serialize_error(
+    message: str,
+    stack: str | None = None,
+    status: int | None = None,
+) -> dict[str, Any]:
     data = {"message": message}
     if stack:
         data["stack"] = stack
+    if status is not None:
+        data["status"] = status
     return data
+
+
+def infer_eval_error_status(message: str) -> int:
+    text = message.lower()
+    if "not found" in text:
+        return 404
+    if (
+        "invalid parameter" in text
+        or "invalid parameters" in text
+        or "must include" in text
+        or "invalid eval" in text
+        or "invalid request" in text
+        or "failed to load dataset" in text
+    ):
+        return 400
+    return 500
+
+
+def send_eval_error(sse: SseWriter | None, message: str, stack: str | None = None, status: int | None = None) -> None:
+    payload = serialize_error(message, stack, status)
+    if sse:
+        sse.send("error", payload)
+    else:
+        eprint(message)
+
+
+def parse_eval_request(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        raise ValueError("Missing BT_EVAL_DEV_REQUEST_JSON")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid BT_EVAL_DEV_REQUEST_JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("BT_EVAL_DEV_REQUEST_JSON must be a JSON object.")
+    if not isinstance(parsed.get("name"), str) or not parsed["name"]:
+        raise ValueError("Eval request must include a non-empty name.")
+    if not isinstance(parsed.get("data"), dict):
+        raise ValueError("Eval request must include a data object.")
+
+    scores = parsed.get("scores")
+    if scores is not None:
+        if not isinstance(scores, list):
+            raise ValueError("scores must be an array")
+        for i, score in enumerate(scores):
+            if not isinstance(score, dict):
+                raise ValueError(f"scores[{i}] must be an object")
+            if not isinstance(score.get("name"), str) or not score["name"]:
+                raise ValueError(f"scores[{i}].name must be a non-empty string")
+            if not isinstance(score.get("function_id"), dict):
+                raise ValueError(f"scores[{i}].function_id must be an object")
+
+    return parsed
+
+
+def resolve_eval_data(data: dict[str, Any]) -> Any:
+    if "data" in data:
+        return data["data"]
+
+    dataset_name = data.get("dataset_name")
+    if isinstance(dataset_name, str):
+        if isinstance(data.get("project_name"), str):
+            return init_dataset(
+                project=data["project_name"],
+                name=dataset_name,
+                _internal_btql=data.get("_internal_btql"),
+            )
+        if isinstance(data.get("project_id"), str):
+            return init_dataset(
+                project_id=data["project_id"],
+                name=dataset_name,
+                _internal_btql=data.get("_internal_btql"),
+            )
+
+    raise ValueError("Invalid eval data payload.")
+
+
+def make_eval_scorer(
+    score: dict[str, Any],
+    project_id: str | None,
+) -> Callable[..., Any]:
+    function_id = dict(score["function_id"])
+    score_name = score["name"]
+
+    def scorer(input: Any, output: Any, expected: Any = None, metadata: Any = None, **_kwargs: Any) -> Any:
+        kwargs = {
+            **function_id,
+            "input": {
+                "input": input,
+                "output": output,
+                "expected": expected,
+                "metadata": metadata,
+            },
+            "stream": False,
+            "mode": "auto",
+            "strict": True,
+        }
+        if project_id:
+            kwargs["project_id"] = project_id
+        return invoke(**kwargs)
+
+    scorer.__name__ = score_name
+    return scorer
+
+
+def build_eval_definitions(evaluator_instances: list[EvaluatorInstance]) -> dict[str, Any]:
+    definitions: dict[str, Any] = {}
+    for evaluator_instance in evaluator_instances:
+        evaluator = evaluator_instance.evaluator
+        scores = [{"name": getattr(score, "__name__", f"scorer_{i}")} for i, score in enumerate(evaluator.scores)]
+        definitions[evaluator.eval_name] = {
+            "parameters": parameters_to_json_schema(evaluator.parameters) if evaluator.parameters else {},
+            "scores": scores,
+        }
+    return definitions
 
 
 def check_match(path_input: str) -> bool:
@@ -437,6 +572,102 @@ async def run_evaluator_task(
         if experiment:
             experiment.flush()
 
+
+async def run_requested_eval(
+    evaluator_instances: list[EvaluatorInstance],
+    reporters: dict[str, Any],
+    no_send_logs: bool,
+    sse: SseWriter | None,
+    config: RunnerConfig,
+) -> bool:
+    try:
+        request = parse_eval_request(config.dev_request_json)
+    except Exception as exc:
+        send_eval_error(sse, str(exc), traceback.format_exc(), 400)
+        return False
+
+    target_name = request["name"]
+    evaluator_instance = next(
+        (candidate for candidate in evaluator_instances if candidate.evaluator.eval_name == target_name),
+        None,
+    )
+    if evaluator_instance is None:
+        send_eval_error(sse, f"Evaluator '{target_name}' not found", None, 404)
+        return False
+
+    evaluator = evaluator_instance.evaluator
+    try:
+        evaluator.data = resolve_eval_data(request["data"])
+
+        if "experiment_name" in request:
+            evaluator.experiment_name = request["experiment_name"]
+        if "project_id" in request:
+            evaluator.project_id = request["project_id"]
+
+        if evaluator.parameters is not None:
+            request_parameters = request.get("parameters", {})
+            if not isinstance(request_parameters, dict):
+                raise ValueError("parameters must be an object")
+            evaluator.parameters = validate_parameters(request_parameters, evaluator.parameters)
+        elif "parameters" in request:
+            if not isinstance(request["parameters"], dict):
+                raise ValueError("parameters must be an object")
+            evaluator.parameters = request["parameters"]
+
+        if "scores" in request and request["scores"]:
+            scorer_functions = [
+                make_eval_scorer(score, request.get("project_id"))
+                for score in request["scores"]
+            ]
+            evaluator.scores = [*evaluator.scores, *scorer_functions]
+    except Exception as exc:
+        message = str(exc)
+        send_eval_error(sse, message, traceback.format_exc(), infer_eval_error_status(message))
+        return False
+
+    try:
+        resolved_reporter = resolve_reporter(
+            getattr(evaluator_instance, "reporter", None),
+            reporters,
+        )
+    except Exception as exc:
+        message = str(exc)
+        send_eval_error(sse, message, traceback.format_exc(), infer_eval_error_status(message))
+        return False
+
+    supports_progress = run_evaluator_supports_progress()
+    progress_cb = create_progress_reporter(sse, evaluator.eval_name)
+
+    try:
+        result = await run_evaluator_task(
+            evaluator,
+            0,
+            no_send_logs,
+            progress_cb,
+            supports_progress,
+        )
+    except Exception as exc:
+        message = str(exc)
+        send_eval_error(sse, message, traceback.format_exc(), infer_eval_error_status(message))
+        return False
+
+    if sse:
+        sse.send("summary", format_summary(result.summary.as_dict()))
+    elif config.jsonl:
+        print(json.dumps(format_summary(result.summary.as_dict())))
+    else:
+        print(result.summary)
+
+    failures = [row for row in result.results if row.error]
+    if failures and resolved_reporter is None:
+        first_error = failures[0]
+        message = f"Evaluator {evaluator.eval_name} failed with {len(failures)} error(s)."
+        send_eval_error(sse, message, first_error.exc_info, 500)
+        return False
+
+    return True
+
+
 async def run_once(
     files: list[str],
     no_send_logs: bool,
@@ -444,7 +675,7 @@ async def run_once(
     config: RunnerConfig,
 ) -> bool:
     evaluators, reporters = load_evaluators(files)
-    if not evaluators and not config.list_only:
+    if not evaluators and not config.list_only and config.dev_mode != "list":
         message = "No evaluators found. Did you call Eval() in the file?"
         if sse:
             sse.send("console", {"stream": "stderr", "message": message})
@@ -453,6 +684,12 @@ async def run_once(
         return True
 
     evaluators = filter_evaluators(evaluators, config.filters)
+    if config.dev_mode == "list":
+        print(json.dumps(build_eval_definitions(evaluators)))
+        return True
+    if config.dev_mode == "eval":
+        return await run_requested_eval(evaluators, reporters, no_send_logs, sse, config)
+
     if config.list_only:
         for evaluator_instance in evaluators:
             print(evaluator_instance.evaluator.eval_name)

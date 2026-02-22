@@ -37,10 +37,18 @@ type EvalFunction = (
 ) => Promise<EvalResult>;
 
 type LoginFunction = (options?: Record<string, unknown>) => Promise<unknown>;
+type InitDatasetFunction = (
+  projectOrOptions: string | Record<string, unknown>,
+  options?: Record<string, unknown>,
+) => unknown;
+type InvokeFunction = (options: Record<string, unknown>) => Promise<unknown>;
 
 type BraintrustModule = {
   Eval?: EvalFunction;
   login?: LoginFunction;
+  initDataset?: InitDatasetFunction;
+  invoke?: InvokeFunction;
+  _internalGetGlobalState?: () => unknown;
   default?: BraintrustModule;
 };
 
@@ -85,11 +93,64 @@ type SerializedEvalFilter = {
   pattern: string;
 };
 
+type EvalScoreSpec = {
+  name: string;
+  function_id: Record<string, unknown>;
+};
+
+type EvalRequest = {
+  name: string;
+  parameters?: Record<string, unknown>;
+  parent?: unknown;
+  experiment_name?: string;
+  project_id?: string;
+  data:
+    | { data: unknown[] }
+    | { project_name: string; dataset_name: string; _internal_btql?: unknown }
+    | { project_id: string; dataset_name: string; _internal_btql?: unknown };
+  scores?: EvalScoreSpec[];
+};
+
 type RunnerConfig = {
   jsonl: boolean;
   list: boolean;
   terminateOnFailure: boolean;
   filters: EvalFilter[];
+  devMode: "list" | "eval" | null;
+  devRequestJson: string | null;
+};
+
+type EvalRunner = {
+  Eval: EvalFunction;
+  sse: SseWriter | null;
+  login?: LoginFunction;
+  initDataset?: InitDatasetFunction;
+  invoke?: InvokeFunction;
+  runEval: (
+    projectName: string,
+    evaluator: Record<string, unknown>,
+    options?: EvalOptions,
+  ) => Promise<EvalResult>;
+  runRegisteredEvals: (evaluators: EvaluatorEntry[]) => Promise<boolean>;
+  makeEvalOptions: (
+    evaluatorName: string,
+    options?: EvalOptions,
+  ) => EvalOptions | undefined;
+  finish: (ok: boolean) => void;
+  noSendLogs: boolean;
+  parseParent: ParseParentFunction | null;
+  getState: (() => unknown) | null;
+};
+
+type ParameterContainerSerializer = (parameters: unknown) => unknown;
+type PromptDefinitionSerializer = (prompt: unknown) => unknown;
+type ZodSchemaSerializer = (schema: unknown) => Record<string, unknown>;
+type ParseParentFunction = (parent: unknown) => string | undefined;
+
+type ParameterSerializationHelpers = {
+  sdkSerializeParameters: ParameterContainerSerializer | null;
+  promptDefinitionToPromptData: PromptDefinitionSerializer | null;
+  zodToJsonSchema: ZodSchemaSerializer | null;
 };
 
 declare global {
@@ -182,12 +243,24 @@ function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
   }
 }
 
+function parseDevMode(value: string | undefined): "list" | "eval" | null {
+  if (!value) {
+    return null;
+  }
+  if (value === "list" || value === "eval") {
+    return value;
+  }
+  throw new Error(`Invalid BT_EVAL_DEV_MODE value: ${value}`);
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
+    devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
+    devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
   };
 }
 
@@ -737,6 +810,212 @@ async function loadBraintrust() {
   return normalizeBraintrustModule(mod);
 }
 
+function extractParameterSerializer(
+  mod: unknown,
+): ParameterContainerSerializer | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "serializeRemoteEvalParametersContainer");
+  if (typeof candidate === "function") {
+    return candidate as ParameterContainerSerializer;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(
+      defaultExport,
+      "serializeRemoteEvalParametersContainer",
+    );
+    if (typeof fromDefault === "function") {
+      return fromDefault as ParameterContainerSerializer;
+    }
+  }
+  return null;
+}
+
+function extractPromptDefinitionSerializer(
+  mod: unknown,
+): PromptDefinitionSerializer | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "promptDefinitionToPromptData");
+  if (typeof candidate === "function") {
+    return candidate as PromptDefinitionSerializer;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(
+      defaultExport,
+      "promptDefinitionToPromptData",
+    );
+    if (typeof fromDefault === "function") {
+      return fromDefault as PromptDefinitionSerializer;
+    }
+  }
+  return null;
+}
+
+function isZodV4Schema(schema: unknown): boolean {
+  return (
+    isObject(schema) &&
+    "_zod" in schema &&
+    Reflect.get(schema, "_zod") !== undefined
+  );
+}
+
+function normalizeJsonSchema(value: unknown): Record<string, unknown> {
+  if (isObject(value)) {
+    return value;
+  }
+  return {};
+}
+
+function loadZodSchemaSerializer(
+  braintrustResolvedPath: string,
+): ZodSchemaSerializer | null {
+  const requireFromBraintrust = createRequire(
+    pathToFileURL(braintrustResolvedPath).href,
+  );
+
+  let zodToJsonSchemaV3: ((schema: unknown) => unknown) | null = null;
+  try {
+    const zodToJsonSchemaModule: unknown =
+      requireFromBraintrust("zod-to-json-schema");
+    if (typeof zodToJsonSchemaModule === "function") {
+      zodToJsonSchemaV3 = zodToJsonSchemaModule as (schema: unknown) => unknown;
+    } else if (isObject(zodToJsonSchemaModule)) {
+      const direct = Reflect.get(zodToJsonSchemaModule, "zodToJsonSchema");
+      if (typeof direct === "function") {
+        zodToJsonSchemaV3 = direct as (schema: unknown) => unknown;
+      } else {
+        const nestedDefault = Reflect.get(zodToJsonSchemaModule, "default");
+        if (typeof nestedDefault === "function") {
+          zodToJsonSchemaV3 = nestedDefault as (schema: unknown) => unknown;
+        } else if (isObject(nestedDefault)) {
+          const fromDefault = Reflect.get(nestedDefault, "zodToJsonSchema");
+          if (typeof fromDefault === "function") {
+            zodToJsonSchemaV3 = fromDefault as (schema: unknown) => unknown;
+          }
+        }
+      }
+    }
+  } catch {
+    zodToJsonSchemaV3 = null;
+  }
+
+  let zodToJsonSchemaV4:
+    | ((schema: unknown, options?: { target?: string }) => unknown)
+    | null = null;
+  try {
+    const zodV4Module: unknown = requireFromBraintrust("zod/v4");
+    if (isObject(zodV4Module)) {
+      const direct = Reflect.get(zodV4Module, "toJSONSchema");
+      if (typeof direct === "function") {
+        zodToJsonSchemaV4 = direct as (
+          schema: unknown,
+          options?: { target?: string },
+        ) => unknown;
+      }
+    }
+  } catch {
+    zodToJsonSchemaV4 = null;
+  }
+
+  if (!zodToJsonSchemaV3 && !zodToJsonSchemaV4) {
+    return null;
+  }
+
+  return (schema: unknown): Record<string, unknown> => {
+    try {
+      if (isZodV4Schema(schema) && zodToJsonSchemaV4) {
+        return normalizeJsonSchema(
+          zodToJsonSchemaV4(schema, { target: "draft-7" }),
+        );
+      }
+      if (zodToJsonSchemaV3) {
+        return normalizeJsonSchema(zodToJsonSchemaV3(schema));
+      }
+      if (zodToJsonSchemaV4) {
+        return normalizeJsonSchema(
+          zodToJsonSchemaV4(schema, { target: "draft-7" }),
+        );
+      }
+      return {};
+    } catch {
+      return {};
+    }
+  };
+}
+
+async function loadParameterSerializationHelpers(): Promise<ParameterSerializationHelpers> {
+  const braintrustPath = resolveBraintrustPath();
+  const zodToJsonSchema = loadZodSchemaSerializer(braintrustPath);
+  try {
+    const mod: unknown = await import(pathToFileURL(braintrustPath).href);
+    return {
+      sdkSerializeParameters: extractParameterSerializer(mod),
+      promptDefinitionToPromptData: extractPromptDefinitionSerializer(mod),
+      zodToJsonSchema,
+    };
+  } catch {
+    return {
+      sdkSerializeParameters: null,
+      promptDefinitionToPromptData: null,
+      zodToJsonSchema,
+    };
+  }
+}
+
+function extractParseParent(mod: unknown): ParseParentFunction | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "parseParent");
+  if (typeof candidate === "function") {
+    return candidate as ParseParentFunction;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(defaultExport, "parseParent");
+    if (typeof fromDefault === "function") {
+      return fromDefault as ParseParentFunction;
+    }
+  }
+  return null;
+}
+
+function extractGlobalStateGetter(mod: unknown): (() => unknown) | null {
+  if (!isObject(mod)) {
+    return null;
+  }
+  const candidate = Reflect.get(mod, "_internalGetGlobalState");
+  if (typeof candidate === "function") {
+    return candidate as () => unknown;
+  }
+  const defaultExport = Reflect.get(mod, "default");
+  if (isObject(defaultExport)) {
+    const fromDefault = Reflect.get(defaultExport, "_internalGetGlobalState");
+    if (typeof fromDefault === "function") {
+      return fromDefault as () => unknown;
+    }
+  }
+  return null;
+}
+
+function loadBraintrustUtilParseParent(): ParseParentFunction | null {
+  const braintrustPath = resolveBraintrustPath();
+  const requireFromBraintrust = createRequire(
+    pathToFileURL(braintrustPath).href,
+  );
+  try {
+    const utilMod: unknown = requireFromBraintrust("braintrust/util");
+    return extractParseParent(utilMod);
+  } catch {
+    return null;
+  }
+}
+
 function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
   const getter = (braintrust as Record<string, unknown>)
     ._internalGetGlobalState;
@@ -976,6 +1255,380 @@ function filterEvaluators(
   );
 }
 
+function extractScoreName(score: unknown, idx: number): string {
+  if (typeof score === "function" && typeof score.name === "string") {
+    return score.name || `scorer_${idx}`;
+  }
+  return `scorer_${idx}`;
+}
+
+async function serializeEvaluatorParameters(
+  raw: unknown,
+  helpers?: ParameterSerializationHelpers,
+): Promise<unknown | undefined> {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+
+  const resolved = raw instanceof Promise ? await raw : raw;
+  if (!isObject(resolved)) {
+    return undefined;
+  }
+
+  if (helpers?.sdkSerializeParameters) {
+    try {
+      return helpers.sdkSerializeParameters(resolved);
+    } catch {
+      // Fallback to legacy serialization below when SDK internals are unavailable.
+    }
+  }
+
+  const marker = Reflect.get(resolved, "__braintrust_parameters_marker");
+  if (marker === true) {
+    const schema = Reflect.get(resolved, "schema");
+    const source = {
+      parametersId: Reflect.get(resolved, "id"),
+      slug: Reflect.get(resolved, "slug"),
+      name: Reflect.get(resolved, "name"),
+      projectId: Reflect.get(resolved, "projectId"),
+      version: Reflect.get(resolved, "version"),
+    };
+    return {
+      type: "braintrust.parameters",
+      schema,
+      source,
+    };
+  }
+
+  const schema: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(resolved)) {
+    if (isObject(value) && value.type === "prompt") {
+      let promptDefault = value.default;
+      if (
+        promptDefault !== undefined &&
+        helpers?.promptDefinitionToPromptData
+      ) {
+        try {
+          promptDefault = helpers.promptDefinitionToPromptData(promptDefault);
+        } catch {
+          // Keep raw prompt default when conversion utility is unavailable.
+        }
+      }
+      schema[name] = {
+        type: "prompt",
+        ...(promptDefault !== undefined ? { default: promptDefault } : {}),
+        ...(typeof value.description === "string"
+          ? { description: value.description }
+          : {}),
+      };
+    } else {
+      const jsonSchema = helpers?.zodToJsonSchema
+        ? helpers.zodToJsonSchema(value)
+        : {};
+      schema[name] = {
+        type: "data",
+        schema: jsonSchema,
+        ...(Object.prototype.hasOwnProperty.call(jsonSchema, "default")
+          ? { default: Reflect.get(jsonSchema, "default") }
+          : {}),
+        ...(typeof Reflect.get(jsonSchema, "description") === "string"
+          ? { description: Reflect.get(jsonSchema, "description") as string }
+          : {}),
+      };
+    }
+  }
+
+  return {
+    type: "braintrust.staticParameters",
+    schema,
+    source: null,
+  };
+}
+
+async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
+  const serializationHelpers = await loadParameterSerializationHelpers();
+  const result: Record<
+    string,
+    { parameters?: unknown; scores: Array<{ name: string }> }
+  > = {};
+
+  for (const entry of evaluators) {
+    const scores = Array.isArray(entry.evaluator.scores)
+      ? entry.evaluator.scores.map((score, idx) => ({
+          name: extractScoreName(score, idx),
+        }))
+      : [];
+
+    const parameters = await serializeEvaluatorParameters(
+      entry.evaluator.parameters,
+      serializationHelpers,
+    );
+
+    result[entry.evaluator.evalName] = {
+      ...(parameters !== undefined ? { parameters } : {}),
+      scores,
+    };
+  }
+
+  return result;
+}
+
+function parseEvalRequest(raw: string | null): EvalRequest {
+  if (!raw) {
+    throw new Error("Missing BT_EVAL_DEV_REQUEST_JSON");
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isObject(parsed)) {
+      throw new Error("BT_EVAL_DEV_REQUEST_JSON must be a JSON object.");
+    }
+    if (typeof parsed.name !== "string" || parsed.name.length === 0) {
+      throw new Error("Eval request must include a non-empty name.");
+    }
+    if (!isObject(parsed.data)) {
+      throw new Error("Eval request must include a data object.");
+    }
+    return parsed as EvalRequest;
+  } catch (err) {
+    if (err instanceof Error) {
+      throw err;
+    }
+    throw new Error(String(err));
+  }
+}
+
+function normalizeParent(
+  parent: unknown,
+  parseParent: ParseParentFunction | null,
+): string | undefined {
+  if (parent === undefined || parent === null) {
+    return undefined;
+  }
+  if (typeof parent === "string") {
+    return parent;
+  }
+  if (parseParent) {
+    try {
+      const parsed = parseParent(parent);
+      if (typeof parsed === "string" || parsed === undefined) {
+        return parsed;
+      }
+    } catch {
+      // Fall through and return a validation error below.
+    }
+  }
+  throw new Error(
+    "Invalid parent payload: expected a serialized parent string or a valid parent object.",
+  );
+}
+
+function resolveEvalData(
+  data: EvalRequest["data"],
+  initDataset: InitDatasetFunction | undefined,
+): unknown {
+  if ("data" in data) {
+    return data.data;
+  }
+  if ("project_name" in data && "dataset_name" in data) {
+    if (!initDataset) {
+      throw new Error(
+        "Unable to resolve dataset references: initDataset() is unavailable.",
+      );
+    }
+    return initDataset(data.project_name, {
+      dataset: data.dataset_name,
+      _internal_btql: data._internal_btql,
+    });
+  }
+  if ("project_id" in data && "dataset_name" in data) {
+    if (!initDataset) {
+      throw new Error(
+        "Unable to resolve dataset references: initDataset() is unavailable.",
+      );
+    }
+    return initDataset({
+      projectId: data.project_id,
+      dataset: data.dataset_name,
+      _internal_btql: data._internal_btql,
+    });
+  }
+  throw new Error("Invalid eval data payload.");
+}
+
+function convertFunctionId(
+  functionId: Record<string, unknown>,
+): Record<string, unknown> {
+  const converted: Record<string, unknown> = {};
+  if (functionId.function_id !== undefined) {
+    converted.function_id = functionId.function_id;
+  }
+  if (typeof functionId.project_name === "string") {
+    converted.projectName = functionId.project_name;
+  }
+  if (typeof functionId.slug === "string") {
+    converted.slug = functionId.slug;
+  }
+  if (typeof functionId.global_function === "string") {
+    converted.globalFunction = functionId.global_function;
+  }
+  if (typeof functionId.function_type === "string") {
+    converted.functionType = functionId.function_type;
+  }
+  if (typeof functionId.prompt_session_id === "string") {
+    converted.promptSessionId = functionId.prompt_session_id;
+  }
+  if (typeof functionId.prompt_session_function_id === "string") {
+    converted.promptSessionFunctionId = functionId.prompt_session_function_id;
+  }
+  if (typeof functionId.version === "string") {
+    converted.version = functionId.version;
+  }
+  return converted;
+}
+
+function makeEvalScorer(
+  invoke: InvokeFunction,
+  score: EvalScoreSpec,
+  projectId: string | undefined,
+) {
+  const scorer = async (args: Record<string, unknown>) => {
+    return await invoke({
+      ...convertFunctionId(score.function_id),
+      input: {
+        input: args.input,
+        output: args.output,
+        expected: args.expected,
+        metadata: args.metadata,
+      },
+      stream: false,
+      mode: "auto",
+      strict: true,
+      ...(projectId ? { projectId } : {}),
+    });
+  };
+
+  Object.defineProperty(scorer, "name", {
+    value: score.name,
+    writable: false,
+  });
+
+  return scorer;
+}
+
+function inferEvalErrorStatus(err: unknown): number {
+  if (!(err instanceof Error)) {
+    return 500;
+  }
+  const message = err.message.toLowerCase();
+  if (
+    message.includes("invalid parameter") ||
+    message.includes("invalid parameters") ||
+    message.includes("must include") ||
+    message.includes("invalid eval")
+  ) {
+    return 400;
+  }
+  if (message.includes("not found")) {
+    return 404;
+  }
+  return 500;
+}
+
+function sendEvalError(sse: SseWriter | null, err: unknown, status?: number) {
+  const payload =
+    err instanceof Error
+      ? {
+          message: err.message,
+          stack: err.stack,
+          ...(status !== undefined ? { status } : {}),
+        }
+      : {
+          message: String(err),
+          ...(status !== undefined ? { status } : {}),
+        };
+  if (sse) {
+    sse.send("error", payload);
+  } else {
+    console.error(payload.message);
+  }
+}
+
+async function runRequestedEval(config: RunnerConfig, runner: EvalRunner) {
+  let request: EvalRequest;
+  try {
+    request = parseEvalRequest(config.devRequestJson);
+  } catch (err) {
+    sendEvalError(runner.sse, err, 400);
+    return;
+  }
+
+  const entry = getEvaluators().find(
+    (candidate) => candidate.evaluator.evalName === request.name,
+  );
+  if (!entry) {
+    sendEvalError(
+      runner.sse,
+      new Error(`Evaluator '${request.name}' not found`),
+      404,
+    );
+    return;
+  }
+
+  try {
+    const baseScores = Array.isArray(entry.evaluator.scores)
+      ? entry.evaluator.scores
+      : [];
+
+    if ((request.scores?.length ?? 0) > 0 && !runner.invoke) {
+      throw new Error(
+        "Unable to run scorer functions: invoke() is unavailable.",
+      );
+    }
+
+    const extraScores = (request.scores ?? []).map((score) =>
+      makeEvalScorer(
+        runner.invoke as InvokeFunction,
+        score,
+        request.project_id,
+      ),
+    );
+
+    const state = runner.getState ? runner.getState() : undefined;
+    const evaluator = {
+      ...entry.evaluator,
+      data: resolveEvalData(request.data, runner.initDataset),
+      scores: baseScores.concat(extraScores),
+      ...(request.experiment_name
+        ? { experimentName: request.experiment_name }
+        : {}),
+      ...(request.project_id ? { projectId: request.project_id } : {}),
+      ...(state !== undefined && state !== null ? { state } : {}),
+    };
+
+    const options: EvalOptions = {};
+    if (request.parameters) {
+      options.parameters = request.parameters;
+    }
+    if (request.parent !== undefined) {
+      options.parent = normalizeParent(request.parent, runner.parseParent);
+    }
+
+    const reporters = getReporters();
+    const resolvedReporter = resolveReporter(entry.reporter, reporters);
+    if (resolvedReporter !== undefined) {
+      options.reporter = resolvedReporter;
+    }
+
+    await runner.runEval(
+      entry.evaluator.projectName,
+      evaluator,
+      Object.keys(options).length > 0 ? options : undefined,
+    );
+  } catch (err) {
+    sendEvalError(runner.sse, err, inferEvalErrorStatus(err));
+  }
+}
+
 function extractBtEvalMain(mod: unknown): BtEvalMain | null {
   if (!mod || typeof mod !== "object") {
     return null;
@@ -1020,6 +1673,40 @@ function getEvaluatorName(
     return candidate;
   }
   return fallback;
+}
+
+function wrapTaskForStreamingProgress(
+  evaluator: Record<string, unknown>,
+): Record<string, unknown> {
+  const task = evaluator.task;
+  if (typeof task !== "function") {
+    return evaluator;
+  }
+
+  const wrappedTask = async (input: unknown, hooks: unknown) => {
+    const result = await task(input, hooks);
+    if (isObject(hooks)) {
+      const reportProgress = Reflect.get(hooks, "reportProgress");
+      if (typeof reportProgress === "function") {
+        try {
+          reportProgress({
+            format: "code",
+            output_type: "completion",
+            event: "json_delta",
+            data: JSON.stringify(result),
+          });
+        } catch {
+          // Progress updates should not fail the evaluator run.
+        }
+      }
+    }
+    return result;
+  };
+
+  return {
+    ...evaluator,
+    task: wrappedTask,
+  };
 }
 
 function mergeEvalOptions(
@@ -1112,16 +1799,20 @@ function mergeProgress(
   };
 }
 
-async function createEvalRunner(config: RunnerConfig) {
+async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   const braintrust = await loadBraintrust();
   const Eval = braintrust.Eval;
   if (typeof Eval !== "function") {
     throw new Error("Unable to load Eval() from braintrust package.");
   }
   const login = braintrust.login;
+  const initDataset = braintrust.initDataset;
+  const invoke = braintrust.invoke;
 
   const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
+  const parseParent = loadBraintrustUtilParseParent();
+  const getState = extractGlobalStateGetter(braintrust);
 
   const makeEvalOptions = (
     evaluatorName: string,
@@ -1163,7 +1854,8 @@ async function createEvalRunner(config: RunnerConfig) {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     const opts = makeEvalOptions(evaluatorName, options);
-    const result = await Eval(projectName, evaluator, opts);
+    const wrappedEvaluator = wrapTaskForStreamingProgress(evaluator);
+    const result = await Eval(projectName, wrappedEvaluator, opts);
     const failingResults = result.results.filter(
       (r: { error?: unknown }) => r.error !== undefined,
     );
@@ -1243,11 +1935,15 @@ async function createEvalRunner(config: RunnerConfig) {
     Eval,
     sse,
     login,
+    initDataset,
+    invoke,
     runEval,
     runRegisteredEvals,
     makeEvalOptions,
     finish,
     noSendLogs,
+    parseParent,
+    getState,
   };
 }
 
@@ -1311,6 +2007,18 @@ async function main() {
       discoveredEvaluators,
       config.filters,
     );
+
+    if (config.devMode === "list") {
+      const definitions = await buildEvaluatorDefinitions(filteredEvaluators);
+      console.log(JSON.stringify(definitions));
+      return;
+    }
+
+    if (config.devMode === "eval") {
+      await runRequestedEval(config, runner);
+      return;
+    }
+
     if (config.list) {
       for (const entry of filteredEvaluators) {
         console.log(entry.evaluator.evalName);
