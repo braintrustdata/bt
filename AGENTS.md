@@ -10,3 +10,4 @@
 - Extreme edge-case exceptions are allowed only when a flag is not feasible (for example, process-internal plumbing), and must be:
   - documented inline with a short rationale, and
   - minimized in scope.
+- Do not infer/transform app URLs from API URLs (for example, replacing `api.` with `www.`). Treat `--app-url` / `BRAINTRUST_APP_URL` as the source of truth for app URLs.

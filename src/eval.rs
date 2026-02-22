@@ -10,7 +10,7 @@ use actix_web::dev::Service;
 use actix_web::http::header::{
     HeaderName, HeaderValue, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
     ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS,
-    ACCESS_CONTROL_MAX_AGE, ORIGIN, VARY,
+    ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ORIGIN, VARY,
 };
 use actix_web::{guard, web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
@@ -47,9 +47,13 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAIN_ORIGIN: &str = "https://www.braintrust.dev";
 const BRAINTRUSTDATA_ORIGIN: &str = "https://www.braintrustdata.com";
 const CORS_METHODS: &str = "GET, PATCH, POST, PUT, DELETE, OPTIONS";
-const CORS_ALLOWED_HEADERS: &str = "Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token, x-bt-auth-token, x-bt-parent, x-bt-org-name, x-bt-project-id, x-bt-stream-fmt, x-bt-use-cache, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch";
+const CORS_ALLOWED_HEADERS: &str = "Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token, x-bt-auth-token, x-bt-parent, x-bt-org-name, x-bt-project-id, x-bt-stream-fmt, x-bt-use-cache, x-bt-use-gateway, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch";
 const CORS_EXPOSED_HEADERS: &str =
     "x-bt-cursor, x-bt-found-existing-experiment, x-bt-span-id, x-bt-span-export";
+const HEADER_BT_AUTH_TOKEN: &str = "x-bt-auth-token";
+const HEADER_BT_ORG_NAME: &str = "x-bt-org-name";
+const HEADER_CORS_REQ_PRIVATE_NETWORK: &str = "access-control-request-private-network";
+const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
 const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
 static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -101,6 +105,29 @@ struct DatasetLookupRow {
     name: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DatasetIdField {
+    String(String),
+    Other(Value),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DatasetEvalDataInput {
+    #[serde(default)]
+    dataset_id: Option<DatasetIdField>,
+    #[serde(default)]
+    _internal_btql: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResolvedDatasetEvalData {
+    project_id: String,
+    dataset_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _internal_btql: Option<Value>,
+}
+
 #[derive(Clone)]
 struct DevServerState {
     base: BaseArgs,
@@ -112,6 +139,7 @@ struct DevServerState {
     host: String,
     port: u16,
     allowed_org_name: Option<String>,
+    allowed_origins: Vec<String>,
     app_url: String,
     http_client: Client,
 }
@@ -225,6 +253,16 @@ pub struct EvalArgs {
     /// Restrict eval dev server access to a specific org name.
     #[arg(long)]
     pub dev_org_name: Option<String>,
+
+    /// Additional allowed browser origin(s) for eval dev server CORS checks.
+    /// Repeat this flag or set BT_EVAL_DEV_ALLOWED_ORIGIN as a comma-separated list.
+    #[arg(
+        long = "dev-allowed-origin",
+        env = "BT_EVAL_DEV_ALLOWED_ORIGIN",
+        value_name = "ORIGIN",
+        value_delimiter = ','
+    )]
+    pub dev_allowed_origin: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +289,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
     if args.dev {
         let language = detect_eval_language(&args.files, args.language)?;
+        let app_url = resolve_app_url(&base);
         let state = DevServerState {
             base: base.clone(),
             language_override: Some(language),
@@ -261,7 +300,8 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             host: args.dev_host.clone(),
             port: args.dev_port,
             allowed_org_name: args.dev_org_name.clone(),
-            app_url: resolve_app_url(&base),
+            allowed_origins: collect_allowed_dev_origins(&args.dev_allowed_origin, &app_url),
+            app_url,
             http_client: Client::builder()
                 .build()
                 .context("failed to create dev server HTTP client")?,
@@ -572,12 +612,41 @@ fn resolve_app_url(base: &BaseArgs) -> String {
     if let Some(app_url) = base.app_url.as_ref() {
         return app_url.clone();
     }
-    if let Some(api_url) = base.api_url.as_ref() {
-        return api_url
-            .replace("api.braintrust", "www.braintrust")
-            .replace("api.braintrustdata", "www.braintrustdata");
-    }
     "https://www.braintrust.dev".to_string()
+}
+
+fn app_origin_from_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url).ok().and_then(|parsed| {
+        let origin = parsed.origin();
+        if origin.is_tuple() {
+            Some(origin.ascii_serialization())
+        } else {
+            None
+        }
+    })
+}
+
+fn collect_allowed_dev_origins(explicit: &[String], app_url: &str) -> Vec<String> {
+    let mut deduped = BTreeSet::new();
+    for origin in explicit {
+        let trimmed = origin.trim();
+        if !trimmed.is_empty() {
+            deduped.insert(trimmed.to_string());
+        }
+    }
+    if let Some(origin) = app_origin_from_url(app_url) {
+        deduped.insert(origin);
+    }
+    deduped.into_iter().collect()
+}
+
+fn join_app_url(app_url: &str, path: &str) -> Result<String> {
+    let base = format!("{}/", app_url.trim_end_matches('/'));
+    let base_url = reqwest::Url::parse(&base).context("invalid app URL")?;
+    let joined = base_url
+        .join(path.trim_start_matches('/'))
+        .context("failed to join app URL path")?;
+    Ok(joined.to_string())
 }
 
 fn json_error_response(status: actix_web::http::StatusCode, message: &str) -> HttpResponse {
@@ -585,7 +654,7 @@ fn json_error_response(status: actix_web::http::StatusCode, message: &str) -> Ht
 }
 
 fn parse_auth_token(req: &HttpRequest) -> Option<String> {
-    if let Some(token) = req.headers().get("x-bt-auth-token") {
+    if let Some(token) = req.headers().get(HEADER_BT_AUTH_TOKEN) {
         if let Ok(value) = token.to_str() {
             if !value.trim().is_empty() {
                 return Some(value.trim().to_string());
@@ -593,7 +662,7 @@ fn parse_auth_token(req: &HttpRequest) -> Option<String> {
         }
     }
 
-    let auth = req.headers().get("authorization")?;
+    let auth = req.headers().get(AUTHORIZATION)?;
     let auth = auth.to_str().ok()?.trim();
     if auth.is_empty() {
         return None;
@@ -626,14 +695,14 @@ async fn authenticate_dev_request(
 
     let org_name = match req
         .headers()
-        .get("x-bt-org-name")
+        .get(HEADER_BT_ORG_NAME)
         .and_then(|value| value.to_str().ok())
     {
         Some(value) if !value.trim().is_empty() => value.trim().to_string(),
         _ => {
             return Err(json_error_response(
                 actix_web::http::StatusCode::BAD_REQUEST,
-                "Missing x-bt-org-name header",
+                &format!("Missing {HEADER_BT_ORG_NAME} header"),
             ));
         }
     };
@@ -650,7 +719,15 @@ async fn authenticate_dev_request(
         }
     }
 
-    let login_url = format!("{}/api/apikey/login", state.app_url.trim_end_matches('/'));
+    let login_url = match join_app_url(&state.app_url, "api/apikey/login") {
+        Ok(url) => url,
+        Err(err) => {
+            return Err(json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            ));
+        }
+    };
     let response = state
         .http_client
         .post(login_url)
@@ -691,19 +768,30 @@ async fn resolve_dataset_ref_for_eval_request(
     auth: &DevAuthContext,
     eval_request: &mut EvalRequest,
 ) -> std::result::Result<(), HttpResponse> {
-    let data_obj = eval_request.data.as_object();
-    let Some(data_obj) = data_obj else {
-        return Ok(());
+    let input = match serde_json::from_value::<DatasetEvalDataInput>(eval_request.data.clone()) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
     };
 
-    let Some(dataset_id_value) = data_obj.get("dataset_id") else {
-        return Ok(());
-    };
-    let Some(dataset_id) = dataset_id_value.as_str() else {
-        return Err(json_error_response(
-            actix_web::http::StatusCode::BAD_REQUEST,
-            "Invalid dataset_id: expected a string.",
-        ));
+    let dataset_id = match input.dataset_id {
+        Some(DatasetIdField::String(dataset_id)) => dataset_id,
+        Some(DatasetIdField::Other(value)) => {
+            let received_type = match value {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            return Err(json_error_response(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                &format!("Invalid dataset_id: expected a string, got {received_type}."),
+            ));
+        }
+        None => {
+            return Ok(());
+        }
     };
     if dataset_id.trim().is_empty() {
         return Err(json_error_response(
@@ -712,12 +800,20 @@ async fn resolve_dataset_ref_for_eval_request(
         ));
     }
 
-    let lookup_url = format!("{}/api/dataset/get", state.app_url.trim_end_matches('/'));
+    let lookup_url = match join_app_url(&state.app_url, "api/dataset/get") {
+        Ok(url) => url,
+        Err(err) => {
+            return Err(json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            ));
+        }
+    };
     let response = state
         .http_client
         .post(lookup_url)
         .bearer_auth(&auth.token)
-        .header("x-bt-org-name", auth.org_name.clone())
+        .header(HEADER_BT_ORG_NAME, auth.org_name.clone())
         .json(&json!({ "id": dataset_id }))
         .send()
         .await
@@ -753,19 +849,17 @@ async fn resolve_dataset_ref_for_eval_request(
         ));
     };
 
-    let mut resolved = serde_json::Map::new();
-    resolved.insert(
-        "project_id".to_string(),
-        Value::String(dataset.project_id.clone()),
-    );
-    resolved.insert(
-        "dataset_name".to_string(),
-        Value::String(dataset.name.clone()),
-    );
-    if let Some(btql) = data_obj.get("_internal_btql") {
-        resolved.insert("_internal_btql".to_string(), btql.clone());
-    }
-    eval_request.data = Value::Object(resolved);
+    let resolved = ResolvedDatasetEvalData {
+        project_id: dataset.project_id.clone(),
+        dataset_name: dataset.name.clone(),
+        _internal_btql: input._internal_btql,
+    };
+    eval_request.data = serde_json::to_value(resolved).map_err(|err| {
+        json_error_response(
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to serialize resolved dataset reference: {err}"),
+        )
+    })?;
     Ok(())
 }
 
@@ -845,33 +939,22 @@ fn is_allowed_preview_origin(origin: &str) -> bool {
     origin.starts_with("https://") && origin.ends_with(".preview.braintrust.dev")
 }
 
-fn is_allowed_origin(origin: &str) -> bool {
+fn is_allowed_origin(origin: &str, allowed_origins: &[String]) -> bool {
     if origin == MAIN_ORIGIN || origin == BRAINTRUSTDATA_ORIGIN || is_allowed_preview_origin(origin)
     {
         return true;
     }
-    if std::env::var("WHITELISTED_ORIGIN")
-        .ok()
-        .is_some_and(|value| value == origin)
-    {
-        return true;
-    }
-    if std::env::var("BRAINTRUST_APP_URL")
-        .ok()
-        .is_some_and(|value| value == origin)
-    {
-        return true;
-    }
-    false
+    allowed_origins.iter().any(|value| value == origin)
 }
 
 fn apply_cors_headers(
     headers: &mut actix_web::http::header::HeaderMap,
     request_origin: Option<&str>,
     allow_private_network: bool,
+    allowed_origins: &[String],
 ) {
     if let Some(origin) = request_origin {
-        if is_allowed_origin(origin) {
+        if is_allowed_origin(origin, allowed_origins) {
             if let Ok(origin_value) = HeaderValue::from_str(origin) {
                 headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
                 headers.insert(
@@ -898,7 +981,7 @@ fn apply_cors_headers(
 
     if allow_private_network {
         headers.insert(
-            HeaderName::from_static("access-control-allow-private-network"),
+            HeaderName::from_static(HEADER_CORS_ALLOW_PRIVATE_NETWORK),
             HeaderValue::from_static("true"),
         );
     }
@@ -1099,9 +1182,9 @@ async fn dev_server_eval(
                 .map(|chunk| (Ok::<_, actix_web::Error>(web::Bytes::from(chunk)), rx))
         });
         return HttpResponse::Ok()
-            .append_header(("Content-Type", "text/event-stream"))
-            .append_header(("Cache-Control", "no-cache"))
-            .append_header(("Connection", "keep-alive"))
+            .append_header((CONTENT_TYPE, "text/event-stream"))
+            .append_header((CACHE_CONTROL, "no-cache"))
+            .append_header((CONNECTION, "keep-alive"))
             .streaming(response_stream);
     }
 
@@ -1156,25 +1239,30 @@ async fn run_dev_server(state: DevServerState) -> Result<()> {
     let host = state.host.clone();
     let port = state.port;
     HttpServer::new(move || {
+        let allowed_origins = state.allowed_origins.clone();
         App::new()
-            .wrap_fn(|req, srv| {
-                let request_origin = req
-                    .headers()
-                    .get(ORIGIN)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                let allow_private_network = req
-                    .headers()
-                    .contains_key("access-control-request-private-network");
-                let fut = srv.call(req);
-                async move {
-                    let mut res = fut.await?;
-                    apply_cors_headers(
-                        res.headers_mut(),
-                        request_origin.as_deref(),
-                        allow_private_network,
-                    );
-                    Ok::<_, actix_web::Error>(res)
+            .wrap_fn({
+                let allowed_origins = allowed_origins.clone();
+                move |req, srv| {
+                    let allowed_origins = allowed_origins.clone();
+                    let request_origin = req
+                        .headers()
+                        .get(ORIGIN)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let allow_private_network =
+                        req.headers().contains_key(HEADER_CORS_REQ_PRIVATE_NETWORK);
+                    let fut = srv.call(req);
+                    async move {
+                        let mut res = fut.await?;
+                        apply_cors_headers(
+                            res.headers_mut(),
+                            request_origin.as_deref(),
+                            allow_private_network,
+                            &allowed_origins,
+                        );
+                        Ok::<_, actix_web::Error>(res)
+                    }
                 }
             })
             .app_data(web::Data::new(state.clone()))
@@ -2550,6 +2638,38 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn join_app_url_normalizes_slashes() {
+        let joined =
+            join_app_url("https://www.braintrust.dev/", "/api/dataset/get").expect("join app url");
+        assert_eq!(joined, "https://www.braintrust.dev/api/dataset/get");
+    }
+
+    #[test]
+    fn collect_allowed_dev_origins_includes_app_origin_and_dedupes() {
+        let origins = collect_allowed_dev_origins(
+            &[
+                "https://example.com".to_string(),
+                "https://example.com".to_string(),
+            ],
+            "https://app.example.dev/some/path",
+        );
+        assert_eq!(
+            origins,
+            vec![
+                "https://app.example.dev".to_string(),
+                "https://example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn is_allowed_origin_accepts_configured_origin() {
+        let allowed = vec!["https://example.com".to_string()];
+        assert!(is_allowed_origin("https://example.com", &allowed));
+        assert!(!is_allowed_origin("https://evil.example", &allowed));
     }
 
     #[test]
