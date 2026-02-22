@@ -2398,14 +2398,14 @@ fn build_root_spans_query(
 ) -> String {
     let root_filter = if root_span_ids.len() == 1 {
         let quoted = sql_quote(&root_span_ids[0]);
-        format!("(root_span_id = {quoted} OR span_id = {quoted} OR id = {quoted})")
+        format!("root_span_id = {quoted}")
     } else {
         let joined = root_span_ids
             .iter()
             .map(|id| sql_quote(id))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("(root_span_id IN [{joined}] OR span_id IN [{joined}] OR id IN [{joined}])")
+        format!("root_span_id IN [{joined}]")
     };
 
     let combined_filter = if let Some(filter_expr) = filter.map(str::trim).filter(|s| !s.is_empty())
@@ -4063,6 +4063,16 @@ mod tests {
         assert!(query.contains("filter: ("));
         assert!(query.contains("root_span_id IN ["));
         assert!(query.contains(") AND (span_attributes.purpose != 'scorer')"));
+    }
+
+    #[test]
+    fn root_spans_query_filters_only_on_root_span_id() {
+        let roots = vec!["root-1".to_string()];
+        let query = build_root_spans_query("project_logs('p')", &roots, None, 200, None);
+
+        assert!(query.contains("filter: root_span_id = 'root-1'"));
+        assert!(!query.contains(" OR span_id "));
+        assert!(!query.contains(" OR id "));
     }
 
     #[test]
