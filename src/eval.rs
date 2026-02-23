@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use actix_web::dev::Service;
@@ -73,6 +73,13 @@ struct EvalRunnerProcess {
 struct EvalProcessOutput {
     status: ExitStatus,
     dependency_files: Vec<String>,
+    error_messages: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EsmRetryMode {
+    Off,
+    ForcedEsm,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,24 +419,58 @@ async fn run_eval_files_once(
     no_send_logs: bool,
     options: EvalRunOptions,
 ) -> Result<EvalRunOutput> {
-    let (process, language, show_js_runner_hint_on_failure) = spawn_eval_runner(
+    let language = detect_eval_language(&files, language_override)?;
+    let show_js_runner_hint_on_failure =
+        language == EvalLanguage::JavaScript && runner_override.is_none();
+
+    let mut output = run_eval_files_once_inner(
         base,
-        language_override,
-        runner_override,
+        language,
+        runner_override.clone(),
         files.clone(),
         no_send_logs,
-        &options,
+        options.clone(),
+        EsmRetryMode::Off,
         &[],
     )
     .await?;
-    let mut ui = EvalUi::new(options.jsonl, options.list);
-    let output = drive_eval_runner(process, |event| ui.handle(event)).await?;
-    ui.finish();
+
+    let mut retried_esm = false;
+    if !output.status.success()
+        && should_retry_esm(
+            language,
+            output.is_tsx_runner,
+            &files,
+            &output.stderr_lines,
+            &output.error_messages,
+        )
+    {
+        retried_esm = true;
+        eprintln!("Eval failed with ESM/CJS interop error. Retrying in ESM mode...");
+        output = run_eval_files_once_inner(
+            base,
+            language,
+            runner_override,
+            files.clone(),
+            no_send_logs,
+            options,
+            EsmRetryMode::ForcedEsm,
+            &[],
+        )
+        .await?;
+    }
+
     if !output.status.success() && show_js_runner_hint_on_failure {
+        let suffix = if retried_esm {
+            " (ESM retry failed)"
+        } else {
+            ""
+        };
         eprintln!(
-            "Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
+            "Hint{suffix}: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
         );
     }
+
     let mut dependencies =
         normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
     if language == EvalLanguage::JavaScript {
@@ -443,6 +484,53 @@ async fn run_eval_files_once(
     })
 }
 
+struct EvalRunOnceOutput {
+    status: ExitStatus,
+    dependency_files: Vec<String>,
+    error_messages: Vec<String>,
+    stderr_lines: Vec<String>,
+    is_tsx_runner: bool,
+}
+
+async fn run_eval_files_once_inner(
+    base: &BaseArgs,
+    language: EvalLanguage,
+    runner_override: Option<String>,
+    files: Vec<String>,
+    no_send_logs: bool,
+    options: EvalRunOptions,
+    esm_mode: EsmRetryMode,
+    extra_env: &[(String, String)],
+) -> Result<EvalRunOnceOutput> {
+    let (process, _language, _show_hint, is_tsx_runner, stderr_capture) = spawn_eval_runner(
+        base,
+        Some(language),
+        runner_override,
+        files,
+        no_send_logs,
+        &options,
+        extra_env,
+        esm_mode,
+    )
+    .await?;
+    let mut ui = EvalUi::new(options.jsonl, options.list);
+    let output = drive_eval_runner(process, |event| ui.handle(event)).await?;
+    ui.finish();
+
+    let stderr_lines = Arc::try_unwrap(stderr_capture)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .unwrap_or_default();
+
+    Ok(EvalRunOnceOutput {
+        status: output.status,
+        dependency_files: output.dependency_files,
+        error_messages: output.error_messages,
+        stderr_lines,
+        is_tsx_runner,
+    })
+}
+
 async fn spawn_eval_runner(
     base: &BaseArgs,
     language_override: Option<EvalLanguage>,
@@ -451,7 +539,8 @@ async fn spawn_eval_runner(
     no_send_logs: bool,
     options: &EvalRunOptions,
     extra_env: &[(String, String)],
-) -> Result<(EvalRunnerProcess, EvalLanguage, bool)> {
+    esm_mode: EsmRetryMode,
+) -> Result<(EvalRunnerProcess, EvalLanguage, bool, bool, Arc<Mutex<Vec<String>>>)> {
     let language = detect_eval_language(&files, language_override)?;
     if language != EvalLanguage::Python && options.num_workers.is_some() {
         anyhow::bail!("--num-workers is only supported for Python evals.");
@@ -459,6 +548,8 @@ async fn spawn_eval_runner(
     let show_js_runner_hint_on_failure =
         language == EvalLanguage::JavaScript && runner_override.is_none();
     let (js_runner, py_runner) = prepare_eval_runners()?;
+    let use_vite_node = esm_mode == EsmRetryMode::ForcedEsm;
+    let force_esm = esm_mode == EsmRetryMode::ForcedEsm;
 
     let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -488,9 +579,18 @@ async fn spawn_eval_runner(
         };
     });
 
-    let mut cmd = match language {
-        EvalLanguage::Python => build_python_command(runner_override, &py_runner, &files)?,
-        EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
+    let (mut cmd, is_tsx_runner) = match language {
+        EvalLanguage::Python => (
+            build_python_command(runner_override, &py_runner, &files)?,
+            false,
+        ),
+        EvalLanguage::JavaScript => {
+            if use_vite_node {
+                (build_vite_node_fallback_command(&js_runner, &files)?, false)
+            } else {
+                build_js_command(runner_override, &js_runner, &files)?
+            }
+        }
     };
 
     cmd.envs(build_env(base).await?);
@@ -519,6 +619,9 @@ async fn spawn_eval_runner(
             serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
         cmd.env("BT_EVAL_FILTER_PARSED", serialized);
     }
+    if language == EvalLanguage::JavaScript && force_esm {
+        cmd.env("BT_EVAL_FORCE_ESM", "1");
+    }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
         socket_path.to_string_lossy().to_string(),
@@ -531,10 +634,12 @@ async fn spawn_eval_runner(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
+    let stderr_capture: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
     if let Some(stdout) = stdout {
         let tx_stdout = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stdout, "stdout", tx_stdout).await {
+            if let Err(err) = forward_stream(stdout, "stdout", tx_stdout, None).await {
                 eprintln!("Failed to read eval stdout: {err}");
             }
         });
@@ -542,8 +647,9 @@ async fn spawn_eval_runner(
 
     if let Some(stderr) = stderr {
         let tx_stderr = tx.clone();
+        let capture = Arc::clone(&stderr_capture);
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stderr, "stderr", tx_stderr).await {
+            if let Err(err) = forward_stream(stderr, "stderr", tx_stderr, Some(capture)).await {
                 eprintln!("Failed to read eval stderr: {err}");
             }
         });
@@ -561,6 +667,8 @@ async fn spawn_eval_runner(
         },
         language,
         show_js_runner_hint_on_failure,
+        is_tsx_runner,
+        stderr_capture,
     ))
 }
 
@@ -573,6 +681,7 @@ where
 {
     let mut status = None;
     let mut dependency_files: Vec<String> = Vec::new();
+    let mut error_messages: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
@@ -581,6 +690,13 @@ where
                     Some(EvalEvent::Dependencies { files }) => {
                         dependency_files.extend(files.clone());
                         on_event(EvalEvent::Dependencies { files });
+                    }
+                    Some(EvalEvent::Error { message, stack, status }) => {
+                        error_messages.push(message.clone());
+                        if let Some(stack) = stack.as_ref() {
+                            error_messages.push(stack.clone());
+                        }
+                        on_event(EvalEvent::Error { message, stack, status });
                     }
                     Some(event) => on_event(event),
                     None => {
@@ -612,7 +728,49 @@ where
     Ok(EvalProcessOutput {
         status: status.context("eval runner process exited without a status")?,
         dependency_files,
+        error_messages,
     })
+}
+
+fn should_retry_esm(
+    language: EvalLanguage,
+    is_tsx_runner: bool,
+    files: &[String],
+    stderr_lines: &[String],
+    error_messages: &[String],
+) -> bool {
+    if language != EvalLanguage::JavaScript || !is_tsx_runner {
+        return false;
+    }
+    if !has_ts_eval_files(files) {
+        return false;
+    }
+    stderr_lines
+        .iter()
+        .chain(error_messages)
+        .any(|line| is_esm_interop_error(line))
+}
+
+fn has_ts_eval_files(files: &[String]) -> bool {
+    files.iter().any(|file| {
+        let ext = Path::new(file)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        matches!(ext.to_ascii_lowercase().as_str(), "ts" | "tsx")
+    })
+}
+
+fn is_esm_interop_error(message: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "ERR_REQUIRE_ESM",
+        "ERR_PACKAGE_PATH_NOT_EXPORTED",
+        "No \"exports\" main defined",
+        "Cannot use import statement outside a module",
+        "ERR_UNKNOWN_FILE_EXTENSION",
+    ];
+
+    PATTERNS.iter().any(|pattern| message.contains(pattern))
 }
 
 fn resolve_app_url(base: &BaseArgs) -> String {
@@ -1014,7 +1172,7 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         }
     };
 
-    let (process, _, _) = match spawn_eval_runner(
+    let (process, _, _, _, _) = match spawn_eval_runner(
         &state.base,
         state.language_override,
         state.runner_override.clone(),
@@ -1022,6 +1180,7 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         state.no_send_logs,
         &state.options,
         &extra_env,
+        EsmRetryMode::Off,
     )
     .await
     {
@@ -1126,7 +1285,7 @@ async fn dev_server_eval(
         }
     };
 
-    let (process, _, _) = match spawn_eval_runner(
+    let (process, _, _, _, _) = match spawn_eval_runner(
         &state.base,
         state.language_override,
         state.runner_override.clone(),
@@ -1134,6 +1293,7 @@ async fn dev_server_eval(
         state.no_send_logs,
         &state.options,
         &extra_env,
+        EsmRetryMode::Off,
     )
     .await
     {
@@ -1586,34 +1746,58 @@ fn build_js_command(
     runner_override: Option<String>,
     runner: &PathBuf,
     files: &[String],
-) -> Result<Command> {
-    let command = if let Some(explicit) = runner_override.as_deref() {
+) -> Result<(Command, bool)> {
+    if let Some(explicit) = runner_override.as_deref() {
         let resolved_runner = resolve_js_runner_command(explicit, files);
         if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files)
-        } else {
-            let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
-            let mut command = Command::new(resolved_runner);
-            command.arg(runner_script).args(files);
-            command
+            return Ok((
+                build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
+                false,
+            ));
         }
-    } else if let Some(auto_runner) = find_js_runner_binary(files) {
+        let is_tsx = is_tsx_runner(resolved_runner.as_ref());
+        let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
+        let mut command = Command::new(resolved_runner);
+        command.arg(runner_script).args(files);
+        return Ok((command, is_tsx));
+    }
+
+    if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            build_deno_js_command(auto_runner.as_os_str(), &runner_script, files)
-        } else {
-            let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
-            let mut command = Command::new(auto_runner);
-            command.arg(runner_script).args(files);
-            command
+            return Ok((
+                build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
+                false,
+            ));
         }
-    } else {
-        let mut command = Command::new("npx");
-        command.arg("--yes").arg("tsx").arg(runner).args(files);
-        command
-    };
+        let is_tsx = is_tsx_runner(auto_runner.as_ref());
+        let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
+        let mut command = Command::new(auto_runner);
+        command.arg(runner_script).args(files);
+        return Ok((command, is_tsx));
+    }
 
+    let mut command = Command::new("npx");
+    command.arg("--yes").arg("tsx").arg(runner).args(files);
+    Ok((command, true))
+}
+
+fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<Command> {
+    if let Some(path) = find_node_module_bin_for_files("vite-node", files)
+        .or_else(|| find_binary_in_path(&["vite-node"]))
+    {
+        let mut command = Command::new(path);
+        command.arg(runner).args(files);
+        return Ok(command);
+    }
+
+    let mut command = Command::new("npx");
+    command
+        .arg("--yes")
+        .arg("vite-node")
+        .arg(runner)
+        .args(files);
     Ok(command)
 }
 
@@ -1761,14 +1945,17 @@ fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
     materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
 }
 
-fn is_ts_node_runner(runner_command: &Path) -> bool {
-    let file_name = match runner_command.file_name().and_then(|name| name.to_str()) {
-        Some(name) => name.to_ascii_lowercase(),
-        None => return false,
-    };
+fn runner_bin_name(runner_command: &Path) -> Option<String> {
+    let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
+    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+}
 
-    let normalized = file_name.strip_suffix(".cmd").unwrap_or(&file_name);
-    normalized == "ts-node" || normalized == "ts-node-esm"
+fn is_tsx_runner(runner_command: &Path) -> bool {
+    runner_bin_name(runner_command).is_some_and(|n| n == "tsx")
+}
+
+fn is_ts_node_runner(runner_command: &Path) -> bool {
+    runner_bin_name(runner_command).is_some_and(|n| n == "ts-node" || n == "ts-node-esm")
 }
 
 fn find_python_binary() -> Option<PathBuf> {
@@ -1996,12 +2183,18 @@ async fn forward_stream<T>(
     stream: T,
     name: &'static str,
     tx: mpsc::UnboundedSender<EvalEvent>,
+    capture: Option<Arc<Mutex<Vec<String>>>>,
 ) -> Result<()>
 where
     T: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(stream).lines();
     while let Some(line) = lines.next_line().await? {
+        if let Some(buffer) = capture.as_ref() {
+            if let Ok(mut guard) = buffer.lock() {
+                guard.push(line.clone());
+            }
+        }
         let _ = tx.send(EvalEvent::Console {
             stream: name.to_string(),
             message: line,

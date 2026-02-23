@@ -1030,10 +1030,12 @@ function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
 
 async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
+  const forceEsm = envFlag("BT_EVAL_FORCE_ESM");
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
     const preferRequire =
-      file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs");
+      !forceEsm &&
+      (file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs"));
 
     if (preferRequire) {
       try {
@@ -1078,6 +1080,9 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
 }
 
 function shouldTryRequire(file: string, err: unknown): boolean {
+  if (envFlag("BT_EVAL_FORCE_ESM")) {
+    return false;
+  }
   if (process.env.BT_EVAL_CJS === "1" || file.endsWith(".cjs")) {
     return true;
   }
