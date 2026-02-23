@@ -108,7 +108,6 @@ struct PullArgs {
     /// Include stored vectors in pulled rows so a subsequent push can re-ingest them.
     #[arg(long)]
     include_vectors: bool,
-
 }
 
 #[derive(Debug, Clone, Args)]
@@ -555,7 +554,10 @@ async fn run_pull(
     let (scope, limit) = resolve_pull_scope_and_limit(args.traces, args.spans)?;
     let fresh = args.fresh || args.cursor.is_some();
 
-    let filter = Some(build_time_filter_clause(&args.window, args.filter.as_deref())?);
+    let filter = Some(build_time_filter_clause(
+        &args.window,
+        args.filter.as_deref(),
+    )?);
 
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
@@ -2016,7 +2018,6 @@ async fn execute_btql_query(
         anyhow!(err).context(format!("BTQL request failed after {attempts} attempt(s)"))
     })
 }
-
 
 async fn enrich_rows_with_vectors(
     client: &ApiClient,
