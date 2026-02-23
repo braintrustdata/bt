@@ -35,6 +35,10 @@ pub struct SqlArgs {
     /// Force non-interactive mode
     #[arg(long)]
     pub non_interactive: bool,
+
+    /// Pagination cursor token (SQL: appends OFFSET '<token>'; BTQL: appends cursor: '<token>')
+    #[arg(long)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,9 +77,14 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let query = read_non_interactive_query(&args.query, interactive)?;
 
     if let Some(query) = query {
+        let query = merge_cursor_into_query(&query, args.cursor.as_deref())?;
         let response = with_spinner("Running query...", execute_query(&client, &query)).await?;
         print_response(&response, base.json)?;
         return Ok(());
+    }
+
+    if args.cursor.is_some() {
+        bail!("--cursor is only available in non-interactive mode with a query");
     }
 
     if !interactive {
@@ -279,6 +288,75 @@ fn print_response(response: &SqlResponse, json_output: bool) -> Result<()> {
     let output = format_response(response, json_output)?;
     println!("{output}");
     Ok(())
+}
+
+fn merge_cursor_into_query(query: &str, cursor: Option<&str>) -> Result<String> {
+    let trimmed = query.trim();
+    let Some(cursor) = cursor else {
+        return Ok(trimmed.to_string());
+    };
+    if cursor.is_empty() {
+        bail!("--cursor cannot be empty");
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("cursor:") {
+        bail!("query already contains a cursor clause; remove it when using --cursor");
+    }
+    if has_sql_offset_clause(&lower) {
+        bail!("query already contains an OFFSET clause; remove it when using --cursor");
+    }
+
+    let suffix = if trimmed.ends_with(';') { ";" } else { "" };
+    let core = if suffix.is_empty() {
+        trimmed
+    } else {
+        trimmed.trim_end_matches(';').trim_end()
+    };
+    let escaped = quote_single(cursor);
+
+    if is_btql_query(core) {
+        return Ok(format!("{core} | cursor: {escaped}{suffix}"));
+    }
+    Ok(format!("{core} OFFSET {escaped}{suffix}"))
+}
+
+fn has_sql_offset_clause(lower_query: &str) -> bool {
+    lower_query.contains(" offset ")
+        || lower_query.ends_with(" offset")
+        || lower_query.contains("\noffset ")
+}
+
+fn is_btql_query(query: &str) -> bool {
+    let first = query
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("--"));
+    let Some(first) = first else {
+        return false;
+    };
+    let lower = first.to_ascii_lowercase();
+    const BTQL_PREFIXES: [&str; 14] = [
+        "select:",
+        "from:",
+        "filter:",
+        "sort:",
+        "limit:",
+        "cursor:",
+        "sample:",
+        "dimensions:",
+        "measures:",
+        "having:",
+        "final_filter:",
+        "unpivot:",
+        "pivot:",
+        "preview_length:",
+    ];
+    BTQL_PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+}
+
+fn quote_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn render_table(response: &SqlResponse) -> Option<String> {
@@ -546,4 +624,47 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
     let mut iter = s[idx..].char_indices();
     iter.next();
     iter.next().map(|(i, _)| idx + i).unwrap_or_else(|| s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_cursor_sql_appends_offset() {
+        let query = "SELECT * FROM project_logs('p') ORDER BY _pagination_key DESC LIMIT 10";
+        let merged = merge_cursor_into_query(query, Some("AAAAAAABAAA")).expect("merge");
+        assert_eq!(
+            merged,
+            "SELECT * FROM project_logs('p') ORDER BY _pagination_key DESC LIMIT 10 OFFSET 'AAAAAAABAAA'"
+        );
+    }
+
+    #[test]
+    fn merge_cursor_btql_appends_clause() {
+        let query = "select: * | from: project_logs('p') | limit: 10";
+        let merged = merge_cursor_into_query(query, Some("AAAAAAABAAA")).expect("merge");
+        assert_eq!(
+            merged,
+            "select: * | from: project_logs('p') | limit: 10 | cursor: 'AAAAAAABAAA'"
+        );
+    }
+
+    #[test]
+    fn merge_cursor_preserves_trailing_semicolon() {
+        let query = "SELECT * FROM project_logs('p') LIMIT 10;";
+        let merged = merge_cursor_into_query(query, Some("AAAAAAABAAA")).expect("merge");
+        assert_eq!(
+            merged,
+            "SELECT * FROM project_logs('p') LIMIT 10 OFFSET 'AAAAAAABAAA';"
+        );
+    }
+
+    #[test]
+    fn merge_cursor_rejects_existing_offset_or_cursor() {
+        let sql = "SELECT * FROM project_logs('p') LIMIT 10 OFFSET 'abc'";
+        let btql = "select: * | from: project_logs('p') | cursor: 'abc'";
+        assert!(merge_cursor_into_query(sql, Some("next")).is_err());
+        assert!(merge_cursor_into_query(btql, Some("next")).is_err());
+    }
 }

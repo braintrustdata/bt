@@ -148,6 +148,10 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - In non-interactive mode, provide SQL via:
   - Positional query: `bt sql "SELECT id FROM project_logs('<PROJECT_ID>') LIMIT 1"`
   - stdin pipe: `echo "SELECT id FROM project_logs('<PROJECT_ID>') LIMIT 1" | bt sql`
+- Pagination:
+  - Pass `--cursor <CURSOR_TOKEN>` in non-interactive mode to fetch the next page.
+  - For SQL queries, `bt sql` appends `OFFSET '<CURSOR_TOKEN>'`.
+  - For BTQL queries, `bt sql` appends `| cursor: '<CURSOR_TOKEN>'`.
 - Quick guidance:
   - Prefer filtering with `WHERE`; use `HAVING` only after aggregation.
   - Unsupported SQL features include joins, subqueries, unions/intersections, and window functions.
