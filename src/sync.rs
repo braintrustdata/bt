@@ -14,7 +14,6 @@ use base64::prelude::{Engine as _, BASE64_STANDARD};
 use braintrust_sdk_rust::Logs3BatchUploader;
 use clap::{Args, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -29,7 +28,7 @@ use crate::ui::fuzzy_select;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
-const DEFAULT_PAGE_SIZE: usize = 200;
+const DEFAULT_PAGE_SIZE: usize = 1000;
 const DEFAULT_WORKERS_FALLBACK: usize = 8;
 // BTQL currently enforces limit <= 1000.
 const ROOT_DISCOVERY_PAGE_SIZE: usize = 1000;
@@ -73,6 +72,10 @@ struct PullArgs {
     /// SQL filter expression.
     #[arg(long)]
     filter: Option<String>,
+
+    /// Relative time window (e.g. 1h, 30m, 3d).
+    #[arg(long, default_value = "3d")]
+    window: String,
 
     /// Number of traces to fetch (default when no limit flag is set).
     #[arg(long)]
@@ -551,6 +554,11 @@ async fn run_pull(
     let (scope, limit) = resolve_pull_scope_and_limit(args.traces, args.spans)?;
     let fresh = args.fresh || args.cursor.is_some();
 
+    let filter = Some(build_time_filter_clause(
+        &args.window,
+        args.filter.as_deref(),
+    )?);
+
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
         object_ref: resolved_object_ref,
@@ -558,7 +566,7 @@ async fn run_pull(
         object_name: object.object_name.clone(),
         direction: DirectionArg::Pull.as_str().to_string(),
         scope: scope.as_str().to_string(),
-        filter: trim_optional(args.filter.clone()),
+        filter,
         limit: Some(limit),
         page_size: args.page_size,
         include_vectors: args.include_vectors,
@@ -1929,11 +1937,10 @@ async fn execute_btql_query(
     let body = json!({
         "query": query,
         "fmt": "json",
+        "query_source": "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
     });
-    let url = client.url("/btql");
-    let http = Client::new();
-    let api_key = ctx.login.api_key.clone();
     let org_name = ctx.login.org_name.clone();
+    let client = client.clone();
     let attempt_counter = Arc::new(AtomicUsize::new(0));
 
     let backoff = ExponentialBackoffBuilder::new()
@@ -1947,26 +1954,21 @@ async fn execute_btql_query(
     let result = retry_notify(
         backoff,
         || {
-            let http = http.clone();
-            let url = url.clone();
+            let client = client.clone();
             let body = body.clone();
-            let api_key = api_key.clone();
             let org_name = org_name.clone();
             let attempt_counter = Arc::clone(&attempt_counter);
             let btql_retry_tracker = btql_retry_tracker.clone();
 
             async move {
                 let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                let mut request = http
-                    .post(&url)
-                    .bearer_auth(&api_key)
-                    .header("content-type", "application/json")
-                    .json(&body);
-                if !org_name.is_empty() {
-                    request = request.header("x-bt-org-name", org_name.clone());
-                }
+                let headers = if org_name.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![("x-bt-org-name", org_name.as_str())]
+                };
 
-                match request.send().await {
+                match client.post_with_headers_raw("/btql", &body, &headers).await {
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
@@ -2426,6 +2428,41 @@ fn build_root_spans_query(
         parts.push(format!("cursor: {}", btql_quote(c)));
     }
     parts.join(" | ")
+}
+
+fn parse_duration_to_seconds(input: &str) -> Result<u64> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("duration cannot be empty");
+    }
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Ok(seconds);
+    }
+
+    let (num_str, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
+    let value: u64 = num_str
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid duration '{input}'"))?;
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
+    };
+    Ok(value.saturating_mul(multiplier))
+}
+
+fn build_time_filter_clause(window: &str, extra_filter: Option<&str>) -> Result<String> {
+    let seconds = parse_duration_to_seconds(window)?;
+    let time_clause = format!("created >= NOW() - INTERVAL {seconds} SECOND");
+
+    if let Some(extra) = extra_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        Ok(format!("({time_clause}) AND ({extra})"))
+    } else {
+        Ok(time_clause)
+    }
 }
 
 async fn submit_logs_batch(
