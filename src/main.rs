@@ -75,6 +75,8 @@ enum Commands {
     Tools(CLIArgs<tools::ToolsArgs>),
     /// Manage scorers
     Scorers(CLIArgs<scorers::ScorersArgs>),
+    /// Manage functions (tools, scorers, and more)
+    Functions(CLIArgs<functions::FunctionsArgs>),
     /// Manage experiments
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
@@ -115,6 +117,7 @@ async fn main() -> Result<()> {
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
+        Commands::Functions(cmd) => functions::run_functions(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,

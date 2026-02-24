@@ -1,58 +1,55 @@
 use std::fmt::Write as _;
-use std::io::IsTerminal;
 
 use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
 use urlencoding::encode;
 
-use crate::http::ApiClient;
-use crate::projects::api::Project;
 use crate::ui::prompt_render::{
     render_code_lines, render_content_lines, render_message, render_options, render_tools,
 };
-use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
+use crate::ui::{
+    is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
+};
 
-use super::{api, delete, FunctionKind};
+use super::{api, label, label_plural, select_function_interactive, url_segment_for};
+use super::{FunctionTypeFilter, ResolvedContext};
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
-    client: &ApiClient,
-    app_url: &str,
-    project: &Project,
-    org_name: &str,
+    ctx: &ResolvedContext,
     slug: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
-    kind: &FunctionKind,
+    ft: Option<FunctionTypeFilter>,
 ) -> Result<()> {
-    let project_id = &project.id;
+    let project_id = &ctx.project.id;
     let function = match slug {
         Some(s) => with_spinner(
-            &format!("Loading {}...", kind.type_name),
-            api::get_function_by_slug(client, project_id, s),
+            &format!("Loading {}...", label(ft)),
+            api::get_function_by_slug(&ctx.client, project_id, s),
         )
         .await?
-        .ok_or_else(|| anyhow!("{} with slug '{s}' not found", kind.type_name))?,
+        .ok_or_else(|| anyhow!("{} with slug '{s}' not found", label(ft)))?,
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!(
                     "{} slug required. Use: bt {} view <slug>",
-                    kind.type_name,
-                    kind.plural
+                    label(ft),
+                    label_plural(ft),
                 );
             }
-            delete::select_function_interactive(client, project_id, kind).await?
+            select_function_interactive(&ctx.client, project_id, ft).await?
         }
     };
 
     if web {
+        let segment = url_segment_for(function.function_type.as_deref());
         let url = format!(
             "{}/app/{}/p/{}/{}{}",
-            app_url.trim_end_matches('/'),
-            encode(org_name),
-            encode(&project.name),
-            kind.url_segment,
+            ctx.app_url.trim_end_matches('/'),
+            encode(ctx.client.org_name()),
+            encode(&ctx.project.name),
+            segment,
             encode(&function.id)
         );
         open::that(&url)?;

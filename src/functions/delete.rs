@@ -1,56 +1,49 @@
-use std::io::IsTerminal;
-
 use anyhow::{anyhow, bail, Result};
 use dialoguer::Confirm;
 
-use crate::{
-    http::ApiClient,
-    projects::api::Project,
-    ui::{self, print_command_status, with_spinner, CommandStatus},
-};
+use crate::ui::{is_interactive, print_command_status, with_spinner, CommandStatus};
 
-use super::{
-    api::{self, Function},
-    FunctionKind,
-};
+use super::{api, label, label_plural, select_function_interactive};
+use super::{FunctionTypeFilter, ResolvedContext};
 
 pub async fn run(
-    client: &ApiClient,
-    project: &Project,
+    ctx: &ResolvedContext,
     slug: Option<&str>,
     force: bool,
-    kind: &FunctionKind,
+    ft: Option<FunctionTypeFilter>,
 ) -> Result<()> {
     if force && slug.is_none() {
         bail!(
             "slug required when using --force. Use: bt {} delete <slug> --force",
-            kind.plural
+            label_plural(ft),
         );
     }
 
-    let project_id = &project.id;
+    let project_id = &ctx.project.id;
 
     let function = match slug {
-        Some(s) => api::get_function_by_slug(client, project_id, s)
+        Some(s) => api::get_function_by_slug(&ctx.client, project_id, s)
             .await?
-            .ok_or_else(|| anyhow!("{} with slug '{s}' not found", kind.type_name))?,
+            .ok_or_else(|| anyhow!("{} with slug '{s}' not found", label(ft)))?,
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!(
                     "{} slug required. Use: bt {} delete <slug>",
-                    kind.type_name,
-                    kind.plural
+                    label(ft),
+                    label_plural(ft),
                 );
             }
-            select_function_interactive(client, project_id, kind).await?
+            select_function_interactive(&ctx.client, project_id, ft).await?
         }
     };
 
-    if !force && std::io::stdin().is_terminal() {
+    if !force && is_interactive() {
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete {} '{}' from {}?",
-                kind.type_name, &function.name, &project.name
+                label(ft),
+                &function.name,
+                &ctx.project.name
             ))
             .default(false)
             .interact()?;
@@ -60,8 +53,8 @@ pub async fn run(
     }
 
     match with_spinner(
-        &format!("Deleting {}...", kind.type_name),
-        api::delete_function(client, &function.id),
+        &format!("Deleting {}...", label(ft)),
+        api::delete_function(&ctx.client, &function.id),
     )
     .await
     {
@@ -72,7 +65,8 @@ pub async fn run(
             );
             eprintln!(
                 "Run `bt {} list` to see remaining {}.",
-                kind.plural, kind.plural
+                label_plural(ft),
+                label_plural(ft)
             );
             Ok(())
         }
@@ -84,25 +78,4 @@ pub async fn run(
             Err(e)
         }
     }
-}
-
-pub async fn select_function_interactive(
-    client: &ApiClient,
-    project: &str,
-    kind: &FunctionKind,
-) -> Result<Function> {
-    let mut functions = with_spinner(
-        &format!("Loading {}...", kind.plural),
-        api::list_functions(client, project, Some(kind.function_type)),
-    )
-    .await?;
-
-    if functions.is_empty() {
-        bail!("no {} found", kind.plural);
-    }
-
-    functions.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-    let selection = ui::fuzzy_select(&format!("Select {}", kind.type_name), &names, 0)?;
-    Ok(functions[selection].clone())
 }
