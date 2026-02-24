@@ -1,15 +1,13 @@
-use std::io::IsTerminal;
-
 use anyhow::{anyhow, bail, Result};
 use dialoguer::Confirm;
 
 use crate::{
     http::ApiClient,
     projects::api::Project,
-    ui::{self, print_command_status, with_spinner, CommandStatus},
+    ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
 };
 
-use super::api::{self, Experiment};
+use super::api;
 
 pub async fn run(
     client: &ApiClient,
@@ -27,14 +25,14 @@ pub async fn run(
             .await?
             .ok_or_else(|| anyhow!("experiment '{n}' not found"))?,
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!("experiment name required. Use: bt experiments delete <name>");
             }
-            select_experiment_interactive(client, project_name).await?
+            super::select_experiment_interactive(client, project_name).await?
         }
     };
 
-    if !force && std::io::stdin().is_terminal() {
+    if !force && is_interactive() {
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete experiment '{}' from {}?",
@@ -69,24 +67,4 @@ pub async fn run(
             Err(e)
         }
     }
-}
-
-pub async fn select_experiment_interactive(
-    client: &ApiClient,
-    project: &str,
-) -> Result<Experiment> {
-    let mut experiments = with_spinner(
-        "Loading experiments...",
-        api::list_experiments(client, project),
-    )
-    .await?;
-
-    if experiments.is_empty() {
-        bail!("no experiments found");
-    }
-
-    experiments.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<&str> = experiments.iter().map(|e| e.name.as_str()).collect();
-    let selection = ui::fuzzy_select("Select experiment", &names, 0)?;
-    Ok(experiments[selection].clone())
 }

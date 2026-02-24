@@ -118,6 +118,36 @@ fn highlight_template_vars(line: &str) -> String {
     result
 }
 
+pub fn render_prompt_block(output: &mut String, prompt_block: &serde_json::Value) -> Result<()> {
+    match prompt_block.get("type").and_then(|t| t.as_str()) {
+        Some("chat") => {
+            if let Some(messages) = prompt_block.get("messages").and_then(|m| m.as_array()) {
+                for msg in messages {
+                    render_message(output, msg)?;
+                }
+            }
+        }
+        Some("completion") => {
+            if let Some(content) = prompt_block.get("content").and_then(|c| c.as_str()) {
+                render_content_lines(output, content)?;
+                writeln!(output)?;
+            }
+        }
+        _ => {}
+    }
+    if let Some(tools_val) = prompt_block.get("tools") {
+        let tools: Option<Vec<serde_json::Value>> = match tools_val {
+            serde_json::Value::Array(arr) => Some(arr.clone()),
+            serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+            _ => None,
+        };
+        if let Some(ref tools) = tools {
+            render_tools(output, tools)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn render_options(output: &mut String, options: &serde_json::Value) -> Result<()> {
     let Some(params) = options.get("params").and_then(|p| p.as_object()) else {
         return Ok(());

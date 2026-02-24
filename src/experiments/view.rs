@@ -1,5 +1,4 @@
 use std::fmt::Write as _;
-use std::io::IsTerminal;
 
 use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
@@ -7,9 +6,11 @@ use urlencoding::encode;
 
 use crate::http::ApiClient;
 use crate::projects::api::Project;
-use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
+use crate::ui::{
+    is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
+};
 
-use super::{api, delete};
+use super::api;
 
 pub async fn run(
     client: &ApiClient,
@@ -29,10 +30,10 @@ pub async fn run(
         .await?
         .ok_or_else(|| anyhow!("experiment '{n}' not found"))?,
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!("experiment name required. Use: bt experiments view <name>");
             }
-            delete::select_experiment_interactive(client, project_name).await?
+            super::select_experiment_interactive(client, project_name).await?
         }
     };
 

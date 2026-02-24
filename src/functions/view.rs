@@ -5,7 +5,7 @@ use dialoguer::console;
 use urlencoding::encode;
 
 use crate::ui::prompt_render::{
-    render_code_lines, render_content_lines, render_message, render_options, render_tools,
+    render_code_lines, render_content_lines, render_options, render_prompt_block,
 };
 use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
@@ -84,33 +84,7 @@ pub async fn run(
         writeln!(output)?;
 
         if let Some(prompt_block) = pd.get("prompt") {
-            match prompt_block.get("type").and_then(|t| t.as_str()) {
-                Some("chat") => {
-                    if let Some(messages) = prompt_block.get("messages").and_then(|m| m.as_array())
-                    {
-                        for msg in messages {
-                            render_message(&mut output, msg)?;
-                        }
-                    }
-                }
-                Some("completion") => {
-                    if let Some(content) = prompt_block.get("content").and_then(|c| c.as_str()) {
-                        render_content_lines(&mut output, content)?;
-                        writeln!(output)?;
-                    }
-                }
-                _ => {}
-            }
-            if let Some(tools_val) = prompt_block.get("tools") {
-                let tools: Option<Vec<serde_json::Value>> = match tools_val {
-                    serde_json::Value::Array(arr) => Some(arr.clone()),
-                    serde_json::Value::String(s) => serde_json::from_str(s).ok(),
-                    _ => None,
-                };
-                if let Some(ref tools) = tools {
-                    render_tools(&mut output, tools)?;
-                }
-            }
+            render_prompt_block(&mut output, prompt_block)?;
         }
     }
 
@@ -321,32 +295,7 @@ fn render_prompt_value(output: &mut String, val: &serde_json::Value) -> Result<(
 
     let mut prompt_buf = String::new();
     if let Some(prompt_block) = val.get("prompt") {
-        match prompt_block.get("type").and_then(|t| t.as_str()) {
-            Some("chat") => {
-                if let Some(messages) = prompt_block.get("messages").and_then(|m| m.as_array()) {
-                    for msg in messages {
-                        render_message(&mut prompt_buf, msg)?;
-                    }
-                }
-            }
-            Some("completion") => {
-                if let Some(content) = prompt_block.get("content").and_then(|c| c.as_str()) {
-                    render_content_lines(&mut prompt_buf, content)?;
-                    writeln!(prompt_buf)?;
-                }
-            }
-            _ => {}
-        }
-        if let Some(tools_val) = prompt_block.get("tools") {
-            let tools: Option<Vec<serde_json::Value>> = match tools_val {
-                serde_json::Value::Array(arr) => Some(arr.clone()),
-                serde_json::Value::String(s) => serde_json::from_str(s).ok(),
-                _ => None,
-            };
-            if let Some(ref tools) = tools {
-                render_tools(&mut prompt_buf, tools)?;
-            }
-        }
+        render_prompt_block(&mut prompt_buf, prompt_block)?;
     }
 
     for line in prompt_buf.lines() {

@@ -299,7 +299,15 @@ pub async fn run_functions(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
         None => list::run(&ctx, base.json, args.function_type).await,
         Some(FunctionsCommands::List(ref la)) => list::run(&ctx, base.json, la.function_type).await,
         Some(FunctionsCommands::View(v)) => {
-            view::run(&ctx, v.slug(), base.json, v.web, v.verbose, None).await
+            view::run(
+                &ctx,
+                v.slug(),
+                base.json,
+                v.web,
+                v.verbose,
+                args.function_type,
+            )
+            .await
         }
         Some(FunctionsCommands::Delete(d)) => {
             delete::run(&ctx, d.slug(), d.force, d.function_type).await

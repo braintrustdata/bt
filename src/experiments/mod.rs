@@ -1,17 +1,21 @@
-use std::io::IsTerminal;
-
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 
 use crate::{
-    args::BaseArgs, auth::login, http::ApiClient, projects::api::get_project_by_name,
-    ui::select_project_interactive,
+    args::BaseArgs,
+    auth::login,
+    config,
+    http::ApiClient,
+    projects::api::get_project_by_name,
+    ui::{self, is_interactive, select_project_interactive, with_spinner},
 };
 
 mod api;
 mod delete;
 mod list;
 mod view;
+
+use api::{self as experiments_api, Experiment};
 
 #[derive(Debug, Clone, Args)]
 pub struct ExperimentsArgs {
@@ -75,30 +79,49 @@ impl DeleteArgs {
     }
 }
 
+pub(crate) async fn select_experiment_interactive(
+    client: &ApiClient,
+    project: &str,
+) -> Result<Experiment> {
+    let mut experiments = with_spinner(
+        "Loading experiments...",
+        experiments_api::list_experiments(client, project),
+    )
+    .await?;
+
+    if experiments.is_empty() {
+        bail!("no experiments found");
+    }
+
+    experiments.sort_by(|a, b| a.name.cmp(&b.name));
+    let names: Vec<&str> = experiments.iter().map(|e| e.name.as_str()).collect();
+    let selection = ui::fuzzy_select("Select experiment", &names, 0)?;
+    Ok(experiments[selection].clone())
+}
+
 pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let project = match base.project {
-        Some(p) => p,
-        None if std::io::stdin().is_terminal() => {
-            select_project_interactive(&client, None, None).await?
-        }
+    let config_project = config::load().ok().and_then(|c| c.project);
+    let project_name = match base.project.as_deref().or(config_project.as_deref()) {
+        Some(p) => p.to_string(),
+        None if is_interactive() => select_project_interactive(&client, None, None).await?,
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 
-    let resolved_project = get_project_by_name(&client, &project)
+    let project = get_project_by_name(&client, &project_name)
         .await?
-        .ok_or_else(|| anyhow!("project '{project}' not found"))?;
+        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
 
     match args.command {
         None | Some(ExperimentsCommands::List) => {
-            list::run(&client, &resolved_project, client.org_name(), base.json).await
+            list::run(&client, &project, client.org_name(), base.json).await
         }
         Some(ExperimentsCommands::View(v)) => {
             view::run(
                 &client,
                 &ctx.app_url,
-                &resolved_project,
+                &project,
                 client.org_name(),
                 v.name(),
                 base.json,
@@ -107,7 +130,7 @@ pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
             .await
         }
         Some(ExperimentsCommands::Delete(d)) => {
-            delete::run(&client, &resolved_project, d.name(), d.force).await
+            delete::run(&client, &project, d.name(), d.force).await
         }
     }
 }

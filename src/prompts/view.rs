@@ -6,9 +6,7 @@ use urlencoding::encode;
 
 use crate::http::ApiClient;
 use crate::prompts::delete::select_prompt_interactive;
-use crate::ui::prompt_render::{
-    render_content_lines, render_message, render_options, render_tools,
-};
+use crate::ui::prompt_render::{render_options, render_prompt_block};
 use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
 
 use super::api;
@@ -79,33 +77,7 @@ pub async fn run(
     writeln!(output)?;
 
     if let Some(prompt_block) = prompt.prompt_data.as_ref().and_then(|pd| pd.get("prompt")) {
-        match prompt_block.get("type").and_then(|t| t.as_str()) {
-            Some("chat") => {
-                if let Some(messages) = prompt_block.get("messages").and_then(|m| m.as_array()) {
-                    for msg in messages {
-                        render_message(&mut output, msg)?;
-                    }
-                }
-            }
-            Some("completion") => {
-                if let Some(content) = prompt_block.get("content").and_then(|c| c.as_str()) {
-                    render_content_lines(&mut output, content)?;
-                    writeln!(output)?;
-                }
-            }
-            _ => {}
-        }
-
-        if let Some(tools_val) = prompt_block.get("tools") {
-            let tools: Option<Vec<serde_json::Value>> = match tools_val {
-                serde_json::Value::Array(arr) => Some(arr.clone()),
-                serde_json::Value::String(s) => serde_json::from_str(s).ok(),
-                _ => None,
-            };
-            if let Some(ref tools) = tools {
-                render_tools(&mut output, tools)?;
-            }
-        }
+        render_prompt_block(&mut output, prompt_block)?;
     }
 
     print_with_pager(&output)?;
