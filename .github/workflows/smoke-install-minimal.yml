@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   smoke-install:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.name != 'release-canary' || github.event.workflow_run.head_branch == 'main')) }}
     runs-on: ubuntu-22.04
     container:
       image: debian:bookworm-slim
