@@ -84,6 +84,7 @@ fn build_web_path(function: &Function) -> String {
                 urlencoding::encode(xact_id)
             )
         }
+        Some("parameters") => format!("parameters/{}", urlencoding::encode(id)),
         _ => format!("functions/{}", urlencoding::encode(id)),
     }
 }
@@ -138,6 +139,9 @@ enum FunctionCommands {
 
 #[derive(Debug, Clone, Args)]
 pub struct FunctionsArgs {
+    /// Filter by function type
+    #[arg(long = "type", short = 't', value_enum)]
+    function_type: Option<FunctionTypeFilter>,
     #[command(subcommand)]
     command: Option<FunctionsCommands>,
 }
@@ -292,7 +296,7 @@ pub async fn run(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -
 pub async fn run_functions(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     let ctx = resolve_context(&base).await?;
     match args.command {
-        None => list::run(&ctx, base.json, None).await,
+        None => list::run(&ctx, base.json, args.function_type).await,
         Some(FunctionsCommands::List(ref la)) => list::run(&ctx, base.json, la.function_type).await,
         Some(FunctionsCommands::View(v)) => {
             view::run(&ctx, v.slug(), base.json, v.web, v.verbose, None).await

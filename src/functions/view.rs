@@ -270,6 +270,9 @@ pub async fn run(
                         )?;
                     }
                 }
+                "parameters" => {
+                    render_parameters(&mut output, fd)?;
+                }
                 "prompt" => {}
                 other => {
                     writeln!(output, "{} {}", console::style("Function:").dim(), other)?;
@@ -304,5 +307,109 @@ pub async fn run(
     }
 
     print_with_pager(&output)?;
+    Ok(())
+}
+
+fn render_prompt_value(output: &mut String, val: &serde_json::Value) -> Result<()> {
+    if let Some(model) = val
+        .get("options")
+        .and_then(|o| o.get("model"))
+        .and_then(|m| m.as_str())
+    {
+        writeln!(output, "    {} {}", console::style("Model:").dim(), model)?;
+    }
+
+    let mut prompt_buf = String::new();
+    if let Some(prompt_block) = val.get("prompt") {
+        match prompt_block.get("type").and_then(|t| t.as_str()) {
+            Some("chat") => {
+                if let Some(messages) = prompt_block.get("messages").and_then(|m| m.as_array()) {
+                    for msg in messages {
+                        render_message(&mut prompt_buf, msg)?;
+                    }
+                }
+            }
+            Some("completion") => {
+                if let Some(content) = prompt_block.get("content").and_then(|c| c.as_str()) {
+                    render_content_lines(&mut prompt_buf, content)?;
+                    writeln!(prompt_buf)?;
+                }
+            }
+            _ => {}
+        }
+        if let Some(tools_val) = prompt_block.get("tools") {
+            let tools: Option<Vec<serde_json::Value>> = match tools_val {
+                serde_json::Value::Array(arr) => Some(arr.clone()),
+                serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+                _ => None,
+            };
+            if let Some(ref tools) = tools {
+                render_tools(&mut prompt_buf, tools)?;
+            }
+        }
+    }
+
+    for line in prompt_buf.lines() {
+        writeln!(output, "    {line}")?;
+    }
+    Ok(())
+}
+
+fn render_parameters(output: &mut String, fd: &serde_json::Value) -> Result<()> {
+    let schema = fd.get("__schema");
+    let data = fd.get("data");
+    let properties = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object());
+    let required: Vec<&str> = schema
+        .and_then(|s| s.get("required"))
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let Some(props) = properties else {
+        return Ok(());
+    };
+
+    writeln!(output)?;
+    writeln!(output, "{}", console::style("Fields:").dim())?;
+
+    for (name, prop) in props {
+        let type_label = prop
+            .get("x-bt-type")
+            .or_else(|| prop.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown");
+        let is_required = required.contains(&name.as_str());
+        let tag = if is_required { "required" } else { "optional" };
+
+        writeln!(
+            output,
+            "  {} {} {}",
+            console::style(name).bold(),
+            console::style(format!("({type_label})")).dim(),
+            console::style(format!("[{tag}]")).dim(),
+        )?;
+
+        if let Some(desc) = prop.get("description").and_then(|d| d.as_str()) {
+            writeln!(output, "    {desc}")?;
+        }
+
+        if let Some(val) = data.and_then(|d| d.get(name)) {
+            if type_label == "prompt" {
+                render_prompt_value(output, val)?;
+            } else {
+                let display = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Null => "null".to_string(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                writeln!(output, "    {} {}", console::style("Value:").dim(), display)?;
+            }
+        }
+    }
+
     Ok(())
 }
