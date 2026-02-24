@@ -37,14 +37,15 @@ pub async fn run(
         }
     };
 
+    let url = format!(
+        "{}/app/{}/p/{}/experiments/{}",
+        app_url.trim_end_matches('/'),
+        encode(org_name),
+        encode(project_name),
+        encode(&experiment.name)
+    );
+
     if web {
-        let url = format!(
-            "{}/app/{}/p/{}/experiments/{}",
-            app_url.trim_end_matches('/'),
-            encode(org_name),
-            encode(project_name),
-            encode(&experiment.name)
-        );
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());
@@ -62,10 +63,20 @@ pub async fn run(
         console::style(&experiment.name).bold()
     )?;
 
-    if let Some(desc) = &experiment.description {
-        if !desc.is_empty() {
-            writeln!(output, "{} {}", console::style("Description:").dim(), desc)?;
-        }
+    let description = experiment
+        .description
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .or_else(|| {
+            experiment
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("description"))
+                .and_then(|d| d.as_str())
+                .filter(|d| !d.is_empty())
+        });
+    if let Some(desc) = description {
+        writeln!(output, "{} {}", console::style("Description:").dim(), desc)?;
     }
     if let Some(created) = &experiment.created {
         writeln!(output, "{} {}", console::style("Created:").dim(), created)?;
@@ -97,6 +108,13 @@ pub async fn run(
             )?;
         }
     }
+
+    writeln!(
+        output,
+        "\n{} {}",
+        console::style("View experiment results:").dim(),
+        console::style(&url).underlined()
+    )?;
 
     print_with_pager(&output)?;
     Ok(())
