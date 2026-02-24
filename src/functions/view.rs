@@ -67,6 +67,11 @@ pub async fn run(
     if let Some(ft) = &function.function_type {
         writeln!(output, "{} {}", console::style("Type:").dim(), ft)?;
     }
+    if let Some(desc) = &function.description {
+        if !desc.is_empty() {
+            writeln!(output, "{} {}", console::style("Description:").dim(), desc)?;
+        }
+    }
 
     if let Some(pd) = &function.prompt_data {
         let options = pd.get("options");
@@ -243,6 +248,37 @@ pub async fn run(
                             model
                         )?;
                     }
+                    if let Some(topics) = fd.get("topic_names").and_then(|t| t.as_object()) {
+                        let mut names: Vec<&str> = topics
+                            .iter()
+                            .filter(|(k, _)| k.as_str() != "noise")
+                            .filter_map(|(_, v)| v.as_str())
+                            .collect();
+                        names.sort();
+                        writeln!(
+                            output,
+                            "{} {}",
+                            console::style("Topics:").dim(),
+                            names.len()
+                        )?;
+                        for name in &names {
+                            writeln!(output, "  {name}")?;
+                        }
+                    }
+                    let path = build_web_path(&function);
+                    let url = format!(
+                        "{}/app/{}/p/{}/{}",
+                        ctx.app_url.trim_end_matches('/'),
+                        encode(ctx.client.org_name()),
+                        encode(&ctx.project.name),
+                        path
+                    );
+                    writeln!(
+                        output,
+                        "\n{} {}",
+                        console::style("View in browser:").dim(),
+                        console::style(&url).underlined()
+                    )?;
                 }
                 "parameters" => {
                     render_parameters(&mut output, fd)?;
