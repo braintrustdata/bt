@@ -1,34 +1,25 @@
 use anyhow::{anyhow, bail, Result};
 use dialoguer::Confirm;
 
-use crate::{
-    http::ApiClient,
-    projects::api::Project,
-    ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
-};
+use crate::ui::{is_interactive, print_command_status, with_spinner, CommandStatus};
 
-use super::api;
+use super::{api, ResolvedContext};
 
-pub async fn run(
-    client: &ApiClient,
-    project: &Project,
-    name: Option<&str>,
-    force: bool,
-) -> Result<()> {
-    let project_name = &project.name;
+pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Result<()> {
+    let project_name = &ctx.project.name;
     if force && name.is_none() {
         bail!("name required when using --force. Use: bt experiments delete <name> --force");
     }
 
     let experiment = match name {
-        Some(n) => api::get_experiment_by_name(client, project_name, n)
+        Some(n) => api::get_experiment_by_name(&ctx.client, project_name, n)
             .await?
             .ok_or_else(|| anyhow!("experiment '{n}' not found"))?,
         None => {
             if !is_interactive() {
                 bail!("experiment name required. Use: bt experiments delete <name>");
             }
-            super::select_experiment_interactive(client, project_name).await?
+            super::select_experiment_interactive(&ctx.client, project_name).await?
         }
     };
 
@@ -47,7 +38,7 @@ pub async fn run(
 
     match with_spinner(
         "Deleting experiment...",
-        api::delete_experiment(client, &experiment.id),
+        api::delete_experiment(&ctx.client, &experiment.id),
     )
     .await
     {

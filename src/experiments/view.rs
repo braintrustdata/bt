@@ -4,28 +4,18 @@ use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
 use urlencoding::encode;
 
-use crate::http::ApiClient;
-use crate::projects::api::Project;
 use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
 };
 
-use super::api;
+use super::{api, ResolvedContext};
 
-pub async fn run(
-    client: &ApiClient,
-    app_url: &str,
-    project: &Project,
-    org_name: &str,
-    name: Option<&str>,
-    json: bool,
-    web: bool,
-) -> Result<()> {
-    let project_name = &project.name;
+pub async fn run(ctx: &ResolvedContext, name: Option<&str>, json: bool, web: bool) -> Result<()> {
+    let project_name = &ctx.project.name;
     let experiment = match name {
         Some(n) => with_spinner(
             "Loading experiment...",
-            api::get_experiment_by_name(client, project_name, n),
+            api::get_experiment_by_name(&ctx.client, project_name, n),
         )
         .await?
         .ok_or_else(|| anyhow!("experiment '{n}' not found"))?,
@@ -33,14 +23,14 @@ pub async fn run(
             if !is_interactive() {
                 bail!("experiment name required. Use: bt experiments view <name>");
             }
-            super::select_experiment_interactive(client, project_name).await?
+            super::select_experiment_interactive(&ctx.client, project_name).await?
         }
     };
 
     let url = format!(
         "{}/app/{}/p/{}/experiments/{}",
-        app_url.trim_end_matches('/'),
-        encode(org_name),
+        ctx.app_url.trim_end_matches('/'),
+        encode(ctx.client.org_name()),
         encode(project_name),
         encode(&experiment.name)
     );

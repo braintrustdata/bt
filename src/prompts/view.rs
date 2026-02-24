@@ -4,28 +4,24 @@ use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
 use urlencoding::encode;
 
-use crate::http::ApiClient;
 use crate::prompts::delete::select_prompt_interactive;
 use crate::ui::prompt_render::{render_options, render_prompt_block};
 use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
 
-use super::api;
+use super::{api, ResolvedContext};
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
-    client: &ApiClient,
-    app_url: &str,
-    project: &str,
-    org_name: &str,
+    ctx: &ResolvedContext,
     slug: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
 ) -> Result<()> {
+    let project_name = &ctx.project.name;
     let prompt = match slug {
         Some(s) => with_spinner(
             "Loading prompt...",
-            api::get_prompt_by_slug(client, project, s),
+            api::get_prompt_by_slug(&ctx.client, project_name, s),
         )
         .await?
         .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
@@ -33,16 +29,16 @@ pub async fn run(
             if !crate::ui::is_interactive() {
                 bail!("prompt slug required. Use: bt prompts view <slug>");
             }
-            select_prompt_interactive(client, project).await?
+            select_prompt_interactive(&ctx.client, project_name).await?
         }
     };
 
     if web {
         let url = format!(
             "{}/app/{}/p/{}/prompts/{}",
-            app_url.trim_end_matches('/'),
-            encode(org_name),
-            encode(project),
+            ctx.app_url.trim_end_matches('/'),
+            encode(ctx.client.org_name()),
+            encode(project_name),
             encode(&prompt.id)
         );
         open::that(&url)?;
