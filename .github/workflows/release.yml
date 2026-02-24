@@ -24,6 +24,7 @@ jobs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ steps.resolve-tag.outputs.tag }}
       tag-flag: ${{ steps.resolve-tag.outputs.tag_flag }}
+      release-version: ${{ steps.resolve-tag.outputs.release_version }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -49,6 +50,7 @@ jobs:
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "tag_flag=--tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_version=${tag#v}" >> "$GITHUB_OUTPUT"
 
       - name: Configure git auth for private dependencies
         shell: bash
@@ -138,6 +140,8 @@ jobs:
       - name: Build artifacts
         shell: bash
         run: |
+          BT_UPDATE_CHANNEL=stable \
+          BT_VERSION_STRING="${{ needs.plan.outputs.release-version }}" \
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
@@ -199,6 +203,8 @@ jobs:
       - id: dist-files
         shell: bash
         run: |
+          BT_UPDATE_CHANNEL=stable \
+          BT_VERSION_STRING="${{ needs.plan.outputs.release-version }}" \
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json --artifacts=global > dist-manifest.json
           echo "dist ran successfully"
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
