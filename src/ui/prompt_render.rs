@@ -80,26 +80,16 @@ pub fn render_content_lines(output: &mut String, content: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn render_code_lines(output: &mut String, code: &str, language: Option<&str>) -> Result<()> {
-    let highlighted: Option<Vec<String>> = if console::colors_enabled() {
-        language.and_then(|lang| super::highlight::highlight_code(code, lang))
-    } else {
-        None
-    };
-
+pub fn render_code_lines(output: &mut String, code: &str) -> Result<()> {
     let lines: Vec<&str> = code.lines().collect();
     let width = lines.len().to_string().len();
     for (i, line) in lines.iter().enumerate() {
-        let display = match &highlighted {
-            Some(hl) => hl.get(i).map(|s| s.as_str()).unwrap_or(line),
-            None => line,
-        };
         writeln!(
             output,
             "  {} {} {}",
             console::style(format!("{:>width$}", i + 1)).dim(),
             console::style("│").dim(),
-            display
+            line
         )?;
     }
     Ok(())

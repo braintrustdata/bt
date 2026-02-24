@@ -100,11 +100,6 @@ pub async fn run(
                     if let Some(data) = fd.get("data") {
                         let data_type = data.get("type").and_then(|t| t.as_str());
 
-                        let runtime_name = data
-                            .get("runtime_context")
-                            .and_then(|rc| rc.get("runtime"))
-                            .and_then(|r| r.as_str());
-
                         if let Some(runtime) = data.get("runtime_context").and_then(|rc| {
                             let rt = rc.get("runtime").and_then(|r| r.as_str())?;
                             let ver = rc.get("version").and_then(|v| v.as_str()).unwrap_or("");
@@ -123,7 +118,7 @@ pub async fn run(
                                     if !code.is_empty() {
                                         writeln!(output)?;
                                         writeln!(output, "{}", console::style("Code:").dim())?;
-                                        render_code_lines(&mut output, code, runtime_name)?;
+                                        render_code_lines(&mut output, code)?;
                                     }
                                 }
                             }
@@ -136,7 +131,7 @@ pub async fn run(
                                             "{}",
                                             console::style("Code (preview):").dim()
                                         )?;
-                                        render_code_lines(&mut output, p, runtime_name)?;
+                                        render_code_lines(&mut output, p)?;
                                     }
                                     _ => {
                                         writeln!(

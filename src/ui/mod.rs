@@ -1,4 +1,3 @@
-pub mod highlight;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
