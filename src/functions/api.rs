@@ -28,6 +28,8 @@ pub struct Function {
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub created: Option<String>,
+    #[serde(default)]
+    pub _xact_id: Option<String>,
 }
 
 pub async fn list_functions(

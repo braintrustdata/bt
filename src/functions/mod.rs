@@ -69,36 +69,23 @@ impl FunctionTypeFilter {
             Self::Parameters => "parameters",
         }
     }
-
-    fn url_segment(&self) -> &'static str {
-        match self {
-            Self::Tool => "tools?pr=",
-            Self::Scorer => "scorers/",
-            _ => "functions/",
-        }
-    }
-
-    fn from_api_str(s: &str) -> Option<Self> {
-        match s {
-            "llm" => Some(Self::Llm),
-            "scorer" => Some(Self::Scorer),
-            "task" => Some(Self::Task),
-            "tool" => Some(Self::Tool),
-            "custom_view" => Some(Self::CustomView),
-            "preprocessor" => Some(Self::Preprocessor),
-            "facet" => Some(Self::Facet),
-            "classifier" => Some(Self::Classifier),
-            "tag" => Some(Self::Tag),
-            "parameters" => Some(Self::Parameters),
-            _ => None,
-        }
-    }
 }
 
-fn url_segment_for(function_type: Option<&str>) -> &'static str {
-    function_type
-        .and_then(FunctionTypeFilter::from_api_str)
-        .map_or("functions/", |ft| ft.url_segment())
+fn build_web_path(function: &Function) -> String {
+    let id = &function.id;
+    match function.function_type.as_deref() {
+        Some("tool") => format!("tools?pr={}", urlencoding::encode(id)),
+        Some("scorer") => format!("scorers/{}", urlencoding::encode(id)),
+        Some("classifier") => {
+            let xact_id = function._xact_id.as_deref().unwrap_or("");
+            format!(
+                "topics?topicMapId={}&topicMapVersion={}",
+                urlencoding::encode(id),
+                urlencoding::encode(xact_id)
+            )
+        }
+        _ => format!("functions/{}", urlencoding::encode(id)),
+    }
 }
 
 fn label(ft: Option<FunctionTypeFilter>) -> &'static str {

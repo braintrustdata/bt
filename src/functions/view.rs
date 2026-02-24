@@ -11,7 +11,7 @@ use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
 };
 
-use super::{api, label, label_plural, select_function_interactive, url_segment_for};
+use super::{api, build_web_path, label, label_plural, select_function_interactive};
 use super::{FunctionTypeFilter, ResolvedContext};
 
 pub async fn run(
@@ -43,14 +43,13 @@ pub async fn run(
     };
 
     if web {
-        let segment = url_segment_for(function.function_type.as_deref());
+        let path = build_web_path(&function);
         let url = format!(
-            "{}/app/{}/p/{}/{}{}",
+            "{}/app/{}/p/{}/{}",
             ctx.app_url.trim_end_matches('/'),
             encode(ctx.client.org_name()),
             encode(&ctx.project.name),
-            segment,
-            encode(&function.id)
+            path
         );
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
@@ -230,6 +229,45 @@ pub async fn run(
                     )?;
                     if let Some(name) = fd.get("name").and_then(|n| n.as_str()) {
                         writeln!(output, "  {} {}", console::style("Name:").dim(), name)?;
+                    }
+                }
+                "facet" => {
+                    if let Some(model) = fd.get("model").and_then(|m| m.as_str()) {
+                        writeln!(output, "{} {}", console::style("Model:").dim(), model)?;
+                    }
+                    if let Some(prompt) = fd.get("prompt").and_then(|p| p.as_str()) {
+                        writeln!(output)?;
+                        writeln!(output, "{}", console::style("Prompt:").dim())?;
+                        render_content_lines(&mut output, prompt)?;
+                    }
+                    if let Some(pp) = fd.get("preprocessor") {
+                        let name = pp.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                        let pp_type = pp.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                        writeln!(
+                            output,
+                            "{} {} ({})",
+                            console::style("Preprocessor:").dim(),
+                            name,
+                            pp_type
+                        )?;
+                    }
+                }
+                "topic_map" => {
+                    if let Some(facet) = fd.get("source_facet").and_then(|f| f.as_str()) {
+                        writeln!(
+                            output,
+                            "{} {}",
+                            console::style("Source facet:").dim(),
+                            facet
+                        )?;
+                    }
+                    if let Some(model) = fd.get("embedding_model").and_then(|m| m.as_str()) {
+                        writeln!(
+                            output,
+                            "{} {}",
+                            console::style("Embedding model:").dim(),
+                            model
+                        )?;
                     }
                 }
                 "prompt" => {}
