@@ -10,7 +10,7 @@ use crate::{
     ui::{self, is_interactive, select_project_interactive, with_spinner},
 };
 
-pub mod api;
+pub(crate) mod api;
 mod delete;
 mod list;
 mod view;
@@ -113,8 +113,10 @@ fn label_plural(ft: Option<FunctionTypeFilter>) -> &'static str {
 
 #[derive(Debug, Clone, Args)]
 struct SlugArgs {
+    /// Function slug
     #[arg(value_name = "SLUG")]
     slug_positional: Option<String>,
+    /// Function slug
     #[arg(long = "slug", short = 's')]
     slug_flag: Option<String>,
 }
@@ -132,16 +134,16 @@ impl SlugArgs {
 #[derive(Debug, Clone, Args)]
 pub struct FunctionArgs {
     #[command(subcommand)]
-    pub command: Option<FunctionCommands>,
+    command: Option<FunctionCommands>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-pub enum FunctionCommands {
+enum FunctionCommands {
     /// List all in the current project
     List,
-    /// View details
+    /// View a function's details
     View(ViewArgs),
-    /// Delete by slug
+    /// Delete a function
     Delete(DeleteArgs),
 }
 
@@ -150,11 +152,11 @@ pub enum FunctionCommands {
 #[derive(Debug, Clone, Args)]
 pub struct FunctionsArgs {
     #[command(subcommand)]
-    pub command: Option<FunctionsCommands>,
+    command: Option<FunctionsCommands>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-pub enum FunctionsCommands {
+enum FunctionsCommands {
     /// List functions in the current project
     List(FunctionsListArgs),
     /// View function details
@@ -164,19 +166,22 @@ pub enum FunctionsCommands {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct FunctionsListArgs {
+struct FunctionsListArgs {
+    /// Filter by function type
     #[arg(long = "type", short = 't', value_enum)]
-    pub function_type: Option<FunctionTypeFilter>,
+    function_type: Option<FunctionTypeFilter>,
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct FunctionsDeleteArgs {
+struct FunctionsDeleteArgs {
     #[command(flatten)]
     slug: SlugArgs,
+    /// Skip confirmation
     #[arg(long, short = 'f')]
     force: bool,
+    /// Filter by function type (for interactive selection)
     #[arg(long = "type", short = 't', value_enum)]
-    pub function_type: Option<FunctionTypeFilter>,
+    function_type: Option<FunctionTypeFilter>,
 }
 
 impl FunctionsDeleteArgs {
@@ -191,8 +196,10 @@ impl FunctionsDeleteArgs {
 pub struct ViewArgs {
     #[command(flatten)]
     slug: SlugArgs,
+    /// Open in browser
     #[arg(long)]
     web: bool,
+    /// Show all configuration details
     #[arg(long)]
     verbose: bool,
 }
@@ -207,6 +214,7 @@ impl ViewArgs {
 pub struct DeleteArgs {
     #[command(flatten)]
     slug: SlugArgs,
+    /// Skip confirmation
     #[arg(long, short = 'f')]
     force: bool,
 }
@@ -232,9 +240,7 @@ async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(p) => p.to_string(),
         None if is_interactive() => select_project_interactive(&client, None, None).await?,
-        None => anyhow::bail!(
-            "--project required (or set BRAINTRUST_DEFAULT_PROJECT, or run `bt switch`)"
-        ),
+        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
     let project = get_project_by_name(&client, &project_name)
         .await?
