@@ -1,13 +1,12 @@
-use std::io::IsTerminal;
-
 use anyhow::{bail, Result};
 use urlencoding::encode;
 
 use crate::http::ApiClient;
-use crate::ui::{print_command_status, with_spinner, CommandStatus};
+use crate::ui::{
+    is_interactive, print_command_status, select_project_interactive, with_spinner, CommandStatus,
+};
 
 use super::api;
-use super::switch::select_project_interactive;
 
 pub async fn run(
     client: &ApiClient,
@@ -18,10 +17,10 @@ pub async fn run(
     let project_name = match name {
         Some(n) => n.to_string(),
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !is_interactive() {
                 bail!("project name required. Use: bt projects view <name>")
             }
-            select_project_interactive(client).await?
+            select_project_interactive(client, None, None).await?
         }
     };
 

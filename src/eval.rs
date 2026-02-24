@@ -30,7 +30,7 @@ use ratatui::widgets::{Cell, Row, Table};
 use ratatui::Terminal;
 
 use crate::args::BaseArgs;
-use crate::login::resolved_auth_env;
+use crate::auth::resolved_auth_env;
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -633,7 +633,11 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
 
 async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
     let mut envs = resolved_auth_env(base).await?;
-    if let Some(project) = base.project.as_ref() {
+    let project = base
+        .project
+        .clone()
+        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
+    if let Some(project) = &project {
         envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
     Ok(envs)
@@ -1224,7 +1228,7 @@ impl EvalUi {
                     }
                 }
                 if show_hint {
-                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt login`/`bt login set --oauth`, or use --no-send-logs for local evals.";
+                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt auth login`/`bt auth login --oauth`, or use --no-send-logs for local evals.";
                     let _ = self.progress.println(hint.dark_grey().to_string());
                 }
             }

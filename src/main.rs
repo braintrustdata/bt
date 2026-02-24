@@ -3,19 +3,24 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 
 mod args;
+mod auth;
+#[allow(dead_code)]
+mod config;
 mod env;
 #[cfg(unix)]
 mod eval;
 mod experiments;
 mod functions;
 mod http;
-mod login;
+mod init;
 mod projects;
 mod prompts;
 mod scorers;
 mod self_update;
 mod setup;
 mod sql;
+mod status;
+mod switch;
 mod sync;
 mod tools;
 mod traces;
@@ -34,7 +39,7 @@ const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
 #[command(
     name = "bt",
     about = "Braintrust CLI",
-    version,
+    version = CLI_VERSION,
     after_help = "Docs: https://braintrust.dev/docs"
 )]
 struct Cli {
@@ -44,14 +49,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Initialize .bt config directory and files
+    Init(CLIArgs<init::InitArgs>),
     /// Configure Braintrust setup flows
     Setup(CLIArgs<setup::SetupArgs>),
     /// Manage workflow docs for coding agents
     Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
-    /// Manage login profiles and persistent auth
-    Login(CLIArgs<login::LoginArgs>),
+    /// Authenticate bt with Braintrust
+    Auth(CLIArgs<auth::AuthArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
@@ -59,11 +66,11 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Manage prompts
+    Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
     /// Self-management commands
     SelfCommand(self_update::SelfArgs),
-    /// Manage prompts
-    Prompts(CLIArgs<prompts::PromptsArgs>),
     /// Manage tools
     Tools(CLIArgs<tools::ToolsArgs>),
     /// Manage scorers
@@ -72,29 +79,47 @@ enum Commands {
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
+    /// Switch org and project context
+    Switch(CLIArgs<switch::SwitchArgs>),
+    /// Show current org and project context
+    Status(CLIArgs<status::StatusArgs>),
+    // /// View and modify config
+    // Config(CLIArgs<config::ConfigArgs>),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
+
+    if std::env::var_os("NO_COLOR").is_some() {
+        dialoguer::console::set_colors_enabled(false);
+        dialoguer::console::set_colors_enabled_stderr(false);
+    }
+    if argv.iter().any(|a| a == "--no-input") {
+        ui::set_no_input(true);
+    }
+
     let cli = Cli::parse_from(argv);
 
     match cli.command {
+        Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
+        Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
+        Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
+        Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
         Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
         Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
-        Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
-        Commands::Login(cmd) => login::run(cmd.base, cmd.args).await?,
-        Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
-        Commands::SelfCommand(args) => self_update::run(args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
+        Commands::SelfCommand(args) => self_update::run(args).await?,
+        Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
+        Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())

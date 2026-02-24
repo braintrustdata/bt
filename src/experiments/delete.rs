@@ -87,6 +87,6 @@ pub async fn select_experiment_interactive(
 
     experiments.sort_by(|a, b| a.name.cmp(&b.name));
     let names: Vec<&str> = experiments.iter().map(|e| e.name.as_str()).collect();
-    let selection = ui::fuzzy_select("Select experiment", &names)?;
+    let selection = ui::fuzzy_select("Select experiment", &names, 0)?;
     Ok(experiments[selection].clone())
 }

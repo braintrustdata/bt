@@ -4,10 +4,8 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
 use crate::{
-    args::BaseArgs,
-    http::ApiClient,
-    login::login,
-    projects::{api::get_project_by_name, switch::select_project_interactive},
+    args::BaseArgs, auth::login, http::ApiClient, projects::api::get_project_by_name,
+    ui::select_project_interactive,
 };
 
 pub mod api;
@@ -106,11 +104,12 @@ impl DeleteArgs {
 
 pub async fn run(base: BaseArgs, args: FunctionArgs, kind: &FunctionKind) -> Result<()> {
     let ctx = login(&base).await?;
-    let org_name = base.org.unwrap_or_else(|| ctx.login.org_name.clone());
-    let client = ApiClient::new(&ctx)?.with_org_name(org_name.clone());
+    let client = ApiClient::new(&ctx)?;
     let project = match base.project {
         Some(p) => p,
-        None if std::io::stdin().is_terminal() => select_project_interactive(&client).await?,
+        None if std::io::stdin().is_terminal() => {
+            select_project_interactive(&client, None, None).await?
+        }
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 
@@ -120,14 +119,21 @@ pub async fn run(base: BaseArgs, args: FunctionArgs, kind: &FunctionKind) -> Res
 
     match args.command {
         None | Some(FunctionCommands::List) => {
-            list::run(&client, &resolved_project, &org_name, base.json, kind).await
+            list::run(
+                &client,
+                &resolved_project,
+                client.org_name(),
+                base.json,
+                kind,
+            )
+            .await
         }
         Some(FunctionCommands::View(v)) => {
             view::run(
                 &client,
                 &ctx.app_url,
                 &resolved_project,
-                &org_name,
+                client.org_name(),
                 v.slug(),
                 base.json,
                 v.web,

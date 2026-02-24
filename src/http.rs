@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::login::LoginContext;
+use crate::auth::LoginContext;
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -112,6 +112,25 @@ impl ApiClient {
         }
 
         response.json().await.context("failed to parse response")
+    }
+
+    pub async fn post_with_headers_raw<B>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response>
+    where
+        B: Serialize,
+    {
+        let url = self.url(path);
+        let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
+
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+
+        request.send().await.context("request failed")
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {

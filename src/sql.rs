@@ -23,8 +23,8 @@ use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::args::BaseArgs;
+use crate::auth::login;
 use crate::http::ApiClient;
-use crate::login::login;
 use crate::ui::with_spinner;
 
 #[derive(Debug, Clone, Args)]
@@ -262,6 +262,7 @@ async fn execute_query(client: &ApiClient, query: &str) -> Result<SqlResponse> {
     let body = json!({
         "query": query,
         "fmt": "json",
+        "query_source": "bt_sql_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
     });
 
     let org_name = client.org_name();

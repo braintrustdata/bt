@@ -103,6 +103,6 @@ pub async fn select_function_interactive(
 
     functions.sort_by(|a, b| a.name.cmp(&b.name));
     let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
-    let selection = ui::fuzzy_select(&format!("Select {}", kind.type_name), &names)?;
+    let selection = ui::fuzzy_select(&format!("Select {}", kind.type_name), &names, 0)?;
     Ok(functions[selection].clone())
 }
