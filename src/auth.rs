@@ -617,23 +617,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        interactive,
     )?;
-
-    if interactive {
-        match selected_org.as_ref() {
-            Some(org) => eprintln!("Selected org: {}", org.name),
-            None => eprintln!("Selected org: (none, cross-org mode)"),
-        }
-        eprintln!("Resolved API URL: {selected_api_url}");
-        let confirmed = Confirm::new()
-            .with_prompt("Use this API URL?")
-            .default(true)
-            .interact()?;
-        if !confirmed {
-            bail!("login cancelled");
-        }
-    }
 
     commit_api_key_profile(
         &profile_name,
@@ -643,23 +627,9 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    if let Some(org) = selected_org.as_ref() {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!(
-                "Logged in to org '{}' with profile '{}'",
-                org.name, profile_name
-            ),
-        );
-    } else {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Logged in with no default org (cross-org) using profile '{profile_name}'"),
-        );
-    }
-    eprintln!(
-        "Saved profile metadata at {} and credential in secure store (OS keychain when available; plaintext fallback otherwise)",
-        auth_store_path()?.display()
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
     Ok(())
 }
@@ -740,10 +710,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         pkce_verifier,
     )
     .await?;
-    if let Some(expires_in) = oauth_tokens.expires_in {
-        eprintln!("Received OAuth access token (expires in {expires_in}s).");
-    }
-
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
@@ -757,21 +723,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        true,
     )?;
-
-    match selected_org.as_ref() {
-        Some(org) => eprintln!("Selected org: {}", org.name),
-        None => eprintln!("Selected org: (none, cross-org mode)"),
-    }
-    eprintln!("Resolved API URL: {selected_api_url}");
-    let confirmed = Confirm::new()
-        .with_prompt("Use this API URL?")
-        .default(true)
-        .interact()?;
-    if !confirmed {
-        bail!("login cancelled");
-    }
 
     commit_oauth_profile(
         &profile_name,
@@ -782,23 +734,9 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    if let Some(org) = selected_org.as_ref() {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!(
-                "Logged in with OAuth to org '{}' with profile '{}'",
-                org.name, profile_name
-            ),
-        );
-    } else {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Logged in with OAuth and no default org (cross-org) using profile '{profile_name}'"),
-        );
-    }
-    eprintln!(
-        "Saved profile metadata at {} and refresh token in secure store (OS keychain when available; plaintext fallback otherwise)",
-        auth_store_path()?.display()
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
 
     Ok(())
@@ -835,7 +773,6 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        false,
     )?;
 
     commit_api_key_profile(
@@ -926,7 +863,6 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        false,
     )?;
 
     commit_oauth_profile(
@@ -1131,7 +1067,6 @@ fn resolve_selected_profile_name_for_debug(
 fn resolve_profile_name(
     explicit_profile: Option<&str>,
     suggested_org_name: Option<&str>,
-    interactive: bool,
 ) -> Result<String> {
     if let Some(profile) = explicit_profile {
         let profile = profile.trim();
@@ -1141,25 +1076,25 @@ fn resolve_profile_name(
         return Ok(profile.to_string());
     }
 
-    let suggested = suggested_org_name
+    Ok(suggested_org_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or("profile")
-        .to_string();
+        .to_string())
+}
 
-    if !interactive {
-        return Ok(suggested);
+fn format_login_success(
+    selected_org: &Option<LoginOrgInfo>,
+    profile_name: &str,
+    api_url: &str,
+) -> String {
+    match selected_org.as_ref() {
+        Some(org) => format!(
+            "Logged in as {} (profile: {profile_name}, api: {api_url})",
+            org.name
+        ),
+        None => format!("Logged in (cross-org, profile: {profile_name}, api: {api_url})"),
     }
-
-    let profile_name = Input::<String>::new()
-        .with_prompt("Profile name")
-        .default(suggested)
-        .interact_text()?;
-    let profile_name = profile_name.trim();
-    if profile_name.is_empty() {
-        bail!("profile name cannot be empty");
-    }
-    Ok(profile_name.to_string())
 }
 
 async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
