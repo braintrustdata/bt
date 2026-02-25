@@ -53,9 +53,17 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         .map(|p| config::load_file(p))
         .unwrap_or_default();
 
-    let (org, project, source) =
-        resolve_config(&base, &global_cfg, &local_cfg, &local_path, &global_path);
-    let profile_info = resolve_profile_info(org.as_deref());
+    let cli_org = cli_flag_value(&["--org", "-o"]);
+    let cli_project = cli_flag_value(&["--project", "-p"]);
+    let (org, project, source) = resolve_config(
+        cli_org,
+        cli_project,
+        &global_cfg,
+        &local_cfg,
+        &local_path,
+        &global_path,
+    );
+    let profile_info = resolve_profile_info(base.profile.as_deref(), org.as_deref());
 
     if base.json {
         let output = StatusOutput {
@@ -105,27 +113,34 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+/// Precedence (clig.dev): CLI flag > env var > local config > global config.
 pub(crate) fn resolve_config(
-    base: &BaseArgs,
+    cli_org: Option<String>,
+    cli_project: Option<String>,
     global: &config::Config,
     local: &config::Config,
     local_path: &Option<std::path::PathBuf>,
     global_path: &Option<std::path::PathBuf>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let org = base
-        .org_name
+    let env_org = std::env::var("BRAINTRUST_ORG_NAME").ok();
+    let env_project = std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok();
+
+    let org = cli_org
         .clone()
+        .or_else(|| env_org.clone())
         .or_else(|| local.org.clone())
         .or_else(|| global.org.clone());
 
-    let project = base
-        .project
+    let project = cli_project
         .clone()
+        .or_else(|| env_project.clone())
         .or_else(|| local.project.clone())
         .or_else(|| global.project.clone());
 
-    let source = if base.org_name.is_some() || base.project.is_some() {
+    let source = if cli_org.is_some() || cli_project.is_some() {
         Some("cli".to_string())
+    } else if env_org.is_some() || env_project.is_some() {
+        Some("env".to_string())
     } else if local.org.is_some() || local.project.is_some() {
         local_path.as_ref().map(|p| p.display().to_string())
     } else if global.org.is_some() || global.project.is_some() {
@@ -137,23 +152,48 @@ pub(crate) fn resolve_config(
     (org, project, source)
 }
 
-fn resolve_profile_info(org: Option<&str>) -> Option<auth::ProfileInfo> {
-    let o = org?;
+fn cli_flag_value(flags: &[&str]) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, arg) in args.iter().enumerate() {
+        for flag in flags {
+            if arg == *flag {
+                return args.get(i + 1).cloned();
+            }
+            if let Some(val) = arg.strip_prefix(&format!("{flag}=")) {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_profile_info(profile: Option<&str>, org: Option<&str>) -> Option<auth::ProfileInfo> {
     let profiles = auth::list_profiles().ok()?;
 
-    if profiles.iter().any(|p| p.name == o) {
-        return profiles.into_iter().find(|p| p.name == o);
+    if let Some(p) = profile {
+        return profiles.into_iter().find(|pi| pi.name == p);
     }
 
-    let org_matches: Vec<&auth::ProfileInfo> = profiles
-        .iter()
-        .filter(|p| p.org_name.as_deref() == Some(o))
-        .collect();
-    if org_matches.len() != 1 {
+    if let Some(o) = org {
+        if profiles.iter().any(|pi| pi.name == o) {
+            return profiles.into_iter().find(|pi| pi.name == o);
+        }
+        let org_matches: Vec<&auth::ProfileInfo> = profiles
+            .iter()
+            .filter(|pi| pi.org_name.as_deref() == Some(o))
+            .collect();
+        if org_matches.len() == 1 {
+            let name = org_matches[0].name.clone();
+            return profiles.into_iter().find(|pi| pi.name == name);
+        }
         return None;
     }
-    let name = org_matches[0].name.clone();
-    profiles.into_iter().find(|p| p.name == name)
+
+    if profiles.len() == 1 {
+        return profiles.into_iter().next();
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -161,21 +201,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
-        BaseArgs {
-            json: false,
-            quiet: false,
-            no_color: false,
-            profile: None,
-            org_name: org.map(String::from),
-            project: project.map(String::from),
-            api_key: None,
-            prefer_profile: false,
-            no_input: false,
-            api_url: None,
-            app_url: None,
-            env_file: None,
-        }
+    fn s(v: &str) -> Option<String> {
+        Some(v.into())
     }
 
     fn config(org: Option<&str>, project: Option<&str>) -> config::Config {
@@ -188,62 +215,64 @@ mod tests {
 
     #[test]
     fn cli_overrides_everything() {
-        let base = base_args(Some("cli-org"), Some("cli-proj"));
         let global = config(Some("global-org"), Some("global-proj"));
         let local = config(Some("local-org"), Some("local-proj"));
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
-            resolve_config(&base, &global, &local, &local_path, &global_path);
+        let (org, project, source) = resolve_config(
+            s("cli-org"),
+            s("cli-proj"),
+            &global,
+            &local,
+            &local_path,
+            &global_path,
+        );
 
-        assert_eq!(org, Some("cli-org".into()));
-        assert_eq!(project, Some("cli-proj".into()));
-        assert_eq!(source, Some("cli".into()));
+        assert_eq!(org, s("cli-org"));
+        assert_eq!(project, s("cli-proj"));
+        assert_eq!(source, s("cli"));
     }
 
     #[test]
     fn local_overrides_global() {
-        let base = base_args(None, None);
         let global = config(Some("global-org"), Some("global-proj"));
         let local = config(Some("local-org"), Some("local-proj"));
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
         let (org, project, source) =
-            resolve_config(&base, &global, &local, &local_path, &global_path);
+            resolve_config(None, None, &global, &local, &local_path, &global_path);
 
-        assert_eq!(org, Some("local-org".into()));
-        assert_eq!(project, Some("local-proj".into()));
-        assert_eq!(source, Some("/project/.bt/config.json".into()));
+        assert_eq!(org, s("local-org"));
+        assert_eq!(project, s("local-proj"));
+        assert_eq!(source, s("/project/.bt/config.json"));
     }
 
     #[test]
     fn global_used_when_local_empty() {
-        let base = base_args(None, None);
         let global = config(Some("global-org"), Some("global-proj"));
         let local = config(None, None);
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
         let (org, project, source) =
-            resolve_config(&base, &global, &local, &local_path, &global_path);
+            resolve_config(None, None, &global, &local, &local_path, &global_path);
 
-        assert_eq!(org, Some("global-org".into()));
-        assert_eq!(project, Some("global-proj".into()));
-        assert_eq!(source, Some("/home/.bt/config.json".into()));
+        assert_eq!(org, s("global-org"));
+        assert_eq!(project, s("global-proj"));
+        assert_eq!(source, s("/home/.bt/config.json"));
     }
 
     #[test]
     fn no_source_when_all_empty() {
-        let base = base_args(None, None);
         let global = config(None, None);
         let local = config(None, None);
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
         let (org, project, source) =
-            resolve_config(&base, &global, &local, &local_path, &global_path);
+            resolve_config(None, None, &global, &local, &local_path, &global_path);
 
         assert_eq!(org, None);
         assert_eq!(project, None);
@@ -252,35 +281,38 @@ mod tests {
 
     #[test]
     fn mixed_sources_org_cli_project_local() {
-        let base = base_args(Some("cli-org"), None);
         let global = config(Some("global-org"), Some("global-proj"));
         let local = config(None, Some("local-proj"));
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
-            resolve_config(&base, &global, &local, &local_path, &global_path);
+        let (org, project, source) = resolve_config(
+            s("cli-org"),
+            None,
+            &global,
+            &local,
+            &local_path,
+            &global_path,
+        );
 
-        assert_eq!(org, Some("cli-org".into()));
-        assert_eq!(project, Some("local-proj".into()));
-        assert_eq!(source, Some("cli".into()));
+        assert_eq!(org, s("cli-org"));
+        assert_eq!(project, s("local-proj"));
+        assert_eq!(source, s("cli"));
     }
 
     #[test]
     fn values_cascade_across_layers() {
-        let base = base_args(None, None);
         let global = config(Some("global-org"), None);
         let local = config(None, Some("local-proj"));
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
         let (org, project, source) =
-            resolve_config(&base, &global, &local, &local_path, &global_path);
+            resolve_config(None, None, &global, &local, &local_path, &global_path);
 
-        assert_eq!(org, Some("global-org".into()));
-        assert_eq!(project, Some("local-proj".into()));
-        // Source reports local since that's where the highest-priority non-empty value came from
-        assert_eq!(source, Some("/project/.bt/config.json".into()));
+        assert_eq!(org, s("global-org"));
+        assert_eq!(project, s("local-proj"));
+        assert_eq!(source, s("/project/.bt/config.json"));
     }
 
     fn profile(

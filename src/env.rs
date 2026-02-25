@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 pub fn bootstrap_from_args(args: &[OsString]) -> Result<()> {
-    let explicit_env_file = extract_env_file_arg(args);
+    let explicit_env_file = extract_env_file_arg(args)
+        .or_else(|| std::env::var("BRAINTRUST_ENV_FILE").ok().map(PathBuf::from));
     load_env(explicit_env_file.as_ref())
 }
 

@@ -1444,7 +1444,7 @@ async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgIn
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        bail!("login failed ({status}): {body}");
+        return Err(crate::http::HttpError { status, body }.into());
     }
 
     let payload: ApiKeyLoginResponse = response

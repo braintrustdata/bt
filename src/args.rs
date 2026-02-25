@@ -11,11 +11,11 @@ pub struct BaseArgs {
     pub json: bool,
 
     /// Suppress non-essential output
-    #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true)]
+    #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub quiet: bool,
 
     /// Disable ANSI color output
-    #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true)]
+    #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub no_color: bool,
 
     /// Use a saved login profile (or via BRAINTRUST_PROFILE)
