@@ -22,7 +22,6 @@ pub struct BtqlResponse<T> {
 impl ApiClient {
     pub fn new(ctx: &LoginContext) -> Result<Self> {
         let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("failed to build HTTP client")?;
 
