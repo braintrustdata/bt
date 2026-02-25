@@ -1,3 +1,4 @@
 {
-  "files": ["tests/basic.eval.mjs"]
+  "files": ["tests/basic.eval.mjs"],
+  "runners": ["tsx", "vite-node", "bun", "deno"]
 }

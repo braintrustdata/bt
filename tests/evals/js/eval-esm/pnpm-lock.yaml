@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@repo/lib':
-        specifier: workspace:*
-        version: link:packages/lib
       braintrust:
         specifier: ^2.2.0
         version: 2.2.2(zod@4.3.6)
@@ -21,8 +18,6 @@ importers:
       vite-node:
         specifier: ^2.1.8
         version: 2.1.9
-
-  packages/lib: {}
 
 packages:
 

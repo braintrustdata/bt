@@ -8,5 +8,9 @@
   "dependencies": {
     "@repo/lib": "workspace:*",
     "braintrust": "^2.2.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2",
+    "vite-node": "^2.1.8"
   }
 }
