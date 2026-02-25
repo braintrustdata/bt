@@ -122,8 +122,12 @@ pub(crate) fn resolve_config(
     local_path: &Option<std::path::PathBuf>,
     global_path: &Option<std::path::PathBuf>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let env_org = std::env::var("BRAINTRUST_ORG_NAME").ok();
-    let env_project = std::env::var("BRAINTRUST_DEFAULT_PROJECT").ok();
+    let env_org = std::env::var("BRAINTRUST_ORG_NAME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let env_project = std::env::var("BRAINTRUST_DEFAULT_PROJECT")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let org = cli_org
         .clone()
@@ -155,12 +159,23 @@ pub(crate) fn resolve_config(
 fn cli_flag_value(flags: &[&str]) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            break;
+        }
         for flag in flags {
             if arg == *flag {
                 return args.get(i + 1).cloned();
             }
             if let Some(val) = arg.strip_prefix(&format!("{flag}=")) {
                 return Some(val.to_string());
+            }
+            // Handle -oVALUE style (short flags only)
+            if flag.len() == 2 && flag.starts_with('-') {
+                if let Some(val) = arg.strip_prefix(flag) {
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
             }
         }
     }
