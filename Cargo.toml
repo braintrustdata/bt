@@ -1,6 +1,6 @@
 [package]
 name = "bt"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.86.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
@@ -63,7 +63,7 @@ targets = [
 ]
 unix-archive = ".tar.gz"
 windows-archive = ".zip"
-install-path = "CARGO_HOME"
+install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
 install-updater = true
 install-success-msg = ""
 
