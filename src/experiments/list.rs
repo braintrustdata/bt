@@ -12,23 +12,22 @@ use super::{api, ResolvedContext};
 
 pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
     let project_name = &ctx.project.name;
-    let prompts = with_spinner(
-        "Loading prompts...",
-        api::list_prompts(&ctx.client, project_name),
+    let experiments = with_spinner(
+        "Loading experiments...",
+        api::list_experiments(&ctx.client, project_name),
     )
     .await?;
 
     if json {
-        println!("{}", serde_json::to_string(&prompts)?);
+        println!("{}", serde_json::to_string(&experiments)?);
         return Ok(());
     }
 
     let mut output = String::new();
-
     let count = format!(
         "{} {}",
-        prompts.len(),
-        pluralize(prompts.len(), "prompt", None)
+        experiments.len(),
+        pluralize(experiments.len(), "experiment", None)
     );
     writeln!(
         output,
@@ -40,17 +39,32 @@ pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
     )?;
 
     let mut table = styled_table();
-    table.set_header(vec![header("Name"), header("Description"), header("Slug")]);
+    table.set_header(vec![
+        header("Name"),
+        header("Description"),
+        header("Created"),
+        header("Commit"),
+    ]);
     apply_column_padding(&mut table, (0, 6));
 
-    for prompt in &prompts {
-        let desc = prompt
+    for exp in &experiments {
+        let desc = exp
             .description
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(|s| truncate(s, 60))
             .unwrap_or_else(|| "-".to_string());
-        table.add_row(vec![&prompt.name, &desc, &prompt.slug]);
+        let created = exp
+            .created
+            .as_deref()
+            .map(|c| truncate(c, 10))
+            .unwrap_or_else(|| "-".to_string());
+        let commit = exp
+            .commit
+            .as_deref()
+            .map(|c| truncate(c, 7))
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![&exp.name, &desc, &created, &commit]);
     }
 
     write!(output, "{table}")?;

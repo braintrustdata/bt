@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::auth::LoginContext;
 
@@ -11,6 +12,11 @@ pub struct ApiClient {
     base_url: String,
     api_key: String,
     org_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BtqlResponse<T> {
+    pub data: Vec<T>,
 }
 
 impl ApiClient {
@@ -34,6 +40,11 @@ impl ApiClient {
 
     pub fn org_name(&self) -> &str {
         &self.org_name
+    }
+
+    pub fn with_org_name(mut self, org: String) -> Self {
+        self.org_name = org;
+        self
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -85,11 +96,29 @@ impl ApiClient {
         T: DeserializeOwned,
         B: Serialize,
     {
+        self.post_with_headers_timeout(path, body, headers, None)
+            .await
+    }
+
+    pub async fn post_with_headers_timeout<T, B>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
         let url = self.url(path);
         let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
 
         for (key, value) in headers {
             request = request.header(*key, *value);
+        }
+        if let Some(t) = timeout {
+            request = request.timeout(t);
         }
 
         let response = request.send().await.context("request failed")?;
@@ -101,6 +130,25 @@ impl ApiClient {
         }
 
         response.json().await.context("failed to parse response")
+    }
+
+    pub async fn post_with_headers_raw<B>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response>
+    where
+        B: Serialize,
+    {
+        let url = self.url(path);
+        let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
+
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+
+        request.send().await.context("request failed")
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {
@@ -120,5 +168,21 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
+        let body = json!({
+            "query": query,
+            "fmt": "json",
+        });
+
+        let org_name = self.org_name();
+        let headers = if !org_name.is_empty() {
+            vec![("x-bt-org-name", org_name)]
+        } else {
+            Vec::new()
+        };
+
+        self.post_with_headers("/btql", &body, &headers).await
     }
 }

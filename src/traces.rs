@@ -5929,6 +5929,7 @@ async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> 
     let body = json!({
         "query": query,
         "fmt": "json",
+        "query_source": "bt_traces_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
     });
 
     let org_name = client.org_name();

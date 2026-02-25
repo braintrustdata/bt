@@ -1,5 +1,6 @@
-use clap::Args;
 use std::path::PathBuf;
+
+use clap::Args;
 
 pub use braintrust_sdk_rust::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
@@ -18,7 +19,13 @@ pub struct BaseArgs {
     pub org_name: Option<String>,
 
     /// Override active project
-    #[arg(short = 'p', long, env = "BRAINTRUST_DEFAULT_PROJECT", global = true)]
+    #[arg(
+        short = 'p',
+        long,
+        env = "BRAINTRUST_DEFAULT_PROJECT",
+        hide_env_values = true,
+        global = true
+    )]
     pub project: Option<String>,
 
     /// Override stored API key (or via BRAINTRUST_API_KEY)
@@ -34,15 +41,25 @@ pub struct BaseArgs {
     pub no_input: bool,
 
     /// Override API URL (or via BRAINTRUST_API_URL)
-    #[arg(long, env = "BRAINTRUST_API_URL", global = true)]
+    #[arg(
+        long,
+        env = "BRAINTRUST_API_URL",
+        hide_env_values = true,
+        global = true
+    )]
     pub api_url: Option<String>,
 
     /// Override app URL (or via BRAINTRUST_APP_URL)
-    #[arg(long, env = "BRAINTRUST_APP_URL", global = true)]
+    #[arg(
+        long,
+        env = "BRAINTRUST_APP_URL",
+        hide_env_values = true,
+        global = true
+    )]
     pub app_url: Option<String>,
 
     /// Path to a .env file to load before running commands.
-    #[arg(long, env = "BRAINTRUST_ENV_FILE")]
+    #[arg(long, env = "BRAINTRUST_ENV_FILE", hide_env_values = true)]
     pub env_file: Option<PathBuf>,
 }
 
