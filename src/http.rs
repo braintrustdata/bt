@@ -97,11 +97,29 @@ impl ApiClient {
         T: DeserializeOwned,
         B: Serialize,
     {
+        self.post_with_headers_timeout(path, body, headers, None)
+            .await
+    }
+
+    pub async fn post_with_headers_timeout<T, B>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
         let url = self.url(path);
         let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
 
         for (key, value) in headers {
             request = request.header(*key, *value);
+        }
+        if let Some(t) = timeout {
+            request = request.timeout(t);
         }
 
         let response = request.send().await.context("request failed")?;

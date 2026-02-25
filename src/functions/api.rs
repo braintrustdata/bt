@@ -63,6 +63,22 @@ pub async fn get_function_by_slug(
     Ok(response.data.into_iter().next())
 }
 
+pub async fn invoke_function(
+    client: &ApiClient,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let org_name = client.org_name();
+    let headers = if !org_name.is_empty() {
+        vec![("x-bt-org-name", org_name)]
+    } else {
+        Vec::new()
+    };
+    let timeout = std::time::Duration::from_secs(300);
+    client
+        .post_with_headers_timeout("/function/invoke", body, &headers, Some(timeout))
+        .await
+}
+
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
     let path = format!("/v1/function/{}", encode(function_id));
     client.delete(&path).await

@@ -12,6 +12,7 @@ use crate::{
 
 pub(crate) mod api;
 mod delete;
+mod invoke;
 mod list;
 mod view;
 
@@ -133,6 +134,8 @@ enum FunctionCommands {
     View(ViewArgs),
     /// Delete a function
     Delete(DeleteArgs),
+    /// Invoke a function
+    Invoke(invoke::InvokeArgs),
 }
 
 // --- bt functions args ---
@@ -154,6 +157,8 @@ enum FunctionsCommands {
     View(ViewArgs),
     /// Delete a function
     Delete(FunctionsDeleteArgs),
+    /// Invoke a function
+    Invoke(FunctionsInvokeArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -179,6 +184,15 @@ impl FunctionsDeleteArgs {
     fn slug(&self) -> Option<&str> {
         self.slug.slug()
     }
+}
+
+#[derive(Debug, Clone, Args)]
+struct FunctionsInvokeArgs {
+    #[command(flatten)]
+    inner: invoke::InvokeArgs,
+    /// Filter by function type (for interactive selection)
+    #[arg(long = "type", short = 't', value_enum)]
+    function_type: Option<FunctionTypeFilter>,
 }
 
 // --- Shared view/delete args ---
@@ -290,6 +304,7 @@ pub async fn run(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -
             view::run(&ctx, v.slug(), base.json, v.web, v.verbose, ft).await
         }
         Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
+        Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
     }
 }
 
@@ -311,6 +326,9 @@ pub async fn run_functions(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
         }
         Some(FunctionsCommands::Delete(d)) => {
             delete::run(&ctx, d.slug(), d.force, d.function_type).await
+        }
+        Some(FunctionsCommands::Invoke(i)) => {
+            invoke::run(&ctx, &i.inner, base.json, i.function_type).await
         }
     }
 }
