@@ -270,6 +270,10 @@ fn classify_error(err: &anyhow::Error) -> ExitCode {
         }
     }
 
+    if let Some(code) = classify_sdk_error(err) {
+        return code;
+    }
+
     if has_reqwest_error(err) {
         return ExitCode::Network;
     }
@@ -284,6 +288,31 @@ fn classify_error(err: &anyhow::Error) -> ExitCode {
 fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
     err.chain()
         .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
+}
+
+fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
+    let sdk_err = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<braintrust_sdk_rust::BraintrustError>())?;
+    match sdk_err {
+        braintrust_sdk_rust::BraintrustError::Api { status, .. } => {
+            if *status == 401 || *status == 403 {
+                Some(ExitCode::Auth)
+            } else if (400..=499).contains(status) {
+                Some(ExitCode::User)
+            } else if (500..=599).contains(status) {
+                Some(ExitCode::Network)
+            } else {
+                None
+            }
+        }
+        braintrust_sdk_rust::BraintrustError::Http(_)
+        | braintrust_sdk_rust::BraintrustError::Network(_) => Some(ExitCode::Network),
+        braintrust_sdk_rust::BraintrustError::InvalidConfig(_)
+        | braintrust_sdk_rust::BraintrustError::ChannelClosed
+        | braintrust_sdk_rust::BraintrustError::Background(_)
+        | braintrust_sdk_rust::BraintrustError::StreamAggregation(_) => None,
+    }
 }
 
 fn has_reqwest_error(err: &anyhow::Error) -> bool {

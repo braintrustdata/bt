@@ -618,6 +618,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
     )?;
+    confirm_profile_overwrite(&profile_name)?;
 
     commit_api_key_profile(
         &profile_name,
@@ -724,6 +725,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
     )?;
+    confirm_profile_overwrite(&profile_name)?;
 
     commit_oauth_profile(
         &profile_name,
@@ -774,6 +776,7 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
     )?;
+    confirm_profile_overwrite(&profile_name)?;
 
     commit_api_key_profile(
         &profile_name,
@@ -864,6 +867,7 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
     )?;
+    confirm_profile_overwrite(&profile_name)?;
 
     commit_oauth_profile(
         &profile_name,
@@ -1081,6 +1085,26 @@ fn resolve_profile_name(
         .filter(|name| !name.is_empty())
         .unwrap_or("profile")
         .to_string())
+}
+
+fn confirm_profile_overwrite(profile_name: &str) -> Result<()> {
+    let store = load_auth_store()?;
+    if !store.profiles.contains_key(profile_name) {
+        return Ok(());
+    }
+    if !ui::is_interactive() {
+        return Ok(());
+    }
+    let confirmed = Confirm::new()
+        .with_prompt(format!(
+            "Profile '{profile_name}' already exists. Overwrite?"
+        ))
+        .default(false)
+        .interact()?;
+    if !confirmed {
+        bail!("login cancelled");
+    }
+    Ok(())
 }
 
 fn format_login_success(
@@ -1444,7 +1468,7 @@ async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgIn
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        bail!("login failed ({status}): {body}");
+        return Err(crate::http::HttpError { status, body }.into());
     }
 
     let payload: ApiKeyLoginResponse = response
