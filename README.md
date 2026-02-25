@@ -6,48 +6,40 @@
 
 ## Install
 
-### Stable (latest release)
-
-Unix-like systems:
+### Unix (macOS / Linux)
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh | sh
+curl -fsSL https://raw.githubusercontent.com/braintrustdata/bt/main/install.sh | bash
 ```
 
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1 | iex"
-```
-
-### Canary (latest `main`)
-
-Unix-like systems:
+Install a specific version:
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh | sh
+curl -fsSL https://raw.githubusercontent.com/braintrustdata/bt/main/install.sh | bash -s -- --version 0.1.2
 ```
 
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1 | iex"
-```
-
-### Canary (exact `main` commit build)
-
-Exact `main` canary builds are published as `canary-<shortsha>`.
-
-Unix-like systems:
+Install the latest canary build (latest `main`):
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary-<shortsha>/bt-installer.sh | sh
+curl -fsSL https://raw.githubusercontent.com/braintrustdata/bt/main/install.sh | bash -s -- --canary
 ```
 
-Windows (PowerShell):
+### Windows (PowerShell)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary-<shortsha>/bt-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+```
+
+Install a specific version:
+
+```powershell
+$env:BT_VERSION='0.1.2'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+```
+
+Canary:
+
+```powershell
+$env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
 ```
 
 ### PR/branch builds (no release)
