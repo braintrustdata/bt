@@ -216,7 +216,7 @@ async fn try_main() -> Result<()> {
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
-        Commands::Functions(cmd) => functions::run_functions(cmd.base, cmd.args).await?,
+        Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(cmd) => self_update::run(cmd.args).await?,

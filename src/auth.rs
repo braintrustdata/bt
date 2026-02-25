@@ -263,6 +263,10 @@ struct AuthLoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
+
+    /// Show org IDs and API URLs in org selector
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -601,7 +605,13 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), interactive)?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        interactive,
+        args.verbose,
+        true,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
@@ -735,7 +745,13 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     }
 
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        true,
+        args.verbose,
+        true,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
@@ -807,7 +823,13 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        true,
+        false,
+        false,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
@@ -892,7 +914,13 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     .await?;
 
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        true,
+        false,
+        false,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
@@ -1499,9 +1527,11 @@ fn select_login_org(
     mut orgs: Vec<LoginOrgInfo>,
     requested_org_name: Option<&str>,
     interactive: bool,
+    verbose: bool,
+    allow_cross_org: bool,
 ) -> Result<Option<LoginOrgInfo>> {
     if orgs.is_empty() {
-        bail!("no organizations found for this API key");
+        bail!("no organizations found for this credential");
     }
     orgs.sort_by(|a, b| {
         a.name
@@ -1526,9 +1556,7 @@ fn select_login_org(
                 .map(|org| org.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::anyhow!(
-                "organization '{name}' not found for this API key. Available organizations: {available}"
-            )
+            anyhow::anyhow!("org '{name}' not found. Available: {available}")
         });
     }
 
@@ -1540,66 +1568,31 @@ fn select_login_org(
         return Ok(None);
     }
 
-    let mut labels = vec![
-        "No default org (cross-org mode; pass --org-name or BRAINTRUST_ORG_NAME when needed)"
-            .to_string(),
-    ];
+    let offset = if allow_cross_org { 1 } else { 0 };
+    let mut labels: Vec<String> = Vec::new();
+    if allow_cross_org {
+        labels.push(
+            "No default org (cross-org mode; pass --org or BRAINTRUST_ORG_NAME when needed)"
+                .to_string(),
+        );
+    }
     labels.extend(orgs.iter().map(|org| {
-        let api_url = org.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
-        format!("{} [{}] ({})", org.name, org.id, api_url)
+        if verbose {
+            let api_url = org.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
+            format!("{} [{}] ({})", org.name, org.id, api_url)
+        } else {
+            org.name.clone()
+        }
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
-    if selection == 0 {
+    if allow_cross_org && selection == 0 {
         return Ok(None);
     }
 
     Ok(Some(
         orgs.into_iter()
-            .nth(selection - 1)
-            .expect("selected index should be in range"),
-    ))
-}
-
-/// Simplified org selector for the wizard — shows only org names (no UUIDs or API URLs).
-/// Auto-selects when there is only one org. Falls back to non-interactive if TTY is unavailable.
-fn select_login_org_simple(
-    mut orgs: Vec<LoginOrgInfo>,
-    requested_org_name: Option<&str>,
-) -> Result<Option<LoginOrgInfo>> {
-    if orgs.is_empty() {
-        bail!("no organizations found for this credential");
-    }
-    orgs.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    });
-
-    if let Some(name) = requested_org_name {
-        let selected = orgs
-            .iter()
-            .find(|org| org.name.eq_ignore_ascii_case(name))
-            .cloned();
-        return selected.map(Some).ok_or_else(|| {
-            let available = orgs
-                .iter()
-                .map(|org| org.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::anyhow!("org '{name}' not found. Available: {available}")
-        });
-    }
-
-    if orgs.len() == 1 {
-        return Ok(Some(orgs.into_iter().next().expect("org exists")));
-    }
-
-    let labels: Vec<&str> = orgs.iter().map(|o| o.name.as_str()).collect();
-    let selection = ui::fuzzy_select("Select organization", &labels, 0)?;
-    Ok(Some(
-        orgs.into_iter()
-            .nth(selection)
+            .nth(selection - offset)
             .expect("selected index should be in range"),
     ))
 }

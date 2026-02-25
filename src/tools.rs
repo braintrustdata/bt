@@ -6,5 +6,5 @@ use crate::functions::{self, FunctionArgs, FunctionTypeFilter};
 pub type ToolsArgs = FunctionArgs;
 
 pub async fn run(base: BaseArgs, args: ToolsArgs) -> Result<()> {
-    functions::run(base, args, FunctionTypeFilter::Tool).await
+    functions::run_typed(base, args, FunctionTypeFilter::Tool).await
 }

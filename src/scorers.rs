@@ -6,5 +6,5 @@ use crate::functions::{self, FunctionArgs, FunctionTypeFilter};
 pub type ScorersArgs = FunctionArgs;
 
 pub async fn run(base: BaseArgs, args: ScorersArgs) -> Result<()> {
-    functions::run(base, args, FunctionTypeFilter::Scorer).await
+    functions::run_typed(base, args, FunctionTypeFilter::Scorer).await
 }

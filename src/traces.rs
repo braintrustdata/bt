@@ -882,13 +882,11 @@ pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
 
-    match args
-        .command
-        .unwrap_or(ViewCommand::Logs(LogsArgs::default()))
-    {
-        ViewCommand::Logs(logs) => run_logs_command(base, client, logs).await,
-        ViewCommand::Trace(trace) => run_trace_command(base, client, trace).await,
-        ViewCommand::Span(span) => run_span_command(base, client, span).await,
+    match args.command {
+        None => run_logs_command(base, client, LogsArgs::default()).await,
+        Some(ViewCommand::Logs(logs)) => run_logs_command(base, client, logs).await,
+        Some(ViewCommand::Trace(trace)) => run_trace_command(base, client, trace).await,
+        Some(ViewCommand::Span(span)) => run_span_command(base, client, span).await,
     }
 }
 
@@ -1475,6 +1473,15 @@ async fn run_interactive(args: InteractiveRunArgs, client: ApiClient) -> Result<
     tokio::task::block_in_place(|| run_interactive_blocking(app, startup_trace_url, client, handle))
 }
 
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        disable_raw_mode().ok();
+        io::stdout().execute(LeaveAlternateScreen).ok();
+    }
+}
+
 fn run_interactive_blocking(
     mut app: TraceViewerApp,
     startup_trace_url: Option<ParsedTraceUrl>,
@@ -1482,6 +1489,7 @@ fn run_interactive_blocking(
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -1491,11 +1499,7 @@ fn run_interactive_blocking(
         request_open_trace_for_parsed_url(&mut app, &client, &handle, parsed_url)?;
     }
     let result = run_app(&mut terminal, &mut app, client, handle);
-
-    disable_raw_mode().ok();
-    terminal.backend_mut().execute(LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
-
     result
 }
 

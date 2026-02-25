@@ -122,23 +122,29 @@ async fn run_interactive(base: BaseArgs, client: ApiClient) -> Result<()> {
     tokio::task::block_in_place(|| run_interactive_blocking(base.json, client, handle))
 }
 
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        disable_raw_mode().ok();
+        io::stdout().execute(LeaveAlternateScreen).ok();
+    }
+}
+
 fn run_interactive_blocking(
     json_output: bool,
     client: ApiClient,
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run_app(&mut terminal, json_output, client, handle);
-
-    disable_raw_mode().ok();
-    terminal.backend_mut().execute(LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
-
     res
 }
 

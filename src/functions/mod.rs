@@ -308,7 +308,7 @@ pub(crate) async fn select_function_interactive(
 
 // --- Entry points ---
 
-pub async fn run(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
+pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
     let ctx = resolve_context(&base).await?;
     let ft = Some(kind);
     match args.command {
@@ -321,7 +321,7 @@ pub async fn run(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -
     }
 }
 
-pub async fn run_functions(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     let ctx = resolve_context(&base).await?;
     match args.command {
         None => list::run(&ctx, base.json, args.function_type).await,
