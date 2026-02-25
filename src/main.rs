@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 mod args;
 mod auth;
@@ -27,7 +27,7 @@ mod traces;
 mod ui;
 mod utils;
 
-use crate::args::CLIArgs;
+use crate::args::{BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -76,7 +76,10 @@ Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
   -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
+  -q, --quiet                Suppress non-essential output
       --json                 Output as JSON
+      --no-color             Disable ANSI color output
+      --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
       --env-file <PATH>      Path to a .env file to load
@@ -126,7 +129,7 @@ enum Commands {
     Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
     /// Self-management commands
-    SelfCommand(self_update::SelfArgs),
+    SelfCommand(CLIArgs<self_update::SelfArgs>),
     /// Manage tools
     Tools(CLIArgs<tools::ToolsArgs>),
     /// Manage scorers
@@ -145,20 +148,60 @@ enum Commands {
     // Config(CLIArgs<config::ConfigArgs>),
 }
 
+impl Commands {
+    fn base(&self) -> &BaseArgs {
+        match self {
+            Commands::Init(cmd) => &cmd.base,
+            Commands::Setup(cmd) => &cmd.base,
+            Commands::Docs(cmd) => &cmd.base,
+            Commands::Sql(cmd) => &cmd.base,
+            Commands::Auth(cmd) => &cmd.base,
+            Commands::View(cmd) => &cmd.base,
+            #[cfg(unix)]
+            Commands::Eval(cmd) => &cmd.base,
+            Commands::Projects(cmd) => &cmd.base,
+            Commands::Prompts(cmd) => &cmd.base,
+            Commands::SelfCommand(cmd) => &cmd.base,
+            Commands::Tools(cmd) => &cmd.base,
+            Commands::Scorers(cmd) => &cmd.base,
+            Commands::Functions(cmd) => &cmd.base,
+            Commands::Experiments(cmd) => &cmd.base,
+            Commands::Sync(cmd) => &cmd.base,
+            Commands::Switch(cmd) => &cmd.base,
+            Commands::Status(cmd) => &cmd.base,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+enum ExitCode {
+    Success = 0,
+    Error = 1,
+    Auth = 2,
+    Network = 3,
+    User = 4,
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    let exit_code = match try_main().await {
+        Ok(()) => ExitCode::Success,
+        Err(err) => {
+            let code = classify_error(&err);
+            print_error(&err, code);
+            code
+        }
+    };
+    std::process::exit(exit_code as i32);
+}
+
+async fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
-    if std::env::var_os("NO_COLOR").is_some() {
-        dialoguer::console::set_colors_enabled(false);
-        dialoguer::console::set_colors_enabled_stderr(false);
-    }
-    if argv.iter().any(|a| a == "--no-input") {
-        ui::set_no_input(true);
-    }
-
     let cli = Cli::parse_from(argv);
+    configure_output(cli.command.base());
 
     match cli.command {
         Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
@@ -173,13 +216,97 @@ async fn main() -> Result<()> {
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
-        Commands::Functions(cmd) => functions::run_functions(cmd.base, cmd.args).await?,
+        Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
-        Commands::SelfCommand(args) => self_update::run(args).await?,
+        Commands::SelfCommand(cmd) => self_update::run(cmd.args).await?,
         Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
         Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())
+}
+
+fn configure_output(base: &BaseArgs) {
+    let mut disable_color = base.no_color || std::env::var_os("NO_COLOR").is_some();
+
+    // TERM is a terminal capability signal; it isn't a user-facing config knob.
+    let term_is_dumb = match std::env::var_os("TERM") {
+        Some(term) => term == OsStr::new("dumb"),
+        None => false,
+    };
+
+    if term_is_dumb {
+        disable_color = true;
+        ui::set_animations_enabled(false);
+    }
+
+    if base.quiet {
+        ui::set_quiet(true);
+        ui::set_animations_enabled(false);
+    }
+
+    if base.no_input {
+        ui::set_no_input(true);
+    }
+
+    if disable_color {
+        dialoguer::console::set_colors_enabled(false);
+        dialoguer::console::set_colors_enabled_stderr(false);
+    }
+}
+
+fn classify_error(err: &anyhow::Error) -> ExitCode {
+    if let Some(http_error) = find_http_error(err) {
+        let status = http_error.status.as_u16();
+        if status == 401 || status == 403 {
+            return ExitCode::Auth;
+        }
+        if (400..=499).contains(&status) {
+            return ExitCode::User;
+        }
+        if (500..=599).contains(&status) {
+            return ExitCode::Network;
+        }
+    }
+
+    if has_reqwest_error(err) {
+        return ExitCode::Network;
+    }
+
+    if has_io_error(err) || looks_like_user_error(err) {
+        return ExitCode::User;
+    }
+
+    ExitCode::Error
+}
+
+fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
+}
+
+fn has_reqwest_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.downcast_ref::<reqwest::Error>().is_some())
+}
+
+fn has_io_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.downcast_ref::<std::io::Error>().is_some())
+}
+
+fn looks_like_user_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_lowercase();
+    message.contains("required")
+        || message.contains("use:")
+        || message.contains("not found")
+        || message.contains("invalid")
+}
+
+fn print_error(err: &anyhow::Error, code: ExitCode) {
+    eprintln!("error: {err}");
+    if code == ExitCode::Error {
+        eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
+    }
 }

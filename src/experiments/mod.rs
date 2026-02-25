@@ -24,6 +24,12 @@ pub(crate) struct ResolvedContext {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt experiments list
+  bt experiments view my-experiment
+  bt experiments delete my-experiment
+")]
 pub struct ExperimentsArgs {
     #[command(subcommand)]
     command: Option<ExperimentsCommands>,

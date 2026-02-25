@@ -186,6 +186,12 @@ pub enum EvalLanguage {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt eval my.eval.ts
+  bt eval --no-send-logs --runner tsx my.eval.ts
+  bt eval --language python my_eval.py
+")]
 pub struct EvalArgs {
     /// One or more eval files to execute (e.g. foo.eval.ts)
     #[arg(required = true, value_name = "FILE")]
@@ -303,6 +309,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             allowed_origins: collect_allowed_dev_origins(&args.dev_allowed_origin, &app_url),
             app_url,
             http_client: Client::builder()
+                .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
                 .build()
                 .context("failed to create dev server HTTP client")?,
         };

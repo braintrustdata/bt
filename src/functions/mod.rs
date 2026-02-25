@@ -121,6 +121,13 @@ impl SlugArgs {
 // --- Wrapper args (bt tools / bt scorers) ---
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt tools list
+  bt tools view my-tool
+  bt scorers list
+  bt scorers delete my-scorer
+")]
 pub struct FunctionArgs {
     #[command(subcommand)]
     command: Option<FunctionCommands>,
@@ -141,6 +148,12 @@ enum FunctionCommands {
 // --- bt functions args ---
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt functions list
+  bt functions view my-function
+  bt functions invoke my-function --input '{\"key\":\"value\"}'
+")]
 pub struct FunctionsArgs {
     /// Filter by function type
     #[arg(long = "type", short = 't', value_enum)]
@@ -295,7 +308,7 @@ pub(crate) async fn select_function_interactive(
 
 // --- Entry points ---
 
-pub async fn run(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
+pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
     let ctx = resolve_context(&base).await?;
     let ft = Some(kind);
     match args.command {
@@ -308,7 +321,7 @@ pub async fn run(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -
     }
 }
 
-pub async fn run_functions(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     let ctx = resolve_context(&base).await?;
     match args.command {
         None => list::run(&ctx, base.json, args.function_type).await,

@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::io::IsTerminal;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -36,7 +35,7 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::http::ApiClient;
-use crate::ui::{fuzzy_select, with_spinner};
+use crate::ui::{fuzzy_select, is_interactive, with_spinner};
 
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
@@ -64,6 +63,12 @@ type TraceLoadResult = (String, Result<Vec<Map<String, Value>>>);
 type FullSpanLoadResult = (String, Result<Option<Map<String, Value>>>);
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt view logs --limit 25
+  bt view trace <ROOT_SPAN_ID>
+  bt view span <SPAN_ID>
+")]
 pub struct ViewArgs {
     #[command(subcommand)]
     command: Option<ViewCommand>,
@@ -876,13 +881,11 @@ pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
 
-    match args
-        .command
-        .unwrap_or(ViewCommand::Logs(LogsArgs::default()))
-    {
-        ViewCommand::Logs(logs) => run_logs_command(base, client, logs).await,
-        ViewCommand::Trace(trace) => run_trace_command(base, client, trace).await,
-        ViewCommand::Span(span) => run_span_command(base, client, span).await,
+    match args.command {
+        None => run_logs_command(base, client, LogsArgs::default()).await,
+        Some(ViewCommand::Logs(logs)) => run_logs_command(base, client, logs).await,
+        Some(ViewCommand::Trace(trace)) => run_trace_command(base, client, trace).await,
+        Some(ViewCommand::Span(span)) => run_span_command(base, client, span).await,
     }
 }
 
@@ -926,7 +929,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
     };
     let search_query = args.search.unwrap_or_default();
 
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !args.non_interactive;
 
     if interactive {
         if args.cursor.is_some() {
@@ -1072,7 +1075,7 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
 
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !args.non_interactive;
     if interactive {
         if object_ref.object_type != "project_logs" {
             bail!("interactive trace view currently supports only project_logs sources");
@@ -1243,7 +1246,7 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
         bail!("span selector required. Pass --id <row-id> or --url <trace-url>");
     }
 
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !args.non_interactive;
     if interactive {
         if object_ref.object_type != "project_logs" {
             bail!("interactive span view currently supports only project_logs sources");
@@ -1417,7 +1420,7 @@ async fn resolve_project(
         });
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !is_interactive() {
         bail!("project is required. Pass --project-id <id> or -p <project-name>");
     }
 
@@ -1469,6 +1472,15 @@ async fn run_interactive(args: InteractiveRunArgs, client: ApiClient) -> Result<
     tokio::task::block_in_place(|| run_interactive_blocking(app, startup_trace_url, client, handle))
 }
 
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        disable_raw_mode().ok();
+        io::stdout().execute(LeaveAlternateScreen).ok();
+    }
+}
+
 fn run_interactive_blocking(
     mut app: TraceViewerApp,
     startup_trace_url: Option<ParsedTraceUrl>,
@@ -1476,6 +1488,7 @@ fn run_interactive_blocking(
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -1485,11 +1498,7 @@ fn run_interactive_blocking(
         request_open_trace_for_parsed_url(&mut app, &client, &handle, parsed_url)?;
     }
     let result = run_app(&mut terminal, &mut app, client, handle);
-
-    disable_raw_mode().ok();
-    terminal.backend_mut().execute(LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
-
     result
 }
 

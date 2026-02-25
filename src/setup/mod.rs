@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -42,6 +41,12 @@ const ALL_WORKFLOWS: [WorkflowArg; 5] = [
 ];
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt setup --agent cursor --workflow observe
+  bt setup skills --agent codex --global
+  bt setup mcp --agent codex
+")]
 pub struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupSubcommand>,
@@ -697,7 +702,7 @@ enum InstrumentAgentArg {
 }
 
 fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
-    if base.json || !std::io::stdin().is_terminal() {
+    if base.json || !ui::is_interactive() {
         return false;
     }
     args.agents.is_empty()
@@ -726,7 +731,7 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
             .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
     };
 
-    if args.agent.is_none() && std::io::stdin().is_terminal() && !args.yes {
+    if args.agent.is_none() && ui::is_interactive() && !args.yes {
         selected = prompt_instrument_agent(selected)?;
     }
 
@@ -862,7 +867,7 @@ fn resolve_instrument_workflow_selection(args: &InstrumentSetupArgs) -> Result<V
         return Ok(selected);
     }
 
-    if std::io::stdin().is_terminal() && !args.yes {
+    if ui::is_interactive() && !args.yes {
         let Some(selected) = prompt_instrument_workflow_selection()? else {
             bail!("instrument setup cancelled by user");
         };
@@ -1255,7 +1260,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
         args.yes,
         YesScopeDefault::LocalIfGit,
     );
-    let interactive = std::io::stdin().is_terminal() && !args.yes;
+    let interactive = ui::is_interactive() && !args.yes;
     let mut prompted_agents: Option<Vec<Agent>> = None;
     let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs {
         Some(Vec::new())
@@ -1373,7 +1378,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
 
 fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
-    let interactive = std::io::stdin().is_terminal() && !args.yes;
+    let interactive = ui::is_interactive() && !args.yes;
     let mut prompted_agents: Option<Vec<Agent>> = None;
 
     if interactive {
@@ -1729,7 +1734,7 @@ fn resolve_scope_from_flags(
         return Ok(resolve_yes_scope(yes_scope_default));
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !ui::is_interactive() {
         bail!("scope required in non-interactive mode: pass --local or --global");
     }
 

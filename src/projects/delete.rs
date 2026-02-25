@@ -53,7 +53,9 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<
                 CommandStatus::Success,
                 &format!("Deleted '{}'", project.name),
             );
-            eprintln!("Run `bt projects list` to see remaining projects.");
+            if !crate::ui::is_quiet() {
+                eprintln!("Run `bt projects list` to see remaining projects.");
+            }
             Ok(())
         }
         Err(e) => {

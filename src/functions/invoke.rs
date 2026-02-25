@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -48,7 +48,7 @@ fn resolve_input(input_arg: &Option<String>) -> Result<Option<Value>> {
         return Ok(Some(parsed));
     }
 
-    if !io::stdin().is_terminal() {
+    if !crate::ui::is_interactive() {
         let mut buf = String::new();
         io::stdin()
             .read_to_string(&mut buf)

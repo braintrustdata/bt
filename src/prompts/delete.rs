@@ -52,7 +52,9 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Resu
                 CommandStatus::Success,
                 &format!("Deleted '{}'", prompt.name),
             );
-            eprintln!("Run `bt prompts list` to see remaining prompts.");
+            if !crate::ui::is_quiet() {
+                eprintln!("Run `bt prompts list` to see remaining prompts.");
+            }
             Ok(())
         }
         Err(e) => {

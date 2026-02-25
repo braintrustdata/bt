@@ -220,6 +220,13 @@ struct OAuthTokenResponse {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt auth login
+  bt auth profiles
+  bt auth refresh
+  bt auth logout --profile work
+")]
 pub struct AuthArgs {
     #[command(subcommand)]
     command: AuthCommand,
@@ -256,6 +263,10 @@ struct AuthLoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
+
+    /// Show org IDs and API URLs in org selector
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -594,29 +605,19 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), interactive)?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        interactive,
+        args.verbose,
+        true,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        interactive,
     )?;
-
-    if interactive {
-        match selected_org.as_ref() {
-            Some(org) => eprintln!("Selected org: {}", org.name),
-            None => eprintln!("Selected org: (none, cross-org mode)"),
-        }
-        eprintln!("Resolved API URL: {selected_api_url}");
-        let confirmed = Confirm::new()
-            .with_prompt("Use this API URL?")
-            .default(true)
-            .interact()?;
-        if !confirmed {
-            bail!("login cancelled");
-        }
-    }
 
     commit_api_key_profile(
         &profile_name,
@@ -626,23 +627,9 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    if let Some(org) = selected_org.as_ref() {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!(
-                "Logged in to org '{}' with profile '{}'",
-                org.name, profile_name
-            ),
-        );
-    } else {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Logged in with no default org (cross-org) using profile '{profile_name}'"),
-        );
-    }
-    eprintln!(
-        "Saved profile metadata at {} and credential in secure store (OS keychain when available; plaintext fallback otherwise)",
-        auth_store_path()?.display()
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
     Ok(())
 }
@@ -723,32 +710,20 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         pkce_verifier,
     )
     .await?;
-    if let Some(expires_in) = oauth_tokens.expires_in {
-        eprintln!("Received OAuth access token (expires in {expires_in}s).");
-    }
-
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        true,
+        args.verbose,
+        true,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        true,
     )?;
-
-    match selected_org.as_ref() {
-        Some(org) => eprintln!("Selected org: {}", org.name),
-        None => eprintln!("Selected org: (none, cross-org mode)"),
-    }
-    eprintln!("Resolved API URL: {selected_api_url}");
-    let confirmed = Confirm::new()
-        .with_prompt("Use this API URL?")
-        .default(true)
-        .interact()?;
-    if !confirmed {
-        bail!("login cancelled");
-    }
 
     commit_oauth_profile(
         &profile_name,
@@ -759,23 +734,9 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    if let Some(org) = selected_org.as_ref() {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!(
-                "Logged in with OAuth to org '{}' with profile '{}'",
-                org.name, profile_name
-            ),
-        );
-    } else {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Logged in with OAuth and no default org (cross-org) using profile '{profile_name}'"),
-        );
-    }
-    eprintln!(
-        "Saved profile metadata at {} and refresh token in secure store (OS keychain when available; plaintext fallback otherwise)",
-        auth_store_path()?.display()
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
 
     Ok(())
@@ -800,13 +761,18 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        true,
+        false,
+        false,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        false,
     )?;
 
     commit_api_key_profile(
@@ -885,13 +851,18 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     .await?;
 
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        true,
+        false,
+        false,
+    )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        false,
     )?;
 
     commit_oauth_profile(
@@ -1096,7 +1067,6 @@ fn resolve_selected_profile_name_for_debug(
 fn resolve_profile_name(
     explicit_profile: Option<&str>,
     suggested_org_name: Option<&str>,
-    interactive: bool,
 ) -> Result<String> {
     if let Some(profile) = explicit_profile {
         let profile = profile.trim();
@@ -1106,25 +1076,25 @@ fn resolve_profile_name(
         return Ok(profile.to_string());
     }
 
-    let suggested = suggested_org_name
+    Ok(suggested_org_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or("profile")
-        .to_string();
+        .to_string())
+}
 
-    if !interactive {
-        return Ok(suggested);
+fn format_login_success(
+    selected_org: &Option<LoginOrgInfo>,
+    profile_name: &str,
+    api_url: &str,
+) -> String {
+    match selected_org.as_ref() {
+        Some(org) => format!(
+            "Logged in as {} (profile: {profile_name}, api: {api_url})",
+            org.name
+        ),
+        None => format!("Logged in (cross-org, profile: {profile_name}, api: {api_url})"),
     }
-
-    let profile_name = Input::<String>::new()
-        .with_prompt("Profile name")
-        .default(suggested)
-        .interact_text()?;
-    let profile_name = profile_name.trim();
-    if profile_name.is_empty() {
-        bail!("profile name cannot be empty");
-    }
-    Ok(profile_name.to_string())
 }
 
 async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
@@ -1460,6 +1430,7 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
     let login_url = format!("{}/api/apikey/login", app_url.trim_end_matches('/'));
     let client = Client::builder()
+        .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
         .build()
         .context("failed to initialize HTTP client")?;
     let response = client
@@ -1491,9 +1462,11 @@ fn select_login_org(
     mut orgs: Vec<LoginOrgInfo>,
     requested_org_name: Option<&str>,
     interactive: bool,
+    verbose: bool,
+    allow_cross_org: bool,
 ) -> Result<Option<LoginOrgInfo>> {
     if orgs.is_empty() {
-        bail!("no organizations found for this API key");
+        bail!("no organizations found for this credential");
     }
     orgs.sort_by(|a, b| {
         a.name
@@ -1518,9 +1491,7 @@ fn select_login_org(
                 .map(|org| org.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::anyhow!(
-                "organization '{name}' not found for this API key. Available organizations: {available}"
-            )
+            anyhow::anyhow!("org '{name}' not found. Available: {available}")
         });
     }
 
@@ -1532,66 +1503,31 @@ fn select_login_org(
         return Ok(None);
     }
 
-    let mut labels = vec![
-        "No default org (cross-org mode; pass --org-name or BRAINTRUST_ORG_NAME when needed)"
-            .to_string(),
-    ];
+    let offset = if allow_cross_org { 1 } else { 0 };
+    let mut labels: Vec<String> = Vec::new();
+    if allow_cross_org {
+        labels.push(
+            "No default org (cross-org mode; pass --org or BRAINTRUST_ORG_NAME when needed)"
+                .to_string(),
+        );
+    }
     labels.extend(orgs.iter().map(|org| {
-        let api_url = org.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
-        format!("{} [{}] ({})", org.name, org.id, api_url)
+        if verbose {
+            let api_url = org.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
+            format!("{} [{}] ({})", org.name, org.id, api_url)
+        } else {
+            org.name.clone()
+        }
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
-    if selection == 0 {
+    if allow_cross_org && selection == 0 {
         return Ok(None);
     }
 
     Ok(Some(
         orgs.into_iter()
-            .nth(selection - 1)
-            .expect("selected index should be in range"),
-    ))
-}
-
-/// Simplified org selector for the wizard — shows only org names (no UUIDs or API URLs).
-/// Auto-selects when there is only one org. Falls back to non-interactive if TTY is unavailable.
-fn select_login_org_simple(
-    mut orgs: Vec<LoginOrgInfo>,
-    requested_org_name: Option<&str>,
-) -> Result<Option<LoginOrgInfo>> {
-    if orgs.is_empty() {
-        bail!("no organizations found for this credential");
-    }
-    orgs.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    });
-
-    if let Some(name) = requested_org_name {
-        let selected = orgs
-            .iter()
-            .find(|org| org.name.eq_ignore_ascii_case(name))
-            .cloned();
-        return selected.map(Some).ok_or_else(|| {
-            let available = orgs
-                .iter()
-                .map(|org| org.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::anyhow!("org '{name}' not found. Available: {available}")
-        });
-    }
-
-    if orgs.len() == 1 {
-        return Ok(Some(orgs.into_iter().next().expect("org exists")));
-    }
-
-    let labels: Vec<&str> = orgs.iter().map(|o| o.name.as_str()).collect();
-    let selection = ui::fuzzy_select("Select organization", &labels, 0)?;
-    Ok(Some(
-        orgs.into_iter()
-            .nth(selection)
+            .nth(selection - offset)
             .expect("selected index should be in range"),
     ))
 }
@@ -2585,6 +2521,8 @@ mod tests {
     fn make_base() -> BaseArgs {
         BaseArgs {
             json: false,
+            quiet: false,
+            no_color: false,
             profile: None,
             project: None,
             org_name: None,

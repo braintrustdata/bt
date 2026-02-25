@@ -5,12 +5,14 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
+use super::{animations_enabled, is_quiet};
+
 const SPINNER_DELAY: Duration = Duration::from_millis(300);
 
 /// Run an async operation with a spinner showing the given message.
 /// Only shows spinner if the operation takes longer than 300ms.
 pub async fn with_spinner<T, F: Future<Output = T>>(message: &str, fut: F) -> T {
-    if !std::io::stderr().is_terminal() {
+    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
         return fut.await;
     }
 
@@ -44,7 +46,7 @@ pub async fn with_spinner_visible<T, F: Future<Output = T>>(
     fut: F,
     min_duration: Duration,
 ) -> T {
-    if !std::io::stderr().is_terminal() {
+    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
         return fut.await;
     }
 

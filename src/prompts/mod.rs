@@ -21,6 +21,12 @@ mod list;
 mod view;
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt prompts list
+  bt prompts view my-prompt
+  bt prompts delete my-prompt
+")]
 pub struct PromptsArgs {
     #[command(subcommand)]
     command: Option<PromptsCommands>,

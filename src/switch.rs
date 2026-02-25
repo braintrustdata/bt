@@ -12,6 +12,12 @@ use crate::ui::{
 };
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt switch
+  bt switch my-project
+  bt switch personal-org/my-project
+")]
 pub struct SwitchArgs {
     /// Force set global config value
     #[arg(long, short = 'g', conflicts_with = "local")]
@@ -239,6 +245,8 @@ mod tests {
     fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
         BaseArgs {
             json: false,
+            quiet: false,
+            no_color: false,
             profile: None,
             org_name: org.map(String::from),
             project: project.map(String::from),
