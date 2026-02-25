@@ -758,6 +758,11 @@ async fn authenticate_dev_request(
                 "Unauthorized",
             ));
         }
+    } else {
+        return Err(json_error_response(
+            actix_web::http::StatusCode::UNAUTHORIZED,
+            "Unauthorized",
+        ));
     }
 
     Ok(DevAuthContext { token, org_name })
@@ -1283,7 +1288,7 @@ async fn run_dev_server(state: DevServerState) -> Result<()> {
             )
     })
     .bind((host.as_str(), port))
-    .with_context(|| format!("failed to bind eval dev server on {}:{}", host, port))?
+    .with_context(|| format!("failed to bind eval dev server on {host}:{port}"))?
     .run()
     .await
     .context("eval dev server exited unexpectedly")
