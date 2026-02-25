@@ -365,7 +365,8 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
         eprintln!("   {}", style("Skipped").dim());
     }
 
-    // ── Agent setup prompts (shared for skills + MCP) ──
+    // ── Step 3: Agent tools (skills + MCP) ──
+    print_wizard_step(3, "Agents");
     let choices = ["Skills", "MCP"];
     let defaults = [true, true];
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
@@ -394,9 +395,8 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
         None
     };
 
-    // ── Step 3: Skills ──
-    print_wizard_step(3, "Skills");
     if wants_skills {
+        eprintln!("   {}", style("Skills:").bold());
         if let Some((scope, ref agents, _)) = setup_context {
             let agent_args: Vec<AgentArg> = agents.iter().map(|a| agent_to_agent_arg(*a)).collect();
             let args = AgentsSetupArgs {
@@ -417,13 +417,10 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                 }
             }
         }
-    } else {
-        eprintln!("   {}", style("Skipped").dim());
     }
 
-    // ── Step 4: MCP ──
-    print_wizard_step(4, "MCP");
     if wants_mcp {
+        eprintln!("   {}", style("MCP:").bold());
         if let Some((scope, ref agents, ref home)) = setup_context {
             let local_root = resolve_local_root_for_scope(scope)?;
             let outcome = execute_mcp_install(scope, local_root.as_deref(), home, agents);
@@ -437,12 +434,14 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                 had_failures = true;
             }
         }
-    } else {
+    }
+
+    if !wants_skills && !wants_mcp {
         eprintln!("   {}", style("Skipped").dim());
     }
 
-    // ── Step 5: Instrument ──
-    print_wizard_step(5, "Instrument");
+    // ── Step 4: Instrument ──
+    print_wizard_step(4, "Instrument");
     if find_git_root().is_some() {
         let instrument = Confirm::new()
             .with_prompt("Run instrumentation agent to set up tracing in this repo?")
