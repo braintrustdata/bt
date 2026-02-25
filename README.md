@@ -9,19 +9,19 @@
 ### Unix (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/braintrustdata/bt/main/install.sh | bash
+curl -fsSL https://bt.dev/cli/install.sh | bash
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/braintrustdata/bt/main/install.sh | bash -s -- --version 0.1.2
+curl -fsSL https://bt.dev/cli/install.sh | bash -s -- --version 0.2.0
 ```
 
 Install the latest canary build (latest `main`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/braintrustdata/bt/main/install.sh | bash -s -- --canary
+curl -fsSL https://bt.dev/cli/install.sh | bash -s -- --canary
 ```
 
 ### Windows (PowerShell)
@@ -87,8 +87,8 @@ If `bt` was installed via another package manager (Homebrew, apt, choco, etc), u
 Unix-like systems:
 
 ```bash
-rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/bt"
-rm -rf "$HOME/.config/bt"
+rm -f "${XDG_BIN_HOME:-${XDG_DATA_HOME:-$HOME/.local}/bin}/bt"
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/bt"
 hash -r
 ```
 
@@ -102,7 +102,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Troubleshooting
 
-- If `bt` is not found after install, start a new shell or add `${CARGO_HOME:-$HOME/.cargo}/bin` to your `PATH`.
+- If `bt` is not found after install, start a new shell or add `${XDG_BIN_HOME:-$HOME/.local/bin}` to your `PATH`.
 - If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 
