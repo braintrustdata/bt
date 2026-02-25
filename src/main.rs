@@ -9,16 +9,20 @@ mod config;
 mod env;
 #[cfg(unix)]
 mod eval;
+mod experiments;
+mod functions;
 mod http;
 mod init;
 mod projects;
 mod prompts;
+mod scorers;
 mod self_update;
 mod setup;
 mod sql;
 mod status;
 mod switch;
 mod sync;
+mod tools;
 mod traces;
 mod ui;
 mod utils;
@@ -44,25 +48,29 @@ const HELP_TEMPLATE: &str = "\
 {before-help}{about} - {usage}
 
 Core
-  init      Initialize .bt config directory and files
-  auth      Authenticate bt with Braintrust
-  switch    Switch org and project context
-  view      View logs, traces, and spans
+  init         Initialize .bt config directory and files
+  auth         Authenticate bt with Braintrust
+  switch       Switch org and project context
+  view         View logs, traces, and spans
 
 Projects & resources
-  projects  Manage projects
-  prompts   Manage prompts
+  projects     Manage projects
+  prompts      Manage prompts
+  functions    Manage functions (tools, scorers, and more)
+  tools        Manage tools
+  scorers      Manage scorers
+  experiments  Manage experiments
 
 Data & evaluation
-  eval      Run eval files
-  sql       Run SQL queries against Braintrust
-  sync      Synchronize project logs between Braintrust and local NDJSON files
+  eval         Run eval files
+  sql          Run SQL queries against Braintrust
+  sync         Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
-  docs      Manage workflow docs for coding agents
-  self      Self-management commands
-  setup     Configure Braintrust setup flows
-  status    Show current org and project context
+  docs         Manage workflow docs for coding agents
+  self         Self-management commands
+  setup        Configure Braintrust setup flows
+  status       Show current org and project context
 
 Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
@@ -88,7 +96,7 @@ Read the manual at https://braintrust.dev/docs/cli
     version = CLI_VERSION,
     before_help = BANNER,
     help_template = HELP_TEMPLATE,
-    disable_help_subcommand = true,
+    after_help = "Docs: https://braintrust.dev/docs",
 )]
 struct Cli {
     #[command(subcommand)]
@@ -119,6 +127,14 @@ enum Commands {
     #[command(name = "self")]
     /// Self-management commands
     SelfCommand(self_update::SelfArgs),
+    /// Manage tools
+    Tools(CLIArgs<tools::ToolsArgs>),
+    /// Manage scorers
+    Scorers(CLIArgs<scorers::ScorersArgs>),
+    /// Manage functions (tools, scorers, and more)
+    Functions(CLIArgs<functions::FunctionsArgs>),
+    /// Manage experiments
+    Experiments(CLIArgs<experiments::ExperimentsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
     /// Switch org and project context
@@ -155,6 +171,10 @@ async fn main() -> Result<()> {
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
+        Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
+        Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
+        Commands::Functions(cmd) => functions::run_functions(cmd.base, cmd.args).await?,
+        Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(args) => self_update::run(args).await?,
         Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,

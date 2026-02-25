@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod pager;
+pub mod prompt_render;
 mod select;
 mod spinner;
 mod status;
