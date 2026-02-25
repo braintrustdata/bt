@@ -5063,7 +5063,7 @@ fn btql_source_expr(object_ref: &ObjectRef) -> Result<String> {
             "unsupported object type '{other}'. supported types: project_logs, experiment, dataset"
         ),
     };
-    Ok(format!("{source}({})", sql_quote(&object_ref.object_name)))
+    Ok(format!("{source}({})", btql_quote(&object_ref.object_name)))
 }
 
 fn format_object_ref_arg(object_ref: &ObjectRef) -> String {
@@ -5313,24 +5313,24 @@ async fn lookup_root_span_id_for_query(
 fn build_url_lookup_by_root_span_id_query(project_id: &str, root_span_id: &str) -> String {
     format!(
         "select: root_span_id, span_id | from: project_logs({}) spans | filter: root_span_id = {} | limit: 1",
-        sql_quote(project_id),
-        sql_quote(root_span_id),
+        btql_quote(project_id),
+        btql_quote(root_span_id),
     )
 }
 
 fn build_url_lookup_by_row_id_query(project_id: &str, row_id: &str) -> String {
     format!(
         "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: id = {} | limit: 1",
-        sql_quote(project_id),
-        sql_quote(row_id),
+        btql_quote(project_id),
+        btql_quote(row_id),
     )
 }
 
 fn build_url_lookup_by_span_id_query(project_id: &str, span_id: &str) -> String {
     format!(
         "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: span_id = {} | limit: 1",
-        sql_quote(project_id),
-        sql_quote(span_id),
+        btql_quote(project_id),
+        btql_quote(span_id),
     )
 }
 
@@ -5361,7 +5361,7 @@ fn build_summary_filter(base_filter: &str, search_query: Option<&str>) -> String
         return base_filter.to_string();
     };
 
-    let match_term = sql_quote(search);
+    let match_term = btql_quote(search);
     let match_clause = TRACE_TEXT_SEARCH_FIELDS
         .iter()
         .map(|field| format!("{field} MATCH {match_term}"))
@@ -5383,8 +5383,8 @@ fn build_spans_query(
         .unwrap_or_default();
     format!(
         "select: id, span_id, root_span_id, _pagination_key, _xact_id, created, span_parents, span_attributes, metadata.model, error, scores, metrics | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: {} | sort: _pagination_key ASC | limit: {}{}",
-        sql_quote(project_id),
-        sql_quote(root_span_id),
+        btql_quote(project_id),
+        btql_quote(root_span_id),
         preview_length,
         limit,
         cursor_clause,
@@ -5403,7 +5403,7 @@ fn build_trace_spans_query(
         .unwrap_or_default();
     format!(
         "select: * | from: {source_expr} spans | filter: root_span_id = {} | preview_length: {} | sort: _pagination_key ASC | limit: {}{}",
-        sql_quote(root_span_id),
+        btql_quote(root_span_id),
         preview_length,
         limit,
         cursor_clause,
@@ -5411,21 +5411,21 @@ fn build_trace_spans_query(
 }
 
 fn build_full_span_query(project_id: &str, span_row_id: &str) -> String {
-    let source_expr = format!("project_logs({})", sql_quote(project_id));
+    let source_expr = format!("project_logs({})", btql_quote(project_id));
     build_full_span_query_by_id(&source_expr, span_row_id)
 }
 
 fn build_full_span_query_by_id(source_expr: &str, span_row_id: &str) -> String {
     format!(
         "select: * | from: {source_expr} spans | filter: id = {} | preview_length: -1 | limit: 1",
-        sql_quote(span_row_id),
+        btql_quote(span_row_id),
     )
 }
 
 fn build_full_span_query_by_span_id(source_expr: &str, span_id: &str) -> String {
     format!(
         "select: * | from: {source_expr} spans | filter: span_id = {} | preview_length: -1 | limit: 1",
-        sql_quote(span_id),
+        btql_quote(span_id),
     )
 }
 
@@ -5492,10 +5492,6 @@ fn invoke_from_error(err: &anyhow::Error) -> Option<String> {
 fn btql_quote(value: &str) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|_| format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")))
-}
-
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 async fn fetch_summary_rows(
@@ -6105,14 +6101,14 @@ mod tests {
         let trace_query = build_trace_spans_query("project_logs('p1')", "root-1", 125, 10, None);
         assert!(trace_query.contains("preview_length: 125"));
         assert!(trace_query.contains("from: project_logs('p1') spans"));
-        assert!(trace_query.contains("filter: root_span_id = 'root-1'"));
+        assert!(trace_query.contains(r#"filter: root_span_id = "root-1""#));
 
         let full_by_row = build_full_span_query_by_id("project_logs('p1')", "row-1");
         assert!(full_by_row.contains("preview_length: -1"));
-        assert!(full_by_row.contains("filter: id = 'row-1'"));
+        assert!(full_by_row.contains(r#"filter: id = "row-1""#));
 
         let full_by_span_id = build_full_span_query_by_span_id("project_logs('p1')", "span-1");
         assert!(full_by_span_id.contains("preview_length: -1"));
-        assert!(full_by_span_id.contains("filter: span_id = 'span-1'"));
+        assert!(full_by_span_id.contains(r#"filter: span_id = "span-1""#));
     }
 }

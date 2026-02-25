@@ -2292,7 +2292,7 @@ fn row_xact_key(row: &Map<String, Value>) -> Option<String> {
 
 fn sql_literal_from_json(value: &Value) -> Option<String> {
     match value {
-        Value::String(s) => Some(sql_quote(s)),
+        Value::String(s) => Some(btql_quote(s)),
         Value::Number(n) => Some(n.to_string()),
         Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
         _ => None,
@@ -2405,12 +2405,12 @@ fn build_root_spans_query(
     cursor: Option<&str>,
 ) -> String {
     let root_filter = if root_span_ids.len() == 1 {
-        let quoted = sql_quote(&root_span_ids[0]);
+        let quoted = btql_quote(&root_span_ids[0]);
         format!("root_span_id = {quoted}")
     } else {
         let joined = root_span_ids
             .iter()
-            .map(|id| sql_quote(id))
+            .map(|id| btql_quote(id))
             .collect::<Vec<_>>()
             .join(", ");
         format!("root_span_id IN [{joined}]")
@@ -3058,7 +3058,7 @@ fn is_uuid_like(value: &str) -> bool {
 
 fn btql_source_expr(object: &ObjectRef) -> Result<String> {
     let source = object.object_type.as_str();
-    Ok(format!("{source}({})", sql_quote(&object.object_name)))
+    Ok(format!("{source}({})", btql_quote(&object.object_name)))
 }
 
 fn sanitize_segment(value: &str) -> String {
@@ -3848,10 +3848,6 @@ fn is_false(value: &bool) -> bool {
 fn btql_quote(value: &str) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|_| format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")))
-}
-
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn show_checkpoint_hint_line(pb: &ProgressBar) {
