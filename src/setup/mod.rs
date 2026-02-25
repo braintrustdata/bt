@@ -19,6 +19,7 @@ use crate::config;
 use crate::http::ApiClient;
 use crate::ui::{self, with_spinner};
 
+mod agent_stream;
 mod docs;
 
 pub use docs::DocsArgs;
@@ -140,6 +141,10 @@ struct InstrumentSetupArgs {
     /// Number of concurrent workers for docs prefetch/download.
     #[arg(long, default_value_t = crate::sync::default_workers())]
     workers: usize,
+
+    /// Suppress streaming agent output; show a spinner and print results at the end
+    #[arg(long, short = 'q')]
+    quiet: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -457,6 +462,7 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                     yes: false,
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
+                    quiet: false,
                 },
             )
             .await?;
@@ -785,7 +791,16 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
         task_path.display()
     ));
 
-    let status = run_agent_invocation(&root, &invocation, !base.json).await?;
+    let show_output = !base.json && !args.quiet;
+    let status = if args.quiet && !base.json {
+        with_spinner(
+            "Running agent instrumentation…",
+            run_agent_invocation(&root, &invocation, false),
+        )
+        .await?
+    } else {
+        run_agent_invocation(&root, &invocation, show_output).await?
+    };
     if status.success() {
         results.push(AgentInstallResult {
             agent: selected,
@@ -827,6 +842,7 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
     }
 
     if !status.success() {
+        let _ = fs::remove_file(&task_path);
         bail!("agent instrumentation command failed");
     }
     Ok(())
@@ -983,6 +999,7 @@ enum InstrumentInvocation {
         args: Vec<String>,
         stdin_file: Option<PathBuf>,
         prompt_file_arg: Option<PathBuf>,
+        stream_json: bool,
     },
     Shell(String),
 }
@@ -1006,6 +1023,7 @@ fn resolve_instrument_invocation(
             args: vec!["exec".to_string(), "-".to_string()],
             stdin_file: Some(task_path.to_path_buf()),
             prompt_file_arg: None,
+            stream_json: false,
         },
         Agent::Claude => InstrumentInvocation::Program {
             program: "claude".to_string(),
@@ -1020,12 +1038,14 @@ fn resolve_instrument_invocation(
             ],
             stdin_file: Some(task_path.to_path_buf()),
             prompt_file_arg: None,
+            stream_json: true,
         },
         Agent::Opencode => InstrumentInvocation::Program {
             program: "opencode".to_string(),
             args: vec!["run".to_string()],
             stdin_file: None,
             prompt_file_arg: Some(task_path.to_path_buf()),
+            stream_json: false,
         },
         Agent::Cursor => InstrumentInvocation::Program {
             program: "cursor-agent".to_string(),
@@ -1038,6 +1058,7 @@ fn resolve_instrument_invocation(
             ],
             stdin_file: None,
             prompt_file_arg: Some(task_path.to_path_buf()),
+            stream_json: true,
         },
     };
     Ok(invocation)
@@ -1066,6 +1087,7 @@ async fn run_agent_invocation(
             args,
             stdin_file,
             prompt_file_arg,
+            stream_json,
         } => {
             let mut command = Command::new(program);
             command.args(args).current_dir(root);
@@ -1088,11 +1110,24 @@ async fn run_agent_invocation(
 
             if !show_output {
                 command.stdout(Stdio::null()).stderr(Stdio::null());
+                return command
+                    .status()
+                    .await
+                    .with_context(|| format!("failed to run agent command in {}", root.display()));
             }
-            command
-                .status()
-                .await
-                .with_context(|| format!("failed to run agent command in {}", root.display()))
+
+            if *stream_json {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                let child = command
+                    .spawn()
+                    .with_context(|| format!("failed to start {program}"))?;
+                agent_stream::stream_agent_output(child, root).await
+            } else {
+                command
+                    .status()
+                    .await
+                    .with_context(|| format!("failed to run agent command in {}", root.display()))
+            }
         }
     }
 }
@@ -2638,6 +2673,7 @@ mod tests {
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
+            quiet: false,
         };
 
         let selected =
@@ -2657,6 +2693,7 @@ mod tests {
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
+            quiet: false,
         };
 
         let selected =
@@ -2691,11 +2728,13 @@ mod tests {
                 args,
                 stdin_file,
                 prompt_file_arg,
+                stream_json,
             } => {
                 assert_eq!(program, "codex");
                 assert_eq!(args, vec!["exec".to_string(), "-".to_string()]);
                 assert_eq!(stdin_file, Some(task_path));
                 assert_eq!(prompt_file_arg, None);
+                assert!(!stream_json);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
@@ -2713,6 +2752,7 @@ mod tests {
                 args,
                 stdin_file,
                 prompt_file_arg,
+                stream_json,
             } => {
                 assert_eq!(program, "claude");
                 assert_eq!(
@@ -2729,6 +2769,7 @@ mod tests {
                 );
                 assert_eq!(stdin_file, Some(task_path));
                 assert_eq!(prompt_file_arg, None);
+                assert!(stream_json);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
@@ -2746,11 +2787,13 @@ mod tests {
                 args,
                 stdin_file,
                 prompt_file_arg,
+                stream_json,
             } => {
                 assert_eq!(program, "opencode");
                 assert_eq!(args, vec!["run".to_string()]);
                 assert_eq!(stdin_file, None);
                 assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
@@ -2768,6 +2811,7 @@ mod tests {
                 args,
                 stdin_file,
                 prompt_file_arg,
+                stream_json,
             } => {
                 assert_eq!(program, "cursor-agent");
                 assert_eq!(
@@ -2782,6 +2826,7 @@ mod tests {
                 );
                 assert_eq!(stdin_file, None);
                 assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(stream_json);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
