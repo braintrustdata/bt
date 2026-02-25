@@ -1,10 +1,7 @@
 const { Eval } = require("braintrust");
 const { greetAll } = require("@repo/lib");
 
-const exactMatch = ({
-  output,
-  expected,
-}) => ({
+const exactMatch = ({ output, expected }) => ({
   name: "exact_match",
   score: output === expected ? 1 : 0,
 });
