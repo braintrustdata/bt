@@ -130,7 +130,7 @@ if ! curl -fsSL "$installer_url" -o "$tmpfile"; then
 fi
 
 # shellcheck disable=SC2086
-bash "$tmpfile" $passthrough_args | grep -v "everything's installed"
+bash "$tmpfile" $passthrough_args
 
 # --- Post-install -------------------------------------------------------------
 

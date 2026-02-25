@@ -20,17 +20,19 @@ mod set;
 pub struct Config {
     pub org: Option<String>,
     pub project: Option<String>,
+    pub project_id: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["org", "project"];
+pub const KNOWN_KEYS: &[&str] = &["org", "project", "project_id"];
 
 impl Config {
     pub fn get_field(&self, key: &str) -> Option<&str> {
         match key {
             "org" => self.org.as_deref(),
             "project" => self.project.as_deref(),
+            "project_id" => self.project_id.as_deref(),
             _ => None,
         }
     }
@@ -38,7 +40,11 @@ impl Config {
     pub fn set_field(&mut self, key: &str, value: String) -> bool {
         match key {
             "org" => self.org = Some(value),
-            "project" => self.project = Some(value),
+            "project" => {
+                self.project = Some(value);
+                self.project_id = None;
+            }
+            "project_id" => self.project_id = Some(value),
             _ => return false,
         }
         true
@@ -47,7 +53,11 @@ impl Config {
     pub fn unset_field(&mut self, key: &str) -> bool {
         match key {
             "org" => self.org = None,
-            "project" => self.project = None,
+            "project" => {
+                self.project = None;
+                self.project_id = None;
+            }
+            "project_id" => self.project_id = None,
             _ => return false,
         }
         true
@@ -63,9 +73,16 @@ impl Config {
     fn merge(&self, other: &Config) -> Config {
         let mut extra = self.extra.clone();
         extra.extend(other.extra.clone());
+        let project = other.project.clone().or_else(|| self.project.clone());
+        let project_id = if other.project.is_some() {
+            other.project_id.clone()
+        } else {
+            self.project_id.clone()
+        };
         Config {
             org: other.org.clone().or_else(|| self.org.clone()),
-            project: other.project.clone().or_else(|| self.project.clone()),
+            project,
+            project_id,
             extra,
         }
     }
@@ -244,14 +261,14 @@ enum ConfigCommands {
     },
     /// Get a config value
     Get {
-        /// Config key (org, project)
+        /// Config key (org, project, project_id)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,
     },
     /// Set a config value
     Set {
-        /// Config key (org, project)
+        /// Config key (org, project, project_id)
         key: String,
         /// Value to set
         value: String,
@@ -260,7 +277,7 @@ enum ConfigCommands {
     },
     /// Remove a config value
     Unset {
-        /// Config key (org, project)
+        /// Config key (org, project, project_id)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,

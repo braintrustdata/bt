@@ -369,7 +369,12 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
     let project = select_project_with_skip(&client).await?;
     if let Some(ref project) = project {
         if find_git_root().is_some() && maybe_init(&org, project)? {
-            eprintln!("   {} Linked to {}/{}", style("✓").green(), org, project);
+            eprintln!(
+                "   {} Linked to {}/{}",
+                style("✓").green(),
+                org,
+                project.name
+            );
         }
     } else {
         eprintln!("   {}", style("Skipped").dim());
@@ -512,7 +517,9 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
     }
 }
 
-async fn select_project_with_skip(client: &ApiClient) -> Result<Option<String>> {
+async fn select_project_with_skip(
+    client: &ApiClient,
+) -> Result<Option<crate::projects::api::Project>> {
     let mut projects = with_spinner(
         "Loading projects...",
         crate::projects::api::list_projects(client),
@@ -532,21 +539,30 @@ async fn select_project_with_skip(client: &ApiClient) -> Result<Option<String>> 
     if selection == labels.len() - 1 {
         Ok(None)
     } else {
-        Ok(Some(projects[selection].name.clone()))
+        Ok(Some(projects[selection].clone()))
     }
 }
 
 /// Returns `true` if config was written or already matched, `false` if user declined.
-fn maybe_init(org: &str, project: &str) -> Result<bool> {
+fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool> {
     let config_path = std::env::current_dir()?.join(".bt").join("config.json");
 
     if config_path.exists() {
-        let existing = config::load_file(&config_path);
-        if existing.org.as_deref() == Some(org) && existing.project.as_deref() == Some(project) {
+        let mut existing = config::load_file(&config_path);
+        let matches = existing.org.as_deref() == Some(org)
+            && existing.project.as_deref() == Some(project.name.as_str());
+        if matches && existing.project_id.as_deref() == Some(project.id.as_str()) {
+            return Ok(true);
+        }
+        if matches {
+            existing.org = Some(org.to_string());
+            existing.project = Some(project.name.clone());
+            existing.project_id = Some(project.id.clone());
+            config::save_local(&existing, true)?;
             return Ok(true);
         }
         let update = Confirm::new()
-            .with_prompt(format!("Update .bt/config.json to {org}/{project}?"))
+            .with_prompt(format!("Update .bt/config.json to {org}/{}?", project.name))
             .default(true)
             .interact()?;
         if !update {
@@ -556,7 +572,8 @@ fn maybe_init(org: &str, project: &str) -> Result<bool> {
 
     let cfg = config::Config {
         org: Some(org.to_string()),
-        project: Some(project.to_string()),
+        project: Some(project.name.clone()),
+        project_id: Some(project.id.clone()),
         ..Default::default()
     };
     config::save_local(&cfg, true)?;
