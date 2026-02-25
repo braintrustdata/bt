@@ -6,13 +6,17 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use dialoguer::{theme::ColorfulTheme, FuzzySelect, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
 use crate::args::BaseArgs;
-use crate::ui::with_spinner;
+use crate::auth;
+use crate::auth::LoginContext;
+use crate::config;
+use crate::http::ApiClient;
+use crate::ui::{self, with_spinner};
 
 mod docs;
 
@@ -320,40 +324,7 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             if should_prompt_setup_action(&base, &args.agents) {
-                match prompt_setup_action()? {
-                    Some(SetupAction::Instrument) => {
-                        run_instrument_setup(
-                            base,
-                            InstrumentSetupArgs {
-                                agent: None,
-                                agent_cmd: None,
-                                workflows: Vec::new(),
-                                yes: false,
-                                refresh_docs: false,
-                                workers: crate::sync::default_workers(),
-                            },
-                        )
-                        .await
-                    }
-                    Some(SetupAction::Skills) => run_setup(base, args.agents).await,
-                    Some(SetupAction::Mcp) => run_mcp_setup(
-                        base,
-                        AgentsMcpSetupArgs {
-                            agents: Vec::new(),
-                            local: false,
-                            global: false,
-                            yes: false,
-                        },
-                    ),
-                    Some(SetupAction::Doctor) => run_doctor(
-                        base,
-                        AgentsDoctorArgs {
-                            local: false,
-                            global: false,
-                        },
-                    ),
-                    None => bail!("setup cancelled by user"),
-                }
+                run_setup_wizard(base).await
             } else {
                 run_setup(base, args.agents).await
             }
@@ -362,6 +333,194 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
 }
 
 pub use docs::run_docs_top;
+
+async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
+    let login_ctx = ensure_auth(&mut base).await?;
+
+    let client = ApiClient::new(&login_ctx)?;
+    let project = select_project_with_skip(&client).await?;
+    let org = client.org_name().to_string();
+
+    if let Some(ref project) = project {
+        if find_git_root().is_some() {
+            maybe_init(&org, project)?;
+        }
+    }
+
+    prompt_and_run_agent_setup(&base).await?;
+
+    if find_git_root().is_some() {
+        let instrument = Confirm::new()
+            .with_prompt("Run instrumentation agent to set up tracing in this repo?")
+            .default(false)
+            .interact()?;
+        if instrument {
+            run_instrument_setup(
+                base,
+                InstrumentSetupArgs {
+                    agent: None,
+                    agent_cmd: None,
+                    workflows: Vec::new(),
+                    yes: false,
+                    refresh_docs: false,
+                    workers: crate::sync::default_workers(),
+                },
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
+    if base.api_key.is_some() {
+        return auth::login(base).await;
+    }
+
+    let profiles = auth::list_profiles()?;
+    match profiles.len() {
+        0 => {
+            eprintln!("No auth profiles found. Let's set one up.\n");
+            auth::login_interactive(base).await?;
+            auth::login(base).await
+        }
+        1 => {
+            let p = &profiles[0];
+            let label = p.org_name.as_deref().unwrap_or(&p.name);
+            eprintln!("Using org: {label}\n");
+            base.profile = Some(p.name.clone());
+            auth::login(base).await
+        }
+        _ => {
+            let name = auth::select_profile_interactive(None)?
+                .ok_or_else(|| anyhow!("no profile selected"))?;
+            base.profile = Some(name);
+            auth::login(base).await
+        }
+    }
+}
+
+async fn select_project_with_skip(client: &ApiClient) -> Result<Option<String>> {
+    let mut projects = with_spinner(
+        "Loading projects...",
+        crate::projects::api::list_projects(client),
+    )
+    .await?;
+
+    if projects.is_empty() {
+        bail!("no projects found in org '{}'", client.org_name());
+    }
+
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut labels: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
+    labels.push("Skip (not recommended)".to_string());
+
+    let selection = ui::fuzzy_select("Select project", &labels, 0)?;
+
+    if selection == labels.len() - 1 {
+        Ok(None)
+    } else {
+        Ok(Some(projects[selection].name.clone()))
+    }
+}
+
+fn maybe_init(org: &str, project: &str) -> Result<()> {
+    let config_path = std::env::current_dir()?.join(".bt").join("config.json");
+
+    if config_path.exists() {
+        let existing = config::load_file(&config_path);
+        if existing.org.as_deref() == Some(org) && existing.project.as_deref() == Some(project) {
+            return Ok(());
+        }
+        let update = Confirm::new()
+            .with_prompt(format!("Update .bt/config.json to {org}/{project}?"))
+            .default(true)
+            .interact()?;
+        if !update {
+            return Ok(());
+        }
+    }
+
+    let cfg = config::Config {
+        org: Some(org.to_string()),
+        project: Some(project.to_string()),
+        ..Default::default()
+    };
+    config::save_local(&cfg, true)?;
+    crate::ui::print_command_status(
+        crate::ui::CommandStatus::Success,
+        &format!("Linked to {org}/{project}"),
+    );
+    Ok(())
+}
+
+fn agent_to_agent_arg(agent: Agent) -> AgentArg {
+    match agent {
+        Agent::Claude => AgentArg::Claude,
+        Agent::Codex => AgentArg::Codex,
+        Agent::Cursor => AgentArg::Cursor,
+        Agent::Opencode => AgentArg::Opencode,
+    }
+}
+
+async fn prompt_and_run_agent_setup(base: &BaseArgs) -> Result<()> {
+    let choices = ["Skills", "MCP"];
+    let defaults = [true, true];
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("What would you like to set up?")
+        .items(&choices)
+        .defaults(&defaults)
+        .interact()?;
+
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let wants_skills = selected.contains(&0);
+    let wants_mcp = selected.contains(&1);
+
+    let scope = prompt_scope_selection("Select install scope")?
+        .ok_or_else(|| anyhow!("setup cancelled"))?;
+
+    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let local_root = resolve_local_root_for_scope(scope)?;
+    let detected = detect_agents(local_root.as_deref(), &home);
+    let agent_defaults = resolve_selected_agents(&[], &detected);
+    let agents =
+        prompt_agents_selection(&agent_defaults)?.ok_or_else(|| anyhow!("setup cancelled"))?;
+
+    if agents.is_empty() {
+        bail!("no agents selected");
+    }
+
+    let agent_args: Vec<AgentArg> = agents.iter().map(|a| agent_to_agent_arg(*a)).collect();
+
+    if wants_skills {
+        let args = AgentsSetupArgs {
+            agents: agent_args.clone(),
+            local: matches!(scope, InstallScope::Local),
+            global: matches!(scope, InstallScope::Global),
+            workflows: Vec::new(),
+            yes: false,
+            no_fetch_docs: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+        };
+        run_setup(base.clone(), args).await?;
+    }
+    if wants_mcp {
+        let args = AgentsMcpSetupArgs {
+            agents: agent_args,
+            local: matches!(scope, InstallScope::Local),
+            global: matches!(scope, InstallScope::Global),
+            yes: false,
+        };
+        run_mcp_setup(base.clone(), args)?;
+    }
+
+    Ok(())
+}
 
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
     let outcome = execute_skills_setup(&base, &args).await?;
@@ -483,14 +642,6 @@ async fn execute_skills_setup(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SetupAction {
-    Instrument,
-    Skills,
-    Mcp,
-    Doctor,
-}
-
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum InstrumentAgentArg {
     Claude,
@@ -511,26 +662,6 @@ fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
         && !args.no_fetch_docs
         && !args.refresh_docs
         && args.workers == crate::sync::default_workers()
-}
-
-fn prompt_setup_action() -> Result<Option<SetupAction>> {
-    let choices = [
-        "instrument (setup skills + use a coding agent to install Braintrust)",
-        "skills (just setup skills)",
-        "mcp (configure MCP)",
-        "doctor (diagnose setup)",
-    ];
-    let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select setup action")
-        .items(&choices)
-        .default(0)
-        .interact_opt()?;
-    Ok(idx.map(|value| match value {
-        0 => SetupAction::Instrument,
-        1 => SetupAction::Skills,
-        2 => SetupAction::Mcp,
-        _ => SetupAction::Doctor,
-    }))
 }
 
 async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Result<()> {

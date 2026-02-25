@@ -816,6 +816,196 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
+pub async fn login_interactive(base: &mut BaseArgs) -> Result<String> {
+    let methods = ["OAuth (browser)", "API key"];
+    let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
+
+    if selected == 0 {
+        login_interactive_oauth(base).await
+    } else {
+        login_interactive_api_key(base).await
+    }
+}
+
+async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
+    let api_key = prompt_api_key()?;
+
+    let login_app_url = base
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
+    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
+    let selected_api_url =
+        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
+    let mut store = load_auth_store()?;
+    let profile_name = resolve_profile_name(
+        base.profile.as_deref(),
+        selected_org.as_ref().map(|org| org.name.as_str()),
+        true,
+    )?;
+
+    save_profile_secret(&profile_name, &api_key)?;
+    let _ = delete_profile_oauth_refresh_token(&profile_name);
+    let _ = delete_profile_oauth_access_token(&profile_name);
+
+    store.profiles.insert(
+        profile_name.to_string(),
+        AuthProfile {
+            auth_kind: AuthKind::ApiKey,
+            api_url: Some(selected_api_url),
+            app_url: base.app_url.clone(),
+            org_name: selected_org.as_ref().map(|org| org.name.clone()),
+            oauth_client_id: None,
+            oauth_access_expires_at: None,
+            user_name: None,
+            email: None,
+            api_key_hint: Some(obscure_api_key(&api_key)),
+        },
+    );
+    save_auth_store(&store)?;
+
+    if let Some(org) = selected_org.as_ref() {
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!(
+                "Logged in to org '{}' with profile '{}'",
+                org.name, profile_name
+            ),
+        );
+    } else {
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!("Logged in with profile '{profile_name}'"),
+        );
+    }
+
+    base.profile = Some(profile_name.clone());
+    Ok(profile_name)
+}
+
+async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
+    let api_url = base
+        .api_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let app_url = base
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let provisional_profile = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("default");
+    let client_id = default_oauth_client_id(provisional_profile);
+
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+    let state = generate_random_token(32)?;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("failed to bind oauth callback listener")?;
+    let callback_port = listener
+        .local_addr()
+        .context("failed to read callback listener address")?
+        .port();
+    let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
+    let oauth_client = build_oauth_client(&api_url, &client_id, Some(&redirect_uri))?;
+    let (authorize_url, _) = oauth_client
+        .authorize_url(|| CsrfToken::new(state.clone()))
+        .add_scope(Scope::new(OAUTH_SCOPE.to_string()))
+        .set_pkce_challenge(pkce_challenge)
+        .url();
+    let authorize_url = authorize_url.to_string();
+
+    eprintln!("Opening browser for OAuth authorization...");
+    eprintln!("If it does not open, visit:\n{authorize_url}");
+    if let Err(err) = open::that(&authorize_url) {
+        eprintln!("warning: failed to open browser automatically: {err}");
+    }
+
+    let callback = collect_oauth_callback(listener, is_ssh_session()).await?;
+    if let Some(error) = callback.error {
+        bail!("oauth authorization failed: {error}");
+    }
+    let auth_code = callback
+        .code
+        .ok_or_else(|| anyhow::anyhow!("no authorization code received"))?;
+    if callback.state.is_none() {
+        bail!("oauth callback missing state; paste the full callback URL (or code=...&state=...)");
+    }
+    if callback.state.as_deref() != Some(state.as_str()) {
+        bail!("oauth state mismatch; please try again");
+    }
+
+    let oauth_tokens = exchange_oauth_authorization_code(
+        &api_url,
+        &client_id,
+        &redirect_uri,
+        &auth_code,
+        pkce_verifier,
+    )
+    .await?;
+
+    let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
+    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
+    let selected_api_url =
+        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
+    let mut store = load_auth_store()?;
+    let profile_name = resolve_profile_name(
+        base.profile.as_deref(),
+        selected_org.as_ref().map(|org| org.name.as_str()),
+        true,
+    )?;
+
+    let refresh_token = oauth_tokens.refresh_token.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "oauth token response did not include a refresh_token; cannot create persistent oauth profile"
+        )
+    })?;
+    save_profile_oauth_refresh_token(&profile_name, refresh_token)?;
+    save_profile_oauth_access_token(&profile_name, &oauth_tokens.access_token)?;
+    let _ = delete_profile_secret(&profile_name);
+    let oauth_access_expires_at = determine_oauth_access_expiry_epoch(&oauth_tokens);
+    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
+
+    store.profiles.insert(
+        profile_name.to_string(),
+        AuthProfile {
+            auth_kind: AuthKind::Oauth,
+            api_url: Some(selected_api_url),
+            app_url: Some(app_url),
+            org_name: selected_org.as_ref().map(|org| org.name.clone()),
+            oauth_client_id: Some(client_id),
+            oauth_access_expires_at,
+            user_name: jwt_id.name,
+            email: jwt_id.email,
+            api_key_hint: None,
+        },
+    );
+    save_auth_store(&store)?;
+
+    if let Some(org) = selected_org.as_ref() {
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!(
+                "Logged in with OAuth to org '{}' with profile '{}'",
+                org.name, profile_name
+            ),
+        );
+    } else {
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!("Logged in with OAuth using profile '{profile_name}'"),
+        );
+    }
+
+    base.profile = Some(profile_name.clone());
+    Ok(profile_name)
+}
+
 fn oauth_ignored_api_key_warning(base: &BaseArgs) -> Option<String> {
     let api_key = base.api_key.as_deref()?.trim();
     if api_key.is_empty() {
