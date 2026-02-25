@@ -48,25 +48,29 @@ const HELP_TEMPLATE: &str = "\
 {before-help}{about} - {usage}
 
 Core
-  init      Initialize .bt config directory and files
-  auth      Authenticate bt with Braintrust
-  switch    Switch org and project context
-  view      View logs, traces, and spans
+  init         Initialize .bt config directory and files
+  auth         Authenticate bt with Braintrust
+  switch       Switch org and project context
+  view         View logs, traces, and spans
 
 Projects & resources
-  projects  Manage projects
-  prompts   Manage prompts
+  projects     Manage projects
+  prompts      Manage prompts
+  functions    Manage functions (tools, scorers, and more)
+  tools        Manage tools
+  scorers      Manage scorers
+  experiments  Manage experiments
 
 Data & evaluation
-  eval      Run eval files
-  sql       Run SQL queries against Braintrust
-  sync      Synchronize project logs between Braintrust and local NDJSON files
+  eval         Run eval files
+  sql          Run SQL queries against Braintrust
+  sync         Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
-  docs      Manage workflow docs for coding agents
-  self      Self-management commands
-  setup     Configure Braintrust setup flows
-  status    Show current org and project context
+  docs         Manage workflow docs for coding agents
+  self         Self-management commands
+  setup        Configure Braintrust setup flows
+  status       Show current org and project context
 
 Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
