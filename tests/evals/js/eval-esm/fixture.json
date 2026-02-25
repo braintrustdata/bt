@@ -1,4 +1,8 @@
 {
-  "files": ["tests/basic.eval.mjs", "tests/top-level-await.eval.mjs"],
+  "files": [
+    "tests/basic.eval.mjs",
+    "tests/top-level-await.eval.mjs",
+    "tests/parse-args.eval.mjs"
+  ],
   "runners": ["tsx", "vite-node", "bun", "deno"]
 }
