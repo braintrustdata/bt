@@ -9,11 +9,13 @@ license = "Apache-2.0"
 repository = "https://github.com/braintrustdata/bt"
 
 [dependencies]
+actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "c8c7c7a8d9189164584adef71449a26d4ae8be2b" }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
+futures-util = "0.3.31"
 indicatif = "0.17.8"
 ratatui = "0.29.0"
 reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls"] }

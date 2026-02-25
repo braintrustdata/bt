@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Debug, Deserialize, Clone)]
 struct FixtureConfig {
@@ -303,6 +304,125 @@ fn eval_watch_python_dependency_retriggers() {
         python.to_string_lossy().as_ref(),
         "eval_local_import.py",
         "helper.py",
+    );
+}
+
+#[test]
+fn eval_runner_list_mode_serializes_parameter_defaults() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but unavailable for list-mode test");
+        }
+        eprintln!(
+            "Skipping eval_runner_list_mode_serializes_parameter_defaults (node not installed)."
+        );
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-ts-node-only");
+    ensure_dependencies(&fixture_dir);
+
+    let runner = fixture_dir
+        .join("node_modules")
+        .join(".bin")
+        .join("ts-node");
+    if !runner.is_file() || !js_module_resolves(&fixture_dir, "zod") {
+        install_js_dependencies(&fixture_dir);
+    }
+
+    if !runner.is_file() {
+        panic!(
+            "ts-node runner missing after dependency install in {}",
+            fixture_dir.display()
+        );
+    }
+    if !js_module_resolves(&fixture_dir, "zod") {
+        panic!(
+            "zod module missing after dependency install in {}",
+            fixture_dir.display()
+        );
+    }
+
+    let runner_script = root.join("scripts").join("eval-runner.ts");
+    let output = Command::new(&runner)
+        .arg(&runner_script)
+        .arg("tests/remote-list-params.eval.ts")
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_DEV_MODE", "list")
+        .env("BT_EVAL_NO_SEND_LOGS", "1")
+        .output()
+        .expect("run eval-runner.ts in list mode");
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "list-mode runner failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status, stdout, stderr
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let manifest_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("runner should emit manifest JSON");
+    let manifest: Value = serde_json::from_str(manifest_line).expect("parse manifest json");
+
+    let evaluator = manifest
+        .as_object()
+        .and_then(|obj| {
+            obj.iter()
+                .find(|(name, _)| name.starts_with("test-cli-remote-list-params"))
+                .map(|(_, value)| value)
+        })
+        .and_then(Value::as_object)
+        .expect("manifest should include evaluator");
+    let parameters = evaluator
+        .get("parameters")
+        .and_then(Value::as_object)
+        .expect("evaluator should include parameter schema");
+    assert_eq!(
+        parameters.get("type").and_then(Value::as_str),
+        Some("braintrust.staticParameters")
+    );
+
+    let schema = parameters
+        .get("schema")
+        .and_then(Value::as_object)
+        .expect("parameters schema should be object");
+    let optional = schema
+        .get("optional_no_default")
+        .and_then(Value::as_object)
+        .expect("optional parameter should exist");
+    assert_eq!(optional.get("type").and_then(Value::as_str), Some("data"));
+    assert!(
+        optional.get("default").is_none(),
+        "optional parameter should not include a default when not explicitly set"
+    );
+
+    let with_default = schema
+        .get("with_default")
+        .and_then(Value::as_object)
+        .expect("defaulted parameter should exist");
+    assert_eq!(
+        with_default.get("type").and_then(Value::as_str),
+        Some("data")
+    );
+    assert_eq!(
+        with_default.get("description").and_then(Value::as_str),
+        Some("Prompt default")
+    );
+    assert_eq!(
+        with_default.get("default").and_then(Value::as_str),
+        Some("default text")
     );
 }
 
@@ -615,6 +735,10 @@ fn ensure_dependencies(dir: &Path) {
         return;
     }
 
+    install_js_dependencies(dir);
+}
+
+fn install_js_dependencies(dir: &Path) {
     if command_exists("pnpm") {
         let status = Command::new("pnpm")
             .args(["install", "--ignore-scripts", "--no-lockfile"])
@@ -635,6 +759,17 @@ fn ensure_dependencies(dir: &Path) {
     if !status.success() {
         panic!("npm install failed for {}", dir.display());
     }
+}
+
+fn js_module_resolves(dir: &Path, module_name: &str) -> bool {
+    Command::new("node")
+        .args(["-e", "require.resolve(process.argv[1])", module_name])
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn build_bt_binary(root: &Path) {
