@@ -64,6 +64,12 @@ type TraceLoadResult = (String, Result<Vec<Map<String, Value>>>);
 type FullSpanLoadResult = (String, Result<Option<Map<String, Value>>>);
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt view logs --limit 25
+  bt view trace <ROOT_SPAN_ID>
+  bt view span <SPAN_ID>
+")]
 pub struct ViewArgs {
     #[command(subcommand)]
     command: Option<ViewCommand>,

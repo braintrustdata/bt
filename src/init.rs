@@ -12,6 +12,11 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt init
+  bt init --org acme --project my-app
+")]
 pub struct InitArgs {}
 
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {

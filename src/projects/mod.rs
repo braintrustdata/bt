@@ -12,6 +12,12 @@ mod list;
 mod view;
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt projects list
+  bt projects create my-project
+  bt projects view my-project --web
+")]
 pub struct ProjectsArgs {
     #[command(subcommand)]
     command: Option<ProjectsCommands>,

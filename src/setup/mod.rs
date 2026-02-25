@@ -42,6 +42,12 @@ const ALL_WORKFLOWS: [WorkflowArg; 5] = [
 ];
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt setup --agent cursor --workflow observe
+  bt setup skills --agent codex --global
+  bt setup mcp --agent codex
+")]
 pub struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupSubcommand>,

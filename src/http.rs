@@ -6,6 +6,8 @@ use serde_json::json;
 
 use crate::auth::LoginContext;
 
+pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
@@ -13,6 +15,20 @@ pub struct ApiClient {
     api_key: String,
     org_name: String,
 }
+
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request failed ({}): {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
 
 #[derive(Debug, Deserialize)]
 pub struct BtqlResponse<T> {
@@ -22,6 +38,7 @@ pub struct BtqlResponse<T> {
 impl ApiClient {
     pub fn new(ctx: &LoginContext) -> Result<Self> {
         let http = Client::builder()
+            .timeout(DEFAULT_HTTP_TIMEOUT)
             .build()
             .context("failed to build HTTP client")?;
 
@@ -60,7 +77,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         response.json().await.context("failed to parse response")
@@ -80,7 +97,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         response.json().await.context("failed to parse response")
@@ -126,7 +143,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         response.json().await.context("failed to parse response")
@@ -164,7 +181,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         Ok(())

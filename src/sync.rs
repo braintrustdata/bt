@@ -24,7 +24,7 @@ use crate::args::BaseArgs;
 use crate::auth::{login, LoginContext};
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
-use crate::ui::fuzzy_select;
+use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
@@ -45,6 +45,12 @@ pub(crate) fn default_workers() -> usize {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt sync pull project_logs:my-project --window 24h
+  bt sync push project_logs:my-project --in bt-sync/project_logs
+  bt sync status project_logs:1234-uuid
+")]
 pub struct SyncArgs {
     #[command(subcommand)]
     command: SyncCommand,
@@ -3849,7 +3855,7 @@ fn sql_quote(value: &str) -> String {
 }
 
 fn show_checkpoint_hint_line(pb: &ProgressBar) {
-    if std::io::stderr().is_terminal() {
+    if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
         pb.println("  Ctrl+C safely checkpoints; rerun same command to resume (--fresh restarts).");
     }
 }
@@ -3861,7 +3867,7 @@ struct PullProgressUi {
 }
 
 fn bounded_bar_with_status_line(total: u64, message: &str, unit_label: &str) -> PullProgressUi {
-    if !std::io::stderr().is_terminal() {
+    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
         return PullProgressUi {
             _multi: None,
             main: ProgressBar::hidden(),
@@ -3907,7 +3913,7 @@ fn pull_status_line(show_checkpoint_hint: bool, retry_summary: Option<&str>) -> 
 }
 
 fn bounded_bar(total: u64, message: &str, unit_label: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
+    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(total);
@@ -3921,7 +3927,7 @@ fn bounded_bar(total: u64, message: &str, unit_label: &str) -> ProgressBar {
 }
 
 fn spinner_bar(message: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() {
+    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new_spinner();

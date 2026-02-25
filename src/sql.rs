@@ -28,6 +28,12 @@ use crate::http::ApiClient;
 use crate::ui::with_spinner;
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt sql \"SELECT * FROM project_logs('<PROJECT_ID>') LIMIT 5\"
+  cat query.sql | bt sql
+  bt sql --non-interactive \"SELECT count(*) FROM project_logs('<PROJECT_ID>')\"
+")]
 pub struct SqlArgs {
     /// SQL query to execute
     pub query: Option<String>,

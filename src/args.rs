@@ -10,6 +10,14 @@ pub struct BaseArgs {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Suppress non-essential output
+    #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true)]
+    pub quiet: bool,
+
+    /// Disable ANSI color output
+    #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true)]
+    pub no_color: bool,
+
     /// Use a saved login profile (or via BRAINTRUST_PROFILE)
     #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
     pub profile: Option<String>,

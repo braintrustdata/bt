@@ -121,6 +121,13 @@ impl SlugArgs {
 // --- Wrapper args (bt tools / bt scorers) ---
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt tools list
+  bt tools view my-tool
+  bt scorers list
+  bt scorers delete my-scorer
+")]
 pub struct FunctionArgs {
     #[command(subcommand)]
     command: Option<FunctionCommands>,
@@ -141,6 +148,12 @@ enum FunctionCommands {
 // --- bt functions args ---
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt functions list
+  bt functions view my-function
+  bt functions invoke my-function --input '{\"key\":\"value\"}'
+")]
 pub struct FunctionsArgs {
     /// Filter by function type
     #[arg(long = "type", short = 't', value_enum)]

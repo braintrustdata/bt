@@ -220,6 +220,13 @@ struct OAuthTokenResponse {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt auth login
+  bt auth profiles
+  bt auth refresh
+  bt auth logout --profile work
+")]
 pub struct AuthArgs {
     #[command(subcommand)]
     command: AuthCommand,
@@ -1460,6 +1467,7 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
     let login_url = format!("{}/api/apikey/login", app_url.trim_end_matches('/'));
     let client = Client::builder()
+        .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
         .build()
         .context("failed to initialize HTTP client")?;
     let response = client
@@ -2585,6 +2593,8 @@ mod tests {
     fn make_base() -> BaseArgs {
         BaseArgs {
             json: false,
+            quiet: false,
+            no_color: false,
             profile: None,
             project: None,
             org_name: None,

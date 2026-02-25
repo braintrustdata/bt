@@ -20,6 +20,11 @@ const SQL_REFERENCE_DOC_TITLE: &str = "SQL queries";
 const SQL_REFERENCE_DOC_URL: &str = "https://www.braintrust.dev/docs/reference/sql.md";
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt docs fetch --workflow reference
+  bt docs fetch --output-dir .bt/skills/docs --refresh
+")]
 pub struct DocsArgs {
     #[command(subcommand)]
     command: Option<DocsSubcommand>,
@@ -190,6 +195,7 @@ pub(super) async fn fetch_docs_pages(
     let llms_base = reqwest::Url::parse(&args.llms_url)
         .with_context(|| format!("invalid llms URL: {}", args.llms_url))?;
     let client = Client::builder()
+        .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
         .build()
         .context("failed to build HTTP client")?;
 

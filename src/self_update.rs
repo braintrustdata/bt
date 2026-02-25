@@ -7,7 +7,15 @@ use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::http::DEFAULT_HTTP_TIMEOUT;
+
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt self update
+  bt self update --check
+  bt self update --channel canary
+")]
 pub struct SelfArgs {
     #[command(subcommand)]
     pub command: SelfSubcommand,
@@ -145,6 +153,7 @@ async fn check_for_update(channel: UpdateChannel) -> Result<()> {
 async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
     let client = Client::builder()
         .user_agent("bt-self-update")
+        .timeout(DEFAULT_HTTP_TIMEOUT)
         .build()
         .context("failed to initialize HTTP client")?;
 
