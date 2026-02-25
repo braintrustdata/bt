@@ -2655,7 +2655,7 @@ async fn resolve_pull_object_ref(
         return resolve_pull_destination(client, value, project_selector).await;
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !crate::ui::is_interactive() {
         bail!("OBJECT_REF is required in non-interactive mode");
     }
 

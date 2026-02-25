@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::io::IsTerminal;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -36,7 +35,7 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::http::ApiClient;
-use crate::ui::{fuzzy_select, with_spinner};
+use crate::ui::{fuzzy_select, is_interactive, with_spinner};
 
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
@@ -930,7 +929,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
     };
     let search_query = args.search.unwrap_or_default();
 
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !args.non_interactive;
 
     if interactive {
         if args.cursor.is_some() {
@@ -1076,7 +1075,7 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
 
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !args.non_interactive;
     if interactive {
         if object_ref.object_type != "project_logs" {
             bail!("interactive trace view currently supports only project_logs sources");
@@ -1247,7 +1246,7 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
         bail!("span selector required. Pass --id <row-id> or --url <trace-url>");
     }
 
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !args.non_interactive;
     if interactive {
         if object_ref.object_type != "project_logs" {
             bail!("interactive span view currently supports only project_logs sources");
@@ -1421,7 +1420,7 @@ async fn resolve_project(
         });
     }
 
-    if !std::io::stdin().is_terminal() {
+    if !is_interactive() {
         bail!("project is required. Pass --project-id <id> or -p <project-name>");
     }
 

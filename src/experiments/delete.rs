@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use dialoguer::Confirm;
 
-use crate::ui::{is_interactive, print_command_status, with_spinner, CommandStatus};
+use crate::ui::{is_interactive, is_quiet, print_command_status, with_spinner, CommandStatus};
 
 use super::{api, ResolvedContext};
 
@@ -47,7 +47,9 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
                 CommandStatus::Success,
                 &format!("Deleted '{}'", experiment.name),
             );
-            eprintln!("Run `bt experiments list` to see remaining experiments.");
+            if !is_quiet() {
+                eprintln!("Run `bt experiments list` to see remaining experiments.");
+            }
             Ok(())
         }
         Err(e) => {

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use dialoguer::Confirm;
 
-use crate::ui::{is_interactive, print_command_status, with_spinner, CommandStatus};
+use crate::ui::{is_interactive, is_quiet, print_command_status, with_spinner, CommandStatus};
 
 use super::{api, label, label_plural, select_function_interactive};
 use super::{FunctionTypeFilter, ResolvedContext};
@@ -63,11 +63,13 @@ pub async fn run(
                 CommandStatus::Success,
                 &format!("Deleted '{}'", function.name),
             );
-            eprintln!(
-                "Run `bt {} list` to see remaining {}.",
-                label_plural(ft),
-                label_plural(ft)
-            );
+            if !is_quiet() {
+                eprintln!(
+                    "Run `bt {} list` to see remaining {}.",
+                    label_plural(ft),
+                    label_plural(ft)
+                );
+            }
             Ok(())
         }
         Err(e) => {

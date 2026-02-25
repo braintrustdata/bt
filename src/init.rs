@@ -1,5 +1,3 @@
-use std::io::IsTerminal;
-
 use anyhow::{bail, Result};
 use clap::Args;
 
@@ -8,7 +6,7 @@ use crate::{
     auth::{self, login},
     config,
     http::ApiClient,
-    ui::{print_command_status, select_project_interactive, CommandStatus},
+    ui::{is_interactive, print_command_status, select_project_interactive, CommandStatus},
 };
 
 #[derive(Debug, Clone, Args)]
@@ -30,7 +28,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
 
     let (org, project) = if let (Some(o), Some(p)) = (&base.org_name, &base.project) {
         (o.clone(), p.clone())
-    } else if !std::io::stdin().is_terminal() {
+    } else if !is_interactive() {
         bail!("--org and --project required in non-interactive mode");
     } else {
         let mut login_base = base.clone();

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io;
-use std::io::IsTerminal;
 use std::io::Read;
 use std::time::Duration;
 
@@ -75,7 +74,7 @@ struct RealtimeState {
 pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && crate::ui::is_interactive() && !args.non_interactive;
     let query = read_non_interactive_query(&args.query, interactive)?;
 
     if let Some(query) = query {
