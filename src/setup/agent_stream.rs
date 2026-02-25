@@ -342,10 +342,11 @@ fn short_path(path: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}…", &s[..end])
     }
 }
 

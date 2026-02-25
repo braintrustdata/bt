@@ -475,6 +475,9 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
 
     // ── Done ──
     print_wizard_done(had_failures);
+    if had_failures {
+        bail!("setup completed with failures");
+    }
     Ok(())
 }
 
@@ -831,14 +834,14 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
             serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
         );
     } else {
-        print_human_report(
-            true,
-            InstallScope::Local,
-            &[selected],
-            &results,
-            &warnings,
-            &notes,
-        );
+        eprintln!();
+        for result in &results {
+            print_wizard_agent_result(result);
+        }
+        for warning in &warnings {
+            eprintln!("   {} {}", style("!").dim(), style(warning).dim());
+        }
+        print_wizard_done(!status.success());
     }
 
     if !status.success() {
@@ -1035,6 +1038,8 @@ fn resolve_instrument_invocation(
                 "--output-format".to_string(),
                 "stream-json".to_string(),
                 "--include-partial-messages".to_string(),
+                "--disallowedTools".to_string(),
+                "EnterPlanMode".to_string(),
             ],
             stdin_file: Some(task_path.to_path_buf()),
             prompt_file_arg: None,
@@ -2765,6 +2770,8 @@ mod tests {
                         "--output-format".to_string(),
                         "stream-json".to_string(),
                         "--include-partial-messages".to_string(),
+                        "--disallowedTools".to_string(),
+                        "EnterPlanMode".to_string(),
                     ]
                 );
                 assert_eq!(stdin_file, Some(task_path));

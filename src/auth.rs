@@ -597,7 +597,6 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), interactive)?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let mut store = load_auth_store()?;
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
@@ -619,28 +618,13 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         }
     }
 
-    save_profile_secret(&profile_name, &api_key)?;
-    let _ = delete_profile_oauth_refresh_token(&profile_name);
-    let _ = delete_profile_oauth_access_token(&profile_name);
-
-    let stored_api_url = Some(selected_api_url.clone());
-    let stored_app_url = base.app_url.clone();
-
-    store.profiles.insert(
-        profile_name.to_string(),
-        AuthProfile {
-            auth_kind: AuthKind::ApiKey,
-            api_url: stored_api_url,
-            app_url: stored_app_url,
-            org_name: selected_org.as_ref().map(|org| org.name.clone()),
-            oauth_client_id: None,
-            oauth_access_expires_at: None,
-            user_name: None,
-            email: None,
-            api_key_hint: Some(obscure_api_key(&api_key)),
-        },
-    );
-    save_auth_store(&store)?;
+    commit_api_key_profile(
+        &profile_name,
+        &api_key,
+        selected_api_url.clone(),
+        base.app_url.clone(),
+        selected_org.as_ref().map(|org| org.name.clone()),
+    )?;
 
     if let Some(org) = selected_org.as_ref() {
         ui::print_command_status(
@@ -747,7 +731,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let mut store = load_auth_store()?;
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
@@ -767,32 +750,14 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         bail!("login cancelled");
     }
 
-    let refresh_token = oauth_tokens.refresh_token.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "oauth token response did not include a refresh_token; cannot create persistent oauth profile"
-        )
-    })?;
-    save_profile_oauth_refresh_token(&profile_name, refresh_token)?;
-    save_profile_oauth_access_token(&profile_name, &oauth_tokens.access_token)?;
-    let _ = delete_profile_secret(&profile_name);
-    let oauth_access_expires_at = determine_oauth_access_expiry_epoch(&oauth_tokens);
-    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
-
-    store.profiles.insert(
-        profile_name.to_string(),
-        AuthProfile {
-            auth_kind: AuthKind::Oauth,
-            api_url: Some(selected_api_url.clone()),
-            app_url: Some(app_url.clone()),
-            org_name: selected_org.as_ref().map(|org| org.name.clone()),
-            oauth_client_id: Some(client_id.clone()),
-            oauth_access_expires_at,
-            user_name: jwt_id.name,
-            email: jwt_id.email,
-            api_key_hint: None,
-        },
-    );
-    save_auth_store(&store)?;
+    commit_oauth_profile(
+        &profile_name,
+        &oauth_tokens,
+        selected_api_url.clone(),
+        app_url.clone(),
+        client_id.clone(),
+        selected_org.as_ref().map(|org| org.name.clone()),
+    )?;
 
     if let Some(org) = selected_org.as_ref() {
         ui::print_command_status(
@@ -838,33 +803,19 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
     let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let mut store = load_auth_store()?;
-    // Auto-generate profile name from org (no prompt)
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
         false,
     )?;
 
-    save_profile_secret(&profile_name, &api_key)?;
-    let _ = delete_profile_oauth_refresh_token(&profile_name);
-    let _ = delete_profile_oauth_access_token(&profile_name);
-
-    store.profiles.insert(
-        profile_name.to_string(),
-        AuthProfile {
-            auth_kind: AuthKind::ApiKey,
-            api_url: Some(selected_api_url),
-            app_url: base.app_url.clone(),
-            org_name: selected_org.as_ref().map(|org| org.name.clone()),
-            oauth_client_id: None,
-            oauth_access_expires_at: None,
-            user_name: None,
-            email: None,
-            api_key_hint: Some(obscure_api_key(&api_key)),
-        },
-    );
-    save_auth_store(&store)?;
+    commit_api_key_profile(
+        &profile_name,
+        &api_key,
+        selected_api_url,
+        base.app_url.clone(),
+        selected_org.as_ref().map(|org| org.name.clone()),
+    )?;
 
     base.profile = Some(profile_name.clone());
     Ok(profile_name)
@@ -934,36 +885,85 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     .await?;
 
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    // Wizard uses simplified org selector (names only, no UUIDs/URLs)
     let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let mut store = load_auth_store()?;
-    // Auto-generate profile name from org (no prompt)
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
         false,
     )?;
 
-    let refresh_token = oauth_tokens.refresh_token.as_ref().ok_or_else(|| {
+    commit_oauth_profile(
+        &profile_name,
+        &oauth_tokens,
+        selected_api_url,
+        app_url,
+        client_id,
+        selected_org.as_ref().map(|org| org.name.clone()),
+    )?;
+
+    base.profile = Some(profile_name.clone());
+    Ok(profile_name)
+}
+
+fn commit_api_key_profile(
+    profile_name: &str,
+    api_key: &str,
+    api_url: String,
+    app_url: Option<String>,
+    org_name: Option<String>,
+) -> Result<()> {
+    save_profile_secret(profile_name, api_key)?;
+    let _ = delete_profile_oauth_refresh_token(profile_name);
+    let _ = delete_profile_oauth_access_token(profile_name);
+
+    let mut store = load_auth_store()?;
+    store.profiles.insert(
+        profile_name.to_string(),
+        AuthProfile {
+            auth_kind: AuthKind::ApiKey,
+            api_url: Some(api_url),
+            app_url,
+            org_name,
+            oauth_client_id: None,
+            oauth_access_expires_at: None,
+            user_name: None,
+            email: None,
+            api_key_hint: Some(obscure_api_key(api_key)),
+        },
+    );
+    save_auth_store(&store)
+}
+
+fn commit_oauth_profile(
+    profile_name: &str,
+    tokens: &OAuthTokenResponse,
+    api_url: String,
+    app_url: String,
+    client_id: String,
+    org_name: Option<String>,
+) -> Result<()> {
+    let refresh_token = tokens.refresh_token.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "oauth token response did not include a refresh_token; cannot create persistent oauth profile"
         )
     })?;
-    save_profile_oauth_refresh_token(&profile_name, refresh_token)?;
-    save_profile_oauth_access_token(&profile_name, &oauth_tokens.access_token)?;
-    let _ = delete_profile_secret(&profile_name);
-    let oauth_access_expires_at = determine_oauth_access_expiry_epoch(&oauth_tokens);
-    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
+    save_profile_oauth_refresh_token(profile_name, refresh_token)?;
+    save_profile_oauth_access_token(profile_name, &tokens.access_token)?;
+    let _ = delete_profile_secret(profile_name);
 
+    let oauth_access_expires_at = determine_oauth_access_expiry_epoch(tokens);
+    let jwt_id = decode_jwt_identity(&tokens.access_token);
+
+    let mut store = load_auth_store()?;
     store.profiles.insert(
         profile_name.to_string(),
         AuthProfile {
             auth_kind: AuthKind::Oauth,
-            api_url: Some(selected_api_url),
+            api_url: Some(api_url),
             app_url: Some(app_url),
-            org_name: selected_org.as_ref().map(|org| org.name.clone()),
+            org_name,
             oauth_client_id: Some(client_id),
             oauth_access_expires_at,
             user_name: jwt_id.name,
@@ -971,10 +971,7 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
             api_key_hint: None,
         },
     );
-    save_auth_store(&store)?;
-
-    base.profile = Some(profile_name.clone());
-    Ok(profile_name)
+    save_auth_store(&store)
 }
 
 fn oauth_ignored_api_key_warning(base: &BaseArgs) -> Option<String> {
