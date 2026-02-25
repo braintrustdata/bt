@@ -6,7 +6,8 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect};
+use dialoguer::console::style;
+use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect, Select};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
@@ -180,6 +181,15 @@ impl Agent {
             Agent::Opencode => "opencode",
         }
     }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude",
+            Agent::Codex => "Codex",
+            Agent::Cursor => "Cursor",
+            Agent::Opencode => "Opencode",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, ValueEnum)]
@@ -335,20 +345,104 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
 pub use docs::run_docs_top;
 
 async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
+    let mut had_failures = false;
+
+    // ── Step 1: Auth ──
+    print_wizard_step(1, "Auth");
     let login_ctx = ensure_auth(&mut base).await?;
-
     let client = ApiClient::new(&login_ctx)?;
-    let project = select_project_with_skip(&client).await?;
     let org = client.org_name().to_string();
+    eprintln!("   {} Using org '{}'", style("✓").green(), org);
 
+    // ── Step 2: Project ──
+    print_wizard_step(2, "Project");
+    let project = select_project_with_skip(&client).await?;
     if let Some(ref project) = project {
-        if find_git_root().is_some() {
-            maybe_init(&org, project)?;
+        if find_git_root().is_some() && maybe_init(&org, project)? {
+            eprintln!("   {} Linked to {}/{}", style("✓").green(), org, project);
         }
+    } else {
+        eprintln!("   {}", style("Skipped").dim());
     }
 
-    prompt_and_run_agent_setup(&base).await?;
+    // ── Agent setup prompts (shared for skills + MCP) ──
+    let choices = ["Skills", "MCP"];
+    let defaults = [true, true];
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("What would you like to set up?")
+        .items(&choices)
+        .defaults(&defaults)
+        .interact()?;
 
+    let wants_skills = selected.contains(&0);
+    let wants_mcp = selected.contains(&1);
+
+    let setup_context = if !selected.is_empty() {
+        let scope = prompt_scope_selection("Select install scope")?
+            .ok_or_else(|| anyhow!("setup cancelled"))?;
+        let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+        let local_root = resolve_local_root_for_scope(scope)?;
+        let detected = detect_agents(local_root.as_deref(), &home);
+        let agent_defaults = resolve_selected_agents(&[], &detected);
+        let agents =
+            prompt_agents_selection(&agent_defaults)?.ok_or_else(|| anyhow!("setup cancelled"))?;
+        if agents.is_empty() {
+            bail!("no agents selected");
+        }
+        Some((scope, agents, home))
+    } else {
+        None
+    };
+
+    // ── Step 3: Skills ──
+    print_wizard_step(3, "Skills");
+    if wants_skills {
+        if let Some((scope, ref agents, _)) = setup_context {
+            let agent_args: Vec<AgentArg> = agents.iter().map(|a| agent_to_agent_arg(*a)).collect();
+            let args = AgentsSetupArgs {
+                agents: agent_args,
+                local: matches!(scope, InstallScope::Local),
+                global: matches!(scope, InstallScope::Global),
+                workflows: Vec::new(),
+                yes: false,
+                no_fetch_docs: true,
+                refresh_docs: false,
+                workers: crate::sync::default_workers(),
+            };
+            let outcome = execute_skills_setup(&base, &args, true).await?;
+            for r in &outcome.results {
+                print_wizard_agent_result(r);
+                if matches!(r.status, InstallStatus::Failed) {
+                    had_failures = true;
+                }
+            }
+        }
+    } else {
+        eprintln!("   {}", style("Skipped").dim());
+    }
+
+    // ── Step 4: MCP ──
+    print_wizard_step(4, "MCP");
+    if wants_mcp {
+        if let Some((scope, ref agents, ref home)) = setup_context {
+            let local_root = resolve_local_root_for_scope(scope)?;
+            let outcome = execute_mcp_install(scope, local_root.as_deref(), home, agents);
+            for r in &outcome.results {
+                print_wizard_agent_result(r);
+                if matches!(r.status, InstallStatus::Failed) {
+                    had_failures = true;
+                }
+            }
+            if outcome.installed_count == 0 {
+                had_failures = true;
+            }
+        }
+    } else {
+        eprintln!("   {}", style("Skipped").dim());
+    }
+
+    // ── Step 5: Instrument ──
+    print_wizard_step(5, "Instrument");
     if find_git_root().is_some() {
         let instrument = Confirm::new()
             .with_prompt("Run instrumentation agent to set up tracing in this repo?")
@@ -367,9 +461,15 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                 },
             )
             .await?;
+        } else {
+            eprintln!("   {}", style("Skipped").dim());
         }
+    } else {
+        eprintln!("   {}", style("Skipped").dim());
     }
 
+    // ── Done ──
+    print_wizard_done(had_failures);
     Ok(())
 }
 
@@ -387,8 +487,6 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
         }
         1 => {
             let p = &profiles[0];
-            let label = p.org_name.as_deref().unwrap_or(&p.name);
-            eprintln!("Using org: {label}\n");
             base.profile = Some(p.name.clone());
             auth::login(base).await
         }
@@ -425,20 +523,21 @@ async fn select_project_with_skip(client: &ApiClient) -> Result<Option<String>> 
     }
 }
 
-fn maybe_init(org: &str, project: &str) -> Result<()> {
+/// Returns `true` if config was written or already matched, `false` if user declined.
+fn maybe_init(org: &str, project: &str) -> Result<bool> {
     let config_path = std::env::current_dir()?.join(".bt").join("config.json");
 
     if config_path.exists() {
         let existing = config::load_file(&config_path);
         if existing.org.as_deref() == Some(org) && existing.project.as_deref() == Some(project) {
-            return Ok(());
+            return Ok(true);
         }
         let update = Confirm::new()
             .with_prompt(format!("Update .bt/config.json to {org}/{project}?"))
             .default(true)
             .interact()?;
         if !update {
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -448,11 +547,7 @@ fn maybe_init(org: &str, project: &str) -> Result<()> {
         ..Default::default()
     };
     config::save_local(&cfg, true)?;
-    crate::ui::print_command_status(
-        crate::ui::CommandStatus::Success,
-        &format!("Linked to {org}/{project}"),
-    );
-    Ok(())
+    Ok(true)
 }
 
 fn agent_to_agent_arg(agent: Agent) -> AgentArg {
@@ -464,66 +559,8 @@ fn agent_to_agent_arg(agent: Agent) -> AgentArg {
     }
 }
 
-async fn prompt_and_run_agent_setup(base: &BaseArgs) -> Result<()> {
-    let choices = ["Skills", "MCP"];
-    let defaults = [true, true];
-    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("What would you like to set up?")
-        .items(&choices)
-        .defaults(&defaults)
-        .interact()?;
-
-    if selected.is_empty() {
-        return Ok(());
-    }
-
-    let wants_skills = selected.contains(&0);
-    let wants_mcp = selected.contains(&1);
-
-    let scope = prompt_scope_selection("Select install scope")?
-        .ok_or_else(|| anyhow!("setup cancelled"))?;
-
-    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), &home);
-    let agent_defaults = resolve_selected_agents(&[], &detected);
-    let agents =
-        prompt_agents_selection(&agent_defaults)?.ok_or_else(|| anyhow!("setup cancelled"))?;
-
-    if agents.is_empty() {
-        bail!("no agents selected");
-    }
-
-    let agent_args: Vec<AgentArg> = agents.iter().map(|a| agent_to_agent_arg(*a)).collect();
-
-    if wants_skills {
-        let args = AgentsSetupArgs {
-            agents: agent_args.clone(),
-            local: matches!(scope, InstallScope::Local),
-            global: matches!(scope, InstallScope::Global),
-            workflows: Vec::new(),
-            yes: false,
-            no_fetch_docs: false,
-            refresh_docs: false,
-            workers: crate::sync::default_workers(),
-        };
-        run_setup(base.clone(), args).await?;
-    }
-    if wants_mcp {
-        let args = AgentsMcpSetupArgs {
-            agents: agent_args,
-            local: matches!(scope, InstallScope::Local),
-            global: matches!(scope, InstallScope::Global),
-            yes: false,
-        };
-        run_mcp_setup(base.clone(), args)?;
-    }
-
-    Ok(())
-}
-
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
-    let outcome = execute_skills_setup(&base, &args).await?;
+    let outcome = execute_skills_setup(&base, &args, false).await?;
     if base.json {
         let report = SetupJsonReport {
             scope: outcome.scope.as_str().to_string(),
@@ -558,6 +595,7 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
 async fn execute_skills_setup(
     base: &BaseArgs,
     args: &AgentsSetupArgs,
+    quiet: bool,
 ) -> Result<SkillsSetupOutcome> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let selection = resolve_setup_selection(args, &home)?;
@@ -569,7 +607,7 @@ async fn execute_skills_setup(
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut results = Vec::new();
-    let show_progress = !base.json;
+    let show_progress = !base.json && !quiet;
 
     if show_progress {
         println!("Configuring coding agents for Braintrust");
@@ -722,7 +760,7 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
             refresh_docs: args.refresh_docs,
             workers: args.workers,
         };
-        let outcome = execute_skills_setup(&base, &setup_args).await?;
+        let outcome = execute_skills_setup(&base, &setup_args, false).await?;
         detected = outcome.detected_agents;
         results.extend(outcome.results);
         warnings.extend(outcome.warnings);
@@ -1087,19 +1125,23 @@ Output:
     )
 }
 
-fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
-    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let selection = resolve_mcp_selection(&args, &home)?;
-    let scope = selection.scope;
-    let local_root = selection.local_root;
-    let detected = selection.detected;
-    let selected_agents = selection.selected_agents;
+struct McpSetupOutcome {
+    results: Vec<AgentInstallResult>,
+    warnings: Vec<String>,
+    installed_count: usize,
+}
 
+fn execute_mcp_install(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    agents: &[Agent],
+) -> McpSetupOutcome {
     let mut warnings = Vec::new();
     let mut results = Vec::new();
 
-    for agent in selected_agents.iter().copied() {
-        let result = install_mcp_for_agent(agent, scope, local_root.as_deref(), &home);
+    for agent in agents.iter().copied() {
+        let result = install_mcp_for_agent(agent, scope, local_root, home);
         match result {
             Ok(r) => {
                 if matches!(r.status, InstallStatus::Skipped)
@@ -1125,13 +1167,30 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
         .filter(|r| matches!(r.status, InstallStatus::Installed))
         .count();
 
+    McpSetupOutcome {
+        results,
+        warnings,
+        installed_count,
+    }
+}
+
+fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
+    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let selection = resolve_mcp_selection(&args, &home)?;
+    let scope = selection.scope;
+    let local_root = selection.local_root;
+    let detected = selection.detected;
+    let selected_agents = selection.selected_agents;
+
+    let outcome = execute_mcp_install(scope, local_root.as_deref(), &home, &selected_agents);
+
     if base.json {
         let report = SetupJsonReport {
             scope: scope.as_str().to_string(),
             selected_agents,
             detected_agents: detected,
-            results,
-            warnings,
+            results: outcome.results,
+            warnings: outcome.warnings,
             notes: vec!["Configured MCP only (`bt setup mcp`).".to_string()],
         };
         println!(
@@ -1140,10 +1199,10 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
                 .context("failed to serialize MCP setup report")?
         );
     } else {
-        print_mcp_human_report(scope, &selected_agents, &results, &warnings);
+        print_mcp_human_report(scope, &selected_agents, &outcome.results, &outcome.warnings);
     }
 
-    if installed_count == 0 {
+    if outcome.installed_count == 0 {
         bail!("no MCP configurations were installed successfully");
     }
 
@@ -1548,7 +1607,7 @@ fn resolve_local_root_for_scope(scope: InstallScope) -> Result<Option<PathBuf>> 
 
 fn prompt_scope_selection(prompt: &str) -> Result<Option<InstallScope>> {
     let choices = ["local (current git repo)", "global (user-wide)"];
-    let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
+    let idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&choices)
         .default(0)
@@ -2285,6 +2344,42 @@ fn command_exists(binary: &str) -> bool {
     }
 
     false
+}
+
+// ── Wizard output helpers ──
+
+fn print_wizard_step(number: u8, label: &str) {
+    eprintln!("\n{}. {}", style(number).bold(), style(label).bold());
+}
+
+fn print_wizard_agent_result(result: &AgentInstallResult) {
+    let (indicator, status_text) = match result.status {
+        InstallStatus::Installed => (style("✓").green(), "installed"),
+        InstallStatus::Skipped => (style("—").dim(), "skipped"),
+        InstallStatus::Failed => (style("✗").red(), "failed"),
+    };
+    eprintln!(
+        "   {} {} — {}",
+        indicator,
+        result.agent.display_name(),
+        status_text
+    );
+}
+
+fn print_wizard_done(had_failures: bool) {
+    if had_failures {
+        eprintln!(
+            "\n{} {}",
+            style("!").dim(),
+            style("Setup complete (with warnings)").bold()
+        );
+    } else {
+        eprintln!(
+            "\n{} {}",
+            style("✓").green(),
+            style("Setup complete").bold()
+        );
+    }
 }
 
 fn print_human_report(

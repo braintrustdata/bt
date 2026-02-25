@@ -835,14 +835,15 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
+    let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let mut store = load_auth_store()?;
+    // Auto-generate profile name from org (no prompt)
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        true,
+        false,
     )?;
 
     save_profile_secret(&profile_name, &api_key)?;
@@ -864,21 +865,6 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
         },
     );
     save_auth_store(&store)?;
-
-    if let Some(org) = selected_org.as_ref() {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!(
-                "Logged in to org '{}' with profile '{}'",
-                org.name, profile_name
-            ),
-        );
-    } else {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Logged in with profile '{profile_name}'"),
-        );
-    }
 
     base.profile = Some(profile_name.clone());
     Ok(profile_name)
@@ -920,11 +906,9 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
         .url();
     let authorize_url = authorize_url.to_string();
 
-    eprintln!("Opening browser for OAuth authorization...");
-    eprintln!("If it does not open, visit:\n{authorize_url}");
-    if let Err(err) = open::that(&authorize_url) {
-        eprintln!("warning: failed to open browser automatically: {err}");
-    }
+    let _ = open::that(&authorize_url);
+    eprintln!("Complete authorization in your browser.");
+    eprintln!("{}", dialoguer::console::style(&authorize_url).dim());
 
     let callback = collect_oauth_callback(listener, is_ssh_session()).await?;
     if let Some(error) = callback.error {
@@ -950,14 +934,16 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     .await?;
 
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let selected_org = select_login_org(login_orgs.clone(), base.org_name.as_deref(), true)?;
+    // Wizard uses simplified org selector (names only, no UUIDs/URLs)
+    let selected_org = select_login_org_simple(login_orgs.clone(), base.org_name.as_deref())?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
     let mut store = load_auth_store()?;
+    // Auto-generate profile name from org (no prompt)
     let profile_name = resolve_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
-        true,
+        false,
     )?;
 
     let refresh_token = oauth_tokens.refresh_token.as_ref().ok_or_else(|| {
@@ -986,21 +972,6 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
         },
     );
     save_auth_store(&store)?;
-
-    if let Some(org) = selected_org.as_ref() {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!(
-                "Logged in with OAuth to org '{}' with profile '{}'",
-                org.name, profile_name
-            ),
-        );
-    } else {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Logged in with OAuth using profile '{profile_name}'"),
-        );
-    }
 
     base.profile = Some(profile_name.clone());
     Ok(profile_name)
@@ -1585,6 +1556,49 @@ fn select_login_org(
     ))
 }
 
+/// Simplified org selector for the wizard — shows only org names (no UUIDs or API URLs).
+/// Auto-selects when there is only one org. Falls back to non-interactive if TTY is unavailable.
+fn select_login_org_simple(
+    mut orgs: Vec<LoginOrgInfo>,
+    requested_org_name: Option<&str>,
+) -> Result<Option<LoginOrgInfo>> {
+    if orgs.is_empty() {
+        bail!("no organizations found for this credential");
+    }
+    orgs.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
+
+    if let Some(name) = requested_org_name {
+        let selected = orgs
+            .iter()
+            .find(|org| org.name.eq_ignore_ascii_case(name))
+            .cloned();
+        return selected.map(Some).ok_or_else(|| {
+            let available = orgs
+                .iter()
+                .map(|org| org.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!("org '{name}' not found. Available: {available}")
+        });
+    }
+
+    if orgs.len() == 1 {
+        return Ok(Some(orgs.into_iter().next().expect("org exists")));
+    }
+
+    let labels: Vec<&str> = orgs.iter().map(|o| o.name.as_str()).collect();
+    let selection = ui::fuzzy_select("Select organization", &labels, 0)?;
+    Ok(Some(
+        orgs.into_iter()
+            .nth(selection)
+            .expect("selected index should be in range"),
+    ))
+}
+
 fn resolve_profile_api_url(
     explicit_api_url: Option<String>,
     selected_org: Option<&LoginOrgInfo>,
@@ -1720,8 +1734,11 @@ async fn collect_oauth_callback(
 }
 
 async fn wait_for_oauth_callback_or_stdin(listener: TcpListener) -> Result<OAuthCallbackParams> {
-    println!("Waiting for OAuth callback...");
-    println!("If localhost callback does not complete, paste code=...&state=... and press Enter.");
+    eprintln!("Waiting for browser authorization...");
+    eprintln!(
+        "{}",
+        dialoguer::console::style("Paste code=...&state=... if callback doesn't complete").dim()
+    );
 
     let callback_fut = wait_for_oauth_callback(listener);
     tokio::pin!(callback_fut);
