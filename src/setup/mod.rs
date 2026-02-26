@@ -939,6 +939,7 @@ fn skill_config_path(
     Ok(path)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prefetch_workflow_docs(
     show_progress: bool,
     scope: InstallScope,

@@ -4082,7 +4082,7 @@ mod tests {
             "{\"root_span_id\":\"r1\"}\n{\"root_span_id\":\"r2\"}\n{\"root_span_id\":\"r3\"}\n",
         )?;
 
-        let seen = collect_seen_roots_until_offset(&[path.clone()], 2)?;
+        let seen = collect_seen_roots_until_offset(std::slice::from_ref(&path), 2)?;
         assert!(seen.contains("r1"));
         assert!(seen.contains("r2"));
         assert!(!seen.contains("r3"));
