@@ -420,7 +420,8 @@ async fn run_eval_files_once(
     options: EvalRunOptions,
 ) -> Result<EvalRunOutput> {
     let language = detect_eval_language(&files, language_override)?;
-    let esm_retry_eligible = language == EvalLanguage::JavaScript && runner_override.is_none();
+    let show_js_hint = language == EvalLanguage::JavaScript && runner_override.is_none();
+    let esm_retry_eligible = show_js_hint && has_ts_eval_files(&files);
 
     let mut output = run_eval_files_once_inner(
         base,
@@ -464,7 +465,7 @@ async fn run_eval_files_once(
         flush_stderr(&output.stderr_lines);
     }
 
-    if !output.status.success() && esm_retry_eligible {
+    if !output.status.success() && show_js_hint {
         let suffix = if retried_esm {
             " (ESM retry failed)"
         } else {
