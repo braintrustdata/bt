@@ -420,8 +420,7 @@ async fn run_eval_files_once(
     options: EvalRunOptions,
 ) -> Result<EvalRunOutput> {
     let language = detect_eval_language(&files, language_override)?;
-    let show_js_runner_hint_on_failure =
-        language == EvalLanguage::JavaScript && runner_override.is_none();
+    let esm_retry_eligible = language == EvalLanguage::JavaScript && runner_override.is_none();
 
     let mut output = run_eval_files_once_inner(
         base,
@@ -432,12 +431,13 @@ async fn run_eval_files_once(
         options.clone(),
         EsmRetryMode::Off,
         &[],
+        esm_retry_eligible,
     )
     .await?;
 
     let mut retried_esm = false;
     if !output.status.success()
-        && runner_override.is_none()
+        && esm_retry_eligible
         && should_retry_esm(
             language,
             output.is_tsx_runner,
@@ -457,11 +457,14 @@ async fn run_eval_files_once(
             options,
             EsmRetryMode::ForcedEsm,
             &[],
+            false,
         )
         .await?;
+    } else if esm_retry_eligible {
+        flush_stderr(&output.stderr_lines);
     }
 
-    if !output.status.success() && show_js_runner_hint_on_failure {
+    if !output.status.success() && esm_retry_eligible {
         let suffix = if retried_esm {
             " (ESM retry failed)"
         } else {
@@ -502,6 +505,7 @@ async fn run_eval_files_once_inner(
     options: EvalRunOptions,
     esm_mode: EsmRetryMode,
     extra_env: &[(String, String)],
+    suppress_stderr: bool,
 ) -> Result<EvalRunOnceOutput> {
     let (process, _language, _show_hint, is_tsx_runner, stderr_capture) = spawn_eval_runner(
         base,
@@ -512,6 +516,7 @@ async fn run_eval_files_once_inner(
         &options,
         extra_env,
         esm_mode,
+        suppress_stderr,
     )
     .await?;
     let mut ui = EvalUi::new(options.jsonl, options.list);
@@ -541,7 +546,14 @@ async fn spawn_eval_runner(
     options: &EvalRunOptions,
     extra_env: &[(String, String)],
     esm_mode: EsmRetryMode,
-) -> Result<(EvalRunnerProcess, EvalLanguage, bool, bool, Arc<Mutex<Vec<String>>>)> {
+    suppress_stderr: bool,
+) -> Result<(
+    EvalRunnerProcess,
+    EvalLanguage,
+    bool,
+    bool,
+    Arc<Mutex<Vec<String>>>,
+)> {
     let language = detect_eval_language(&files, language_override)?;
     if language != EvalLanguage::Python && options.num_workers.is_some() {
         anyhow::bail!("--num-workers is only supported for Python evals.");
@@ -640,7 +652,7 @@ async fn spawn_eval_runner(
     if let Some(stdout) = stdout {
         let tx_stdout = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stdout, "stdout", tx_stdout, None).await {
+            if let Err(err) = forward_stream(stdout, "stdout", Some(tx_stdout), None).await {
                 eprintln!("Failed to read eval stdout: {err}");
             }
         });
@@ -649,8 +661,16 @@ async fn spawn_eval_runner(
     if let Some(stderr) = stderr {
         let tx_stderr = tx.clone();
         let capture = Arc::clone(&stderr_capture);
+        let forward_tx = if suppress_stderr {
+            None
+        } else {
+            Some(tx_stderr.clone())
+        };
+        // tx_stderr is moved into the task to keep the channel alive until stderr
+        // is fully drained, ensuring Arc::try_unwrap on stderr_capture succeeds.
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stderr, "stderr", tx_stderr, Some(capture)).await {
+            let _hold = tx_stderr;
+            if let Err(err) = forward_stream(stderr, "stderr", forward_tx, Some(capture)).await {
                 eprintln!("Failed to read eval stderr: {err}");
             }
         });
@@ -731,6 +751,12 @@ where
         dependency_files,
         error_messages,
     })
+}
+
+fn flush_stderr(lines: &[String]) {
+    for line in lines {
+        eprintln!("{line}");
+    }
 }
 
 fn should_retry_esm(
@@ -1182,6 +1208,7 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         &state.options,
         &extra_env,
         EsmRetryMode::Off,
+        false,
     )
     .await
     {
@@ -1295,6 +1322,7 @@ async fn dev_server_eval(
         &state.options,
         &extra_env,
         EsmRetryMode::Off,
+        false,
     )
     .await
     {
@@ -2183,7 +2211,7 @@ struct SseDependenciesEventData {
 async fn forward_stream<T>(
     stream: T,
     name: &'static str,
-    tx: mpsc::UnboundedSender<EvalEvent>,
+    tx: Option<mpsc::UnboundedSender<EvalEvent>>,
     capture: Option<Arc<Mutex<Vec<String>>>>,
 ) -> Result<()>
 where
@@ -2196,10 +2224,12 @@ where
                 guard.push(line.clone());
             }
         }
-        let _ = tx.send(EvalEvent::Console {
-            stream: name.to_string(),
-            message: line,
-        });
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(EvalEvent::Console {
+                stream: name.to_string(),
+                message: line,
+            });
+        }
     }
     Ok(())
 }
