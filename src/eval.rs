@@ -667,7 +667,12 @@ async fn spawn_eval_runner(
 
     if let Some(stderr) = stderr {
         let tx_stderr = tx.clone();
-        let capture = Arc::clone(&stderr_capture);
+        // Only capture stderr when we intentionally suppress it (ESM retry detection).
+        let capture = if suppress_stderr {
+            Some(Arc::clone(&stderr_capture))
+        } else {
+            None
+        };
         let forward_tx = if suppress_stderr {
             None
         } else {
@@ -677,7 +682,7 @@ async fn spawn_eval_runner(
         // is fully drained, ensuring Arc::try_unwrap on stderr_capture succeeds.
         tokio::spawn(async move {
             let _hold = tx_stderr;
-            if let Err(err) = forward_stream(stderr, "stderr", forward_tx, Some(capture)).await {
+            if let Err(err) = forward_stream(stderr, "stderr", forward_tx, capture).await {
                 eprintln!("Failed to read eval stderr: {err}");
             }
         });
