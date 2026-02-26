@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::future::retry_notify;
@@ -80,7 +80,7 @@ struct PullArgs {
     filter: Option<String>,
 
     /// Relative time window (e.g. 1h, 30m, 3d).
-    #[arg(long, default_value = "3d")]
+    #[arg(long, env = "BT_SYNC_WINDOW", default_value = "3d")]
     window: String,
 
     /// Number of traces to fetch (default when no limit flag is set).
@@ -114,6 +114,10 @@ struct PullArgs {
     /// Include stored vectors in pulled rows so a subsequent push can re-ingest them.
     #[arg(long)]
     include_vectors: bool,
+
+    /// Print each BTQL query and timing information.
+    #[arg(long, env = "BT_SYNC_VERBOSE")]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -281,6 +285,8 @@ struct SyncSpec {
     direction: String,
     scope: String,
     filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<String>,
     limit: Option<usize>,
     page_size: usize,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -442,11 +448,6 @@ struct VectorSpec {
     model: String,
 }
 
-#[derive(Debug, Clone, Default)]
-struct VectorPullCache {
-    models_by_facet: BTreeMap<String, Vec<String>>,
-}
-
 #[derive(Debug, Default)]
 struct BtqlRetryTracker {
     total_retries: AtomicUsize,
@@ -560,10 +561,9 @@ async fn run_pull(
     let (scope, limit) = resolve_pull_scope_and_limit(args.traces, args.spans)?;
     let fresh = args.fresh || args.cursor.is_some();
 
-    let filter = Some(build_time_filter_clause(
-        &args.window,
-        args.filter.as_deref(),
-    )?);
+    let user_filter = trim_optional(args.filter.clone());
+    let window = args.window.clone();
+    let discovery_filter = Some(build_time_filter_clause(&window, user_filter.as_deref())?);
 
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
@@ -572,7 +572,8 @@ async fn run_pull(
         object_name: object.object_name.clone(),
         direction: DirectionArg::Pull.as_str().to_string(),
         scope: scope.as_str().to_string(),
-        filter,
+        filter: user_filter.clone(),
+        window: Some(window),
         limit: Some(limit),
         page_size: args.page_size,
         include_vectors: args.include_vectors,
@@ -696,6 +697,7 @@ async fn run_pull(
         Some(RunStatus::Running),
     )?;
     let btql_retry_tracker = Arc::new(BtqlRetryTracker::default());
+    let verbose = args.verbose;
 
     match scope {
         ScopeArg::Spans => {
@@ -707,8 +709,10 @@ async fn run_pull(
                 &output_path,
                 &state_path,
                 &mut state,
+                discovery_filter.as_deref(),
                 args.include_vectors,
                 &btql_retry_tracker,
+                verbose,
                 !json_output,
             )
             .await?
@@ -724,7 +728,10 @@ async fn run_pull(
                 &mut state,
                 args.include_vectors,
                 args.workers.max(1),
+                discovery_filter.clone(),
+                user_filter.clone(),
                 &btql_retry_tracker,
+                verbose,
                 !json_output,
             )
             .await?
@@ -824,8 +831,10 @@ async fn pull_spans_mode(
     output_dir: &Path,
     state_path: &Path,
     state: &mut PullState,
+    filter: Option<&str>,
     include_vectors: bool,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
+    verbose: bool,
     show_checkpoint_hint: bool,
 ) -> Result<()> {
     let limit = state.limit;
@@ -833,36 +842,55 @@ async fn pull_spans_mode(
     let baseline_roots_done = state.root_ids.len();
     let baseline_items_done = state.items_done;
     let baseline_bytes_written = state.bytes_written;
-    let ui = bounded_bar_with_status_line(limit as u64, "Fetching spans", "spans");
+    let ui = bounded_bar_with_status_line(limit as u64, "Fetching spans", "spans", !verbose);
     let pb = ui.main.clone();
     let status_line = ui.status_line.clone();
-    pb.set_position(state.items_done as u64);
-    pb.set_message(pull_spans_progress_message_with_baseline(
-        state,
-        phase_started_at,
-        baseline_roots_done,
-        baseline_items_done,
-        baseline_bytes_written,
-    ));
-    status_line.set_message(pull_status_line(
-        show_checkpoint_hint,
-        btql_retry_tracker.summary_line().as_deref(),
-    ));
+    let mut last_log = Instant::now();
+    if !verbose {
+        pb.set_position(state.items_done as u64);
+        pb.set_message(pull_spans_progress_message_with_baseline(
+            state,
+            phase_started_at,
+            baseline_roots_done,
+            baseline_items_done,
+            baseline_bytes_written,
+        ));
+        status_line.set_message(pull_status_line(
+            show_checkpoint_hint,
+            btql_retry_tracker.summary_line().as_deref(),
+        ));
+    }
     let mut seen_roots: HashSet<String> = state.root_ids.iter().cloned().collect();
-    let mut vector_cache = include_vectors.then_some(VectorPullCache::default());
+    let vector_specs = if include_vectors {
+        Some(Arc::new(
+            discover_vector_specs_global(
+                client,
+                ctx,
+                source_expr,
+                filter,
+                btql_retry_tracker,
+                verbose,
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
 
     let mut writer = open_jsonl_part_writer(output_dir, state.items_done > 0)?;
 
     while state.items_done < limit {
         let batch_limit = (limit - state.items_done).min(spec.page_size);
-        let query = build_spans_query(
-            source_expr,
-            spec.filter.as_deref(),
-            batch_limit,
-            state.cursor.as_deref(),
-        );
-        let BtqlResponse { data, cursor } =
-            execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
+        let query = build_spans_query(source_expr, filter, batch_limit, state.cursor.as_deref());
+        let BtqlResponse { data, cursor } = execute_btql_query_timed(
+            client,
+            ctx,
+            &query,
+            Some(Arc::clone(btql_retry_tracker)),
+            verbose,
+            "spans",
+        )
+        .await?;
         let mut rows = data;
         let batch_count = rows.len();
 
@@ -871,15 +899,16 @@ async fn pull_spans_mode(
             break;
         }
 
-        if let Some(cache) = vector_cache.as_mut() {
+        if let Some(specs) = vector_specs.as_deref() {
             enrich_rows_with_vectors(
                 client,
                 ctx,
                 source_expr,
-                spec.filter.as_deref(),
+                filter,
                 &mut rows,
-                cache,
+                specs,
                 btql_retry_tracker,
+                verbose,
             )
             .await?;
         }
@@ -900,26 +929,34 @@ async fn pull_spans_mode(
         state.updated_at = epoch_seconds();
 
         write_json_atomic(state_path, state)?;
-        pb.set_position(state.items_done.min(limit) as u64);
-        pb.set_message(pull_spans_progress_message_with_baseline(
+        let message = pull_spans_progress_message_with_baseline(
             state,
             phase_started_at,
             baseline_roots_done,
             baseline_items_done,
             baseline_bytes_written,
-        ));
-        status_line.set_message(pull_status_line(
+        );
+        let status = pull_status_line(
             show_checkpoint_hint,
             btql_retry_tracker.summary_line().as_deref(),
-        ));
+        );
+        if verbose {
+            log_progress_if_due(&mut last_log, &message, &status);
+        } else {
+            pb.set_position(state.items_done.min(limit) as u64);
+            pb.set_message(message);
+            status_line.set_message(status);
+        }
 
         if state.cursor.is_none() {
             break;
         }
     }
 
-    status_line.finish_and_clear();
-    pb.finish_and_clear();
+    if !verbose {
+        status_line.finish_and_clear();
+        pb.finish_and_clear();
+    }
     Ok(())
 }
 
@@ -934,7 +971,10 @@ async fn pull_traces_mode(
     state: &mut PullState,
     include_vectors: bool,
     workers: usize,
+    discovery_filter: Option<String>,
+    fetch_filter: Option<String>,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
+    verbose: bool,
     show_checkpoint_hint: bool,
 ) -> Result<()> {
     if trace_state_needs_discovery(state) {
@@ -954,22 +994,25 @@ async fn pull_traces_mode(
     let fetch_baseline_trace_progress = trace_progress_roots.lock().await.len();
     let fetch_baseline_items_done = state.items_done;
     let fetch_baseline_bytes_written = state.bytes_written;
-    let ui = bounded_bar_with_status_line(state.limit as u64, "Syncing traces", "traces");
+    let ui = bounded_bar_with_status_line(state.limit as u64, "Syncing traces", "traces", !verbose);
     let trace_fetch_bar = ui.main.clone();
     let status_line = ui.status_line.clone();
-    trace_fetch_bar.set_position(fetch_baseline_trace_progress.min(state.limit) as u64);
-    trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
-        state,
-        fetch_phase_started_at,
-        fetch_baseline_trace_progress,
-        fetch_baseline_trace_progress,
-        fetch_baseline_items_done,
-        fetch_baseline_bytes_written,
-    ));
-    status_line.set_message(pull_status_line(
-        show_checkpoint_hint,
-        btql_retry_tracker.summary_line().as_deref(),
-    ));
+    let mut last_log = Instant::now();
+    if !verbose {
+        trace_fetch_bar.set_position(fetch_baseline_trace_progress.min(state.limit) as u64);
+        trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
+            state,
+            fetch_phase_started_at,
+            fetch_baseline_trace_progress,
+            fetch_baseline_trace_progress,
+            fetch_baseline_items_done,
+            fetch_baseline_bytes_written,
+        ));
+        status_line.set_message(pull_status_line(
+            show_checkpoint_hint,
+            btql_retry_tracker.summary_line().as_deref(),
+        ));
+    }
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(state.clone()));
     let shared_writer = Arc::new(tokio::sync::Mutex::new(open_jsonl_part_writer(
@@ -982,6 +1025,21 @@ async fn pull_traces_mode(
     let discovery_done = Arc::new(AtomicBool::new(!needs_discovery));
     let worker_count = workers.max(1);
     let mut join_set = tokio::task::JoinSet::new();
+    let vector_specs = if include_vectors {
+        Some(Arc::new(
+            discover_vector_specs_global(
+                client,
+                ctx,
+                source_expr,
+                discovery_filter.as_deref(),
+                btql_retry_tracker,
+                verbose,
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
 
     for _ in 0..worker_count {
         let client = client.clone();
@@ -996,8 +1054,9 @@ async fn pull_traces_mode(
         let progress = trace_fetch_bar.clone();
         let status_line = status_line.clone();
         let page_size = spec.page_size;
-        let fetch_filter = spec.filter.clone();
-        let mut vector_cache = include_vectors.then_some(VectorPullCache::default());
+        let fetch_filter = fetch_filter.clone();
+        let vector_filter = discovery_filter.clone();
+        let vector_specs = vector_specs.clone();
         let btql_retry_tracker = Arc::clone(btql_retry_tracker);
         let trace_progress_roots = Arc::clone(&trace_progress_roots);
 
@@ -1019,12 +1078,13 @@ async fn pull_traces_mode(
                     &ctx,
                     &source_expr,
                     fetch_filter.as_deref(),
+                    vector_filter.as_deref(),
                     page_size,
                     &state_path,
                     chunk_idx,
                     &shared_state,
                     &shared_writer,
-                    &mut vector_cache,
+                    &vector_specs,
                     &progress,
                     &status_line,
                     show_checkpoint_hint,
@@ -1034,6 +1094,7 @@ async fn pull_traces_mode(
                     fetch_baseline_bytes_written,
                     &trace_progress_roots,
                     &btql_retry_tracker,
+                    verbose,
                 )
                 .await;
 
@@ -1056,13 +1117,19 @@ async fn pull_traces_mode(
             let page_limit = ROOT_DISCOVERY_PAGE_SIZE;
             let query = build_root_discovery_query(
                 source_expr,
-                spec.filter.as_deref(),
+                discovery_filter.as_deref(),
                 page_limit,
                 discovery_cursor.as_deref(),
             );
-            let response =
-                execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker)))
-                    .await?;
+            let response = execute_btql_query_timed(
+                client,
+                ctx,
+                &query,
+                Some(Arc::clone(btql_retry_tracker)),
+                verbose,
+                "discover_roots",
+            )
+            .await?;
             let row_count = response.data.len();
 
             let new_chunks;
@@ -1086,19 +1153,25 @@ async fn pull_traces_mode(
                 shared.updated_at = epoch_seconds();
                 write_json_atomic(state_path, &*shared)?;
                 let trace_progress_done = trace_progress_roots.lock().await.len();
-                trace_fetch_bar.set_position(trace_progress_done.min(shared.limit) as u64);
-                trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
+                let message = pull_trace_progress_message_with_baseline(
                     &shared,
                     fetch_phase_started_at,
                     trace_progress_done,
                     fetch_baseline_trace_progress,
                     fetch_baseline_items_done,
                     fetch_baseline_bytes_written,
-                ));
-                status_line.set_message(pull_status_line(
+                );
+                let status = pull_status_line(
                     show_checkpoint_hint,
                     btql_retry_tracker.summary_line().as_deref(),
-                ));
+                );
+                if verbose {
+                    log_progress_if_due(&mut last_log, &message, &status);
+                } else {
+                    trace_fetch_bar.set_position(trace_progress_done.min(shared.limit) as u64);
+                    trace_fetch_bar.set_message(message);
+                    status_line.set_message(status);
+                }
             }
             if new_chunks > 0 {
                 work_notify.notify_waiters();
@@ -1117,19 +1190,25 @@ async fn pull_traces_mode(
             shared.updated_at = epoch_seconds();
             write_json_atomic(state_path, &*shared)?;
             let trace_progress_done = trace_progress_roots.lock().await.len();
-            trace_fetch_bar.set_position(trace_progress_done.min(shared.limit) as u64);
-            trace_fetch_bar.set_message(pull_trace_progress_message_with_baseline(
+            let message = pull_trace_progress_message_with_baseline(
                 &shared,
                 fetch_phase_started_at,
                 trace_progress_done,
                 fetch_baseline_trace_progress,
                 fetch_baseline_items_done,
                 fetch_baseline_bytes_written,
-            ));
-            status_line.set_message(pull_status_line(
+            );
+            let status = pull_status_line(
                 show_checkpoint_hint,
                 btql_retry_tracker.summary_line().as_deref(),
-            ));
+            );
+            if verbose {
+                log_progress_if_due(&mut last_log, &message, &status);
+            } else {
+                trace_fetch_bar.set_position(trace_progress_done.min(shared.limit) as u64);
+                trace_fetch_bar.set_message(message);
+                status_line.set_message(status);
+            }
             if new_chunks > 0 {
                 work_notify.notify_waiters();
             }
@@ -1152,9 +1231,18 @@ async fn pull_traces_mode(
     }
     *state = shared_state.lock().await.clone();
 
-    status_line.finish_and_clear();
-    trace_fetch_bar.finish_and_clear();
+    if !verbose {
+        status_line.finish_and_clear();
+        trace_fetch_bar.finish_and_clear();
+    }
     Ok(())
+}
+
+fn log_progress_if_due(last_log: &mut Instant, message: &str, status: &str) {
+    if last_log.elapsed() >= Duration::from_secs(5) {
+        eprintln!("progress: {message} | {status}");
+        *last_log = Instant::now();
+    }
 }
 
 fn trace_state_needs_discovery(state: &PullState) -> bool {
@@ -1295,12 +1383,13 @@ async fn process_trace_chunk(
     ctx: &LoginContext,
     source_expr: &str,
     fetch_filter: Option<&str>,
+    vector_filter: Option<&str>,
     page_size: usize,
     state_path: &Path,
     chunk_idx: usize,
     shared_state: &Arc<tokio::sync::Mutex<PullState>>,
     shared_writer: &Arc<tokio::sync::Mutex<JsonlPartWriter>>,
-    vector_cache: &mut Option<VectorPullCache>,
+    vector_specs: &Option<Arc<Vec<VectorSpec>>>,
     progress: &ProgressBar,
     status_line: &ProgressBar,
     show_checkpoint_hint: bool,
@@ -1310,6 +1399,7 @@ async fn process_trace_chunk(
     fetch_baseline_bytes_written: u64,
     trace_progress_roots: &Arc<tokio::sync::Mutex<HashSet<String>>>,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
+    verbose: bool,
 ) -> Result<()> {
     loop {
         let (root_chunk, cursor, already_completed) = {
@@ -1333,21 +1423,29 @@ async fn process_trace_chunk(
             page_size,
             cursor.as_deref(),
         );
-        let BtqlResponse { data, cursor } =
-            execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
+        let BtqlResponse { data, cursor } = execute_btql_query_timed(
+            client,
+            ctx,
+            &query,
+            Some(Arc::clone(btql_retry_tracker)),
+            verbose,
+            "fetch_roots",
+        )
+        .await?;
         let mut rows = data;
         let batch_count = rows.len();
         let next_cursor = cursor.filter(|c| !c.is_empty());
 
-        if let Some(cache) = vector_cache.as_mut() {
+        if let Some(specs) = vector_specs.as_deref() {
             enrich_rows_with_vectors(
                 client,
                 ctx,
                 source_expr,
-                fetch_filter,
+                vector_filter,
                 &mut rows,
-                cache,
+                specs,
                 btql_retry_tracker,
+                verbose,
             )
             .await?;
         }
@@ -1483,6 +1581,7 @@ async fn run_push(
         direction: DirectionArg::Push.as_str().to_string(),
         scope: scope.as_str().to_string(),
         filter: trim_optional(args.filter.clone()),
+        window: None,
         limit,
         page_size: args.page_size,
         include_vectors: false,
@@ -1871,6 +1970,7 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
         direction: args.direction.as_str().to_string(),
         scope: scope.as_str().to_string(),
         filter: trim_optional(args.filter.clone()),
+        window: None,
         limit,
         page_size: args.page_size,
         include_vectors: matches!(args.direction, DirectionArg::Pull) && args.include_vectors,
@@ -2025,34 +2125,51 @@ async fn execute_btql_query(
     })
 }
 
+async fn execute_btql_query_timed(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &str,
+    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
+    verbose: bool,
+    label: &str,
+) -> Result<BtqlResponse> {
+    if !verbose {
+        return execute_btql_query(client, ctx, query, btql_retry_tracker).await;
+    }
+    let start = Instant::now();
+    eprintln!("btql[{label}] query:\n{query}\n");
+    let result = execute_btql_query(client, ctx, query, btql_retry_tracker).await;
+    let elapsed_ms = start.elapsed().as_millis();
+    match &result {
+        Ok(response) => {
+            let row_count = response.data.len();
+            let cursor = if response.cursor.as_deref().unwrap_or("").is_empty() {
+                "none"
+            } else {
+                "set"
+            };
+            eprintln!("btql[{label}] {elapsed_ms}ms rows={row_count} cursor={cursor}");
+        }
+        Err(err) => {
+            eprintln!("btql[{label}] {elapsed_ms}ms error={err}");
+        }
+    }
+    result
+}
+
 async fn enrich_rows_with_vectors(
     client: &ApiClient,
     ctx: &LoginContext,
     source_expr: &str,
     filter: Option<&str>,
     rows: &mut [Map<String, Value>],
-    cache: &mut VectorPullCache,
+    vector_specs: &[VectorSpec],
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
+    verbose: bool,
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-
-    let new_facets = collect_new_facet_names(rows, cache);
-    for facet_name in new_facets {
-        let models = discover_facet_vector_models(
-            client,
-            ctx,
-            source_expr,
-            filter,
-            &facet_name,
-            btql_retry_tracker,
-        )
-        .await?;
-        cache.models_by_facet.insert(facet_name, models);
-    }
-
-    let vector_specs = vector_specs_from_cache(cache);
     if vector_specs.is_empty() {
         return Ok(());
     }
@@ -2063,8 +2180,9 @@ async fn enrich_rows_with_vectors(
         source_expr,
         filter,
         rows,
-        &vector_specs,
+        vector_specs,
         btql_retry_tracker,
+        verbose,
     )
     .await?;
     if fetched_rows.is_empty() {
@@ -2118,95 +2236,63 @@ async fn enrich_rows_with_vectors(
     Ok(())
 }
 
-fn collect_new_facet_names(rows: &[Map<String, Value>], cache: &VectorPullCache) -> Vec<String> {
-    let mut names = HashSet::new();
-    for row in rows {
-        let Some(facets) = row.get("facets").and_then(Value::as_object) else {
-            continue;
-        };
-        for (name, value) in facets {
-            if value.is_null() || cache.models_by_facet.contains_key(name) {
-                continue;
-            }
-            names.insert(name.clone());
-        }
-    }
-    let mut sorted = names.into_iter().collect::<Vec<_>>();
-    sorted.sort();
-    sorted
-}
-
-async fn discover_facet_vector_models(
+async fn discover_vector_specs_global(
     client: &ApiClient,
     ctx: &LoginContext,
     source_expr: &str,
     filter: Option<&str>,
-    facet_name: &str,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
-) -> Result<Vec<String>> {
-    let facet_path = btql_identifier_path(["facets", facet_name]);
-    let facet_filter = format!("{facet_path} IS NOT NULL");
-    let combined_filter = combine_sql_filters(filter, &facet_filter);
-    let mut models = HashSet::new();
-    let mut cursor: Option<String> = None;
+    verbose: bool,
+) -> Result<Vec<VectorSpec>> {
+    let query = vec![
+        "select: vector_keys(facets) as models".to_string(),
+        format!("from: {source_expr} spans"),
+        format!("filter: {}", filter.unwrap_or("true")),
+        "limit: 1".to_string(),
+    ]
+    .join(" | ");
+    let response = execute_btql_query_timed(
+        client,
+        ctx,
+        &query,
+        Some(Arc::clone(btql_retry_tracker)),
+        verbose,
+        "vector_models",
+    )
+    .await?;
 
-    loop {
-        let mut query_parts = vec![
-            format!("select: vector_keys({facet_path}) as models"),
-            format!("from: {source_expr} spans"),
-            format!("filter: {combined_filter}"),
-            format!("limit: {}", ROOT_DISCOVERY_PAGE_SIZE),
-            "sort: _pagination_key DESC".to_string(),
-        ];
-        if let Some(c) = cursor.as_deref() {
-            query_parts.push(format!("cursor: {}", btql_quote(c)));
-        }
-        let query = query_parts.join(" | ");
-        let response =
-            execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
+    let mut specs = Vec::new();
+    let Some(row) = response.data.first() else {
+        return Ok(specs);
+    };
+    let Some(models) = row.get("models") else {
+        return Ok(specs);
+    };
+    let Some(map) = models.as_object() else {
+        return Ok(specs);
+    };
 
-        for row in &response.data {
-            let Some(items) = row.get("models").and_then(Value::as_array) else {
+    for (facet_name, value) in map {
+        let Some(items) = value.as_array() else {
+            continue;
+        };
+        for item in items {
+            let Some(model) = item.as_str() else {
                 continue;
             };
-            for item in items {
-                let Some(model) = item.as_str() else {
-                    continue;
-                };
-                if model.is_empty() {
-                    continue;
-                }
-                models.insert(model.to_string());
+            if model.is_empty() {
+                continue;
             }
-        }
-
-        if response.data.is_empty() {
-            break;
-        }
-        cursor = response.cursor.filter(|c| !c.is_empty());
-        if cursor.is_none() {
-            break;
-        }
-    }
-
-    let mut sorted = models.into_iter().collect::<Vec<_>>();
-    sorted.sort();
-    Ok(sorted)
-}
-
-fn vector_specs_from_cache(cache: &VectorPullCache) -> Vec<VectorSpec> {
-    let mut specs = Vec::new();
-    for (facet_name, models) in &cache.models_by_facet {
-        for model in models {
             specs.push(VectorSpec {
                 facet_name: facet_name.clone(),
-                model: model.clone(),
+                model: model.to_string(),
             });
         }
     }
+
     specs.sort();
     specs.dedup();
-    specs
+    Ok(specs)
 }
 
 async fn fetch_vector_columns_for_rows(
@@ -2217,6 +2303,7 @@ async fn fetch_vector_columns_for_rows(
     rows: &[Map<String, Value>],
     vector_specs: &[VectorSpec],
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
+    verbose: bool,
 ) -> Result<BTreeMap<String, Map<String, Value>>> {
     if rows.is_empty() || vector_specs.is_empty() {
         return Ok(BTreeMap::new());
@@ -2248,8 +2335,15 @@ async fn fetch_vector_columns_for_rows(
         select_columns.join(", "),
         xact_literals.len()
     );
-    let response =
-        execute_btql_query(client, ctx, &query, Some(Arc::clone(btql_retry_tracker))).await?;
+    let response = execute_btql_query_timed(
+        client,
+        ctx,
+        &query,
+        Some(Arc::clone(btql_retry_tracker)),
+        verbose,
+        "vector_rows",
+    )
+    .await?;
 
     let mut by_xact = BTreeMap::new();
     for row in response.data {
@@ -3866,8 +3960,13 @@ struct PullProgressUi {
     status_line: ProgressBar,
 }
 
-fn bounded_bar_with_status_line(total: u64, message: &str, unit_label: &str) -> PullProgressUi {
-    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
+fn bounded_bar_with_status_line(
+    total: u64,
+    message: &str,
+    unit_label: &str,
+    render: bool,
+) -> PullProgressUi {
+    if !render || !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
         return PullProgressUi {
             _multi: None,
             main: ProgressBar::hidden(),
