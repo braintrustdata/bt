@@ -448,6 +448,7 @@ async fn run_eval_files_once(
         )
     {
         retried_esm = true;
+        let first_attempt_stderr = std::mem::take(&mut output.stderr_lines);
         eprintln!("Eval failed with ESM/CJS interop error. Retrying in ESM mode...");
         output = run_eval_files_once_inner(
             base,
@@ -461,6 +462,11 @@ async fn run_eval_files_once(
             false,
         )
         .await?;
+
+        if !output.status.success() {
+            eprintln!("\nFirst attempt (CJS mode) error:");
+            flush_stderr(&first_attempt_stderr);
+        }
     } else if esm_retry_eligible {
         flush_stderr(&output.stderr_lines);
     }
