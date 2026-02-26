@@ -221,43 +221,74 @@ pub struct EvalArgs {
     pub no_send_logs: bool,
 
     /// Output one JSON summary per evaluator.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_JSONL",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub jsonl: bool,
 
     /// Stop after the first failing evaluator.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_TERMINATE_ON_FAILURE",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub terminate_on_failure: bool,
 
     /// Number of worker threads for Python eval execution.
-    #[arg(long, value_name = "COUNT")]
+    #[arg(long, env = "BT_EVAL_NUM_WORKERS", value_name = "COUNT")]
     pub num_workers: Option<usize>,
 
     /// List evaluators without executing them.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_LIST",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub list: bool,
 
     /// Filter expression(s) used to select which evaluators to run.
-    #[arg(long, value_name = "FILTER")]
+    #[arg(
+        long,
+        env = "BT_EVAL_FILTER",
+        value_name = "FILTER",
+        value_delimiter = ','
+    )]
     pub filter: Vec<String>,
 
     /// Re-run evals when input files change.
-    #[arg(long, short = 'w')]
+    #[arg(
+        long,
+        short = 'w',
+        env = "BT_EVAL_WATCH",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub watch: bool,
 
     /// Start the eval dev web server.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_DEV",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub dev: bool,
 
     /// Host interface for eval dev server.
-    #[arg(long, default_value = "localhost")]
+    #[arg(long, env = "BT_EVAL_DEV_HOST", default_value = "localhost")]
     pub dev_host: String,
 
     /// Port for eval dev server.
-    #[arg(long, default_value_t = 8300)]
+    #[arg(long, env = "BT_EVAL_DEV_PORT", default_value_t = 8300)]
     pub dev_port: u16,
 
     /// Restrict eval dev server access to a specific org name.
-    #[arg(long)]
+    #[arg(long, env = "BT_EVAL_DEV_ORG_NAME")]
     pub dev_org_name: Option<String>,
 
     /// Additional allowed browser origin(s) for eval dev server CORS checks.
