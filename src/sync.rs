@@ -2191,10 +2191,10 @@ async fn enrich_rows_with_vectors(
     }
 
     for row in rows {
-        let Some(xact_key) = row_xact_key(row) else {
+        let Some(row_id) = row_id_key(row) else {
             continue;
         };
-        let Some(vector_row) = fetched_rows.get(&xact_key) else {
+        let Some(vector_row) = fetched_rows.get(&row_id) else {
             continue;
         };
 
@@ -2264,35 +2264,51 @@ async fn discover_vector_specs_global(
 
     let mut specs = Vec::new();
     let Some(row) = response.data.first() else {
+        if verbose {
+            eprintln!("btql[vector_models] no rows returned; no vectors will be fetched.");
+        }
         return Ok(specs);
     };
     let Some(models) = row.get("models") else {
+        if verbose {
+            eprintln!("btql[vector_models] missing 'models' field; no vectors will be fetched.");
+        }
         return Ok(specs);
     };
-    let Some(map) = models.as_object() else {
-        return Ok(specs);
-    };
-
-    for (facet_name, value) in map {
-        let Some(items) = value.as_array() else {
-            continue;
-        };
+    if let Some(items) = models.as_array() {
         for item in items {
-            let Some(model) = item.as_str() else {
+            let Some(full) = item.as_str() else {
                 continue;
             };
-            if model.is_empty() {
+            let Some((facet, model)) = full.split_once('.') else {
+                continue;
+            };
+            if facet.is_empty() || model.is_empty() {
                 continue;
             }
             specs.push(VectorSpec {
-                facet_name: facet_name.clone(),
+                facet_name: facet.to_string(),
                 model: model.to_string(),
             });
         }
+    } else {
+        if verbose {
+            eprintln!(
+                "btql[vector_models] unexpected models shape: {}; no vectors will be fetched.",
+                models
+            );
+        }
+        return Ok(specs);
     }
 
     specs.sort();
     specs.dedup();
+    if verbose {
+        eprintln!(
+            "btql[vector_models] discovered {} vector spec(s).",
+            specs.len()
+        );
+    }
     Ok(specs)
 }
 
@@ -2311,19 +2327,34 @@ async fn fetch_vector_columns_for_rows(
         return Ok(BTreeMap::new());
     }
 
-    let xact_literals = collect_xact_id_literals(rows);
-    if xact_literals.is_empty() {
+    let root_literals = collect_root_span_id_literals(rows);
+    if root_literals.is_empty() {
         return Ok(BTreeMap::new());
     }
 
-    let xact_filter = if xact_literals.len() == 1 {
-        format!("_xact_id = {}", xact_literals[0])
+    let root_filter = if root_literals.len() == 1 {
+        format!("root_span_id = {}", root_literals[0])
     } else {
-        format!("_xact_id IN [{}]", xact_literals.join(", "))
+        format!("root_span_id IN [{}]", root_literals.join(", "))
     };
-    let combined_filter = combine_sql_filters(filter, &xact_filter);
 
-    let mut select_columns = vec!["_xact_id".to_string()];
+    let id_literals = collect_row_id_literals(rows);
+    let id_filter = if id_literals.is_empty() {
+        None
+    } else if id_literals.len() == 1 {
+        Some(format!("id = {}", id_literals[0]))
+    } else {
+        Some(format!("id IN [{}]", id_literals.join(", ")))
+    };
+
+    let combined_filter = if let Some(id_filter) = id_filter {
+        let combined = format!("({root_filter}) AND ({id_filter})");
+        combine_sql_filters(filter, &combined)
+    } else {
+        combine_sql_filters(filter, &root_filter)
+    };
+
+    let mut select_columns = vec!["id".to_string(), "root_span_id".to_string()];
     for (idx, spec) in vector_specs.iter().enumerate() {
         select_columns.push(format!(
             "vector({}) as {}",
@@ -2335,7 +2366,7 @@ async fn fetch_vector_columns_for_rows(
     let query = format!(
         "select: {} | from: {source_expr} spans | filter: {combined_filter} | limit: {}",
         select_columns.join(", "),
-        xact_literals.len()
+        id_literals.len().max(1)
     );
     let response = execute_btql_query_timed(
         client,
@@ -2349,24 +2380,42 @@ async fn fetch_vector_columns_for_rows(
 
     let mut by_xact = BTreeMap::new();
     for row in response.data {
-        let Some(xact_key) = row_xact_key(&row) else {
+        let Some(row_id) = row_id_key(&row) else {
             continue;
         };
-        by_xact.insert(xact_key, row);
+        by_xact.insert(row_id, row);
     }
     Ok(by_xact)
 }
 
-fn collect_xact_id_literals(rows: &[Map<String, Value>]) -> Vec<String> {
+fn collect_row_id_literals(rows: &[Map<String, Value>]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for row in rows {
-        let Some(value) = row.get("_xact_id") else {
+        let Some(value) = row.get("id") else {
             continue;
         };
         let Some(literal) = sql_literal_from_json(value) else {
             continue;
         };
+        if seen.insert(literal.clone()) {
+            out.push(literal);
+        }
+    }
+    out
+}
+
+fn collect_root_span_id_literals(rows: &[Map<String, Value>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(root_id) = row_root_span_id(row) else {
+            continue;
+        };
+        if root_id.is_empty() {
+            continue;
+        }
+        let literal = sql_quote(&root_id);
         if seen.insert(literal.clone()) {
             out.push(literal);
         }
@@ -2382,8 +2431,8 @@ fn combine_sql_filters(filter: Option<&str>, extra_clause: &str) -> String {
     }
 }
 
-fn row_xact_key(row: &Map<String, Value>) -> Option<String> {
-    value_as_string(row.get("_xact_id"))
+fn row_id_key(row: &Map<String, Value>) -> Option<String> {
+    value_as_string(row.get("id"))
 }
 
 fn sql_literal_from_json(value: &Value) -> Option<String> {
