@@ -2157,6 +2157,7 @@ async fn execute_btql_query_timed(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enrich_rows_with_vectors(
     client: &ApiClient,
     ctx: &LoginContext,
@@ -2295,6 +2296,7 @@ async fn discover_vector_specs_global(
     Ok(specs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_vector_columns_for_rows(
     client: &ApiClient,
     ctx: &LoginContext,
@@ -4255,6 +4257,7 @@ mod tests {
             direction: "pull".to_string(),
             scope: "traces".to_string(),
             filter: None,
+            window: None,
             limit: Some(10),
             page_size: 200,
             include_vectors: false,
@@ -4277,6 +4280,7 @@ mod tests {
             direction: "pull".to_string(),
             scope: "traces".to_string(),
             filter: None,
+            window: None,
             limit: Some(10),
             page_size: 200,
             include_vectors: true,
