@@ -2245,7 +2245,7 @@ async fn discover_vector_specs_global(
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
     verbose: bool,
 ) -> Result<Vec<VectorSpec>> {
-    let query = vec![
+    let query = [
         "select: vector_keys(facets) as models".to_string(),
         format!("from: {source_expr} spans"),
         format!("filter: {}", filter.unwrap_or("true")),
