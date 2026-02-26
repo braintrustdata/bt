@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use actix_web::dev::Service;
@@ -74,12 +74,33 @@ struct EvalProcessOutput {
     status: ExitStatus,
     dependency_files: Vec<String>,
     error_messages: Vec<String>,
+    stderr_lines: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EsmRetryMode {
-    Off,
-    ForcedEsm,
+enum RetryPolicy {
+    Allow,
+    Disallow,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsMode {
+    Auto,
+    ForceEsm,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsolePolicy {
+    Forward,
+    BufferStderr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunnerKind {
+    Tsx,
+    ViteNode,
+    Deno,
+    Other,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,20 +348,20 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         run_eval_files_watch(
             &base,
             args.language,
-            args.runner.clone(),
-            args.files.clone(),
+            args.runner.as_deref(),
+            &args.files,
             args.no_send_logs,
-            options,
+            &options,
         )
         .await
     } else {
         let output = run_eval_files_once(
             &base,
             args.language,
-            args.runner.clone(),
-            args.files.clone(),
+            args.runner.as_deref(),
+            &args.files,
             args.no_send_logs,
-            options,
+            &options,
         )
         .await?;
         if !output.status.success() {
@@ -353,12 +374,12 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 async fn run_eval_files_watch(
     base: &BaseArgs,
     language_override: Option<EvalLanguage>,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    runner_override: Option<&str>,
+    files: &[String],
     no_send_logs: bool,
-    options: EvalRunOptions,
+    options: &EvalRunOptions,
 ) -> Result<()> {
-    let input_watch_paths = resolve_watch_paths(&files)?;
+    let input_watch_paths = resolve_watch_paths(files)?;
     let mut active_watch_paths = input_watch_paths.clone();
     let mut watch_state = snapshot_watch_state(&active_watch_paths)?;
 
@@ -371,10 +392,10 @@ async fn run_eval_files_watch(
         match run_eval_files_once(
             base,
             language_override,
-            runner_override.clone(),
-            files.clone(),
+            runner_override,
+            files,
             no_send_logs,
-            options.clone(),
+            options,
         )
         .await
         {
@@ -411,55 +432,83 @@ async fn run_eval_files_watch(
     }
 }
 
+struct EvalPlan<'a> {
+    language: EvalLanguage,
+    files: &'a [String],
+    runner_override: Option<&'a str>,
+    show_js_hint: bool,
+    retry_policy: RetryPolicy,
+}
+
+struct EvalAttemptOutput {
+    status: ExitStatus,
+    dependency_files: Vec<String>,
+    error_messages: Vec<String>,
+    stderr_lines: Vec<String>,
+    runner_kind: RunnerKind,
+}
+
+fn build_eval_plan<'a>(
+    files: &'a [String],
+    language_override: Option<EvalLanguage>,
+    runner_override: Option<&'a str>,
+) -> Result<EvalPlan<'a>> {
+    let language = detect_eval_language(files, language_override)?;
+    let show_js_hint = language == EvalLanguage::JavaScript && runner_override.is_none();
+    let has_ts_files = language == EvalLanguage::JavaScript && has_ts_eval_files(files);
+    let retry_policy = if show_js_hint && has_ts_files {
+        RetryPolicy::Allow
+    } else {
+        RetryPolicy::Disallow
+    };
+
+    Ok(EvalPlan {
+        language,
+        files,
+        runner_override,
+        show_js_hint,
+        retry_policy,
+    })
+}
+
 async fn run_eval_files_once(
     base: &BaseArgs,
     language_override: Option<EvalLanguage>,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    runner_override: Option<&str>,
+    files: &[String],
     no_send_logs: bool,
-    options: EvalRunOptions,
+    options: &EvalRunOptions,
 ) -> Result<EvalRunOutput> {
-    let language = detect_eval_language(&files, language_override)?;
-    let show_js_hint = language == EvalLanguage::JavaScript && runner_override.is_none();
-    let esm_retry_eligible = show_js_hint && has_ts_eval_files(&files);
+    let plan = build_eval_plan(files, language_override, runner_override)?;
+    let console_policy = match plan.retry_policy {
+        RetryPolicy::Allow => ConsolePolicy::BufferStderr,
+        RetryPolicy::Disallow => ConsolePolicy::Forward,
+    };
 
-    let mut output = run_eval_files_once_inner(
+    let mut output = run_eval_attempt(
         base,
-        language,
-        runner_override.clone(),
-        files.clone(),
+        &plan,
         no_send_logs,
-        options.clone(),
-        EsmRetryMode::Off,
+        options,
         &[],
-        esm_retry_eligible,
+        JsMode::Auto,
+        console_policy,
     )
     .await?;
 
     let mut retried_esm = false;
-    if !output.status.success()
-        && esm_retry_eligible
-        && should_retry_esm(
-            language,
-            output.is_tsx_runner,
-            &files,
-            &output.stderr_lines,
-            &output.error_messages,
-        )
-    {
+    if !output.status.success() && should_retry_esm(&plan, &output) {
         retried_esm = true;
         let first_attempt_stderr = std::mem::take(&mut output.stderr_lines);
         eprintln!("Eval failed with ESM/CJS interop error. Retrying in ESM mode...");
-        output = run_eval_files_once_inner(
+        output = run_eval_attempt(
             base,
-            language,
-            runner_override,
-            files.clone(),
+            &plan,
             no_send_logs,
             options,
-            EsmRetryMode::ForcedEsm,
             &[],
-            false,
+            JsMode::ForceEsm,
+            ConsolePolicy::Forward,
         )
         .await?;
 
@@ -467,11 +516,11 @@ async fn run_eval_files_once(
             eprintln!("\nFirst attempt (CJS mode) error:");
             flush_stderr(&first_attempt_stderr);
         }
-    } else if esm_retry_eligible {
+    } else if matches!(plan.retry_policy, RetryPolicy::Allow) {
         flush_stderr(&output.stderr_lines);
     }
 
-    if !output.status.success() && show_js_hint {
+    if !output.status.success() && plan.show_js_hint {
         let suffix = if retried_esm {
             " (ESM retry failed)"
         } else {
@@ -484,8 +533,8 @@ async fn run_eval_files_once(
 
     let mut dependencies =
         normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
-    if language == EvalLanguage::JavaScript {
-        let static_dependencies = collect_js_static_dependencies(&files)?;
+    if plan.language == EvalLanguage::JavaScript {
+        let static_dependencies = collect_js_static_dependencies(files)?;
         dependencies = merge_watch_paths(&dependencies, &static_dependencies);
     }
 
@@ -495,81 +544,60 @@ async fn run_eval_files_once(
     })
 }
 
-struct EvalRunOnceOutput {
-    status: ExitStatus,
-    dependency_files: Vec<String>,
-    error_messages: Vec<String>,
-    stderr_lines: Vec<String>,
-    is_tsx_runner: bool,
-}
-
-async fn run_eval_files_once_inner(
+async fn run_eval_attempt(
     base: &BaseArgs,
-    language: EvalLanguage,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    plan: &EvalPlan<'_>,
     no_send_logs: bool,
-    options: EvalRunOptions,
-    esm_mode: EsmRetryMode,
+    options: &EvalRunOptions,
     extra_env: &[(String, String)],
-    suppress_stderr: bool,
-) -> Result<EvalRunOnceOutput> {
-    let (process, _language, _show_hint, is_tsx_runner, stderr_capture) = spawn_eval_runner(
+    js_mode: JsMode,
+    console_policy: ConsolePolicy,
+) -> Result<EvalAttemptOutput> {
+    let spawned = spawn_eval_runner(
         base,
-        Some(language),
-        runner_override,
-        files,
+        plan.language,
+        plan.runner_override,
+        plan.files,
         no_send_logs,
-        &options,
+        options,
         extra_env,
-        esm_mode,
-        suppress_stderr,
+        js_mode,
     )
     .await?;
     let mut ui = EvalUi::new(options.jsonl, options.list);
-    let output = drive_eval_runner(process, |event| ui.handle(event)).await?;
+    let output =
+        drive_eval_runner(spawned.process, console_policy, |event| ui.handle(event)).await?;
     ui.finish();
 
-    let stderr_lines = Arc::try_unwrap(stderr_capture)
-        .ok()
-        .and_then(|m| m.into_inner().ok())
-        .unwrap_or_default();
-
-    Ok(EvalRunOnceOutput {
+    Ok(EvalAttemptOutput {
         status: output.status,
         dependency_files: output.dependency_files,
         error_messages: output.error_messages,
-        stderr_lines,
-        is_tsx_runner,
+        stderr_lines: output.stderr_lines,
+        runner_kind: spawned.runner_kind,
     })
+}
+
+struct EvalSpawned {
+    process: EvalRunnerProcess,
+    runner_kind: RunnerKind,
 }
 
 async fn spawn_eval_runner(
     base: &BaseArgs,
-    language_override: Option<EvalLanguage>,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    language: EvalLanguage,
+    runner_override: Option<&str>,
+    files: &[String],
     no_send_logs: bool,
     options: &EvalRunOptions,
     extra_env: &[(String, String)],
-    esm_mode: EsmRetryMode,
-    suppress_stderr: bool,
-) -> Result<(
-    EvalRunnerProcess,
-    EvalLanguage,
-    bool,
-    bool,
-    Arc<Mutex<Vec<String>>>,
-)> {
-    let language = detect_eval_language(&files, language_override)?;
+    js_mode: JsMode,
+) -> Result<EvalSpawned> {
     if language != EvalLanguage::Python && options.num_workers.is_some() {
         anyhow::bail!("--num-workers is only supported for Python evals.");
     }
-    let show_js_runner_hint_on_failure =
-        language == EvalLanguage::JavaScript && runner_override.is_none();
     let (js_runner, py_runner) = prepare_eval_runners()?;
-    let use_vite_node = esm_mode == EsmRetryMode::ForcedEsm;
-    let force_esm = esm_mode == EsmRetryMode::ForcedEsm;
+    let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
     let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -599,16 +627,20 @@ async fn spawn_eval_runner(
         };
     });
 
-    let (mut cmd, is_tsx_runner) = match language {
+    let (mut cmd, runner_kind) = match language {
         EvalLanguage::Python => (
-            build_python_command(runner_override, &py_runner, &files)?,
-            false,
+            build_python_command(runner_override, &py_runner, files)?,
+            RunnerKind::Other,
         ),
         EvalLanguage::JavaScript => {
-            if use_vite_node {
-                (build_vite_node_fallback_command(&js_runner, &files)?, false)
+            if force_esm {
+                (
+                    build_vite_node_fallback_command(&js_runner, files)?,
+                    RunnerKind::ViteNode,
+                )
             } else {
-                build_js_command(runner_override, &js_runner, &files)?
+                let plan = build_js_plan(runner_override, &js_runner, files)?;
+                (plan.cmd, plan.kind)
             }
         }
     };
@@ -654,12 +686,10 @@ async fn spawn_eval_runner(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let stderr_capture: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
     if let Some(stdout) = stdout {
         let tx_stdout = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stdout, "stdout", Some(tx_stdout), None).await {
+            if let Err(err) = forward_stream(stdout, "stdout", tx_stdout).await {
                 eprintln!("Failed to read eval stdout: {err}");
             }
         });
@@ -667,22 +697,8 @@ async fn spawn_eval_runner(
 
     if let Some(stderr) = stderr {
         let tx_stderr = tx.clone();
-        // Only capture stderr when we intentionally suppress it (ESM retry detection).
-        let capture = if suppress_stderr {
-            Some(Arc::clone(&stderr_capture))
-        } else {
-            None
-        };
-        let forward_tx = if suppress_stderr {
-            None
-        } else {
-            Some(tx_stderr.clone())
-        };
-        // tx_stderr is moved into the task to keep the channel alive until stderr
-        // is fully drained, ensuring Arc::try_unwrap on stderr_capture succeeds.
         tokio::spawn(async move {
-            let _hold = tx_stderr;
-            if let Err(err) = forward_stream(stderr, "stderr", forward_tx, capture).await {
+            if let Err(err) = forward_stream(stderr, "stderr", tx_stderr).await {
                 eprintln!("Failed to read eval stderr: {err}");
             }
         });
@@ -690,23 +706,21 @@ async fn spawn_eval_runner(
 
     drop(tx);
 
-    Ok((
-        EvalRunnerProcess {
+    Ok(EvalSpawned {
+        process: EvalRunnerProcess {
             child,
             rx,
             sse_task,
             sse_connected,
             _socket_cleanup_guard: socket_cleanup_guard,
         },
-        language,
-        show_js_runner_hint_on_failure,
-        is_tsx_runner,
-        stderr_capture,
-    ))
+        runner_kind,
+    })
 }
 
 async fn drive_eval_runner<F>(
     mut process: EvalRunnerProcess,
+    console_policy: ConsolePolicy,
     mut on_event: F,
 ) -> Result<EvalProcessOutput>
 where
@@ -715,6 +729,7 @@ where
     let mut status = None;
     let mut dependency_files: Vec<String> = Vec::new();
     let mut error_messages: Vec<String> = Vec::new();
+    let mut stderr_lines: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
@@ -730,6 +745,14 @@ where
                             error_messages.push(stack.clone());
                         }
                         on_event(EvalEvent::Error { message, stack, status });
+                    }
+                    Some(EvalEvent::Console { stream, message }) => {
+                        if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr)
+                        {
+                            stderr_lines.push(message);
+                        } else {
+                            on_event(EvalEvent::Console { stream, message });
+                        }
                     }
                     Some(event) => on_event(event),
                     None => {
@@ -762,6 +785,7 @@ where
         status: status.context("eval runner process exited without a status")?,
         dependency_files,
         error_messages,
+        stderr_lines,
     })
 }
 
@@ -771,22 +795,17 @@ fn flush_stderr(lines: &[String]) {
     }
 }
 
-fn should_retry_esm(
-    language: EvalLanguage,
-    is_tsx_runner: bool,
-    files: &[String],
-    stderr_lines: &[String],
-    error_messages: &[String],
-) -> bool {
-    if language != EvalLanguage::JavaScript || !is_tsx_runner {
+fn should_retry_esm(plan: &EvalPlan<'_>, output: &EvalAttemptOutput) -> bool {
+    if matches!(plan.retry_policy, RetryPolicy::Disallow) {
         return false;
     }
-    if !has_ts_eval_files(files) {
+    if output.runner_kind != RunnerKind::Tsx {
         return false;
     }
-    stderr_lines
+    output
+        .stderr_lines
         .iter()
-        .chain(error_messages)
+        .chain(&output.error_messages)
         .any(|line| is_esm_interop_error(line))
 }
 
@@ -1211,16 +1230,24 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         }
     };
 
-    let (process, _, _, _, _) = match spawn_eval_runner(
+    let language = match detect_eval_language(&state.files, state.language_override) {
+        Ok(language) => language,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    let spawned = match spawn_eval_runner(
         &state.base,
-        state.language_override,
-        state.runner_override.clone(),
-        state.files.clone(),
+        language,
+        state.runner_override.as_deref(),
+        &state.files,
         state.no_send_logs,
         &state.options,
         &extra_env,
-        EsmRetryMode::Off,
-        false,
+        JsMode::Auto,
     )
     .await
     {
@@ -1235,27 +1262,32 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
 
     let mut stdout_lines = Vec::new();
     let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-    let output = match drive_eval_runner(process, |event| match event {
-        EvalEvent::Console { stream, message } if stream == "stdout" => {
-            stdout_lines.push(message);
-        }
-        EvalEvent::Error {
-            message,
-            stack: _,
-            status,
-        } => errors.push((message, status)),
-        _ => {}
-    })
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
+    let output =
+        match drive_eval_runner(
+            spawned.process,
+            ConsolePolicy::Forward,
+            |event| match event {
+                EvalEvent::Console { stream, message } if stream == "stdout" => {
+                    stdout_lines.push(message);
+                }
+                EvalEvent::Error {
+                    message,
+                    stack: _,
+                    status,
+                } => errors.push((message, status)),
+                _ => {}
+            },
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                return json_error_response(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("{err:#}"),
+                );
+            }
+        };
 
     if let Some((message, status)) = errors.first() {
         let status = status
@@ -1325,16 +1357,24 @@ async fn dev_server_eval(
         }
     };
 
-    let (process, _, _, _, _) = match spawn_eval_runner(
+    let language = match detect_eval_language(&state.files, state.language_override) {
+        Ok(language) => language,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    let spawned = match spawn_eval_runner(
         &state.base,
-        state.language_override,
-        state.runner_override.clone(),
-        state.files.clone(),
+        language,
+        state.runner_override.as_deref(),
+        &state.files,
         state.no_send_logs,
         &state.options,
         &extra_env,
-        EsmRetryMode::Off,
-        false,
+        JsMode::Auto,
     )
     .await
     {
@@ -1352,7 +1392,7 @@ async fn dev_server_eval(
         tokio::spawn(async move {
             let mut saw_error = false;
             let mut saw_done = false;
-            let output = drive_eval_runner(process, |event| {
+            let output = drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
                 if matches!(event, EvalEvent::Error { .. }) {
                     saw_error = true;
                 }
@@ -1403,25 +1443,30 @@ async fn dev_server_eval(
 
     let mut summary: Option<ExperimentSummary> = None;
     let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-    let output = match drive_eval_runner(process, |event| match event {
-        EvalEvent::Summary(current) => summary = Some(current),
-        EvalEvent::Error {
-            message,
-            stack: _,
-            status,
-        } => errors.push((message, status)),
-        _ => {}
-    })
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
+    let output =
+        match drive_eval_runner(
+            spawned.process,
+            ConsolePolicy::Forward,
+            |event| match event {
+                EvalEvent::Summary(current) => summary = Some(current),
+                EvalEvent::Error {
+                    message,
+                    stack: _,
+                    status,
+                } => errors.push((message, status)),
+                _ => {}
+            },
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                return json_error_response(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("{err:#}"),
+                );
+            }
+        };
 
     if let Some((message, status)) = errors.first() {
         let status = status
@@ -1783,45 +1828,53 @@ fn detect_eval_language(
     detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
 }
 
-fn build_js_command(
-    runner_override: Option<String>,
-    runner: &PathBuf,
+struct JsRunnerPlan {
+    cmd: Command,
+    kind: RunnerKind,
+}
+
+fn build_js_plan(
+    runner_override: Option<&str>,
+    runner: &Path,
     files: &[String],
-) -> Result<(Command, bool)> {
-    if let Some(explicit) = runner_override.as_deref() {
+) -> Result<JsRunnerPlan> {
+    if let Some(explicit) = runner_override {
         let resolved_runner = resolve_js_runner_command(explicit, files);
         if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            return Ok((
-                build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
-                false,
-            ));
+            return Ok(JsRunnerPlan {
+                cmd: build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
+                kind: RunnerKind::Deno,
+            });
         }
-        let is_tsx = is_tsx_runner(resolved_runner.as_ref());
+        let kind = runner_kind_for_bin(resolved_runner.as_ref());
         let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
         let mut command = Command::new(resolved_runner);
         command.arg(runner_script).args(files);
-        return Ok((command, is_tsx));
+        return Ok(JsRunnerPlan { cmd: command, kind });
     }
 
     if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            return Ok((
-                build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
-                false,
-            ));
+            return Ok(JsRunnerPlan {
+                cmd: build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
+                kind: RunnerKind::Deno,
+            });
         }
-        let is_tsx = is_tsx_runner(auto_runner.as_ref());
+        let kind = runner_kind_for_bin(auto_runner.as_ref());
         let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
         let mut command = Command::new(auto_runner);
         command.arg(runner_script).args(files);
-        return Ok((command, is_tsx));
+        return Ok(JsRunnerPlan { cmd: command, kind });
     }
 
     let mut command = Command::new("npx");
     command.arg("--yes").arg("tsx").arg(runner).args(files);
-    Ok((command, true))
+    Ok(JsRunnerPlan {
+        cmd: command,
+        kind: RunnerKind::Tsx,
+    })
 }
 
 fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<Command> {
@@ -1865,11 +1918,12 @@ fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
 }
 
 fn build_python_command(
-    runner_override: Option<String>,
-    runner: &PathBuf,
+    runner_override: Option<&str>,
+    runner: &Path,
     files: &[String],
 ) -> Result<Command> {
     let runner_override = runner_override
+        .map(ToOwned::to_owned)
         .or_else(|| std::env::var("BT_EVAL_PYTHON_RUNNER").ok())
         .or_else(|| std::env::var("BT_EVAL_PYTHON").ok());
 
@@ -1991,8 +2045,12 @@ fn runner_bin_name(runner_command: &Path) -> Option<String> {
     Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
 }
 
-fn is_tsx_runner(runner_command: &Path) -> bool {
-    runner_bin_name(runner_command).is_some_and(|n| n == "tsx")
+fn runner_kind_for_bin(runner_command: &Path) -> RunnerKind {
+    match runner_bin_name(runner_command).as_deref() {
+        Some("tsx") => RunnerKind::Tsx,
+        Some("vite-node") => RunnerKind::ViteNode,
+        _ => RunnerKind::Other,
+    }
 }
 
 fn is_ts_node_runner(runner_command: &Path) -> bool {
@@ -2223,25 +2281,17 @@ struct SseDependenciesEventData {
 async fn forward_stream<T>(
     stream: T,
     name: &'static str,
-    tx: Option<mpsc::UnboundedSender<EvalEvent>>,
-    capture: Option<Arc<Mutex<Vec<String>>>>,
+    tx: mpsc::UnboundedSender<EvalEvent>,
 ) -> Result<()>
 where
     T: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(stream).lines();
     while let Some(line) = lines.next_line().await? {
-        if let Some(buffer) = capture.as_ref() {
-            if let Ok(mut guard) = buffer.lock() {
-                guard.push(line.clone());
-            }
-        }
-        if let Some(tx) = tx.as_ref() {
-            let _ = tx.send(EvalEvent::Console {
-                stream: name.to_string(),
-                message: line,
-            });
-        }
+        let _ = tx.send(EvalEvent::Console {
+            stream: name.to_string(),
+            message: line,
+        });
     }
     Ok(())
 }

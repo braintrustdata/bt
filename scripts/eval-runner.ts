@@ -1030,6 +1030,7 @@ function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
 
 async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
+  // Internal CLI-controlled flag for ESM retry; not user-facing config.
   const forceEsm = envFlag("BT_EVAL_FORCE_ESM");
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
