@@ -1,5 +1,4 @@
 use std::fmt::Write as _;
-use std::io::IsTerminal;
 use std::sync::LazyLock;
 
 use anyhow::{anyhow, bail, Result};
@@ -34,7 +33,7 @@ pub async fn run(
         .await?
         .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
         None => {
-            if !std::io::stdin().is_terminal() {
+            if !crate::ui::is_interactive() {
                 bail!("prompt slug required. Use: bt prompts view <slug>");
             }
             select_prompt_interactive(client, project).await?

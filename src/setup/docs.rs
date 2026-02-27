@@ -221,10 +221,7 @@ pub(super) async fn fetch_docs_pages(
             .send()
             .await
             .with_context(|| {
-                format!(
-                    "failed to fetch fallback index {}",
-                    DEFAULT_DOCS_LLMS_FULL_URL
-                )
+                format!("failed to fetch fallback index {DEFAULT_DOCS_LLMS_FULL_URL}")
             })?;
         if fallback_response.status().is_success() {
             let fallback_body = fallback_response
@@ -714,7 +711,7 @@ fn write_docs_indexes(
             .filter(|file| file.workflow == workflow.as_str() && file.status == "written")
             .collect::<Vec<_>>();
 
-        top_lines.push(format!("## {}", workflow));
+        top_lines.push(format!("## {workflow}"));
         if workflow_files.is_empty() {
             top_lines.push("- no pages downloaded".to_string());
             top_lines.push(String::new());
@@ -722,7 +719,7 @@ fn write_docs_indexes(
         }
 
         let mut workflow_index_lines = Vec::new();
-        workflow_index_lines.push(format!("# {} Docs", workflow));
+        workflow_index_lines.push(format!("# {workflow} Docs"));
         workflow_index_lines.push(String::new());
 
         for file in workflow_files {
@@ -742,7 +739,7 @@ fn write_docs_indexes(
 
         let workflow_index = output_dir.join(workflow).join("_index.md");
         write_text_file(&workflow_index, &workflow_index_lines.join("\n"))?;
-        top_lines.push(format!("- [_index]({}/_index.md)", workflow));
+        top_lines.push(format!("- [_index]({workflow}/_index.md)"));
         top_lines.push(String::new());
     }
 
