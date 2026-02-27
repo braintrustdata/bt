@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::auth::LoginContext;
+
+pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -13,9 +16,29 @@ pub struct ApiClient {
     org_name: String,
 }
 
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request failed ({}): {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+#[derive(Debug, Deserialize)]
+pub struct BtqlResponse<T> {
+    pub data: Vec<T>,
+}
+
 impl ApiClient {
     pub fn new(ctx: &LoginContext) -> Result<Self> {
         let http = Client::builder()
+            .timeout(DEFAULT_HTTP_TIMEOUT)
             .build()
             .context("failed to build HTTP client")?;
 
@@ -49,7 +72,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         response.json().await.context("failed to parse response")
@@ -69,7 +92,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         response.json().await.context("failed to parse response")
@@ -85,11 +108,29 @@ impl ApiClient {
         T: DeserializeOwned,
         B: Serialize,
     {
+        self.post_with_headers_timeout(path, body, headers, None)
+            .await
+    }
+
+    pub async fn post_with_headers_timeout<T, B>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
         let url = self.url(path);
         let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
 
         for (key, value) in headers {
             request = request.header(*key, *value);
+        }
+        if let Some(t) = timeout {
+            request = request.timeout(t);
         }
 
         let response = request.send().await.context("request failed")?;
@@ -97,7 +138,7 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         response.json().await.context("failed to parse response")
@@ -135,9 +176,25 @@ impl ApiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("request failed ({status}): {body}");
+            return Err(HttpError { status, body }.into());
         }
 
         Ok(())
+    }
+
+    pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
+        let body = json!({
+            "query": query,
+            "fmt": "json",
+        });
+
+        let org_name = self.org_name();
+        let headers = if !org_name.is_empty() {
+            vec![("x-bt-org-name", org_name)]
+        } else {
+            Vec::new()
+        };
+
+        self.post_with_headers("/btql", &body, &headers).await
     }
 }

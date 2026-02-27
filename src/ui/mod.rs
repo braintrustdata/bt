@@ -2,15 +2,34 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod pager;
+pub mod prompt_render;
 mod select;
 mod spinner;
 mod status;
 mod table;
 
 static NO_INPUT: AtomicBool = AtomicBool::new(false);
+static QUIET: AtomicBool = AtomicBool::new(false);
+static ANIMATIONS_ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub fn set_no_input(val: bool) {
     NO_INPUT.store(val, Ordering::Relaxed);
+}
+
+pub fn set_quiet(val: bool) {
+    QUIET.store(val, Ordering::Relaxed);
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
+pub fn set_animations_enabled(val: bool) {
+    ANIMATIONS_ENABLED.store(val, Ordering::Relaxed);
+}
+
+pub fn animations_enabled() -> bool {
+    ANIMATIONS_ENABLED.load(Ordering::Relaxed)
 }
 
 pub fn is_interactive() -> bool {

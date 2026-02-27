@@ -6,48 +6,40 @@
 
 ## Install
 
-### Stable (latest release)
-
-Unix-like systems:
+### Unix (macOS / Linux)
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh | sh
+curl -fsSL https://bt.dev/cli/install.sh | bash
 ```
 
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1 | iex"
-```
-
-### Canary (latest `main`)
-
-Unix-like systems:
+Install a specific version:
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh | sh
+curl -fsSL https://bt.dev/cli/install.sh | bash -s -- --version 0.2.0
 ```
 
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1 | iex"
-```
-
-### Canary (exact `main` commit build)
-
-Exact `main` canary builds are published as `canary-<shortsha>`.
-
-Unix-like systems:
+Install the latest canary build (latest `main`):
 
 ```bash
-curl -fsSL https://github.com/braintrustdata/bt/releases/download/canary-<shortsha>/bt-installer.sh | sh
+curl -fsSL https://bt.dev/cli/install.sh | bash -s -- --canary
 ```
 
-Windows (PowerShell):
+### Windows (PowerShell)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary-<shortsha>/bt-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+```
+
+Install a specific version:
+
+```powershell
+$env:BT_VERSION='0.1.2'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+```
+
+Canary:
+
+```powershell
+$env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
 ```
 
 ### PR/branch builds (no release)
@@ -95,8 +87,8 @@ If `bt` was installed via another package manager (Homebrew, apt, choco, etc), u
 Unix-like systems:
 
 ```bash
-rm -f "${CARGO_HOME:-$HOME/.cargo}/bin/bt"
-rm -rf "$HOME/.config/bt"
+rm -f "${XDG_BIN_HOME:-${XDG_DATA_HOME:-$HOME/.local}/bin}/bt"
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/bt"
 hash -r
 ```
 
@@ -110,7 +102,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Troubleshooting
 
-- If `bt` is not found after install, start a new shell or add `${CARGO_HOME:-$HOME/.cargo}/bin` to your `PATH`.
+- If `bt` is not found after install, start a new shell or add `${XDG_BIN_HOME:-$HOME/.local/bin}` to your `PATH`.
 - If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 

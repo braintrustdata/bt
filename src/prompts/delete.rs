@@ -7,20 +7,23 @@ use crate::{
     ui::{self, is_interactive, print_command_status, with_spinner, CommandStatus},
 };
 
-pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: bool) -> Result<()> {
+use super::ResolvedContext;
+
+pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Result<()> {
+    let project_name = &ctx.project.name;
     if force && slug.is_none() {
         bail!("slug required when using --force. Use: bt prompts delete <slug> --force");
     }
 
     let prompt = match slug {
-        Some(s) => api::get_prompt_by_slug(client, project, s)
+        Some(s) => api::get_prompt_by_slug(&ctx.client, project_name, s)
             .await?
             .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
         None => {
             if !is_interactive() {
                 bail!("prompt slug required. Use: bt prompts delete <slug>");
             }
-            select_prompt_interactive(client, project).await?
+            select_prompt_interactive(&ctx.client, project_name).await?
         }
     };
 
@@ -28,7 +31,7 @@ pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: b
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete prompt '{}' from {}?",
-                &prompt.name, project
+                &prompt.name, project_name
             ))
             .default(false)
             .interact()?;
@@ -38,13 +41,20 @@ pub async fn run(client: &ApiClient, project: &str, slug: Option<&str>, force: b
         }
     }
 
-    match with_spinner("Deleting prompt...", api::delete_prompt(client, &prompt.id)).await {
+    match with_spinner(
+        "Deleting prompt...",
+        api::delete_prompt(&ctx.client, &prompt.id),
+    )
+    .await
+    {
         Ok(_) => {
             print_command_status(
                 CommandStatus::Success,
                 &format!("Deleted '{}'", prompt.name),
             );
-            eprintln!("Run `bt prompts list` to see remaining prompts.");
+            if !crate::ui::is_quiet() {
+                eprintln!("Run `bt prompts list` to see remaining prompts.");
+            }
             Ok(())
         }
         Err(e) => {

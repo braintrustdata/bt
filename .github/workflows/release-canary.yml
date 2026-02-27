@@ -448,7 +448,7 @@ jobs:
       - name: Verify installed binary
         shell: bash
         run: |
-          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version | grep -i canary
           bt self update --check
 
@@ -471,7 +471,7 @@ jobs:
       - name: Verify installed binary
         shell: bash
         run: |
-          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version | grep -i canary
           bt self update --check
 
@@ -494,8 +494,8 @@ jobs:
       - name: Verify installed binary
         shell: pwsh
         run: |
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
-          $btExe = Join-Path $cargoHome "bin\bt.exe"
+          $binDir = if ($env:XDG_BIN_HOME) { $env:XDG_BIN_HOME } else { Join-Path $HOME ".local/bin" }
+          $btExe = Join-Path $binDir "bt.exe"
           if (!(Test-Path $btExe)) {
             throw "bt.exe not found at $btExe"
           }
@@ -503,5 +503,5 @@ jobs:
           if ($version -notmatch "canary") {
             throw "expected canary version string, got: $version"
           }
-          $env:PATH = "$(Join-Path $cargoHome 'bin');$env:PATH"
+          $env:PATH = "$binDir;$env:PATH"
           & $btExe self update --check

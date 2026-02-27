@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io;
-use std::io::IsTerminal;
 use std::io::Read;
 use std::time::Duration;
 
@@ -28,6 +27,12 @@ use crate::http::ApiClient;
 use crate::ui::with_spinner;
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt sql \"SELECT * FROM project_logs('<PROJECT_ID>') LIMIT 5\"
+  cat query.sql | bt sql
+  bt sql --non-interactive \"SELECT count(*) FROM project_logs('<PROJECT_ID>')\"
+")]
 pub struct SqlArgs {
     /// SQL query to execute
     pub query: Option<String>,
@@ -69,7 +74,7 @@ struct RealtimeState {
 pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let interactive = !base.json && std::io::stdin().is_terminal() && !args.non_interactive;
+    let interactive = !base.json && crate::ui::is_interactive() && !args.non_interactive;
     let query = read_non_interactive_query(&args.query, interactive)?;
 
     if let Some(query) = query {
@@ -116,23 +121,29 @@ async fn run_interactive(base: BaseArgs, client: ApiClient) -> Result<()> {
     tokio::task::block_in_place(|| run_interactive_blocking(base.json, client, handle))
 }
 
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        disable_raw_mode().ok();
+        io::stdout().execute(LeaveAlternateScreen).ok();
+    }
+}
+
 fn run_interactive_blocking(
     json_output: bool,
     client: ApiClient,
     handle: tokio::runtime::Handle,
 ) -> Result<()> {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run_app(&mut terminal, json_output, client, handle);
-
-    disable_raw_mode().ok();
-    terminal.backend_mut().execute(LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
-
     res
 }
 
