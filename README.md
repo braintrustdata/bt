@@ -167,6 +167,26 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
   - Detail view: `t` span/thread, `Left/Right` switch panes, `Backspace`/`Esc` back
   - Global: `q` quit
 
+## `bt util xact`
+
+Local transaction-id conversion helpers:
+
+- Convert transaction id to pretty version id:
+  - `bt util xact to-pretty 1000192656880881099`
+- Convert pretty version id to transaction id:
+  - `bt util xact from-pretty 81cd05ee665fdfb3`
+- Convert transaction id to timestamp:
+  - `bt util xact to-time 1000192656880881099`
+  - `bt util xact to-time 1000192656880881099 --format unix`
+- Convert timestamp to transaction id:
+  - `bt util xact from-time` (defaults to current time)
+  - `bt util xact from-time 2025-01-01` (date-only ISO at UTC midnight)
+  - `bt util xact from-time 2024-03-14T18:00:00Z`
+  - `bt util xact from-time 1710439200 --input unix --counter 42`
+- Inspect any xact value:
+  - `bt util xact inspect 1000192656880881099`
+  - `bt util xact inspect 81cd05ee665fdfb3`
+
 ## `bt login` profiles
 
 - Save an API key to a named profile (stored in secure credential store):

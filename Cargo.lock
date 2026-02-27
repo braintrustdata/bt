@@ -224,6 +224,7 @@ dependencies = [
  "backoff",
  "base64 0.22.1",
  "braintrust-sdk-rust",
+ "chrono",
  "clap",
  "comfy-table",
  "crossterm 0.28.1",

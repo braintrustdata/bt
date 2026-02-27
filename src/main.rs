@@ -16,6 +16,7 @@ mod sql;
 mod sync;
 mod traces;
 mod ui;
+mod util_cmd;
 mod utils;
 
 use crate::args::CLIArgs;
@@ -57,6 +58,8 @@ enum Commands {
     Prompts(CLIArgs<prompts::PromptsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
+    /// Local utility commands
+    Util(CLIArgs<util_cmd::UtilArgs>),
 }
 
 #[tokio::main]
@@ -77,6 +80,7 @@ async fn main() -> Result<()> {
         Commands::SelfCommand(args) => self_update::run(args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
+        Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
     }
 
     Ok(())
