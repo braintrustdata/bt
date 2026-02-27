@@ -221,43 +221,74 @@ pub struct EvalArgs {
     pub no_send_logs: bool,
 
     /// Output one JSON summary per evaluator.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_JSONL",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub jsonl: bool,
 
     /// Stop after the first failing evaluator.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_TERMINATE_ON_FAILURE",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub terminate_on_failure: bool,
 
     /// Number of worker threads for Python eval execution.
-    #[arg(long, value_name = "COUNT")]
+    #[arg(long, env = "BT_EVAL_NUM_WORKERS", value_name = "COUNT")]
     pub num_workers: Option<usize>,
 
     /// List evaluators without executing them.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_LIST",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub list: bool,
 
     /// Filter expression(s) used to select which evaluators to run.
-    #[arg(long, value_name = "FILTER")]
+    #[arg(
+        long,
+        env = "BT_EVAL_FILTER",
+        value_name = "FILTER",
+        value_delimiter = ','
+    )]
     pub filter: Vec<String>,
 
     /// Re-run evals when input files change.
-    #[arg(long, short = 'w')]
+    #[arg(
+        long,
+        short = 'w',
+        env = "BT_EVAL_WATCH",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub watch: bool,
 
     /// Start the eval dev web server.
-    #[arg(long)]
+    #[arg(
+        long,
+        env = "BT_EVAL_DEV",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
     pub dev: bool,
 
     /// Host interface for eval dev server.
-    #[arg(long, default_value = "localhost")]
+    #[arg(long, env = "BT_EVAL_DEV_HOST", default_value = "localhost")]
     pub dev_host: String,
 
     /// Port for eval dev server.
-    #[arg(long, default_value_t = 8300)]
+    #[arg(long, env = "BT_EVAL_DEV_PORT", default_value_t = 8300)]
     pub dev_port: u16,
 
     /// Restrict eval dev server access to a specific org name.
-    #[arg(long)]
+    #[arg(long, env = "BT_EVAL_DEV_ORG_NAME")]
     pub dev_org_name: Option<String>,
 
     /// Additional allowed browser origin(s) for eval dev server CORS checks.
@@ -2635,9 +2666,49 @@ fn convert_color(color: Color) -> CtColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Parser)]
+    struct EvalArgsHarness {
+        #[command(flatten)]
+        eval: EvalArgs,
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_env_var(key: &str, value: &str) -> Option<String> {
+        let previous = std::env::var(key).ok();
+        // Safe in tests because access is serialized with env_test_lock().
+        unsafe { std::env::set_var(key, value) };
+        previous
+    }
+
+    fn clear_env_var(key: &str) -> Option<String> {
+        let previous = std::env::var(key).ok();
+        // Safe in tests because access is serialized with env_test_lock().
+        unsafe { std::env::remove_var(key) };
+        previous
+    }
+
+    fn restore_env_var(key: &str, previous: Option<String>) {
+        match previous {
+            Some(value) => {
+                // Safe in tests because access is serialized with env_test_lock().
+                unsafe { std::env::set_var(key, value) };
+            }
+            None => {
+                // Safe in tests because access is serialized with env_test_lock().
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+    }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let now = SystemTime::now()
@@ -2924,5 +2995,59 @@ mod tests {
             err.to_string().contains("Invalid filter"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn eval_args_from_env_populates_supported_fields() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = [
+            "BT_EVAL_JSONL",
+            "BT_EVAL_TERMINATE_ON_FAILURE",
+            "BT_EVAL_NUM_WORKERS",
+            "BT_EVAL_LIST",
+            "BT_EVAL_FILTER",
+            "BT_EVAL_WATCH",
+            "BT_EVAL_DEV",
+            "BT_EVAL_DEV_HOST",
+            "BT_EVAL_DEV_PORT",
+            "BT_EVAL_DEV_ORG_NAME",
+        ];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+        set_env_var("BT_EVAL_JSONL", "true");
+        set_env_var("BT_EVAL_TERMINATE_ON_FAILURE", "1");
+        set_env_var("BT_EVAL_NUM_WORKERS", "4");
+        set_env_var("BT_EVAL_LIST", "yes");
+        set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
+        set_env_var("BT_EVAL_WATCH", "on");
+        set_env_var("BT_EVAL_DEV", "true");
+        set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
+        set_env_var("BT_EVAL_DEV_PORT", "9999");
+        set_env_var("BT_EVAL_DEV_ORG_NAME", "acme");
+
+        let parsed = EvalArgsHarness::try_parse_from(["bt", "sample.eval.ts"])
+            .expect("env vars should parse into eval args");
+        assert!(parsed.eval.jsonl);
+        assert!(parsed.eval.terminate_on_failure);
+        assert_eq!(parsed.eval.num_workers, Some(4));
+        assert!(parsed.eval.list);
+        assert_eq!(
+            parsed.eval.filter,
+            vec![
+                "metadata.case=smoke.*".to_string(),
+                "metadata.kind=fast".to_string()
+            ]
+        );
+        assert!(parsed.eval.watch);
+        assert!(parsed.eval.dev);
+        assert_eq!(parsed.eval.dev_host, "127.0.0.1");
+        assert_eq!(parsed.eval.dev_port, 9999);
+        assert_eq!(parsed.eval.dev_org_name, Some("acme".to_string()));
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
     }
 }
