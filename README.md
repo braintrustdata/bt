@@ -78,6 +78,9 @@ bt self update --check
 
 # switch/update to latest mainline canary
 bt self update --channel canary
+
+# switch/update to the moving canary tag for a specific branch
+bt self update --channel canary --canary-branch <branch-name>
 ```
 
 If `bt` was installed via another package manager (Homebrew, apt, choco, etc), use that package manager to update instead.
