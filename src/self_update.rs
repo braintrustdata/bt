@@ -15,6 +15,7 @@ Examples:
   bt self update
   bt self update --check
   bt self update --channel canary
+  bt self update --channel canary --canary-branch my-feature
 ")]
 pub struct SelfArgs {
     #[command(subcommand)]
@@ -36,6 +37,10 @@ pub struct UpdateArgs {
     /// Update channel (defaults to the build channel)
     #[arg(long, value_enum)]
     pub channel: Option<UpdateChannel>,
+
+    /// Canary branch to target (maps to release tag: canary-<branch-slug>)
+    #[arg(long, env = "BT_SELF_UPDATE_CANARY_BRANCH", value_name = "BRANCH")]
+    pub canary_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -44,42 +49,62 @@ pub enum UpdateChannel {
     Canary,
 }
 
-impl UpdateChannel {
-    fn installer_url(self) -> &'static str {
-        match self {
-            UpdateChannel::Stable => {
-                "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh"
-            }
-            UpdateChannel::Canary => {
-                "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh"
-            }
-        }
-    }
-
-    fn github_release_api_url(self) -> &'static str {
-        match self {
-            UpdateChannel::Stable => {
-                "https://api.github.com/repos/braintrustdata/bt/releases/latest"
-            }
-            UpdateChannel::Canary => {
-                "https://api.github.com/repos/braintrustdata/bt/releases/tags/canary"
-            }
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            UpdateChannel::Stable => "stable",
-            UpdateChannel::Canary => "canary",
-        }
-    }
-}
-
 const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum UpdateTarget {
+    Stable,
+    Canary,
+    CanaryBranch { slug: String },
+}
+
+impl UpdateTarget {
+    fn installer_url(&self) -> String {
+        match self {
+            UpdateTarget::Stable => {
+                "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh"
+                    .to_string()
+            }
+            UpdateTarget::Canary => {
+                "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh"
+                    .to_string()
+            }
+            UpdateTarget::CanaryBranch { slug } => format!(
+                "https://github.com/braintrustdata/bt/releases/download/canary-{slug}/bt-installer.sh"
+            ),
+        }
+    }
+
+    fn github_release_api_url(&self) -> String {
+        match self {
+            UpdateTarget::Stable => {
+                "https://api.github.com/repos/braintrustdata/bt/releases/latest".to_string()
+            }
+            UpdateTarget::Canary => {
+                "https://api.github.com/repos/braintrustdata/bt/releases/tags/canary".to_string()
+            }
+            UpdateTarget::CanaryBranch { slug } => format!(
+                "https://api.github.com/repos/braintrustdata/bt/releases/tags/canary-{slug}"
+            ),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            UpdateTarget::Stable => "stable".to_string(),
+            UpdateTarget::Canary => "canary".to_string(),
+            UpdateTarget::CanaryBranch { slug } => format!("canary-{slug}"),
+        }
+    }
+
+    fn is_stable(&self) -> bool {
+        matches!(self, UpdateTarget::Stable)
+    }
 }
 
 pub async fn run(args: SelfArgs) -> Result<()> {
@@ -93,14 +118,15 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
     let channel = args
         .channel
         .unwrap_or_else(|| inferred_update_channel(BUILD_UPDATE_CHANNEL));
+    let target = resolve_update_target(channel, args.canary_branch.as_deref())?;
 
     if args.check {
-        check_for_update(channel).await?;
+        check_for_update(&target).await?;
         return Ok(());
     }
 
-    if channel == UpdateChannel::Stable {
-        match fetch_release(channel).await {
+    if target.is_stable() {
+        match fetch_release(&target).await {
             Ok(release) => {
                 let current = env!("CARGO_PKG_VERSION");
                 if stable_is_up_to_date(current, &release.tag_name) {
@@ -116,7 +142,7 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(channel)?;
+    run_installer(&target)?;
     Ok(())
 }
 
@@ -134,23 +160,26 @@ fn ensure_installer_managed_install() -> Result<()> {
     );
 }
 
-async fn check_for_update(channel: UpdateChannel) -> Result<()> {
-    let release = fetch_release(channel).await?;
+async fn check_for_update(target: &UpdateTarget) -> Result<()> {
+    let release = fetch_release(target).await?;
     let current = env!("CARGO_PKG_VERSION");
 
-    match channel {
-        UpdateChannel::Stable => {
+    match target {
+        UpdateTarget::Stable => {
             println!("{}", stable_check_message(current, &release.tag_name));
         }
-        UpdateChannel::Canary => {
-            println!("{}", canary_check_message(&release.tag_name));
+        UpdateTarget::Canary => {
+            println!("{}", canary_check_message(&release.tag_name, None));
+        }
+        UpdateTarget::CanaryBranch { slug } => {
+            println!("{}", canary_check_message(&release.tag_name, Some(slug)));
         }
     }
 
     Ok(())
 }
 
-async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
+async fn fetch_release(target: &UpdateTarget) -> Result<GitHubRelease> {
     let client = Client::builder()
         .user_agent("bt-self-update")
         .timeout(DEFAULT_HTTP_TIMEOUT)
@@ -158,7 +187,7 @@ async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
         .context("failed to initialize HTTP client")?;
 
     let mut request = client
-        .get(channel.github_release_api_url())
+        .get(target.github_release_api_url())
         .header("Accept", "application/vnd.github+json");
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         let token = token.trim();
@@ -183,11 +212,11 @@ async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
         .context("failed to parse GitHub release response")
 }
 
-fn run_installer(channel: UpdateChannel) -> Result<()> {
+fn run_installer(target: &UpdateTarget) -> Result<()> {
     #[cfg(not(windows))]
     {
-        let installer_url = channel.installer_url();
-        println!("updating bt from {} channel...", channel.name());
+        let installer_url = target.installer_url();
+        println!("updating bt from {} channel...", target.name());
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let status = Command::new("sh")
             .arg("-c")
@@ -205,13 +234,18 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
 
     #[cfg(windows)]
     {
-        let installer_url = match channel {
-            UpdateChannel::Stable => {
+        let installer_url = match target {
+            UpdateTarget::Stable => {
                 "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1"
+                    .to_string()
             }
-            UpdateChannel::Canary => {
+            UpdateTarget::Canary => {
                 "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1"
+                    .to_string()
             }
+            UpdateTarget::CanaryBranch { slug } => format!(
+                "https://github.com/braintrustdata/bt/releases/download/canary-{slug}/bt-installer.ps1"
+            ),
         };
         let script = format!("irm {installer_url} | iex");
         let status = Command::new("powershell")
@@ -313,10 +347,15 @@ fn stable_is_up_to_date(current: &str, release_tag: &str) -> bool {
     latest == current
 }
 
-fn canary_check_message(release_tag: &str) -> String {
-    format!(
-        "latest canary release tag: {release_tag}\nrun `bt self update --channel canary` to install it"
-    )
+fn canary_check_message(release_tag: &str, branch_slug: Option<&str>) -> String {
+    match branch_slug {
+        Some(slug) => format!(
+            "latest canary release tag: {release_tag}\nrun `bt self update --channel canary --canary-branch {slug}` to install it"
+        ),
+        None => format!(
+            "latest canary release tag: {release_tag}\nrun `bt self update --channel canary` to install it"
+        ),
+    }
 }
 
 fn parse_update_channel(raw: Option<&str>) -> Option<UpdateChannel> {
@@ -331,6 +370,48 @@ fn inferred_update_channel(raw: Option<&str>) -> UpdateChannel {
     parse_update_channel(raw).unwrap_or(UpdateChannel::Canary)
 }
 
+fn resolve_update_target(
+    channel: UpdateChannel,
+    canary_branch: Option<&str>,
+) -> Result<UpdateTarget> {
+    if let Some(branch) = canary_branch {
+        if channel == UpdateChannel::Stable {
+            anyhow::bail!("--canary-branch requires --channel canary.");
+        }
+        let slug = canary_branch_slug(branch);
+        return Ok(UpdateTarget::CanaryBranch { slug });
+    }
+
+    Ok(match channel {
+        UpdateChannel::Stable => UpdateTarget::Stable,
+        UpdateChannel::Canary => UpdateTarget::Canary,
+    })
+}
+
+fn canary_branch_slug(branch: &str) -> String {
+    let lower = branch.trim().to_ascii_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    let mut prev_dash = false;
+
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-').to_string();
+    let collapsed = if trimmed.is_empty() {
+        "branch".to_string()
+    } else {
+        trimmed
+    };
+    collapsed.chars().take(40).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,20 +420,34 @@ mod tests {
     #[test]
     fn channel_urls_are_expected() {
         assert_eq!(
-            UpdateChannel::Stable.installer_url(),
+            UpdateTarget::Stable.installer_url(),
             "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh"
         );
         assert_eq!(
-            UpdateChannel::Canary.installer_url(),
+            UpdateTarget::Canary.installer_url(),
             "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh"
         );
         assert_eq!(
-            UpdateChannel::Stable.github_release_api_url(),
+            UpdateTarget::Stable.github_release_api_url(),
             "https://api.github.com/repos/braintrustdata/bt/releases/latest"
         );
         assert_eq!(
-            UpdateChannel::Canary.github_release_api_url(),
+            UpdateTarget::Canary.github_release_api_url(),
             "https://api.github.com/repos/braintrustdata/bt/releases/tags/canary"
+        );
+        assert_eq!(
+            (UpdateTarget::CanaryBranch {
+                slug: "my-branch".to_string()
+            })
+            .installer_url(),
+            "https://github.com/braintrustdata/bt/releases/download/canary-my-branch/bt-installer.sh"
+        );
+        assert_eq!(
+            (UpdateTarget::CanaryBranch {
+                slug: "my-branch".to_string()
+            })
+            .github_release_api_url(),
+            "https://api.github.com/repos/braintrustdata/bt/releases/tags/canary-my-branch"
         );
     }
 
@@ -401,9 +496,13 @@ mod tests {
 
     #[test]
     fn canary_check_message_contains_guidance() {
-        let msg = canary_check_message("canary-deadbeef");
+        let msg = canary_check_message("canary-deadbeef", None);
         assert!(msg.contains("canary-deadbeef"));
         assert!(msg.contains("bt self update --channel canary"));
+
+        let branch_msg = canary_check_message("canary-my-branch-deadbeef", Some("my-branch"));
+        assert!(branch_msg.contains("canary-my-branch-deadbeef"));
+        assert!(branch_msg.contains("--canary-branch my-branch"));
     }
 
     #[test]
@@ -447,5 +546,38 @@ mod tests {
             inferred_update_channel(Some("canary")),
             UpdateChannel::Canary
         );
+    }
+
+    #[test]
+    fn canary_branch_slug_matches_workflow_style() {
+        assert_eq!(
+            canary_branch_slug("Feature/My Big_branch..name"),
+            "feature-my-big-branch-name"
+        );
+        assert_eq!(canary_branch_slug("___"), "branch");
+        assert_eq!(
+            canary_branch_slug("abcdefghijklmnopqrstuvwxyz0123456789-extra"),
+            "abcdefghijklmnopqrstuvwxyz0123456789-ext"
+        );
+    }
+
+    #[test]
+    fn resolve_update_target_handles_canary_branch() {
+        let target = resolve_update_target(UpdateChannel::Canary, Some("My Branch")).unwrap();
+        assert_eq!(
+            target,
+            UpdateTarget::CanaryBranch {
+                slug: "my-branch".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_update_target_rejects_stable_with_canary_branch() {
+        let err = resolve_update_target(UpdateChannel::Stable, Some("main"))
+            .expect_err("expected stable/canary-branch conflict");
+        assert!(err
+            .to_string()
+            .contains("--canary-branch requires --channel canary"));
     }
 }
