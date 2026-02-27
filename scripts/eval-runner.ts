@@ -1269,6 +1269,10 @@ async function main() {
   const braintrust = await loadBraintrust();
   propagateInheritedBraintrustState(braintrust);
   initRegistry();
+  // Strip eval file paths from process.argv before loading user code so that
+  // user-side parseArgs({ strict: true }) does not see them as unexpected
+  // positional arguments.
+  process.argv = process.argv.slice(0, 2);
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 
