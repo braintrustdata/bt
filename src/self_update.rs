@@ -124,7 +124,8 @@ fn ensure_installer_managed_install() -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
 
     let receipt_exists = receipt_path().as_ref().is_some_and(|path| path.exists());
-    if is_installer_managed_install(&exe, receipt_exists, cargo_home_bin_path().as_deref()) {
+    let installer_bin_paths = installer_bin_paths();
+    if is_installer_managed_install(&exe, receipt_exists, &installer_bin_paths) {
         return Ok(());
     }
 
@@ -256,18 +257,39 @@ fn cargo_home_bin_path() -> Option<PathBuf> {
         return Some(PathBuf::from(cargo_home).join("bin"));
     }
 
+    user_home_dir().map(|path| path.join(".cargo").join("bin"))
+}
+
+fn user_home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .map(|path| path.join(".cargo").join("bin"))
+        env::var_os("USERPROFILE").map(PathBuf::from)
     }
     #[cfg(not(windows))]
     {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|path| path.join(".cargo").join("bin"))
+        env::var_os("HOME").map(PathBuf::from)
     }
+}
+
+fn installer_bin_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(path) = cargo_home_bin_path() {
+        paths.push(path);
+    }
+    // These environment lookups match cargo-dist installer path conventions.
+    // They are internal install-detection plumbing, not user-facing runtime config.
+    if let Some(path) = env::var_os("XDG_BIN_HOME") {
+        paths.push(PathBuf::from(path));
+    }
+    if let Some(path) = env::var_os("XDG_DATA_HOME") {
+        paths.push(PathBuf::from(path).join("..").join("bin"));
+    }
+    if let Some(path) = user_home_dir() {
+        paths.push(path.join(".local").join("bin"));
+    }
+
+    paths
 }
 
 fn binary_name() -> &'static str {
@@ -290,15 +312,15 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 fn is_installer_managed_install(
     exe: &Path,
     receipt_exists: bool,
-    cargo_home_bin: Option<&Path>,
+    installer_bin_paths: &[PathBuf],
 ) -> bool {
     if receipt_exists {
         return true;
     }
 
-    cargo_home_bin
-        .map(|bin| paths_equal(exe, &bin.join(binary_name())))
-        .unwrap_or(false)
+    installer_bin_paths
+        .iter()
+        .any(|bin| paths_equal(exe, &bin.join(binary_name())))
 }
 
 fn stable_check_message(current: &str, release_tag: &str) -> String {
@@ -359,7 +381,7 @@ mod tests {
     #[test]
     fn installer_detection_accepts_receipt() {
         let exe = Path::new("/tmp/not-in-cargo-home/bt");
-        assert!(is_installer_managed_install(exe, true, None));
+        assert!(is_installer_managed_install(exe, true, &[]));
     }
 
     #[test]
@@ -369,18 +391,30 @@ mod tests {
         assert!(is_installer_managed_install(
             &exe,
             false,
-            Some(cargo_home_bin)
+            &[cargo_home_bin.to_path_buf()]
+        ));
+    }
+
+    #[test]
+    fn installer_detection_accepts_local_bin_path() {
+        let local_bin = Path::new("/tmp/home/.local/bin");
+        let exe = local_bin.join(binary_name());
+        assert!(is_installer_managed_install(
+            &exe,
+            false,
+            &[local_bin.to_path_buf()]
         ));
     }
 
     #[test]
     fn installer_detection_rejects_non_installer_location() {
         let cargo_home_bin = Path::new("/tmp/cargo/bin");
+        let local_bin = Path::new("/tmp/home/.local/bin");
         let exe = Path::new("/usr/local/bin/bt");
         assert!(!is_installer_managed_install(
             exe,
             false,
-            Some(cargo_home_bin)
+            &[cargo_home_bin.to_path_buf(), local_bin.to_path_buf()]
         ));
     }
 
