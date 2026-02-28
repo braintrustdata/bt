@@ -66,6 +66,29 @@ enum SyncCommand {
     Status(StatusArgs),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SyncCommandKind {
+    Pull,
+    Push,
+    Status,
+}
+
+fn sync_command_kind(command: &SyncCommand) -> SyncCommandKind {
+    match command {
+        SyncCommand::Pull(_) => SyncCommandKind::Pull,
+        SyncCommand::Push(_) => SyncCommandKind::Push,
+        SyncCommand::Status(_) => SyncCommandKind::Status,
+    }
+}
+
+fn policy_for_sync_command(kind: SyncCommandKind) -> Option<LoginPolicy> {
+    match kind {
+        SyncCommandKind::Pull => Some(LoginPolicy::Fast),
+        SyncCommandKind::Push => Some(LoginPolicy::Validated),
+        SyncCommandKind::Status => None,
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 struct PullArgs {
     /// Source object reference, format object_type:object_id_or_name.
@@ -528,22 +551,53 @@ struct JsonlPartWriter {
 }
 
 pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
+    let command_kind = sync_command_kind(&args.command);
     let project = base
         .project
         .clone()
         .or_else(|| crate::config::load().ok().and_then(|c| c.project));
     match args.command {
         SyncCommand::Pull(pull) => {
-            let ctx = login_with_policy(&base, LoginPolicy::Fast, true).await?;
+            let policy = policy_for_sync_command(command_kind)
+                .expect("pull command must have a login policy");
+            let ctx = login_with_policy(&base, policy, true).await?;
             let client = ApiClient::new(&ctx)?;
             run_pull(base.json, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
-            let ctx = login_with_policy(&base, LoginPolicy::Validated, true).await?;
+            let policy = policy_for_sync_command(command_kind)
+                .expect("push command must have a login policy");
+            let ctx = login_with_policy(&base, policy, true).await?;
             let client = ApiClient::new(&ctx)?;
             run_push(base.json, &ctx, &client, project.as_deref(), push).await
         }
         SyncCommand::Status(status) => run_status(base.json, status),
+    }
+}
+
+#[cfg(test)]
+mod login_policy_tests {
+    use super::*;
+
+    #[test]
+    fn push_uses_validated_login() {
+        assert_eq!(
+            policy_for_sync_command(SyncCommandKind::Push),
+            Some(LoginPolicy::Validated)
+        );
+    }
+
+    #[test]
+    fn pull_uses_fast_login() {
+        assert_eq!(
+            policy_for_sync_command(SyncCommandKind::Pull),
+            Some(LoginPolicy::Fast)
+        );
+    }
+
+    #[test]
+    fn status_skips_login() {
+        assert_eq!(policy_for_sync_command(SyncCommandKind::Status), None);
     }
 }
 

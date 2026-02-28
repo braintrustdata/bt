@@ -19,6 +19,14 @@ pub(crate) struct ProjectContext {
     pub project: Project,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StaleRecoveryPath {
+    ErrorRequiresExplicitSelector,
+    NonInteractiveUseResolved,
+    InteractiveConfirmOrSelect,
+    InteractiveSelectOnly,
+}
+
 pub(crate) async fn resolve_project_or_select(
     base: &BaseArgs,
     client: &ApiClient,
@@ -89,21 +97,45 @@ async fn recover_stale_project(
     resolved_by_name: Option<Project>,
     explicit_project_name: bool,
 ) -> Result<Project> {
-    let interactive = ui::is_interactive();
-    if !interactive && !explicit_project_name {
-        bail!(
+    let path = decide_stale_recovery_path(
+        ui::is_interactive(),
+        explicit_project_name,
+        resolved_by_name.is_some(),
+    );
+    let healed = match path {
+        StaleRecoveryPath::ErrorRequiresExplicitSelector => bail!(
             "cached project_id for '{requested_name}' is stale. In non-interactive mode, pass --project <project-name> or --project-id <project-id>."
-        );
-    }
-
-    let healed = if interactive {
-        choose_healed_project_interactive(client, requested_name, resolved_by_name.as_ref()).await?
-    } else {
-        resolved_by_name.ok_or_else(|| anyhow!("project '{requested_name}' not found"))?
+        ),
+        StaleRecoveryPath::NonInteractiveUseResolved => {
+            resolved_by_name.ok_or_else(|| anyhow!("project '{requested_name}' not found"))?
+        }
+        StaleRecoveryPath::InteractiveConfirmOrSelect | StaleRecoveryPath::InteractiveSelectOnly => {
+            choose_healed_project_interactive(client, requested_name, resolved_by_name.as_ref())
+                .await?
+        }
     };
 
     maybe_heal_project_config(cfg.project.as_deref(), &healed)?;
     Ok(healed)
+}
+
+fn decide_stale_recovery_path(
+    interactive: bool,
+    explicit_project_name: bool,
+    resolved_by_name_exists: bool,
+) -> StaleRecoveryPath {
+    if !interactive && !explicit_project_name {
+        return StaleRecoveryPath::ErrorRequiresExplicitSelector;
+    }
+    if interactive {
+        if resolved_by_name_exists {
+            StaleRecoveryPath::InteractiveConfirmOrSelect
+        } else {
+            StaleRecoveryPath::InteractiveSelectOnly
+        }
+    } else {
+        StaleRecoveryPath::NonInteractiveUseResolved
+    }
 }
 
 async fn choose_healed_project_interactive(
@@ -274,5 +306,37 @@ mod tests {
         let cfg = config(Some("foo"), Some("proj_ok"));
         let resolved = project("bar", "proj_ok");
         assert!(!has_stale_cached_project_id(&cfg, "bar", Some(&resolved)));
+    }
+
+    #[test]
+    fn stale_recovery_requires_explicit_selector_when_non_interactive() {
+        assert_eq!(
+            decide_stale_recovery_path(false, false, true),
+            StaleRecoveryPath::ErrorRequiresExplicitSelector
+        );
+    }
+
+    #[test]
+    fn stale_recovery_allows_non_interactive_when_explicit_project_provided() {
+        assert_eq!(
+            decide_stale_recovery_path(false, true, true),
+            StaleRecoveryPath::NonInteractiveUseResolved
+        );
+    }
+
+    #[test]
+    fn stale_recovery_interactive_uses_confirm_when_named_match_exists() {
+        assert_eq!(
+            decide_stale_recovery_path(true, false, true),
+            StaleRecoveryPath::InteractiveConfirmOrSelect
+        );
+    }
+
+    #[test]
+    fn stale_recovery_interactive_falls_back_to_selection_when_named_match_missing() {
+        assert_eq!(
+            decide_stale_recovery_path(true, false, false),
+            StaleRecoveryPath::InteractiveSelectOnly
+        );
     }
 }
