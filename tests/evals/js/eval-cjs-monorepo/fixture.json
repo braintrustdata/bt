@@ -1,0 +1,4 @@
+{
+  "files": ["tests/basic.eval.cjs"],
+  "runners": ["tsx", "vite-node", "bun", "deno"]
+}
