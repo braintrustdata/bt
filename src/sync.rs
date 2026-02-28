@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
-use crate::auth::{login, LoginContext};
+use crate::auth::{login_with_policy, LoginContext, LoginPolicy};
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
@@ -534,12 +534,12 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
         .or_else(|| crate::config::load().ok().and_then(|c| c.project));
     match args.command {
         SyncCommand::Pull(pull) => {
-            let ctx = login(&base).await?;
+            let ctx = login_with_policy(&base, LoginPolicy::Fast, true).await?;
             let client = ApiClient::new(&ctx)?;
             run_pull(base.json, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
-            let ctx = login(&base).await?;
+            let ctx = login_with_policy(&base, LoginPolicy::Validated, true).await?;
             let client = ApiClient::new(&ctx)?;
             run_push(base.json, &ctx, &client, project.as_deref(), push).await
         }

@@ -289,6 +289,64 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LoginPolicy {
+    Fast,
+    Validated,
+}
+
+pub async fn login_with_policy(
+    base: &BaseArgs,
+    policy: LoginPolicy,
+    require_org_name: bool,
+) -> Result<LoginContext> {
+    let mut ctx = match policy {
+        LoginPolicy::Fast => fast_login(base).await?,
+        LoginPolicy::Validated => login(base).await?,
+    };
+
+    if require_org_name
+        && ctx.login.org_name.trim().is_empty()
+        && matches!(policy, LoginPolicy::Fast)
+    {
+        ctx = login(base).await?;
+    }
+
+    Ok(ctx)
+}
+
+/// Build login context from stored auth without forcing a login validation request.
+/// Use for read-oriented flows where downstream API calls can surface auth errors.
+pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
+    maybe_warn_api_key_override(base);
+    let auth = resolve_auth(base).await?;
+    let api_key = auth.api_key.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
+        )
+    })?;
+    let org_name = auth.org_name.clone().unwrap_or_default();
+    let api_url = auth
+        .api_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let app_url = auth
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+
+    Ok(LoginContext {
+        login: LoginState {
+            api_key,
+            org_id: String::new(),
+            org_name,
+            api_url: Some(api_url.clone()),
+        },
+        api_url,
+        app_url,
+    })
+}
+
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;

@@ -3,7 +3,7 @@ use clap::Args;
 
 use crate::{
     args::BaseArgs,
-    auth::{self, login},
+    auth::{self, login_with_policy, LoginPolicy},
     config,
     http::ApiClient,
     ui::{is_interactive, print_command_status, select_project_interactive, CommandStatus},
@@ -37,7 +37,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
                 login_base.profile = Some(profile);
             }
         }
-        let ctx = login(&login_base).await?;
+        let ctx = login_with_policy(&login_base, LoginPolicy::Validated, true).await?;
         let client = ApiClient::new(&ctx)?;
 
         let org = client.org_name().to_string();

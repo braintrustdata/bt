@@ -3,7 +3,7 @@ use clap::Args;
 use dialoguer::{console, theme::ColorfulTheme, Select};
 
 use crate::args::BaseArgs;
-use crate::auth::{self, login};
+use crate::auth::{self, login_with_policy, LoginPolicy};
 use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
@@ -108,7 +108,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    let ctx = login(&login_base).await?;
+    let ctx = login_with_policy(&login_base, LoginPolicy::Validated, true).await?;
     let client = ApiClient::new(&ctx)?;
     let org_name = client.org_name();
 

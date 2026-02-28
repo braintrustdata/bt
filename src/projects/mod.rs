@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::args::BaseArgs;
-use crate::auth::login;
+use crate::auth::{login_with_policy, LoginPolicy};
 use crate::http::ApiClient;
 
 pub(crate) mod api;
@@ -72,17 +72,26 @@ struct DeleteArgs {
 }
 
 pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
-    let ctx = login(&base).await?;
-    let client = ApiClient::new(&ctx)?;
-
     match args.command {
         None | Some(ProjectsCommands::List) => {
+            let ctx = login_with_policy(&base, LoginPolicy::Fast, true).await?;
+            let client = ApiClient::new(&ctx)?;
             list::run(&client, &ctx.login.org_name, base.json).await
         }
-        Some(ProjectsCommands::Create(a)) => create::run(&client, a.name.as_deref()).await,
+        Some(ProjectsCommands::Create(a)) => {
+            let ctx = login_with_policy(&base, LoginPolicy::Validated, true).await?;
+            let client = ApiClient::new(&ctx)?;
+            create::run(&client, a.name.as_deref()).await
+        }
         Some(ProjectsCommands::View(a)) => {
+            let ctx = login_with_policy(&base, LoginPolicy::Fast, true).await?;
+            let client = ApiClient::new(&ctx)?;
             view::run(&client, &ctx.app_url, &ctx.login.org_name, a.name()).await
         }
-        Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref(), a.force).await,
+        Some(ProjectsCommands::Delete(a)) => {
+            let ctx = login_with_policy(&base, LoginPolicy::Validated, true).await?;
+            let client = ApiClient::new(&ctx)?;
+            delete::run(&client, a.name.as_deref(), a.force).await
+        }
     }
 }
