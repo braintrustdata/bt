@@ -32,18 +32,23 @@ pub struct Function {
     pub _xact_id: Option<String>,
 }
 
+pub const FUNCTION_LIST_FIELDS: &str =
+    "id, name, slug, project_id, function_type, description, _xact_id";
+
 pub async fn list_functions(
     client: &ApiClient,
     project_id: &str,
     function_type: Option<&str>,
+    fields: Option<&str>,
 ) -> Result<Vec<Function>> {
     let pid = escape_sql(project_id);
+    let fields = fields.unwrap_or("*");
     let query = match function_type {
         Some(ft) => {
             let ft = escape_sql(ft);
-            format!("SELECT * FROM project_functions('{pid}') WHERE function_type = '{ft}'")
+            format!("SELECT {fields} FROM project_functions('{pid}') WHERE function_type = '{ft}'")
         }
-        None => format!("SELECT * FROM project_functions('{pid}')"),
+        None => format!("SELECT {fields} FROM project_functions('{pid}')"),
     };
     let response = client.btql::<Function>(&query).await?;
 

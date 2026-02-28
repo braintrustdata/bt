@@ -12,9 +12,14 @@ use super::{api, label, label_plural, FunctionTypeFilter, ResolvedContext};
 
 pub async fn run(ctx: &ResolvedContext, json: bool, ft: Option<FunctionTypeFilter>) -> Result<()> {
     let function_type = ft.map(|f| f.as_str());
+    let fields = if json {
+        None
+    } else {
+        Some(api::FUNCTION_LIST_FIELDS)
+    };
     let functions = with_spinner(
         &format!("Loading {}...", label_plural(ft)),
-        api::list_functions(&ctx.client, &ctx.project.id, function_type),
+        api::list_functions(&ctx.client, &ctx.project.id, function_type, fields),
     )
     .await?;
 

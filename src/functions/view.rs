@@ -38,7 +38,17 @@ pub async fn run(
                     label_plural(ft),
                 );
             }
-            select_function_interactive(&ctx.client, project_id, ft).await?
+            let selected = select_function_interactive(&ctx.client, project_id, ft).await?;
+            if web {
+                selected
+            } else {
+                with_spinner(
+                    &format!("Loading {}...", label(ft)),
+                    api::get_function_by_slug(&ctx.client, project_id, &selected.slug),
+                )
+                .await?
+                .ok_or_else(|| anyhow!("{} with slug '{}' not found", label(ft), selected.slug))?
+            }
         }
     };
 

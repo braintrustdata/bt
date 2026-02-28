@@ -267,7 +267,12 @@ pub(crate) async fn select_function_interactive(
     let function_type = ft.map(|f| f.as_str());
     let mut functions = with_spinner(
         &format!("Loading {}...", label_plural(ft)),
-        api::list_functions(client, project_id, function_type),
+        api::list_functions(
+            client,
+            project_id,
+            function_type,
+            Some(api::FUNCTION_LIST_FIELDS),
+        ),
     )
     .await?;
 
