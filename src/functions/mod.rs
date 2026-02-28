@@ -1,13 +1,12 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::{
     args::BaseArgs,
     auth::login,
-    config,
     http::ApiClient,
-    projects::api::{get_project_by_name, Project},
-    ui::{self, is_interactive, select_project_interactive, with_spinner},
+    projects::resolve::{resolve_project_or_select, ProjectContext},
+    ui::{self, with_spinner},
 };
 
 pub(crate) mod api;
@@ -245,24 +244,12 @@ impl DeleteArgs {
 
 // --- Resolved context ---
 
-pub(crate) struct ResolvedContext {
-    pub client: ApiClient,
-    pub app_url: String,
-    pub project: Project,
-}
+pub(crate) type ResolvedContext = ProjectContext;
 
 async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
     let ctx = login(base).await?;
     let client = ApiClient::new(&ctx)?;
-    let config_project = config::load().ok().and_then(|c| c.project);
-    let project_name = match base.project.as_deref().or(config_project.as_deref()) {
-        Some(p) => p.to_string(),
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
-        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
-    };
-    let project = get_project_by_name(&client, &project_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
+    let project = resolve_project_or_select(base, &client).await?;
     Ok(ResolvedContext {
         client,
         app_url: ctx.app_url,

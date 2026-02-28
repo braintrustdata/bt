@@ -9,6 +9,7 @@ pub(crate) mod api;
 mod create;
 mod delete;
 mod list;
+pub(crate) mod resolve;
 mod view;
 
 #[derive(Debug, Clone, Args)]
