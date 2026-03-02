@@ -110,16 +110,23 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let ctx = login(&login_base).await?;
     let client = ApiClient::new(&ctx)?;
-    let org_name = client.org_name();
+    let org_name = client.org_name().to_string();
 
-    let project_name = match resolved_project {
-        Some(p) => Some(validate_or_create_project(&client, &p).await?),
+    let project = match resolved_project {
+        Some(p) => validate_or_create_project(&client, &p).await?,
         None => {
             if !is_interactive() {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
-            Some(select_project_interactive(&client, None, current_cfg.project.as_deref()).await?)
+            let selected_name =
+                select_project_interactive(&client, None, current_cfg.project.as_deref()).await?;
+            with_spinner(
+                "Loading project...",
+                api::get_project_by_name(&client, &selected_name),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("project '{selected_name}' not found"))?
         }
     };
 
@@ -138,15 +145,13 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     };
 
     let mut cfg = config::load_file(&path);
-    cfg.org = Some(org_name.to_string());
-    cfg.project = project_name.clone();
+    cfg.org = Some(org_name.clone());
+    cfg.project = Some(project.name.clone());
+    cfg.project_id = Some(project.id.clone());
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 
-    let display = match &project_name {
-        Some(p) => format!("{org_name}/{p}"),
-        None => org_name.to_string(),
-    };
+    let display = format!("{org_name}/{}", project.name);
     print_command_status(CommandStatus::Success, &format!("Switched to {display}"));
     if args.verbose {
         eprintln!("Wrote to {}", path.display());
@@ -204,11 +209,11 @@ fn select_scope() -> Result<std::path::PathBuf> {
     }
 }
 
-async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<String> {
+async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<api::Project> {
     let exists = with_spinner("Loading project...", api::get_project_by_name(client, name)).await?;
 
-    if exists.is_some() {
-        return Ok(name.to_string());
+    if let Some(project) = exists {
+        return Ok(project);
     }
 
     if !is_interactive() {
@@ -221,8 +226,7 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<St
         .interact()?;
 
     if create {
-        with_spinner("Creating project...", api::create_project(client, name)).await?;
-        Ok(name.to_string())
+        with_spinner("Creating project...", api::create_project(client, name)).await
     } else {
         bail!("project '{name}' not found");
     }

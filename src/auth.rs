@@ -324,6 +324,46 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     }
 }
 
+pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
+    if has_cached_project_id() {
+        fast_login(base).await
+    } else {
+        login(base).await
+    }
+}
+
+/// Build login context from stored auth without forcing a login validation request.
+/// Use for read-oriented flows where downstream API calls can surface auth errors.
+pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
+    maybe_warn_api_key_override(base);
+    let auth = resolve_auth(base).await?;
+    let api_key = auth.api_key.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
+        )
+    })?;
+    let org_name = auth.org_name.clone().unwrap_or_default();
+    let api_url = auth
+        .api_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let app_url = auth
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+
+    Ok(LoginContext {
+        login: LoginState {
+            api_key,
+            org_id: String::new(),
+            org_name,
+            api_url: Some(api_url.clone()),
+        },
+        api_url,
+        app_url,
+    })
+}
+
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
@@ -387,6 +427,13 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         api_url,
         app_url,
     })
+}
+
+fn has_cached_project_id() -> bool {
+    crate::config::load()
+        .ok()
+        .and_then(|config| config.project_id)
+        .is_some_and(|project_id| !project_id.trim().is_empty())
 }
 
 fn maybe_warn_api_key_override(base: &BaseArgs) {
