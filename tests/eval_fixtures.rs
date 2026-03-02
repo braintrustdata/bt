@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::Value;
+#[cfg(unix)]
+use tempfile::TempDir;
 
 #[derive(Debug, Deserialize, Clone)]
 struct FixtureConfig {
@@ -31,6 +33,10 @@ fn test_lock() -> MutexGuard<'static, ()> {
 #[test]
 fn eval_fixtures() {
     let _guard = test_lock();
+    if !unix_socket_bind_supported() {
+        eprintln!("Skipping eval_fixtures (unix socket bind unavailable).");
+        return;
+    }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures_root = root.join("tests").join("evals");
     if !fixtures_root.exists() {
@@ -198,6 +204,10 @@ fn eval_fixtures() {
 #[test]
 fn eval_watch_js_dependency_retriggers() {
     let _guard = test_lock();
+    if !unix_socket_bind_supported() {
+        eprintln!("Skipping eval_watch_js_dependency_retriggers (unix socket bind unavailable).");
+        return;
+    }
     if !command_exists("node") {
         if required_runtimes().contains("node") {
             panic!("node runtime is required but unavailable for watch test");
@@ -226,6 +236,10 @@ fn eval_watch_js_dependency_retriggers() {
 #[test]
 fn eval_watch_bun_dependency_retriggers() {
     let _guard = test_lock();
+    if !unix_socket_bind_supported() {
+        eprintln!("Skipping eval_watch_bun_dependency_retriggers (unix socket bind unavailable).");
+        return;
+    }
     if !command_exists("bun") {
         if required_runtimes().contains("bun") {
             panic!("bun runtime is required but unavailable for watch test");
@@ -253,6 +267,10 @@ fn eval_watch_bun_dependency_retriggers() {
 #[test]
 fn eval_watch_deno_dependency_retriggers() {
     let _guard = test_lock();
+    if !unix_socket_bind_supported() {
+        eprintln!("Skipping eval_watch_deno_dependency_retriggers (unix socket bind unavailable).");
+        return;
+    }
     if !command_exists("deno") {
         if required_runtimes().contains("deno") {
             panic!("deno runtime is required but unavailable for watch test");
@@ -280,6 +298,12 @@ fn eval_watch_deno_dependency_retriggers() {
 #[test]
 fn eval_watch_python_dependency_retriggers() {
     let _guard = test_lock();
+    if !unix_socket_bind_supported() {
+        eprintln!(
+            "Skipping eval_watch_python_dependency_retriggers (unix socket bind unavailable)."
+        );
+        return;
+    }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures_root = root.join("tests").join("evals");
     let fixture_dir = fixtures_root.join("py").join("local_import");
@@ -697,6 +721,24 @@ fn parse_runtime_list(env_var: &str) -> BTreeSet<String> {
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
         .collect()
+}
+
+fn unix_socket_bind_supported() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixListener;
+
+        let temp = match TempDir::new() {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let socket_path = temp.path().join("bt-eval-fixture-bind-check.sock");
+        UnixListener::bind(socket_path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn enforce_required_runtimes(fixtures_root: &Path) {

@@ -67,26 +67,13 @@ async fn resolve_named_project(
     cfg: &Config,
     project_name: &str,
 ) -> Result<Project> {
-    let explicit_project_name = base
-        .project
-        .as_deref()
-        .and_then(non_empty_trimmed)
-        .is_some();
     let resolved = get_project_by_name(client, project_name).await?;
 
     if !has_stale_cached_project_id(cfg, project_name, resolved.as_ref()) {
         return resolved.ok_or_else(|| anyhow!("project '{project_name}' not found"));
     }
 
-    recover_stale_project(
-        base,
-        client,
-        cfg,
-        project_name,
-        resolved,
-        explicit_project_name,
-    )
-    .await
+    recover_stale_project(base, client, cfg, project_name, resolved).await
 }
 
 async fn recover_stale_project(
@@ -95,21 +82,17 @@ async fn recover_stale_project(
     cfg: &Config,
     requested_name: &str,
     resolved_by_name: Option<Project>,
-    explicit_project_name: bool,
 ) -> Result<Project> {
-    let path = decide_stale_recovery_path(
-        ui::is_interactive(),
-        explicit_project_name,
-        resolved_by_name.is_some(),
-    );
+    let path = decide_stale_recovery_path(ui::is_interactive(), resolved_by_name.is_some());
     let healed = match path {
-        StaleRecoveryPath::ErrorRequiresExplicitSelector => bail!(
-            "cached project_id for '{requested_name}' is stale. In non-interactive mode, pass --project <project-name> or --project-id <project-id>."
-        ),
+        StaleRecoveryPath::ErrorRequiresExplicitSelector => {
+            bail!("{}", stale_non_interactive_error_message(requested_name))
+        }
         StaleRecoveryPath::NonInteractiveUseResolved => {
             resolved_by_name.ok_or_else(|| anyhow!("project '{requested_name}' not found"))?
         }
-        StaleRecoveryPath::InteractiveConfirmOrSelect | StaleRecoveryPath::InteractiveSelectOnly => {
+        StaleRecoveryPath::InteractiveConfirmOrSelect
+        | StaleRecoveryPath::InteractiveSelectOnly => {
             choose_healed_project_interactive(client, requested_name, resolved_by_name.as_ref())
                 .await?
         }
@@ -121,20 +104,18 @@ async fn recover_stale_project(
 
 fn decide_stale_recovery_path(
     interactive: bool,
-    explicit_project_name: bool,
     resolved_by_name_exists: bool,
 ) -> StaleRecoveryPath {
-    if !interactive && !explicit_project_name {
-        return StaleRecoveryPath::ErrorRequiresExplicitSelector;
-    }
     if interactive {
         if resolved_by_name_exists {
             StaleRecoveryPath::InteractiveConfirmOrSelect
         } else {
             StaleRecoveryPath::InteractiveSelectOnly
         }
-    } else {
+    } else if resolved_by_name_exists {
         StaleRecoveryPath::NonInteractiveUseResolved
+    } else {
+        StaleRecoveryPath::ErrorRequiresExplicitSelector
     }
 }
 
@@ -201,16 +182,23 @@ fn maybe_heal_project_config(config_project_name: Option<&str>, project: &Projec
         return Ok(());
     };
 
-    let mut file_cfg = config::load_file(&path);
-    if file_cfg.project.as_deref() == Some(project.name.as_str())
-        && file_cfg.project_id.as_deref() == Some(project.id.as_str())
-    {
-        return Ok(());
-    }
+    let healed_name = project.name.clone();
+    let healed_id = project.id.clone();
+    config::update_file_with_lock(&path, |file_cfg| {
+        if file_cfg.project.as_deref() != Some(config_project_name) {
+            return false;
+        }
+        if file_cfg.project.as_deref() == Some(healed_name.as_str())
+            && file_cfg.project_id.as_deref() == Some(healed_id.as_str())
+        {
+            return false;
+        }
 
-    file_cfg.project = Some(project.name.clone());
-    file_cfg.project_id = Some(project.id.clone());
-    config::save_file(&path, &file_cfg)
+        file_cfg.project = Some(healed_name.clone());
+        file_cfg.project_id = Some(healed_id.clone());
+        true
+    })?;
+    Ok(())
 }
 
 fn project_config_path(project_name: &str) -> Result<Option<PathBuf>> {
@@ -259,9 +247,21 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
     }
 }
 
+fn stale_non_interactive_error_message(requested_name: &str) -> String {
+    format!(
+        "cached project_id for '{requested_name}' is stale and project '{requested_name}' was not found. In non-interactive mode, pass --project <project-name> or set BRAINTRUST_DEFAULT_PROJECT."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        env,
+        ffi::OsString,
+        sync::{Mutex, OnceLock},
+    };
+    use tempfile::TempDir;
 
     fn config(project: Option<&str>, project_id: Option<&str>) -> Config {
         Config {
@@ -309,25 +309,25 @@ mod tests {
     }
 
     #[test]
-    fn stale_recovery_requires_explicit_selector_when_non_interactive() {
+    fn stale_recovery_non_interactive_uses_resolved_when_available() {
         assert_eq!(
-            decide_stale_recovery_path(false, false, true),
-            StaleRecoveryPath::ErrorRequiresExplicitSelector
+            decide_stale_recovery_path(false, true),
+            StaleRecoveryPath::NonInteractiveUseResolved
         );
     }
 
     #[test]
-    fn stale_recovery_allows_non_interactive_when_explicit_project_provided() {
+    fn stale_recovery_non_interactive_errors_when_named_project_missing() {
         assert_eq!(
-            decide_stale_recovery_path(false, true, true),
-            StaleRecoveryPath::NonInteractiveUseResolved
+            decide_stale_recovery_path(false, false),
+            StaleRecoveryPath::ErrorRequiresExplicitSelector
         );
     }
 
     #[test]
     fn stale_recovery_interactive_uses_confirm_when_named_match_exists() {
         assert_eq!(
-            decide_stale_recovery_path(true, false, true),
+            decide_stale_recovery_path(true, true),
             StaleRecoveryPath::InteractiveConfirmOrSelect
         );
     }
@@ -335,8 +335,68 @@ mod tests {
     #[test]
     fn stale_recovery_interactive_falls_back_to_selection_when_named_match_missing() {
         assert_eq!(
-            decide_stale_recovery_path(true, false, false),
+            decide_stale_recovery_path(true, false),
             StaleRecoveryPath::InteractiveSelectOnly
         );
+    }
+
+    #[test]
+    fn stale_non_interactive_message_does_not_suggest_project_id() {
+        let message = stale_non_interactive_error_message("foo");
+        assert!(message.contains("--project <project-name>"));
+        assert!(!message.contains("--project-id"));
+    }
+
+    #[test]
+    fn maybe_heal_project_config_updates_project_and_project_id_atomically() {
+        let _guard = env_test_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let _xdg_guard = XdgConfigHomeGuard::set_to(temp.path().join("xdg"));
+
+        let config_path = config::global_path().unwrap();
+        let initial = Config {
+            project: Some("foo".to_string()),
+            project_id: Some("proj_old".to_string()),
+            ..Default::default()
+        };
+        config::save_file(&config_path, &initial).unwrap();
+
+        let healed = project("foo", "proj_new");
+        maybe_heal_project_config(Some("foo"), &healed).unwrap();
+        let healed_config = config::load_file(&config_path);
+        assert_eq!(healed_config.project.as_deref(), Some("foo"));
+        assert_eq!(healed_config.project_id.as_deref(), Some("proj_new"));
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct XdgConfigHomeGuard {
+        old: Option<OsString>,
+    }
+
+    impl XdgConfigHomeGuard {
+        fn set_to(path: std::path::PathBuf) -> Self {
+            let old = env::var_os("XDG_CONFIG_HOME");
+            unsafe {
+                env::set_var("XDG_CONFIG_HOME", path);
+            }
+            Self { old }
+        }
+    }
+
+    impl Drop for XdgConfigHomeGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    env::set_var("XDG_CONFIG_HOME", value);
+                },
+                None => unsafe {
+                    env::remove_var("XDG_CONFIG_HOME");
+                },
+            }
+        }
     }
 }

@@ -4,6 +4,7 @@ use std::{
     env, fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -149,6 +150,27 @@ pub fn load() -> Result<Config> {
 }
 
 pub fn save_file(path: &Path, config: &Config) -> Result<()> {
+    let _lock = acquire_config_lock(path, CONFIG_LOCK_RETRIES, CONFIG_LOCK_RETRY_DELAY)?;
+    save_file_unlocked(path, config)
+}
+
+pub fn update_file_with_lock<F>(path: &Path, mut updater: F) -> Result<bool>
+where
+    F: FnMut(&mut Config) -> bool,
+{
+    let _lock = acquire_config_lock(path, CONFIG_LOCK_RETRIES, CONFIG_LOCK_RETRY_DELAY)?;
+    let mut config = load_file(path);
+    if !updater(&mut config) {
+        return Ok(false);
+    }
+    save_file_unlocked(path, &config)?;
+    Ok(true)
+}
+
+const CONFIG_LOCK_RETRIES: u32 = 200;
+const CONFIG_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+fn save_file_unlocked(path: &Path, config: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -162,6 +184,62 @@ pub fn save_file(path: &Path, config: &Config) -> Result<()> {
     fs::rename(&temp_path, path)?;
 
     Ok(())
+}
+
+struct ConfigLockGuard {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl Drop for ConfigLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_config_lock(
+    path: &Path,
+    max_retries: u32,
+    retry_delay: Duration,
+) -> Result<ConfigLockGuard> {
+    let lock_path = lock_path_for(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut attempts = 0u32;
+    loop {
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => {
+                return Ok(ConfigLockGuard {
+                    path: lock_path,
+                    _file: file,
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if attempts >= max_retries {
+                    bail!("timed out waiting for config lock {}", lock_path.display());
+                }
+                attempts += 1;
+                std::thread::sleep(retry_delay);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    if let Some(file_name) = path.file_name() {
+        let mut lock_name = file_name.to_os_string();
+        lock_name.push(".lock");
+        path.with_file_name(lock_name)
+    } else {
+        path.with_extension("lock")
+    }
 }
 
 pub fn save_global(config: &Config) -> Result<()> {
@@ -318,6 +396,8 @@ pub fn run(base: BaseArgs, args: ConfigArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::thread;
     use tempfile::TempDir;
 
     #[test]
@@ -459,5 +539,65 @@ mod tests {
 
         save_file(&path, &config).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn update_file_with_lock_preserves_concurrent_updates() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        save_file(&path, &Config::default()).unwrap();
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let increments = 100;
+
+        let thread_a = thread::spawn(move || {
+            for _ in 0..increments {
+                update_file_with_lock(&path_a, |cfg| {
+                    let value = cfg.extra.get("a").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                    cfg.extra.insert("a".to_string(), json!(value));
+                    true
+                })
+                .unwrap();
+            }
+        });
+
+        let thread_b = thread::spawn(move || {
+            for _ in 0..increments {
+                update_file_with_lock(&path_b, |cfg| {
+                    let value = cfg.extra.get("b").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                    cfg.extra.insert("b".to_string(), json!(value));
+                    true
+                })
+                .unwrap();
+            }
+        });
+
+        thread_a.join().unwrap();
+        thread_b.join().unwrap();
+
+        let final_config = load_file(&path);
+        assert_eq!(
+            final_config.extra.get("a").and_then(|v| v.as_i64()),
+            Some(100)
+        );
+        assert_eq!(
+            final_config.extra.get("b").and_then(|v| v.as_i64()),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn acquire_config_lock_times_out_when_already_held() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+
+        let _lock = acquire_config_lock(&path, 0, Duration::from_millis(0)).unwrap();
+        match acquire_config_lock(&path, 0, Duration::from_millis(0)) {
+            Ok(_) => panic!("expected lock acquisition to fail while lock is held"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("timed out waiting for config lock")),
+        }
     }
 }
