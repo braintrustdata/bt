@@ -110,7 +110,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let ctx = login_with_policy(&login_base, LoginPolicy::Validated, true).await?;
     let client = ApiClient::new(&ctx)?;
-    let org_name = client.org_name();
+    let org_name = client.org_name().to_string();
 
     let project_name = match resolved_project {
         Some(p) => Some(validate_or_create_project(&client, &p).await?),
@@ -137,11 +137,14 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         config::global_path()?
     };
 
-    let mut cfg = config::load_file(&path);
-    cfg.org = Some(org_name.to_string());
-    cfg.project = project_name.clone();
-    config::save_file(&path, &cfg)
-        .context(format!("Could not save config to {}", path.display()))?;
+    let org_name_for_cfg = org_name.clone();
+    let project_name_for_cfg = project_name.clone();
+    config::update_file_with_lock(&path, move |cfg| {
+        cfg.org = Some(org_name_for_cfg.clone());
+        cfg.project = project_name_for_cfg.clone();
+        true
+    })
+    .context(format!("Could not save config to {}", path.display()))?;
 
     let display = match &project_name {
         Some(p) => format!("{org_name}/{p}"),

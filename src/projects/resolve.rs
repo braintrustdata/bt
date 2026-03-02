@@ -7,7 +7,7 @@ use crate::{
     args::BaseArgs,
     config::{self, Config},
     http::ApiClient,
-    ui::{self, with_spinner},
+    ui::{self, print_command_status, with_spinner, CommandStatus},
 };
 
 use super::api::{get_project_by_name, list_projects, Project};
@@ -44,7 +44,7 @@ pub(crate) async fn resolve_project_or_select_with_id(
         let project = resolve_project_by_id(client, project_id)
             .await?
             .ok_or_else(|| anyhow!("project '{project_id}' not found"))?;
-        maybe_heal_project_config(cfg.project.as_deref(), &project)?;
+        heal_project_config_best_effort(base, cfg.project.as_deref(), &project);
         return Ok(project);
     }
 
@@ -77,7 +77,7 @@ async fn resolve_named_project(
 }
 
 async fn recover_stale_project(
-    _base: &BaseArgs,
+    base: &BaseArgs,
     client: &ApiClient,
     cfg: &Config,
     requested_name: &str,
@@ -98,7 +98,7 @@ async fn recover_stale_project(
         }
     };
 
-    maybe_heal_project_config(cfg.project.as_deref(), &healed)?;
+    heal_project_config_best_effort(base, cfg.project.as_deref(), &healed);
     Ok(healed)
 }
 
@@ -199,6 +199,24 @@ fn maybe_heal_project_config(config_project_name: Option<&str>, project: &Projec
         true
     })?;
     Ok(())
+}
+
+fn heal_project_config_best_effort(
+    base: &BaseArgs,
+    config_project_name: Option<&str>,
+    project: &Project,
+) {
+    if let Err(err) = maybe_heal_project_config(config_project_name, project) {
+        if !base.json {
+            print_command_status(
+                CommandStatus::Warning,
+                &format!(
+                    "resolved project '{}' but failed to heal cached config: {err}",
+                    project.name
+                ),
+            );
+        }
+    }
 }
 
 fn project_config_path(project_name: &str) -> Result<Option<PathBuf>> {
