@@ -33,7 +33,7 @@ use unicode_width::UnicodeWidthStr;
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
-use crate::auth::login;
+use crate::auth::{self, login};
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
 
@@ -878,6 +878,9 @@ impl TraceViewerApp {
 }
 
 pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
+    let parsed_startup_url = parse_startup_trace_url_from_view_args(&args)?;
+    let base = apply_url_hints_to_base(base, parsed_startup_url.as_ref());
+
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
 
@@ -1365,7 +1368,8 @@ async fn resolve_object_ref_for_view(
     let cfg_project = crate::config::load().ok().and_then(|c| c.project);
     let project = resolve_project(
         client,
-        base.project.as_deref().or(cfg_project.as_deref()),
+        base.project.as_deref(),
+        cfg_project.as_deref(),
         project_id,
         project_name_from_url,
     )
@@ -1382,6 +1386,7 @@ async fn resolve_object_ref_for_view(
 async fn resolve_project(
     client: &ApiClient,
     project_name_from_base: Option<&str>,
+    project_name_from_cfg: Option<&str>,
     explicit_project_id: Option<&str>,
     project_name_from_url: Option<&str>,
 ) -> Result<ProjectSelection> {
@@ -1392,18 +1397,11 @@ async fn resolve_project(
         });
     }
 
-    if let Some(name) = project_name_from_base {
-        let project = get_project_by_name(client, name)
-            .await?
-            .with_context(|| format!("project '{name}' not found"))?;
-
-        return Ok(ProjectSelection {
-            id: project.id,
-            name: Some(project.name),
-        });
-    }
-
-    if let Some(name) = project_name_from_url {
+    if let Some(name) = select_project_selector(
+        project_name_from_base,
+        project_name_from_cfg,
+        project_name_from_url,
+    ) {
         if is_uuid_like(name) {
             return Ok(ProjectSelection {
                 id: name.to_string(),
@@ -1441,6 +1439,26 @@ async fn resolve_project(
         id: project.id,
         name: Some(project.name),
     })
+}
+
+fn select_project_selector<'a>(
+    project_name_from_base: Option<&'a str>,
+    project_name_from_cfg: Option<&'a str>,
+    project_name_from_url: Option<&'a str>,
+) -> Option<&'a str> {
+    project_name_from_base
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            project_name_from_url
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+        .or_else(|| {
+            project_name_from_cfg
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
 }
 
 async fn list_projects(client: &ApiClient) -> Result<Vec<ProjectInfo>> {
@@ -5077,6 +5095,71 @@ fn profile_flag_suffix(profile: Option<&str>) -> String {
     }
 }
 
+fn parse_startup_trace_url_from_view_args(args: &ViewArgs) -> Result<Option<ParsedTraceUrl>> {
+    let startup_url = match &args.command {
+        None => None,
+        Some(ViewCommand::Logs(logs_args)) => {
+            select_startup_url(logs_args.url.as_deref(), logs_args.url_arg.as_deref())?
+        }
+        Some(ViewCommand::Trace(trace_args)) => {
+            select_startup_url(trace_args.url.as_deref(), trace_args.url_arg.as_deref())?
+        }
+        Some(ViewCommand::Span(span_args)) => {
+            select_startup_url(span_args.url.as_deref(), span_args.url_arg.as_deref())?
+        }
+    };
+    startup_url.as_deref().map(parse_trace_url).transpose()
+}
+
+fn apply_url_hints_to_base(base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
+    apply_url_hints_with_profile_resolver(base, parsed_url, |org| {
+        let profiles = auth::list_profiles().ok()?;
+        auth::resolve_org_to_profile(org, &profiles).ok()
+    })
+}
+
+fn apply_url_hints_with_profile_resolver<F>(
+    mut base: BaseArgs,
+    parsed_url: Option<&ParsedTraceUrl>,
+    resolve_profile_for_org: F,
+) -> BaseArgs
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(parsed) = parsed_url else {
+        return base;
+    };
+    let Some(url_org) = parsed
+        .org
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return base;
+    };
+
+    let has_profile_override = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty());
+    let has_org_override = base
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty());
+
+    if !has_org_override && !has_profile_override {
+        base.org_name = Some(url_org.to_string());
+    }
+    if !has_profile_override && !has_org_override {
+        if let Some(profile_name) = resolve_profile_for_org(url_org) {
+            base.profile = Some(profile_name);
+        }
+    }
+    base
+}
+
 fn select_startup_url(
     long_url: Option<&str>,
     positional_url: Option<&str>,
@@ -5972,6 +6055,34 @@ mod tests {
     use ratatui::Terminal;
     use serde_json::json;
 
+    fn base_args() -> BaseArgs {
+        BaseArgs {
+            json: false,
+            quiet: false,
+            no_color: false,
+            profile: None,
+            org_name: None,
+            project: None,
+            api_key: None,
+            prefer_profile: false,
+            no_input: false,
+            api_url: None,
+            app_url: None,
+            env_file: None,
+        }
+    }
+
+    fn parsed_url_with_org(org: &str) -> ParsedTraceUrl {
+        ParsedTraceUrl {
+            org: Some(org.to_string()),
+            project: None,
+            page: None,
+            row_ref: Some("r1".to_string()),
+            span_id: None,
+            trace_view_type: None,
+        }
+    }
+
     fn draw_messages_once(messages: &[Value], expanded: bool) -> bool {
         let backend = TestBackend::new(140, 40);
         let mut terminal = Terminal::new(backend).expect("create terminal");
@@ -6114,5 +6225,77 @@ mod tests {
         let full_by_span_id = build_full_span_query_by_span_id("project_logs('p1')", "span-1");
         assert!(full_by_span_id.contains("preview_length: -1"));
         assert!(full_by_span_id.contains("filter: span_id = 'span-1'"));
+    }
+
+    #[test]
+    fn select_project_selector_prefers_base_then_url_then_config() {
+        assert_eq!(
+            select_project_selector(Some(" from-base "), Some("from-cfg"), Some("from-url")),
+            Some("from-base")
+        );
+        assert_eq!(
+            select_project_selector(None, Some("from-cfg"), Some("from-url")),
+            Some("from-url")
+        );
+        assert_eq!(
+            select_project_selector(None, Some("from-cfg"), None),
+            Some("from-cfg")
+        );
+    }
+
+    #[test]
+    fn apply_url_hints_infers_profile_from_url_org() {
+        let base = base_args();
+        let parsed = parsed_url_with_org("Lovable");
+
+        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |org| {
+            (org == "Lovable").then(|| "lovable-profile".to_string())
+        });
+
+        assert_eq!(updated.org_name.as_deref(), Some("Lovable"));
+        assert_eq!(updated.profile.as_deref(), Some("lovable-profile"));
+    }
+
+    #[test]
+    fn apply_url_hints_preserves_explicit_profile() {
+        let mut base = base_args();
+        base.profile = Some("explicit-profile".to_string());
+        let parsed = parsed_url_with_org("Lovable");
+
+        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |_| {
+            Some("other".to_string())
+        });
+
+        assert_eq!(updated.profile.as_deref(), Some("explicit-profile"));
+        assert!(updated.org_name.is_none());
+    }
+
+    #[test]
+    fn parse_startup_trace_url_from_trace_subcommand_reads_positional_url() {
+        let args = ViewArgs {
+            command: Some(ViewCommand::Trace(TraceArgs {
+                object_ref: None,
+                project_id: None,
+                trace_id: None,
+                url: None,
+                url_arg: Some(
+                    "https://www.braintrust.dev/app/Lovable/p/lovable/logs?r=abc&s=def".to_string(),
+                ),
+                limit: 100,
+                cursor: None,
+                preview_length: 125,
+                print_queries: false,
+                non_interactive: false,
+            })),
+        };
+
+        let parsed = parse_startup_trace_url_from_view_args(&args)
+            .expect("parse")
+            .expect("url present");
+
+        assert_eq!(parsed.org.as_deref(), Some("Lovable"));
+        assert_eq!(parsed.project.as_deref(), Some("lovable"));
+        assert_eq!(parsed.row_ref.as_deref(), Some("abc"));
+        assert_eq!(parsed.span_id.as_deref(), Some("def"));
     }
 }
