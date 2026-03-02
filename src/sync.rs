@@ -2294,8 +2294,7 @@ async fn discover_vector_specs_global(
     } else {
         if verbose {
             eprintln!(
-                "btql[vector_models] unexpected models shape: {}; no vectors will be fetched.",
-                models
+                "btql[vector_models] unexpected models shape: {models}; no vectors will be fetched."
             );
         }
         return Ok(specs);
