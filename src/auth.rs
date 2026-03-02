@@ -290,10 +290,15 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
 }
 
 pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
-    if has_cached_project_id() {
-        fast_login(base).await
-    } else {
+    if !has_cached_project_id() {
+        return login(base).await;
+    }
+
+    let ctx = fast_login(base).await?;
+    if ctx.login.org_name.trim().is_empty() {
         login(base).await
+    } else {
+        Ok(ctx)
     }
 }
 
