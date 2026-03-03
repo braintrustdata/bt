@@ -10,7 +10,7 @@ use crate::{
     ui::{self, is_interactive, select_project_interactive, with_spinner},
 };
 
-mod api;
+pub(crate) mod api;
 mod delete;
 mod list;
 mod view;

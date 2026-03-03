@@ -22,6 +22,7 @@ use urlencoding::encode;
 
 use crate::args::BaseArgs;
 use crate::auth::{login, LoginContext};
+use crate::experiments::api::create_experiment;
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
@@ -126,6 +127,7 @@ struct PushArgs {
     /// Supported:
     /// - project_logs:<project-id|project-name>
     /// - experiment:<experiment-id|experiment-name> (requires --project for names)
+    /// - dataset:<dataset-id|dataset-name> (requires --project for names)
     object_ref: String,
 
     /// Input JSONL/NDJSON file or directory of part files. If omitted, bt sync uses the latest completed pull output.
@@ -376,6 +378,12 @@ struct BtqlResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct NamedObject {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CreatedDataset {
     id: String,
     name: String,
 }
@@ -1776,7 +1784,14 @@ async fn run_push(
                 seen_roots.insert(root_id);
             }
 
-            prepare_row_for_upload(&mut row, &project_id, state.run_id.as_str(), selected_count);
+            prepare_row_for_upload(
+                &mut row,
+                &project_id,
+                &destination.object.object_type,
+                &destination.object.object_name,
+                state.run_id.as_str(),
+                selected_count,
+            );
 
             selected_count += 1;
             batch_end_line_offset = current_line_offset + 1;
@@ -2624,7 +2639,7 @@ async fn submit_logs_batch(
     let result = uploader
         .upload_rows(rows, page_size)
         .await
-        .context("logs3 upload failed")?;
+        .map_err(|err| anyhow!("logs3 upload failed: {err}"))?;
     Ok(result.bytes_processed)
 }
 
@@ -2687,6 +2702,8 @@ fn flush_ready_push_results(
 fn prepare_row_for_upload(
     row: &mut Map<String, Value>,
     project_id: &str,
+    destination_type: &ObjectType,
+    destination_id: &str,
     run_id: &str,
     row_index: usize,
 ) {
@@ -2700,7 +2717,29 @@ fn prepare_row_for_upload(
         "project_id".to_string(),
         Value::String(project_id.to_string()),
     );
-    row.insert("log_id".to_string(), Value::String("g".to_string()));
+    match destination_type {
+        ObjectType::ProjectLogs => {
+            row.insert("log_id".to_string(), Value::String("g".to_string()));
+            row.remove("experiment_id");
+            row.remove("dataset_id");
+        }
+        ObjectType::Experiment => {
+            row.remove("log_id");
+            row.insert(
+                "experiment_id".to_string(),
+                Value::String(destination_id.to_string()),
+            );
+            row.remove("dataset_id");
+        }
+        ObjectType::Dataset => {
+            row.remove("log_id");
+            row.insert(
+                "dataset_id".to_string(),
+                Value::String(destination_id.to_string()),
+            );
+            row.remove("experiment_id");
+        }
+    }
 
     let id = row
         .get("id")
@@ -2892,13 +2931,22 @@ async fn resolve_destination(
             })
         }
         ObjectType::Experiment => {
-            let resolved = resolve_named_object_target(
-                client,
-                ObjectType::Experiment,
-                requested.object_name.trim(),
-                project_selector,
-            )
-            .await?;
+            let resolved = if matches!(mode, DestinationMode::Push) {
+                resolve_push_experiment_target(
+                    client,
+                    requested.object_name.trim(),
+                    project_selector,
+                )
+                .await?
+            } else {
+                resolve_named_object_target(
+                    client,
+                    ObjectType::Experiment,
+                    requested.object_name.trim(),
+                    project_selector,
+                )
+                .await?
+            };
             let run_id = if matches!(mode, DestinationMode::Push) {
                 Some(resolved.object_id.clone())
             } else {
@@ -2916,19 +2964,18 @@ async fn resolve_destination(
             })
         }
         ObjectType::Dataset => {
-            if matches!(mode, DestinationMode::Push) {
-                bail!(
-                    "push destination type '{}' is unsupported. use project_logs:<project-id|project-name> or experiment:<experiment-id|experiment-name>",
-                    ObjectType::Dataset
-                );
-            }
-            let resolved = resolve_named_object_target(
-                client,
-                ObjectType::Dataset,
-                requested.object_name.trim(),
-                project_selector,
-            )
-            .await?;
+            let resolved = if matches!(mode, DestinationMode::Push) {
+                resolve_push_dataset_target(client, requested.object_name.trim(), project_selector)
+                    .await?
+            } else {
+                resolve_named_object_target(
+                    client,
+                    ObjectType::Dataset,
+                    requested.object_name.trim(),
+                    project_selector,
+                )
+                .await?
+            };
             let object = ObjectRef {
                 object_type: ObjectType::Dataset,
                 object_name: resolved.object_id.clone(),
@@ -3025,6 +3072,145 @@ async fn resolve_named_object_target(
     bail!(
         "{object_type} '{object_selector}' was not found by id across accessible projects; if this is a name, pass --project <project-name> (or set BRAINTRUST_DEFAULT_PROJECT)"
     );
+}
+
+async fn resolve_push_experiment_target(
+    client: &ApiClient,
+    experiment_selector: &str,
+    project_selector: Option<&str>,
+) -> Result<ResolvedNamedObjectTarget> {
+    let experiment_selector = experiment_selector.trim();
+    if experiment_selector.is_empty() {
+        bail!("experiment selector cannot be empty");
+    }
+
+    let project_selector = project_selector
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "experiment '{experiment_selector}' not found; pass --project <project-name> to create it"
+            )
+        })?;
+
+    let project = resolve_project_logs_target(client, project_selector, DestinationMode::Push)
+        .await
+        .with_context(|| format!("project '{project_selector}' not found"))?;
+
+    let objects = list_project_named_objects(client, ObjectType::Experiment, &project.id).await?;
+    if let Ok(object) = find_named_object_by_selector(
+        &objects,
+        experiment_selector,
+        ObjectType::Experiment.as_str(),
+        Some(&project.name),
+    ) {
+        return Ok(ResolvedNamedObjectTarget {
+            object_id: object.id.clone(),
+            project_id: project.id,
+        });
+    }
+
+    if is_uuid_like(experiment_selector) {
+        bail!(
+            "experiment id '{}' not found in project '{}'",
+            experiment_selector,
+            project.name
+        );
+    }
+
+    let created = create_experiment(client, &project.id, experiment_selector)
+        .await
+        .with_context(|| {
+            format!("experiment '{experiment_selector}' not found, and creating it failed")
+        })?;
+
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "Experiment '{}' not found; created new experiment '{}' ({}) in project '{}'.",
+            experiment_selector, created.name, created.id, project.name
+        );
+    }
+
+    Ok(ResolvedNamedObjectTarget {
+        object_id: created.id,
+        project_id: project.id,
+    })
+}
+
+async fn resolve_push_dataset_target(
+    client: &ApiClient,
+    dataset_selector: &str,
+    project_selector: Option<&str>,
+) -> Result<ResolvedNamedObjectTarget> {
+    let dataset_selector = dataset_selector.trim();
+    if dataset_selector.is_empty() {
+        bail!("dataset selector cannot be empty");
+    }
+
+    let project_selector = project_selector
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "dataset '{dataset_selector}' not found; pass --project <project-name> to create it"
+            )
+        })?;
+
+    let project = resolve_project_logs_target(client, project_selector, DestinationMode::Push)
+        .await
+        .with_context(|| format!("project '{project_selector}' not found"))?;
+
+    let objects = list_project_named_objects(client, ObjectType::Dataset, &project.id).await?;
+    if let Ok(object) = find_named_object_by_selector(
+        &objects,
+        dataset_selector,
+        ObjectType::Dataset.as_str(),
+        Some(&project.name),
+    ) {
+        return Ok(ResolvedNamedObjectTarget {
+            object_id: object.id.clone(),
+            project_id: project.id,
+        });
+    }
+
+    if is_uuid_like(dataset_selector) {
+        bail!(
+            "dataset id '{}' not found in project '{}'",
+            dataset_selector,
+            project.name
+        );
+    }
+
+    let created = create_dataset(client, &project.id, dataset_selector)
+        .await
+        .with_context(|| {
+            format!("dataset '{dataset_selector}' not found, and creating it failed")
+        })?;
+
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "Dataset '{}' not found; created new dataset '{}' ({}) in project '{}'.",
+            dataset_selector, created.name, created.id, project.name
+        );
+    }
+
+    Ok(ResolvedNamedObjectTarget {
+        object_id: created.id,
+        project_id: project.id,
+    })
+}
+
+async fn create_dataset(
+    client: &ApiClient,
+    project_id: &str,
+    name: &str,
+) -> Result<CreatedDataset> {
+    let body = serde_json::json!({
+        "name": name,
+        "project_id": project_id,
+        "org_name": client.org_name(),
+    });
+    client.post("/v1/dataset", &body).await
 }
 
 async fn list_project_named_objects(
@@ -4430,7 +4616,14 @@ mod tests {
             ]))]),
         );
 
-        prepare_row_for_upload(&mut row, "project-1", "run-1", 0);
+        prepare_row_for_upload(
+            &mut row,
+            "project-1",
+            &ObjectType::ProjectLogs,
+            "project-1",
+            "run-1",
+            0,
+        );
 
         assert!(row.get("vectors").is_some());
     }
