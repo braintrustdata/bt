@@ -343,6 +343,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
+    validate_eval_input_files(&args.files)?;
 
     let options = EvalRunOptions {
         jsonl: args.jsonl,
@@ -1859,6 +1860,71 @@ fn detect_eval_language(
     detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
 }
 
+fn validate_eval_input_files(files: &[String]) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    validate_eval_input_files_in_cwd(files, &cwd)
+}
+
+fn validate_eval_input_files_in_cwd(files: &[String], cwd: &Path) -> Result<()> {
+    for input in files {
+        let input_path = Path::new(input);
+        let resolved = if input_path.is_absolute() {
+            input_path.to_path_buf()
+        } else {
+            cwd.join(input_path)
+        };
+
+        match std::fs::metadata(&resolved) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    anyhow::bail!(
+                        "Eval file is not a regular file: {} (from input `{input}`).",
+                        resolved.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(suggested) = maybe_missing_eval_file_suggestion(input, cwd) {
+                    anyhow::bail!(
+                        "Eval file not found: {} (from input `{input}` in `{}`). Did you mean `bt eval {suggested}`?",
+                        resolved.display(),
+                        cwd.display()
+                    );
+                }
+                anyhow::bail!(
+                    "Eval file not found: {} (from input `{input}` in `{}`).",
+                    resolved.display(),
+                    cwd.display()
+                );
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read eval file {}", resolved.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn maybe_missing_eval_file_suggestion(input: &str, cwd: &Path) -> Option<String> {
+    if Path::new(input).is_absolute() {
+        return None;
+    }
+    let cwd_name = cwd.file_name()?.to_str()?;
+    let prefixed = format!("{cwd_name}/");
+    let suggested = input.strip_prefix(&prefixed)?;
+    if suggested.is_empty() {
+        return None;
+    }
+    let candidate = cwd.join(suggested);
+    if candidate.is_file() {
+        Some(suggested.to_string())
+    } else {
+        None
+    }
+}
+
 struct JsRunnerPlan {
     cmd: Command,
     kind: RunnerKind,
@@ -3098,6 +3164,43 @@ mod tests {
         assert_eq!(resolved, local_runner);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_eval_input_files_reports_missing_path_with_prefixed_directory_hint() {
+        let dir = make_temp_dir("missing-file-hint");
+        let eval_file = dir.join("real-world-facets.eval.ts");
+        fs::write(&eval_file, "export {};").expect("eval file should be written");
+
+        let cwd_name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp dir should have a UTF-8 name");
+        let input = format!("{cwd_name}/real-world-facets.eval.ts");
+        let err = validate_eval_input_files_in_cwd(&[input], &dir)
+            .expect_err("duplicated cwd prefix should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("Eval file not found:"));
+        assert!(message.contains("Did you mean `bt eval real-world-facets.eval.ts`?"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_eval_input_files_rejects_directory_inputs() {
+        let dir = make_temp_dir("directory-input");
+        let child_dir = dir.join("evals");
+        fs::create_dir_all(&child_dir).expect("child directory should be created");
+
+        let err = validate_eval_input_files_in_cwd(&["evals".to_string()], &dir)
+            .expect_err("directory inputs should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("Eval file is not a regular file:"));
+        assert!(message.contains("from input `evals`"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
