@@ -695,6 +695,9 @@ async def run_once(
             print(evaluator_instance.evaluator.eval_name)
         return True
 
+    if sse:
+        sse.send("processing", {"evaluators": len(evaluators)})
+
     supports_progress = run_evaluator_supports_progress()
 
     async def run_single_evaluator(
