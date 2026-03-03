@@ -65,3 +65,16 @@ pub async fn delete_experiment(client: &ApiClient, experiment_id: &str) -> Resul
     let path = format!("/v1/experiment/{}", encode(experiment_id));
     client.delete(&path).await
 }
+
+pub async fn create_experiment(
+    client: &ApiClient,
+    project_id: &str,
+    name: &str,
+) -> Result<Experiment> {
+    let body = serde_json::json!({
+        "name": name,
+        "project_id": project_id,
+        "org_name": client.org_name(),
+    });
+    client.post("/v1/experiment", &body).await
+}
