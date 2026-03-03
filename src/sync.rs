@@ -737,7 +737,6 @@ async fn run_pull(
                 args.include_vectors,
                 args.workers.max(1),
                 discovery_filter.clone(),
-                user_filter.clone(),
                 &btql_retry_tracker,
                 verbose,
                 !json_output,
@@ -980,7 +979,6 @@ async fn pull_traces_mode(
     include_vectors: bool,
     workers: usize,
     discovery_filter: Option<String>,
-    fetch_filter: Option<String>,
     btql_retry_tracker: &Arc<BtqlRetryTracker>,
     verbose: bool,
     show_checkpoint_hint: bool,
@@ -1062,7 +1060,7 @@ async fn pull_traces_mode(
         let progress = trace_fetch_bar.clone();
         let status_line = status_line.clone();
         let page_size = spec.page_size;
-        let fetch_filter = fetch_filter.clone();
+        let fetch_filter: Option<String> = None;
         let vector_filter = discovery_filter.clone();
         let vector_specs = vector_specs.clone();
         let btql_retry_tracker = Arc::clone(btql_retry_tracker);
