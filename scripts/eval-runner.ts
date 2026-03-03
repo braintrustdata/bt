@@ -1880,6 +1880,9 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   };
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
+    if (sse) {
+      sse.send("processing", { evaluators: evaluators.length });
+    }
     const reporters = getReporters();
     const runEntry = async (entry: EvaluatorEntry): Promise<boolean> => {
       try {

@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +42,7 @@ use ratatui::Terminal;
 
 use crate::args::BaseArgs;
 use crate::auth::resolved_auth_env;
+use crate::ui::{animations_enabled, is_quiet};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -55,6 +57,8 @@ const HEADER_BT_ORG_NAME: &str = "x-bt-org-name";
 const HEADER_CORS_REQ_PRIVATE_NETWORK: &str = "access-control-request-private-network";
 const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
 const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
+const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
+const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
 static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct EvalRunOutput {
@@ -95,11 +99,12 @@ enum ConsolePolicy {
     BufferStderr,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunnerKind {
     Tsx,
     ViteNode,
     Deno,
+    Bun,
     Other,
 }
 
@@ -288,6 +293,15 @@ pub struct EvalArgs {
     )]
     pub filter: Vec<String>,
 
+    /// Show verbose evaluator errors and stderr output.
+    #[arg(
+        long,
+        env = "BT_EVAL_VERBOSE",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    pub verbose: bool,
+
     /// Re-run evals when input files change.
     #[arg(
         long,
@@ -337,6 +351,7 @@ struct EvalRunOptions {
     num_workers: Option<usize>,
     list: bool,
     filter: Vec<String>,
+    verbose: bool,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
@@ -351,6 +366,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         num_workers: args.num_workers,
         list: args.list,
         filter: args.filter,
+        verbose: args.verbose,
     };
 
     if args.dev {
@@ -528,9 +544,7 @@ async fn run_eval_files_once(
     )
     .await?;
 
-    let mut retried_esm = false;
     if !output.status.success() && should_retry_esm(&plan, &output) {
-        retried_esm = true;
         let first_attempt_stderr = std::mem::take(&mut output.stderr_lines);
         eprintln!("Eval failed with ESM/CJS interop error. Retrying in ESM mode...");
         output = run_eval_attempt(
@@ -546,21 +560,14 @@ async fn run_eval_files_once(
 
         if !output.status.success() {
             eprintln!("\nFirst attempt (CJS mode) error:");
-            flush_stderr(&first_attempt_stderr);
+            report_buffered_stderr(&first_attempt_stderr, options.verbose);
         }
     } else if matches!(plan.retry_policy, RetryPolicy::Allow) {
-        flush_stderr(&output.stderr_lines);
+        report_buffered_stderr(&output.stderr_lines, options.verbose);
     }
 
-    if !output.status.success() && plan.show_js_hint {
-        let suffix = if retried_esm {
-            " (ESM retry failed)"
-        } else {
-            ""
-        };
-        eprintln!(
-            "Hint{suffix}: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
-        );
+    if !output.status.success() && plan.show_js_hint && should_retry_esm(&plan, &output) {
+        eprintln!("Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`.");
     }
 
     let mut dependencies =
@@ -596,7 +603,7 @@ async fn run_eval_attempt(
         js_mode,
     )
     .await?;
-    let mut ui = EvalUi::new(options.jsonl, options.list);
+    let mut ui = EvalUi::new(options.jsonl, options.list, options.verbose);
     let output =
         drive_eval_runner(spawned.process, console_policy, |event| ui.handle(event)).await?;
     ui.finish();
@@ -676,6 +683,9 @@ async fn spawn_eval_runner(
             }
         }
     };
+    if language == EvalLanguage::JavaScript && should_set_node_heap_size(runner_kind) {
+        set_node_heap_size_env(&mut cmd);
+    }
 
     cmd.envs(build_env(base).await?);
     for (key, value) in extra_env {
@@ -824,6 +834,20 @@ where
 fn flush_stderr(lines: &[String]) {
     for line in lines {
         eprintln!("{line}");
+    }
+}
+
+fn report_buffered_stderr(lines: &[String], verbose: bool) {
+    if lines.is_empty() {
+        return;
+    }
+    if verbose {
+        flush_stderr(lines);
+    } else {
+        eprintln!(
+            "Suppressed {} stderr line(s). Re-run with `bt eval --verbose ...` to inspect details.",
+            lines.len()
+        );
     }
 }
 
@@ -1155,7 +1179,10 @@ fn is_eval_progress_payload(progress: &SseProgressEventData) -> bool {
 
 fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
     match event {
-        EvalEvent::Start(summary) => serde_json::to_string(summary)
+        EvalEvent::Processing(payload) => serde_json::to_string(payload)
+            .ok()
+            .map(|data| serialize_sse_event("processing", &data)),
+        EvalEvent::Start(start) => serde_json::to_string(start)
             .ok()
             .map(|data| serialize_sse_event("start", &data)),
         EvalEvent::Summary(summary) => serde_json::to_string(summary)
@@ -2146,8 +2173,29 @@ fn runner_kind_for_bin(runner_command: &Path) -> RunnerKind {
     match runner_bin_name(runner_command).as_deref() {
         Some("tsx") => RunnerKind::Tsx,
         Some("vite-node") => RunnerKind::ViteNode,
+        Some("bun") | Some("bunx") => RunnerKind::Bun,
         _ => RunnerKind::Other,
     }
+}
+
+fn should_set_node_heap_size(runner_kind: RunnerKind) -> bool {
+    !matches!(runner_kind, RunnerKind::Deno | RunnerKind::Bun)
+}
+
+fn set_node_heap_size_env(command: &mut Command) {
+    let heap_option = format!("--max-old-space-size={EVAL_NODE_MAX_OLD_SPACE_SIZE_MB}");
+    let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    let has_existing_max_old_space = existing
+        .split_whitespace()
+        .any(|arg| arg.starts_with("--max-old-space-size"));
+    let merged = if existing.trim().is_empty() {
+        heap_option
+    } else if has_existing_max_old_space {
+        existing
+    } else {
+        format!("{existing} {heap_option}")
+    };
+    command.env("NODE_OPTIONS", merged);
 }
 
 fn is_ts_node_runner(runner_command: &Path) -> bool {
@@ -2284,7 +2332,8 @@ fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) ->
 
 #[derive(Debug)]
 enum EvalEvent {
-    Start(ExperimentSummary),
+    Processing(ProcessingEventData),
+    Start(ExperimentStart),
     Summary(ExperimentSummary),
     Progress(SseProgressEventData),
     Dependencies {
@@ -2300,6 +2349,25 @@ enum EvalEvent {
         stream: String,
         message: String,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProcessingEventData {
+    #[serde(default)]
+    evaluators: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExperimentStart {
+    #[serde(default, alias = "project_name")]
+    project_name: Option<String>,
+    #[serde(default, alias = "experiment_name")]
+    experiment_name: Option<String>,
+    #[serde(default, alias = "project_url")]
+    project_url: Option<String>,
+    #[serde(default, alias = "experiment_url")]
+    experiment_url: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2322,7 +2390,9 @@ struct ScoreSummary {
     name: String,
     score: f64,
     diff: Option<f64>,
+    #[serde(default)]
     improvements: i64,
+    #[serde(default)]
     regressions: i64,
 }
 
@@ -2337,9 +2407,12 @@ struct EvalErrorPayload {
 struct MetricSummary {
     name: String,
     metric: f64,
+    #[serde(default)]
     unit: String,
     diff: Option<f64>,
+    #[serde(default)]
     improvements: i64,
+    #[serde(default)]
     regressions: i64,
 }
 
@@ -2429,9 +2502,14 @@ where
 fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSender<EvalEvent>) {
     let event_name = event.unwrap_or_default();
     match event_name.as_str() {
+        "processing" => {
+            if let Ok(payload) = serde_json::from_str::<ProcessingEventData>(&data) {
+                let _ = tx.send(EvalEvent::Processing(payload));
+            }
+        }
         "start" => {
-            if let Ok(summary) = serde_json::from_str::<ExperimentSummary>(&data) {
-                let _ = tx.send(EvalEvent::Start(summary));
+            if let Ok(start) = serde_json::from_str::<ExperimentStart>(&data) {
+                let _ = tx.send(EvalEvent::Start(start));
             }
         }
         "summary" => {
@@ -2488,11 +2566,21 @@ struct EvalUi {
     spinner_style: ProgressStyle,
     jsonl: bool,
     list: bool,
+    verbose: bool,
+    deferred_errors: Vec<String>,
+    suppressed_stderr_lines: usize,
+    finished: bool,
 }
 
 impl EvalUi {
-    fn new(jsonl: bool, list: bool) -> Self {
-        let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    fn new(jsonl: bool, list: bool, verbose: bool) -> Self {
+        let draw_target = if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet()
+        {
+            ProgressDrawTarget::stderr_with_hz(10)
+        } else {
+            ProgressDrawTarget::stderr()
+        };
+        let progress = MultiProgress::with_draw_target(draw_target);
         let bar_style =
             ProgressStyle::with_template("{bar:10.blue} {msg} {percent}% {pos}/{len} {eta}")
                 .unwrap();
@@ -2504,20 +2592,35 @@ impl EvalUi {
             spinner_style,
             jsonl,
             list,
+            verbose,
+            deferred_errors: Vec::new(),
+            suppressed_stderr_lines: 0,
+            finished: false,
         }
     }
 
     fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
         for (_, bar) in self.bars.drain() {
             bar.finish_and_clear();
         }
+        let _ = self.progress.clear();
+        self.progress.set_draw_target(ProgressDrawTarget::hidden());
+        self.print_deferred_error_footnote();
+        self.finished = true;
     }
 
     fn handle(&mut self, event: EvalEvent) {
         match event {
-            EvalEvent::Start(summary) => {
-                let line = format_start_line(&summary);
-                let _ = self.progress.println(line);
+            EvalEvent::Processing(payload) => {
+                self.print_persistent_line(format_processing_line(payload.evaluators));
+            }
+            EvalEvent::Start(start) => {
+                if let Some(line) = format_start_line(&start) {
+                    self.print_persistent_line(line);
+                }
             }
             EvalEvent::Summary(summary) => {
                 if self.jsonl {
@@ -2526,9 +2629,7 @@ impl EvalUi {
                     }
                 } else {
                     let rendered = format_experiment_summary(&summary);
-                    for line in rendered.lines() {
-                        let _ = self.progress.println(line);
-                    }
+                    self.print_persistent_multiline(rendered);
                 }
             }
             EvalEvent::Progress(progress) => {
@@ -2538,22 +2639,32 @@ impl EvalUi {
             EvalEvent::Console { stream, message } => {
                 if stream == "stdout" && (self.list || self.jsonl) {
                     println!("{message}");
+                } else if stream == "stderr" && !self.verbose {
+                    self.suppressed_stderr_lines += 1;
                 } else {
                     let _ = self.progress.println(message);
                 }
             }
             EvalEvent::Error { message, stack, .. } => {
                 let show_hint = message.contains("Please specify an api key");
-                let line = message.as_str().red().to_string();
-                let _ = self.progress.println(line);
-                if let Some(stack) = stack {
-                    for line in stack.lines() {
-                        let _ = self.progress.println(line.dark_grey().to_string());
+                if self.verbose {
+                    let line = message.as_str().red().to_string();
+                    let _ = self.progress.println(line);
+                    if let Some(stack) = stack {
+                        for line in stack.lines() {
+                            let _ = self.progress.println(line.dark_grey().to_string());
+                        }
                     }
+                } else {
+                    self.record_deferred_error(message);
                 }
                 if show_hint {
                     let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt auth login`/`bt auth login --oauth`, or use --no-send-logs for local evals.";
-                    let _ = self.progress.println(hint.dark_grey().to_string());
+                    if self.verbose {
+                        let _ = self.progress.println(hint.dark_grey().to_string());
+                    } else {
+                        self.record_deferred_error(hint.to_string());
+                    }
                 }
             }
             EvalEvent::Done => {
@@ -2610,30 +2721,144 @@ impl EvalUi {
             _ => {}
         }
     }
+
+    fn print_persistent_line(&self, line: String) {
+        self.progress.suspend(|| {
+            eprintln!("{line}");
+        });
+    }
+
+    fn print_persistent_multiline(&self, text: String) {
+        self.progress.suspend(|| {
+            for line in text.lines() {
+                eprintln!("{line}");
+            }
+        });
+    }
+
+    fn record_deferred_error(&mut self, message: String) {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self
+            .deferred_errors
+            .iter()
+            .any(|existing| existing == trimmed)
+        {
+            return;
+        }
+        if self.deferred_errors.len() < MAX_DEFERRED_EVAL_ERRORS {
+            self.deferred_errors.push(trimmed.to_string());
+        }
+    }
+
+    fn print_deferred_error_footnote(&self) {
+        if self.verbose {
+            return;
+        }
+        if self.deferred_errors.is_empty() && self.suppressed_stderr_lines == 0 {
+            return;
+        }
+
+        eprintln!();
+        if !self.deferred_errors.is_empty() {
+            let noun = if self.deferred_errors.len() == 1 {
+                "error"
+            } else {
+                "errors"
+            };
+            eprintln!(
+                "Encountered {} evaluator {noun}:",
+                self.deferred_errors.len()
+            );
+            for message in &self.deferred_errors {
+                eprintln!("  - {message}");
+            }
+        }
+        if self.suppressed_stderr_lines > 0 {
+            eprintln!(
+                "Suppressed {} stderr line(s). Re-run with `bt eval --verbose ...` to inspect details.",
+                self.suppressed_stderr_lines
+            );
+        }
+    }
+}
+
+impl Drop for EvalUi {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 fn fit_name_to_spaces(name: &str, length: usize) -> String {
-    let mut padded = name.to_string();
-    let char_count = padded.chars().count();
+    let char_count = name.chars().count();
     if char_count < length {
+        let mut padded = name.to_string();
         padded.push_str(&" ".repeat(length - char_count));
         return padded;
     }
-    if char_count <= length {
-        return padded;
+    if char_count == length {
+        return name.to_string();
     }
     if length <= 3 {
-        return padded.chars().take(length).collect();
+        return name.chars().take(length).collect();
     }
-    let truncated: String = padded.chars().take(length - 3).collect();
-    format!("{truncated}...")
+    if length <= 5 {
+        let truncated: String = name.chars().take(length - 3).collect();
+        return format!("{truncated}...");
+    }
+
+    // Keep both prefix and suffix so similarly named evaluators remain distinguishable.
+    let keep_total = length - 3;
+    let head_len = keep_total / 2;
+    let tail_len = keep_total - head_len;
+    let head: String = name.chars().take(head_len).collect();
+    let tail: String = name
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
 }
 
-fn format_start_line(summary: &ExperimentSummary) -> String {
+fn format_processing_line(evaluators: usize) -> String {
+    let noun = if evaluators == 1 {
+        "evaluator"
+    } else {
+        "evaluators"
+    };
+    format!("Processing {evaluators} {noun}...")
+}
+
+fn format_start_line(start: &ExperimentStart) -> Option<String> {
+    let experiment_name = start
+        .experiment_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let experiment_url = start
+        .experiment_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let arrow = "▶".cyan();
-    let name = summary.experiment_name.as_str().bold();
-    let link = summary.experiment_url.as_deref().unwrap_or("locally");
-    format!("{arrow} Experiment {name} is running at {link}")
+
+    match (experiment_name, experiment_url) {
+        (Some(name), Some(url)) => Some(format!(
+            "{arrow} Experiment {} is running at {url}",
+            name.bold()
+        )),
+        (Some(name), None) => Some(format!(
+            "{arrow} Experiment {} is running at locally",
+            name.bold()
+        )),
+        (None, Some(url)) => Some(format!("{arrow} Experiment is running at {url}")),
+        (None, None) => None,
+    }
 }
 
 fn format_experiment_summary(summary: &ExperimentSummary) -> String {
@@ -3062,6 +3287,16 @@ mod tests {
         }
     }
 
+    fn get_command_env(command: &Command, key: &str) -> Option<String> {
+        command.as_std().get_envs().find_map(|(env_key, value)| {
+            if env_key == OsStr::new(key) {
+                value.map(|v| v.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+    }
+
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3314,6 +3549,71 @@ mod tests {
     }
 
     #[test]
+    fn runner_kind_for_bin_detects_bun() {
+        assert_eq!(runner_kind_for_bin(Path::new("bun")), RunnerKind::Bun);
+        assert_eq!(runner_kind_for_bin(Path::new("bunx")), RunnerKind::Bun);
+        assert_eq!(runner_kind_for_bin(Path::new("deno")), RunnerKind::Other);
+    }
+
+    #[test]
+    fn set_node_heap_size_env_sets_default_when_absent() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = clear_env_var("NODE_OPTIONS");
+        let mut command = Command::new("node");
+
+        set_node_heap_size_env(&mut command);
+        let configured =
+            get_command_env(&command, "NODE_OPTIONS").expect("NODE_OPTIONS should be set");
+        assert!(configured.contains("--max-old-space-size=8192"));
+
+        restore_env_var("NODE_OPTIONS", previous);
+    }
+
+    #[test]
+    fn set_node_heap_size_env_appends_to_existing_options() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = set_env_var("NODE_OPTIONS", "--trace-warnings");
+        let mut command = Command::new("node");
+
+        set_node_heap_size_env(&mut command);
+        let configured =
+            get_command_env(&command, "NODE_OPTIONS").expect("NODE_OPTIONS should be set");
+        assert!(configured.contains("--trace-warnings"));
+        assert!(configured.contains("--max-old-space-size=8192"));
+
+        restore_env_var("NODE_OPTIONS", previous);
+    }
+
+    #[test]
+    fn set_node_heap_size_env_preserves_existing_heap_override() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = set_env_var("NODE_OPTIONS", "--max-old-space-size=2048");
+        let mut command = Command::new("node");
+
+        set_node_heap_size_env(&mut command);
+        let configured =
+            get_command_env(&command, "NODE_OPTIONS").expect("NODE_OPTIONS should be set");
+        assert_eq!(configured, "--max-old-space-size=2048");
+
+        restore_env_var("NODE_OPTIONS", previous);
+    }
+
+    #[test]
+    fn should_set_node_heap_size_skips_non_node_runtimes() {
+        assert!(should_set_node_heap_size(RunnerKind::Tsx));
+        assert!(should_set_node_heap_size(RunnerKind::ViteNode));
+        assert!(should_set_node_heap_size(RunnerKind::Other));
+        assert!(!should_set_node_heap_size(RunnerKind::Deno));
+        assert!(!should_set_node_heap_size(RunnerKind::Bun));
+    }
+
+    #[test]
     fn build_sse_socket_path_is_unique_for_consecutive_calls() {
         let first = build_sse_socket_path().expect("first socket path");
         let second = build_sse_socket_path().expect("second socket path");
@@ -3352,6 +3652,102 @@ mod tests {
         let encoded = encode_eval_event_for_http(&event).expect("progress should be forwarded");
         assert!(encoded.contains("event: progress"));
         assert!(encoded.contains("json_delta"));
+    }
+
+    #[test]
+    fn format_processing_line_handles_pluralization() {
+        assert_eq!(format_processing_line(1), "Processing 1 evaluator...");
+        assert_eq!(format_processing_line(2), "Processing 2 evaluators...");
+    }
+
+    #[test]
+    fn format_start_line_handles_partial_payload() {
+        let start = ExperimentStart {
+            experiment_name: Some("my-exp".to_string()),
+            experiment_url: Some("https://example.dev/exp".to_string()),
+            ..Default::default()
+        };
+        let line = format_start_line(&start).expect("line should be rendered");
+        assert!(line.contains("my-exp"));
+        assert!(line.contains("https://example.dev/exp"));
+
+        assert!(format_start_line(&ExperimentStart::default()).is_none());
+    }
+
+    #[test]
+    fn fit_name_to_spaces_preserves_suffix_when_truncating() {
+        let rendered =
+            fit_name_to_spaces("Topics [experimentName=facets-real-world-30b-f5a78312]", 40);
+        assert_eq!(rendered.chars().count(), 40);
+        assert!(rendered.contains("..."));
+        assert!(rendered.contains("f5a78312]"));
+    }
+
+    #[test]
+    fn fit_name_to_spaces_pads_short_names() {
+        let rendered = fit_name_to_spaces("short", 10);
+        assert_eq!(rendered, "short     ");
+    }
+
+    #[test]
+    fn handle_sse_event_parses_processing_and_start_payloads() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(
+            Some("processing".to_string()),
+            r#"{"evaluators": 2}"#.to_string(),
+            &tx,
+        );
+        handle_sse_event(
+            Some("start".to_string()),
+            r#"{"experiment_name":"my-exp","experiment_url":"https://example.dev/exp"}"#
+                .to_string(),
+            &tx,
+        );
+
+        match rx.try_recv().expect("processing event should be emitted") {
+            EvalEvent::Processing(payload) => assert_eq!(payload.evaluators, 2),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match rx.try_recv().expect("start event should be emitted") {
+            EvalEvent::Start(start) => {
+                assert_eq!(start.experiment_name.as_deref(), Some("my-exp"));
+                assert_eq!(
+                    start.experiment_url.as_deref(),
+                    Some("https://example.dev/exp")
+                );
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_sse_event_parses_summary_without_comparison_fields() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(
+            Some("summary".to_string()),
+            r#"{
+              "projectName":"Topics",
+              "experimentName":"facets-real-world-thinking-on",
+              "scores":{
+                "Factuality":{"name":"Factuality","score":0.62}
+              }
+            }"#
+            .to_string(),
+            &tx,
+        );
+
+        match rx.try_recv().expect("summary event should be emitted") {
+            EvalEvent::Summary(summary) => {
+                let factuality = summary
+                    .scores
+                    .get("Factuality")
+                    .expect("score should exist");
+                assert_eq!(factuality.improvements, 0);
+                assert_eq!(factuality.regressions, 0);
+                assert!(factuality.diff.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
@@ -3397,6 +3793,7 @@ mod tests {
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
+            "BT_EVAL_VERBOSE",
             "BT_EVAL_WATCH",
             "BT_EVAL_DEV",
             "BT_EVAL_DEV_HOST",
@@ -3410,6 +3807,7 @@ mod tests {
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
+        set_env_var("BT_EVAL_VERBOSE", "1");
         set_env_var("BT_EVAL_WATCH", "on");
         set_env_var("BT_EVAL_DEV", "true");
         set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
@@ -3429,6 +3827,7 @@ mod tests {
                 "metadata.kind=fast".to_string()
             ]
         );
+        assert!(parsed.eval.verbose);
         assert!(parsed.eval.watch);
         assert!(parsed.eval.dev);
         assert_eq!(parsed.eval.dev_host, "127.0.0.1");
