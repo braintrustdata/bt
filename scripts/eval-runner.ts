@@ -804,9 +804,24 @@ function resolveBraintrustPath(): string {
 }
 
 async function loadBraintrust() {
-  const resolved = resolveBraintrustPath();
-  const moduleUrl = pathToFileURL(resolved).href;
-  const mod: unknown = await import(moduleUrl);
+  const cjsPath = resolveBraintrustPath();
+  const cjsUrl = pathToFileURL(cjsPath).href;
+
+  try {
+    const mod: unknown = await import(cjsUrl);
+    return normalizeBraintrustModule(mod);
+  } catch {}
+
+  const esmPath = cjsPath.replace(/\.js$/, ".mjs");
+  if (esmPath !== cjsPath && fsMutable.existsSync(esmPath)) {
+    try {
+      const mod: unknown = await import(pathToFileURL(esmPath).href);
+      return normalizeBraintrustModule(mod);
+    } catch {}
+  }
+
+  const require = createRequire(cjsUrl);
+  const mod: unknown = require(cjsPath);
   return normalizeBraintrustModule(mod);
 }
 

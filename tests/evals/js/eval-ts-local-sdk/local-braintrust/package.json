@@ -1,0 +1,13 @@
+{
+  "name": "braintrust",
+  "version": "0.0.0-local",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "default": "./dist/index.mjs"
+    }
+  }
+}
