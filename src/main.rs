@@ -25,6 +25,7 @@ mod sync;
 mod tools;
 mod traces;
 mod ui;
+mod util_cmd;
 mod utils;
 
 use crate::args::{BaseArgs, CLIArgs};
@@ -140,6 +141,8 @@ enum Commands {
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
+    /// Local utility commands
+    Util(CLIArgs<util_cmd::UtilArgs>),
     /// Switch org and project context
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
@@ -167,6 +170,7 @@ impl Commands {
             Commands::Functions(cmd) => &cmd.base,
             Commands::Experiments(cmd) => &cmd.base,
             Commands::Sync(cmd) => &cmd.base,
+            Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
             Commands::Status(cmd) => &cmd.base,
         }
@@ -219,6 +223,7 @@ async fn try_main() -> Result<()> {
         Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
+        Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(cmd) => self_update::run(cmd.args).await?,
         Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
         Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
