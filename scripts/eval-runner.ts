@@ -708,8 +708,16 @@ function ensureBraintrustAvailable() {
   resolveBraintrustPath();
 }
 
+function getEvalFiles(): string[] {
+  const fromEnv = process.env.BT_EVAL_FILES_JSON;
+  if (fromEnv) {
+    return JSON.parse(fromEnv) as string[];
+  }
+  return process.argv.slice(2);
+}
+
 function resolveBraintrustPath(): string {
-  const files = normalizeFiles(process.argv.slice(2));
+  const files = normalizeFiles(getEvalFiles());
   for (const file of files) {
     try {
       const require = createRequire(pathToFileURL(file).href);
@@ -1253,7 +1261,7 @@ async function createEvalRunner(config: RunnerConfig) {
 
 async function main() {
   const config = readRunnerConfig();
-  const files = process.argv.slice(2);
+  const files = getEvalFiles();
   if (files.length === 0) {
     console.error("No eval files provided.");
     process.exit(1);
@@ -1269,10 +1277,6 @@ async function main() {
   const braintrust = await loadBraintrust();
   propagateInheritedBraintrustState(braintrust);
   initRegistry();
-  // Strip eval file paths from process.argv before loading user code so that
-  // user-side parseArgs({ strict: true }) does not see them as unexpected
-  // positional arguments.
-  process.argv = process.argv.slice(0, 2);
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 
