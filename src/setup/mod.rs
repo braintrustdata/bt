@@ -29,7 +29,7 @@ const SHARED_SKILL_TEMPLATE: &str = include_str!("../../skills/shared/skill_temp
 const SKILL_FRONTMATTER: &str = include_str!("../../skills/shared/skill_frontmatter.md");
 const BT_README: &str = include_str!("../../README.md");
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
-    "bt eval", "bt sql", "bt view", "bt login", "bt setup", "bt docs",
+    "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
 ];
 const ALL_AGENTS: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode];
 const ALL_WORKFLOWS: [WorkflowArg; 5] = [
