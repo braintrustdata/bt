@@ -716,6 +716,16 @@ async fn spawn_eval_runner(
     if language == EvalLanguage::JavaScript && force_esm {
         cmd.env("BT_EVAL_FORCE_ESM", "1");
     }
+    if language == EvalLanguage::JavaScript {
+        let runner_name = match runner_kind {
+            RunnerKind::Tsx => "tsx",
+            RunnerKind::ViteNode => "vite-node",
+            RunnerKind::Deno => "deno",
+            RunnerKind::Bun => "bun",
+            RunnerKind::Other => "other",
+        };
+        cmd.env("BT_EVAL_RUNNER", runner_name);
+    }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
         socket_path.to_string_lossy().to_string(),

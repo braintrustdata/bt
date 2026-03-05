@@ -1047,11 +1047,19 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
   // Internal CLI-controlled flag for ESM retry; not user-facing config.
   const forceEsm = envFlag("BT_EVAL_FORCE_ESM");
+  // vite-node installs transform hooks that handle TypeScript (including
+  // extension-less imports) and CJS named-export interop natively. A failed
+  // require() corrupts Node's module cache and causes the subsequent import()
+  // to hit the "module imported again after being required" bug, so we skip
+  // require() for .ts/.tsx files entirely when running under vite-node.
+  const isViteNode = process.env.BT_EVAL_RUNNER === "vite-node";
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
+    const isTypeScript = file.endsWith(".ts") || file.endsWith(".tsx");
     const preferRequire =
       !forceEsm &&
-      (file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs"));
+      !(isViteNode && isTypeScript) &&
+      (isTypeScript || file.endsWith(".cjs"));
 
     if (preferRequire) {
       try {
@@ -1097,6 +1105,9 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
 
 function shouldTryRequire(file: string, err: unknown): boolean {
   if (envFlag("BT_EVAL_FORCE_ESM")) {
+    return false;
+  }
+  if (process.env.BT_EVAL_RUNNER === "vite-node") {
     return false;
   }
   if (process.env.BT_EVAL_CJS === "1" || file.endsWith(".cjs")) {
