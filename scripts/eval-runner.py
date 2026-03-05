@@ -667,6 +667,59 @@ def wrap_task_with_progress(task: Any, progress_cb: Callable[[str, int | None], 
     return wrapped_task
 
 
+def run_evaluator_supports_stream() -> bool:
+    try:
+        from inspect import signature
+
+        return "stream" in signature(run_evaluator).parameters
+    except Exception:
+        return False
+
+
+def _wrap_task_for_streaming(task):
+    import inspect
+
+    sig = inspect.signature(task)
+    takes_hooks = len(sig.parameters) >= 2
+
+    async def wrapped_task(input, hooks):
+        if takes_hooks:
+            result = task(input, hooks)
+        else:
+            result = task(input)
+        if asyncio.iscoroutine(result):
+            result = await result
+        try:
+            hooks.report_progress({
+                "format": "code",
+                "output_type": "completion",
+                "event": "json_delta",
+                "data": json.dumps(result),
+            })
+        except Exception:
+            pass
+        return result
+
+    return wrapped_task
+
+
+def _send_experiment_start(sse: SseWriter | None, experiment) -> None:
+    if not sse or not experiment:
+        return
+    try:
+        summary = experiment.summarize(summarize_scores=False)
+        sse.send("start", {
+            "projectName": summary.project_name,
+            "experimentName": summary.experiment_name,
+            "projectId": summary.project_id,
+            "experimentId": summary.experiment_id,
+            "projectUrl": summary.project_url,
+            "experimentUrl": summary.experiment_url,
+        })
+    except Exception:
+        pass
+
+
 async def run_evaluator_task(
     evaluator, position: int, no_send_logs: bool, progress_cb, progress_mode: str, sse: SseWriter | None
 ):
@@ -675,18 +728,25 @@ async def run_evaluator_task(
         experiment = _init_experiment_for_eval(evaluator)
     send_experiment_start(sse, evaluator, experiment)
 
+    _send_experiment_start(sse, experiment)
+
     fallback_progress = progress_cb is not None and progress_mode != "progress"
-    original_task = None
+    original_task = evaluator.task
     if fallback_progress:
         progress_cb("start", infer_evaluator_total(evaluator))
-        original_task = getattr(evaluator, "task", None)
-        if original_task is not None:
-            evaluator.task = wrap_task_with_progress(original_task, progress_cb)
+        evaluator.task = wrap_task_with_progress(original_task, progress_cb)
+
+    supports_stream = run_evaluator_supports_stream()
+
+    if sse and supports_stream:
+        evaluator.task = _wrap_task_for_streaming(evaluator.task)
 
     try:
         kwargs = {}
         if progress_cb and progress_mode == "progress":
             kwargs["progress"] = progress_cb
+        if sse and supports_stream:
+            kwargs["stream"] = lambda event: sse.send("progress", event if isinstance(event, dict) else event.__dict__)
         return await run_evaluator(
             experiment,
             evaluator,
@@ -695,9 +755,8 @@ async def run_evaluator_task(
             **kwargs,
         )
     finally:
+        evaluator.task = original_task
         if fallback_progress:
-            if original_task is not None:
-                evaluator.task = original_task
             progress_cb("stop", None)
         if experiment:
             experiment.flush()
@@ -734,15 +793,17 @@ async def run_requested_eval(
         if "project_id" in request:
             evaluator.project_id = request["project_id"]
 
+        request_parameters = request.get("parameters")
         if evaluator.parameters is not None:
-            request_parameters = request.get("parameters", {})
+            if request_parameters is None:
+                request_parameters = {}
             if not isinstance(request_parameters, dict):
                 raise ValueError("parameters must be an object")
             evaluator.parameters = validate_parameters(request_parameters, evaluator.parameters)
-        elif "parameters" in request:
-            if not isinstance(request["parameters"], dict):
+        elif request_parameters is not None:
+            if not isinstance(request_parameters, dict):
                 raise ValueError("parameters must be an object")
-            evaluator.parameters = request["parameters"]
+            evaluator.parameters = request_parameters
 
         if "scores" in request and request["scores"]:
             scorer_functions = [
