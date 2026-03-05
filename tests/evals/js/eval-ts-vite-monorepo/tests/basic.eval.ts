@@ -6,8 +6,8 @@ const exactMatch = ({ output, expected }) => ({
   score: output === expected ? 1 : 0,
 });
 
-Eval("test-cli-eval-ts-esm-monorepo", {
-  experimentName: "ESM Monorepo Test",
+Eval("test-cli-eval-ts-vite-monorepo", {
+  experimentName: "Vite Monorepo Test",
   data: () => [
     { input: "Alice", expected: "Hello Alice" },
     { input: "Bob", expected: "Hello Bob" },
