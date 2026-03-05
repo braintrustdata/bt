@@ -1052,7 +1052,7 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
   // require() corrupts Node's module cache and causes the subsequent import()
   // to hit the "module imported again after being required" bug, so we skip
   // require() for .ts/.tsx files entirely when running under vite-node.
-  const isViteNode = process.env.BT_EVAL_RUNNER === "vite-node";
+  const isViteNode = process.env.BT_EVAL_RUNNER_KIND === "vite-node";
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
     const isTypeScript = file.endsWith(".ts") || file.endsWith(".tsx");
@@ -1107,7 +1107,7 @@ function shouldTryRequire(file: string, err: unknown): boolean {
   if (envFlag("BT_EVAL_FORCE_ESM")) {
     return false;
   }
-  if (process.env.BT_EVAL_RUNNER === "vite-node") {
+  if (process.env.BT_EVAL_RUNNER_KIND === "vite-node") {
     return false;
   }
   if (process.env.BT_EVAL_CJS === "1" || file.endsWith(".cjs")) {

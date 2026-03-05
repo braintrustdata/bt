@@ -724,7 +724,7 @@ async fn spawn_eval_runner(
             RunnerKind::Bun => "bun",
             RunnerKind::Other => "other",
         };
-        cmd.env("BT_EVAL_RUNNER", runner_name);
+        cmd.env("BT_EVAL_RUNNER_KIND", runner_name);
     }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
