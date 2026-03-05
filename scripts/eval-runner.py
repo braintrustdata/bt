@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import fnmatch
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -23,7 +24,7 @@ try:
         run_evaluator,
         set_thread_pool_max_workers,
     )
-    from braintrust.logger import Dataset
+    from braintrust.logger import Dataset, init as init_logger_experiment
     from braintrust.parameters import parameters_to_json_schema, validate_parameters
     from braintrust.util import eprint
 except Exception as exc:  # pragma: no cover - runtime guard
@@ -44,6 +45,7 @@ WATCH_EXCLUDE_SEGMENTS = (
     "/.venv/",
     "/venv/",
 )
+_DATASET_TOTAL_CACHE: dict[str, int] = {}
 
 
 @dataclass(frozen=True)
@@ -518,12 +520,10 @@ def _init_experiment_for_eval(evaluator):
     if isinstance(evaluator.data, Dataset):
         dataset = evaluator.data
 
-    from braintrust.framework import init_experiment
-
-    return init_experiment(
-        project_name=evaluator.project_name,
+    return init_logger_experiment(
+        project=evaluator.project_name,
         project_id=evaluator.project_id,
-        experiment_name=evaluator.experiment_name,
+        experiment=evaluator.experiment_name,
         description=evaluator.description,
         metadata=evaluator.metadata,
         is_public=evaluator.is_public,
@@ -533,31 +533,159 @@ def _init_experiment_for_eval(evaluator):
         git_metadata_settings=evaluator.git_metadata_settings,
         repo_info=evaluator.repo_info,
         dataset=dataset,
+        set_current=False,
     )
 
 
-def run_evaluator_supports_progress() -> bool:
+def send_experiment_start(
+    sse: SseWriter | None,
+    evaluator: Any,
+    experiment: Any | None,
+) -> None:
+    if not sse:
+        return
+
+    if experiment is not None:
+        try:
+            summary = experiment.summarize(summarize_scores=False)
+            sse.send(
+                "start",
+                {
+                    "project_name": getattr(summary, "project_name", None),
+                    "experiment_name": getattr(summary, "experiment_name", None),
+                    "project_url": getattr(summary, "project_url", None),
+                    "experiment_url": getattr(summary, "experiment_url", None),
+                },
+            )
+            return
+        except Exception:
+            pass
+
+    experiment_name = getattr(evaluator, "experiment_name", None) or getattr(
+        evaluator, "eval_name", None
+    )
+    if experiment_name:
+        sse.send("start", {"experiment_name": experiment_name})
+
+
+def run_evaluator_progress_mode() -> str:
     try:
         from inspect import signature
 
-        return "progress" in signature(run_evaluator).parameters
+        parameters = signature(run_evaluator).parameters
+        if "progress" in parameters:
+            return "progress"
+        if "stream" in parameters:
+            return "stream"
     except Exception:
-        return False
+        pass
+    return "none"
+
+
+def infer_data_total(data: Any) -> int | None:
+    if data is None:
+        return None
+
+    try:
+        total = len(data)
+        if isinstance(total, int) and total >= 0:
+            return total
+    except Exception:
+        pass
+
+    if isinstance(data, Dataset):
+        dataset_id = None
+        try:
+            dataset_id = data.id
+        except Exception:
+            dataset_id = None
+
+        if dataset_id and dataset_id in _DATASET_TOTAL_CACHE:
+            return _DATASET_TOTAL_CACHE[dataset_id]
+
+        try:
+            summary = data.summarize(summarize_data=True)
+            data_summary = getattr(summary, "data_summary", None)
+            total_records = getattr(data_summary, "total_records", None)
+            if isinstance(total_records, int) and total_records >= 0:
+                if dataset_id:
+                    _DATASET_TOTAL_CACHE[dataset_id] = total_records
+                return total_records
+        except Exception:
+            return None
+
+    if inspect.isclass(data) or inspect.isroutine(data):
+        return None
+    if inspect.isgenerator(data) or inspect.isasyncgen(data):
+        return None
+
+    return None
+
+
+def infer_evaluator_total(evaluator: Any) -> int | None:
+    data_total = infer_data_total(getattr(evaluator, "data", None))
+    if data_total is None:
+        return None
+
+    trial_count = getattr(evaluator, "trial_count", 1)
+    try:
+        trial_count = int(trial_count)
+    except Exception:
+        trial_count = 1
+    if trial_count < 1:
+        trial_count = 1
+
+    return data_total * trial_count
+
+
+def wrap_task_with_progress(task: Any, progress_cb: Callable[[str, int | None], None] | None) -> Any:
+    if not callable(task) or progress_cb is None:
+        return task
+
+    task_signature = None
+    try:
+        task_signature = inspect.signature(task)
+    except Exception:
+        task_signature = None
+
+    async def wrapped_task(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = task(*args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        finally:
+            progress_cb("increment", None)
+
+    if task_signature is not None:
+        setattr(wrapped_task, "__signature__", task_signature)
+    if hasattr(task, "__name__"):
+        setattr(wrapped_task, "__name__", getattr(task, "__name__"))
+    if hasattr(task, "__qualname__"):
+        setattr(wrapped_task, "__qualname__", getattr(task, "__qualname__"))
+
+    return wrapped_task
 
 
 async def run_evaluator_task(
-    evaluator, position: int, no_send_logs: bool, progress_cb, supports_progress: bool
+    evaluator, position: int, no_send_logs: bool, progress_cb, progress_mode: str, sse: SseWriter | None
 ):
     experiment = None
     if not no_send_logs:
         experiment = _init_experiment_for_eval(evaluator)
+    send_experiment_start(sse, evaluator, experiment)
 
-    if progress_cb and not supports_progress:
-        progress_cb("start", None)
+    fallback_progress = progress_cb is not None and progress_mode != "progress"
+    original_task = None
+    if fallback_progress:
+        progress_cb("start", infer_evaluator_total(evaluator))
+        original_task = getattr(evaluator, "task", None)
+        if original_task is not None:
+            evaluator.task = wrap_task_with_progress(original_task, progress_cb)
 
     try:
         kwargs = {}
-        if progress_cb and supports_progress:
+        if progress_cb and progress_mode == "progress":
             kwargs["progress"] = progress_cb
         return await run_evaluator(
             experiment,
@@ -567,7 +695,9 @@ async def run_evaluator_task(
             **kwargs,
         )
     finally:
-        if progress_cb and not supports_progress:
+        if fallback_progress:
+            if original_task is not None:
+                evaluator.task = original_task
             progress_cb("stop", None)
         if experiment:
             experiment.flush()
@@ -635,7 +765,7 @@ async def run_requested_eval(
         send_eval_error(sse, message, traceback.format_exc(), infer_eval_error_status(message))
         return False
 
-    supports_progress = run_evaluator_supports_progress()
+    progress_mode = run_evaluator_progress_mode()
     progress_cb = create_progress_reporter(sse, evaluator.eval_name)
 
     try:
@@ -644,7 +774,8 @@ async def run_requested_eval(
             0,
             no_send_logs,
             progress_cb,
-            supports_progress,
+            progress_mode,
+            sse,
         )
     except Exception as exc:
         message = str(exc)
@@ -695,7 +826,10 @@ async def run_once(
             print(evaluator_instance.evaluator.eval_name)
         return True
 
-    supports_progress = run_evaluator_supports_progress()
+    if sse:
+        sse.send("processing", {"evaluators": len(evaluators)})
+
+    progress_mode = run_evaluator_progress_mode()
 
     async def run_single_evaluator(
         idx: int, evaluator_instance: EvaluatorInstance
@@ -716,7 +850,8 @@ async def run_once(
                 idx,
                 no_send_logs,
                 progress_cb,
-                supports_progress,
+                progress_mode,
+                sse,
             )
         except Exception as exc:
             err = serialize_error(str(exc), traceback.format_exc())

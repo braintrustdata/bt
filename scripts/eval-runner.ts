@@ -804,9 +804,24 @@ function resolveBraintrustPath(): string {
 }
 
 async function loadBraintrust() {
-  const resolved = resolveBraintrustPath();
-  const moduleUrl = pathToFileURL(resolved).href;
-  const mod: unknown = await import(moduleUrl);
+  const cjsPath = resolveBraintrustPath();
+  const cjsUrl = pathToFileURL(cjsPath).href;
+
+  try {
+    const mod: unknown = await import(cjsUrl);
+    return normalizeBraintrustModule(mod);
+  } catch {}
+
+  const esmPath = cjsPath.replace(/\.js$/, ".mjs");
+  if (esmPath !== cjsPath && fsMutable.existsSync(esmPath)) {
+    try {
+      const mod: unknown = await import(pathToFileURL(esmPath).href);
+      return normalizeBraintrustModule(mod);
+    } catch {}
+  }
+
+  const require = createRequire(cjsUrl);
+  const mod: unknown = require(cjsPath);
   return normalizeBraintrustModule(mod);
 }
 
@@ -1030,10 +1045,13 @@ function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
 
 async function loadFiles(files: string[]): Promise<unknown[]> {
   const modules: unknown[] = [];
+  // Internal CLI-controlled flag for ESM retry; not user-facing config.
+  const forceEsm = envFlag("BT_EVAL_FORCE_ESM");
   for (const file of files) {
     const fileUrl = pathToFileURL(file).href;
     const preferRequire =
-      file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs");
+      !forceEsm &&
+      (file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".cjs"));
 
     if (preferRequire) {
       try {
@@ -1078,6 +1096,9 @@ async function loadFiles(files: string[]): Promise<unknown[]> {
 }
 
 function shouldTryRequire(file: string, err: unknown): boolean {
+  if (envFlag("BT_EVAL_FORCE_ESM")) {
+    return false;
+  }
   if (process.env.BT_EVAL_CJS === "1" || file.endsWith(".cjs")) {
     return true;
   }
@@ -1874,6 +1895,9 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   };
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
+    if (sse) {
+      sse.send("processing", { evaluators: evaluators.length });
+    }
     const reporters = getReporters();
     const runEntry = async (entry: EvaluatorEntry): Promise<boolean> => {
       try {

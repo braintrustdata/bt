@@ -1,0 +1,12 @@
+{
+  "name": "bt-eval-ts-local-sdk",
+  "private": true,
+  "description": "Tests bt eval with a local (non-node_modules) braintrust SDK build and an ESM-only dependency. This simulates setups where braintrust resolves outside node_modules such as when testing local sdk changes, causing vite-node to process the CJS bundle through its module proxy instead of externalizing it.",
+  "dependencies": {
+    "braintrust": "link:./local-braintrust",
+    "esm-only-pkg": "file:./esm-only-pkg"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2"
+  }
+}

@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +42,7 @@ use ratatui::Terminal;
 
 use crate::args::BaseArgs;
 use crate::auth::resolved_auth_env;
+use crate::ui::{animations_enabled, is_quiet};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -55,6 +57,8 @@ const HEADER_BT_ORG_NAME: &str = "x-bt-org-name";
 const HEADER_CORS_REQ_PRIVATE_NETWORK: &str = "access-control-request-private-network";
 const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
 const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
+const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
+const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
 static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct EvalRunOutput {
@@ -73,6 +77,35 @@ struct EvalRunnerProcess {
 struct EvalProcessOutput {
     status: ExitStatus,
     dependency_files: Vec<String>,
+    error_messages: Vec<String>,
+    stderr_lines: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryPolicy {
+    Allow,
+    Disallow,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsMode {
+    Auto,
+    ForceEsm,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsolePolicy {
+    Forward,
+    BufferStderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerKind {
+    Tsx,
+    ViteNode,
+    Deno,
+    Bun,
+    Other,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +293,15 @@ pub struct EvalArgs {
     )]
     pub filter: Vec<String>,
 
+    /// Show verbose evaluator errors and stderr output.
+    #[arg(
+        long,
+        env = "BT_EVAL_VERBOSE",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    pub verbose: bool,
+
     /// Re-run evals when input files change.
     #[arg(
         long,
@@ -309,12 +351,14 @@ struct EvalRunOptions {
     num_workers: Option<usize>,
     list: bool,
     filter: Vec<String>,
+    verbose: bool,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
+    validate_eval_input_files(&args.files)?;
 
     let options = EvalRunOptions {
         jsonl: args.jsonl,
@@ -322,6 +366,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         num_workers: args.num_workers,
         list: args.list,
         filter: args.filter,
+        verbose: args.verbose,
     };
 
     if args.dev {
@@ -351,20 +396,20 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         run_eval_files_watch(
             &base,
             args.language,
-            args.runner.clone(),
-            args.files.clone(),
+            args.runner.as_deref(),
+            &args.files,
             args.no_send_logs,
-            options,
+            &options,
         )
         .await
     } else {
         let output = run_eval_files_once(
             &base,
             args.language,
-            args.runner.clone(),
-            args.files.clone(),
+            args.runner.as_deref(),
+            &args.files,
             args.no_send_logs,
-            options,
+            &options,
         )
         .await?;
         if !output.status.success() {
@@ -377,12 +422,12 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 async fn run_eval_files_watch(
     base: &BaseArgs,
     language_override: Option<EvalLanguage>,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    runner_override: Option<&str>,
+    files: &[String],
     no_send_logs: bool,
-    options: EvalRunOptions,
+    options: &EvalRunOptions,
 ) -> Result<()> {
-    let input_watch_paths = resolve_watch_paths(&files)?;
+    let input_watch_paths = resolve_watch_paths(files)?;
     let mut active_watch_paths = input_watch_paths.clone();
     let mut watch_state = snapshot_watch_state(&active_watch_paths)?;
 
@@ -395,10 +440,10 @@ async fn run_eval_files_watch(
         match run_eval_files_once(
             base,
             language_override,
-            runner_override.clone(),
-            files.clone(),
+            runner_override,
+            files,
             no_send_logs,
-            options.clone(),
+            options,
         )
         .await
         {
@@ -435,36 +480,100 @@ async fn run_eval_files_watch(
     }
 }
 
+struct EvalPlan<'a> {
+    language: EvalLanguage,
+    files: &'a [String],
+    runner_override: Option<&'a str>,
+    show_js_hint: bool,
+    retry_policy: RetryPolicy,
+}
+
+struct EvalAttemptOutput {
+    status: ExitStatus,
+    dependency_files: Vec<String>,
+    error_messages: Vec<String>,
+    stderr_lines: Vec<String>,
+    runner_kind: RunnerKind,
+}
+
+fn build_eval_plan<'a>(
+    files: &'a [String],
+    language_override: Option<EvalLanguage>,
+    runner_override: Option<&'a str>,
+) -> Result<EvalPlan<'a>> {
+    let language = detect_eval_language(files, language_override)?;
+    let show_js_hint = language == EvalLanguage::JavaScript && runner_override.is_none();
+    let has_ts_files = language == EvalLanguage::JavaScript && has_ts_eval_files(files);
+    let retry_policy = if show_js_hint && has_ts_files {
+        RetryPolicy::Allow
+    } else {
+        RetryPolicy::Disallow
+    };
+
+    Ok(EvalPlan {
+        language,
+        files,
+        runner_override,
+        show_js_hint,
+        retry_policy,
+    })
+}
+
 async fn run_eval_files_once(
     base: &BaseArgs,
     language_override: Option<EvalLanguage>,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    runner_override: Option<&str>,
+    files: &[String],
     no_send_logs: bool,
-    options: EvalRunOptions,
+    options: &EvalRunOptions,
 ) -> Result<EvalRunOutput> {
-    let (process, language, show_js_runner_hint_on_failure) = spawn_eval_runner(
+    let plan = build_eval_plan(files, language_override, runner_override)?;
+    let console_policy = match plan.retry_policy {
+        RetryPolicy::Allow => ConsolePolicy::BufferStderr,
+        RetryPolicy::Disallow => ConsolePolicy::Forward,
+    };
+
+    let mut output = run_eval_attempt(
         base,
-        language_override,
-        runner_override,
-        files.clone(),
+        &plan,
         no_send_logs,
-        &options,
+        options,
         &[],
+        JsMode::Auto,
+        console_policy,
     )
     .await?;
-    let mut ui = EvalUi::new(options.jsonl, options.list);
-    let output = drive_eval_runner(process, |event| ui.handle(event)).await?;
-    ui.finish();
-    if !output.status.success() && show_js_runner_hint_on_failure {
-        eprintln!(
-            "Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`."
-        );
+
+    if !output.status.success() && should_retry_esm(&plan, &output) {
+        let first_attempt_stderr = std::mem::take(&mut output.stderr_lines);
+        eprintln!("Eval failed with ESM/CJS interop error. Retrying in ESM mode...");
+        output = run_eval_attempt(
+            base,
+            &plan,
+            no_send_logs,
+            options,
+            &[],
+            JsMode::ForceEsm,
+            ConsolePolicy::Forward,
+        )
+        .await?;
+
+        if !output.status.success() {
+            eprintln!("\nFirst attempt (CJS mode) error:");
+            report_buffered_stderr(&first_attempt_stderr, options.verbose);
+        }
+    } else if matches!(plan.retry_policy, RetryPolicy::Allow) {
+        report_buffered_stderr(&output.stderr_lines, options.verbose);
     }
+
+    if !output.status.success() && plan.show_js_hint && should_retry_esm(&plan, &output) {
+        eprintln!("Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`.");
+    }
+
     let mut dependencies =
         normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
-    if language == EvalLanguage::JavaScript {
-        let static_dependencies = collect_js_static_dependencies(&files)?;
+    if plan.language == EvalLanguage::JavaScript {
+        let static_dependencies = collect_js_static_dependencies(files)?;
         dependencies = merge_watch_paths(&dependencies, &static_dependencies);
     }
 
@@ -474,22 +583,60 @@ async fn run_eval_files_once(
     })
 }
 
-async fn spawn_eval_runner(
+async fn run_eval_attempt(
     base: &BaseArgs,
-    language_override: Option<EvalLanguage>,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    plan: &EvalPlan<'_>,
     no_send_logs: bool,
     options: &EvalRunOptions,
     extra_env: &[(String, String)],
-) -> Result<(EvalRunnerProcess, EvalLanguage, bool)> {
-    let language = detect_eval_language(&files, language_override)?;
+    js_mode: JsMode,
+    console_policy: ConsolePolicy,
+) -> Result<EvalAttemptOutput> {
+    let spawned = spawn_eval_runner(
+        base,
+        plan.language,
+        plan.runner_override,
+        plan.files,
+        no_send_logs,
+        options,
+        extra_env,
+        js_mode,
+    )
+    .await?;
+    let mut ui = EvalUi::new(options.jsonl, options.list, options.verbose);
+    let output =
+        drive_eval_runner(spawned.process, console_policy, |event| ui.handle(event)).await?;
+    ui.finish();
+
+    Ok(EvalAttemptOutput {
+        status: output.status,
+        dependency_files: output.dependency_files,
+        error_messages: output.error_messages,
+        stderr_lines: output.stderr_lines,
+        runner_kind: spawned.runner_kind,
+    })
+}
+
+struct EvalSpawned {
+    process: EvalRunnerProcess,
+    runner_kind: RunnerKind,
+}
+
+async fn spawn_eval_runner(
+    base: &BaseArgs,
+    language: EvalLanguage,
+    runner_override: Option<&str>,
+    files: &[String],
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+    extra_env: &[(String, String)],
+    js_mode: JsMode,
+) -> Result<EvalSpawned> {
     if language != EvalLanguage::Python && options.num_workers.is_some() {
         anyhow::bail!("--num-workers is only supported for Python evals.");
     }
-    let show_js_runner_hint_on_failure =
-        language == EvalLanguage::JavaScript && runner_override.is_none();
     let (js_runner, py_runner) = prepare_eval_runners()?;
+    let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
     let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -519,10 +666,26 @@ async fn spawn_eval_runner(
         };
     });
 
-    let mut cmd = match language {
-        EvalLanguage::Python => build_python_command(runner_override, &py_runner, &files)?,
-        EvalLanguage::JavaScript => build_js_command(runner_override, &js_runner, &files)?,
+    let (mut cmd, runner_kind) = match language {
+        EvalLanguage::Python => (
+            build_python_command(runner_override, &py_runner, files)?,
+            RunnerKind::Other,
+        ),
+        EvalLanguage::JavaScript => {
+            if force_esm {
+                (
+                    build_vite_node_fallback_command(&js_runner, files)?,
+                    RunnerKind::ViteNode,
+                )
+            } else {
+                let plan = build_js_plan(runner_override, &js_runner, files)?;
+                (plan.cmd, plan.kind)
+            }
+        }
     };
+    if language == EvalLanguage::JavaScript && should_set_node_heap_size(runner_kind) {
+        set_node_heap_size_env(&mut cmd);
+    }
 
     cmd.envs(build_env(base).await?);
     for (key, value) in extra_env {
@@ -549,6 +712,9 @@ async fn spawn_eval_runner(
         let serialized =
             serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
         cmd.env("BT_EVAL_FILTER_PARSED", serialized);
+    }
+    if language == EvalLanguage::JavaScript && force_esm {
+        cmd.env("BT_EVAL_FORCE_ESM", "1");
     }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
@@ -582,21 +748,21 @@ async fn spawn_eval_runner(
 
     drop(tx);
 
-    Ok((
-        EvalRunnerProcess {
+    Ok(EvalSpawned {
+        process: EvalRunnerProcess {
             child,
             rx,
             sse_task,
             sse_connected,
             _socket_cleanup_guard: socket_cleanup_guard,
         },
-        language,
-        show_js_runner_hint_on_failure,
-    ))
+        runner_kind,
+    })
 }
 
 async fn drive_eval_runner<F>(
     mut process: EvalRunnerProcess,
+    console_policy: ConsolePolicy,
     mut on_event: F,
 ) -> Result<EvalProcessOutput>
 where
@@ -604,6 +770,8 @@ where
 {
     let mut status = None;
     let mut dependency_files: Vec<String> = Vec::new();
+    let mut error_messages: Vec<String> = Vec::new();
+    let mut stderr_lines: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
@@ -612,6 +780,21 @@ where
                     Some(EvalEvent::Dependencies { files }) => {
                         dependency_files.extend(files.clone());
                         on_event(EvalEvent::Dependencies { files });
+                    }
+                    Some(EvalEvent::Error { message, stack, status }) => {
+                        error_messages.push(message.clone());
+                        if let Some(stack) = stack.as_ref() {
+                            error_messages.push(stack.clone());
+                        }
+                        on_event(EvalEvent::Error { message, stack, status });
+                    }
+                    Some(EvalEvent::Console { stream, message }) => {
+                        if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr)
+                        {
+                            stderr_lines.push(message);
+                        } else {
+                            on_event(EvalEvent::Console { stream, message });
+                        }
                     }
                     Some(event) => on_event(event),
                     None => {
@@ -643,7 +826,65 @@ where
     Ok(EvalProcessOutput {
         status: status.context("eval runner process exited without a status")?,
         dependency_files,
+        error_messages,
+        stderr_lines,
     })
+}
+
+fn flush_stderr(lines: &[String]) {
+    for line in lines {
+        eprintln!("{line}");
+    }
+}
+
+fn report_buffered_stderr(lines: &[String], verbose: bool) {
+    if lines.is_empty() {
+        return;
+    }
+    if verbose {
+        flush_stderr(lines);
+    } else {
+        eprintln!(
+            "Suppressed {} stderr line(s). Re-run with `bt eval --verbose ...` to inspect details.",
+            lines.len()
+        );
+    }
+}
+
+fn should_retry_esm(plan: &EvalPlan<'_>, output: &EvalAttemptOutput) -> bool {
+    if matches!(plan.retry_policy, RetryPolicy::Disallow) {
+        return false;
+    }
+    if output.runner_kind != RunnerKind::Tsx {
+        return false;
+    }
+    output
+        .stderr_lines
+        .iter()
+        .chain(&output.error_messages)
+        .any(|line| is_esm_interop_error(line))
+}
+
+fn has_ts_eval_files(files: &[String]) -> bool {
+    files.iter().any(|file| {
+        let ext = Path::new(file)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        matches!(ext.to_ascii_lowercase().as_str(), "ts" | "tsx")
+    })
+}
+
+fn is_esm_interop_error(message: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "ERR_REQUIRE_ESM",
+        "ERR_PACKAGE_PATH_NOT_EXPORTED",
+        "No \"exports\" main defined",
+        "Cannot use import statement outside a module",
+        "ERR_UNKNOWN_FILE_EXTENSION",
+    ];
+
+    PATTERNS.iter().any(|pattern| message.contains(pattern))
 }
 
 fn resolve_app_url(base: &BaseArgs) -> String {
@@ -938,7 +1179,10 @@ fn is_eval_progress_payload(progress: &SseProgressEventData) -> bool {
 
 fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
     match event {
-        EvalEvent::Start(summary) => serde_json::to_string(summary)
+        EvalEvent::Processing(payload) => serde_json::to_string(payload)
+            .ok()
+            .map(|data| serialize_sse_event("processing", &data)),
+        EvalEvent::Start(start) => serde_json::to_string(start)
             .ok()
             .map(|data| serialize_sse_event("start", &data)),
         EvalEvent::Summary(summary) => serde_json::to_string(summary)
@@ -1045,14 +1289,24 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         }
     };
 
-    let (process, _, _) = match spawn_eval_runner(
+    let language = match detect_eval_language(&state.files, state.language_override) {
+        Ok(language) => language,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    let spawned = match spawn_eval_runner(
         &state.base,
-        state.language_override,
-        state.runner_override.clone(),
-        state.files.clone(),
+        language,
+        state.runner_override.as_deref(),
+        &state.files,
         state.no_send_logs,
         &state.options,
         &extra_env,
+        JsMode::Auto,
     )
     .await
     {
@@ -1067,27 +1321,32 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
 
     let mut stdout_lines = Vec::new();
     let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-    let output = match drive_eval_runner(process, |event| match event {
-        EvalEvent::Console { stream, message } if stream == "stdout" => {
-            stdout_lines.push(message);
-        }
-        EvalEvent::Error {
-            message,
-            stack: _,
-            status,
-        } => errors.push((message, status)),
-        _ => {}
-    })
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
+    let output =
+        match drive_eval_runner(
+            spawned.process,
+            ConsolePolicy::Forward,
+            |event| match event {
+                EvalEvent::Console { stream, message } if stream == "stdout" => {
+                    stdout_lines.push(message);
+                }
+                EvalEvent::Error {
+                    message,
+                    stack: _,
+                    status,
+                } => errors.push((message, status)),
+                _ => {}
+            },
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                return json_error_response(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("{err:#}"),
+                );
+            }
+        };
 
     if let Some((message, status)) = errors.first() {
         let status = status
@@ -1157,14 +1416,24 @@ async fn dev_server_eval(
         }
     };
 
-    let (process, _, _) = match spawn_eval_runner(
+    let language = match detect_eval_language(&state.files, state.language_override) {
+        Ok(language) => language,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    let spawned = match spawn_eval_runner(
         &state.base,
-        state.language_override,
-        state.runner_override.clone(),
-        state.files.clone(),
+        language,
+        state.runner_override.as_deref(),
+        &state.files,
         state.no_send_logs,
         &state.options,
         &extra_env,
+        JsMode::Auto,
     )
     .await
     {
@@ -1182,7 +1451,7 @@ async fn dev_server_eval(
         tokio::spawn(async move {
             let mut saw_error = false;
             let mut saw_done = false;
-            let output = drive_eval_runner(process, |event| {
+            let output = drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
                 if matches!(event, EvalEvent::Error { .. }) {
                     saw_error = true;
                 }
@@ -1233,25 +1502,30 @@ async fn dev_server_eval(
 
     let mut summary: Option<ExperimentSummary> = None;
     let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-    let output = match drive_eval_runner(process, |event| match event {
-        EvalEvent::Summary(current) => summary = Some(current),
-        EvalEvent::Error {
-            message,
-            stack: _,
-            status,
-        } => errors.push((message, status)),
-        _ => {}
-    })
-    .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
+    let output =
+        match drive_eval_runner(
+            spawned.process,
+            ConsolePolicy::Forward,
+            |event| match event {
+                EvalEvent::Summary(current) => summary = Some(current),
+                EvalEvent::Error {
+                    message,
+                    stack: _,
+                    status,
+                } => errors.push((message, status)),
+                _ => {}
+            },
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                return json_error_response(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("{err:#}"),
+                );
+            }
+        };
 
     if let Some((message, status)) = errors.first() {
         let status = status
@@ -1613,38 +1887,135 @@ fn detect_eval_language(
     detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
 }
 
-fn build_js_command(
-    runner_override: Option<String>,
-    runner: &PathBuf,
+fn validate_eval_input_files(files: &[String]) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    validate_eval_input_files_in_cwd(files, &cwd)
+}
+
+fn validate_eval_input_files_in_cwd(files: &[String], cwd: &Path) -> Result<()> {
+    for input in files {
+        let input_path = Path::new(input);
+        let resolved = if input_path.is_absolute() {
+            input_path.to_path_buf()
+        } else {
+            cwd.join(input_path)
+        };
+
+        match std::fs::metadata(&resolved) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    anyhow::bail!(
+                        "Eval file is not a regular file: {} (from input `{input}`).",
+                        resolved.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(suggested) = maybe_missing_eval_file_suggestion(input, cwd) {
+                    anyhow::bail!(
+                        "Eval file not found: {} (from input `{input}` in `{}`). Did you mean `bt eval {suggested}`?",
+                        resolved.display(),
+                        cwd.display()
+                    );
+                }
+                anyhow::bail!(
+                    "Eval file not found: {} (from input `{input}` in `{}`).",
+                    resolved.display(),
+                    cwd.display()
+                );
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read eval file {}", resolved.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn maybe_missing_eval_file_suggestion(input: &str, cwd: &Path) -> Option<String> {
+    if Path::new(input).is_absolute() {
+        return None;
+    }
+    let cwd_name = cwd.file_name()?.to_str()?;
+    let prefixed = format!("{cwd_name}/");
+    let suggested = input.strip_prefix(&prefixed)?;
+    if suggested.is_empty() {
+        return None;
+    }
+    let candidate = cwd.join(suggested);
+    if candidate.is_file() {
+        Some(suggested.to_string())
+    } else {
+        None
+    }
+}
+
+struct JsRunnerPlan {
+    cmd: Command,
+    kind: RunnerKind,
+}
+
+fn build_js_plan(
+    runner_override: Option<&str>,
+    runner: &Path,
     files: &[String],
-) -> Result<Command> {
-    let command = if let Some(explicit) = runner_override.as_deref() {
+) -> Result<JsRunnerPlan> {
+    if let Some(explicit) = runner_override {
         let resolved_runner = resolve_js_runner_command(explicit, files);
         if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files)
-        } else {
-            let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
-            let mut command = Command::new(resolved_runner);
-            command.arg(runner_script).args(files);
-            command
+            return Ok(JsRunnerPlan {
+                cmd: build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
+                kind: RunnerKind::Deno,
+            });
         }
-    } else if let Some(auto_runner) = find_js_runner_binary(files) {
+        let kind = runner_kind_for_bin(resolved_runner.as_ref());
+        let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
+        let mut command = Command::new(resolved_runner);
+        command.arg(runner_script).args(files);
+        return Ok(JsRunnerPlan { cmd: command, kind });
+    }
+
+    if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
             let runner_script = prepare_js_runner_in_cwd()?;
-            build_deno_js_command(auto_runner.as_os_str(), &runner_script, files)
-        } else {
-            let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
-            let mut command = Command::new(auto_runner);
-            command.arg(runner_script).args(files);
-            command
+            return Ok(JsRunnerPlan {
+                cmd: build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
+                kind: RunnerKind::Deno,
+            });
         }
-    } else {
-        let mut command = Command::new("npx");
-        command.arg("--yes").arg("tsx").arg(runner).args(files);
-        command
-    };
+        let kind = runner_kind_for_bin(auto_runner.as_ref());
+        let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
+        let mut command = Command::new(auto_runner);
+        command.arg(runner_script).args(files);
+        return Ok(JsRunnerPlan { cmd: command, kind });
+    }
 
+    let mut command = Command::new("npx");
+    command.arg("--yes").arg("tsx").arg(runner).args(files);
+    Ok(JsRunnerPlan {
+        cmd: command,
+        kind: RunnerKind::Tsx,
+    })
+}
+
+fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<Command> {
+    if let Some(path) = find_node_module_bin_for_files("vite-node", files)
+        .or_else(|| find_binary_in_path(&["vite-node"]))
+    {
+        let mut command = Command::new(path);
+        command.arg(runner).args(files);
+        return Ok(command);
+    }
+
+    let mut command = Command::new("npx");
+    command
+        .arg("--yes")
+        .arg("vite-node")
+        .arg(runner)
+        .args(files);
     Ok(command)
 }
 
@@ -1671,11 +2042,12 @@ fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
 }
 
 fn build_python_command(
-    runner_override: Option<String>,
-    runner: &PathBuf,
+    runner_override: Option<&str>,
+    runner: &Path,
     files: &[String],
 ) -> Result<Command> {
     let runner_override = runner_override
+        .map(ToOwned::to_owned)
         .or_else(|| std::env::var("BT_EVAL_PYTHON_RUNNER").ok())
         .or_else(|| std::env::var("BT_EVAL_PYTHON").ok());
 
@@ -1792,14 +2164,42 @@ fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
     materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
 }
 
-fn is_ts_node_runner(runner_command: &Path) -> bool {
-    let file_name = match runner_command.file_name().and_then(|name| name.to_str()) {
-        Some(name) => name.to_ascii_lowercase(),
-        None => return false,
-    };
+fn runner_bin_name(runner_command: &Path) -> Option<String> {
+    let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
+    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+}
 
-    let normalized = file_name.strip_suffix(".cmd").unwrap_or(&file_name);
-    normalized == "ts-node" || normalized == "ts-node-esm"
+fn runner_kind_for_bin(runner_command: &Path) -> RunnerKind {
+    match runner_bin_name(runner_command).as_deref() {
+        Some("tsx") => RunnerKind::Tsx,
+        Some("vite-node") => RunnerKind::ViteNode,
+        Some("bun") | Some("bunx") => RunnerKind::Bun,
+        _ => RunnerKind::Other,
+    }
+}
+
+fn should_set_node_heap_size(runner_kind: RunnerKind) -> bool {
+    !matches!(runner_kind, RunnerKind::Deno | RunnerKind::Bun)
+}
+
+fn set_node_heap_size_env(command: &mut Command) {
+    let heap_option = format!("--max-old-space-size={EVAL_NODE_MAX_OLD_SPACE_SIZE_MB}");
+    let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    let has_existing_max_old_space = existing
+        .split_whitespace()
+        .any(|arg| arg.starts_with("--max-old-space-size"));
+    let merged = if existing.trim().is_empty() {
+        heap_option
+    } else if has_existing_max_old_space {
+        existing
+    } else {
+        format!("{existing} {heap_option}")
+    };
+    command.env("NODE_OPTIONS", merged);
+}
+
+fn is_ts_node_runner(runner_command: &Path) -> bool {
+    runner_bin_name(runner_command).is_some_and(|n| n == "ts-node" || n == "ts-node-esm")
 }
 
 fn find_python_binary() -> Option<PathBuf> {
@@ -1932,7 +2332,8 @@ fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) ->
 
 #[derive(Debug)]
 enum EvalEvent {
-    Start(ExperimentSummary),
+    Processing(ProcessingEventData),
+    Start(ExperimentStart),
     Summary(ExperimentSummary),
     Progress(SseProgressEventData),
     Dependencies {
@@ -1948,6 +2349,25 @@ enum EvalEvent {
         stream: String,
         message: String,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProcessingEventData {
+    #[serde(default)]
+    evaluators: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExperimentStart {
+    #[serde(default, alias = "project_name")]
+    project_name: Option<String>,
+    #[serde(default, alias = "experiment_name")]
+    experiment_name: Option<String>,
+    #[serde(default, alias = "project_url")]
+    project_url: Option<String>,
+    #[serde(default, alias = "experiment_url")]
+    experiment_url: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -1970,7 +2390,9 @@ struct ScoreSummary {
     name: String,
     score: f64,
     diff: Option<f64>,
+    #[serde(default)]
     improvements: i64,
+    #[serde(default)]
     regressions: i64,
 }
 
@@ -1985,9 +2407,12 @@ struct EvalErrorPayload {
 struct MetricSummary {
     name: String,
     metric: f64,
+    #[serde(default)]
     unit: String,
     diff: Option<f64>,
+    #[serde(default)]
     improvements: i64,
+    #[serde(default)]
     regressions: i64,
 }
 
@@ -2077,9 +2502,14 @@ where
 fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSender<EvalEvent>) {
     let event_name = event.unwrap_or_default();
     match event_name.as_str() {
+        "processing" => {
+            if let Ok(payload) = serde_json::from_str::<ProcessingEventData>(&data) {
+                let _ = tx.send(EvalEvent::Processing(payload));
+            }
+        }
         "start" => {
-            if let Ok(summary) = serde_json::from_str::<ExperimentSummary>(&data) {
-                let _ = tx.send(EvalEvent::Start(summary));
+            if let Ok(start) = serde_json::from_str::<ExperimentStart>(&data) {
+                let _ = tx.send(EvalEvent::Start(start));
             }
         }
         "summary" => {
@@ -2136,11 +2566,21 @@ struct EvalUi {
     spinner_style: ProgressStyle,
     jsonl: bool,
     list: bool,
+    verbose: bool,
+    deferred_errors: Vec<String>,
+    suppressed_stderr_lines: usize,
+    finished: bool,
 }
 
 impl EvalUi {
-    fn new(jsonl: bool, list: bool) -> Self {
-        let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    fn new(jsonl: bool, list: bool, verbose: bool) -> Self {
+        let draw_target = if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet()
+        {
+            ProgressDrawTarget::stderr_with_hz(10)
+        } else {
+            ProgressDrawTarget::stderr()
+        };
+        let progress = MultiProgress::with_draw_target(draw_target);
         let bar_style =
             ProgressStyle::with_template("{bar:10.blue} {msg} {percent}% {pos}/{len} {eta}")
                 .unwrap();
@@ -2152,20 +2592,35 @@ impl EvalUi {
             spinner_style,
             jsonl,
             list,
+            verbose,
+            deferred_errors: Vec::new(),
+            suppressed_stderr_lines: 0,
+            finished: false,
         }
     }
 
     fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
         for (_, bar) in self.bars.drain() {
             bar.finish_and_clear();
         }
+        let _ = self.progress.clear();
+        self.progress.set_draw_target(ProgressDrawTarget::hidden());
+        self.print_deferred_error_footnote();
+        self.finished = true;
     }
 
     fn handle(&mut self, event: EvalEvent) {
         match event {
-            EvalEvent::Start(summary) => {
-                let line = format_start_line(&summary);
-                let _ = self.progress.println(line);
+            EvalEvent::Processing(payload) => {
+                self.print_persistent_line(format_processing_line(payload.evaluators));
+            }
+            EvalEvent::Start(start) => {
+                if let Some(line) = format_start_line(&start) {
+                    self.print_persistent_line(line);
+                }
             }
             EvalEvent::Summary(summary) => {
                 if self.jsonl {
@@ -2174,9 +2629,7 @@ impl EvalUi {
                     }
                 } else {
                     let rendered = format_experiment_summary(&summary);
-                    for line in rendered.lines() {
-                        let _ = self.progress.println(line);
-                    }
+                    self.print_persistent_multiline(rendered);
                 }
             }
             EvalEvent::Progress(progress) => {
@@ -2186,22 +2639,32 @@ impl EvalUi {
             EvalEvent::Console { stream, message } => {
                 if stream == "stdout" && (self.list || self.jsonl) {
                     println!("{message}");
+                } else if stream == "stderr" && !self.verbose {
+                    self.suppressed_stderr_lines += 1;
                 } else {
                     let _ = self.progress.println(message);
                 }
             }
             EvalEvent::Error { message, stack, .. } => {
                 let show_hint = message.contains("Please specify an api key");
-                let line = message.as_str().red().to_string();
-                let _ = self.progress.println(line);
-                if let Some(stack) = stack {
-                    for line in stack.lines() {
-                        let _ = self.progress.println(line.dark_grey().to_string());
+                if self.verbose {
+                    let line = message.as_str().red().to_string();
+                    let _ = self.progress.println(line);
+                    if let Some(stack) = stack {
+                        for line in stack.lines() {
+                            let _ = self.progress.println(line.dark_grey().to_string());
+                        }
                     }
+                } else {
+                    self.record_deferred_error(message);
                 }
                 if show_hint {
                     let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt auth login`/`bt auth login --oauth`, or use --no-send-logs for local evals.";
-                    let _ = self.progress.println(hint.dark_grey().to_string());
+                    if self.verbose {
+                        let _ = self.progress.println(hint.dark_grey().to_string());
+                    } else {
+                        self.record_deferred_error(hint.to_string());
+                    }
                 }
             }
             EvalEvent::Done => {
@@ -2258,30 +2721,144 @@ impl EvalUi {
             _ => {}
         }
     }
+
+    fn print_persistent_line(&self, line: String) {
+        self.progress.suspend(|| {
+            eprintln!("{line}");
+        });
+    }
+
+    fn print_persistent_multiline(&self, text: String) {
+        self.progress.suspend(|| {
+            for line in text.lines() {
+                eprintln!("{line}");
+            }
+        });
+    }
+
+    fn record_deferred_error(&mut self, message: String) {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self
+            .deferred_errors
+            .iter()
+            .any(|existing| existing == trimmed)
+        {
+            return;
+        }
+        if self.deferred_errors.len() < MAX_DEFERRED_EVAL_ERRORS {
+            self.deferred_errors.push(trimmed.to_string());
+        }
+    }
+
+    fn print_deferred_error_footnote(&self) {
+        if self.verbose {
+            return;
+        }
+        if self.deferred_errors.is_empty() && self.suppressed_stderr_lines == 0 {
+            return;
+        }
+
+        eprintln!();
+        if !self.deferred_errors.is_empty() {
+            let noun = if self.deferred_errors.len() == 1 {
+                "error"
+            } else {
+                "errors"
+            };
+            eprintln!(
+                "Encountered {} evaluator {noun}:",
+                self.deferred_errors.len()
+            );
+            for message in &self.deferred_errors {
+                eprintln!("  - {message}");
+            }
+        }
+        if self.suppressed_stderr_lines > 0 {
+            eprintln!(
+                "Suppressed {} stderr line(s). Re-run with `bt eval --verbose ...` to inspect details.",
+                self.suppressed_stderr_lines
+            );
+        }
+    }
+}
+
+impl Drop for EvalUi {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 fn fit_name_to_spaces(name: &str, length: usize) -> String {
-    let mut padded = name.to_string();
-    let char_count = padded.chars().count();
+    let char_count = name.chars().count();
     if char_count < length {
+        let mut padded = name.to_string();
         padded.push_str(&" ".repeat(length - char_count));
         return padded;
     }
-    if char_count <= length {
-        return padded;
+    if char_count == length {
+        return name.to_string();
     }
     if length <= 3 {
-        return padded.chars().take(length).collect();
+        return name.chars().take(length).collect();
     }
-    let truncated: String = padded.chars().take(length - 3).collect();
-    format!("{truncated}...")
+    if length <= 5 {
+        let truncated: String = name.chars().take(length - 3).collect();
+        return format!("{truncated}...");
+    }
+
+    // Keep both prefix and suffix so similarly named evaluators remain distinguishable.
+    let keep_total = length - 3;
+    let head_len = keep_total / 2;
+    let tail_len = keep_total - head_len;
+    let head: String = name.chars().take(head_len).collect();
+    let tail: String = name
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
 }
 
-fn format_start_line(summary: &ExperimentSummary) -> String {
+fn format_processing_line(evaluators: usize) -> String {
+    let noun = if evaluators == 1 {
+        "evaluator"
+    } else {
+        "evaluators"
+    };
+    format!("Processing {evaluators} {noun}...")
+}
+
+fn format_start_line(start: &ExperimentStart) -> Option<String> {
+    let experiment_name = start
+        .experiment_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let experiment_url = start
+        .experiment_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let arrow = "▶".cyan();
-    let name = summary.experiment_name.as_str().bold();
-    let link = summary.experiment_url.as_deref().unwrap_or("locally");
-    format!("{arrow} Experiment {name} is running at {link}")
+
+    match (experiment_name, experiment_url) {
+        (Some(name), Some(url)) => Some(format!(
+            "{arrow} Experiment {} is running at {url}",
+            name.bold()
+        )),
+        (Some(name), None) => Some(format!(
+            "{arrow} Experiment {} is running at locally",
+            name.bold()
+        )),
+        (None, Some(url)) => Some(format!("{arrow} Experiment is running at {url}")),
+        (None, None) => None,
+    }
 }
 
 fn format_experiment_summary(summary: &ExperimentSummary) -> String {
@@ -2710,6 +3287,16 @@ mod tests {
         }
     }
 
+    fn get_command_env(command: &Command, key: &str) -> Option<String> {
+        command.as_std().get_envs().find_map(|(env_key, value)| {
+            if env_key == OsStr::new(key) {
+                value.map(|v| v.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+    }
+
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2812,6 +3399,43 @@ mod tests {
         assert_eq!(resolved, local_runner);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_eval_input_files_reports_missing_path_with_prefixed_directory_hint() {
+        let dir = make_temp_dir("missing-file-hint");
+        let eval_file = dir.join("real-world-facets.eval.ts");
+        fs::write(&eval_file, "export {};").expect("eval file should be written");
+
+        let cwd_name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp dir should have a UTF-8 name");
+        let input = format!("{cwd_name}/real-world-facets.eval.ts");
+        let err = validate_eval_input_files_in_cwd(&[input], &dir)
+            .expect_err("duplicated cwd prefix should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("Eval file not found:"));
+        assert!(message.contains("Did you mean `bt eval real-world-facets.eval.ts`?"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_eval_input_files_rejects_directory_inputs() {
+        let dir = make_temp_dir("directory-input");
+        let child_dir = dir.join("evals");
+        fs::create_dir_all(&child_dir).expect("child directory should be created");
+
+        let err = validate_eval_input_files_in_cwd(&["evals".to_string()], &dir)
+            .expect_err("directory inputs should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("Eval file is not a regular file:"));
+        assert!(message.contains("from input `evals`"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2925,6 +3549,71 @@ mod tests {
     }
 
     #[test]
+    fn runner_kind_for_bin_detects_bun() {
+        assert_eq!(runner_kind_for_bin(Path::new("bun")), RunnerKind::Bun);
+        assert_eq!(runner_kind_for_bin(Path::new("bunx")), RunnerKind::Bun);
+        assert_eq!(runner_kind_for_bin(Path::new("deno")), RunnerKind::Other);
+    }
+
+    #[test]
+    fn set_node_heap_size_env_sets_default_when_absent() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = clear_env_var("NODE_OPTIONS");
+        let mut command = Command::new("node");
+
+        set_node_heap_size_env(&mut command);
+        let configured =
+            get_command_env(&command, "NODE_OPTIONS").expect("NODE_OPTIONS should be set");
+        assert!(configured.contains("--max-old-space-size=8192"));
+
+        restore_env_var("NODE_OPTIONS", previous);
+    }
+
+    #[test]
+    fn set_node_heap_size_env_appends_to_existing_options() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = set_env_var("NODE_OPTIONS", "--trace-warnings");
+        let mut command = Command::new("node");
+
+        set_node_heap_size_env(&mut command);
+        let configured =
+            get_command_env(&command, "NODE_OPTIONS").expect("NODE_OPTIONS should be set");
+        assert!(configured.contains("--trace-warnings"));
+        assert!(configured.contains("--max-old-space-size=8192"));
+
+        restore_env_var("NODE_OPTIONS", previous);
+    }
+
+    #[test]
+    fn set_node_heap_size_env_preserves_existing_heap_override() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = set_env_var("NODE_OPTIONS", "--max-old-space-size=2048");
+        let mut command = Command::new("node");
+
+        set_node_heap_size_env(&mut command);
+        let configured =
+            get_command_env(&command, "NODE_OPTIONS").expect("NODE_OPTIONS should be set");
+        assert_eq!(configured, "--max-old-space-size=2048");
+
+        restore_env_var("NODE_OPTIONS", previous);
+    }
+
+    #[test]
+    fn should_set_node_heap_size_skips_non_node_runtimes() {
+        assert!(should_set_node_heap_size(RunnerKind::Tsx));
+        assert!(should_set_node_heap_size(RunnerKind::ViteNode));
+        assert!(should_set_node_heap_size(RunnerKind::Other));
+        assert!(!should_set_node_heap_size(RunnerKind::Deno));
+        assert!(!should_set_node_heap_size(RunnerKind::Bun));
+    }
+
+    #[test]
     fn build_sse_socket_path_is_unique_for_consecutive_calls() {
         let first = build_sse_socket_path().expect("first socket path");
         let second = build_sse_socket_path().expect("second socket path");
@@ -2963,6 +3652,102 @@ mod tests {
         let encoded = encode_eval_event_for_http(&event).expect("progress should be forwarded");
         assert!(encoded.contains("event: progress"));
         assert!(encoded.contains("json_delta"));
+    }
+
+    #[test]
+    fn format_processing_line_handles_pluralization() {
+        assert_eq!(format_processing_line(1), "Processing 1 evaluator...");
+        assert_eq!(format_processing_line(2), "Processing 2 evaluators...");
+    }
+
+    #[test]
+    fn format_start_line_handles_partial_payload() {
+        let start = ExperimentStart {
+            experiment_name: Some("my-exp".to_string()),
+            experiment_url: Some("https://example.dev/exp".to_string()),
+            ..Default::default()
+        };
+        let line = format_start_line(&start).expect("line should be rendered");
+        assert!(line.contains("my-exp"));
+        assert!(line.contains("https://example.dev/exp"));
+
+        assert!(format_start_line(&ExperimentStart::default()).is_none());
+    }
+
+    #[test]
+    fn fit_name_to_spaces_preserves_suffix_when_truncating() {
+        let rendered =
+            fit_name_to_spaces("Topics [experimentName=facets-real-world-30b-f5a78312]", 40);
+        assert_eq!(rendered.chars().count(), 40);
+        assert!(rendered.contains("..."));
+        assert!(rendered.contains("f5a78312]"));
+    }
+
+    #[test]
+    fn fit_name_to_spaces_pads_short_names() {
+        let rendered = fit_name_to_spaces("short", 10);
+        assert_eq!(rendered, "short     ");
+    }
+
+    #[test]
+    fn handle_sse_event_parses_processing_and_start_payloads() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(
+            Some("processing".to_string()),
+            r#"{"evaluators": 2}"#.to_string(),
+            &tx,
+        );
+        handle_sse_event(
+            Some("start".to_string()),
+            r#"{"experiment_name":"my-exp","experiment_url":"https://example.dev/exp"}"#
+                .to_string(),
+            &tx,
+        );
+
+        match rx.try_recv().expect("processing event should be emitted") {
+            EvalEvent::Processing(payload) => assert_eq!(payload.evaluators, 2),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match rx.try_recv().expect("start event should be emitted") {
+            EvalEvent::Start(start) => {
+                assert_eq!(start.experiment_name.as_deref(), Some("my-exp"));
+                assert_eq!(
+                    start.experiment_url.as_deref(),
+                    Some("https://example.dev/exp")
+                );
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_sse_event_parses_summary_without_comparison_fields() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(
+            Some("summary".to_string()),
+            r#"{
+              "projectName":"Topics",
+              "experimentName":"facets-real-world-thinking-on",
+              "scores":{
+                "Factuality":{"name":"Factuality","score":0.62}
+              }
+            }"#
+            .to_string(),
+            &tx,
+        );
+
+        match rx.try_recv().expect("summary event should be emitted") {
+            EvalEvent::Summary(summary) => {
+                let factuality = summary
+                    .scores
+                    .get("Factuality")
+                    .expect("score should exist");
+                assert_eq!(factuality.improvements, 0);
+                assert_eq!(factuality.regressions, 0);
+                assert!(factuality.diff.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
@@ -3008,6 +3793,7 @@ mod tests {
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
+            "BT_EVAL_VERBOSE",
             "BT_EVAL_WATCH",
             "BT_EVAL_DEV",
             "BT_EVAL_DEV_HOST",
@@ -3021,6 +3807,7 @@ mod tests {
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
+        set_env_var("BT_EVAL_VERBOSE", "1");
         set_env_var("BT_EVAL_WATCH", "on");
         set_env_var("BT_EVAL_DEV", "true");
         set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
@@ -3040,6 +3827,7 @@ mod tests {
                 "metadata.kind=fast".to_string()
             ]
         );
+        assert!(parsed.eval.verbose);
         assert!(parsed.eval.watch);
         assert!(parsed.eval.dev);
         assert_eq!(parsed.eval.dev_host, "127.0.0.1");
