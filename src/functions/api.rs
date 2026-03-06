@@ -39,6 +39,7 @@ pub struct FunctionListQuery {
     pub project_name: Option<String>,
     pub slug: Option<String>,
     pub id: Option<String>,
+    pub version: Option<String>,
     pub cursor: Option<String>,
     pub snapshot: Option<String>,
 }
@@ -132,6 +133,9 @@ pub async fn list_functions_page(
     }
     if let Some(id) = &query.id {
         params.push(("ids", id.clone()));
+    }
+    if let Some(version) = &query.version {
+        params.push(("version", version.clone()));
     }
     if let Some(cursor) = &query.cursor {
         params.push(("cursor", cursor.clone()));

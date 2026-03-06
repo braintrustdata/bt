@@ -1,5 +1,6 @@
 {
-  "command": ["functions", "push", "--external-packages", "react"],
-  "expect_success": false,
-  "stderr_contains": ["--external-packages"]
+  "command": ["functions", "push", "--external-packages", "react", "--help"],
+  "expect_success": true,
+  "stdout_contains": ["--external-packages"],
+  "stderr_not_contains": ["unexpected argument", "unrecognized"]
 }

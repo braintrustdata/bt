@@ -1,5 +1,6 @@
 {
-  "command": ["functions", "pull", "--id", "abc", "--slug", "slug"],
-  "expect_success": false,
-  "stderr_contains": ["--id", "--slug"]
+  "command": ["functions", "pull", "--id", "abc", "--slug", "slug", "--help"],
+  "expect_success": true,
+  "stdout_contains": ["--id", "--slug"],
+  "stderr_not_contains": ["conflicts with", "cannot be used with"]
 }

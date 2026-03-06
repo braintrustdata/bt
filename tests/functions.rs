@@ -145,12 +145,15 @@ fn sanitized_env_keys() -> &'static [&'static str] {
         "BT_FUNCTIONS_PUSH_RUNNER",
         "BT_FUNCTIONS_PUSH_LANGUAGE",
         "BT_FUNCTIONS_PUSH_REQUIREMENTS",
+        "BT_FUNCTIONS_PUSH_TSCONFIG",
+        "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
         "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
         "BT_FUNCTIONS_PULL_OUTPUT_DIR",
         "BT_FUNCTIONS_PULL_PROJECT_ID",
         "BT_FUNCTIONS_PULL_PROJECT_NAME",
         "BT_FUNCTIONS_PULL_ID",
         "BT_FUNCTIONS_PULL_SLUG",
+        "BT_FUNCTIONS_PULL_VERSION",
         "BT_FUNCTIONS_PULL_FORCE",
         "BT_FUNCTIONS_PULL_LANGUAGE",
     ]
@@ -527,6 +530,8 @@ fn functions_push_help_includes_expected_flags() {
     assert!(stdout.contains("--create-missing-projects"));
     assert!(stdout.contains("--language"));
     assert!(stdout.contains("--requirements"));
+    assert!(stdout.contains("--tsconfig"));
+    assert!(stdout.contains("--external-packages"));
 }
 
 #[test]
@@ -543,11 +548,12 @@ fn functions_pull_help_includes_expected_flags() {
     assert!(stdout.contains("--output-dir"));
     assert!(stdout.contains("--project-id"));
     assert!(stdout.contains("--project-name"));
+    assert!(stdout.contains("--version"));
     assert!(stdout.contains("--language"));
 }
 
 #[test]
-fn functions_pull_id_and_slug_conflict() {
+fn functions_pull_accepts_id_and_slug_together() {
     let output = Command::new(bt_binary_path())
         .arg("functions")
         .arg("pull")
@@ -555,13 +561,14 @@ fn functions_pull_id_and_slug_conflict() {
         .arg("abc")
         .arg("--slug")
         .arg("slug")
+        .arg("--help")
         .output()
-        .expect("run conflicting pull command");
+        .expect("run pull with id and slug");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--id"));
-    assert!(stderr.contains("--slug"));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--id"));
+    assert!(stdout.contains("--slug"));
 }
 
 #[test]
@@ -624,6 +631,34 @@ fn functions_help_lists_push_and_pull() {
 }
 
 #[test]
+fn top_level_push_help_is_available() {
+    let output = Command::new(bt_binary_path())
+        .arg("push")
+        .arg("--help")
+        .output()
+        .expect("run bt push --help");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--if-exists"));
+    assert!(stdout.contains("--file"));
+}
+
+#[test]
+fn top_level_pull_help_is_available() {
+    let output = Command::new(bt_binary_path())
+        .arg("pull")
+        .arg("--help")
+        .output()
+        .expect("run bt pull --help");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--output-dir"));
+    assert!(stdout.contains("--version"));
+}
+
+#[test]
 fn push_and_pull_help_are_machine_readable() {
     let push_help = Command::new(bt_binary_path())
         .arg("functions")
@@ -647,8 +682,11 @@ fn push_and_pull_help_are_machine_readable() {
     assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS"));
     assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_LANGUAGE"));
     assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_REQUIREMENTS"));
+    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_TSCONFIG"));
+    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES"));
     assert!(pull_stdout.contains("BT_FUNCTIONS_PULL_OUTPUT_DIR"));
     assert!(pull_stdout.contains("BT_FUNCTIONS_PULL_LANGUAGE"));
+    assert!(pull_stdout.contains("BT_FUNCTIONS_PULL_VERSION"));
 }
 
 #[test]
@@ -1376,7 +1414,7 @@ async fn functions_pull_works_against_mock_api() {
     assert_eq!(summary["files_written"].as_u64(), Some(1));
     assert_eq!(summary["files_failed"].as_u64(), Some(0));
 
-    let rendered_file = out_dir.join("doc-search.ts");
+    let rendered_file = out_dir.join("mock-project.ts");
     assert!(rendered_file.is_file(), "expected rendered file to exist");
     let rendered = std::fs::read_to_string(&rendered_file).expect("read rendered file");
     assert!(

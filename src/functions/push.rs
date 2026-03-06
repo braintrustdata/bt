@@ -257,6 +257,17 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
     };
     emit_language_selection_notice(&args, &classified, selected_language);
 
+    if args.tsconfig.is_some() {
+        eprintln!(
+            "Notice: --tsconfig is enabled for runner compatibility where supported (TS_NODE_PROJECT/TSX_TSCONFIG_PATH)."
+        );
+    }
+    if !args.external_packages.is_empty() {
+        eprintln!(
+            "Notice: --external-packages is accepted for compatibility; dependency handling is runner-managed in bt functions push."
+        );
+    }
+
     if args.requirements.is_some() && selected_language != SourceLanguage::Python {
         return fail_push(
             &base,
@@ -999,6 +1010,16 @@ fn run_functions_runner(
     };
 
     command.env("BRAINTRUST_API_KEY", api_key);
+    if let Some(tsconfig) = &args.tsconfig {
+        command.env("TS_NODE_PROJECT", tsconfig);
+        command.env("TSX_TSCONFIG_PATH", tsconfig);
+    }
+    if !args.external_packages.is_empty() {
+        command.env(
+            "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+            args.external_packages.join(","),
+        );
+    }
 
     let output = command.output().map_err(|err| FileFailure {
         reason: HardFailureReason::RunnerSpawnFailed,
@@ -2804,6 +2825,8 @@ mod tests {
             runner: None,
             language: PushLanguage::Auto,
             requirements: None,
+            tsconfig: None,
+            external_packages: vec![],
             create_missing_projects: false,
         };
         let classified = ClassifiedFiles {
@@ -2831,6 +2854,8 @@ mod tests {
             runner: None,
             language: PushLanguage::Auto,
             requirements: None,
+            tsconfig: None,
+            external_packages: vec![],
             create_missing_projects: false,
         };
         let classified = ClassifiedFiles {
