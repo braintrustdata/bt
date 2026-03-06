@@ -2000,6 +2000,13 @@ async function main() {
   const braintrust = await loadBraintrust();
   propagateInheritedBraintrustState(braintrust);
   initRegistry();
+  // Replace process.argv with [runtime, script, ...extraArgs] so that user
+  // code sees only the args they explicitly passed via `bt eval file -- ...`
+  // and not the eval file paths the runner uses internally.
+  const extraArgs: string[] = process.env.BT_EVAL_EXTRA_ARGS_JSON
+    ? (JSON.parse(process.env.BT_EVAL_EXTRA_ARGS_JSON) as string[])
+    : [];
+  process.argv = [...process.argv.slice(0, 2), ...extraArgs];
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 

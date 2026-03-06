@@ -312,6 +312,11 @@ pub struct EvalArgs {
     )]
     pub watch: bool,
 
+    /// Arguments forwarded to the eval file via process.argv (everything after `--`).
+    /// Example: bt eval foo.eval.ts -- --description "Prod" --shard=1/4
+    #[arg(last = true, value_name = "ARG")]
+    pub extra_args: Vec<String>,
+
     /// Start the eval dev web server.
     #[arg(
         long,
@@ -352,6 +357,7 @@ struct EvalRunOptions {
     list: bool,
     filter: Vec<String>,
     verbose: bool,
+    extra_args: Vec<String>,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
@@ -367,6 +373,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         list: args.list,
         filter: args.filter,
         verbose: args.verbose,
+        extra_args: args.extra_args,
     };
 
     if args.dev {
@@ -725,6 +732,11 @@ async fn spawn_eval_runner(
             RunnerKind::Other => "other",
         };
         cmd.env("BT_EVAL_RUNNER_KIND", runner_name);
+    }
+    if !options.extra_args.is_empty() {
+        let serialized =
+            serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
+        cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
     }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
