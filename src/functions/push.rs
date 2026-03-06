@@ -223,7 +223,8 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         }
     };
 
-    let classified = match collect_classified_files(&args.files) {
+    let files = args.resolved_files();
+    let classified = match collect_classified_files(&files) {
         Ok(files) => files,
         Err(err) => {
             return fail_push(
