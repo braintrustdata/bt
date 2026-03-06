@@ -8,15 +8,20 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::args::BaseArgs;
+use crate::auth::list_available_orgs;
 use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PullFileReport, PullSummary, ReportError,
     ReportWarning, SoftSkipReason, WarningReason,
 };
-use crate::projects::api::{list_projects, Project};
+use crate::projects::api::{get_project_by_name, list_projects, Project};
+use crate::ui::{fuzzy_select, select_project_interactive};
 use crate::utils::{write_text_atomic, GitRepo};
 
 use super::api::{self, FunctionListQuery};
-use super::{resolve_auth_context, resolve_project_context, FunctionsLanguage, PullArgs};
+use super::{
+    current_org_label, resolve_auth_context, resolve_project_context_optional,
+    validate_explicit_org_selection, FunctionsLanguage, PullArgs,
+};
 
 const PAGINATION_PAGE_LIMIT: usize = 10_000;
 const OUTPUT_LOCK_FILE: &str = ".bt-functions-pull.lock";
@@ -98,19 +103,35 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         errors: vec![],
     };
     let mut projects_cache: Option<Vec<Project>> = None;
+    let has_explicit_project = args.project_id.is_some() || args.project_name.is_some();
 
-    let auth_ctx = match resolve_auth_context(&base)
-        .await
-        .context("failed to resolve auth context")
-    {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            return fail_pull(
-                &base,
-                &mut summary,
-                HardFailureReason::AuthFailed,
-                err.to_string(),
-            );
+    let mut base = base;
+    let (auth_ctx, selected_project) = if !has_explicit_project {
+        match resolve_pull_target(&mut base).await {
+            Ok(result) => result,
+            Err(err) => {
+                return fail_pull(
+                    &base,
+                    &mut summary,
+                    HardFailureReason::AuthFailed,
+                    err.to_string(),
+                );
+            }
+        }
+    } else {
+        match resolve_auth_context(&base)
+            .await
+            .context("failed to resolve auth context")
+        {
+            Ok(ctx) => (ctx, None),
+            Err(err) => {
+                return fail_pull(
+                    &base,
+                    &mut summary,
+                    HardFailureReason::AuthFailed,
+                    err.to_string(),
+                );
+            }
         }
     };
 
@@ -139,29 +160,23 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             );
         }
         query.project_name = Some(project_name.clone());
-    } else {
-        let project = match resolve_project_context(&base, &auth_ctx)
-            .await
-            .context("failed to resolve default project context")
-        {
-            Ok(project) => project,
-            Err(err) => {
-                return fail_pull(
-                    &base,
-                    &mut summary,
-                    HardFailureReason::ResponseInvalid,
-                    err.to_string(),
-                );
-            }
-        };
+    } else if let Some(project) = selected_project {
         query.project_id = Some(project.id);
+    } else {
+        return fail_pull(
+            &base,
+            &mut summary,
+            HardFailureReason::ResponseInvalid,
+            "no project selected".to_string(),
+        );
     }
 
     if let Some(id) = &args.id {
         query.id = Some(id.clone());
     }
-    if let Some(slug) = &args.slug {
-        query.slug = Some(slug.clone());
+    let resolved_slugs = args.resolved_slugs();
+    if resolved_slugs.len() == 1 {
+        query.slug = Some(resolved_slugs[0].clone());
     }
     let fetched = match fetch_all_function_rows(&auth_ctx.client, &query).await {
         Ok(fetched) => fetched,
@@ -208,7 +223,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
 
     let winners = select_winner_rows(narrowed_rows, &mut summary);
 
-    if (args.id.is_some() || args.slug.is_some()) && winners.is_empty() {
+    if (args.id.is_some() || args.has_slug_selector()) && winners.is_empty() {
         return fail_pull(
             &base,
             &mut summary,
@@ -226,22 +241,12 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         }
     }
 
-    if (args.id.is_some() || args.slug.is_some()) && materializable.is_empty() {
+    if (args.id.is_some() || args.has_slug_selector()) && materializable.is_empty() {
         return fail_pull(
             &base,
             &mut summary,
             HardFailureReason::SelectorNotFound,
             "selector matched records but none are materializable prompts".to_string(),
-        );
-    }
-
-    if args.slug.is_some() && materializable.len() > 1 {
-        return fail_pull(
-            &base,
-            &mut summary,
-            HardFailureReason::SelectorNotFound,
-            "slug selector matched multiple prompts; pass --project-name or --project-id"
-                .to_string(),
         );
     }
 
@@ -319,110 +324,104 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         }
     };
 
-    let grouped_by_project = match group_rows_by_project(materializable, &project_names) {
-        Ok(grouped) => grouped,
-        Err(err) => {
-            return fail_pull(
-                &base,
-                &mut summary,
-                HardFailureReason::ResponseInvalid,
-                err.to_string(),
-            );
-        }
-    };
-    summary.projects_total = grouped_by_project.len();
-
     let ext = match args.language {
         FunctionsLanguage::Typescript => "ts",
         FunctionsLanguage::Python => "py",
     };
-    let file_names = match build_output_file_names(&grouped_by_project, args.slug.as_deref(), ext) {
-        Ok(file_names) => file_names,
-        Err(err) => {
-            return fail_pull(
-                &base,
-                &mut summary,
-                HardFailureReason::SelectorNotFound,
-                err.to_string(),
-            );
-        }
-    };
 
-    for ((project_id, project_name), rows) in grouped_by_project {
-        let file_name = file_names
-            .get(&(project_id.clone(), project_name.clone()))
-            .ok_or_else(|| anyhow!("missing output file mapping"))?
-            .clone();
-
-        let target = canonical_output_dir.join(&file_name);
-        let display_target = display_output_path(&target);
-        if !target.starts_with(&canonical_output_dir) {
-            record_pull_file_failure(
-                &mut summary,
-                target.display().to_string(),
-                HardFailureReason::UnsafeOutputPath,
-                format!("refusing to write outside output dir: {}", target.display()),
-            );
-            continue;
-        }
-
-        let skip_reason = match should_skip_target(&repo, &target, args.force) {
-            Ok(reason) => reason,
-            Err(err) => {
-                record_pull_file_failure(
-                    &mut summary,
-                    target.display().to_string(),
-                    HardFailureReason::RequestFailed,
-                    err.to_string(),
-                );
-                continue;
-            }
-        };
-        if let Some(reason) = skip_reason {
-            summary.files_skipped += 1;
-            summary.files.push(PullFileReport {
-                output_file: target.display().to_string(),
-                status: FileStatus::Skipped,
-                skipped_reason: Some(reason),
-                error_reason: None,
-                message: None,
-            });
-            continue;
-        }
-
-        let rendered =
-            match render_project_file(args.language, &project_name, &display_target, &rows) {
-                Ok(rendered) => rendered,
-                Err(err) => {
-                    record_pull_file_failure(
-                        &mut summary,
-                        target.display().to_string(),
-                        HardFailureReason::ResponseInvalid,
-                        err.to_string(),
-                    );
-                    continue;
-                }
-            };
-        match write_text_atomic(&target, &rendered) {
-            Ok(()) => {
-                summary.files_written += 1;
-                summary.functions_materialized += rows.len();
-                summary.files.push(PullFileReport {
-                    output_file: target.display().to_string(),
-                    status: FileStatus::Success,
-                    skipped_reason: None,
-                    error_reason: None,
-                    message: None,
+    if !resolved_slugs.is_empty() {
+        // Slug mode: one file per slug.
+        let found_slugs: BTreeSet<&str> = materializable.iter().map(|r| r.slug.as_str()).collect();
+        for slug in &resolved_slugs {
+            if !found_slugs.contains(slug.as_str()) {
+                summary.warnings.push(ReportWarning {
+                    reason: WarningReason::SelectorPartialMatch,
+                    message: format!("slug '{}' not found", slug),
                 });
             }
+        }
+
+        // Check for cross-project collisions: if any slug appears in multiple projects,
+        // require --project-name/--project-id to disambiguate.
+        if !has_explicit_project {
+            let mut slug_projects: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+            for row in &materializable {
+                slug_projects
+                    .entry(row.slug.as_str())
+                    .or_default()
+                    .insert(row.project_id.as_str());
+            }
+            for (slug, projects) in &slug_projects {
+                if projects.len() > 1 {
+                    return fail_pull(
+                        &base,
+                        &mut summary,
+                        HardFailureReason::SelectorNotFound,
+                        format!(
+                            "slug '{}' exists in {} projects; pass --project-name or --project-id",
+                            slug,
+                            projects.len()
+                        ),
+                    );
+                }
+            }
+        }
+
+        summary.projects_total = materializable
+            .iter()
+            .map(|r| r.project_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+
+        for row in &materializable {
+            let project_name = project_names
+                .get(&row.project_id)
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            let file_name = format!("{}.{ext}", sanitize_filename(&row.slug));
+            write_pull_file(
+                &mut summary,
+                &canonical_output_dir,
+                &repo,
+                args.force,
+                args.language,
+                project_name,
+                &file_name,
+                std::slice::from_ref(row),
+            );
+        }
+    } else {
+        // Project mode: one file per project (existing behavior).
+        let grouped_by_project = match group_rows_by_project(materializable, &project_names) {
+            Ok(grouped) => grouped,
             Err(err) => {
-                record_pull_file_failure(
+                return fail_pull(
+                    &base,
                     &mut summary,
-                    target.display().to_string(),
-                    HardFailureReason::AtomicWriteFailed,
+                    HardFailureReason::ResponseInvalid,
                     err.to_string(),
                 );
             }
+        };
+        summary.projects_total = grouped_by_project.len();
+
+        let file_names = build_project_file_names(&grouped_by_project, ext);
+
+        for ((project_id, project_name), rows) in grouped_by_project {
+            let file_name = file_names
+                .get(&(project_id.clone(), project_name.clone()))
+                .ok_or_else(|| anyhow!("missing output file mapping"))?
+                .clone();
+            write_pull_file(
+                &mut summary,
+                &canonical_output_dir,
+                &repo,
+                args.force,
+                args.language,
+                &project_name,
+                &file_name,
+                &rows,
+            );
         }
     }
 
@@ -436,7 +435,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     }
 
     let failure = summary.status == CommandStatus::Failed;
-    emit_summary(&base, &summary)?;
+    emit_summary(&base, &summary, args.verbose)?;
     if failure {
         bail!("functions pull failed; see summary for details");
     }
@@ -546,19 +545,21 @@ fn apply_selector_narrowing(
     rows: Vec<PullFunctionRow>,
     args: &PullArgs,
 ) -> Result<Vec<PullFunctionRow>> {
+    let resolved_slugs = args.resolved_slugs();
     let narrowed = if let Some(id) = &args.id {
         rows.into_iter()
             .filter(|row| row.id == *id)
             .collect::<Vec<_>>()
-    } else if let Some(slug) = &args.slug {
+    } else if !resolved_slugs.is_empty() {
+        let slug_set: BTreeSet<&str> = resolved_slugs.iter().map(String::as_str).collect();
         rows.into_iter()
-            .filter(|row| row.slug == *slug)
+            .filter(|row| slug_set.contains(row.slug.as_str()))
             .collect::<Vec<_>>()
     } else {
         rows
     };
 
-    if (args.id.is_some() || args.slug.is_some()) && narrowed.is_empty() {
+    if (args.id.is_some() || args.has_slug_selector()) && narrowed.is_empty() {
         bail!("selector did not match any function rows");
     }
 
@@ -675,6 +676,87 @@ fn group_rows_by_project(
             .push(row);
     }
     Ok(grouped)
+}
+
+fn write_pull_file(
+    summary: &mut PullSummary,
+    canonical_output_dir: &Path,
+    repo: &Option<GitRepo>,
+    force: bool,
+    language: FunctionsLanguage,
+    project_name: &str,
+    file_name: &str,
+    rows: &[PullFunctionRow],
+) {
+    let target = canonical_output_dir.join(file_name);
+    let display_target = display_output_path(&target);
+    if !target.starts_with(canonical_output_dir) {
+        record_pull_file_failure(
+            summary,
+            target.display().to_string(),
+            HardFailureReason::UnsafeOutputPath,
+            format!("refusing to write outside output dir: {}", target.display()),
+        );
+        return;
+    }
+
+    let skip_reason = match should_skip_target(repo, &target, force) {
+        Ok(reason) => reason,
+        Err(err) => {
+            record_pull_file_failure(
+                summary,
+                target.display().to_string(),
+                HardFailureReason::RequestFailed,
+                err.to_string(),
+            );
+            return;
+        }
+    };
+    if let Some(reason) = skip_reason {
+        summary.files_skipped += 1;
+        summary.files.push(PullFileReport {
+            output_file: target.display().to_string(),
+            status: FileStatus::Skipped,
+            skipped_reason: Some(reason),
+            error_reason: None,
+            message: None,
+        });
+        return;
+    }
+
+    let rendered = match render_project_file(language, project_name, &display_target, rows) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            record_pull_file_failure(
+                summary,
+                target.display().to_string(),
+                HardFailureReason::ResponseInvalid,
+                err.to_string(),
+            );
+            return;
+        }
+    };
+    match write_text_atomic(&target, &rendered) {
+        Ok(()) => {
+            summary.files_written += 1;
+            summary.functions_materialized += rows.len();
+            summary.files.push(PullFileReport {
+                output_file: target.display().to_string(),
+                status: FileStatus::Success,
+                skipped_reason: None,
+                error_reason: None,
+                message: None,
+            });
+        }
+        Err(err) => {
+            record_pull_file_failure(
+                summary,
+                target.display().to_string(),
+                HardFailureReason::AtomicWriteFailed,
+                err.to_string(),
+            );
+        }
+    }
 }
 
 fn build_project_file_names(
@@ -1414,36 +1496,77 @@ fn is_empty_render_value(value: &Value) -> bool {
     }
 }
 
-fn emit_summary(base: &BaseArgs, summary: &PullSummary) -> Result<()> {
+fn skip_reason_label(reason: Option<SoftSkipReason>) -> &'static str {
+    match reason {
+        Some(SoftSkipReason::DirtyTarget) => "dirty target",
+        Some(SoftSkipReason::ExistingNonGitNoForce) => "already exists",
+        Some(SoftSkipReason::MalformedRecord) => "malformed record",
+        Some(SoftSkipReason::UnsupportedFunctionType) => "unsupported type",
+        Some(SoftSkipReason::SupersededVersion) => "superseded",
+        Some(SoftSkipReason::TerminatedAfterFailure) => "terminated after failure",
+        Some(SoftSkipReason::IfExistsIgnored) => "ignored",
+        Some(SoftSkipReason::NoDefinitionsFound) => "no definitions found",
+        None => "skipped",
+    }
+}
+
+fn short_display_path(path_str: &str, cwd: Option<&Path>) -> String {
+    let p = Path::new(path_str);
+    let file_name = p.file_name().unwrap_or(p.as_os_str());
+    match (cwd, p.parent()) {
+        (Some(cwd), Some(parent)) if parent == cwd => file_name.to_string_lossy().into_owned(),
+        _ => {
+            // parent_dir/file_name
+            let parent_name = p.parent().and_then(|p| p.file_name()).unwrap_or_default();
+            Path::new(parent_name).join(file_name).display().to_string()
+        }
+    }
+}
+
+fn emit_summary(base: &BaseArgs, summary: &PullSummary, verbose: bool) -> Result<()> {
     if base.json {
         println!("{}", serde_json::to_string(summary)?);
-    } else {
-        match summary.status {
-            CommandStatus::Success => {
-                eprintln!(
-                    "Pulled {} file(s), materialized {} prompt(s).",
-                    summary.files_written, summary.functions_materialized
-                );
-            }
-            CommandStatus::Partial => {
-                eprintln!(
-                    "Pull completed with partial results: written={}, skipped={}, failed={}",
-                    summary.files_written, summary.files_skipped, summary.files_failed
-                );
-            }
-            CommandStatus::Failed => {
-                eprintln!(
-                    "Pull failed: written={}, skipped={}, failed={}",
-                    summary.files_written, summary.files_skipped, summary.files_failed
-                );
+        return Ok(());
+    }
+
+    let has_visible_files = summary
+        .files
+        .iter()
+        .any(|f| f.status == FileStatus::Success || f.status == FileStatus::Failed || verbose);
+    let mut parts = vec![format!("Wrote {} file(s)", summary.files_written)];
+    if has_visible_files {
+        let cwd = std::env::current_dir().ok();
+        for f in &summary.files {
+            let name = short_display_path(&f.output_file, cwd.as_deref());
+            match f.status {
+                FileStatus::Success => eprintln!("Pulled {name}"),
+                FileStatus::Failed => {
+                    let msg = f.message.as_deref().unwrap_or("unknown error");
+                    eprintln!("Failed to pull {name} ({msg})");
+                }
+                FileStatus::Skipped if verbose => {
+                    let reason = skip_reason_label(f.skipped_reason);
+                    eprintln!("Skipped {name} ({reason})");
+                }
+                FileStatus::Skipped => {}
             }
         }
-        for warning in &summary.warnings {
-            eprintln!("warning: {}", warning.message);
-        }
-        for error in &summary.errors {
-            eprintln!("error: {}", error.message);
-        }
+        eprintln!();
+    }
+
+    if summary.files_skipped > 0 {
+        parts.push(format!("skipped {}", summary.files_skipped));
+    }
+    if summary.files_failed > 0 {
+        parts.push(format!("failed {}", summary.files_failed));
+    }
+    eprintln!("{}.", parts.join(", "));
+
+    for warning in &summary.warnings {
+        eprintln!("warning: {}", warning.message);
+    }
+    for error in &summary.errors {
+        eprintln!("error: {}", error.message);
     }
 
     Ok(())
@@ -1461,7 +1584,7 @@ fn fail_pull(
         message: message.clone(),
     });
     if base.json {
-        emit_summary(base, summary)?;
+        emit_summary(base, summary, false)?;
     }
     bail!(message);
 }
@@ -1485,6 +1608,68 @@ fn record_pull_file_failure(
         error_reason: Some(reason),
         message: Some(message),
     });
+}
+
+async fn resolve_pull_target(base: &mut BaseArgs) -> Result<(super::AuthContext, Option<Project>)> {
+    let available_orgs = list_available_orgs(base)
+        .await
+        .context("failed to list available orgs")?;
+
+    validate_explicit_org_selection(base, &available_orgs)?;
+
+    let mut auth_ctx = resolve_auth_context(base)
+        .await
+        .context("failed to resolve auth context")?;
+
+    // Org selector: show when multiple orgs and no explicit --org.
+    let has_explicit_org = base
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some();
+    if !has_explicit_org && available_orgs.len() > 1 && crate::ui::is_interactive() {
+        let org_label = current_org_label(&auth_ctx);
+        let names: Vec<&str> = available_orgs.iter().map(|o| o.name.as_str()).collect();
+        let default_index = names
+            .iter()
+            .position(|n| *n == org_label || n.eq_ignore_ascii_case(&org_label))
+            .unwrap_or(0);
+        let selected_index = fuzzy_select("Select org:", &names, default_index)?;
+        let selected = &available_orgs[selected_index];
+        if selected.name != org_label && !selected.name.eq_ignore_ascii_case(&org_label) {
+            base.org_name = Some(selected.name.clone());
+            auth_ctx = resolve_auth_context(base)
+                .await
+                .context("failed to resolve switched org context")?;
+        }
+    } else if !has_explicit_org && available_orgs.len() > 1 {
+        bail!(
+            "multiple organizations are available for this credential; pass --org <ORG_NAME> in non-interactive mode"
+        );
+    }
+
+    // Project selector with current default pre-focused.
+    let default_project = resolve_project_context_optional(base, &auth_ctx, false)
+        .await
+        .ok()
+        .flatten();
+    if !crate::ui::is_interactive() {
+        return Ok((auth_ctx, default_project));
+    }
+    let current_name = default_project.as_ref().map(|p| p.name.as_str());
+    let selected_name = select_project_interactive(
+        &auth_ctx.client,
+        Some("Select project to pull from:"),
+        current_name,
+    )
+    .await?;
+
+    let project = get_project_by_name(&auth_ctx.client, &selected_name)
+        .await?
+        .ok_or_else(|| anyhow!("project '{selected_name}' not found"))?;
+
+    Ok((auth_ctx, Some(project)))
 }
 
 #[cfg(test)]
@@ -1539,17 +1724,78 @@ mod tests {
             _xact_id: None,
         };
         let args = PullArgs {
+            slugs: vec![],
+            slug_flag: vec![],
             output_dir: PathBuf::from("."),
             language: FunctionsLanguage::Typescript,
             project_name: None,
             project_id: None,
             id: Some("missing".to_string()),
-            slug: None,
             force: false,
+            verbose: false,
         };
 
         let err = apply_selector_narrowing(vec![row], &args).expect_err("should fail");
         assert!(err.to_string().contains("selector"));
+    }
+
+    #[test]
+    fn multi_slug_narrowing_filters_to_matching() {
+        let rows = vec![
+            PullFunctionRow {
+                id: "f1".to_string(),
+                name: "A".to_string(),
+                slug: "alpha".to_string(),
+                project_id: "p1".to_string(),
+                project_name: Some("Proj".to_string()),
+                description: None,
+                prompt_data: None,
+                function_data: None,
+                created: None,
+                _xact_id: None,
+            },
+            PullFunctionRow {
+                id: "f2".to_string(),
+                name: "B".to_string(),
+                slug: "beta".to_string(),
+                project_id: "p1".to_string(),
+                project_name: Some("Proj".to_string()),
+                description: None,
+                prompt_data: None,
+                function_data: None,
+                created: None,
+                _xact_id: None,
+            },
+            PullFunctionRow {
+                id: "f3".to_string(),
+                name: "G".to_string(),
+                slug: "gamma".to_string(),
+                project_id: "p1".to_string(),
+                project_name: Some("Proj".to_string()),
+                description: None,
+                prompt_data: None,
+                function_data: None,
+                created: None,
+                _xact_id: None,
+            },
+        ];
+        let args = PullArgs {
+            slugs: vec!["alpha".to_string()],
+            slug_flag: vec!["gamma".to_string()],
+            output_dir: PathBuf::from("."),
+            language: FunctionsLanguage::Typescript,
+            project_name: None,
+            project_id: None,
+            id: None,
+            force: false,
+            verbose: false,
+        };
+
+        let narrowed = apply_selector_narrowing(rows, &args).expect("should narrow");
+        assert_eq!(narrowed.len(), 2);
+        let slugs: Vec<&str> = narrowed.iter().map(|r| r.slug.as_str()).collect();
+        assert!(slugs.contains(&"alpha"));
+        assert!(slugs.contains(&"gamma"));
     }
 
     #[test]
