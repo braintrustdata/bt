@@ -358,7 +358,8 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
-    validate_eval_input_files(&args.files)?;
+    let files = expand_eval_file_globs(&args.files)?;
+    validate_eval_input_files(&files)?;
 
     let options = EvalRunOptions {
         jsonl: args.jsonl,
@@ -370,13 +371,13 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     };
 
     if args.dev {
-        let language = detect_eval_language(&args.files, args.language)?;
+        let language = detect_eval_language(&files, args.language)?;
         let app_url = resolve_app_url(&base);
         let state = DevServerState {
             base: base.clone(),
             language_override: Some(language),
             runner_override: args.runner.clone(),
-            files: args.files.clone(),
+            files,
             no_send_logs: args.no_send_logs,
             options,
             host: args.dev_host.clone(),
@@ -397,7 +398,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             &base,
             args.language,
             args.runner.as_deref(),
-            &args.files,
+            &files,
             args.no_send_logs,
             &options,
         )
@@ -407,7 +408,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             &base,
             args.language,
             args.runner.as_deref(),
-            &args.files,
+            &files,
             args.no_send_logs,
             &options,
         )
@@ -1895,6 +1896,29 @@ fn detect_eval_language(
     }
 
     detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
+}
+
+fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
+    let mut expanded = Vec::new();
+    for input in inputs {
+        if !input.contains(['*', '?', '[']) {
+            expanded.push(input.clone());
+            continue;
+        }
+        let matches: Vec<PathBuf> = glob::glob(input)
+            .with_context(|| format!("invalid glob pattern: {input}"))?
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("error expanding glob: {input}"))?;
+        if matches.is_empty() {
+            anyhow::bail!("glob pattern matched no files: {input}");
+        }
+        expanded.extend(
+            matches
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+    }
+    Ok(expanded)
 }
 
 fn validate_eval_input_files(files: &[String]) -> Result<()> {
@@ -3409,6 +3433,58 @@ mod tests {
         assert_eq!(resolved, local_runner);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_eval_file_globs_expands_flat_glob() {
+        let dir = make_temp_dir("glob-flat");
+        fs::write(dir.join("a.eval.ts"), "").unwrap();
+        fs::write(dir.join("b.eval.ts"), "").unwrap();
+
+        let pattern = dir.join("*.eval.ts").to_string_lossy().into_owned();
+        let mut result = expand_eval_file_globs(&[pattern]).expect("glob should expand");
+        result.sort();
+
+        assert_eq!(result.len(), 2);
+        assert!(result[0].ends_with("a.eval.ts"));
+        assert!(result[1].ends_with("b.eval.ts"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_eval_file_globs_expands_recursive_glob() {
+        let dir = make_temp_dir("glob-recursive");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(dir.join("a.eval.ts"), "").unwrap();
+        fs::write(sub.join("b.eval.ts"), "").unwrap();
+
+        let pattern = dir.join("**/*.eval.ts").to_string_lossy().into_owned();
+        let mut result = expand_eval_file_globs(&[pattern]).expect("glob should expand");
+        result.sort();
+
+        assert_eq!(result.len(), 2);
+        assert!(result[0].ends_with("a.eval.ts"));
+        assert!(result[1].ends_with("b.eval.ts"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_eval_file_globs_errors_on_no_matches() {
+        let dir = make_temp_dir("glob-no-match");
+        let pattern = dir.join("*.eval.ts").to_string_lossy().into_owned();
+        let err = expand_eval_file_globs(&[pattern]).expect_err("empty glob should fail");
+        assert!(format!("{err}").contains("glob pattern matched no files"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_eval_file_globs_passes_through_non_glob() {
+        let result = expand_eval_file_globs(&["src/foo.eval.ts".to_string()])
+            .expect("non-glob should pass through");
+        assert_eq!(result, vec!["src/foo.eval.ts"]);
     }
 
     #[test]
