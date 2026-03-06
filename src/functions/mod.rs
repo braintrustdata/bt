@@ -637,7 +637,7 @@ mod tests {
         };
 
         assert_eq!(
-            push.files,
+            push.file_flag,
             vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")]
         );
     }
@@ -695,7 +695,7 @@ mod tests {
             panic!("expected push command");
         };
         assert_eq!(
-            push.files,
+            push.file_flag,
             vec![
                 PathBuf::from("a.ts"),
                 PathBuf::from("b.ts"),

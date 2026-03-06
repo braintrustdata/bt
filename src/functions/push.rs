@@ -5,13 +5,15 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use dialoguer::console::style;
+use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::args::BaseArgs;
-use crate::auth::{list_available_orgs, AvailableOrg};
+use crate::auth::{list_available_orgs, list_profiles, AvailableOrg};
 use crate::config;
 use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PushFileReport, PushSummary, ReportError,
@@ -136,7 +138,6 @@ struct ProjectPreflight {
     requires_default_project: bool,
     named_projects: BTreeSet<String>,
     direct_project_ids: BTreeSet<String>,
-    selector_preview: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,18 +302,19 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         return Ok(());
     }
 
-    let manifest = match run_functions_runner(&args, &files, selected_language) {
-        Ok(manifest) => manifest,
-        Err(failure) => {
-            return fail_push_with_all_skipped(
-                &base,
-                &files,
-                failure.reason,
-                &failure.message,
-                "skipped because manifest generation failed",
-            );
-        }
-    };
+    let manifest =
+        match run_functions_runner(&args, &files, selected_language, auth_ctx.client.api_key()) {
+            Ok(manifest) => manifest,
+            Err(failure) => {
+                return fail_push_with_all_skipped(
+                    &base,
+                    &files,
+                    failure.reason,
+                    &failure.message,
+                    "skipped because manifest generation failed",
+                );
+            }
+        };
 
     if let Err(failure) = validate_manifest_paths(
         &manifest,
@@ -375,12 +377,19 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         }
     };
 
+    let preflight_source_files: Vec<&str> = manifest
+        .files
+        .iter()
+        .map(|f| f.source_file.as_str())
+        .collect();
+    let preflight_project_names: Vec<String> = preflight.named_projects.iter().cloned().collect();
+
     let (org_decision, org_prompt_confirmed) = match resolve_org_decision(
         &base,
         &auth_ctx,
         &available_orgs,
-        &preflight.selector_preview,
-        manifest.files.len(),
+        &preflight_source_files,
+        &preflight_project_names,
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -493,8 +502,19 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
 
     let target_project_ids = resolved_targets.unique_project_ids.clone();
 
+    let source_files: Vec<&str> = manifest
+        .files
+        .iter()
+        .map(|f| f.source_file.as_str())
+        .collect();
+
     if !org_prompt_confirmed
-        && !confirm_push_targets(&auth_ctx, &target_project_ids, manifest.files.len())?
+        && !confirm_push_targets(
+            &auth_ctx,
+            &target_project_ids,
+            &source_files,
+            &project_name_cache,
+        )?
     {
         return cancel_push(&base, &files);
     }
@@ -924,6 +944,7 @@ fn run_functions_runner(
     args: &PushArgs,
     files: &[PathBuf],
     language: SourceLanguage,
+    api_key: &str,
 ) -> std::result::Result<RunnerManifest, FileFailure> {
     let mut command = match language {
         SourceLanguage::JsLike => {
@@ -983,6 +1004,8 @@ fn run_functions_runner(
             command
         }
     };
+
+    command.env("BRAINTRUST_API_KEY", api_key);
 
     let output = command.output().map_err(|err| FileFailure {
         reason: HardFailureReason::RunnerSpawnFailed,
@@ -1896,8 +1919,8 @@ fn resolve_org_decision(
     base: &BaseArgs,
     auth_ctx: &super::AuthContext,
     available_orgs: &[AvailableOrg],
-    selector_preview: &[String],
-    file_count: usize,
+    source_files: &[&str],
+    project_names: &[String],
 ) -> Result<(OrgDecision, bool)> {
     if base
         .org_name
@@ -1920,17 +1943,31 @@ fn resolve_org_decision(
     }
 
     let org_label = current_org_label(auth_ctx);
-    let selector_label = if selector_preview.is_empty() {
-        "none".to_string()
+
+    let file_names: Vec<&str> = source_files
+        .iter()
+        .map(|f| {
+            Path::new(f)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(f)
+        })
+        .collect();
+    let files_part = file_names
+        .iter()
+        .map(|f| style(f).green().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let projects_part = if project_names.is_empty() {
+        "(no project)".to_string()
     } else {
-        selector_preview.join(", ")
+        project_names.join(", ")
     };
-    let prompt = format!(
-        "Push {file_count} file(s) with org '{org_label}'. Project selectors: [{selector_label}]"
-    );
+
+    let prompt = format!("Push {files_part} to {projects_part} in {org_label}");
     let options = [
-        "Continue with current org".to_string(),
-        "Switch organization".to_string(),
+        format!("Push to {org_label}"),
+        "Switch org".to_string(),
         "Cancel".to_string(),
     ];
     let option_refs = options.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2033,8 +2070,6 @@ fn collect_project_preflight(
     let mut requires_default_project = false;
     let mut named_projects = BTreeSet::new();
     let mut direct_project_ids = BTreeSet::new();
-    let mut selector_preview = BTreeSet::new();
-
     for file in &manifest.files {
         for entry in &file.entries {
             let selector = match entry {
@@ -2054,7 +2089,6 @@ fn collect_project_preflight(
                 default_project_name.as_deref(),
                 &mut named_projects,
                 &mut direct_project_ids,
-                &mut selector_preview,
                 &mut requires_default_project,
             )?;
         }
@@ -2065,7 +2099,6 @@ fn collect_project_preflight(
         requires_default_project,
         named_projects,
         direct_project_ids,
-        selector_preview: selector_preview.into_iter().collect(),
     })
 }
 
@@ -2089,17 +2122,14 @@ fn add_selector_requirement(
     default_project_name: Option<&str>,
     named_projects: &mut BTreeSet<String>,
     direct_project_ids: &mut BTreeSet<String>,
-    selector_preview: &mut BTreeSet<String>,
     requires_default_project: &mut bool,
 ) -> Result<()> {
     match selector {
         ProjectSelector::Id(project_id) => {
             direct_project_ids.insert(project_id.clone());
-            selector_preview.insert(project_id.clone());
         }
         ProjectSelector::Name(project_name) => {
             named_projects.insert(project_name.clone());
-            selector_preview.insert(format!("name:{project_name}"));
         }
         ProjectSelector::Fallback => {
             let Some(default_project_name) = default_project_name else {
@@ -2111,7 +2141,6 @@ fn add_selector_requirement(
             };
             *requires_default_project = true;
             named_projects.insert(default_project_name.to_string());
-            selector_preview.insert(format!("default:{default_project_name}"));
         }
     }
     Ok(())
@@ -2464,25 +2493,56 @@ async fn resolve_project_name(
 fn confirm_push_targets(
     auth_ctx: &super::AuthContext,
     target_project_ids: &[String],
-    file_count: usize,
+    source_files: &[&str],
+    project_name_cache: &BTreeMap<String, String>,
 ) -> Result<bool> {
     if !is_interactive() || target_project_ids.is_empty() {
         return Ok(true);
     }
 
-    let org_label = if auth_ctx.client.org_name().is_empty() {
-        auth_ctx.org_id.clone()
+    let id_to_name: BTreeMap<&str, &str> = project_name_cache
+        .iter()
+        .map(|(name, id)| (id.as_str(), name.as_str()))
+        .collect();
+
+    let project_labels: Vec<&str> = target_project_ids
+        .iter()
+        .map(|id| id_to_name.get(id.as_str()).copied().unwrap_or(id.as_str()))
+        .collect();
+
+    let file_names: Vec<&str> = source_files
+        .iter()
+        .map(|f| {
+            Path::new(f)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(f)
+        })
+        .collect();
+
+    let files_part = file_names
+        .iter()
+        .map(|f| style(f).green().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let projects_part = project_labels.join(", ");
+
+    let multi_org = list_profiles().is_ok_and(|p| p.len() > 1);
+    let prompt = if multi_org {
+        let org_label = if auth_ctx.client.org_name().is_empty() {
+            &auth_ctx.org_id
+        } else {
+            auth_ctx.client.org_name()
+        };
+        format!(
+            "Push {files_part} to {projects_part} {}?",
+            style(format!("({org_label})")).dim()
+        )
     } else {
-        auth_ctx.client.org_name().to_string()
+        format!("Push {files_part} to {projects_part}?")
     };
 
-    let prompt = format!(
-        "Push {} file(s) to org '{}' and project(s) [{}]?",
-        file_count,
-        org_label,
-        target_project_ids.join(", ")
-    );
-    let confirmed = Confirm::new()
+    let confirmed = Confirm::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .default(false)
         .interact()?;
@@ -2764,7 +2824,6 @@ mod tests {
         };
         let mut named_projects = BTreeSet::new();
         let mut direct_project_ids = BTreeSet::new();
-        let mut selector_preview = BTreeSet::new();
         let mut requires_default_project = false;
 
         let err = add_selector_requirement(
@@ -2774,7 +2833,6 @@ mod tests {
             None,
             &mut named_projects,
             &mut direct_project_ids,
-            &mut selector_preview,
             &mut requires_default_project,
         )
         .expect_err("must fail");
@@ -2834,6 +2892,7 @@ mod tests {
     fn select_push_language_auto_prefers_js_like_for_mixed_scan() {
         let args = PushArgs {
             files: vec![PathBuf::from(".")],
+            file_flag: vec![],
             if_exists: IfExistsMode::Error,
             terminate_on_failure: false,
             runner: None,
@@ -2860,6 +2919,7 @@ mod tests {
     fn select_push_language_rejects_mixed_explicit_files() {
         let args = PushArgs {
             files: vec![PathBuf::from("a.ts"), PathBuf::from("b.py")],
+            file_flag: vec![],
             if_exists: IfExistsMode::Error,
             terminate_on_failure: false,
             runner: None,
