@@ -1,5 +1,7 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, bail, Result};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{builder::BoolishValueParser, Args, Subcommand, ValueEnum};
 
 use crate::{
     args::BaseArgs,
@@ -14,6 +16,9 @@ pub(crate) mod api;
 mod delete;
 mod invoke;
 mod list;
+mod pull;
+mod push;
+pub(crate) mod report;
 mod view;
 
 use api::Function;
@@ -72,6 +77,38 @@ impl FunctionTypeFilter {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IfExistsMode {
+    Error,
+    Replace,
+    Ignore,
+}
+
+impl IfExistsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Replace => "replace",
+            Self::Ignore => "ignore",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum FunctionsLanguage {
+    Typescript,
+    Python,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum PushLanguage {
+    Auto,
+    #[value(name = "javascript")]
+    JavaScript,
+    Python,
+}
+
 fn build_web_path(function: &Function) -> String {
     let id = &function.id;
     match function.function_type.as_deref() {
@@ -98,8 +135,6 @@ fn label_plural(ft: Option<FunctionTypeFilter>) -> &'static str {
     ft.map_or("functions", |f| f.plural())
 }
 
-// --- Slug args (shared) ---
-
 #[derive(Debug, Clone, Args)]
 struct SlugArgs {
     /// Function slug
@@ -117,8 +152,6 @@ impl SlugArgs {
             .or(self.slug_flag.as_deref())
     }
 }
-
-// --- Wrapper args (bt tools / bt scorers) ---
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -145,19 +178,20 @@ enum FunctionCommands {
     Invoke(invoke::InvokeArgs),
 }
 
-// --- bt functions args ---
-
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
   bt functions list
   bt functions view my-function
   bt functions invoke my-function --input '{\"key\":\"value\"}'
+  bt functions push --file ./functions
+  bt functions pull --output-dir ./braintrust
 ")]
 pub struct FunctionsArgs {
     /// Filter by function type
     #[arg(long = "type", short = 't', value_enum)]
     function_type: Option<FunctionTypeFilter>,
+
     #[command(subcommand)]
     command: Option<FunctionsCommands>,
 }
@@ -167,16 +201,29 @@ enum FunctionsCommands {
     /// List functions in the current project
     List(FunctionsListArgs),
     /// View function details
-    View(ViewArgs),
+    View(FunctionsViewArgs),
     /// Delete a function
     Delete(FunctionsDeleteArgs),
     /// Invoke a function
     Invoke(FunctionsInvokeArgs),
+    /// Push local function definitions
+    Push(PushArgs),
+    /// Pull remote function definitions
+    Pull(PullArgs),
 }
 
 #[derive(Debug, Clone, Args)]
 struct FunctionsListArgs {
     /// Filter by function type
+    #[arg(long = "type", short = 't', value_enum)]
+    function_type: Option<FunctionTypeFilter>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct FunctionsViewArgs {
+    #[command(flatten)]
+    inner: ViewArgs,
+    /// Filter by function type (for interactive selection)
     #[arg(long = "type", short = 't', value_enum)]
     function_type: Option<FunctionTypeFilter>,
 }
@@ -208,7 +255,112 @@ struct FunctionsInvokeArgs {
     function_type: Option<FunctionTypeFilter>,
 }
 
-// --- Shared view/delete args ---
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PushArgs {
+    /// File or directory path(s) to scan for function definitions.
+    #[arg(
+        long = "file",
+        env = "BT_FUNCTIONS_PUSH_FILES",
+        default_value = ".",
+        value_name = "PATH",
+        value_delimiter = ','
+    )]
+    pub files: Vec<PathBuf>,
+
+    /// Behavior when a function with the same slug already exists.
+    #[arg(
+        long = "if-exists",
+        env = "BT_FUNCTIONS_PUSH_IF_EXISTS",
+        value_enum,
+        default_value = "error"
+    )]
+    pub if_exists: IfExistsMode,
+
+    /// Stop after the first hard failure.
+    #[arg(
+        long,
+        env = "BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
+    pub terminate_on_failure: bool,
+
+    /// Override runner binary (e.g. tsx, vite-node, deno, python).
+    #[arg(long, env = "BT_FUNCTIONS_PUSH_RUNNER", value_name = "RUNNER")]
+    pub runner: Option<String>,
+
+    /// Force runtime language selection.
+    #[arg(
+        long = "language",
+        env = "BT_FUNCTIONS_PUSH_LANGUAGE",
+        value_enum,
+        default_value = "auto"
+    )]
+    pub language: PushLanguage,
+
+    /// Optional Python requirements file.
+    #[arg(long, env = "BT_FUNCTIONS_PUSH_REQUIREMENTS", value_name = "PATH")]
+    pub requirements: Option<PathBuf>,
+
+    /// Create missing projects referenced by function definitions.
+    #[arg(
+        long = "create-missing-projects",
+        env = "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
+    pub create_missing_projects: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PullArgs {
+    /// Destination directory for generated files.
+    #[arg(
+        long,
+        env = "BT_FUNCTIONS_PULL_OUTPUT_DIR",
+        default_value = ".",
+        value_name = "PATH"
+    )]
+    pub output_dir: PathBuf,
+
+    /// Output language.
+    #[arg(
+        long = "language",
+        env = "BT_FUNCTIONS_PULL_LANGUAGE",
+        value_enum,
+        default_value = "typescript"
+    )]
+    pub language: FunctionsLanguage,
+
+    /// Project name filter.
+    #[arg(long, env = "BT_FUNCTIONS_PULL_PROJECT_NAME")]
+    pub project_name: Option<String>,
+
+    /// Project id filter.
+    #[arg(
+        long,
+        env = "BT_FUNCTIONS_PULL_PROJECT_ID",
+        conflicts_with = "project_name"
+    )]
+    pub project_id: Option<String>,
+
+    /// Function id selector.
+    #[arg(long, env = "BT_FUNCTIONS_PULL_ID", conflicts_with = "slug")]
+    pub id: Option<String>,
+
+    /// Function slug selector.
+    #[arg(long, env = "BT_FUNCTIONS_PULL_SLUG")]
+    pub slug: Option<String>,
+
+    /// Overwrite targets even when dirty or already existing.
+    #[arg(
+        long,
+        env = "BT_FUNCTIONS_PULL_FORCE",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
+    pub force: bool,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct ViewArgs {
@@ -243,7 +395,11 @@ impl DeleteArgs {
     }
 }
 
-// --- Resolved context ---
+pub(crate) struct AuthContext {
+    pub client: ApiClient,
+    pub app_url: String,
+    pub org_id: String,
+}
 
 pub(crate) struct ResolvedContext {
     pub client: ApiClient,
@@ -251,26 +407,57 @@ pub(crate) struct ResolvedContext {
     pub project: Project,
 }
 
-async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
+pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext> {
     let ctx = login(base).await?;
     let client = ApiClient::new(&ctx)?;
-    let config_project = config::load().ok().and_then(|c| c.project);
-    let project_name = match base.project.as_deref().or(config_project.as_deref()) {
-        Some(p) => p.to_string(),
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
-        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
-    };
-    let project = get_project_by_name(&client, &project_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
-    Ok(ResolvedContext {
+    Ok(AuthContext {
         client,
         app_url: ctx.app_url,
-        project,
+        org_id: ctx.login.org_id,
     })
 }
 
-// --- Interactive selection ---
+pub(crate) async fn resolve_project_context(
+    base: &BaseArgs,
+    auth_ctx: &AuthContext,
+) -> Result<Project> {
+    resolve_project_context_optional(base, auth_ctx, true)
+        .await?
+        .ok_or_else(|| anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))
+}
+
+pub(crate) async fn resolve_project_context_optional(
+    base: &BaseArgs,
+    auth_ctx: &AuthContext,
+    allow_interactive_selection: bool,
+) -> Result<Option<Project>> {
+    let config_project = config::load().ok().and_then(|c| c.project);
+    let project_name = match base.project.as_deref().or(config_project.as_deref()) {
+        Some(p) => Some(p.to_string()),
+        None if allow_interactive_selection && is_interactive() => {
+            Some(select_project_interactive(&auth_ctx.client, None, None).await?)
+        }
+        None => None,
+    };
+
+    match project_name {
+        Some(project_name) => get_project_by_name(&auth_ctx.client, &project_name)
+            .await?
+            .map(Some)
+            .ok_or_else(|| anyhow!("project '{project_name}' not found")),
+        None => Ok(None),
+    }
+}
+
+async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
+    let auth_ctx = resolve_auth_context(base).await?;
+    let project = resolve_project_context(base, &auth_ctx).await?;
+    Ok(ResolvedContext {
+        client: auth_ctx.client,
+        app_url: auth_ctx.app_url,
+        project,
+    })
+}
 
 pub(crate) async fn select_function_interactive(
     client: &ApiClient,
@@ -306,8 +493,6 @@ pub(crate) async fn select_function_interactive(
     Ok(functions[selection].clone())
 }
 
-// --- Entry points ---
-
 pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
     let ctx = resolve_context(&base).await?;
     let ft = Some(kind);
@@ -322,26 +507,289 @@ pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFil
 }
 
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
-    let ctx = resolve_context(&base).await?;
     match args.command {
-        None => list::run(&ctx, base.json, args.function_type).await,
-        Some(FunctionsCommands::List(ref la)) => list::run(&ctx, base.json, la.function_type).await,
+        None => {
+            let ctx = resolve_context(&base).await?;
+            list::run(&ctx, base.json, args.function_type).await
+        }
+        Some(FunctionsCommands::List(ref la)) => {
+            let ctx = resolve_context(&base).await?;
+            list::run(&ctx, base.json, la.function_type.or(args.function_type)).await
+        }
         Some(FunctionsCommands::View(v)) => {
+            let ctx = resolve_context(&base).await?;
             view::run(
                 &ctx,
-                v.slug(),
+                v.inner.slug(),
                 base.json,
-                v.web,
-                v.verbose,
-                args.function_type,
+                v.inner.web,
+                v.inner.verbose,
+                v.function_type.or(args.function_type),
             )
             .await
         }
         Some(FunctionsCommands::Delete(d)) => {
-            delete::run(&ctx, d.slug(), d.force, d.function_type).await
+            let ctx = resolve_context(&base).await?;
+            delete::run(
+                &ctx,
+                d.slug(),
+                d.force,
+                d.function_type.or(args.function_type),
+            )
+            .await
         }
         Some(FunctionsCommands::Invoke(i)) => {
-            invoke::run(&ctx, &i.inner, base.json, i.function_type).await
+            let ctx = resolve_context(&base).await?;
+            invoke::run(
+                &ctx,
+                &i.inner,
+                base.json,
+                i.function_type.or(args.function_type),
+            )
+            .await
         }
+        Some(FunctionsCommands::Push(args)) => push::run(base, args).await,
+        Some(FunctionsCommands::Pull(args)) => pull::run(base, args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use clap::{Parser, Subcommand};
+
+    use super::*;
+
+    #[derive(Debug, Parser)]
+    struct CliHarness {
+        #[command(subcommand)]
+        command: Commands,
+    }
+
+    #[derive(Debug, Subcommand)]
+    enum Commands {
+        Functions(FunctionsArgs),
+    }
+
+    fn parse(args: &[&str]) -> anyhow::Result<FunctionsArgs> {
+        let mut argv = vec!["bt"];
+        argv.extend_from_slice(args);
+        let parsed = CliHarness::try_parse_from(argv)?;
+        match parsed.command {
+            Commands::Functions(args) => Ok(args),
+        }
+    }
+
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn push_rejects_legacy_type_flag() {
+        let _guard = test_lock();
+        let err = parse(&["functions", "push", "--type", "tool"]).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--type"));
+    }
+
+    #[test]
+    fn top_level_type_flag_still_parses_for_functions_namespace() {
+        let _guard = test_lock();
+        let parsed = parse(&["functions", "--type", "tool"]).expect("parse functions");
+        assert!(matches!(
+            parsed.function_type,
+            Some(FunctionTypeFilter::Tool)
+        ));
+    }
+
+    #[test]
+    fn push_file_env_uses_delimiter() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::set_var("BT_FUNCTIONS_PUSH_FILES", "a.ts,b.ts");
+        }
+        let parsed = parse(&["functions", "push"]).expect("parse push");
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PUSH_FILES");
+        }
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+
+        assert_eq!(
+            push.files,
+            vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")]
+        );
+    }
+
+    #[test]
+    fn push_boolish_flag_from_env() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::set_var("BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE", "true");
+        }
+        let parsed = parse(&["functions", "push"]).expect("parse push");
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE");
+        }
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert!(push.terminate_on_failure);
+    }
+
+    #[test]
+    fn push_create_missing_projects_flag_from_env() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::set_var("BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS", "true");
+        }
+        let parsed = parse(&["functions", "push"]).expect("parse push");
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS");
+        }
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert!(push.create_missing_projects);
+    }
+
+    #[test]
+    fn push_repeated_file_flags_append_in_order() {
+        let _guard = test_lock();
+        let parsed = parse(&[
+            "functions",
+            "push",
+            "--file",
+            "a.ts",
+            "--file",
+            "b.ts",
+            "--file",
+            "c.ts",
+        ])
+        .expect("parse push");
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert_eq!(
+            push.files,
+            vec![
+                PathBuf::from("a.ts"),
+                PathBuf::from("b.ts"),
+                PathBuf::from("c.ts")
+            ]
+        );
+    }
+
+    #[test]
+    fn push_language_from_env() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::set_var("BT_FUNCTIONS_PUSH_LANGUAGE", "python");
+        }
+        let parsed = parse(&["functions", "push"]).expect("parse push");
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PUSH_LANGUAGE");
+        }
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert_eq!(push.language, PushLanguage::Python);
+    }
+
+    #[test]
+    fn push_requirements_from_env() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::set_var("BT_FUNCTIONS_PUSH_REQUIREMENTS", "requirements.txt");
+        }
+        let parsed = parse(&["functions", "push"]).expect("parse push");
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PUSH_REQUIREMENTS");
+        }
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert_eq!(push.requirements, Some(PathBuf::from("requirements.txt")));
+    }
+
+    #[test]
+    fn pull_language_from_env() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::set_var("BT_FUNCTIONS_PULL_LANGUAGE", "python");
+        }
+        let parsed = parse(&["functions", "pull"]).expect("parse pull");
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PULL_LANGUAGE");
+        }
+
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull command");
+        };
+        assert_eq!(pull.language, FunctionsLanguage::Python);
+    }
+
+    #[test]
+    fn pull_language_defaults_to_typescript() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PULL_LANGUAGE");
+        }
+        let parsed = parse(&["functions", "pull"]).expect("parse pull");
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull command");
+        };
+        assert_eq!(pull.language, FunctionsLanguage::Typescript);
+    }
+
+    #[test]
+    fn pull_rejects_invalid_language() {
+        let _guard = test_lock();
+        let err = parse(&["functions", "pull", "--language", "ruby"]).expect_err("should fail");
+        assert!(err.to_string().contains("ruby"));
+    }
+
+    #[test]
+    fn push_rejects_invalid_language() {
+        let _guard = test_lock();
+        let err =
+            parse(&["functions", "push", "--language", "typescript"]).expect_err("should fail");
+        assert!(err.to_string().contains("typescript"));
+    }
+
+    #[test]
+    fn pull_conflicts_project_selectors() {
+        let _guard = test_lock();
+        let err = parse(&[
+            "functions",
+            "pull",
+            "--project-id",
+            "p1",
+            "--project-name",
+            "proj",
+        ])
+        .expect_err("should conflict");
+
+        assert!(err.to_string().contains("--project-name"));
+    }
+
+    #[test]
+    fn pull_conflicts_id_and_slug() {
+        let _guard = test_lock();
+        let err = parse(&["functions", "pull", "--id", "f1", "--slug", "slug"])
+            .expect_err("should conflict");
+
+        assert!(err.to_string().contains("--slug"));
     }
 }
