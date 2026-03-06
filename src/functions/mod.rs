@@ -5,11 +5,11 @@ use clap::{builder::BoolishValueParser, Args, Subcommand, ValueEnum};
 
 use crate::{
     args::BaseArgs,
-    auth::login,
+    auth::{login, AvailableOrg},
     config,
     http::ApiClient,
     projects::api::{get_project_by_name, Project},
-    ui::{self, is_interactive, select_project_interactive, with_spinner},
+    ui::{self, fuzzy_select, is_interactive, select_project_interactive, with_spinner},
 };
 
 pub(crate) mod api;
@@ -329,6 +329,19 @@ impl PushArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PullArgs {
+    /// Function slug(s) to pull.
+    #[arg(value_name = "SLUG")]
+    pub slugs: Vec<String>,
+
+    /// Function slug(s) to pull.
+    #[arg(
+        long = "slug",
+        short = 's',
+        env = "BT_FUNCTIONS_PULL_SLUG",
+        value_delimiter = ','
+    )]
+    pub slug_flag: Vec<String>,
+
     /// Destination directory for generated files.
     #[arg(
         long,
@@ -360,12 +373,8 @@ pub(crate) struct PullArgs {
     pub project_id: Option<String>,
 
     /// Function id selector.
-    #[arg(long, env = "BT_FUNCTIONS_PULL_ID", conflicts_with = "slug")]
+    #[arg(long, env = "BT_FUNCTIONS_PULL_ID", conflicts_with_all = ["slugs", "slug_flag"])]
     pub id: Option<String>,
-
-    /// Function slug selector.
-    #[arg(long, env = "BT_FUNCTIONS_PULL_SLUG")]
-    pub slug: Option<String>,
 
     /// Overwrite targets even when dirty or already existing.
     #[arg(
@@ -375,6 +384,27 @@ pub(crate) struct PullArgs {
         value_parser = BoolishValueParser::new()
     )]
     pub force: bool,
+
+    /// Show skipped files in output.
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+impl PullArgs {
+    pub fn resolved_slugs(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut result = Vec::new();
+        for s in self.slugs.iter().chain(self.slug_flag.iter()) {
+            if seen.insert(s.clone()) {
+                result.push(s.clone());
+            }
+        }
+        result
+    }
+
+    pub fn has_slug_selector(&self) -> bool {
+        !self.slugs.is_empty() || !self.slug_flag.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -430,6 +460,119 @@ pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext>
         app_url: ctx.app_url,
         org_id: ctx.login.org_id,
     })
+}
+
+#[derive(Debug)]
+pub(crate) enum OrgDecision {
+    Continue,
+    Switch(String),
+    Cancel,
+}
+
+pub(crate) fn current_org_label(auth_ctx: &AuthContext) -> String {
+    if auth_ctx.client.org_name().trim().is_empty() {
+        auth_ctx.org_id.clone()
+    } else {
+        auth_ctx.client.org_name().to_string()
+    }
+}
+
+pub(crate) fn validate_explicit_org_selection(
+    base: &BaseArgs,
+    available_orgs: &[AvailableOrg],
+) -> Result<()> {
+    let Some(explicit_org) = base
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let exists = available_orgs
+        .iter()
+        .any(|org| org.name == explicit_org || org.name.eq_ignore_ascii_case(explicit_org));
+    if exists {
+        return Ok(());
+    }
+
+    let available = available_orgs
+        .iter()
+        .map(|org| org.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("org '{explicit_org}' is not available for this credential. Available: {available}");
+}
+
+/// Prompt the user to confirm/switch org when multiple orgs are available.
+/// `prompt` is the question text, `action_label` is used for the confirm option (e.g. "Push to", "Pull from").
+pub(crate) fn resolve_org_decision(
+    base: &BaseArgs,
+    auth_ctx: &AuthContext,
+    available_orgs: &[AvailableOrg],
+    prompt: &str,
+    action_label: &str,
+) -> Result<(OrgDecision, bool)> {
+    if base
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return Ok((OrgDecision::Continue, false));
+    }
+
+    if available_orgs.len() <= 1 {
+        return Ok((OrgDecision::Continue, false));
+    }
+
+    if !is_interactive() {
+        bail!(
+            "multiple organizations are available for this credential; pass --org <ORG_NAME> in non-interactive mode"
+        );
+    }
+
+    let org_label = current_org_label(auth_ctx);
+
+    let options = [
+        format!("{action_label} {org_label}"),
+        "Switch org".to_string(),
+        "Cancel".to_string(),
+    ];
+    let option_refs = options.iter().map(String::as_str).collect::<Vec<_>>();
+    let choice = fuzzy_select(prompt, &option_refs, 0)?;
+
+    match choice {
+        0 => Ok((OrgDecision::Continue, true)),
+        1 => {
+            let mut labels = Vec::with_capacity(available_orgs.len());
+            let mut default_index = 0usize;
+            for (index, org) in available_orgs.iter().enumerate() {
+                let label = if org.api_url.is_some() {
+                    format!("{} [{}]", org.name, org.id)
+                } else {
+                    org.name.clone()
+                };
+                if org.name == org_label || org.name.eq_ignore_ascii_case(&org_label) {
+                    default_index = index;
+                }
+                labels.push(label);
+            }
+            let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+            let selected_index = fuzzy_select("Select organization", &label_refs, default_index)?;
+            let selected = available_orgs
+                .get(selected_index)
+                .ok_or_else(|| anyhow!("invalid org selection"))?;
+            if selected.name == org_label || selected.name.eq_ignore_ascii_case(&org_label) {
+                Ok((OrgDecision::Continue, true))
+            } else {
+                Ok((OrgDecision::Switch(selected.name.clone()), true))
+            }
+        }
+        _ => Ok((OrgDecision::Cancel, true)),
+    }
 }
 
 pub(crate) async fn resolve_project_context(
@@ -800,11 +943,81 @@ mod tests {
     }
 
     #[test]
-    fn pull_conflicts_id_and_slug() {
+    fn pull_conflicts_id_and_slug_flag() {
         let _guard = test_lock();
         let err = parse(&["functions", "pull", "--id", "f1", "--slug", "slug"])
             .expect_err("should conflict");
+        assert!(err.to_string().contains("--slug") || err.to_string().contains("--id"));
+    }
 
-        assert!(err.to_string().contains("--slug"));
+    #[test]
+    fn pull_conflicts_id_and_positional_slug() {
+        let _guard = test_lock();
+        let err =
+            parse(&["functions", "pull", "--id", "f1", "my-slug"]).expect_err("should conflict");
+        assert!(
+            err.to_string().contains("--id")
+                || err.to_string().contains("SLUG")
+                || err.to_string().contains("cannot be used")
+        );
+    }
+
+    #[test]
+    fn pull_positional_slugs_parse() {
+        let _guard = test_lock();
+        let parsed = parse(&["functions", "pull", "slug-a", "slug-b"]).expect("parse pull");
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull");
+        };
+        assert_eq!(pull.resolved_slugs(), vec!["slug-a", "slug-b"]);
+    }
+
+    #[test]
+    fn pull_slug_flag_repeats() {
+        let _guard = test_lock();
+        let parsed =
+            parse(&["functions", "pull", "--slug", "a", "--slug", "b"]).expect("parse pull");
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull");
+        };
+        assert_eq!(pull.resolved_slugs(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn pull_merges_positional_and_flag_slugs() {
+        let _guard = test_lock();
+        let parsed =
+            parse(&["functions", "pull", "pos-slug", "--slug", "flag-slug"]).expect("parse pull");
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull");
+        };
+        assert_eq!(pull.resolved_slugs(), vec!["pos-slug", "flag-slug"]);
+    }
+
+    #[test]
+    fn pull_deduplicates_slugs() {
+        let _guard = test_lock();
+        let parsed = parse(&["functions", "pull", "same", "--slug", "same"]).expect("parse pull");
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull");
+        };
+        assert_eq!(pull.resolved_slugs(), vec!["same"]);
+    }
+
+    #[test]
+    fn pull_slug_env_uses_delimiter() {
+        let _guard = test_lock();
+        unsafe {
+            std::env::set_var("BT_FUNCTIONS_PULL_SLUG", "a,b,c");
+        }
+        let parsed = parse(&["functions", "pull"]).expect("parse pull");
+        unsafe {
+            std::env::remove_var("BT_FUNCTIONS_PULL_SLUG");
+        }
+
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull command");
+        };
+        assert_eq!(pull.slug_flag, vec!["a", "b", "c"]);
     }
 }

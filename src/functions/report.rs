@@ -55,6 +55,7 @@ pub enum SoftSkipReason {
 #[serde(rename_all = "snake_case")]
 pub enum WarningReason {
     PaginationNotSnapshotConsistent,
+    SelectorPartialMatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::args::BaseArgs;
-use crate::auth::{list_available_orgs, list_profiles, AvailableOrg};
+use crate::auth::{list_available_orgs, list_profiles};
 use crate::config;
 use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PushFileReport, PushSummary, ReportError,
@@ -23,10 +23,13 @@ use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
 use crate::source_language::{classify_runtime_extension, JsExtensionProfile, SourceLanguage};
-use crate::ui::{fuzzy_select, is_interactive};
+use crate::ui::is_interactive;
 
 use super::api;
-use super::{resolve_auth_context, PushArgs, PushLanguage};
+use super::{
+    current_org_label, resolve_auth_context, resolve_org_decision, validate_explicit_org_selection,
+    OrgDecision, PushArgs, PushLanguage,
+};
 
 const FUNCTIONS_JS_RUNNER_FILE: &str = "functions-runner.ts";
 const FUNCTIONS_PY_RUNNER_FILE: &str = "functions-runner.py";
@@ -116,13 +119,6 @@ struct FileFailure {
 
 fn error_chain(err: &anyhow::Error) -> String {
     format!("{err:#}")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OrgDecision {
-    Continue,
-    Switch(String),
-    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,24 +380,21 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         .collect();
     let preflight_project_names: Vec<String> = preflight.named_projects.iter().cloned().collect();
 
-    let (org_decision, org_prompt_confirmed) = match resolve_org_decision(
-        &base,
-        &auth_ctx,
-        &available_orgs,
-        &preflight_source_files,
-        &preflight_project_names,
-    ) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return fail_push(
-                &base,
-                files.len(),
-                HardFailureReason::ResponseInvalid,
-                error_chain(&err),
-                "failed to resolve org context",
-            );
-        }
-    };
+    let org_prompt =
+        build_push_org_prompt(&auth_ctx, &preflight_source_files, &preflight_project_names);
+    let (org_decision, org_prompt_confirmed) =
+        match resolve_org_decision(&base, &auth_ctx, &available_orgs, &org_prompt, "Push to") {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return fail_push(
+                    &base,
+                    files.len(),
+                    HardFailureReason::ResponseInvalid,
+                    error_chain(&err),
+                    "failed to resolve org context",
+                );
+            }
+        };
 
     match org_decision {
         OrgDecision::Continue => {}
@@ -1890,60 +1883,11 @@ fn ensure_path_within_allowed_roots(
     );
 }
 
-fn validate_explicit_org_selection(base: &BaseArgs, available_orgs: &[AvailableOrg]) -> Result<()> {
-    let Some(explicit_org) = base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(());
-    };
-
-    let exists = available_orgs
-        .iter()
-        .any(|org| org.name == explicit_org || org.name.eq_ignore_ascii_case(explicit_org));
-    if exists {
-        return Ok(());
-    }
-
-    let available = available_orgs
-        .iter()
-        .map(|org| org.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!("org '{explicit_org}' is not available for this credential. Available: {available}");
-}
-
-fn resolve_org_decision(
-    base: &BaseArgs,
+fn build_push_org_prompt(
     auth_ctx: &super::AuthContext,
-    available_orgs: &[AvailableOrg],
     source_files: &[&str],
     project_names: &[String],
-) -> Result<(OrgDecision, bool)> {
-    if base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        return Ok((OrgDecision::Continue, false));
-    }
-
-    if available_orgs.len() <= 1 {
-        return Ok((OrgDecision::Continue, false));
-    }
-
-    if !is_interactive() {
-        bail!(
-            "multiple organizations are available for this credential; pass --org <ORG_NAME> in non-interactive mode"
-        );
-    }
-
-    let org_label = current_org_label(auth_ctx);
-
+) -> String {
     let file_names: Vec<&str> = source_files
         .iter()
         .map(|f| {
@@ -1961,55 +1905,15 @@ fn resolve_org_decision(
     let projects_part = if project_names.is_empty() {
         "(no project)".to_string()
     } else {
-        project_names.join(", ")
+        project_names
+            .iter()
+            .map(|p| style(p).green().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
+    let org_styled = style(current_org_label(auth_ctx)).green();
 
-    let prompt = format!("Push {files_part} to {projects_part} in {org_label}");
-    let options = [
-        format!("Push to {org_label}"),
-        "Switch org".to_string(),
-        "Cancel".to_string(),
-    ];
-    let option_refs = options.iter().map(String::as_str).collect::<Vec<_>>();
-    let choice = fuzzy_select(&prompt, &option_refs, 0)?;
-
-    match choice {
-        0 => Ok((OrgDecision::Continue, true)),
-        1 => {
-            let mut labels = Vec::with_capacity(available_orgs.len());
-            let mut default_index = 0usize;
-            for (index, org) in available_orgs.iter().enumerate() {
-                let label = if org.api_url.is_some() {
-                    format!("{} [{}]", org.name, org.id)
-                } else {
-                    org.name.clone()
-                };
-                if org.name == org_label || org.name.eq_ignore_ascii_case(&org_label) {
-                    default_index = index;
-                }
-                labels.push(label);
-            }
-            let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
-            let selected_index = fuzzy_select("Select organization", &label_refs, default_index)?;
-            let selected = available_orgs
-                .get(selected_index)
-                .ok_or_else(|| anyhow!("invalid org selection"))?;
-            if selected.name == org_label || selected.name.eq_ignore_ascii_case(&org_label) {
-                Ok((OrgDecision::Continue, true))
-            } else {
-                Ok((OrgDecision::Switch(selected.name.clone()), true))
-            }
-        }
-        _ => Ok((OrgDecision::Cancel, true)),
-    }
-}
-
-fn current_org_label(auth_ctx: &super::AuthContext) -> String {
-    if auth_ctx.client.org_name().trim().is_empty() {
-        auth_ctx.org_id.clone()
-    } else {
-        auth_ctx.client.org_name().to_string()
-    }
+    format!("Push {files_part} to {projects_part} in {org_styled}")
 }
 
 fn cancel_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
@@ -2662,6 +2566,7 @@ fn to_warning_code(warning: &ReportWarning) -> &'static str {
         super::report::WarningReason::PaginationNotSnapshotConsistent => {
             "pagination_not_snapshot_consistent"
         }
+        super::report::WarningReason::SelectorPartialMatch => "selector_partial_match",
     }
 }
 
@@ -2780,6 +2685,7 @@ fn fail_push_manifest_preflight(
 #[cfg(test)]
 mod tests {
     use crate::args::BaseArgs;
+    use crate::auth::AvailableOrg;
     use crate::functions::IfExistsMode;
 
     use super::*;
