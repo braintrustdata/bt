@@ -1,0 +1,5 @@
+{
+  "command": ["functions", "push", "--tsconfig", "./tsconfig.json"],
+  "expect_success": false,
+  "stderr_contains": ["--tsconfig"]
+}

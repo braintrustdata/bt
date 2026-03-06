@@ -1,0 +1,13 @@
+{
+  "command": ["functions", "pull", "--help"],
+  "expect_success": true,
+  "stdout_contains": [
+    "--output-dir",
+    "--project-id",
+    "--project-name",
+    "--id",
+    "--slug",
+    "--language",
+    "--force"
+  ]
+}

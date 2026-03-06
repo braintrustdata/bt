@@ -1,0 +1,13 @@
+{
+  "command": ["functions", "pull", "--help"],
+  "expect_success": true,
+  "stdout_contains": [
+    "BT_FUNCTIONS_PULL_OUTPUT_DIR",
+    "BT_FUNCTIONS_PULL_PROJECT_ID",
+    "BT_FUNCTIONS_PULL_PROJECT_NAME",
+    "BT_FUNCTIONS_PULL_ID",
+    "BT_FUNCTIONS_PULL_SLUG",
+    "BT_FUNCTIONS_PULL_FORCE",
+    "BT_FUNCTIONS_PULL_LANGUAGE"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "command": ["functions", "pull", "--language", "python", "--help"],
+  "expect_success": true,
+  "stdout_contains": ["Usage:", "--language"],
+  "stderr_not_contains": ["invalid value 'python'"]
+}
