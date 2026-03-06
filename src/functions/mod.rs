@@ -258,14 +258,17 @@ struct FunctionsInvokeArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PushArgs {
     /// File or directory path(s) to scan for function definitions.
+    #[arg(value_name = "PATH")]
+    pub files: Vec<PathBuf>,
+
+    /// File or directory path(s) to scan for function definitions.
     #[arg(
         long = "file",
         env = "BT_FUNCTIONS_PUSH_FILES",
-        default_value = ".",
         value_name = "PATH",
         value_delimiter = ','
     )]
-    pub files: Vec<PathBuf>,
+    pub file_flag: Vec<PathBuf>,
 
     /// Behavior when a function with the same slug already exists.
     #[arg(
@@ -310,6 +313,18 @@ pub(crate) struct PushArgs {
         value_parser = BoolishValueParser::new()
     )]
     pub create_missing_projects: bool,
+}
+
+impl PushArgs {
+    pub fn resolved_files(&self) -> Vec<PathBuf> {
+        let mut all = self.files.clone();
+        all.extend(self.file_flag.iter().cloned());
+        if all.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            all
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
