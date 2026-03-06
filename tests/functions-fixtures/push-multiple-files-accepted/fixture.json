@@ -1,6 +1,5 @@
 {
-  "command": ["functions", "push", "a.ts", "b.ts", "--type", "tool"],
+  "command": ["functions", "push", "a.ts", "b.ts"],
   "expect_success": false,
-  "stderr_contains": ["--type"],
-  "stderr_not_contains": ["unexpected argument"]
+  "stderr_not_contains": ["unexpected argument", "unrecognized"]
 }
