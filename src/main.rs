@@ -13,11 +13,14 @@ mod experiments;
 mod functions;
 mod http;
 mod init;
+mod js_runner;
 mod projects;
 mod prompts;
+mod python_runner;
 mod scorers;
 mod self_update;
 mod setup;
+mod source_language;
 mod sql;
 mod status;
 mod switch;
@@ -27,6 +30,10 @@ mod traces;
 mod ui;
 mod util_cmd;
 mod utils;
+
+mod js_runner;
+mod python_runner;
+mod source_language;
 
 use crate::args::{BaseArgs, CLIArgs};
 
