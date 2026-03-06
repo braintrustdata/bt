@@ -8,23 +8,22 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::args::BaseArgs;
-use crate::auth::list_available_orgs;
 use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PullFileReport, PullSummary, ReportError,
     ReportWarning, SoftSkipReason, WarningReason,
 };
-use crate::projects::api::{get_project_by_name, list_projects, Project};
-use crate::ui::{fuzzy_select, select_project_interactive};
+use crate::projects::api::{list_projects, Project};
 use crate::utils::{write_text_atomic, GitRepo};
 
 use super::api::{self, FunctionListQuery};
-use super::{
-    current_org_label, resolve_auth_context, resolve_project_context_optional,
-    validate_explicit_org_selection, FunctionsLanguage, PullArgs,
-};
+use super::{resolve_auth_context, FunctionsLanguage, PullArgs};
 
 const PAGINATION_PAGE_LIMIT: usize = 10_000;
 const OUTPUT_LOCK_FILE: &str = ".bt-functions-pull.lock";
+const TOP_BITS: u64 = 0x0DE1u64 << 48;
+const MODULUS: u128 = 1u128 << 64;
+const COPRIME: u64 = 205_891_132_094_649;
+const COPRIME_INVERSE: u64 = 1_522_336_535_492_693_385;
 
 #[derive(Debug, Clone, Deserialize)]
 struct PullFunctionRow {
@@ -103,35 +102,18 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         errors: vec![],
     };
     let mut projects_cache: Option<Vec<Project>> = None;
-    let has_explicit_project = args.project_id.is_some() || args.project_name.is_some();
-
-    let mut base = base;
-    let (auth_ctx, selected_project) = if !has_explicit_project {
-        match resolve_pull_target(&mut base).await {
-            Ok(result) => result,
-            Err(err) => {
-                return fail_pull(
-                    &base,
-                    &mut summary,
-                    HardFailureReason::AuthFailed,
-                    err.to_string(),
-                );
-            }
-        }
-    } else {
-        match resolve_auth_context(&base)
-            .await
-            .context("failed to resolve auth context")
-        {
-            Ok(ctx) => (ctx, None),
-            Err(err) => {
-                return fail_pull(
-                    &base,
-                    &mut summary,
-                    HardFailureReason::AuthFailed,
-                    err.to_string(),
-                );
-            }
+    let auth_ctx = match resolve_auth_context(&base)
+        .await
+        .context("failed to resolve auth context")
+    {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            return fail_pull(
+                &base,
+                &mut summary,
+                HardFailureReason::AuthFailed,
+                err.to_string(),
+            );
         }
     };
 
@@ -160,19 +142,23 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             );
         }
         query.project_name = Some(project_name.clone());
-    } else if let Some(project) = selected_project {
-        query.project_id = Some(project.id);
-    } else {
-        return fail_pull(
-            &base,
-            &mut summary,
-            HardFailureReason::ResponseInvalid,
-            "no project selected".to_string(),
-        );
     }
 
     if let Some(id) = &args.id {
         query.id = Some(id.clone());
+    }
+    if let Some(version) = &args.version {
+        query.version = match load_pretty_xact_compat(version) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return fail_pull(
+                    &base,
+                    &mut summary,
+                    HardFailureReason::ResponseInvalid,
+                    err.to_string(),
+                );
+            }
+        };
     }
     let resolved_slugs = args.resolved_slugs();
     if resolved_slugs.len() == 1 {
@@ -232,22 +218,18 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         );
     }
 
+    let project_ids_with_matches = winners
+        .iter()
+        .map(|row| row.project_id.clone())
+        .collect::<BTreeSet<_>>();
+
     let mut materializable = Vec::new();
-    for row in winners {
+    for row in winners.iter().cloned() {
         if is_prompt_row(&row) {
             materializable.push(row);
         } else {
             summary.unsupported_records_skipped += 1;
         }
-    }
-
-    if (args.id.is_some() || args.has_slug_selector()) && materializable.is_empty() {
-        return fail_pull(
-            &base,
-            &mut summary,
-            HardFailureReason::SelectorNotFound,
-            "selector matched records but none are materializable prompts".to_string(),
-        );
     }
 
     let output_dir = if args.output_dir.is_absolute() {
@@ -330,7 +312,6 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     };
 
     if !resolved_slugs.is_empty() {
-        // Slug mode: one file per slug.
         let found_slugs: BTreeSet<&str> = materializable.iter().map(|r| r.slug.as_str()).collect();
         for slug in &resolved_slugs {
             if !found_slugs.contains(slug.as_str()) {
@@ -340,89 +321,64 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
                 });
             }
         }
+    }
 
-        // Check for cross-project collisions: if any slug appears in multiple projects,
-        // require --project-name/--project-id to disambiguate.
-        if !has_explicit_project {
-            let mut slug_projects: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-            for row in &materializable {
-                slug_projects
-                    .entry(row.slug.as_str())
-                    .or_default()
-                    .insert(row.project_id.as_str());
-            }
-            for (slug, projects) in &slug_projects {
-                if projects.len() > 1 {
-                    return fail_pull(
-                        &base,
-                        &mut summary,
-                        HardFailureReason::SelectorNotFound,
-                        format!(
-                            "slug '{}' exists in {} projects; pass --project-name or --project-id",
-                            slug,
-                            projects.len()
-                        ),
-                    );
-                }
-            }
-        }
-
-        summary.projects_total = materializable
-            .iter()
-            .map(|r| r.project_id.as_str())
-            .collect::<BTreeSet<_>>()
-            .len();
-
-        for row in &materializable {
-            let project_name = project_names
-                .get(&row.project_id)
-                .map(String::as_str)
-                .unwrap_or("unknown");
-            let file_name = format!("{}.{ext}", sanitize_filename(&row.slug));
-            write_pull_file(
+    // Legacy-compatible project mode: one output file per project, even for
+    // selector pulls that only matched unsupported record types.
+    let mut grouped_by_project = BTreeMap::<(String, String), Vec<PullFunctionRow>>::new();
+    for project_id in project_ids_with_matches {
+        let Some(project_name) = project_names.get(&project_id).cloned() else {
+            return fail_pull(
+                &base,
                 &mut summary,
-                &canonical_output_dir,
-                &repo,
-                args.force,
-                args.language,
-                project_name,
-                &file_name,
-                std::slice::from_ref(row),
+                HardFailureReason::ResponseInvalid,
+                format!(
+                    "missing resolved project name for project id '{}'",
+                    project_id
+                ),
             );
-        }
-    } else {
-        // Project mode: one file per project (existing behavior).
-        let grouped_by_project = match group_rows_by_project(materializable, &project_names) {
-            Ok(grouped) => grouped,
-            Err(err) => {
-                return fail_pull(
-                    &base,
-                    &mut summary,
-                    HardFailureReason::ResponseInvalid,
-                    err.to_string(),
-                );
-            }
         };
-        summary.projects_total = grouped_by_project.len();
-
-        let file_names = build_project_file_names(&grouped_by_project, ext);
-
-        for ((project_id, project_name), rows) in grouped_by_project {
-            let file_name = file_names
-                .get(&(project_id.clone(), project_name.clone()))
-                .ok_or_else(|| anyhow!("missing output file mapping"))?
-                .clone();
-            write_pull_file(
+        grouped_by_project
+            .entry((project_id, project_name))
+            .or_default();
+    }
+    for row in materializable {
+        let Some(project_name) = project_names.get(&row.project_id).cloned() else {
+            return fail_pull(
+                &base,
                 &mut summary,
-                &canonical_output_dir,
-                &repo,
-                args.force,
-                args.language,
-                &project_name,
-                &file_name,
-                &rows,
+                HardFailureReason::ResponseInvalid,
+                format!(
+                    "missing resolved project name for project id '{}'",
+                    row.project_id
+                ),
             );
-        }
+        };
+        grouped_by_project
+            .entry((row.project_id.clone(), project_name))
+            .or_default()
+            .push(row);
+    }
+
+    summary.projects_total = grouped_by_project.len();
+
+    let file_names = build_project_file_names(&grouped_by_project, ext);
+
+    for ((project_id, project_name), rows) in grouped_by_project {
+        let file_name = file_names
+            .get(&(project_id.clone(), project_name.clone()))
+            .ok_or_else(|| anyhow!("missing output file mapping"))?
+            .clone();
+        write_pull_file(
+            &mut summary,
+            &canonical_output_dir,
+            &repo,
+            args.force,
+            args.language,
+            &project_name,
+            &file_name,
+            &rows,
+        );
     }
 
     if summary.status != CommandStatus::Failed
@@ -468,6 +424,26 @@ fn ensure_unambiguous_project_name(projects: &[Project], project_name: &str) -> 
             bail!("project-name '{project_name}' is ambiguous ({count} matches); use --project-id")
         }
     }
+}
+
+fn modular_multiply(value: u64, prime: u64) -> u64 {
+    ((value as u128 * prime as u128) % MODULUS) as u64
+}
+
+fn load_pretty_xact_compat(encoded_hex: &str) -> Result<String> {
+    if encoded_hex.len() != 16 {
+        return Ok(encoded_hex.to_string());
+    }
+    let value = u64::from_str_radix(encoded_hex, 16).with_context(|| {
+        format!("invalid pretty version '{encoded_hex}' (expected 16 hex characters)")
+    })?;
+    let multiplied_inverse = modular_multiply(value, COPRIME_INVERSE);
+    let with_top_bits = TOP_BITS | multiplied_inverse;
+    let roundtrip = modular_multiply(with_top_bits, COPRIME);
+    if roundtrip != value {
+        bail!("invalid pretty version '{encoded_hex}' (failed compatibility decode)");
+    }
+    Ok(with_top_bits.to_string())
 }
 
 struct FetchRowsResult {
@@ -546,20 +522,17 @@ fn apply_selector_narrowing(
     args: &PullArgs,
 ) -> Result<Vec<PullFunctionRow>> {
     let resolved_slugs = args.resolved_slugs();
-    let narrowed = if let Some(id) = &args.id {
-        rows.into_iter()
-            .filter(|row| row.id == *id)
-            .collect::<Vec<_>>()
-    } else if !resolved_slugs.is_empty() {
-        let slug_set: BTreeSet<&str> = resolved_slugs.iter().map(String::as_str).collect();
-        rows.into_iter()
-            .filter(|row| slug_set.contains(row.slug.as_str()))
-            .collect::<Vec<_>>()
-    } else {
-        rows
-    };
+    let slug_set: BTreeSet<&str> = resolved_slugs.iter().map(String::as_str).collect();
+    let has_id_selector = args.id.is_some();
+    let has_slug_selector = !slug_set.is_empty();
 
-    if (args.id.is_some() || args.has_slug_selector()) && narrowed.is_empty() {
+    let narrowed = rows
+        .into_iter()
+        .filter(|row| args.id.as_ref().is_none_or(|id| row.id == *id))
+        .filter(|row| !has_slug_selector || slug_set.contains(row.slug.as_str()))
+        .collect::<Vec<_>>();
+
+    if (has_id_selector || has_slug_selector) && narrowed.is_empty() {
         bail!("selector did not match any function rows");
     }
 
@@ -658,6 +631,7 @@ fn resolve_project_names(
     Ok(names_by_id)
 }
 
+#[allow(dead_code)]
 fn group_rows_by_project(
     rows: Vec<PullFunctionRow>,
     project_names: &BTreeMap<String, String>,
@@ -792,6 +766,7 @@ fn build_project_file_names(
     names
 }
 
+#[allow(dead_code)]
 fn build_output_file_names(
     grouped_by_project: &BTreeMap<(String, String), Vec<PullFunctionRow>>,
     slug_selector: Option<&str>,
@@ -1610,68 +1585,6 @@ fn record_pull_file_failure(
     });
 }
 
-async fn resolve_pull_target(base: &mut BaseArgs) -> Result<(super::AuthContext, Option<Project>)> {
-    let available_orgs = list_available_orgs(base)
-        .await
-        .context("failed to list available orgs")?;
-
-    validate_explicit_org_selection(base, &available_orgs)?;
-
-    let mut auth_ctx = resolve_auth_context(base)
-        .await
-        .context("failed to resolve auth context")?;
-
-    // Org selector: show when multiple orgs and no explicit --org.
-    let has_explicit_org = base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .is_some();
-    if !has_explicit_org && available_orgs.len() > 1 && crate::ui::is_interactive() {
-        let org_label = current_org_label(&auth_ctx);
-        let names: Vec<&str> = available_orgs.iter().map(|o| o.name.as_str()).collect();
-        let default_index = names
-            .iter()
-            .position(|n| *n == org_label || n.eq_ignore_ascii_case(&org_label))
-            .unwrap_or(0);
-        let selected_index = fuzzy_select("Select org:", &names, default_index)?;
-        let selected = &available_orgs[selected_index];
-        if selected.name != org_label && !selected.name.eq_ignore_ascii_case(&org_label) {
-            base.org_name = Some(selected.name.clone());
-            auth_ctx = resolve_auth_context(base)
-                .await
-                .context("failed to resolve switched org context")?;
-        }
-    } else if !has_explicit_org && available_orgs.len() > 1 {
-        bail!(
-            "multiple organizations are available for this credential; pass --org <ORG_NAME> in non-interactive mode"
-        );
-    }
-
-    // Project selector with current default pre-focused.
-    let default_project = resolve_project_context_optional(base, &auth_ctx, false)
-        .await
-        .ok()
-        .flatten();
-    if !crate::ui::is_interactive() {
-        return Ok((auth_ctx, default_project));
-    }
-    let current_name = default_project.as_ref().map(|p| p.name.as_str());
-    let selected_name = select_project_interactive(
-        &auth_ctx.client,
-        Some("Select project to pull from:"),
-        current_name,
-    )
-    .await?;
-
-    let project = get_project_by_name(&auth_ctx.client, &selected_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{selected_name}' not found"))?;
-
-    Ok((auth_ctx, Some(project)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,6 +1644,7 @@ mod tests {
             project_name: None,
             project_id: None,
             id: Some("missing".to_string()),
+            version: None,
             force: false,
             verbose: false,
         };
@@ -1787,6 +1701,7 @@ mod tests {
             project_name: None,
             project_id: None,
             id: None,
+            version: None,
             force: false,
             verbose: false,
         };

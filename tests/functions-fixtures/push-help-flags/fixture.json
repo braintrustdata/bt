@@ -8,6 +8,8 @@
     "--create-missing-projects",
     "--language",
     "--requirements",
+    "--tsconfig",
+    "--external-packages",
     "--runner"
   ]
 }

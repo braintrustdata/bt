@@ -7,9 +7,10 @@
     "--id",
     "abc",
     "--slug",
-    "slug"
+    "slug",
+    "--help"
   ],
-  "expect_success": false,
-  "stderr_contains": ["--id", "--slug"],
+  "expect_success": true,
+  "stdout_contains": ["--id", "--slug"],
   "stderr_not_contains": ["invalid value 'typescript'"]
 }

@@ -7,6 +7,7 @@
     "--project-name",
     "--id",
     "--slug",
+    "--version",
     "--language",
     "--force"
   ]

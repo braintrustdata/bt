@@ -60,6 +60,8 @@ Core
 Projects & resources
   projects     Manage projects
   prompts      Manage prompts
+  push         Compatibility alias for `functions push`
+  pull         Compatibility alias for `functions pull`
   functions    Manage functions (tools, scorers, and more)
   tools        Manage tools
   scorers      Manage scorers
@@ -140,6 +142,10 @@ enum Commands {
     Scorers(CLIArgs<scorers::ScorersArgs>),
     /// Manage functions (tools, scorers, and more)
     Functions(CLIArgs<functions::FunctionsArgs>),
+    /// Compatibility alias for `functions push`
+    Push(CLIArgs<functions::PushArgs>),
+    /// Compatibility alias for `functions pull`
+    Pull(CLIArgs<functions::PullArgs>),
     /// Manage experiments
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
@@ -171,6 +177,8 @@ impl Commands {
             Commands::Tools(cmd) => &cmd.base,
             Commands::Scorers(cmd) => &cmd.base,
             Commands::Functions(cmd) => &cmd.base,
+            Commands::Push(cmd) => &cmd.base,
+            Commands::Pull(cmd) => &cmd.base,
             Commands::Experiments(cmd) => &cmd.base,
             Commands::Sync(cmd) => &cmd.base,
             Commands::Util(cmd) => &cmd.base,
@@ -224,6 +232,8 @@ async fn try_main() -> Result<()> {
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
         Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
+        Commands::Push(cmd) => functions::run_push(cmd.base, cmd.args).await?,
+        Commands::Pull(cmd) => functions::run_pull(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
         Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,

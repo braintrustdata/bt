@@ -305,11 +305,24 @@ pub(crate) struct PushArgs {
     #[arg(long, env = "BT_FUNCTIONS_PUSH_REQUIREMENTS", value_name = "PATH")]
     pub requirements: Option<PathBuf>,
 
+    /// Compatibility flag for legacy push workflows. Currently informational.
+    #[arg(long, env = "BT_FUNCTIONS_PUSH_TSCONFIG", value_name = "PATH")]
+    pub tsconfig: Option<PathBuf>,
+
+    /// Compatibility flag for legacy push workflows. Currently informational.
+    #[arg(
+        long = "external-packages",
+        env = "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+        value_delimiter = ',',
+        value_name = "PACKAGE"
+    )]
+    pub external_packages: Vec<String>,
+
     /// Create missing projects referenced by function definitions.
     #[arg(
         long = "create-missing-projects",
         env = "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
-        default_value_t = false,
+        default_value_t = true,
         value_parser = BoolishValueParser::new()
     )]
     pub create_missing_projects: bool,
@@ -346,7 +359,7 @@ pub(crate) struct PullArgs {
     #[arg(
         long,
         env = "BT_FUNCTIONS_PULL_OUTPUT_DIR",
-        default_value = ".",
+        default_value = "./braintrust",
         value_name = "PATH"
     )]
     pub output_dir: PathBuf,
@@ -373,8 +386,12 @@ pub(crate) struct PullArgs {
     pub project_id: Option<String>,
 
     /// Function id selector.
-    #[arg(long, env = "BT_FUNCTIONS_PULL_ID", conflicts_with_all = ["slugs", "slug_flag"])]
+    #[arg(long, env = "BT_FUNCTIONS_PULL_ID")]
     pub id: Option<String>,
+
+    /// Version selector (supports pretty version IDs).
+    #[arg(long, env = "BT_FUNCTIONS_PULL_VERSION")]
+    pub version: Option<String>,
 
     /// Overwrite targets even when dirty or already existing.
     #[arg(
@@ -711,6 +728,14 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     }
 }
 
+pub async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
+    push::run(base, args).await
+}
+
+pub async fn run_pull(base: BaseArgs, args: PullArgs) -> Result<()> {
+    pull::run(base, args).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -945,21 +970,24 @@ mod tests {
     #[test]
     fn pull_conflicts_id_and_slug_flag() {
         let _guard = test_lock();
-        let err = parse(&["functions", "pull", "--id", "f1", "--slug", "slug"])
-            .expect_err("should conflict");
-        assert!(err.to_string().contains("--slug") || err.to_string().contains("--id"));
+        let parsed =
+            parse(&["functions", "pull", "--id", "f1", "--slug", "slug"]).expect("parse pull");
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull");
+        };
+        assert_eq!(pull.id.as_deref(), Some("f1"));
+        assert_eq!(pull.resolved_slugs(), vec!["slug"]);
     }
 
     #[test]
     fn pull_conflicts_id_and_positional_slug() {
         let _guard = test_lock();
-        let err =
-            parse(&["functions", "pull", "--id", "f1", "my-slug"]).expect_err("should conflict");
-        assert!(
-            err.to_string().contains("--id")
-                || err.to_string().contains("SLUG")
-                || err.to_string().contains("cannot be used")
-        );
+        let parsed = parse(&["functions", "pull", "--id", "f1", "my-slug"]).expect("parse pull");
+        let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
+            panic!("expected pull");
+        };
+        assert_eq!(pull.id.as_deref(), Some("f1"));
+        assert_eq!(pull.resolved_slugs(), vec!["my-slug"]);
     }
 
     #[test]
