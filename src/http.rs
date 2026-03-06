@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use reqwest::header::HeaderValue;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -197,4 +198,34 @@ impl ApiClient {
 
         self.post_with_headers("/btql", &body, &headers).await
     }
+}
+
+pub async fn put_signed_url(
+    url: &str,
+    body: Vec<u8>,
+    content_encoding: Option<&str>,
+) -> Result<()> {
+    let client = Client::builder()
+        .timeout(DEFAULT_HTTP_TIMEOUT)
+        .build()
+        .context("failed to build signed-url HTTP client")?;
+
+    let mut request = client.put(url).body(body);
+    if let Some(encoding) = content_encoding {
+        request = request.header("Content-Encoding", encoding);
+    }
+    if url.contains(".blob.core.windows.net") {
+        request = request.header("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("signed-url upload request failed")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(HttpError { status, body }.into());
+    }
+    Ok(())
 }
