@@ -305,14 +305,15 @@ pub(crate) struct PushArgs {
     #[arg(long, env = "BT_FUNCTIONS_PUSH_REQUIREMENTS", value_name = "PATH")]
     pub requirements: Option<PathBuf>,
 
-    /// Compatibility flag for legacy push workflows. Currently informational.
+    /// Optional tsconfig path for JS runner and bundler.
     #[arg(long, env = "BT_FUNCTIONS_PUSH_TSCONFIG", value_name = "PATH")]
     pub tsconfig: Option<PathBuf>,
 
-    /// Compatibility flag for legacy push workflows. Currently informational.
+    /// Additional packages to mark external during JS bundling.
     #[arg(
         long = "external-packages",
         env = "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+        num_args = 1..,
         value_delimiter = ',',
         value_name = "PACKAGE"
     )]
@@ -904,6 +905,48 @@ mod tests {
             panic!("expected push command");
         };
         assert_eq!(push.requirements, Some(PathBuf::from("requirements.txt")));
+    }
+
+    #[test]
+    fn push_external_packages_flag_accepts_space_separated_values() {
+        let _guard = test_lock();
+        let parsed = parse(&[
+            "functions",
+            "push",
+            "--external-packages",
+            "sqlite3",
+            "fsevents",
+            "@mapbox/node-pre-gyp",
+        ])
+        .expect("parse push");
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert_eq!(
+            push.external_packages,
+            vec!["sqlite3", "fsevents", "@mapbox/node-pre-gyp"]
+        );
+    }
+
+    #[test]
+    fn push_external_packages_flag_accepts_comma_delimited_values() {
+        let _guard = test_lock();
+        let parsed = parse(&[
+            "functions",
+            "push",
+            "--external-packages",
+            "sqlite3,fsevents,@mapbox/node-pre-gyp",
+        ])
+        .expect("parse push");
+
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert_eq!(
+            push.external_packages,
+            vec!["sqlite3", "fsevents", "@mapbox/node-pre-gyp"]
+        );
     }
 
     #[test]

@@ -122,6 +122,19 @@ fn find_tsc() -> Option<PathBuf> {
     None
 }
 
+fn decode_uploaded_bundle(bundle: &[u8]) -> String {
+    if bundle.starts_with(&[0x1f, 0x8b]) {
+        let mut decoder = GzDecoder::new(bundle);
+        let mut out = String::new();
+        decoder
+            .read_to_string(&mut out)
+            .expect("decompress uploaded bundle");
+        out
+    } else {
+        String::from_utf8(bundle.to_vec()).expect("uploaded bundle utf8")
+    }
+}
+
 fn read_fixture_config(path: &Path) -> FixtureConfig {
     let raw = fs::read_to_string(path).expect("read fixture.json");
     serde_json::from_str(&raw).expect("parse fixture.json")
@@ -199,6 +212,7 @@ impl MockServer {
                 .route("/insert-functions", web::post().to(mock_insert_functions))
                 .route("/v1/function", web::get().to(mock_list_functions))
         })
+        .workers(1)
         .listen(listener)
         .expect("listen mock server")
         .run();
@@ -1199,6 +1213,9 @@ async fn functions_push_works_against_mock_api() {
 set -eu
 _runner_script="$1"
 shift
+_runner_name="$(basename "$_runner_script")"
+
+if [ "$_runner_name" = "functions-runner.ts" ]; then
 node - "$@" <<'NODE'
 const path = require("node:path");
 const files = process.argv.slice(2);
@@ -1221,6 +1238,18 @@ const manifest = {
 };
 process.stdout.write(JSON.stringify(manifest));
 NODE
+exit 0
+fi
+
+if [ "$_runner_name" = "functions-bundler.ts" ]; then
+  _source_file="$1"
+  _output_file="$2"
+  cp "$_source_file" "$_output_file"
+  exit 0
+fi
+
+echo "unexpected runner script: $_runner_name" >&2
+exit 24
 "#,
     )
     .expect("write mock runner");
@@ -1313,23 +1342,435 @@ NODE
         .clone();
     assert_eq!(uploaded.len(), 1, "expected one uploaded bundle");
     let bundle = &uploaded[0];
-    if bundle.starts_with(&[0x1f, 0x8b]) {
-        let mut decoder = GzDecoder::new(bundle.as_slice());
-        let mut decompressed = String::new();
-        decoder
-            .read_to_string(&mut decompressed)
-            .expect("decompress uploaded bundle");
-        assert!(
-            decompressed.contains("globalThis._evals"),
-            "uploaded bundle should contain original source"
+    let decompressed = decode_uploaded_bundle(bundle);
+    assert!(
+        decompressed.contains("globalThis._evals"),
+        "uploaded bundle should contain original source"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_external_packages_bundles_with_runner() {
+    if !command_exists("node") {
+        eprintln!(
+            "Skipping functions_push_external_packages_bundles_with_runner (node not installed)."
         );
-    } else {
-        let raw = String::from_utf8(bundle.clone()).expect("uploaded bundle utf8");
-        assert!(
-            raw.contains("globalThis._evals"),
-            "uploaded bundle should contain original source"
-        );
+        return;
     }
+
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("tool.js");
+    std::fs::write(
+        &source,
+        "globalThis._evals ??= { functions: [], prompts: [], parameters: [], evaluators: {}, reporters: {} };\n",
+    )
+    .expect("write source file");
+
+    let runner = tmp.path().join("mock-runner.sh");
+    std::fs::write(
+        &runner,
+        r#"#!/bin/sh
+set -eu
+_runner_script="$1"
+shift
+_runner_name="$(basename "$_runner_script")"
+
+if [ "$_runner_name" = "functions-runner.ts" ]; then
+  node - "$@" <<'NODE'
+const path = require("node:path");
+const files = process.argv.slice(2);
+const manifest = {
+  runtime_context: { runtime: "node", version: process.versions.node || "unknown" },
+  files: files.map((file, index) => ({
+    source_file: path.resolve(file),
+    entries: [
+      {
+        kind: "code",
+        project_id: "proj_mock",
+        name: index === 0 ? "mock-tool" : `mock-tool-${index}`,
+        slug: index === 0 ? "mock-tool" : `mock-tool-${index}`,
+        function_type: "tool",
+        preview: "function handler() { return 1; }",
+        location: { type: "function", index: 0 }
+      }
+    ]
+  }))
+};
+process.stdout.write(JSON.stringify(manifest));
+NODE
+  exit 0
+fi
+
+if [ "$_runner_name" = "functions-bundler.ts" ]; then
+  if [ "${BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES:-}" != "sqlite3,fsevents" ]; then
+    echo "unexpected BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES=${BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES:-}" >&2
+    exit 23
+  fi
+  _source_file="$1"
+  _output_file="$2"
+  printf '%s\n' "// bundled output" >"$_output_file"
+  printf '%s\n' "const externalMarker = \"externals:${BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES}\";" >>"$_output_file"
+  printf '%s\n' "const sourceMarker = \"source:${_source_file}\";" >>"$_output_file"
+  exit 0
+fi
+
+echo "unexpected runner script: $_runner_name" >&2
+exit 24
+"#,
+    )
+    .expect("write mock runner");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&runner)
+        .expect("runner metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&runner, perms).expect("runner permissions");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--file",
+            source
+                .to_str()
+                .expect("source path should be valid UTF-8 for test"),
+            "--language",
+            "javascript",
+            "--runner",
+            runner
+                .to_str()
+                .expect("runner path should be valid UTF-8 for test"),
+            "--external-packages",
+            "sqlite3,fsevents",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions push");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock push failed:\n{stderr}");
+    }
+
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("parse push summary");
+    assert_eq!(summary["status"].as_str(), Some("success"));
+    assert_eq!(summary["uploaded_files"].as_u64(), Some(1));
+    assert_eq!(summary["failed_files"].as_u64(), Some(0));
+
+    let uploaded = state
+        .uploaded_bundles
+        .lock()
+        .expect("uploaded bundles lock")
+        .clone();
+    assert_eq!(uploaded.len(), 1, "expected one uploaded bundle");
+    let bundle = &uploaded[0];
+    let decompressed = decode_uploaded_bundle(bundle);
+    assert!(
+        decompressed.contains("externals:sqlite3,fsevents"),
+        "uploaded bundle should include bundler output with external package marker"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_js_bundles_by_default() {
+    if !command_exists("node") {
+        eprintln!("Skipping functions_push_js_bundles_by_default (node not installed).");
+        return;
+    }
+
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("tool.js");
+    std::fs::write(
+        &source,
+        "globalThis._evals ??= { functions: [], prompts: [], parameters: [], evaluators: {}, reporters: {} };\n",
+    )
+    .expect("write source file");
+
+    let runner = tmp.path().join("mock-runner.sh");
+    std::fs::write(
+        &runner,
+        r#"#!/bin/sh
+set -eu
+_runner_script="$1"
+shift
+_runner_name="$(basename "$_runner_script")"
+
+if [ "$_runner_name" = "functions-runner.ts" ]; then
+  node - "$@" <<'NODE'
+const path = require("node:path");
+const files = process.argv.slice(2);
+const manifest = {
+  runtime_context: { runtime: "node", version: process.versions.node || "unknown" },
+  files: files.map((file, index) => ({
+    source_file: path.resolve(file),
+    entries: [
+      {
+        kind: "code",
+        project_id: "proj_mock",
+        name: index === 0 ? "mock-tool" : `mock-tool-${index}`,
+        slug: index === 0 ? "mock-tool" : `mock-tool-${index}`,
+        function_type: "tool",
+        preview: "function handler() { return 1; }",
+        location: { type: "function", index: 0 }
+      }
+    ]
+  }))
+};
+process.stdout.write(JSON.stringify(manifest));
+NODE
+  exit 0
+fi
+
+if [ "$_runner_name" = "functions-bundler.ts" ]; then
+  _output_file="$2"
+  printf '%s\n' "// bundled by default path" >"$_output_file"
+  printf '%s\n' "const marker = \"default-bundler-used\";" >>"$_output_file"
+  exit 0
+fi
+
+echo "unexpected runner script: $_runner_name" >&2
+exit 24
+"#,
+    )
+    .expect("write mock runner");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&runner)
+        .expect("runner metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&runner, perms).expect("runner permissions");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--file",
+            source
+                .to_str()
+                .expect("source path should be valid UTF-8 for test"),
+            "--language",
+            "javascript",
+            "--runner",
+            runner
+                .to_str()
+                .expect("runner path should be valid UTF-8 for test"),
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions push");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock push failed:\n{stderr}");
+    }
+
+    let uploaded = state
+        .uploaded_bundles
+        .lock()
+        .expect("uploaded bundles lock")
+        .clone();
+    assert_eq!(uploaded.len(), 1, "expected one uploaded bundle");
+    let decompressed = decode_uploaded_bundle(&uploaded[0]);
+    assert!(
+        decompressed.contains("default-bundler-used"),
+        "uploaded bundle should include marker emitted by bundler path"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_tsconfig_is_forwarded_to_bundler() {
+    if !command_exists("node") {
+        eprintln!("Skipping functions_push_tsconfig_is_forwarded_to_bundler (node not installed).");
+        return;
+    }
+
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("tool.js");
+    std::fs::write(
+        &source,
+        "globalThis._evals ??= { functions: [], prompts: [], parameters: [], evaluators: {}, reporters: {} };\n",
+    )
+    .expect("write source file");
+    let tsconfig = tmp.path().join("tsconfig.json");
+    std::fs::write(
+        &tsconfig,
+        "{ \"compilerOptions\": { \"target\": \"ES2020\" } }",
+    )
+    .expect("write tsconfig");
+
+    let runner = tmp.path().join("mock-runner.sh");
+    std::fs::write(
+        &runner,
+        r#"#!/bin/sh
+set -eu
+_runner_script="$1"
+shift
+_runner_name="$(basename "$_runner_script")"
+
+if [ "$_runner_name" = "functions-runner.ts" ]; then
+  node - "$@" <<'NODE'
+const path = require("node:path");
+const files = process.argv.slice(2);
+const manifest = {
+  runtime_context: { runtime: "node", version: process.versions.node || "unknown" },
+  files: files.map((file, index) => ({
+    source_file: path.resolve(file),
+    entries: [
+      {
+        kind: "code",
+        project_id: "proj_mock",
+        name: index === 0 ? "mock-tool" : `mock-tool-${index}`,
+        slug: index === 0 ? "mock-tool" : `mock-tool-${index}`,
+        function_type: "tool",
+        preview: "function handler() { return 1; }",
+        location: { type: "function", index: 0 }
+      }
+    ]
+  }))
+};
+process.stdout.write(JSON.stringify(manifest));
+NODE
+  exit 0
+fi
+
+if [ "$_runner_name" = "functions-bundler.ts" ]; then
+  if [ "${TS_NODE_PROJECT:-}" != "${EXPECTED_TSCONFIG:-}" ]; then
+    echo "unexpected TS_NODE_PROJECT=${TS_NODE_PROJECT:-}" >&2
+    exit 31
+  fi
+  if [ "${TSX_TSCONFIG_PATH:-}" != "${EXPECTED_TSCONFIG:-}" ]; then
+    echo "unexpected TSX_TSCONFIG_PATH=${TSX_TSCONFIG_PATH:-}" >&2
+    exit 32
+  fi
+  _output_file="$2"
+  printf '%s\n' "// bundled with tsconfig" >"$_output_file"
+  printf '%s\n' "const marker = \"tsconfig-forwarded:${TS_NODE_PROJECT}\";" >>"$_output_file"
+  exit 0
+fi
+
+echo "unexpected runner script: $_runner_name" >&2
+exit 24
+"#,
+    )
+    .expect("write mock runner");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&runner)
+        .expect("runner metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&runner, perms).expect("runner permissions");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--file",
+            source
+                .to_str()
+                .expect("source path should be valid UTF-8 for test"),
+            "--language",
+            "javascript",
+            "--runner",
+            runner
+                .to_str()
+                .expect("runner path should be valid UTF-8 for test"),
+            "--tsconfig",
+            tsconfig
+                .to_str()
+                .expect("tsconfig path should be valid UTF-8 for test"),
+        ])
+        .env("EXPECTED_TSCONFIG", &tsconfig)
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions push");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock push failed:\n{stderr}");
+    }
+
+    let uploaded = state
+        .uploaded_bundles
+        .lock()
+        .expect("uploaded bundles lock")
+        .clone();
+    assert_eq!(uploaded.len(), 1, "expected one uploaded bundle");
+    let decompressed = decode_uploaded_bundle(&uploaded[0]);
+    assert!(
+        decompressed.contains(&format!(
+            "tsconfig-forwarded:{}",
+            tsconfig
+                .to_str()
+                .expect("tsconfig path should be valid UTF-8 for test")
+        )),
+        "uploaded bundle should include tsconfig marker emitted by bundler path"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

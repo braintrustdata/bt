@@ -32,10 +32,12 @@ use super::{
 };
 
 const FUNCTIONS_JS_RUNNER_FILE: &str = "functions-runner.ts";
+const FUNCTIONS_JS_BUNDLER_FILE: &str = "functions-bundler.ts";
 const FUNCTIONS_PY_RUNNER_FILE: &str = "functions-runner.py";
 const RUNNER_COMMON_FILE: &str = "runner-common.ts";
 const PYTHON_RUNNER_COMMON_FILE: &str = "python_runner_common.py";
 const FUNCTIONS_JS_RUNNER_SOURCE: &str = include_str!("../../scripts/functions-runner.ts");
+const FUNCTIONS_JS_BUNDLER_SOURCE: &str = include_str!("../../scripts/functions-bundler.ts");
 const FUNCTIONS_PY_RUNNER_SOURCE: &str = include_str!("../../scripts/functions-runner.py");
 const RUNNER_COMMON_SOURCE: &str = include_str!("../../scripts/runner-common.ts");
 const PYTHON_RUNNER_COMMON_SOURCE: &str = include_str!("../../scripts/python_runner_common.py");
@@ -259,12 +261,19 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
 
     if args.tsconfig.is_some() {
         eprintln!(
-            "Notice: --tsconfig is enabled for runner compatibility where supported (TS_NODE_PROJECT/TSX_TSCONFIG_PATH)."
+            "Notice: --tsconfig is enabled for JS runner and JS bundling (TS_NODE_PROJECT/TSX_TSCONFIG_PATH)."
         );
     }
     if !args.external_packages.is_empty() {
-        eprintln!(
-            "Notice: --external-packages is accepted for compatibility; dependency handling is runner-managed in bt functions push."
+        eprintln!("Notice: --external-packages will be applied to JS bundle builds.");
+    }
+    if !args.external_packages.is_empty() && selected_language != SourceLanguage::JsLike {
+        return fail_push(
+            &base,
+            0,
+            HardFailureReason::ManifestSchemaInvalid,
+            "--external-packages can only be used when pushing JS/TS sources".to_string(),
+            "invalid --external-packages usage",
         );
     }
 
@@ -745,10 +754,7 @@ async fn push_file(
     if !code_entries.is_empty() {
         let (upload_bytes, content_encoding) = match selected_language {
             SourceLanguage::JsLike => {
-                let bundle_bytes = std::fs::read(source_path).map_err(|err| FileFailure {
-                    reason: HardFailureReason::ManifestPathMissing,
-                    message: format!("failed to read {}: {err}", source_path.display()),
-                })?;
+                let bundle_bytes = build_js_bundle(source_path, args)?;
                 let gzipped = gzip_bytes(&bundle_bytes).map_err(|err| FileFailure {
                     reason: HardFailureReason::BundleUploadFailed,
                     message: format!("failed to gzip {}: {err}", source_path.display()),
@@ -935,6 +941,67 @@ async fn push_file(
         uploaded_entries,
         ignored_entries,
         bundle_id,
+    })
+}
+
+fn build_js_bundle(
+    source_path: &Path,
+    args: &PushArgs,
+) -> std::result::Result<Vec<u8>, FileFailure> {
+    let build_dir = TempBuildDir::create("bt-functions-js-bundle").map_err(|err| FileFailure {
+        reason: HardFailureReason::BundleUploadFailed,
+        message: err.to_string(),
+    })?;
+    let output_bundle = build_dir.path.join("bundle.js");
+
+    let bundler_script = js_runner::materialize_runner_script_in_cwd(
+        "functions-runners",
+        FUNCTIONS_JS_BUNDLER_FILE,
+        FUNCTIONS_JS_BUNDLER_SOURCE,
+    )
+    .map_err(|err| FileFailure {
+        reason: HardFailureReason::RunnerSpawnFailed,
+        message: format!("failed to materialize JS bundler script: {err}"),
+    })?;
+
+    let mut command = js_runner::build_js_runner_command(
+        args.runner.as_deref(),
+        &bundler_script,
+        &[source_path.to_path_buf(), output_bundle.clone()],
+    );
+    if let Some(tsconfig) = &args.tsconfig {
+        command.env("TS_NODE_PROJECT", tsconfig);
+        command.env("TSX_TSCONFIG_PATH", tsconfig);
+    }
+    if !args.external_packages.is_empty() {
+        command.env(
+            "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+            args.external_packages.join(","),
+        );
+    }
+
+    let output = command.output().map_err(|err| FileFailure {
+        reason: HardFailureReason::RunnerSpawnFailed,
+        message: format!("failed to spawn JS bundler: {err}"),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FileFailure {
+            reason: HardFailureReason::BundleUploadFailed,
+            message: format!(
+                "JS bundler exited with status {}: {}",
+                output.status,
+                stderr.trim()
+            ),
+        });
+    }
+
+    std::fs::read(&output_bundle).map_err(|err| FileFailure {
+        reason: HardFailureReason::BundleUploadFailed,
+        message: format!(
+            "failed to read bundled JS output {}: {err}",
+            output_bundle.display()
+        ),
     })
 }
 
