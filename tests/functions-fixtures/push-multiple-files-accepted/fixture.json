@@ -1,0 +1,15 @@
+{
+  "command": [
+    "functions",
+    "push",
+    "--file",
+    "a.ts",
+    "--file",
+    "b.ts",
+    "--type",
+    "tool"
+  ],
+  "expect_success": false,
+  "stderr_contains": ["--type"],
+  "stderr_not_contains": ["unexpected argument '--file'"]
+}

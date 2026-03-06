@@ -1,0 +1,12 @@
+{
+  "command": [
+    "functions",
+    "pull",
+    "--project-id",
+    "proj_123",
+    "--project-name",
+    "demo"
+  ],
+  "expect_success": false,
+  "stderr_contains": ["--project-id", "--project-name"]
+}

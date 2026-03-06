@@ -1,0 +1,13 @@
+{
+  "command": ["functions", "push", "--help"],
+  "expect_success": true,
+  "stdout_contains": [
+    "--file",
+    "--if-exists",
+    "--terminate-on-failure",
+    "--create-missing-projects",
+    "--language",
+    "--requirements",
+    "--runner"
+  ]
+}

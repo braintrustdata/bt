@@ -1,0 +1,5 @@
+{
+  "command": ["functions", "push", "--external-packages", "react"],
+  "expect_success": false,
+  "stderr_contains": ["--external-packages"]
+}

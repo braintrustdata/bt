@@ -1,0 +1,8 @@
+{
+  "command": ["functions", "push", "--language", "typescript"],
+  "expect_success": false,
+  "stderr_contains": [
+    "invalid value 'typescript'",
+    "possible values: auto, javascript, python"
+  ]
+}

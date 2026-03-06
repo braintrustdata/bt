@@ -1,0 +1,13 @@
+{
+  "command": [
+    "functions",
+    "push",
+    "--language",
+    "javascript",
+    "--type",
+    "tool"
+  ],
+  "expect_success": false,
+  "stderr_contains": ["--type"],
+  "stderr_not_contains": ["invalid value 'javascript'"]
+}

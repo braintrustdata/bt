@@ -1,0 +1,5 @@
+{
+  "command": ["functions", "pull", "--id", "abc", "--slug", "slug"],
+  "expect_success": false,
+  "stderr_contains": ["--id", "--slug"]
+}

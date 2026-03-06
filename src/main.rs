@@ -31,10 +31,6 @@ mod ui;
 mod util_cmd;
 mod utils;
 
-mod js_runner;
-mod python_runner;
-mod source_language;
-
 use crate::args::{BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
