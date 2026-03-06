@@ -18,6 +18,9 @@ struct FixtureConfig {
     runners: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
     args: Option<Vec<String>>,
+    /// Args appended after the file list, e.g. `["--", "--description", "foo"]`
+    /// to test passthrough of user flags via the `--` separator.
+    trailing_args: Option<Vec<String>>,
     expect_success: Option<bool>,
 }
 
@@ -143,7 +146,11 @@ fn eval_fixtures() {
             if let Some(runner_cmd) = resolved_runner.as_ref() {
                 cmd.arg("--runner").arg(runner_cmd);
             }
-            cmd.args(&config.files).current_dir(&dir);
+            cmd.args(&config.files);
+            if let Some(trailing_args) = config.trailing_args.as_ref() {
+                cmd.args(trailing_args);
+            }
+            cmd.current_dir(&dir);
             cmd.env("BT_EVAL_LOCAL", "1");
             cmd.env(
                 "BRAINTRUST_API_KEY",

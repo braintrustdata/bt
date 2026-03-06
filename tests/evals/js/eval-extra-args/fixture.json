@@ -1,0 +1,5 @@
+{
+  "files": ["tests/extra-args.eval.mjs"],
+  "trailing_args": ["--", "--description", "test-desc", "--shard=1/4"],
+  "runners": ["tsx"]
+}
