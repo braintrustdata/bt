@@ -713,6 +713,7 @@ fn build_code_function_data(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn push_file(
     auth_ctx: &super::AuthContext,
     default_project_id: Option<&str>,
@@ -1196,18 +1197,36 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     })
 }
 
+const MAX_DIR_DEPTH: usize = 64;
+
 fn collect_from_dir(
     dir: &Path,
     js_like: &mut BTreeSet<PathBuf>,
     python: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
+    collect_from_dir_inner(dir, js_like, python, 0)
+}
+
+fn collect_from_dir_inner(
+    dir: &Path,
+    js_like: &mut BTreeSet<PathBuf>,
+    python: &mut BTreeSet<PathBuf>,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_DIR_DEPTH {
+        bail!(
+            "directory traversal exceeded maximum depth ({}); possible symlink loop at {}",
+            MAX_DIR_DEPTH,
+            dir.display()
+        );
+    }
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("failed to read directory {}", dir.display()))?
     {
         let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            collect_from_dir(&path, js_like, python)?;
+            collect_from_dir_inner(&path, js_like, python, depth + 1)?;
         } else if path.is_file() {
             let canonical = path
                 .canonicalize()
@@ -1786,19 +1805,30 @@ fn run_uv_command(uv: &Path, args: &[OsString], stage: &str) -> Result<()> {
 
 fn collect_regular_files_recursive(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    collect_regular_files_recursive_impl(root, &mut files)?;
+    collect_regular_files_recursive_impl(root, &mut files, 0)?;
     files.sort();
     Ok(files)
 }
 
-fn collect_regular_files_recursive_impl(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_regular_files_recursive_impl(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_DIR_DEPTH {
+        bail!(
+            "directory traversal exceeded maximum depth ({}); possible symlink loop at {}",
+            MAX_DIR_DEPTH,
+            root.display()
+        );
+    }
     for entry in
         std::fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))?
     {
         let entry = entry.with_context(|| format!("failed to read entry in {}", root.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            collect_regular_files_recursive_impl(&path, out)?;
+            collect_regular_files_recursive_impl(&path, out, depth + 1)?;
         } else if path.is_file() {
             out.push(path);
         }

@@ -1881,3 +1881,89 @@ async fn functions_pull_works_against_mock_api() {
         "pull request should include selector query params"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    state
+        .pull_rows
+        .lock()
+        .expect("pull rows lock")
+        .push(serde_json::json!({
+            "id": "fn_code_1",
+            "name": "Legacy Code Function",
+            "slug": "legacy-code",
+            "project_id": "proj_mock",
+            "description": "",
+            "function_data": { "type": "code" },
+            "_xact_id": "0000000000000001"
+        }));
+
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let out_dir = tmp.path().join("pulled");
+    std::fs::create_dir_all(&out_dir).expect("create output dir");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "pull",
+            "--project-id",
+            "proj_mock",
+            "--slug",
+            "legacy-code",
+            "--force",
+            "--output-dir",
+            out_dir
+                .to_str()
+                .expect("output dir should be valid UTF-8 for test"),
+            "--language",
+            "typescript",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions pull");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock pull failed:\n{stderr}");
+    }
+
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("parse pull summary");
+    assert_eq!(summary["status"].as_str(), Some("partial"));
+    assert_eq!(summary["files_written"].as_u64(), Some(1));
+    assert_eq!(summary["files_failed"].as_u64(), Some(0));
+    assert_eq!(summary["unsupported_records_skipped"].as_u64(), Some(1));
+    assert_eq!(summary["functions_materialized"].as_u64(), Some(0));
+
+    let rendered_file = out_dir.join("mock-project.ts");
+    assert!(rendered_file.is_file(), "expected rendered file to exist");
+    let rendered = std::fs::read_to_string(&rendered_file).expect("read rendered file");
+    assert!(
+        rendered.contains("const project = braintrust.projects.create"),
+        "rendered file should still include project scaffold"
+    );
+    assert!(
+        !rendered.contains("project.prompts.create"),
+        "rendered file should not include prompt materializations"
+    );
+}
