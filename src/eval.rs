@@ -358,11 +358,18 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
-    let files = if args.files.is_empty() {
-        expand_eval_file_globs_defaults()?
+    let inputs: Vec<String> = if args.files.is_empty() {
+        vec![".".to_string()]
     } else {
-        expand_eval_file_globs(&args.files)?
+        args.files.clone()
     };
+    let mut files = expand_eval_file_globs(&inputs)?;
+    if args.files.is_empty() {
+        files.retain(|p| !is_excluded_by_default(p));
+        if files.is_empty() {
+            anyhow::bail!("no eval files found in current directory");
+        }
+    }
     validate_eval_input_files(&files)?;
 
     let options = EvalRunOptions {
@@ -1902,19 +1909,13 @@ fn detect_eval_language(
     detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
 }
 
-const EVAL_EXTENSIONS: &[&str] = &["ts", "js", "mjs", "cjs", "py"];
-
-fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
-    expand_eval_file_globs_inner(inputs, true)
-}
-
 const DEFAULT_EVAL_GLOBS: &[&str] = &[
-    "./**/*.eval.ts",
-    "./**/*.eval.js",
-    "./**/*.eval.mjs",
-    "./**/*.eval.cjs",
-    "./**/*.eval.py",
-    "./**/eval_*.py",
+    "**/*.eval.ts",
+    "**/*.eval.js",
+    "**/*.eval.mjs",
+    "**/*.eval.cjs",
+    "**/*.eval.py",
+    "**/eval_*.py",
 ];
 
 /// Directory name segments excluded during default discovery.
@@ -1938,23 +1939,7 @@ fn is_excluded_by_default(path: &str) -> bool {
     })
 }
 
-fn expand_eval_file_globs_defaults() -> Result<Vec<String>> {
-    let patterns: Vec<String> = DEFAULT_EVAL_GLOBS.iter().map(|s| s.to_string()).collect();
-    let result = expand_eval_file_globs_inner(&patterns, false)?;
-    let result: Vec<String> = result
-        .into_iter()
-        .filter(|p| !is_excluded_by_default(p))
-        .collect();
-    if result.is_empty() {
-        anyhow::bail!("no eval files found in current directory");
-    }
-    Ok(result)
-}
-
-fn expand_eval_file_globs_inner(
-    inputs: &[String],
-    require_match_per_pattern: bool,
-) -> Result<Vec<String>> {
+fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
     let mut expanded: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1968,8 +1953,8 @@ fn expand_eval_file_globs_inner(
         let path = Path::new(input);
         if path.is_dir() {
             let mut dir_files: Vec<String> = Vec::new();
-            for ext in EVAL_EXTENSIONS {
-                let pattern = format!("{input}/**/*.eval.{ext}");
+            for glob_suffix in DEFAULT_EVAL_GLOBS {
+                let pattern = format!("{input}/{glob_suffix}");
                 let matches: Vec<PathBuf> = glob::glob(&pattern)
                     .with_context(|| format!("invalid glob pattern: {pattern}"))?
                     .collect::<Result<_, _>>()
@@ -2001,10 +1986,7 @@ fn expand_eval_file_globs_inner(
             .collect::<Result<_, _>>()
             .with_context(|| format!("error expanding glob: {input}"))?;
         if matches.is_empty() {
-            if require_match_per_pattern {
-                anyhow::bail!("glob pattern matched no files: {input}");
-            }
-            continue;
+            anyhow::bail!("glob pattern matched no files: {input}");
         }
         matches
             .into_iter()
@@ -3606,6 +3588,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn expand_eval_file_globs_directory_finds_eval_prefix_files() {
+        // `bt eval .` should find eval_*.py just like the defaults do.
+        let dir = make_temp_dir("glob-dir-eval-prefix");
+        fs::write(dir.join("eval_foo.py"), "").unwrap();
+        fs::write(dir.join("foo.eval.ts"), "").unwrap();
+        fs::write(dir.join("helper.py"), "").unwrap(); // not an eval file
+
+        let mut result =
+            expand_eval_file_globs(&[dir.to_string_lossy().into_owned()]).expect("should expand");
+        result.sort();
+
+        assert_eq!(
+            result.len(),
+            2,
+            "should find both eval_*.py and *.eval.ts: {result:?}"
+        );
+        assert!(result.iter().any(|p| p.ends_with("eval_foo.py")));
+        assert!(result.iter().any(|p| p.ends_with("foo.eval.ts")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // --- Mixed inputs ---
 
     #[test]
@@ -3700,7 +3705,9 @@ mod tests {
 
         let orig = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
-        let result = expand_eval_file_globs_defaults().expect("defaults should expand");
+        let mut result =
+            expand_eval_file_globs(&[".".to_string()]).expect("defaults should expand");
+        result.retain(|p| !is_excluded_by_default(p));
         std::env::set_current_dir(orig).unwrap();
 
         assert_eq!(
