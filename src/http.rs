@@ -204,13 +204,15 @@ impl ApiClient {
     }
 }
 
+const UPLOAD_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub async fn put_signed_url(
     url: &str,
     body: Vec<u8>,
     content_encoding: Option<&str>,
 ) -> Result<()> {
     let client = Client::builder()
-        .timeout(DEFAULT_HTTP_TIMEOUT)
+        .timeout(UPLOAD_HTTP_TIMEOUT)
         .build()
         .context("failed to build signed-url HTTP client")?;
 

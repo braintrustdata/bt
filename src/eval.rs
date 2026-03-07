@@ -642,6 +642,7 @@ struct EvalSpawned {
     runner_kind: RunnerKind,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_eval_runner(
     base: &BaseArgs,
     language: EvalLanguage,

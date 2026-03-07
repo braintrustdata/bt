@@ -20,6 +20,11 @@ use super::{resolve_auth_context, FunctionsLanguage, PullArgs};
 
 const PAGINATION_PAGE_LIMIT: usize = 10_000;
 const OUTPUT_LOCK_FILE: &str = ".bt-functions-pull.lock";
+// Pretty version IDs are a reversible encoding of internal transaction IDs
+// (_xact_id). The encoding multiplies the xact ID (with a fixed top-nibble tag)
+// by COPRIME mod 2^64, producing a 16-hex-char string that looks random but
+// decodes back via the modular inverse.  This lets `--version` accept either the
+// raw numeric xact ID or the pretty hex form transparently.
 const TOP_BITS: u64 = 0x0DE1u64 << 48;
 const MODULUS: u128 = 1u128 << 64;
 const COPRIME: u64 = 205_891_132_094_649;
@@ -279,7 +284,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     };
     let repo = GitRepo::discover_from(&canonical_output_dir);
 
-    let project_names = if materializable.is_empty() {
+    let project_names = if project_ids_with_matches.is_empty() {
         BTreeMap::new()
     } else {
         let projects = match get_projects_cached(&auth_ctx.client, &mut projects_cache).await {
@@ -293,7 +298,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
                 );
             }
         };
-        match resolve_project_names(&materializable, projects) {
+        match resolve_project_names(&winners, projects) {
             Ok(names) => names,
             Err(err) => {
                 return fail_pull(
@@ -631,27 +636,7 @@ fn resolve_project_names(
     Ok(names_by_id)
 }
 
-#[allow(dead_code)]
-fn group_rows_by_project(
-    rows: Vec<PullFunctionRow>,
-    project_names: &BTreeMap<String, String>,
-) -> Result<BTreeMap<(String, String), Vec<PullFunctionRow>>> {
-    let mut grouped = BTreeMap::new();
-    for row in rows {
-        let Some(project_name) = project_names.get(&row.project_id).cloned() else {
-            bail!(
-                "missing resolved project name for project id '{}'",
-                row.project_id
-            );
-        };
-        grouped
-            .entry((row.project_id.clone(), project_name))
-            .or_insert_with(Vec::new)
-            .push(row);
-    }
-    Ok(grouped)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn write_pull_file(
     summary: &mut PullSummary,
     canonical_output_dir: &Path,
@@ -764,35 +749,6 @@ fn build_project_file_names(
     }
 
     names
-}
-
-#[allow(dead_code)]
-fn build_output_file_names(
-    grouped_by_project: &BTreeMap<(String, String), Vec<PullFunctionRow>>,
-    slug_selector: Option<&str>,
-    ext: &str,
-) -> Result<BTreeMap<(String, String), String>> {
-    if let Some(slug) = slug_selector {
-        if grouped_by_project.len() != 1 {
-            bail!("slug selector matched multiple projects; pass --project-name or --project-id");
-        }
-        let mut names = BTreeMap::new();
-        let key = grouped_by_project
-            .keys()
-            .next()
-            .ok_or_else(|| anyhow!("missing grouped project for slug selector"))?
-            .clone();
-        let base = sanitize_filename(slug);
-        let file_stem = if base.is_empty() {
-            "function".to_string()
-        } else {
-            base
-        };
-        names.insert(key, format!("{file_stem}.{ext}"));
-        return Ok(names);
-    }
-
-    Ok(build_project_file_names(grouped_by_project, ext))
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -1714,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn group_rows_uses_resolved_project_name() {
+    fn resolve_project_names_uses_project_lookup() {
         let row = PullFunctionRow {
             id: "f1".to_string(),
             name: "Prompt".to_string(),
@@ -1728,16 +1684,19 @@ mod tests {
             _xact_id: None,
         };
 
-        let mut names = BTreeMap::new();
-        names.insert("p1".to_string(), "Woohoo".to_string());
+        let projects = vec![crate::projects::api::Project {
+            id: "p1".to_string(),
+            name: "Woohoo".to_string(),
+            org_id: "o1".to_string(),
+            description: None,
+        }];
 
-        let grouped = group_rows_by_project(vec![row], &names).expect("grouped");
-        assert_eq!(grouped.len(), 1);
-        assert!(grouped.contains_key(&("p1".to_string(), "Woohoo".to_string())));
+        let names = resolve_project_names(&[row], &projects).expect("resolved names");
+        assert_eq!(names.get("p1").map(String::as_str), Some("Woohoo"));
     }
 
     #[test]
-    fn group_rows_fails_when_project_name_missing() {
+    fn resolve_project_names_fails_when_missing() {
         let row = PullFunctionRow {
             id: "f1".to_string(),
             name: "Prompt".to_string(),
@@ -1751,43 +1710,47 @@ mod tests {
             _xact_id: None,
         };
 
-        let err = group_rows_by_project(vec![row], &BTreeMap::new()).expect_err("should fail");
-        assert!(err.to_string().contains("project id"));
+        let err = resolve_project_names(&[row], &[]).expect_err("should fail");
+        assert!(err.to_string().contains("failed to resolve project name"));
     }
 
     #[test]
-    fn slug_selector_names_output_file_from_slug() {
+    fn project_file_names_use_sanitized_project_name() {
         let mut grouped = BTreeMap::new();
         grouped.insert(
-            ("p1".to_string(), "Project".to_string()),
+            ("p1".to_string(), "Doc Search".to_string()),
             Vec::<PullFunctionRow>::new(),
         );
 
-        let names =
-            build_output_file_names(&grouped, Some("doc-search"), "ts").expect("file names");
+        let names = build_project_file_names(&grouped, "ts");
         assert_eq!(
             names
-                .get(&("p1".to_string(), "Project".to_string()))
+                .get(&("p1".to_string(), "Doc Search".to_string()))
                 .map(String::as_str),
             Some("doc-search.ts")
         );
     }
 
     #[test]
-    fn slug_selector_rejects_multiple_projects() {
+    fn project_file_names_include_project_id_suffix_on_collision() {
         let mut grouped = BTreeMap::new();
         grouped.insert(
             ("p1".to_string(), "Project One".to_string()),
             Vec::<PullFunctionRow>::new(),
         );
         grouped.insert(
-            ("p2".to_string(), "Project Two".to_string()),
+            ("p2".to_string(), "project-one".to_string()),
             Vec::<PullFunctionRow>::new(),
         );
 
-        let err =
-            build_output_file_names(&grouped, Some("doc-search"), "ts").expect_err("should fail");
-        assert!(err.to_string().contains("multiple projects"));
+        let names = build_project_file_names(&grouped, "ts");
+        let first = names
+            .get(&("p1".to_string(), "Project One".to_string()))
+            .expect("first");
+        let second = names
+            .get(&("p2".to_string(), "project-one".to_string()))
+            .expect("second");
+        assert_ne!(first.to_ascii_lowercase(), second.to_ascii_lowercase());
     }
 
     #[test]
