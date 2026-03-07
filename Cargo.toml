@@ -38,6 +38,7 @@ getrandom = "0.3"
 chrono = { version = "0.4.40", features = ["clock"] }
 dirs = "5"
 pathdiff = "0.2.3"
+glob = "0.3"
 
 [profile.dist]
 inherits = "release"
