@@ -1917,9 +1917,34 @@ const DEFAULT_EVAL_GLOBS: &[&str] = &[
     "./**/eval_*.py",
 ];
 
+/// Directory name segments excluded during default discovery.
+/// Explicit user-provided files/globs bypass this list.
+const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
+    "node_modules",
+    "site-packages",
+    "dist-packages",
+    "__pycache__",
+    ".venv",
+    "venv",
+];
+
+fn is_excluded_by_default(path: &str) -> bool {
+    Path::new(path).components().any(|c| {
+        if let std::path::Component::Normal(s) = c {
+            DEFAULT_EXCLUDE_DIRS.contains(&s.to_string_lossy().as_ref())
+        } else {
+            false
+        }
+    })
+}
+
 fn expand_eval_file_globs_defaults() -> Result<Vec<String>> {
     let patterns: Vec<String> = DEFAULT_EVAL_GLOBS.iter().map(|s| s.to_string()).collect();
     let result = expand_eval_file_globs_inner(&patterns, false)?;
+    let result: Vec<String> = result
+        .into_iter()
+        .filter(|p| !is_excluded_by_default(p))
+        .collect();
     if result.is_empty() {
         anyhow::bail!("no eval files found in current directory");
     }
@@ -3641,6 +3666,68 @@ mod tests {
             result.len(),
             2,
             "overlapping dir + glob should dedup: {result:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Default discovery exclusions ---
+
+    #[test]
+    fn is_excluded_by_default_matches_known_dirs() {
+        assert!(is_excluded_by_default("node_modules/foo/bar.eval.ts"));
+        assert!(is_excluded_by_default("a/b/node_modules/pkg/x.eval.ts"));
+        assert!(is_excluded_by_default("site-packages/lib/x.eval.py"));
+        assert!(is_excluded_by_default("__pycache__/x.eval.py"));
+        assert!(is_excluded_by_default(".venv/lib/x.eval.py"));
+        assert!(is_excluded_by_default("venv/lib/x.eval.py"));
+    }
+
+    #[test]
+    fn is_excluded_by_default_allows_normal_paths() {
+        assert!(!is_excluded_by_default("src/foo.eval.ts"));
+        assert!(!is_excluded_by_default("tests/sub/bar.eval.py"));
+        assert!(!is_excluded_by_default("my_node_modules_backup/x.eval.ts"));
+    }
+
+    #[test]
+    fn expand_eval_file_globs_defaults_excludes_node_modules() {
+        let dir = make_temp_dir("glob-defaults-exclude");
+        let nm = dir.join("node_modules").join("pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(dir.join("a.eval.ts"), "").unwrap();
+        fs::write(nm.join("b.eval.ts"), "").unwrap();
+
+        let orig = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let result = expand_eval_file_globs_defaults().expect("defaults should expand");
+        std::env::set_current_dir(orig).unwrap();
+
+        assert_eq!(
+            result.len(),
+            1,
+            "node_modules should be excluded: {result:?}"
+        );
+        assert!(result[0].ends_with("a.eval.ts"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_eval_file_globs_explicit_does_not_exclude_node_modules() {
+        let dir = make_temp_dir("glob-explicit-node-modules");
+        let nm = dir.join("node_modules").join("pkg");
+        fs::create_dir_all(&nm).unwrap();
+        let target = nm.join("b.eval.ts");
+        fs::write(&target, "").unwrap();
+
+        let pattern = target.to_string_lossy().into_owned();
+        let result = expand_eval_file_globs(&[pattern]).expect("explicit path should pass through");
+
+        assert_eq!(
+            result.len(),
+            1,
+            "explicit path in node_modules should not be excluded: {result:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);
