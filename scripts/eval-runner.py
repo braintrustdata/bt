@@ -11,7 +11,6 @@ import socket
 import sys
 import traceback
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import Any, Callable
 
 try:
@@ -35,8 +34,6 @@ except Exception as exc:  # pragma: no cover - runtime guard
     print(str(exc), file=sys.stderr)
     sys.exit(1)
 
-INCLUDE = ["**/eval_*.py", "**/*.eval.py"]
-EXCLUDE = ["**/site-packages/**", "**/__pycache__/**"]
 WATCHABLE_PYTHON_EXTENSIONS = {".py"}
 WATCH_EXCLUDE_SEGMENTS = (
     "/site-packages/",
@@ -366,26 +363,12 @@ def build_eval_definitions(evaluator_instances: list[EvaluatorInstance]) -> dict
     return definitions
 
 
-def check_match(path_input: str) -> bool:
-    p = PurePosixPath(os.path.abspath(path_input).replace("\\", "/"))
-    if INCLUDE:
-        matched = any(p.match(pattern) for pattern in INCLUDE)
-        if not matched:
-            return False
-    if EXCLUDE:
-        if any(p.match(pattern) for pattern in EXCLUDE):
-            return False
-    return True
-
-
 def collect_files(input_path: str) -> list[str]:
     if os.path.isdir(input_path):
         matches: list[str] = []
         for root, _, files in os.walk(input_path):
             for filename in files:
-                fname = os.path.join(root, filename)
-                if check_match(fname):
-                    matches.append(fname)
+                matches.append(os.path.join(root, filename))
         return matches
     return [input_path]
 

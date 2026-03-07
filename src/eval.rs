@@ -358,7 +358,11 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
-    let files = expand_eval_file_globs(&args.files)?;
+    let files = if args.files.is_empty() {
+        expand_eval_file_globs_defaults()?
+    } else {
+        expand_eval_file_globs(&args.files)?
+    };
     validate_eval_input_files(&files)?;
 
     let options = EvalRunOptions {
@@ -1898,9 +1902,34 @@ fn detect_eval_language(
     detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
 }
 
-const EVAL_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "mjs", "cjs", "py"];
+const EVAL_EXTENSIONS: &[&str] = &["ts", "js", "mjs", "cjs", "py"];
 
 fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
+    expand_eval_file_globs_inner(inputs, true)
+}
+
+const DEFAULT_EVAL_GLOBS: &[&str] = &[
+    "./**/*.eval.ts",
+    "./**/*.eval.js",
+    "./**/*.eval.mjs",
+    "./**/*.eval.cjs",
+    "./**/*.eval.py",
+    "./**/eval_*.py",
+];
+
+fn expand_eval_file_globs_defaults() -> Result<Vec<String>> {
+    let patterns: Vec<String> = DEFAULT_EVAL_GLOBS.iter().map(|s| s.to_string()).collect();
+    let result = expand_eval_file_globs_inner(&patterns, false)?;
+    if result.is_empty() {
+        anyhow::bail!("no eval files found in current directory");
+    }
+    Ok(result)
+}
+
+fn expand_eval_file_globs_inner(
+    inputs: &[String],
+    require_match_per_pattern: bool,
+) -> Result<Vec<String>> {
     let mut expanded: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1947,7 +1976,10 @@ fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
             .collect::<Result<_, _>>()
             .with_context(|| format!("error expanding glob: {input}"))?;
         if matches.is_empty() {
-            anyhow::bail!("glob pattern matched no files: {input}");
+            if require_match_per_pattern {
+                anyhow::bail!("glob pattern matched no files: {input}");
+            }
+            continue;
         }
         matches
             .into_iter()
