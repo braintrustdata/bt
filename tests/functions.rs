@@ -1947,20 +1947,20 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
 
     let summary: Value = serde_json::from_slice(&output.stdout).expect("parse pull summary");
     assert_eq!(summary["status"].as_str(), Some("partial"));
-    assert_eq!(summary["files_written"].as_u64(), Some(1));
+    assert_eq!(summary["files_written"].as_u64(), Some(0));
     assert_eq!(summary["files_failed"].as_u64(), Some(0));
     assert_eq!(summary["unsupported_records_skipped"].as_u64(), Some(1));
     assert_eq!(summary["functions_materialized"].as_u64(), Some(0));
 
     let rendered_file = out_dir.join("mock-project.ts");
-    assert!(rendered_file.is_file(), "expected rendered file to exist");
-    let rendered = std::fs::read_to_string(&rendered_file).expect("read rendered file");
     assert!(
-        rendered.contains("const project = braintrust.projects.create"),
-        "rendered file should still include project scaffold"
+        !rendered_file.exists(),
+        "no file should be written when all rows are unsupported"
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !rendered.contains("project.prompts.create"),
-        "rendered file should not include prompt materializations"
+        stderr.contains("skipping 'legacy-code' because it is not a prompt"),
+        "expected warning about non-prompt function on stderr, got:\n{stderr}"
     );
 }
