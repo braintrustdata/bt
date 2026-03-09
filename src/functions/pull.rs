@@ -1,9 +1,13 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use dialoguer::console::style;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -16,7 +20,11 @@ use crate::projects::api::{list_projects, Project};
 use crate::utils::{write_text_atomic, GitRepo};
 
 use super::api::{self, FunctionListQuery};
-use super::{resolve_auth_context, FunctionsLanguage, PullArgs};
+use super::{
+    current_org_label, resolve_auth_context, resolve_project_context_optional, FunctionsLanguage,
+    PullArgs,
+};
+use crate::ui::{animations_enabled, is_quiet};
 
 const PAGINATION_PAGE_LIMIT: usize = 10_000;
 const OUTPUT_LOCK_FILE: &str = ".bt-functions-pull.lock";
@@ -123,6 +131,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     };
 
     let mut query = FunctionListQuery::default();
+    let mut resolved_project_name: Option<String> = None;
 
     if let Some(project_id) = &args.project_id {
         query.project_id = Some(project_id.clone());
@@ -146,7 +155,24 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
                 err.to_string(),
             );
         }
+        resolved_project_name = Some(project_name.clone());
         query.project_name = Some(project_name.clone());
+    } else {
+        let project = match resolve_project_context_optional(&base, &auth_ctx, false).await {
+            Ok(project) => project,
+            Err(err) => {
+                return fail_pull(
+                    &base,
+                    &mut summary,
+                    HardFailureReason::ResponseInvalid,
+                    err.to_string(),
+                );
+            }
+        };
+        if let Some(project) = project {
+            resolved_project_name = Some(project.name.clone());
+            query.project_id = Some(project.id);
+        }
     }
 
     if let Some(id) = &args.id {
@@ -169,9 +195,37 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     if resolved_slugs.len() == 1 {
         query.slug = Some(resolved_slugs[0].clone());
     }
+
+    let org_label = current_org_label(&auth_ctx);
+    let subject = if !resolved_slugs.is_empty() {
+        resolved_slugs.join(", ")
+    } else {
+        "functions".to_string()
+    };
+    let from_label = match &resolved_project_name {
+        Some(project) => format!("{org_label}/{project}"),
+        None => org_label.clone(),
+    };
+    let use_progress =
+        !base.json && std::io::stderr().is_terminal() && animations_enabled() && !is_quiet();
+    let spinner = if use_progress {
+        let spinner_style = ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "])
+            .template("{spinner:.cyan} {msg}")
+            .unwrap();
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(spinner_style);
+        pb.set_message(format!("Pulling {subject} from {from_label}..."));
+        pb.enable_steady_tick(Duration::from_millis(80));
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
+
     let fetched = match fetch_all_function_rows(&auth_ctx.client, &query).await {
         Ok(fetched) => fetched,
         Err(err) => {
+            spinner.finish_and_clear();
             return fail_pull(
                 &base,
                 &mut summary,
@@ -203,6 +257,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     let narrowed_rows = match apply_selector_narrowing(parsed_rows, &args) {
         Ok(rows) => rows,
         Err(err) => {
+            spinner.finish_and_clear();
             return fail_pull(
                 &base,
                 &mut summary,
@@ -215,6 +270,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     let winners = select_winner_rows(narrowed_rows, &mut summary);
 
     if (args.id.is_some() || args.has_slug_selector()) && winners.is_empty() {
+        spinner.finish_and_clear();
         return fail_pull(
             &base,
             &mut summary,
@@ -248,6 +304,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     if let Err(err) = std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create output directory {}", output_dir.display()))
     {
+        spinner.finish_and_clear();
         return fail_pull(
             &base,
             &mut summary,
@@ -262,6 +319,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     {
         Ok(path) => path,
         Err(err) => {
+            spinner.finish_and_clear();
             return fail_pull(
                 &base,
                 &mut summary,
@@ -274,6 +332,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     let _lock = match OutputLock::acquire(&canonical_output_dir) {
         Ok(lock) => lock,
         Err(err) => {
+            spinner.finish_and_clear();
             return fail_pull(
                 &base,
                 &mut summary,
@@ -290,6 +349,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         let projects = match get_projects_cached(&auth_ctx.client, &mut projects_cache).await {
             Ok(projects) => projects,
             Err(err) => {
+                spinner.finish_and_clear();
                 return fail_pull(
                     &base,
                     &mut summary,
@@ -301,6 +361,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         match resolve_project_names(&winners, projects) {
             Ok(names) => names,
             Err(err) => {
+                spinner.finish_and_clear();
                 return fail_pull(
                     &base,
                     &mut summary,
@@ -396,6 +457,26 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     }
 
     let failure = summary.status == CommandStatus::Failed;
+    spinner.finish_and_clear();
+    if use_progress {
+        if failure {
+            eprintln!("{} Failed to pull {subject}", style("✗").red());
+        } else {
+            let cwd = std::env::current_dir().ok();
+            let pulled_files: Vec<_> = summary
+                .files
+                .iter()
+                .filter(|f| f.status == FileStatus::Success)
+                .map(|f| short_display_path(&f.output_file, cwd.as_deref()))
+                .collect();
+            let file_label = if pulled_files.is_empty() {
+                from_label.clone()
+            } else {
+                pulled_files.join(", ")
+            };
+            eprintln!("{} Pulled {subject} to {file_label}", style("✓").green(),);
+        }
+    }
     emit_summary(&base, &summary, args.verbose)?;
     if failure {
         bail!("functions pull failed; see summary for details");
@@ -1460,38 +1541,22 @@ fn emit_summary(base: &BaseArgs, summary: &PullSummary, verbose: bool) -> Result
         return Ok(());
     }
 
-    let has_visible_files = summary
-        .files
-        .iter()
-        .any(|f| f.status == FileStatus::Success || f.status == FileStatus::Failed || verbose);
-    let mut parts = vec![format!("Wrote {} file(s)", summary.files_written)];
-    if has_visible_files {
-        let cwd = std::env::current_dir().ok();
-        for f in &summary.files {
-            let name = short_display_path(&f.output_file, cwd.as_deref());
-            match f.status {
-                FileStatus::Success => eprintln!("Pulled {name}"),
-                FileStatus::Failed => {
-                    let msg = f.message.as_deref().unwrap_or("unknown error");
-                    eprintln!("Failed to pull {name} ({msg})");
-                }
-                FileStatus::Skipped if verbose => {
-                    let reason = skip_reason_label(f.skipped_reason);
-                    eprintln!("Skipped {name} ({reason})");
-                }
-                FileStatus::Skipped => {}
+    let cwd = std::env::current_dir().ok();
+    for f in &summary.files {
+        let name = short_display_path(&f.output_file, cwd.as_deref());
+        match f.status {
+            FileStatus::Success => {}
+            FileStatus::Failed => {
+                let msg = f.message.as_deref().unwrap_or("unknown error");
+                eprintln!("Failed to pull {name} ({msg})");
             }
+            FileStatus::Skipped if verbose => {
+                let reason = skip_reason_label(f.skipped_reason);
+                eprintln!("Skipped {name} ({reason})");
+            }
+            FileStatus::Skipped => {}
         }
-        eprintln!();
     }
-
-    if summary.files_skipped > 0 {
-        parts.push(format!("skipped {}", summary.files_skipped));
-    }
-    if summary.files_failed > 0 {
-        parts.push(format!("failed {}", summary.files_failed));
-    }
-    eprintln!("{}.", parts.join(", "));
 
     for warning in &summary.warnings {
         eprintln!("warning: {}", warning.message);
