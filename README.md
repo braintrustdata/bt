@@ -122,15 +122,34 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
 | `bt self update` | Update bt in-place                                                 |
 
-## `bt eval` runners
+## `bt eval`
+
+**File selection:**
+
+- `bt eval` — discover and run all eval files in the current directory (recursive)
+- `bt eval tests/` — discover eval files under a specific directory
+- `bt eval "tests/**/*.eval.ts"` — glob pattern
+- `bt eval a.eval.ts b.eval.ts` — one or more explicit files
+
+Files inside `node_modules`, `.venv`, `venv`, `site-packages`, `dist-packages`, and `__pycache__` are excluded from automatic discovery. Explicit paths and globs bypass these exclusions.
+
+**Runners:**
 
 - By default, `bt eval` auto-detects a JavaScript runner from your project (`tsx`, `vite-node`, `ts-node`, then `ts-node-esm`).
-- You can also set a runner explicitly with `--runner`:
+- Set a runner explicitly with `--runner` / `BT_EVAL_RUNNER`:
   - `bt eval --runner vite-node tutorial.eval.ts`
   - `bt eval --runner tsx tutorial.eval.ts`
-- You do not need to pass a full path for common runners; `bt` resolves local `node_modules/.bin` entries automatically.
+- `bt` resolves local `node_modules/.bin` entries automatically — no need for a full path.
 - If eval execution fails with ESM/top-level-await related errors, retry with:
   - `bt eval --runner vite-node tutorial.eval.ts`
+
+**Passing arguments to the eval file:**
+
+Use `--` to forward extra arguments to the eval file via `process.argv`:
+
+```bash
+bt eval foo.eval.ts -- --description "Prod" --shard=1/4
+```
 
 ## `bt sql`
 
