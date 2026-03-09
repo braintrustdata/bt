@@ -5,7 +5,6 @@
     "--file",
     "--if-exists",
     "--terminate-on-failure",
-    "--create-missing-projects",
     "--language",
     "--requirements",
     "--tsconfig",

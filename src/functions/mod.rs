@@ -9,7 +9,7 @@ use crate::{
     config,
     http::ApiClient,
     projects::api::{get_project_by_name, Project},
-    ui::{self, fuzzy_select, is_interactive, select_project_interactive, with_spinner},
+    ui::{self, is_interactive, select_project_interactive, with_spinner},
 };
 
 pub(crate) mod api;
@@ -319,14 +319,9 @@ pub(crate) struct PushArgs {
     )]
     pub external_packages: Vec<String>,
 
-    /// Create missing projects referenced by function definitions.
-    #[arg(
-        long = "create-missing-projects",
-        env = "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
-        default_value_t = true,
-        value_parser = BoolishValueParser::new()
-    )]
-    pub create_missing_projects: bool,
+    /// Skip confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 impl PushArgs {
@@ -480,13 +475,6 @@ pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext>
     })
 }
 
-#[derive(Debug)]
-pub(crate) enum OrgDecision {
-    Continue,
-    Switch(String),
-    Cancel,
-}
-
 pub(crate) fn current_org_label(auth_ctx: &AuthContext) -> String {
     if auth_ctx.client.org_name().trim().is_empty() {
         auth_ctx.org_id.clone()
@@ -521,76 +509,6 @@ pub(crate) fn validate_explicit_org_selection(
         .collect::<Vec<_>>()
         .join(", ");
     bail!("org '{explicit_org}' is not available for this credential. Available: {available}");
-}
-
-/// Prompt the user to confirm/switch org when multiple orgs are available.
-/// `prompt` is the question text, `action_label` is used for the confirm option (e.g. "Push to", "Pull from").
-pub(crate) fn resolve_org_decision(
-    base: &BaseArgs,
-    auth_ctx: &AuthContext,
-    available_orgs: &[AvailableOrg],
-    prompt: &str,
-    action_label: &str,
-) -> Result<(OrgDecision, bool)> {
-    if base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        return Ok((OrgDecision::Continue, false));
-    }
-
-    if available_orgs.len() <= 1 {
-        return Ok((OrgDecision::Continue, false));
-    }
-
-    if !is_interactive() {
-        bail!(
-            "multiple organizations are available for this credential; pass --org <ORG_NAME> in non-interactive mode"
-        );
-    }
-
-    let org_label = current_org_label(auth_ctx);
-
-    let options = [
-        format!("{action_label} {org_label}"),
-        "Switch org".to_string(),
-        "Cancel".to_string(),
-    ];
-    let option_refs = options.iter().map(String::as_str).collect::<Vec<_>>();
-    let choice = fuzzy_select(prompt, &option_refs, 0)?;
-
-    match choice {
-        0 => Ok((OrgDecision::Continue, true)),
-        1 => {
-            let mut labels = Vec::with_capacity(available_orgs.len());
-            let mut default_index = 0usize;
-            for (index, org) in available_orgs.iter().enumerate() {
-                let label = if org.api_url.is_some() {
-                    format!("{} [{}]", org.name, org.id)
-                } else {
-                    org.name.clone()
-                };
-                if org.name == org_label || org.name.eq_ignore_ascii_case(&org_label) {
-                    default_index = index;
-                }
-                labels.push(label);
-            }
-            let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
-            let selected_index = fuzzy_select("Select organization", &label_refs, default_index)?;
-            let selected = available_orgs
-                .get(selected_index)
-                .ok_or_else(|| anyhow!("invalid org selection"))?;
-            if selected.name == org_label || selected.name.eq_ignore_ascii_case(&org_label) {
-                Ok((OrgDecision::Continue, true))
-            } else {
-                Ok((OrgDecision::Switch(selected.name.clone()), true))
-            }
-        }
-        _ => Ok((OrgDecision::Cancel, true)),
-    }
 }
 
 pub(crate) async fn resolve_project_context(
@@ -826,23 +744,6 @@ mod tests {
             panic!("expected push command");
         };
         assert!(push.terminate_on_failure);
-    }
-
-    #[test]
-    fn push_create_missing_projects_flag_from_env() {
-        let _guard = test_lock();
-        unsafe {
-            std::env::set_var("BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS", "true");
-        }
-        let parsed = parse(&["functions", "push"]).expect("parse push");
-        unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS");
-        }
-
-        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
-            panic!("expected push command");
-        };
-        assert!(push.create_missing_projects);
     }
 
     #[test]

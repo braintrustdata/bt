@@ -1,9 +1,0 @@
-{
-  "command": ["functions", "push", "--language", "typescript"],
-  "env": {
-    "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS": "true"
-  },
-  "expect_success": false,
-  "stderr_contains": ["invalid value 'typescript'"],
-  "stderr_not_contains": ["value was not a boolean"]
-}
