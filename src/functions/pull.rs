@@ -279,17 +279,19 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         );
     }
 
-    let project_ids_with_matches = winners
-        .iter()
-        .map(|row| row.project_id.clone())
-        .collect::<BTreeSet<_>>();
-
     let mut materializable = Vec::new();
     for row in winners.iter().cloned() {
         if is_prompt_row(&row) {
             materializable.push(row);
         } else {
             summary.unsupported_records_skipped += 1;
+            if !is_quiet() {
+                eprintln!(
+                    "{} skipping '{}' because it is not a prompt",
+                    style("warning:").yellow(),
+                    row.slug
+                );
+            }
         }
     }
 
@@ -343,7 +345,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     };
     let repo = GitRepo::discover_from(&canonical_output_dir);
 
-    let project_names = if project_ids_with_matches.is_empty() {
+    let project_names = if materializable.is_empty() {
         BTreeMap::new()
     } else {
         let projects = match get_projects_cached(&auth_ctx.client, &mut projects_cache).await {
@@ -378,7 +380,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     };
 
     if !resolved_slugs.is_empty() {
-        let found_slugs: BTreeSet<&str> = materializable.iter().map(|r| r.slug.as_str()).collect();
+        let found_slugs: BTreeSet<&str> = winners.iter().map(|r| r.slug.as_str()).collect();
         for slug in &resolved_slugs {
             if !found_slugs.contains(slug.as_str()) {
                 summary.warnings.push(ReportWarning {
@@ -389,25 +391,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         }
     }
 
-    // Legacy-compatible project mode: one output file per project, even for
-    // selector pulls that only matched unsupported record types.
     let mut grouped_by_project = BTreeMap::<(String, String), Vec<PullFunctionRow>>::new();
-    for project_id in project_ids_with_matches {
-        let Some(project_name) = project_names.get(&project_id).cloned() else {
-            return fail_pull(
-                &base,
-                &mut summary,
-                HardFailureReason::ResponseInvalid,
-                format!(
-                    "missing resolved project name for project id '{}'",
-                    project_id
-                ),
-            );
-        };
-        grouped_by_project
-            .entry((project_id, project_name))
-            .or_default();
-    }
     for row in materializable {
         let Some(project_name) = project_names.get(&row.project_id).cloned() else {
             return fail_pull(

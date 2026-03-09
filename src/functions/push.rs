@@ -614,18 +614,11 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         }
     }
 
+    spinner.finish_and_clear();
     if summary.status == CommandStatus::Failed {
-        spinner.finish_with_message(format!(
-            "{} Failed to push {}",
-            style("✗").red(),
-            file_label,
-        ));
+        eprintln!("{} Failed to push {}", style("✗").red(), file_label);
     } else {
-        spinner.finish_with_message(format!(
-            "{} Successfully pushed {}",
-            style("✓").green(),
-            file_label,
-        ));
+        eprintln!("{} Successfully pushed {}", style("✓").green(), file_label);
     }
 
     emit_summary(&base, &summary)?;
@@ -1197,7 +1190,7 @@ fn collect_from_dir_inner(
         let path = entry.path();
         if file_type.is_dir() && !file_type.is_symlink() {
             collect_from_dir_inner(&path, js_like, python, depth + 1)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             let canonical = path
                 .canonicalize()
                 .with_context(|| format!("failed to canonicalize file {}", path.display()))?;
@@ -1569,12 +1562,16 @@ fn build_python_bundle_archive(
     requirements_path: Option<&Path>,
     runner: Option<&str>,
 ) -> Result<Vec<u8>> {
+    let Some(python) = python_runner::resolve_python_interpreter(runner, &[]) else {
+        bail!("No Python interpreter found. Install python or pass --runner.")
+    };
+
     let build_dir = TempBuildDir::create("bt-functions-python-bundle")?;
     let pkg_dir = build_dir.path.join("pkg");
     std::fs::create_dir_all(&pkg_dir)
         .with_context(|| format!("failed to create {}", pkg_dir.display()))?;
 
-    install_python_dependencies(&pkg_dir, requirements_path)?;
+    install_python_dependencies(&pkg_dir, requirements_path, &python)?;
 
     let stage_dir = build_dir.path.join("stage");
     std::fs::create_dir_all(&stage_dir)
@@ -1592,7 +1589,7 @@ fn build_python_bundle_archive(
     .context("failed to write register.py")?;
 
     let zip_path = build_dir.path.join("pkg.zip");
-    create_zip_with_python(runner, &stage_dir, &zip_path)?;
+    create_zip_with_python(&python, &stage_dir, &zip_path)?;
     std::fs::read(&zip_path)
         .with_context(|| format!("failed to read generated archive {}", zip_path.display()))
 }
@@ -1657,7 +1654,7 @@ fn normalized_archive_relative_path(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn create_zip_with_python(runner: Option<&str>, stage_root: &Path, zip_path: &Path) -> Result<()> {
+fn create_zip_with_python(python: &Path, stage_root: &Path, zip_path: &Path) -> Result<()> {
     const ZIP_SCRIPT: &str = r#"import os
 import sys
 import zipfile
@@ -1675,9 +1672,6 @@ with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compressle
             zf.write(source, rel)
 "#;
 
-    let Some(python) = python_runner::resolve_python_interpreter(runner, &[]) else {
-        bail!("No Python interpreter found. Install python or pass --runner.")
-    };
     let output = Command::new(python)
         .arg("-c")
         .arg(ZIP_SCRIPT)
@@ -1710,18 +1704,46 @@ with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compressle
     );
 }
 
-fn install_python_dependencies(pkg_dir: &Path, requirements_path: Option<&Path>) -> Result<()> {
+fn baseline_uv_install_args(pkg_dir: &Path, python: &Path) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("pip"),
+        OsString::from("install"),
+        OsString::from("--python"),
+        python.as_os_str().to_os_string(),
+        OsString::from("--target"),
+        pkg_dir.as_os_str().to_os_string(),
+    ];
+    args.extend(PYTHON_BASELINE_DEPS.iter().map(OsString::from));
+    args
+}
+
+fn requirements_uv_install_args(
+    pkg_dir: &Path,
+    requirements: &Path,
+    python: &Path,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("pip"),
+        OsString::from("install"),
+        OsString::from("--python"),
+        python.as_os_str().to_os_string(),
+        OsString::from("--target"),
+        pkg_dir.as_os_str().to_os_string(),
+        OsString::from("-r"),
+        requirements.as_os_str().to_os_string(),
+    ]
+}
+
+fn install_python_dependencies(
+    pkg_dir: &Path,
+    requirements_path: Option<&Path>,
+    python: &Path,
+) -> Result<()> {
     let uv = python_runner::find_binary_in_path(&["uv"]).ok_or_else(|| {
         anyhow!("`uv` is required to build Python code bundles; please install uv")
     })?;
 
-    let mut baseline_args = vec![
-        OsString::from("pip"),
-        OsString::from("install"),
-        OsString::from("--target"),
-        pkg_dir.as_os_str().to_os_string(),
-    ];
-    baseline_args.extend(PYTHON_BASELINE_DEPS.iter().map(OsString::from));
+    let baseline_args = baseline_uv_install_args(pkg_dir, python);
     run_uv_command(
         &uv,
         &baseline_args,
@@ -1729,14 +1751,7 @@ fn install_python_dependencies(pkg_dir: &Path, requirements_path: Option<&Path>)
     )?;
 
     if let Some(requirements) = requirements_path {
-        let args = vec![
-            OsString::from("pip"),
-            OsString::from("install"),
-            OsString::from("--target"),
-            pkg_dir.as_os_str().to_os_string(),
-            OsString::from("-r"),
-            requirements.as_os_str().to_os_string(),
-        ];
+        let args = requirements_uv_install_args(pkg_dir, requirements, python);
         run_uv_command(&uv, &args, "installing requirements file dependencies")?;
     }
 
@@ -1802,7 +1817,7 @@ fn collect_regular_files_recursive_impl(
         let path = entry.path();
         if file_type.is_dir() && !file_type.is_symlink() {
             collect_regular_files_recursive_impl(&path, out, depth + 1)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             out.push(path);
         }
     }
@@ -2505,32 +2520,14 @@ fn emit_summary(base: &BaseArgs, summary: &PushSummary) -> Result<()> {
         println!("{}", serde_json::to_string(summary)?);
     } else {
         for error in &summary.errors {
-            eprintln!("error ({}): {}", to_error_code(error), error.message);
+            let code = serde_json::to_value(error.reason)
+                .ok()
+                .and_then(|v| v.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| format!("{:?}", error.reason));
+            eprintln!("error ({code}): {}", error.message);
         }
     }
     Ok(())
-}
-
-fn to_error_code(error: &ReportError) -> &'static str {
-    match error.reason {
-        HardFailureReason::AuthFailed => "auth_failed",
-        HardFailureReason::RequestFailed => "request_failed",
-        HardFailureReason::ResponseInvalid => "response_invalid",
-        HardFailureReason::UserCancelled => "user_cancelled",
-        HardFailureReason::OutputDirInvalid => "output_dir_invalid",
-        HardFailureReason::AtomicWriteFailed => "atomic_write_failed",
-        HardFailureReason::UnsafeOutputPath => "unsafe_output_path",
-        HardFailureReason::RunnerSpawnFailed => "runner_spawn_failed",
-        HardFailureReason::RunnerExitNonzero => "runner_exit_nonzero",
-        HardFailureReason::ManifestInvalidJson => "manifest_invalid_json",
-        HardFailureReason::ManifestSchemaInvalid => "manifest_schema_invalid",
-        HardFailureReason::ManifestPathMissing => "manifest_path_missing",
-        HardFailureReason::UploadSlotFailed => "upload_slot_failed",
-        HardFailureReason::BundleUploadFailed => "bundle_upload_failed",
-        HardFailureReason::InsertFunctionsFailed => "insert_functions_failed",
-        HardFailureReason::SelectorNotFound => "selector_not_found",
-        HardFailureReason::PaginationUnsupported => "pagination_unsupported",
-    }
 }
 
 fn fail_push(
@@ -3070,6 +3067,103 @@ mod tests {
 
         assert_eq!(value["type"], "code");
         assert!(value["data"].get("preview").is_none());
+    }
+
+    #[test]
+    fn uv_install_args_include_selected_python() {
+        let pkg_dir = PathBuf::from("/tmp/pkg");
+        let python = PathBuf::from("/tmp/custom-python");
+        let rendered = baseline_uv_install_args(&pkg_dir, &python)
+            .into_iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let python_str = python.to_string_lossy().to_string();
+
+        assert!(
+            rendered
+                .windows(2)
+                .any(|window| window[0] == "--python" && window[1] == python_str.as_str()),
+            "baseline uv args should pin the selected python interpreter"
+        );
+    }
+
+    #[test]
+    fn requirements_uv_install_args_include_selected_python() {
+        let pkg_dir = PathBuf::from("/tmp/pkg");
+        let requirements = PathBuf::from("/tmp/requirements.txt");
+        let python = PathBuf::from("/tmp/custom-python");
+        let rendered = requirements_uv_install_args(&pkg_dir, &requirements, &python)
+            .into_iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let python_str = python.to_string_lossy().to_string();
+
+        assert!(
+            rendered
+                .windows(2)
+                .any(|window| window[0] == "--python" && window[1] == python_str.as_str()),
+            "requirements uv args should pin the selected python interpreter"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_from_dir_skips_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let inside = root.join("inside.ts");
+        std::fs::write(&inside, "export const inside = 1;\n").expect("write inside");
+
+        let outside = dir.path().join("outside.ts");
+        std::fs::write(&outside, "export const outside = 2;\n").expect("write outside");
+        symlink(&outside, root.join("outside-link.ts")).expect("create symlink");
+
+        let mut js_like = BTreeSet::new();
+        let mut python = BTreeSet::new();
+        collect_from_dir(&root, &mut js_like, &mut python).expect("collect sources");
+
+        let inside = inside.canonicalize().expect("canonicalize inside");
+        let outside = outside.canonicalize().expect("canonicalize outside");
+        assert!(js_like.contains(&inside));
+        assert!(
+            !js_like.contains(&outside),
+            "directory scan should not follow symlinked files"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_regular_files_recursive_skips_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let inside = root.join("inside.txt");
+        std::fs::write(&inside, "inside\n").expect("write inside");
+
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "outside\n").expect("write outside");
+        symlink(&outside, root.join("outside-link.txt")).expect("create symlink");
+
+        let files = collect_regular_files_recursive(&root).expect("collect regular files");
+        assert!(files.contains(&inside));
+        assert!(
+            files.iter().all(|path| path != &outside),
+            "collector must not include symlink targets outside root"
+        );
+        assert!(
+            files.iter().all(|path| path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_none_or(|value| value != "outside-link.txt")),
+            "collector must skip symlink file entries"
+        );
     }
 
     fn test_base_args() -> BaseArgs {
