@@ -4,31 +4,34 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::io::IsTerminal;
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Context, Result};
 use dialoguer::console::style;
-use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
-use reqwest::StatusCode;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::args::BaseArgs;
-use crate::auth::{list_available_orgs, list_profiles};
+
+use crate::auth::list_available_orgs;
 use crate::config;
 use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PushFileReport, PushSummary, ReportError,
-    ReportWarning, SoftSkipReason,
+    SoftSkipReason,
 };
 use crate::js_runner;
-use crate::projects::api::{create_project, get_project_by_name, list_projects};
+use crate::projects::api::{get_project_by_name, list_projects};
 use crate::python_runner;
 use crate::source_language::{classify_runtime_extension, JsExtensionProfile, SourceLanguage};
-use crate::ui::is_interactive;
+use crate::ui::{animations_enabled, is_interactive, is_quiet};
 
 use super::api;
 use super::{
-    current_org_label, resolve_auth_context, resolve_org_decision, validate_explicit_org_selection,
-    OrgDecision, PushArgs, PushLanguage,
+    current_org_label, resolve_auth_context, validate_explicit_org_selection, PushArgs,
+    PushLanguage,
 };
 
 const FUNCTIONS_JS_RUNNER_FILE: &str = "functions-runner.ts";
@@ -155,7 +158,6 @@ struct ResolvedFileTargets {
 struct ResolvedManifestTargets {
     entries: Vec<ResolvedEntryTarget>,
     per_file: Vec<ResolvedFileTargets>,
-    unique_project_ids: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -206,7 +208,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         );
     }
 
-    let mut auth_ctx = match resolve_auth_context(&base)
+    let auth_ctx = match resolve_auth_context(&base)
         .await
         .context("failed to resolve auth context")
     {
@@ -400,66 +402,31 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         .collect();
     let preflight_project_names: Vec<String> = preflight.named_projects.iter().cloned().collect();
 
-    let org_prompt =
-        build_push_org_prompt(&auth_ctx, &preflight_source_files, &preflight_project_names);
-    let (org_decision, org_prompt_confirmed) =
-        match resolve_org_decision(&base, &auth_ctx, &available_orgs, &org_prompt, "Push to") {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                return fail_push(
-                    &base,
-                    files.len(),
-                    HardFailureReason::ResponseInvalid,
-                    error_chain(&err),
-                    "failed to resolve org context",
-                );
-            }
-        };
-
-    match org_decision {
-        OrgDecision::Continue => {}
-        OrgDecision::Switch(org_name) => {
-            let mut switched_base = base.clone();
-            switched_base.org_name = Some(org_name);
-            auth_ctx = match resolve_auth_context(&switched_base)
-                .await
-                .context("failed to resolve switched org context")
-            {
-                Ok(ctx) => ctx,
-                Err(err) => {
-                    return fail_push(
-                        &base,
-                        files.len(),
-                        HardFailureReason::AuthFailed,
-                        error_chain(&err),
-                        "failed to resolve switched org context",
-                    );
-                }
-            };
-        }
-        OrgDecision::Cancel => {
+    if !args.yes && is_interactive() {
+        let prompt =
+            build_push_confirm_prompt(&auth_ctx, &preflight_source_files, &preflight_project_names);
+        let confirmed = Confirm::new()
+            .with_prompt(prompt)
+            .default(false)
+            .interact()?;
+        if !confirmed {
             return cancel_push(&base, &files);
         }
     }
 
-    let mut project_name_cache = match resolve_and_ensure_named_projects(
-        &auth_ctx,
-        &preflight.named_projects,
-        args.create_missing_projects,
-    )
-    .await
-    {
-        Ok(cache) => cache,
-        Err(err) => {
-            let message = format!("failed to resolve target projects for push: {err}");
-            return fail_push_manifest_preflight(
-                &base,
-                &files,
-                &message,
-                "skipped because project target resolution failed",
-            );
-        }
-    };
+    let mut project_name_cache =
+        match resolve_named_projects(&auth_ctx, &preflight.named_projects).await {
+            Ok(cache) => cache,
+            Err(err) => {
+                let message = format!("failed to resolve target projects for push: {err}");
+                return fail_push_manifest_preflight(
+                    &base,
+                    &files,
+                    &message,
+                    "skipped because project target resolution failed",
+                );
+            }
+        };
 
     if let Err(err) = validate_direct_project_ids(&auth_ctx, &preflight.direct_project_ids).await {
         let message = format!("failed to validate project ids for push: {err}");
@@ -513,25 +480,6 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         );
     }
 
-    let target_project_ids = resolved_targets.unique_project_ids.clone();
-
-    let source_files: Vec<&str> = manifest
-        .files
-        .iter()
-        .map(|f| f.source_file.as_str())
-        .collect();
-
-    if !org_prompt_confirmed
-        && !confirm_push_targets(
-            &auth_ctx,
-            &target_project_ids,
-            &source_files,
-            &project_name_cache,
-        )?
-    {
-        return cancel_push(&base, &files);
-    }
-
     let mut summary = PushSummary {
         status: CommandStatus::Success,
         total_files: manifest.files.len(),
@@ -553,6 +501,35 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         );
     }
 
+    let use_progress =
+        !base.json && std::io::stderr().is_terminal() && animations_enabled() && !is_quiet();
+
+    let file_parts: Vec<&str> = manifest
+        .files
+        .iter()
+        .map(|f| {
+            Path::new(&f.source_file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&f.source_file)
+        })
+        .collect();
+    let file_label = file_parts.join(", ");
+
+    let spinner = if use_progress {
+        let spinner_style = ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "])
+            .template("{spinner:.cyan} {msg}")
+            .unwrap();
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(spinner_style);
+        pb.set_message(format!("Pushing {file_label}..."));
+        pb.enable_steady_tick(Duration::from_millis(80));
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
+
     for (index, (file, resolved_file)) in manifest
         .files
         .iter()
@@ -560,6 +537,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         .enumerate()
     {
         if resolved_file.source_file != file.source_file {
+            spinner.finish_and_clear();
             return fail_push_manifest_preflight(
                 &base,
                 &files,
@@ -567,6 +545,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
                 "skipped because internal target resolution failed",
             );
         }
+
         let source_path = PathBuf::from(&file.source_file);
         let file_result = push_file(
             &auth_ctx,
@@ -586,36 +565,15 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         match file_result {
             Ok(file_success) => {
                 summary.ignored_entries += file_success.ignored_entries;
-                let skipped_reason = if file_success.uploaded_entries == 0 {
-                    if file_success.ignored_entries > 0 {
-                        Some(SoftSkipReason::IfExistsIgnored)
-                    } else {
-                        Some(SoftSkipReason::NoDefinitionsFound)
-                    }
-                } else {
-                    None
-                };
-                let status = if skipped_reason.is_some() {
-                    summary.skipped_files += 1;
-                    FileStatus::Skipped
-                } else {
-                    summary.uploaded_files += 1;
-                    FileStatus::Success
-                };
+                summary.uploaded_files += 1;
                 summary.files.push(PushFileReport {
                     source_file: file.source_file.clone(),
-                    status,
+                    status: FileStatus::Success,
                     uploaded_entries: file_success.uploaded_entries,
-                    skipped_reason,
+                    skipped_reason: None,
                     error_reason: None,
                     bundle_id: file_success.bundle_id,
-                    message: if file_success.uploaded_entries == 0
-                        && file_success.ignored_entries == 0
-                    {
-                        Some("no publishable definitions found in this file".to_string())
-                    } else {
-                        None
-                    },
+                    message: None,
                 });
             }
             Err(file_failure) => {
@@ -656,14 +614,23 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         }
     }
 
-    if summary.status != CommandStatus::Failed && summary.skipped_files > 0 {
-        summary.status = CommandStatus::Partial;
+    if summary.status == CommandStatus::Failed {
+        spinner.finish_with_message(format!(
+            "{} Failed to push {}",
+            style("✗").red(),
+            file_label,
+        ));
+    } else {
+        spinner.finish_with_message(format!(
+            "{} Successfully pushed {}",
+            style("✓").green(),
+            file_label,
+        ));
     }
 
-    let failure = summary.status == CommandStatus::Failed;
     emit_summary(&base, &summary)?;
 
-    if failure {
+    if summary.status == CommandStatus::Failed {
         bail!("functions push failed; see summary for details");
     }
 
@@ -1197,7 +1164,7 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     })
 }
 
-const MAX_DIR_DEPTH: usize = 64;
+const MAX_DIR_DEPTH: usize = 256;
 
 fn collect_from_dir(
     dir: &Path,
@@ -1224,8 +1191,11 @@ fn collect_from_dir_inner(
         .with_context(|| format!("failed to read directory {}", dir.display()))?
     {
         let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type in {}", dir.display()))?;
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() && !file_type.is_symlink() {
             collect_from_dir_inner(&path, js_like, python, depth + 1)?;
         } else if path.is_file() {
             let canonical = path
@@ -1826,8 +1796,11 @@ fn collect_regular_files_recursive_impl(
         std::fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))?
     {
         let entry = entry.with_context(|| format!("failed to read entry in {}", root.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type in {}", root.display()))?;
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() && !file_type.is_symlink() {
             collect_regular_files_recursive_impl(&path, out, depth + 1)?;
         } else if path.is_file() {
             out.push(path);
@@ -2001,7 +1974,7 @@ fn ensure_path_within_allowed_roots(
     );
 }
 
-fn build_push_org_prompt(
+fn build_push_confirm_prompt(
     auth_ctx: &super::AuthContext,
     source_files: &[&str],
     project_names: &[String],
@@ -2020,18 +1993,18 @@ fn build_push_org_prompt(
         .map(|f| style(f).green().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let projects_part = if project_names.is_empty() {
-        "(no project)".to_string()
+    let org_label = current_org_label(auth_ctx);
+    let targets_part = if project_names.is_empty() {
+        style(&org_label).green().to_string()
     } else {
         project_names
             .iter()
-            .map(|p| style(p).green().to_string())
+            .map(|p| style(format!("{org_label}/{p}")).green().to_string())
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let org_styled = style(current_org_label(auth_ctx)).green();
 
-    format!("Push {files_part} to {projects_part} in {org_styled}")
+    format!("Push {files_part} to {targets_part}")
 }
 
 fn cancel_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
@@ -2259,10 +2232,9 @@ fn resolve_default_project_id(
     Ok(Some(project_id))
 }
 
-async fn resolve_and_ensure_named_projects(
+async fn resolve_named_projects(
     auth_ctx: &super::AuthContext,
     named_projects: &BTreeSet<String>,
-    auto_create: bool,
 ) -> Result<BTreeMap<String, String>> {
     let mut project_name_cache = BTreeMap::new();
     let mut missing = Vec::new();
@@ -2276,63 +2248,13 @@ async fn resolve_and_ensure_named_projects(
         }
     }
 
-    if missing.is_empty() {
-        return Ok(project_name_cache);
-    }
-
-    if !auto_create && !is_interactive() {
+    if !missing.is_empty() {
         let joined = missing.join(", ");
         let org = current_org_label(auth_ctx);
-        bail!(
-            "project(s) not found in org '{org}': {joined}. Re-run with --create-missing-projects or create them first"
-        );
-    }
-
-    for project_name in missing {
-        let should_create = if auto_create {
-            true
-        } else {
-            Confirm::new()
-                .with_prompt(format!(
-                    "Project '{}' does not exist in org '{}'. Create it?",
-                    project_name,
-                    current_org_label(auth_ctx)
-                ))
-                .default(false)
-                .interact()?
-        };
-
-        if !should_create {
-            bail!("project '{project_name}' is missing; push cancelled");
-        }
-
-        match create_project(&auth_ctx.client, &project_name).await {
-            Ok(project) => {
-                project_name_cache.insert(project_name.clone(), project.id);
-            }
-            Err(err) if is_http_conflict(&err) => {
-                let project = get_project_by_name(&auth_ctx.client, &project_name)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "project '{}' already exists but could not be resolved after create conflict",
-                            project_name
-                        )
-                    })?;
-                project_name_cache.insert(project_name.clone(), project.id);
-            }
-            Err(err) => {
-                return Err(err).context(format!("failed to create project '{project_name}'"));
-            }
-        }
+        bail!("project(s) not found in org '{org}': {joined}");
     }
 
     Ok(project_name_cache)
-}
-
-fn is_http_conflict(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<crate::http::HttpError>()
-        .is_some_and(|http| http.status == StatusCode::CONFLICT)
 }
 
 async fn validate_direct_project_ids(
@@ -2369,7 +2291,6 @@ async fn resolve_manifest_targets(
     manifest: &RunnerManifest,
     project_name_cache: &mut BTreeMap<String, String>,
 ) -> Result<ResolvedManifestTargets> {
-    let mut seen_project_ids = BTreeSet::new();
     let mut entries = Vec::new();
     let mut per_file = Vec::with_capacity(manifest.files.len());
 
@@ -2388,7 +2309,6 @@ async fn resolve_manifest_targets(
                 project_name_cache,
             )
             .await?;
-            seen_project_ids.insert(project_id.clone());
             entry_project_ids.push(project_id.clone());
             entries.push(ResolvedEntryTarget {
                 source_file: file.source_file.clone(),
@@ -2403,11 +2323,7 @@ async fn resolve_manifest_targets(
         });
     }
 
-    Ok(ResolvedManifestTargets {
-        entries,
-        per_file,
-        unique_project_ids: seen_project_ids.into_iter().collect(),
-    })
+    Ok(ResolvedManifestTargets { entries, per_file })
 }
 
 fn validate_duplicate_slugs(entries: &[ResolvedEntryTarget]) -> Result<()> {
@@ -2512,66 +2428,6 @@ async fn resolve_project_name(
     Ok(project.id)
 }
 
-fn confirm_push_targets(
-    auth_ctx: &super::AuthContext,
-    target_project_ids: &[String],
-    source_files: &[&str],
-    project_name_cache: &BTreeMap<String, String>,
-) -> Result<bool> {
-    if !is_interactive() || target_project_ids.is_empty() {
-        return Ok(true);
-    }
-
-    let id_to_name: BTreeMap<&str, &str> = project_name_cache
-        .iter()
-        .map(|(name, id)| (id.as_str(), name.as_str()))
-        .collect();
-
-    let project_labels: Vec<&str> = target_project_ids
-        .iter()
-        .map(|id| id_to_name.get(id.as_str()).copied().unwrap_or(id.as_str()))
-        .collect();
-
-    let file_names: Vec<&str> = source_files
-        .iter()
-        .map(|f| {
-            Path::new(f)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(f)
-        })
-        .collect();
-
-    let files_part = file_names
-        .iter()
-        .map(|f| style(f).green().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let projects_part = project_labels.join(", ");
-
-    let multi_org = list_profiles().is_ok_and(|p| p.len() > 1);
-    let prompt = if multi_org {
-        let org_label = if auth_ctx.client.org_name().is_empty() {
-            &auth_ctx.org_id
-        } else {
-            auth_ctx.client.org_name()
-        };
-        format!(
-            "Push {files_part} to {projects_part} {}?",
-            style(format!("({org_label})")).dim()
-        )
-    } else {
-        format!("Push {files_part} to {projects_part}?")
-    };
-
-    let confirmed = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(prompt)
-        .default(false)
-        .interact()?;
-
-    Ok(confirmed)
-}
-
 fn collect_project_name_placeholders_checked(
     value: &Value,
     out: &mut BTreeSet<String>,
@@ -2648,44 +2504,11 @@ fn emit_summary(base: &BaseArgs, summary: &PushSummary) -> Result<()> {
     if base.json {
         println!("{}", serde_json::to_string(summary)?);
     } else {
-        match summary.status {
-            CommandStatus::Success => {
-                eprintln!("Pushed {} file(s) successfully.", summary.uploaded_files);
-            }
-            CommandStatus::Partial => {
-                eprintln!(
-                    "Pushed with partial success: uploaded={}, skipped={}, failed={}",
-                    summary.uploaded_files, summary.skipped_files, summary.failed_files
-                );
-            }
-            CommandStatus::Failed => {
-                eprintln!(
-                    "Push failed: uploaded={}, skipped={}, failed={}",
-                    summary.uploaded_files, summary.skipped_files, summary.failed_files
-                );
-            }
-        }
-        for warning in &summary.warnings {
-            eprintln!(
-                "warning ({}): {}",
-                to_warning_code(warning),
-                warning.message
-            );
-        }
         for error in &summary.errors {
             eprintln!("error ({}): {}", to_error_code(error), error.message);
         }
     }
     Ok(())
-}
-
-fn to_warning_code(warning: &ReportWarning) -> &'static str {
-    match warning.reason {
-        super::report::WarningReason::PaginationNotSnapshotConsistent => {
-            "pagination_not_snapshot_consistent"
-        }
-        super::report::WarningReason::SelectorPartialMatch => "selector_partial_match",
-    }
 }
 
 fn to_error_code(error: &ReportError) -> &'static str {
@@ -2924,7 +2747,7 @@ mod tests {
             requirements: None,
             tsconfig: None,
             external_packages: vec![],
-            create_missing_projects: false,
+            yes: false,
         };
         let classified = ClassifiedFiles {
             js_like: vec![PathBuf::from("/tmp/a.ts")],
@@ -2953,7 +2776,7 @@ mod tests {
             requirements: None,
             tsconfig: None,
             external_packages: vec![],
-            create_missing_projects: false,
+            yes: false,
         };
         let classified = ClassifiedFiles {
             js_like: vec![PathBuf::from("/tmp/a.ts")],

@@ -1,8 +1,0 @@
-{
-  "command": ["functions", "push"],
-  "env": {
-    "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS": "notabool"
-  },
-  "expect_success": false,
-  "stderr_contains": ["--create-missing-projects", "value was not a boolean"]
-}

@@ -160,7 +160,6 @@ fn sanitized_env_keys() -> &'static [&'static str] {
         "BT_FUNCTIONS_PUSH_REQUIREMENTS",
         "BT_FUNCTIONS_PUSH_TSCONFIG",
         "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
-        "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
         "BT_FUNCTIONS_PULL_OUTPUT_DIR",
         "BT_FUNCTIONS_PULL_PROJECT_ID",
         "BT_FUNCTIONS_PULL_PROJECT_NAME",
@@ -541,7 +540,6 @@ fn functions_push_help_includes_expected_flags() {
     assert!(stdout.contains("--file"));
     assert!(stdout.contains("--if-exists"));
     assert!(stdout.contains("--terminate-on-failure"));
-    assert!(stdout.contains("--create-missing-projects"));
     assert!(stdout.contains("--language"));
     assert!(stdout.contains("--requirements"));
     assert!(stdout.contains("--tsconfig"));
@@ -693,7 +691,6 @@ fn push_and_pull_help_are_machine_readable() {
     let push_stdout = String::from_utf8_lossy(&push_help.stdout);
     let pull_stdout = String::from_utf8_lossy(&pull_help.stdout);
     assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_FILES"));
-    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS"));
     assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_LANGUAGE"));
     assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_REQUIREMENTS"));
     assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_TSCONFIG"));
