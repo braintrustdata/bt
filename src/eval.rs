@@ -226,8 +226,9 @@ Examples:
   bt eval --language python my_eval.py
 ")]
 pub struct EvalArgs {
-    /// One or more eval files to execute (e.g. foo.eval.ts)
-    #[arg(required = true, value_name = "FILE")]
+    /// Eval files, directories, or glob patterns to execute (e.g. foo.eval.ts, tests/, "**/*.eval.ts").
+    /// Defaults to the current directory.
+    #[arg(value_name = "FILE")]
     pub files: Vec<String>,
 
     /// Eval runner binary (e.g. tsx, bun, ts-node, deno, python). Defaults to tsx for JS files.
