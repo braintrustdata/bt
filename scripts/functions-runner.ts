@@ -30,6 +30,22 @@ type CodeRegistryItem = {
 type EventRegistryItem = {
   project?: ProjectRef;
   toFunctionDefinition?: (resolver: Resolver) => Promise<JsonObject>;
+  name?: string;
+  slug?: string;
+  description?: string;
+  ifExists?: string;
+  metadata?: JsonValue;
+  prompt?: JsonValue;
+  toolFunctions?: LegacyToolFunction[];
+};
+
+type LegacyToolFunction = {
+  type?: string;
+  id?: string;
+  name?: string;
+  slug?: string;
+  project?: ProjectRef;
+  project_id?: string;
 };
 
 type CodeEntry = {
@@ -101,6 +117,7 @@ function currentRegistry(fallback: EvalRegistry): EvalRegistry {
 
 async function collectFunctionEvents(
   items: EventRegistryItem[],
+  includeLegacyPrompts: boolean,
 ): Promise<FunctionEventEntry[]> {
   const entries: FunctionEventEntry[] = [];
 
@@ -113,6 +130,12 @@ async function collectFunctionEvents(
 
   for (const item of items) {
     if (!item.toFunctionDefinition) {
+      if (includeLegacyPrompts) {
+        const entry = await collectLegacyPromptEvent(item, resolver);
+        if (entry) {
+          entries.push(entry);
+        }
+      }
       continue;
     }
 
@@ -139,6 +162,107 @@ async function collectFunctionEvents(
   }
 
   return entries;
+}
+
+async function collectLegacyPromptEvent(
+  item: EventRegistryItem,
+  resolver: Resolver,
+): Promise<FunctionEventEntry | null> {
+  if (typeof item.name !== "string" || typeof item.slug !== "string") {
+    return null;
+  }
+
+  const normalizedPrompt = toJsonValue(item.prompt ?? {});
+  if (!isJsonObject(normalizedPrompt)) {
+    return null;
+  }
+
+  const promptData: JsonObject = { ...normalizedPrompt };
+  const toolFunctions = Array.isArray(item.toolFunctions)
+    ? item.toolFunctions
+    : [];
+  if (toolFunctions.length > 0) {
+    const resolvedTools: JsonValue[] = [];
+    for (const tool of toolFunctions) {
+      const resolved = await resolveLegacyToolFunction(tool, resolver);
+      if (resolved) {
+        resolvedTools.push(resolved);
+      }
+    }
+    if (resolvedTools.length > 0) {
+      promptData.tool_functions = resolvedTools;
+    }
+  }
+
+  const selector = asProjectSelector(item.project);
+  const projectId =
+    typeof selector.project_id === "string" ? selector.project_id : undefined;
+  const projectName =
+    typeof selector.project_name === "string"
+      ? selector.project_name
+      : undefined;
+
+  const event: JsonObject = {
+    name: item.name,
+    slug: item.slug,
+    description: typeof item.description === "string" ? item.description : "",
+    function_data: {
+      type: "prompt",
+    },
+    prompt_data: promptData,
+  };
+  if (typeof item.ifExists === "string") {
+    event.if_exists = item.ifExists;
+  }
+  if (item.metadata !== undefined) {
+    event.metadata = item.metadata;
+  }
+
+  return {
+    kind: "function_event",
+    project_id: projectId,
+    project_name: projectName,
+    event,
+  };
+}
+
+async function resolveLegacyToolFunction(
+  tool: LegacyToolFunction,
+  resolver: Resolver,
+): Promise<JsonObject | null> {
+  if (
+    typeof tool.slug === "string" &&
+    tool.slug.length > 0 &&
+    tool.project !== undefined
+  ) {
+    const projectId = await resolver.resolve(tool.project);
+    if (projectId.length > 0) {
+      return {
+        type: "slug",
+        project_id: projectId,
+        slug: tool.slug,
+      };
+    }
+  }
+
+  const direct: JsonObject = {};
+  if (typeof tool.type === "string") {
+    direct.type = tool.type;
+  }
+  if (typeof tool.id === "string") {
+    direct.id = tool.id;
+  }
+  if (typeof tool.name === "string") {
+    direct.name = tool.name;
+  }
+  if (typeof tool.project_id === "string") {
+    direct.project_id = tool.project_id;
+  }
+  if (typeof tool.slug === "string") {
+    direct.slug = tool.slug;
+  }
+
+  return Object.keys(direct).length > 0 ? direct : null;
 }
 
 function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
@@ -197,9 +321,13 @@ async function processFile(filePath: string): Promise<ManifestFile> {
 
   const entries: Array<CodeEntry | FunctionEventEntry> = [
     ...collectCodeEntries(registry.functions as CodeRegistryItem[]),
-    ...(await collectFunctionEvents(registry.prompts as EventRegistryItem[])),
+    ...(await collectFunctionEvents(
+      registry.prompts as EventRegistryItem[],
+      true,
+    )),
     ...(await collectFunctionEvents(
       registry.parameters as EventRegistryItem[],
+      false,
     )),
   ];
 

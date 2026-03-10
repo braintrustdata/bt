@@ -848,6 +848,7 @@ async fn push_file(
                     Value::String(args.if_exists.as_str().to_string()),
                 );
             }
+            default_prompt_function_type(object);
         }
 
         function_events.push(event);
@@ -960,6 +961,36 @@ fn calculate_upload_counts(total_entries: usize, ignored_entries: Option<usize>)
     let ignored_entries = ignored_entries.unwrap_or(0);
     let uploaded_entries = total_entries.saturating_sub(ignored_entries);
     (uploaded_entries, ignored_entries)
+}
+
+fn default_prompt_function_type(event: &mut Map<String, Value>) {
+    if !is_prompt_function_event(event) {
+        return;
+    }
+
+    if function_type_missing_or_empty(event.get("function_type")) {
+        event.insert(
+            "function_type".to_string(),
+            Value::String("prompt".to_string()),
+        );
+    }
+}
+
+fn is_prompt_function_event(event: &Map<String, Value>) -> bool {
+    event
+        .get("function_data")
+        .and_then(Value::as_object)
+        .and_then(|function_data| function_data.get("type"))
+        .and_then(Value::as_str)
+        == Some("prompt")
+}
+
+fn function_type_missing_or_empty(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.trim().is_empty(),
+        Some(_) => false,
+    }
 }
 
 fn run_functions_runner(
@@ -2846,6 +2877,61 @@ mod tests {
         assert_eq!(calculate_upload_counts(3, Some(1)), (2, 1));
         assert_eq!(calculate_upload_counts(3, Some(10)), (0, 10));
         assert_eq!(calculate_upload_counts(3, None), (3, 0));
+    }
+
+    #[test]
+    fn prompt_event_defaults_function_type_when_missing() {
+        let mut event = Map::new();
+        event.insert(
+            "function_data".to_string(),
+            serde_json::json!({
+                "type": "prompt"
+            }),
+        );
+
+        default_prompt_function_type(&mut event);
+
+        assert_eq!(
+            event.get("function_type"),
+            Some(&Value::String("prompt".to_string()))
+        );
+    }
+
+    #[test]
+    fn prompt_event_preserves_existing_function_type() {
+        let mut event = Map::new();
+        event.insert(
+            "function_data".to_string(),
+            serde_json::json!({
+                "type": "prompt"
+            }),
+        );
+        event.insert(
+            "function_type".to_string(),
+            Value::String("scorer".to_string()),
+        );
+
+        default_prompt_function_type(&mut event);
+
+        assert_eq!(
+            event.get("function_type"),
+            Some(&Value::String("scorer".to_string()))
+        );
+    }
+
+    #[test]
+    fn non_prompt_event_does_not_default_function_type() {
+        let mut event = Map::new();
+        event.insert(
+            "function_data".to_string(),
+            serde_json::json!({
+                "type": "code"
+            }),
+        );
+
+        default_prompt_function_type(&mut event);
+
+        assert!(!event.contains_key("function_type"));
     }
 
     #[test]
