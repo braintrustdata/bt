@@ -559,7 +559,6 @@ fn functions_pull_help_includes_expected_flags() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--output-dir"));
     assert!(stdout.contains("--project-id"));
-    assert!(stdout.contains("--project-name"));
     assert!(stdout.contains("--version"));
     assert!(stdout.contains("--language"));
 }
@@ -640,34 +639,6 @@ fn functions_help_lists_push_and_pull() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("push"));
     assert!(stdout.contains("pull"));
-}
-
-#[test]
-fn top_level_push_help_is_available() {
-    let output = Command::new(bt_binary_path())
-        .arg("push")
-        .arg("--help")
-        .output()
-        .expect("run bt push --help");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("--if-exists"));
-    assert!(stdout.contains("--file"));
-}
-
-#[test]
-fn top_level_pull_help_is_available() {
-    let output = Command::new(bt_binary_path())
-        .arg("pull")
-        .arg("--help")
-        .output()
-        .expect("run bt pull --help");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("--output-dir"));
-    assert!(stdout.contains("--version"));
 }
 
 #[test]
@@ -1928,6 +1899,7 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
                 .expect("output dir should be valid UTF-8 for test"),
             "--language",
             "typescript",
+            "--verbose",
         ])
         .env("BRAINTRUST_API_KEY", "test-key")
         .env("BRAINTRUST_ORG_NAME", "test-org")

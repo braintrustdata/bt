@@ -164,7 +164,6 @@ struct ResolvedManifestTargets {
 struct ClassifiedFiles {
     js_like: Vec<PathBuf>,
     python: Vec<PathBuf>,
-    had_directory_inputs: bool,
     explicit_file_inputs: usize,
     explicit_supported_files: usize,
     explicit_js_like: usize,
@@ -259,16 +258,8 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             );
         }
     };
-    emit_language_selection_notice(&args, &classified, selected_language);
+    emit_language_selection_notice(&classified, selected_language);
 
-    if args.tsconfig.is_some() {
-        eprintln!(
-            "Notice: --tsconfig is enabled for JS runner and JS bundling (TS_NODE_PROJECT/TSX_TSCONFIG_PATH)."
-        );
-    }
-    if !args.external_packages.is_empty() {
-        eprintln!("Notice: --external-packages will be applied to JS bundle builds.");
-    }
     if !args.external_packages.is_empty() && selected_language != SourceLanguage::JsLike {
         return fail_push(
             &base,
@@ -287,6 +278,14 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             "--requirements can only be used when pushing Python sources".to_string(),
             "invalid --requirements usage",
         );
+    }
+    if args.tsconfig.is_some() {
+        eprintln!(
+            "Notice: --tsconfig is enabled for JS runner and JS bundling (TS_NODE_PROJECT/TSX_TSCONFIG_PATH)."
+        );
+    }
+    if !args.external_packages.is_empty() {
+        eprintln!("Notice: --external-packages will be applied to JS bundle builds.");
     }
 
     let files = classified.files_for_language(selected_language);
@@ -382,14 +381,22 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         None
     };
 
+    let fail_manifest_preflight = |message: String, file_message: &str| {
+        fail_push_with_all_skipped(
+            &base,
+            &files,
+            HardFailureReason::ManifestSchemaInvalid,
+            &message,
+            file_message,
+        )
+    };
+
     let preflight = match collect_project_preflight(&base, &manifest) {
         Ok(preflight) => preflight,
         Err(err) => {
             let message = format!("failed to resolve project selectors in manifest: {err}");
-            return fail_push_manifest_preflight(
-                &base,
-                &files,
-                &message,
+            return fail_manifest_preflight(
+                message,
                 "skipped because project selector preflight failed",
             );
         }
@@ -419,10 +426,8 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             Ok(cache) => cache,
             Err(err) => {
                 let message = format!("failed to resolve target projects for push: {err}");
-                return fail_push_manifest_preflight(
-                    &base,
-                    &files,
-                    &message,
+                return fail_manifest_preflight(
+                    message,
                     "skipped because project target resolution failed",
                 );
             }
@@ -430,22 +435,15 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
 
     if let Err(err) = validate_direct_project_ids(&auth_ctx, &preflight.direct_project_ids).await {
         let message = format!("failed to validate project ids for push: {err}");
-        return fail_push_manifest_preflight(
-            &base,
-            &files,
-            &message,
-            "skipped because project id validation failed",
-        );
+        return fail_manifest_preflight(message, "skipped because project id validation failed");
     }
 
     let default_project_id = match resolve_default_project_id(&preflight, &project_name_cache) {
         Ok(id) => id,
         Err(err) => {
             let message = format!("failed to resolve default project for push: {err}");
-            return fail_push_manifest_preflight(
-                &base,
-                &files,
-                &message,
+            return fail_manifest_preflight(
+                message,
                 "skipped because default project resolution failed",
             );
         }
@@ -462,20 +460,16 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         Ok(targets) => targets,
         Err(err) => {
             let message = format!("failed to resolve target projects for push: {err}");
-            return fail_push_manifest_preflight(
-                &base,
-                &files,
-                &message,
+            return fail_manifest_preflight(
+                message,
                 "skipped because project target resolution failed",
             );
         }
     };
 
     if let Err(err) = validate_duplicate_slugs(&resolved_targets.entries) {
-        return fail_push_manifest_preflight(
-            &base,
-            &files,
-            &err.to_string(),
+        return fail_manifest_preflight(
+            err.to_string(),
             "skipped because duplicate slug validation failed",
         );
     }
@@ -493,10 +487,8 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
     };
 
     if resolved_targets.per_file.len() != manifest.files.len() {
-        return fail_push_manifest_preflight(
-            &base,
-            &files,
-            "internal error: resolved target count did not match manifest file count",
+        return fail_manifest_preflight(
+            "internal error: resolved target count did not match manifest file count".to_string(),
             "skipped because internal target resolution failed",
         );
     }
@@ -538,10 +530,8 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
     {
         if resolved_file.source_file != file.source_file {
             spinner.finish_and_clear();
-            return fail_push_manifest_preflight(
-                &base,
-                &files,
-                "internal error: resolved target source mismatch",
+            return fail_manifest_preflight(
+                "internal error: resolved target source mismatch".to_string(),
                 "skipped because internal target resolution failed",
             );
         }
@@ -1092,7 +1082,6 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     let mut js_like = BTreeSet::new();
     let mut python = BTreeSet::new();
     let mut allowed_roots = BTreeSet::new();
-    let mut had_directory_inputs = false;
     let mut explicit_file_inputs = 0usize;
     let mut explicit_supported_files = 0usize;
     let mut explicit_js_like = 0usize;
@@ -1137,7 +1126,6 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
             continue;
         }
 
-        had_directory_inputs = true;
         let canonical_dir = path
             .canonicalize()
             .with_context(|| format!("failed to canonicalize directory {}", path.display()))?;
@@ -1148,7 +1136,6 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     Ok(ClassifiedFiles {
         js_like: js_like.into_iter().collect(),
         python: python.into_iter().collect(),
-        had_directory_inputs,
         explicit_file_inputs,
         explicit_supported_files,
         explicit_js_like,
@@ -1219,7 +1206,9 @@ fn select_push_language(args: &PushArgs, files: &ClassifiedFiles) -> Result<Sour
     match args.language {
         PushLanguage::Auto => {
             if !files.js_like.is_empty() && !files.python.is_empty() {
-                Ok(SourceLanguage::JsLike)
+                bail!(
+                    "mixed source languages are not supported in one push invocation; run separate commands for Python and JS/TS files"
+                );
             } else if !files.python.is_empty() {
                 Ok(SourceLanguage::Python)
             } else {
@@ -1231,11 +1220,7 @@ fn select_push_language(args: &PushArgs, files: &ClassifiedFiles) -> Result<Sour
     }
 }
 
-fn emit_language_selection_notice(
-    args: &PushArgs,
-    files: &ClassifiedFiles,
-    selected_language: SourceLanguage,
-) {
+fn emit_language_selection_notice(files: &ClassifiedFiles, selected_language: SourceLanguage) {
     let has_mixed = !files.js_like.is_empty() && !files.python.is_empty();
     if !has_mixed {
         return;
@@ -1245,16 +1230,6 @@ fn emit_language_selection_notice(
         SourceLanguage::JsLike => (files.js_like.len(), files.python.len(), "python"),
         SourceLanguage::Python => (files.python.len(), files.js_like.len(), "js/ts"),
     };
-
-    if args.language == PushLanguage::Auto
-        && selected_language == SourceLanguage::JsLike
-        && files.had_directory_inputs
-    {
-        eprintln!(
-            "Notice: discovered mixed runtimes during directory scan; defaulting to JS/TS for compatibility and skipping {skipped_count} Python files. Run a separate `bt functions push --language python` invocation."
-        );
-        return;
-    }
 
     if skipped_count > 0 {
         eprintln!(
@@ -2530,22 +2505,36 @@ fn emit_summary(base: &BaseArgs, summary: &PushSummary) -> Result<()> {
     Ok(())
 }
 
-fn fail_push(
+enum FailedPushFiles<'a> {
+    SingleFailed {
+        total_files: usize,
+        file_message: &'a str,
+        reason: HardFailureReason,
+    },
+    AllSkipped {
+        files: &'a [PathBuf],
+        file_message: &'a str,
+    },
+}
+
+fn emit_failed_push_summary(
     base: &BaseArgs,
-    total_files: usize,
     reason: HardFailureReason,
-    message: String,
-    file_message: &str,
+    message: &str,
+    file_shape: FailedPushFiles<'_>,
 ) -> Result<()> {
-    if base.json {
-        let summary = PushSummary {
-            status: CommandStatus::Failed,
+    if !base.json {
+        return Ok(());
+    }
+
+    let (total_files, files) = match file_shape {
+        FailedPushFiles::SingleFailed {
             total_files,
-            uploaded_files: 0,
-            failed_files: 0,
-            skipped_files: total_files,
-            ignored_entries: 0,
-            files: vec![PushFileReport {
+            file_message,
+            reason,
+        } => (
+            total_files,
+            vec![PushFileReport {
                 source_file: String::new(),
                 status: FileStatus::Failed,
                 uploaded_entries: 0,
@@ -2554,34 +2543,13 @@ fn fail_push(
                 bundle_id: None,
                 message: Some(file_message.to_string()),
             }],
-            warnings: vec![],
-            errors: vec![ReportError {
-                reason,
-                message: message.clone(),
-            }],
-        };
-        emit_summary(base, &summary)?;
-    }
-
-    bail!(message);
-}
-
-fn fail_push_with_all_skipped(
-    base: &BaseArgs,
-    files: &[PathBuf],
-    reason: HardFailureReason,
-    message: &str,
-    file_message: &str,
-) -> Result<()> {
-    if base.json {
-        let summary = PushSummary {
-            status: CommandStatus::Failed,
-            total_files: files.len(),
-            uploaded_files: 0,
-            failed_files: 0,
-            skipped_files: files.len(),
-            ignored_entries: 0,
-            files: files
+        ),
+        FailedPushFiles::AllSkipped {
+            files,
+            file_message,
+        } => (
+            files.len(),
+            files
                 .iter()
                 .map(|path| PushFileReport {
                     source_file: path.display().to_string(),
@@ -2593,31 +2561,63 @@ fn fail_push_with_all_skipped(
                     message: Some(file_message.to_string()),
                 })
                 .collect(),
-            warnings: vec![],
-            errors: vec![ReportError {
-                reason,
-                message: message.to_string(),
-            }],
-        };
-        emit_summary(base, &summary)?;
-    }
+        ),
+    };
 
-    bail!(message.to_string());
+    let summary = PushSummary {
+        status: CommandStatus::Failed,
+        total_files,
+        uploaded_files: 0,
+        failed_files: 0,
+        skipped_files: total_files,
+        ignored_entries: 0,
+        files,
+        warnings: vec![],
+        errors: vec![ReportError {
+            reason,
+            message: message.to_string(),
+        }],
+    };
+    emit_summary(base, &summary)
 }
 
-fn fail_push_manifest_preflight(
+fn fail_push(
+    base: &BaseArgs,
+    total_files: usize,
+    reason: HardFailureReason,
+    message: String,
+    file_message: &str,
+) -> Result<()> {
+    emit_failed_push_summary(
+        base,
+        reason,
+        &message,
+        FailedPushFiles::SingleFailed {
+            total_files,
+            file_message,
+            reason,
+        },
+    )?;
+    bail!(message);
+}
+
+fn fail_push_with_all_skipped(
     base: &BaseArgs,
     files: &[PathBuf],
+    reason: HardFailureReason,
     message: &str,
     file_message: &str,
 ) -> Result<()> {
-    fail_push_with_all_skipped(
+    emit_failed_push_summary(
         base,
-        files,
-        HardFailureReason::ManifestSchemaInvalid,
+        reason,
         message,
-        file_message,
-    )
+        FailedPushFiles::AllSkipped {
+            files,
+            file_message,
+        },
+    )?;
+    bail!(message.to_string());
 }
 
 #[cfg(test)]
@@ -2733,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    fn select_push_language_auto_prefers_js_like_for_mixed_scan() {
+    fn select_push_language_auto_rejects_mixed_scan() {
         let args = PushArgs {
             files: vec![PathBuf::from(".")],
             file_flag: vec![],
@@ -2749,7 +2749,6 @@ mod tests {
         let classified = ClassifiedFiles {
             js_like: vec![PathBuf::from("/tmp/a.ts")],
             python: vec![PathBuf::from("/tmp/a.py")],
-            had_directory_inputs: true,
             explicit_file_inputs: 0,
             explicit_supported_files: 0,
             explicit_js_like: 0,
@@ -2757,8 +2756,8 @@ mod tests {
             allowed_roots: Vec::new(),
         };
 
-        let selected = select_push_language(&args, &classified).expect("select language");
-        assert_eq!(selected, SourceLanguage::JsLike);
+        let err = select_push_language(&args, &classified).expect_err("must fail");
+        assert!(err.to_string().contains("mixed source languages"));
     }
 
     #[test]
@@ -2778,7 +2777,6 @@ mod tests {
         let classified = ClassifiedFiles {
             js_like: vec![PathBuf::from("/tmp/a.ts")],
             python: vec![PathBuf::from("/tmp/b.py")],
-            had_directory_inputs: false,
             explicit_file_inputs: 2,
             explicit_supported_files: 2,
             explicit_js_like: 1,

@@ -42,23 +42,8 @@ def to_json_value(value: Any) -> Any:
 
 
 def load_framework_globals() -> tuple[Any, Any, Any]:
-    try:
-        from braintrust.framework2.global_ import functions, prompts
-    except Exception:
-        from braintrust.framework2 import global_ as global_state
-
-        functions = getattr(global_state, "functions", [])
-        prompts = getattr(global_state, "prompts", [])
-
-    lazy = None
-    try:
-        from braintrust.framework2.lazy_load import _set_lazy_load as lazy
-    except Exception:
-        try:
-            from braintrust.framework import _set_lazy_load as lazy
-        except Exception:
-            lazy = None
-
+    from braintrust.framework2.global_ import functions, prompts
+    from braintrust.framework2.lazy_load import _set_lazy_load as lazy
     return functions, prompts, lazy
 
 
@@ -155,7 +140,7 @@ def collect_code_entries(functions_registry: Any) -> list[dict[str, Any]]:
         normalized_function_type = normalize_function_type(function_type)
         if normalized_function_type:
             entry["function_type"] = normalized_function_type
-        if_exists = getattr(item, "if_exists", None) or getattr(item, "ifExists", None)
+        if_exists = getattr(item, "if_exists", None)
         if isinstance(if_exists, str):
             entry["if_exists"] = if_exists
         metadata = getattr(item, "metadata", None)
@@ -172,60 +157,6 @@ def collect_code_entries(functions_registry: Any) -> list[dict[str, Any]]:
 
         entries.append(entry)
     return entries
-
-
-def collect_legacy_prompt_event(item: Any, resolver: Resolver) -> dict[str, Any] | None:
-    name = getattr(item, "name", None)
-    slug = getattr(item, "slug", None)
-    if not isinstance(name, str) or not isinstance(slug, str) or not name or not slug:
-        return None
-
-    prompt = to_json_value(getattr(item, "prompt", {}) or {})
-    if not isinstance(prompt, dict):
-        prompt = {}
-
-    tool_functions = getattr(item, "tool_functions", None)
-    if isinstance(tool_functions, list) and tool_functions:
-        resolved_tools: list[Any] = []
-        for tool in tool_functions:
-            if isinstance(tool, dict):
-                slug_value = tool.get("slug")
-                project = tool.get("project")
-                if isinstance(slug_value, str) and project is not None:
-                    placeholder = selector_to_project_placeholder(project)
-                    if placeholder:
-                        resolved_tools.append(
-                            {"type": "slug", "project_id": placeholder, "slug": slug_value}
-                        )
-                        continue
-                resolved_tools.append(to_json_value(tool))
-            else:
-                resolved_tools.append(to_json_value(tool))
-        if resolved_tools:
-            prompt["tool_functions"] = resolved_tools
-
-    event: dict[str, Any] = {
-        "name": name,
-        "slug": slug,
-        "description": getattr(item, "description", "") or "",
-        "function_data": {"type": "prompt"},
-        "prompt_data": prompt,
-    }
-
-    if_exists = getattr(item, "if_exists", None) or getattr(item, "ifExists", None)
-    if isinstance(if_exists, str):
-        event["if_exists"] = if_exists
-    metadata = getattr(item, "metadata", None)
-    if metadata is not None:
-        event["metadata"] = to_json_value(metadata)
-
-    project_id, project_name = normalize_project_selector(getattr(item, "project", None))
-    out: dict[str, Any] = {"kind": "function_event", "event": event}
-    if project_id:
-        out["project_id"] = project_id
-    if project_name:
-        out["project_name"] = project_name
-    return out
 
 
 async def collect_function_event_entries(prompts_registry: Any) -> list[dict[str, Any]]:
@@ -247,11 +178,6 @@ async def collect_function_event_entries(prompts_registry: Any) -> list[dict[str
                 if project_name:
                     event_entry["project_name"] = project_name
                 entries.append(event_entry)
-            continue
-
-        legacy = collect_legacy_prompt_event(item, resolver)
-        if legacy is not None:
-            entries.append(legacy)
 
     return entries
 

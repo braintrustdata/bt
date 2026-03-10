@@ -49,8 +49,6 @@ pub struct FunctionListPage {
     pub objects: Vec<Value>,
     pub next_cursor: Option<String>,
     pub snapshot: Option<String>,
-    pub pagination_field_present: bool,
-    pub snapshot_field_present: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,37 +168,16 @@ fn parse_function_list_page(raw: Value) -> Result<FunctionListPage> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("missing 'objects' array in /v1/function response"))?;
 
-    let explicit_next_cursor = raw
+    let next_cursor = raw
         .get("next_cursor")
         .and_then(Value::as_str)
-        .or_else(|| raw.get("nextCursor").and_then(Value::as_str))
-        .or_else(|| raw.get("next").and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-
-    let cursor_field = raw
-        .get("cursor")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-
-    let has_more = raw
-        .get("has_more")
-        .and_then(Value::as_bool)
-        .or_else(|| raw.get("hasMore").and_then(Value::as_bool));
-
-    let next_cursor = explicit_next_cursor.or(match has_more {
-        Some(false) => None,
-        _ => cursor_field,
-    });
 
     let snapshot = raw
         .get("snapshot")
         .and_then(Value::as_str)
-        .or_else(|| raw.get("snapshot_id").and_then(Value::as_str))
-        .or_else(|| raw.get("as_of").and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
@@ -209,15 +186,6 @@ fn parse_function_list_page(raw: Value) -> Result<FunctionListPage> {
         objects,
         next_cursor,
         snapshot,
-        pagination_field_present: raw.get("next_cursor").is_some()
-            || raw.get("nextCursor").is_some()
-            || raw.get("next").is_some()
-            || raw.get("cursor").is_some()
-            || raw.get("has_more").is_some()
-            || raw.get("hasMore").is_some(),
-        snapshot_field_present: raw.get("snapshot").is_some()
-            || raw.get("snapshot_id").is_some()
-            || raw.get("as_of").is_some(),
     })
 }
 
@@ -267,24 +235,9 @@ pub async fn insert_functions(
 }
 
 fn ignored_count(raw: &Value) -> Option<usize> {
-    if let Some(count) = raw.get("ignored_count").and_then(Value::as_u64) {
-        return usize::try_from(count).ok();
-    }
-
-    if let Some(items) = raw.get("ignored").and_then(Value::as_array) {
-        return Some(items.len());
-    }
-
-    if let Some(count) = raw
-        .get("stats")
-        .and_then(Value::as_object)
-        .and_then(|stats| stats.get("ignored"))
+    raw.get("ignored_count")
         .and_then(Value::as_u64)
-    {
-        return usize::try_from(count).ok();
-    }
-
-    None
+        .and_then(|count| usize::try_from(count).ok())
 }
 
 #[cfg(test)]
@@ -292,15 +245,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ignored_count_extracts_known_shapes() {
+    fn ignored_count_extracts_canonical_shape() {
         let first = serde_json::json!({ "ignored_count": 3 });
         assert_eq!(ignored_count(&first), Some(3));
 
         let second = serde_json::json!({ "ignored": [1, 2] });
-        assert_eq!(ignored_count(&second), Some(2));
+        assert_eq!(ignored_count(&second), None);
 
         let third = serde_json::json!({ "stats": { "ignored": 5 } });
-        assert_eq!(ignored_count(&third), Some(5));
+        assert_eq!(ignored_count(&third), None);
 
         assert_eq!(ignored_count(&serde_json::json!({})), None);
     }
@@ -313,7 +266,6 @@ mod tests {
 
         let page = parse_function_list_page(raw).expect("parse function page");
         assert!(page.objects.is_empty());
-        assert!(!page.pagination_field_present);
         assert!(page.next_cursor.is_none());
     }
 
@@ -321,37 +273,21 @@ mod tests {
     fn parse_function_list_page_detects_next_pagination_field() {
         let raw = serde_json::json!({
             "objects": [],
-            "next": "cursor-1",
+            "next_cursor": "cursor-1",
         });
 
         let page = parse_function_list_page(raw).expect("parse function page");
-        assert!(page.pagination_field_present);
         assert_eq!(page.next_cursor.as_deref(), Some("cursor-1"));
     }
 
     #[test]
-    fn parse_function_list_page_supports_cursor_has_more_shape() {
+    fn parse_function_list_page_extracts_snapshot() {
         let raw = serde_json::json!({
             "objects": [],
-            "cursor": "cursor-2",
-            "has_more": true,
+            "snapshot": "snapshot-1",
         });
 
         let page = parse_function_list_page(raw).expect("parse function page");
-        assert!(page.pagination_field_present);
-        assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
-    }
-
-    #[test]
-    fn parse_function_list_page_ignores_cursor_when_has_more_false() {
-        let raw = serde_json::json!({
-            "objects": [],
-            "cursor": "cursor-2",
-            "has_more": false,
-        });
-
-        let page = parse_function_list_page(raw).expect("parse function page");
-        assert!(page.pagination_field_present);
-        assert!(page.next_cursor.is_none());
+        assert_eq!(page.snapshot.as_deref(), Some("snapshot-1"));
     }
 }

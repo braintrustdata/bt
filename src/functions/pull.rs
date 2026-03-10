@@ -28,15 +28,6 @@ use crate::ui::{animations_enabled, is_quiet};
 
 const PAGINATION_PAGE_LIMIT: usize = 10_000;
 const OUTPUT_LOCK_FILE: &str = ".bt-functions-pull.lock";
-// Pretty version IDs are a reversible encoding of internal transaction IDs
-// (_xact_id). The encoding multiplies the xact ID (with a fixed top-nibble tag)
-// by COPRIME mod 2^64, producing a 16-hex-char string that looks random but
-// decodes back via the modular inverse.  This lets `--version` accept either the
-// raw numeric xact ID or the pretty hex form transparently.
-const TOP_BITS: u64 = 0x0DE1u64 << 48;
-const MODULUS: u128 = 1u128 << 64;
-const COPRIME: u64 = 205_891_132_094_649;
-const COPRIME_INVERSE: u64 = 1_522_336_535_492_693_385;
 
 #[derive(Debug, Clone, Deserialize)]
 struct PullFunctionRow {
@@ -135,28 +126,6 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
 
     if let Some(project_id) = &args.project_id {
         query.project_id = Some(project_id.clone());
-    } else if let Some(project_name) = &args.project_name {
-        let projects = match get_projects_cached(&auth_ctx.client, &mut projects_cache).await {
-            Ok(projects) => projects,
-            Err(err) => {
-                return fail_pull(
-                    &base,
-                    &mut summary,
-                    HardFailureReason::ResponseInvalid,
-                    err.to_string(),
-                );
-            }
-        };
-        if let Err(err) = ensure_unambiguous_project_name(projects, project_name) {
-            return fail_pull(
-                &base,
-                &mut summary,
-                HardFailureReason::ResponseInvalid,
-                err.to_string(),
-            );
-        }
-        resolved_project_name = Some(project_name.clone());
-        query.project_name = Some(project_name.clone());
     } else {
         let project = match resolve_project_context_optional(&base, &auth_ctx, false).await {
             Ok(project) => project,
@@ -179,17 +148,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         query.id = Some(id.clone());
     }
     if let Some(version) = &args.version {
-        query.version = match load_pretty_xact_compat(version) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                return fail_pull(
-                    &base,
-                    &mut summary,
-                    HardFailureReason::ResponseInvalid,
-                    err.to_string(),
-                );
-            }
-        };
+        query.version = Some(version.clone());
     }
     let resolved_slugs = args.resolved_slugs();
     if resolved_slugs.len() == 1 {
@@ -269,23 +228,13 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
 
     let winners = select_winner_rows(narrowed_rows, &mut summary);
 
-    if (args.id.is_some() || args.has_slug_selector()) && winners.is_empty() {
-        spinner.finish_and_clear();
-        return fail_pull(
-            &base,
-            &mut summary,
-            HardFailureReason::SelectorNotFound,
-            "no matching function rows found for selector".to_string(),
-        );
-    }
-
     let mut materializable = Vec::new();
     for row in winners.iter().cloned() {
         if is_prompt_row(&row) {
             materializable.push(row);
         } else {
             summary.unsupported_records_skipped += 1;
-            if !is_quiet() {
+            if args.verbose {
                 eprintln!(
                     "{} skipping '{}' because it is not a prompt",
                     style("warning:").yellow(),
@@ -453,12 +402,12 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
                 .filter(|f| f.status == FileStatus::Success)
                 .map(|f| short_display_path(&f.output_file, cwd.as_deref()))
                 .collect();
-            let file_label = if pulled_files.is_empty() {
-                from_label.clone()
+            if pulled_files.is_empty() {
+                eprintln!("No functions to pull from {from_label}");
             } else {
-                pulled_files.join(", ")
-            };
-            eprintln!("{} Pulled {subject} to {file_label}", style("✓").green(),);
+                let file_label = pulled_files.join(", ");
+                eprintln!("{} Pulled {subject} to {file_label}", style("✓").green(),);
+            }
         }
     }
     emit_summary(&base, &summary, args.verbose)?;
@@ -479,41 +428,6 @@ async fn get_projects_cached<'a>(
     Ok(cache
         .as_deref()
         .expect("project cache should be initialized"))
-}
-
-fn ensure_unambiguous_project_name(projects: &[Project], project_name: &str) -> Result<()> {
-    let exact: Vec<_> = projects
-        .iter()
-        .filter(|project| project.name == project_name)
-        .collect();
-
-    match exact.len() {
-        0 => bail!("project '{project_name}' not found"),
-        1 => Ok(()),
-        count => {
-            bail!("project-name '{project_name}' is ambiguous ({count} matches); use --project-id")
-        }
-    }
-}
-
-fn modular_multiply(value: u64, prime: u64) -> u64 {
-    ((value as u128 * prime as u128) % MODULUS) as u64
-}
-
-fn load_pretty_xact_compat(encoded_hex: &str) -> Result<String> {
-    if encoded_hex.len() != 16 {
-        return Ok(encoded_hex.to_string());
-    }
-    let value = u64::from_str_radix(encoded_hex, 16).with_context(|| {
-        format!("invalid pretty version '{encoded_hex}' (expected 16 hex characters)")
-    })?;
-    let multiplied_inverse = modular_multiply(value, COPRIME_INVERSE);
-    let with_top_bits = TOP_BITS | multiplied_inverse;
-    let roundtrip = modular_multiply(with_top_bits, COPRIME);
-    if roundtrip != value {
-        bail!("invalid pretty version '{encoded_hex}' (failed compatibility decode)");
-    }
-    Ok(with_top_bits.to_string())
 }
 
 struct FetchRowsResult {
@@ -544,18 +458,11 @@ async fn fetch_all_function_rows(
         page_query.snapshot = snapshot.clone();
 
         let page = api::list_functions_page(client, &page_query).await?;
-
-        if page_count == 0 && !page.pagination_field_present {
-            page_count += 1;
-            rows.extend(page.objects);
-            break;
-        }
-
         page_count += 1;
 
         if page_count == 1 {
             snapshot = page.snapshot.clone();
-        } else if snapshot.is_none() || !page.snapshot_field_present {
+        } else if snapshot != page.snapshot {
             snapshot_consistent = false;
         }
 
@@ -1177,7 +1084,7 @@ fn render_project_file_ts(
     out.push_str("// This file was automatically generated by bt functions pull. You can\n");
     out.push_str("// generate it again by running:\n");
     out.push_str(&format!(
-        "//  $ bt functions pull --project-name {}\n",
+        "//  $ bt functions pull --project {}\n",
         serde_json::to_string(project_name)?
     ));
     out.push_str(
@@ -1252,7 +1159,7 @@ fn render_project_file_py(
     out.push_str("# This file was automatically generated by bt functions pull. You can\n");
     out.push_str("# generate it again by running:\n");
     out.push_str(&format!(
-        "#  $ bt functions pull --project-name {} --language python\n",
+        "#  $ bt functions pull --project {} --language python\n",
         serde_json::to_string(project_name)?
     ));
     out.push_str(
@@ -1646,7 +1553,6 @@ mod tests {
             slug_flag: vec![],
             output_dir: PathBuf::from("."),
             language: FunctionsLanguage::Typescript,
-            project_name: None,
             project_id: None,
             id: Some("missing".to_string()),
             version: None,
@@ -1703,7 +1609,6 @@ mod tests {
             slug_flag: vec!["gamma".to_string()],
             output_dir: PathBuf::from("."),
             language: FunctionsLanguage::Typescript,
-            project_name: None,
             project_id: None,
             id: None,
             version: None,
@@ -1803,54 +1708,6 @@ mod tests {
     }
 
     #[test]
-    fn render_project_file_matches_legacy_shape() {
-        let row = PullFunctionRow {
-            id: "f1".to_string(),
-            name: "Doc Search".to_string(),
-            slug: "doc-search".to_string(),
-            project_id: "p1".to_string(),
-            project_name: Some("woohoo".to_string()),
-            description: Some(String::new()),
-            prompt_data: Some(serde_json::json!({
-                "prompt": {
-                    "type": "chat",
-                    "messages": [
-                        { "content": "Hello", "role": "system" }
-                    ]
-                },
-                "options": {
-                    "model": "gpt-4o-mini"
-                },
-                "tool_functions": [
-                    { "type": "function", "id": "tool-1" }
-                ]
-            })),
-            function_data: Some(serde_json::json!({ "type": "prompt" })),
-            created: None,
-            _xact_id: Some("123".to_string()),
-        };
-
-        let rendered = render_project_file(
-            FunctionsLanguage::Typescript,
-            "woohoo",
-            "braintrust/woohoo.ts",
-            &[row],
-        )
-        .expect("rendered");
-
-        assert!(rendered.contains("automatically generated by bt functions pull"));
-        assert!(rendered.contains("bt functions pull --project-name \"woohoo\""));
-        assert!(rendered.contains("bt functions push --file \"braintrust/woohoo.ts\""));
-        assert!(
-            rendered.contains("const project = braintrust.projects.create({\n  name: \"woohoo\",")
-        );
-        assert!(rendered.contains("export const docSearch = project.prompts.create({"));
-        assert!(!rendered.contains("description: \"\","));
-        assert!(!rendered.contains("version:"));
-        assert!(!rendered.contains("id: \"f1\""));
-    }
-
-    #[test]
     fn render_project_file_python_shape() {
         let row = PullFunctionRow {
             id: "f1".to_string(),
@@ -1887,7 +1744,7 @@ mod tests {
         )
         .expect("rendered");
 
-        assert!(rendered.contains("bt functions pull --project-name \"woohoo\" --language python"));
+        assert!(rendered.contains("bt functions pull --project \"woohoo\" --language python"));
         assert!(rendered.contains("bt functions push --file \"braintrust/woohoo.py\""));
         assert!(rendered.contains("import braintrust"));
         assert!(rendered.contains("project = braintrust.projects.create(name=\"woohoo\")"));

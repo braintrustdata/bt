@@ -4,7 +4,6 @@
   "stdout_contains": [
     "--output-dir",
     "--project-id",
-    "--project-name",
     "--id",
     "--slug",
     "--version",

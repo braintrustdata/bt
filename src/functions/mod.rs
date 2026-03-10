@@ -369,23 +369,15 @@ pub(crate) struct PullArgs {
     )]
     pub language: FunctionsLanguage,
 
-    /// Project name filter.
-    #[arg(long, env = "BT_FUNCTIONS_PULL_PROJECT_NAME")]
-    pub project_name: Option<String>,
-
     /// Project id filter.
-    #[arg(
-        long,
-        env = "BT_FUNCTIONS_PULL_PROJECT_ID",
-        conflicts_with = "project_name"
-    )]
+    #[arg(long, env = "BT_FUNCTIONS_PULL_PROJECT_ID")]
     pub project_id: Option<String>,
 
     /// Function id selector.
     #[arg(long, env = "BT_FUNCTIONS_PULL_ID")]
     pub id: Option<String>,
 
-    /// Version selector (supports pretty version IDs).
+    /// Version selector.
     #[arg(long, env = "BT_FUNCTIONS_PULL_VERSION")]
     pub version: Option<String>,
 
@@ -413,10 +405,6 @@ impl PullArgs {
             }
         }
         result
-    }
-
-    pub fn has_slug_selector(&self) -> bool {
-        !self.slugs.is_empty() || !self.slug_flag.is_empty()
     }
 }
 
@@ -601,58 +589,40 @@ pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFil
 }
 
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
+    let function_type = args.function_type;
     match args.command {
-        None => {
+        Some(FunctionsCommands::Push(push_args)) => push::run(base, push_args).await,
+        Some(FunctionsCommands::Pull(pull_args)) => pull::run(base, pull_args).await,
+        command => {
             let ctx = resolve_context(&base).await?;
-            list::run(&ctx, base.json, args.function_type).await
+            match command {
+                None => list::run(&ctx, base.json, function_type).await,
+                Some(FunctionsCommands::List(la)) => {
+                    list::run(&ctx, base.json, la.function_type.or(function_type)).await
+                }
+                Some(FunctionsCommands::View(v)) => {
+                    view::run(
+                        &ctx,
+                        v.inner.slug(),
+                        base.json,
+                        v.inner.web,
+                        v.inner.verbose,
+                        v.function_type.or(function_type),
+                    )
+                    .await
+                }
+                Some(FunctionsCommands::Delete(d)) => {
+                    delete::run(&ctx, d.slug(), d.force, d.function_type.or(function_type)).await
+                }
+                Some(FunctionsCommands::Invoke(i)) => {
+                    invoke::run(&ctx, &i.inner, base.json, i.function_type.or(function_type)).await
+                }
+                Some(FunctionsCommands::Push(_)) | Some(FunctionsCommands::Pull(_)) => {
+                    unreachable!("handled before context resolution")
+                }
+            }
         }
-        Some(FunctionsCommands::List(ref la)) => {
-            let ctx = resolve_context(&base).await?;
-            list::run(&ctx, base.json, la.function_type.or(args.function_type)).await
-        }
-        Some(FunctionsCommands::View(v)) => {
-            let ctx = resolve_context(&base).await?;
-            view::run(
-                &ctx,
-                v.inner.slug(),
-                base.json,
-                v.inner.web,
-                v.inner.verbose,
-                v.function_type.or(args.function_type),
-            )
-            .await
-        }
-        Some(FunctionsCommands::Delete(d)) => {
-            let ctx = resolve_context(&base).await?;
-            delete::run(
-                &ctx,
-                d.slug(),
-                d.force,
-                d.function_type.or(args.function_type),
-            )
-            .await
-        }
-        Some(FunctionsCommands::Invoke(i)) => {
-            let ctx = resolve_context(&base).await?;
-            invoke::run(
-                &ctx,
-                &i.inner,
-                base.json,
-                i.function_type.or(args.function_type),
-            )
-            .await
-        }
-        Some(FunctionsCommands::Push(args)) => push::run(base, args).await,
-        Some(FunctionsCommands::Pull(args)) => pull::run(base, args).await,
     }
-}
-
-pub async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
-    push::run(base, args).await
-}
-
-pub async fn run_pull(base: BaseArgs, args: PullArgs) -> Result<()> {
-    pull::run(base, args).await
 }
 
 #[cfg(test)]
@@ -893,22 +863,6 @@ mod tests {
         let err =
             parse(&["functions", "push", "--language", "typescript"]).expect_err("should fail");
         assert!(err.to_string().contains("typescript"));
-    }
-
-    #[test]
-    fn pull_conflicts_project_selectors() {
-        let _guard = test_lock();
-        let err = parse(&[
-            "functions",
-            "pull",
-            "--project-id",
-            "p1",
-            "--project-name",
-            "proj",
-        ])
-        .expect_err("should conflict");
-
-        assert!(err.to_string().contains("--project-name"));
     }
 
     #[test]
