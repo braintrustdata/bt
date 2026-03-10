@@ -83,6 +83,7 @@ type Manifest = {
 };
 
 type EvalRegistry = NonNullable<typeof globalThis._evals>;
+let moduleImportNonce = 0;
 
 function freshRegistry(): EvalRegistry {
   return {
@@ -113,6 +114,15 @@ function currentRegistry(fallback: EvalRegistry): EvalRegistry {
         ? registry.reporters
         : {},
   };
+}
+
+function buildIsolatedImportUrl(absolutePath: string): string {
+  const moduleUrl = pathToFileURL(absolutePath);
+  // Force top-level evaluation for each input file, even if imported earlier
+  // as a dependency while processing a previous input file.
+  moduleUrl.searchParams.set("bt_runner_input_nonce", `${moduleImportNonce}`);
+  moduleImportNonce += 1;
+  return moduleUrl.href;
 }
 
 async function collectFunctionEvents(
@@ -316,7 +326,7 @@ async function processFile(filePath: string): Promise<ManifestFile> {
   globalThis._evals = fallbackRegistry;
   globalThis._lazy_load = true;
 
-  await import(pathToFileURL(absolutePath).href);
+  await import(buildIsolatedImportUrl(absolutePath));
   const registry = currentRegistry(fallbackRegistry);
 
   const entries: Array<CodeEntry | FunctionEventEntry> = [
