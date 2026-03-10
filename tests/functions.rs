@@ -903,6 +903,157 @@ globalThis._evals.functions.push({
 }
 
 #[test]
+fn functions_js_runner_reexecutes_imported_input_files() {
+    if !command_exists("node") {
+        eprintln!(
+            "Skipping functions_js_runner_reexecutes_imported_input_files (node not installed)."
+        );
+        return;
+    }
+    let Some(tsc) = find_tsc() else {
+        eprintln!(
+            "Skipping functions_js_runner_reexecutes_imported_input_files (tsc not installed)."
+        );
+        return;
+    };
+
+    let root = repo_root();
+    let tmp = tempdir().expect("tempdir");
+    let sample_b_path = tmp.path().join("sample-b.mjs");
+    std::fs::write(
+        &sample_b_path,
+        r#"globalThis._evals ??= { functions: [], prompts: [], parameters: [], evaluators: {}, reporters: {} };
+globalThis._evals.functions.push({
+  name: "js-tool-b",
+  slug: "js-tool-b",
+  type: "tool",
+  preview: "export function b() { return 2; }"
+});
+export const b = 2;
+"#,
+    )
+    .expect("write sample-b.mjs");
+
+    let sample_a_path = tmp.path().join("sample-a.mjs");
+    std::fs::write(
+        &sample_a_path,
+        r#"import "./sample-b.mjs";
+globalThis._evals ??= { functions: [], prompts: [], parameters: [], evaluators: {}, reporters: {} };
+globalThis._evals.functions.push({
+  name: "js-tool-a",
+  slug: "js-tool-a",
+  type: "tool",
+  preview: "export function a() { return 1; }"
+});
+"#,
+    )
+    .expect("write sample-a.mjs");
+
+    let runner_dir = tmp.path().join("runner");
+    let compile_output = Command::new(&tsc)
+        .current_dir(&root)
+        .args([
+            "scripts/functions-runner.ts",
+            "scripts/runner-common.ts",
+            "--module",
+            "esnext",
+            "--target",
+            "es2020",
+            "--moduleResolution",
+            "bundler",
+            "--outDir",
+        ])
+        .arg(&runner_dir)
+        .output()
+        .expect("compile functions runner");
+    if !compile_output.status.success() {
+        let stderr = String::from_utf8_lossy(&compile_output.stderr);
+        panic!("tsc failed for functions runner:\n{stderr}");
+    }
+
+    let runner_js = runner_dir.join("functions-runner.js");
+    let runner_common_js = runner_dir.join("runner-common.js");
+    assert!(runner_js.is_file(), "compiled functions-runner.js missing");
+    assert!(
+        runner_common_js.is_file(),
+        "compiled runner-common.js missing"
+    );
+
+    let runner_code = std::fs::read_to_string(&runner_js).expect("read compiled runner");
+    let patched_runner_code = runner_code
+        .replace("\"./runner-common\"", "\"./runner-common.js\"")
+        .replace("'./runner-common'", "'./runner-common.js'");
+    assert_ne!(
+        runner_code, patched_runner_code,
+        "compiled runner import path did not contain ./runner-common"
+    );
+    std::fs::write(&runner_js, patched_runner_code).expect("write patched compiled runner");
+    std::fs::write(runner_dir.join("package.json"), r#"{ "type": "module" }"#)
+        .expect("write runner package.json");
+
+    let output = Command::new("node")
+        .arg(&runner_js)
+        .arg(&sample_a_path)
+        .arg(&sample_b_path)
+        .output()
+        .expect("run compiled functions runner");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("compiled functions runner failed:\n{stderr}");
+    }
+
+    let manifest: Value = serde_json::from_slice(&output.stdout).expect("parse manifest JSON");
+    let files = manifest["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 2, "expected two manifest files");
+
+    let sample_a_canonical = sample_a_path
+        .canonicalize()
+        .expect("canonicalize sample-a.mjs");
+    let sample_b_canonical = sample_b_path
+        .canonicalize()
+        .expect("canonicalize sample-b.mjs");
+    let mut files_by_source = BTreeMap::new();
+    for file in files {
+        let source_file = file
+            .get("source_file")
+            .and_then(Value::as_str)
+            .expect("source_file");
+        let canonical_source = PathBuf::from(source_file)
+            .canonicalize()
+            .expect("canonicalize manifest source_file");
+        files_by_source.insert(canonical_source, file);
+    }
+
+    let file_a = files_by_source
+        .get(&sample_a_canonical)
+        .expect("manifest file for sample-a.mjs");
+    let entries_a = file_a
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("sample-a entries");
+    assert!(
+        entries_a
+            .iter()
+            .any(|entry| { entry.get("slug").and_then(Value::as_str) == Some("js-tool-a") }),
+        "expected sample-a.mjs entries to include js-tool-a"
+    );
+
+    let file_b = files_by_source
+        .get(&sample_b_canonical)
+        .expect("manifest file for sample-b.mjs");
+    let entries_b = file_b
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("sample-b entries");
+    assert!(
+        entries_b
+            .iter()
+            .any(|entry| { entry.get("slug").and_then(Value::as_str) == Some("js-tool-b") }),
+        "expected sample-b.mjs entries to include js-tool-b"
+    );
+}
+
+#[test]
 fn functions_python_runner_emits_valid_manifest_with_bundle() {
     let Some(python) = find_python() else {
         eprintln!(
