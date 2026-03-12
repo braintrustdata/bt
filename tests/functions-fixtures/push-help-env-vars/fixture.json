@@ -1,0 +1,14 @@
+{
+  "command": ["functions", "push", "--help"],
+  "expect_success": true,
+  "stdout_contains": [
+    "BT_FUNCTIONS_PUSH_FILES",
+    "BT_FUNCTIONS_PUSH_IF_EXISTS",
+    "BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE",
+    "BT_FUNCTIONS_PUSH_RUNNER",
+    "BT_FUNCTIONS_PUSH_LANGUAGE",
+    "BT_FUNCTIONS_PUSH_REQUIREMENTS",
+    "BT_FUNCTIONS_PUSH_TSCONFIG",
+    "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES"
+  ]
+}

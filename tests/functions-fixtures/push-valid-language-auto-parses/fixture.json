@@ -1,0 +1,6 @@
+{
+  "command": ["functions", "push", "--language", "auto", "--type", "tool"],
+  "expect_success": false,
+  "stderr_contains": ["--type"],
+  "stderr_not_contains": ["invalid value 'auto'"]
+}

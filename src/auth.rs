@@ -60,6 +60,13 @@ pub struct ProfileInfo {
     pub api_key_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableOrg {
+    pub id: String,
+    pub name: String,
+    pub api_url: Option<String>,
+}
+
 pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
     let store = load_auth_store()?;
     Ok(store
@@ -153,6 +160,34 @@ pub fn select_profile_interactive(current: Option<&str>) -> Result<Option<String
         .unwrap_or(0);
     let idx = crate::ui::fuzzy_select("Select org", &labels, default)?;
     Ok(Some(profiles[idx].name.clone()))
+}
+
+pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
+    let resolved = resolve_auth(base).await?;
+    let app_url = resolved
+        .app_url
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let api_key = match resolved.api_key {
+        Some(api_key) => api_key,
+        None => login(base).await?.login.api_key,
+    };
+
+    let mut orgs = fetch_login_orgs(&api_key, &app_url).await?;
+    orgs.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(orgs
+        .into_iter()
+        .map(|org| AvailableOrg {
+            id: org.id,
+            name: org.name,
+            api_url: org.api_url,
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,0 +1,6 @@
+{
+  "command": ["functions", "push", "--tsconfig", "./tsconfig.json", "--help"],
+  "expect_success": true,
+  "stdout_contains": ["--tsconfig"],
+  "stderr_not_contains": ["unexpected argument", "unrecognized"]
+}
