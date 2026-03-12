@@ -1,13 +1,11 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::{
     args::BaseArgs,
-    auth::login,
-    config,
     http::ApiClient,
-    projects::api::{get_project_by_name, Project},
-    ui::{self, is_interactive, select_project_interactive, with_spinner},
+    projects::context::{resolve_project_context, ProjectContext},
+    ui::{self, with_spinner},
 };
 
 pub(crate) mod api;
@@ -245,30 +243,7 @@ impl DeleteArgs {
 
 // --- Resolved context ---
 
-pub(crate) struct ResolvedContext {
-    pub client: ApiClient,
-    pub app_url: String,
-    pub project: Project,
-}
-
-async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
-    let ctx = login(base).await?;
-    let client = ApiClient::new(&ctx)?;
-    let config_project = config::load().ok().and_then(|c| c.project);
-    let project_name = match base.project.as_deref().or(config_project.as_deref()) {
-        Some(p) => p.to_string(),
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
-        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
-    };
-    let project = get_project_by_name(&client, &project_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
-    Ok(ResolvedContext {
-        client,
-        app_url: ctx.app_url,
-        project,
-    })
-}
+pub(crate) type ResolvedContext = ProjectContext;
 
 // --- Interactive selection ---
 
@@ -309,38 +284,56 @@ pub(crate) async fn select_function_interactive(
 // --- Entry points ---
 
 pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
-    let ctx = resolve_context(&base).await?;
     let ft = Some(kind);
     match args.command {
-        None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
+        None | Some(FunctionCommands::List) => {
+            let ctx = resolve_project_context(&base, true).await?;
+            list::run(&ctx, base.json, ft).await
+        }
         Some(FunctionCommands::View(v)) => {
+            let ctx = resolve_project_context(&base, true).await?;
             view::run(&ctx, v.slug(), base.json, v.web, v.verbose, ft).await
         }
-        Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
-        Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
+        Some(FunctionCommands::Delete(d)) => {
+            let ctx = resolve_project_context(&base, false).await?;
+            delete::run(&ctx, d.slug(), d.force, ft).await
+        }
+        Some(FunctionCommands::Invoke(i)) => {
+            let ctx = resolve_project_context(&base, false).await?;
+            invoke::run(&ctx, &i, base.json, ft).await
+        }
     }
 }
 
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
-    let ctx = resolve_context(&base).await?;
+    let default_function_type = args.function_type;
     match args.command {
-        None => list::run(&ctx, base.json, args.function_type).await,
-        Some(FunctionsCommands::List(ref la)) => list::run(&ctx, base.json, la.function_type).await,
+        None => {
+            let ctx = resolve_project_context(&base, true).await?;
+            list::run(&ctx, base.json, default_function_type).await
+        }
+        Some(FunctionsCommands::List(la)) => {
+            let ctx = resolve_project_context(&base, true).await?;
+            list::run(&ctx, base.json, la.function_type).await
+        }
         Some(FunctionsCommands::View(v)) => {
+            let ctx = resolve_project_context(&base, true).await?;
             view::run(
                 &ctx,
                 v.slug(),
                 base.json,
                 v.web,
                 v.verbose,
-                args.function_type,
+                default_function_type,
             )
             .await
         }
         Some(FunctionsCommands::Delete(d)) => {
+            let ctx = resolve_project_context(&base, false).await?;
             delete::run(&ctx, d.slug(), d.force, d.function_type).await
         }
         Some(FunctionsCommands::Invoke(i)) => {
+            let ctx = resolve_project_context(&base, false).await?;
             invoke::run(&ctx, &i.inner, base.json, i.function_type).await
         }
     }
