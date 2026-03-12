@@ -1485,13 +1485,26 @@ async fn dev_server_eval(
         let (tx, rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             let mut saw_error = false;
-            let mut saw_done = false;
+            let mut stderr_lines: Vec<String> = Vec::new();
             let output = drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
                 if matches!(event, EvalEvent::Error { .. }) {
                     saw_error = true;
                 }
                 if matches!(event, EvalEvent::Done) {
-                    saw_done = true;
+                    return;
+                }
+                if let EvalEvent::Console {
+                    ref stream,
+                    ref message,
+                } = event
+                {
+                    for line in message.lines() {
+                        let _ = tx.send(format!(": [{stream}] {line}\n"));
+                    }
+                    if stream == "stderr" {
+                        stderr_lines.push(message.clone());
+                    }
+                    return;
                 }
                 if let Some(encoded) = encode_eval_event_for_http(&event) {
                     let _ = tx.send(encoded);
@@ -1502,10 +1515,13 @@ async fn dev_server_eval(
             match output {
                 Ok(output) => {
                     if !output.status.success() && !saw_error {
-                        let error = serialize_sse_event(
-                            "error",
-                            &json!({ "message": "Eval runner exited with an error." }).to_string(),
-                        );
+                        let mut detail = format!("Eval runner exited with {}.", output.status);
+                        for line in stderr_lines.iter() {
+                            detail.push('\n');
+                            detail.push_str(line);
+                        }
+                        let error =
+                            serialize_sse_event("error", &json!({ "message": detail }).to_string());
                         let _ = tx.send(error);
                     }
                 }
@@ -1518,9 +1534,7 @@ async fn dev_server_eval(
                 }
             }
 
-            if !saw_done {
-                let _ = tx.send(serialize_sse_event("done", ""));
-            }
+            let _ = tx.send(serialize_sse_event("done", ""));
         });
 
         let response_stream = stream::unfold(rx, |mut rx| async {
@@ -2486,6 +2500,10 @@ struct ExperimentStart {
     project_name: Option<String>,
     #[serde(default, alias = "experiment_name")]
     experiment_name: Option<String>,
+    #[serde(default, alias = "project_id")]
+    project_id: Option<String>,
+    #[serde(default, alias = "experiment_id")]
+    experiment_id: Option<String>,
     #[serde(default, alias = "project_url")]
     project_url: Option<String>,
     #[serde(default, alias = "experiment_url")]
