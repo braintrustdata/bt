@@ -1,0 +1,5 @@
+{
+  "files": ["basic.eval.ts", "eval_basic.py"],
+  "runners_js": ["tsx", "bun", "deno"],
+  "runners_python": ["python"]
+}
