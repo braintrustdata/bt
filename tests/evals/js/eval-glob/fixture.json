@@ -1,4 +1,4 @@
 {
   "files": [".", "tests/**/*.eval.mjs"],
-  "runners": ["tsx"]
+  "runners_js": ["tsx"]
 }

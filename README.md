@@ -136,12 +136,14 @@ Files inside `node_modules`, `.venv`, `venv`, `site-packages`, `dist-packages`, 
 **Runners:**
 
 - By default, `bt eval` auto-detects a JavaScript runner from your project (`tsx`, `vite-node`, `ts-node`, then `ts-node-esm`).
-- Set a runner explicitly with `--runner` / `BT_EVAL_RUNNER`:
-  - `bt eval --runner vite-node tutorial.eval.ts`
-  - `bt eval --runner tsx tutorial.eval.ts`
+- Set a JavaScript runner explicitly with `--runner-js` / `BT_EVAL_JS_RUNNER`:
+  - `bt eval --runner-js vite-node tutorial.eval.ts`
+  - `bt eval --runner-js tsx tutorial.eval.ts`
+- Set a Python runner explicitly with `--runner-python` / `BT_EVAL_PYTHON_RUNNER`:
+  - `bt eval --runner-python python tutorial.eval.py`
 - `bt` resolves local `node_modules/.bin` entries automatically — no need for a full path.
 - If eval execution fails with ESM/top-level-await related errors, retry with:
-  - `bt eval --runner vite-node tutorial.eval.ts`
+  - `bt eval --runner-js vite-node tutorial.eval.ts`
 
 **Passing arguments to the eval file:**
 

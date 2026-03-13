@@ -13,9 +13,9 @@ use serde_json::Value;
 #[derive(Debug, Deserialize, Clone)]
 struct FixtureConfig {
     files: Vec<String>,
-    runtime: Option<String>,
-    runner: Option<String>,
-    runners: Option<Vec<String>>,
+
+    runners_js: Option<Vec<String>>,
+    runners_python: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
     args: Option<Vec<String>>,
     /// Args appended after the file list, e.g. `["--", "--description", "foo"]`
@@ -55,13 +55,14 @@ fn eval_fixtures() {
     };
 
     let mut fixture_dirs: Vec<PathBuf> = Vec::new();
-    for runtime_dir in ["js", "py"] {
-        let root_dir = fixtures_root.join(runtime_dir);
-        if !root_dir.exists() {
-            continue;
-        }
-        let mut dirs: Vec<PathBuf> = fs::read_dir(&root_dir)
-            .expect("read fixtures dir")
+    for category_entry in fs::read_dir(&fixtures_root)
+        .expect("read evals root dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+    {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(&category_entry)
+            .expect("read fixtures category dir")
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
@@ -85,22 +86,23 @@ fn eval_fixtures() {
             panic!("Fixture {fixture_name} has no files configured.");
         }
 
-        let runtime = config.runtime.as_deref().unwrap_or("node");
+        let has_js = config_has_js_files(&config);
+        let has_python = config_has_python_files(&config);
+        let is_mixed = has_js && has_python;
+
         if let Some(selected) = selected_runtimes.as_ref() {
-            if !selected.contains(runtime) {
-                eprintln!("Skipping {fixture_name} (runtime {runtime} filtered out).");
+            let fixture_runtimes = config_fixture_runtimes(&config);
+            if fixture_runtimes.is_disjoint(selected) {
+                eprintln!("Skipping {fixture_name} (no matching runtimes).");
                 continue;
             }
         }
-        match runtime {
-            "node" => ensure_dependencies(&dir),
-            "bun" => ensure_dependencies(&dir),
-            "deno" => ensure_dependencies(&dir),
-            "python" => {}
-            other => panic!("Unsupported runtime for fixture {fixture_name}: {other}"),
+
+        if has_js {
+            ensure_dependencies(&dir);
         }
 
-        let python_runner = if runtime == "python" {
+        let python_runner = if has_python {
             match ensure_python_env(&fixtures_root.join("py")) {
                 Some(python) => Some(python),
                 None => {
@@ -117,81 +119,182 @@ fn eval_fixtures() {
             None
         };
 
-        let runners = collect_runners(&config);
         let mut ran_variant = false;
-        for runner in runners {
-            if needs_bun(runtime, runner.as_deref()) && !command_exists("bun") {
-                if required_runtimes().contains("bun") {
-                    panic!("Bun runtime is required but unavailable for fixture {fixture_name}");
+        if is_mixed {
+            let variants = collect_mixed_runner_variants(&config);
+            for (js_runner, py_runner) in &variants {
+                if needs_bun(js_runner.as_deref()) && !command_exists("bun") {
+                    if required_runtimes().contains("bun") {
+                        panic!(
+                            "Bun runtime is required but unavailable for fixture {fixture_name}"
+                        );
+                    }
+                    let label = js_runner.as_deref().unwrap_or("default");
+                    eprintln!("Skipping {fixture_name} [js={label}] (bun not installed).");
+                    continue;
                 }
-                let label = runner.as_deref().unwrap_or("default");
-                eprintln!("Skipping {fixture_name} [{label}] (bun not installed).");
-                continue;
-            }
-            if needs_deno(runtime, runner.as_deref()) && !command_exists("deno") {
-                if required_runtimes().contains("deno") {
-                    panic!("Deno runtime is required but unavailable for fixture {fixture_name}");
+                if needs_deno(js_runner.as_deref()) && !command_exists("deno") {
+                    if required_runtimes().contains("deno") {
+                        panic!(
+                            "Deno runtime is required but unavailable for fixture {fixture_name}"
+                        );
+                    }
+                    let label = js_runner.as_deref().unwrap_or("default");
+                    eprintln!("Skipping {fixture_name} [js={label}] (deno not installed).");
+                    continue;
                 }
-                let label = runner.as_deref().unwrap_or("default");
-                eprintln!("Skipping {fixture_name} [{label}] (deno not installed).");
-                continue;
-            }
 
-            let mut cmd = Command::new(&bt_path);
-            cmd.arg("eval");
-            if let Some(args) = config.args.as_ref() {
-                cmd.args(args);
-            }
-            let resolved_runner = resolve_runner(&dir, runner.as_deref(), python_runner.as_ref());
-            if let Some(runner_cmd) = resolved_runner.as_ref() {
-                cmd.arg("--runner").arg(runner_cmd);
-            }
-            cmd.args(&config.files);
-            if let Some(trailing_args) = config.trailing_args.as_ref() {
-                cmd.args(trailing_args);
-            }
-            cmd.current_dir(&dir);
-            cmd.env("BT_EVAL_LOCAL", "1");
-            cmd.env(
-                "BRAINTRUST_API_KEY",
-                std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
-            );
-
-            if let Some(env) = config.env.as_ref() {
-                for (key, value) in env {
-                    cmd.env(key, value);
+                let mut cmd = Command::new(&bt_path);
+                cmd.arg("eval");
+                if let Some(args) = config.args.as_ref() {
+                    cmd.args(args);
                 }
-            }
-
-            if runner.is_some() {
-                if let Some(tsx_path) = local_tsx_path(&dir) {
-                    cmd.env("BT_EVAL_RUNNER", tsx_path);
+                if let Some(js_cmd) = js_runner.as_ref() {
+                    if let Some(resolved) = resolve_runner(&dir, Some(js_cmd.as_str()), None) {
+                        cmd.arg("--runner-js").arg(resolved);
+                    }
+                } else if let Some(tsx_path) = local_tsx_path(&dir) {
+                    cmd.arg("--runner-js").arg(tsx_path);
                 }
-            }
-
-            if let Some(python) = python_runner.as_ref() {
-                cmd.env("BT_EVAL_PYTHON_RUNNER", python);
-            }
-
-            let expect_success = config.expect_success.unwrap_or(true);
-            let output = cmd.output().expect("run bt eval");
-            let status = output.status;
-            if status.success() != expect_success {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let deno_diagnostics =
-                    if needs_deno(runtime, resolved_runner.as_deref()) && expect_success {
-                        collect_deno_eval_diagnostics(&dir, &config.files)
-                    } else {
-                        None
-                    };
-                panic!(
-                    "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})\nstdout:\n{stdout}\nstderr:\n{stderr}{}",
-                    deno_diagnostics.unwrap_or_default(),
-                    runner.as_deref().unwrap_or("default")
+                if let Some(py_cmd) = py_runner.as_ref() {
+                    if let Some(resolved) =
+                        resolve_runner(&dir, Some(py_cmd.as_str()), python_runner.as_ref())
+                    {
+                        cmd.arg("--runner-python").arg(resolved);
+                    }
+                } else if let Some(python) = python_runner.as_ref() {
+                    cmd.arg("--runner-python").arg(python);
+                }
+                cmd.args(&config.files);
+                if let Some(trailing_args) = config.trailing_args.as_ref() {
+                    cmd.args(trailing_args);
+                }
+                cmd.current_dir(&dir);
+                cmd.env("BT_EVAL_LOCAL", "1");
+                cmd.env(
+                    "BRAINTRUST_API_KEY",
+                    std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
                 );
+                if let Some(env) = config.env.as_ref() {
+                    for (key, value) in env {
+                        cmd.env(key, value);
+                    }
+                }
+                let label = format!(
+                    "js={}/py={}",
+                    js_runner.as_deref().unwrap_or("default"),
+                    py_runner.as_deref().unwrap_or("default"),
+                );
+                let expect_success = config.expect_success.unwrap_or(true);
+                let output = cmd.output().expect("run bt eval");
+                let status = output.status;
+                if status.success() != expect_success {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    panic!(
+                        "Fixture {fixture_name} [{label}] had status {status} (expected success={expect_success})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    );
+                }
+                ran_variant = true;
             }
-            ran_variant = true;
+        } else {
+            let raw_runners = if has_python {
+                config.runners_python.clone().unwrap_or_default()
+            } else {
+                config.runners_js.clone().unwrap_or_default()
+            };
+            let runners: Vec<Option<String>> = if raw_runners.is_empty() {
+                vec![None]
+            } else {
+                raw_runners
+                    .into_iter()
+                    .map(|r| if r == "default" { None } else { Some(r) })
+                    .collect()
+            };
+            for runner in runners {
+                if needs_bun(runner.as_deref()) && !command_exists("bun") {
+                    if required_runtimes().contains("bun") {
+                        panic!(
+                            "Bun runtime is required but unavailable for fixture {fixture_name}"
+                        );
+                    }
+                    let label = runner.as_deref().unwrap_or("default");
+                    eprintln!("Skipping {fixture_name} [{label}] (bun not installed).");
+                    continue;
+                }
+                if needs_deno(runner.as_deref()) && !command_exists("deno") {
+                    if required_runtimes().contains("deno") {
+                        panic!(
+                            "Deno runtime is required but unavailable for fixture {fixture_name}"
+                        );
+                    }
+                    let label = runner.as_deref().unwrap_or("default");
+                    eprintln!("Skipping {fixture_name} [{label}] (deno not installed).");
+                    continue;
+                }
+
+                let mut cmd = Command::new(&bt_path);
+                cmd.arg("eval");
+                if let Some(args) = config.args.as_ref() {
+                    cmd.args(args);
+                }
+                let resolved_runner =
+                    resolve_runner(&dir, runner.as_deref(), python_runner.as_ref());
+                if let Some(runner_cmd) = resolved_runner.as_ref() {
+                    let runner_flag = if has_python {
+                        "--runner-python"
+                    } else {
+                        "--runner-js"
+                    };
+                    cmd.arg(runner_flag).arg(runner_cmd);
+                }
+                cmd.args(&config.files);
+                if let Some(trailing_args) = config.trailing_args.as_ref() {
+                    cmd.args(trailing_args);
+                }
+                cmd.current_dir(&dir);
+                cmd.env("BT_EVAL_LOCAL", "1");
+                cmd.env(
+                    "BRAINTRUST_API_KEY",
+                    std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+                );
+
+                if let Some(env) = config.env.as_ref() {
+                    for (key, value) in env {
+                        cmd.env(key, value);
+                    }
+                }
+
+                if runner.is_some() {
+                    if let Some(tsx_path) = local_tsx_path(&dir) {
+                        cmd.env("BT_EVAL_RUNNER", tsx_path);
+                    }
+                }
+
+                if let Some(python) = python_runner.as_ref() {
+                    cmd.env("BT_EVAL_PYTHON_RUNNER", python);
+                }
+
+                let expect_success = config.expect_success.unwrap_or(true);
+                let output = cmd.output().expect("run bt eval");
+                let status = output.status;
+                if status.success() != expect_success {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let deno_diagnostics =
+                        if needs_deno(resolved_runner.as_deref()) && expect_success {
+                            collect_deno_eval_diagnostics(&dir, &config.files)
+                        } else {
+                            None
+                        };
+                    panic!(
+                        "Fixture {fixture_name} [{}] had status {status} (expected success={expect_success})\nstdout:\n{stdout}\nstderr:\n{stderr}{}",
+                        deno_diagnostics.unwrap_or_default(),
+                        runner.as_deref().unwrap_or("default")
+                    );
+                }
+                ran_variant = true;
+            }
         }
 
         if !ran_variant {
@@ -227,6 +330,7 @@ fn eval_watch_js_dependency_retriggers() {
         &bt_path,
         &fixture_dir,
         &runner,
+        false,
         "tests/async-import.eval.ts",
         "tests/helper.js",
     );
@@ -254,6 +358,7 @@ fn eval_watch_bun_dependency_retriggers() {
         &bt_path,
         &fixture_dir,
         "bun",
+        false,
         "tests/async-import.eval.ts",
         "tests/helper.js",
     );
@@ -281,6 +386,7 @@ fn eval_watch_deno_dependency_retriggers() {
         &bt_path,
         &fixture_dir,
         "deno",
+        false,
         "tests/basic.eval.ts",
         "tests/helper.ts",
     );
@@ -311,6 +417,7 @@ fn eval_watch_python_dependency_retriggers() {
         &bt_path,
         &fixture_dir,
         python.to_string_lossy().as_ref(),
+        true,
         "eval_local_import.py",
         "helper.py",
     );
@@ -513,6 +620,7 @@ fn assert_watch_detects_dependency_change(
     bt_path: &Path,
     fixture_dir: &Path,
     runner: &str,
+    is_python: bool,
     entry_file: &str,
     dependency_file: &str,
 ) {
@@ -520,10 +628,15 @@ fn assert_watch_detects_dependency_change(
     let _restore_guard = FileRestoreGuard::new(dep_path.clone());
 
     let mut cmd = Command::new(bt_path);
+    let runner_flag = if is_python {
+        "--runner-python"
+    } else {
+        "--runner-js"
+    };
     cmd.arg("eval")
         .arg("--watch")
         .arg("--no-send-logs")
-        .arg("--runner")
+        .arg(runner_flag)
         .arg(runner)
         .arg(entry_file)
         .current_dir(fixture_dir)
@@ -643,21 +756,27 @@ fn wait_for_output(
     }
 }
 
-fn collect_runners(config: &FixtureConfig) -> Vec<Option<String>> {
-    if let Some(runners) = config.runners.as_ref() {
-        return runners
-            .iter()
-            .map(|value| {
-                if value == "default" {
-                    None
-                } else {
-                    Some(value.clone())
-                }
-            })
-            .collect();
+fn collect_mixed_runner_variants(config: &FixtureConfig) -> Vec<(Option<String>, Option<String>)> {
+    let default = vec!["default".to_string()];
+    let js_runners = config.runners_js.as_deref().unwrap_or(&default);
+    let py_runners = config.runners_python.as_deref().unwrap_or(&default);
+    let mut variants = Vec::new();
+    for js in js_runners {
+        for py in py_runners {
+            let js_val = if js == "default" {
+                None
+            } else {
+                Some(js.clone())
+            };
+            let py_val = if py == "default" {
+                None
+            } else {
+                Some(py.clone())
+            };
+            variants.push((js_val, py_val));
+        }
     }
-
-    vec![config.runner.clone()]
+    variants
 }
 
 fn resolve_runner(dir: &Path, runner: Option<&str>, python: Option<&PathBuf>) -> Option<String> {
@@ -681,12 +800,62 @@ fn local_tsx_path(dir: &Path) -> Option<PathBuf> {
     tsx_path.is_file().then_some(tsx_path)
 }
 
-fn needs_bun(runtime: &str, runner: Option<&str>) -> bool {
-    runtime == "bun" || runner == Some("bun")
+fn needs_bun(runner: Option<&str>) -> bool {
+    runner == Some("bun")
 }
 
-fn needs_deno(runtime: &str, runner: Option<&str>) -> bool {
-    runtime == "deno" || runner == Some("deno")
+fn needs_deno(runner: Option<&str>) -> bool {
+    runner == Some("deno")
+}
+
+fn config_has_js_files(config: &FixtureConfig) -> bool {
+    config.files.iter().any(|f| {
+        matches!(
+            Path::new(f)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or(""),
+            "ts" | "tsx" | "js" | "mjs" | "cjs"
+        )
+    })
+}
+
+fn config_has_python_files(config: &FixtureConfig) -> bool {
+    config.files.iter().any(|f| {
+        Path::new(f)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            == "py"
+    })
+}
+
+fn config_fixture_runtimes(config: &FixtureConfig) -> BTreeSet<String> {
+    let mut runtimes = BTreeSet::new();
+    if config_has_python_files(config) {
+        runtimes.insert("python".to_string());
+    }
+    if config_has_js_files(config) {
+        let js_runners: Vec<String> = config.runners_js.as_deref().unwrap_or(&[]).to_vec();
+        if js_runners.is_empty() {
+            runtimes.insert("node".to_string());
+        } else {
+            for r in &js_runners {
+                match r.as_str() {
+                    "bun" => {
+                        runtimes.insert("bun".to_string());
+                    }
+                    "deno" => {
+                        runtimes.insert("deno".to_string());
+                    }
+                    _ => {
+                        runtimes.insert("node".to_string());
+                    }
+                }
+            }
+        }
+    }
+    runtimes
 }
 
 fn required_runtimes() -> BTreeSet<String> {
