@@ -702,10 +702,14 @@ async fn push_file(
 
     let mut function_events: Vec<Value> = Vec::new();
 
+    let has_sandbox_entries = code_entries
+        .iter()
+        .any(|(code, _)| code.function_type.as_deref() == Some("sandbox"));
+
     if !code_entries.is_empty() {
         let (upload_bytes, content_encoding) = match selected_language {
             SourceLanguage::JsLike => {
-                let bundle_bytes = build_js_bundle(source_path, args)?;
+                let bundle_bytes = build_js_bundle(source_path, args, has_sandbox_entries)?;
                 let gzipped = gzip_bytes(&bundle_bytes).map_err(|err| FileFailure {
                     reason: HardFailureReason::BundleUploadFailed,
                     message: format!("failed to gzip {}: {err}", source_path.display()),
@@ -899,6 +903,7 @@ async fn push_file(
 fn build_js_bundle(
     source_path: &Path,
     args: &PushArgs,
+    self_contained: bool,
 ) -> std::result::Result<Vec<u8>, FileFailure> {
     let build_dir = TempBuildDir::create("bt-functions-js-bundle").map_err(|err| FileFailure {
         reason: HardFailureReason::BundleUploadFailed,
@@ -930,6 +935,9 @@ fn build_js_bundle(
             "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
             args.external_packages.join(","),
         );
+    }
+    if self_contained {
+        command.env("BT_FUNCTIONS_PUSH_SELF_CONTAINED", "1");
     }
 
     let output = command.output().map_err(|err| FileFailure {

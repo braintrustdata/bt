@@ -414,7 +414,7 @@ function collectEvaluatorEntries(
       location: {
         type: "sandbox",
         sandbox_spec: { provider: "lambda" },
-        entrypoints: [sourceFilePath],
+        entrypoints: [path.relative(process.cwd(), sourceFilePath)],
         eval_name: evalName,
         evaluator_definition: evaluatorDefinition as JsonValue,
       } as JsonValue,

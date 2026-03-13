@@ -1081,6 +1081,22 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
         "from contextlib import nullcontext\n\ndef _set_lazy_load(_enabled):\n    return nullcontext()\n",
     )
     .expect("write lazy_load.py");
+    std::fs::write(
+        stub_root.join("braintrust").join("framework.py"),
+        concat!(
+            "from contextlib import nullcontext\n",
+            "\n",
+            "def _set_lazy_load(_enabled):\n",
+            "    return nullcontext()\n",
+            "\n",
+            "class _EvalFile:\n",
+            "    def __init__(self):\n",
+            "        self.evaluators = {}\n",
+            "\n",
+            "_evals = _EvalFile()\n",
+        ),
+    )
+    .expect("write framework.py");
 
     let sample_path = tmp.path().join("sample_tool.py");
     std::fs::write(

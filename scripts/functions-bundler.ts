@@ -118,6 +118,7 @@ async function main(): Promise<void> {
   const externalPackages = parseExternalPackages(
     process.env.BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES,
   );
+  const selfContained = process.env.BT_FUNCTIONS_PUSH_SELF_CONTAINED === "1";
   const tsconfig = loadTsconfigPath();
 
   const outputDir = path.dirname(outputFile);
@@ -137,8 +138,12 @@ async function main(): Promise<void> {
     write: true,
     outfile: outputFile,
     tsconfig,
-    external: ["node_modules/*", "fsevents"],
-    plugins: [createMarkKnownPackagesExternalPlugin(externalPackages)],
+    external: selfContained
+      ? ["fsevents", "chokidar"]
+      : ["node_modules/*", "fsevents"],
+    plugins: selfContained
+      ? []
+      : [createMarkKnownPackagesExternalPlugin(externalPackages)],
   });
 }
 

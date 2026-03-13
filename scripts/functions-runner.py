@@ -43,8 +43,10 @@ def to_json_value(value: Any) -> Any:
 
 
 def load_framework_globals() -> tuple[Any, Any, Any, Any]:
-    from braintrust.framework2.global_ import functions, prompts
-    from braintrust.framework2.lazy_load import _set_lazy_load as lazy
+    from braintrust.framework2 import global_
+    functions = global_.functions
+    prompts = global_.prompts
+    from braintrust.framework import _set_lazy_load as lazy
     try:
         from braintrust.framework import _evals
     except ImportError:
@@ -259,7 +261,7 @@ def collect_evaluator_entries(evals_registry: Any, source_file: str) -> list[dic
             "location": {
                 "type": "sandbox",
                 "sandbox_spec": {"provider": "lambda"},
-                "entrypoints": [source_file],
+                "entrypoints": [os.path.relpath(source_file)],
                 "eval_name": eval_name,
                 "evaluator_definition": evaluator_definition,
             },
