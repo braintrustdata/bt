@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from contextlib import nullcontext
 from typing import Any
@@ -41,10 +42,14 @@ def to_json_value(value: Any) -> Any:
     return str(value)
 
 
-def load_framework_globals() -> tuple[Any, Any, Any]:
+def load_framework_globals() -> tuple[Any, Any, Any, Any]:
     from braintrust.framework2.global_ import functions, prompts
     from braintrust.framework2.lazy_load import _set_lazy_load as lazy
-    return functions, prompts, lazy
+    try:
+        from braintrust.framework import _evals
+    except ImportError:
+        _evals = None
+    return functions, prompts, lazy, _evals
 
 
 def normalize_project_selector(project: Any) -> tuple[str | None, str | None]:
@@ -182,15 +187,100 @@ async def collect_function_event_entries(prompts_registry: Any) -> list[dict[str
     return entries
 
 
+def slugify(text: str) -> str:
+    return re.sub(r"^-|-$", "", re.sub(r"[^a-z0-9]+", "-", text.lower()))
+
+
+def collect_evaluator_entries(evals_registry: Any, source_file: str) -> list[dict[str, Any]]:
+    if evals_registry is None:
+        return []
+
+    evaluators = getattr(evals_registry, "evaluators", None)
+    if not evaluators or not isinstance(evaluators, dict):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    stem_base, _ = os.path.splitext(os.path.basename(source_file))
+    stem = re.sub(r"\.eval$", "", stem_base)
+
+    for eval_name, instance in evaluators.items():
+        if instance is None:
+            continue
+        evaluator = getattr(instance, "evaluator", None)
+        if evaluator is None:
+            continue
+
+        project_name = getattr(evaluator, "project_name", None)
+        project_id, proj_name = normalize_project_selector(
+            {"project_name": project_name} if isinstance(project_name, str) else None
+        )
+
+        scores = getattr(evaluator, "scores", []) or []
+        score_descriptors = [
+            {"name": getattr(score, "__name__", f"scorer_{i}")}
+            for i, score in enumerate(scores)
+        ]
+
+        evaluator_definition: dict[str, Any] = {"scores": score_descriptors}
+
+        raw_params = getattr(evaluator, "parameters", None)
+        if raw_params is not None:
+            marker = getattr(raw_params, "__braintrust_parameters_marker", None)
+            if marker is True:
+                evaluator_definition["parameters"] = {
+                    "type": "braintrust.parameters",
+                    "schema": getattr(raw_params, "schema", None),
+                    "source": {
+                        "parametersId": getattr(raw_params, "id", None),
+                        "slug": getattr(raw_params, "slug", None),
+                        "name": getattr(raw_params, "name", None),
+                        "projectId": getattr(raw_params, "projectId", None),
+                        "version": getattr(raw_params, "version", None),
+                    },
+                }
+            else:
+                serialized = to_json_value(raw_params)
+                if serialized is not None:
+                    evaluator_definition["parameters"] = serialized
+
+        base_entry: dict[str, Any] = {"kind": "code"}
+        if project_id:
+            base_entry["project_id"] = project_id
+        if proj_name:
+            base_entry["project_name"] = proj_name
+
+        # Sandbox entry only — task and scorer entries are pushed separately
+        # when the eval is actually run, matching the Python SDK behavior.
+        sandbox_entry = {
+            **base_entry,
+            "name": f"Eval {eval_name} sandbox",
+            "slug": slugify(f"{stem}-{eval_name}-sandbox"),
+            "function_type": "sandbox",
+            "location": {
+                "type": "sandbox",
+                "sandbox_spec": {"provider": "lambda"},
+                "entrypoints": [source_file],
+                "eval_name": eval_name,
+                "evaluator_definition": evaluator_definition,
+            },
+            "metadata": {"_bt_sandbox_group_name": stem},
+        }
+        entries.append(sandbox_entry)
+
+    return entries
+
+
 async def process_file(file_path: str) -> dict[str, Any]:
     abs_path = os.path.abspath(file_path)
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
 
-    functions_registry, prompts_registry, lazy_loader = load_framework_globals()
+    functions_registry, prompts_registry, lazy_loader, evals_registry = load_framework_globals()
     clear_registry(functions_registry)
     clear_registry(prompts_registry)
+    if evals_registry is not None and hasattr(evals_registry, "evaluators") and isinstance(evals_registry.evaluators, dict):
+        evals_registry.evaluators.clear()
     purge_local_modules(cwd, preserve_modules={__name__, "python_runner_common"})
 
     module_name, extra_paths = resolve_module_info(abs_path)
@@ -199,12 +289,13 @@ async def process_file(file_path: str) -> dict[str, Any]:
         import_file(module_name, abs_path, extra_paths)
         code_entries = collect_code_entries(functions_registry)
         event_entries = await collect_function_event_entries(prompts_registry)
-        entries = [*code_entries, *event_entries]
+        evaluator_entries = collect_evaluator_entries(evals_registry, abs_path)
+        entries = [*code_entries, *event_entries, *evaluator_entries]
         file_manifest: dict[str, Any] = {
             "source_file": abs_path,
             "entries": entries,
         }
-        if code_entries:
+        if code_entries or evaluator_entries:
             file_manifest["python_bundle"] = {
                 "entry_module": module_name,
                 "sources": collect_python_sources(cwd, abs_path),
@@ -212,6 +303,8 @@ async def process_file(file_path: str) -> dict[str, Any]:
 
     clear_registry(functions_registry)
     clear_registry(prompts_registry)
+    if evals_registry is not None and hasattr(evals_registry, "evaluators") and isinstance(evals_registry.evaluators, dict):
+        evals_registry.evaluators.clear()
     return file_manifest
 
 

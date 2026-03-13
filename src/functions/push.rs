@@ -3250,6 +3250,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn code_function_data_passes_through_sandbox_location() {
+        let runtime = RuntimeContext {
+            runtime: "node".to_string(),
+            version: "20.0.0".to_string(),
+        };
+        let sandbox_location = serde_json::json!({
+            "type": "sandbox",
+            "sandbox_spec": { "provider": "lambda" },
+            "entrypoints": ["/tmp/eval.ts"],
+            "eval_name": "my-eval",
+            "evaluator_definition": {
+                "scores": [{ "name": "accuracy" }]
+            }
+        });
+        let value = build_code_function_data(
+            &runtime,
+            sandbox_location.clone(),
+            "bundle-sandbox-1",
+            None,
+        );
+
+        assert_eq!(value["type"], "code");
+        assert_eq!(value["data"]["type"], "bundle");
+        assert_eq!(value["data"]["bundle_id"], "bundle-sandbox-1");
+        assert_eq!(value["data"]["location"], sandbox_location);
+        assert!(value["data"].get("preview").is_none());
+    }
+
+    #[test]
+    fn code_function_data_passes_through_experiment_location() {
+        let runtime = RuntimeContext {
+            runtime: "node".to_string(),
+            version: "20.0.0".to_string(),
+        };
+        let experiment_location = serde_json::json!({
+            "type": "experiment",
+            "eval_name": "my-eval",
+            "position": { "type": "task" }
+        });
+        let value = build_code_function_data(
+            &runtime,
+            experiment_location.clone(),
+            "bundle-task-1",
+            None,
+        );
+
+        assert_eq!(value["type"], "code");
+        assert_eq!(value["data"]["location"], experiment_location);
+    }
+
     fn test_base_args() -> BaseArgs {
         BaseArgs {
             json: false,

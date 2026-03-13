@@ -1,0 +1,5 @@
+{
+  "command": ["functions", "list", "--type", "sandbox"],
+  "expect_success": false,
+  "stderr_not_contains": ["invalid value 'sandbox'"]
+}

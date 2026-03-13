@@ -1892,6 +1892,202 @@ exit 24
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_sandbox_entries_reach_api() {
+    if !command_exists("node") {
+        eprintln!("Skipping functions_push_sandbox_entries_reach_api (node not installed).");
+        return;
+    }
+
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("my-eval.js");
+    std::fs::write(
+        &source,
+        "globalThis._evals ??= { functions: [], prompts: [], parameters: [], evaluators: {}, reporters: {} };\n",
+    )
+    .expect("write source file");
+
+    let runner = tmp.path().join("mock-runner.sh");
+    std::fs::write(
+        &runner,
+        r#"#!/bin/sh
+set -eu
+_runner_script="$1"
+shift
+_runner_name="$(basename "$_runner_script")"
+
+if [ "$_runner_name" = "functions-runner.ts" ]; then
+node - "$@" <<'NODE'
+const path = require("node:path");
+const files = process.argv.slice(2);
+const manifest = {
+  runtime_context: { runtime: "node", version: process.versions.node || "unknown" },
+  files: files.map((file) => {
+    const abs = path.resolve(file);
+    return {
+      source_file: abs,
+      entries: [
+        {
+          kind: "code",
+          project_name: "mock-project",
+          name: "Eval my-eval sandbox",
+          slug: "my-eval-my-eval-sandbox",
+          function_type: "sandbox",
+          location: {
+            type: "sandbox",
+            sandbox_spec: { provider: "lambda" },
+            entrypoints: [abs],
+            eval_name: "my-eval",
+            evaluator_definition: { scores: [{ name: "accuracy" }] }
+          },
+          metadata: { _bt_sandbox_group_name: "my-eval" }
+        }
+      ]
+    };
+  })
+};
+process.stdout.write(JSON.stringify(manifest));
+NODE
+exit 0
+fi
+
+if [ "$_runner_name" = "functions-bundler.ts" ]; then
+  _source_file="$1"
+  _output_file="$2"
+  cp "$_source_file" "$_output_file"
+  exit 0
+fi
+
+echo "unexpected runner script: $_runner_name" >&2
+exit 24
+"#,
+    )
+    .expect("write mock runner");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&runner)
+        .expect("runner metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&runner, perms).expect("runner permissions");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--file",
+            source
+                .to_str()
+                .expect("source path should be valid UTF-8 for test"),
+            "--language",
+            "javascript",
+            "--runner",
+            runner
+                .to_str()
+                .expect("runner path should be valid UTF-8 for test"),
+            "--if-exists",
+            "replace",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions push");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock push failed:\n{stderr}");
+    }
+
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("parse push summary");
+    assert_eq!(summary["status"].as_str(), Some("success"));
+    assert_eq!(summary["uploaded_files"].as_u64(), Some(1));
+    assert_eq!(summary["failed_files"].as_u64(), Some(0));
+
+    let inserted = state
+        .inserted_functions
+        .lock()
+        .expect("inserted functions lock")
+        .clone();
+    assert_eq!(
+        inserted.len(),
+        1,
+        "expected 1 inserted function (sandbox only)"
+    );
+
+    let sandbox_obj = inserted[0].as_object().expect("sandbox should be an object");
+    assert_eq!(
+        sandbox_obj.get("slug").and_then(Value::as_str),
+        Some("my-eval-my-eval-sandbox")
+    );
+    assert_eq!(
+        sandbox_obj.get("function_type").and_then(Value::as_str),
+        Some("sandbox")
+    );
+
+    // Verify function_data.data.location is sandbox type
+    let function_data = sandbox_obj
+        .get("function_data")
+        .and_then(Value::as_object)
+        .expect("function_data object");
+    assert_eq!(
+        function_data.get("type").and_then(Value::as_str),
+        Some("code")
+    );
+    let data = function_data
+        .get("data")
+        .and_then(Value::as_object)
+        .expect("function_data.data object");
+    let location = data
+        .get("location")
+        .and_then(Value::as_object)
+        .expect("location object");
+    assert_eq!(
+        location.get("type").and_then(Value::as_str),
+        Some("sandbox")
+    );
+    let sandbox_spec = location
+        .get("sandbox_spec")
+        .and_then(Value::as_object)
+        .expect("sandbox_spec object");
+    assert_eq!(
+        sandbox_spec.get("provider").and_then(Value::as_str),
+        Some("lambda")
+    );
+
+    // Verify metadata
+    let metadata = sandbox_obj
+        .get("metadata")
+        .and_then(Value::as_object)
+        .expect("metadata object");
+    assert_eq!(
+        metadata
+            .get("_bt_sandbox_group_name")
+            .and_then(Value::as_str),
+        Some("my-eval")
+    );
+
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn functions_pull_works_against_mock_api() {
     let state = Arc::new(MockServerState::default());
