@@ -88,6 +88,20 @@ type Manifest = {
   files: ManifestFile[];
 };
 
+function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function extractScoreName(score: unknown, idx: number): string {
+  if (typeof score === "function" && typeof score.name === "string") {
+    return score.name || `scorer_${idx}`;
+  }
+  return `scorer_${idx}`;
+}
+
 type EvalRegistry = NonNullable<typeof globalThis._evals>;
 type ZodToJsonSchemaFn = (schema: unknown) => unknown;
 
@@ -473,6 +487,97 @@ function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
   return entries;
 }
 
+function collectEvaluatorEntries(
+  evaluators: Record<string, unknown>,
+  sourceFilePath: string,
+): CodeEntry[] {
+  const entries: CodeEntry[] = [];
+  const ext = path.extname(sourceFilePath);
+  const stem = path.basename(sourceFilePath, ext).replace(/\.eval$/, "");
+
+  for (const [evalName, entry] of Object.entries(evaluators)) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const evaluator = (entry as Record<string, unknown>).evaluator;
+    if (!evaluator || typeof evaluator !== "object") {
+      continue;
+    }
+
+    const evalObj = evaluator as Record<string, unknown>;
+    const projectName =
+      typeof evalObj.project_name === "string" ? evalObj.project_name : undefined;
+    const scores = Array.isArray(evalObj.scores) ? evalObj.scores : [];
+
+    const selector = asProjectSelector(
+      typeof projectName === "string" ? { name: projectName } : undefined,
+    );
+    const projectId =
+      typeof selector.project_id === "string" ? selector.project_id : undefined;
+    const selectorProjectName =
+      typeof selector.project_name === "string"
+        ? selector.project_name
+        : undefined;
+
+    const scoreDescriptors = scores.map((s: unknown, i: number) => ({
+      name: extractScoreName(s, i),
+    }));
+
+    const evaluatorDefinition: JsonObject = {
+      scores: scoreDescriptors as JsonValue,
+    };
+
+    const rawParams = evalObj.parameters;
+    if (rawParams !== undefined && rawParams !== null) {
+      const marker =
+        rawParams !== null &&
+        typeof rawParams === "object" &&
+        (rawParams as Record<string, unknown>).__braintrust_parameters_marker === true;
+      if (marker) {
+        const paramObj = rawParams as Record<string, unknown>;
+        evaluatorDefinition.parameters = toJsonValue({
+          type: "braintrust.parameters",
+          schema: paramObj.schema,
+          source: {
+            parametersId: paramObj.id,
+            slug: paramObj.slug,
+            name: paramObj.name,
+            projectId: paramObj.projectId,
+            version: paramObj.version,
+          },
+        } as JsonValue);
+      } else {
+        const serialized = toJsonValue(rawParams as JsonValue);
+        if (serialized !== undefined) {
+          evaluatorDefinition.parameters = serialized;
+        }
+      }
+    }
+
+    // Sandbox entry only — task and scorer entries are pushed separately
+    // when the eval is actually run, matching the Python SDK behavior.
+    entries.push({
+      kind: "code",
+      project_id: projectId,
+      project_name: selectorProjectName,
+      name: `Eval ${evalName} sandbox`,
+      slug: slugify(`${stem}-${evalName}-sandbox`),
+      function_type: "sandbox",
+      location: {
+        type: "sandbox",
+        sandbox_spec: { provider: "lambda" },
+        entrypoints: [sourceFilePath],
+        eval_name: evalName,
+        evaluator_definition: evaluatorDefinition as JsonValue,
+      } as JsonValue,
+      metadata: { _bt_sandbox_group_name: stem },
+    });
+  }
+
+  return entries;
+}
+
 async function processFile(filePath: string): Promise<ManifestFile> {
   const absolutePath = path.resolve(process.cwd(), filePath);
   const fallbackRegistry = freshRegistry();
@@ -492,6 +597,10 @@ async function processFile(filePath: string): Promise<ManifestFile> {
       registry.parameters as EventRegistryItem[],
       false,
     )),
+    ...collectEvaluatorEntries(
+      registry.evaluators as Record<string, unknown>,
+      absolutePath,
+    ),
   ];
 
   return {
