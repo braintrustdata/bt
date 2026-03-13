@@ -275,7 +275,10 @@ async function main(): Promise<void> {
   const externalPackages = parseExternalPackages(
     process.env.BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES,
   );
-  const external = buildExternalPackagePatterns(externalPackages);
+  const selfContained = process.env.BT_FUNCTIONS_PUSH_SELF_CONTAINED === "1";
+  const external = selfContained
+    ? ["fsevents", "chokidar"]
+    : buildExternalPackagePatterns(externalPackages);
   const tsconfig = loadTsconfigPath();
 
   const outputDir = path.dirname(outputFile);

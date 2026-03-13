@@ -360,7 +360,7 @@ def collect_evaluator_entries(evals_registry: Any, source_file: str) -> list[dic
             "location": {
                 "type": "sandbox",
                 "sandbox_spec": {"provider": "lambda"},
-                "entrypoints": [source_file],
+                "entrypoints": [os.path.relpath(source_file)],
                 "eval_name": eval_name,
                 "evaluator_definition": evaluator_definition,
             },
