@@ -1,4 +1,3 @@
 {
-  "runtime": "python",
   "files": ["eval_local_import.py"]
 }

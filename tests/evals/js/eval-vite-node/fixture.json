@@ -1,4 +1,4 @@
 {
-  "runner": "./node_modules/.bin/vite-node",
-  "files": ["tests/basic.eval.ts", "tests/top-level-await.eval.ts"]
+  "files": ["tests/basic.eval.ts", "tests/top-level-await.eval.ts"],
+  "runners_js": ["./node_modules/.bin/vite-node"]
 }
