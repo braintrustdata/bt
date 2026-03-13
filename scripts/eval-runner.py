@@ -434,6 +434,21 @@ def load_evaluators(files: list[str]) -> tuple[list[EvaluatorInstance], dict[str
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
+
+    # Add the project root inferred from input files to sys.path so that
+    # sibling-package imports work when files live outside CWD (e.g.
+    # sandbox bundles extracted to a temp directory).  Walk up from each
+    # file's directory looking for a register.py (bundle marker) or the
+    # filesystem root, whichever comes first.
+    for f in files:
+        d = os.path.dirname(os.path.abspath(f))
+        while d and d != os.path.dirname(d):
+            if os.path.isfile(os.path.join(d, "register.py")):
+                if d not in sys.path:
+                    sys.path.insert(0, d)
+                break
+            d = os.path.dirname(d)
+
     unique_files: set[str] = set()
     for file_path in files:
         for candidate in collect_files(file_path):
