@@ -1125,6 +1125,14 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     let mut explicit_js_like = 0usize;
     let mut explicit_python = 0usize;
 
+    // Always include CWD so that Python files importing from sibling
+    // packages (e.g. `from src.agents import ...`) are accepted.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(canonical_cwd) = cwd.canonicalize() {
+            allowed_roots.insert(canonical_cwd);
+        }
+    }
+
     for input in inputs {
         let path = if input.is_absolute() {
             input.clone()
