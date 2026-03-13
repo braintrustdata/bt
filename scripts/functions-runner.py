@@ -28,9 +28,9 @@ def to_json_value(value: Any) -> Any:
         return [to_json_value(item) for item in value]
     if isinstance(value, dict):
         return {str(key): to_json_value(val) for key, val in value.items()}
-    if hasattr(value, "model_dump"):
+    if hasattr(value, "model_dump") and not isinstance(value, type):
         return to_json_value(value.model_dump())
-    if hasattr(value, "dict"):
+    if hasattr(value, "dict") and not isinstance(value, type):
         return to_json_value(value.dict())
     if hasattr(value, "__dict__"):
         result: dict[str, Any] = {}
@@ -298,8 +298,13 @@ async def process_file(file_path: str) -> dict[str, Any]:
             "entries": entries,
         }
         if code_entries or evaluator_entries:
+            # Compute entry_module as a CWD-relative dotted path so that the
+            # archive root inferred by push.rs walks back to CWD, matching
+            # the Python SDK behavior and allowing sibling-package imports.
+            rel_path = os.path.relpath(abs_path, cwd)
+            archive_module = re.sub(r"\.py$", "", rel_path).replace("-", "_").replace(os.sep, ".")
             file_manifest["python_bundle"] = {
-                "entry_module": module_name,
+                "entry_module": archive_module,
                 "sources": collect_python_sources(cwd, abs_path),
             }
 

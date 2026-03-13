@@ -61,6 +61,12 @@ def purge_local_modules(cwd: str, preserve_modules: set[str] | None = None) -> N
         candidate_abs = os.path.abspath(candidate)
         if not os.path.isfile(candidate_abs):
             continue
+        # Skip installed packages inside virtualenvs under cwd (e.g. .venv/lib/.../site-packages).
+        if os.sep + "site-packages" + os.sep in candidate_abs:
+            continue
+        # Skip bt runner scripts materialised under .bt/.
+        if os.sep + ".bt" + os.sep in candidate_abs:
+            continue
         try:
             common = os.path.commonpath([candidate_abs, cwd_abs])
         except ValueError:
@@ -83,6 +89,12 @@ def collect_python_sources(cwd: str, input_file: str) -> list[str]:
         if not os.path.isfile(candidate_abs):
             continue
         if not candidate_abs.endswith(".py"):
+            continue
+        # Skip installed packages inside virtualenvs under cwd (e.g. .venv/lib/.../site-packages).
+        if os.sep + "site-packages" + os.sep in candidate_abs:
+            continue
+        # Skip bt runner scripts materialised under .bt/.
+        if os.sep + ".bt" + os.sep in candidate_abs:
             continue
         try:
             common = os.path.commonpath([candidate_abs, cwd])
