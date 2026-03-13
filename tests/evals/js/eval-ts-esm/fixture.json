@@ -1,4 +1,4 @@
 {
-  "runners": ["tsx", "bun"],
-  "files": ["tests/basic.eval.ts", "tests/top-level-await.eval.ts"]
+  "files": ["tests/basic.eval.ts", "tests/top-level-await.eval.ts"],
+  "runners_js": ["tsx", "bun"]
 }

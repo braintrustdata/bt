@@ -1,5 +1,5 @@
 {
-  "runners": ["default"],
   "files": ["tests/basic.eval.ts"],
-  "expect_success": true
+  "expect_success": true,
+  "runners_js": ["default"]
 }
