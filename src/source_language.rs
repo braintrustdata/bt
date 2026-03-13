@@ -4,7 +4,17 @@ pub enum SourceLanguage {
     Python,
 }
 
-pub fn classify_runtime_extension(ext: &str) -> Option<SourceLanguage> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsExtensionProfile {
+    FunctionsPush,
+    #[allow(dead_code)]
+    Eval,
+}
+
+pub fn classify_runtime_extension(
+    ext: &str,
+    _js_profile: JsExtensionProfile,
+) -> Option<SourceLanguage> {
     let normalized = ext.to_ascii_lowercase();
     if normalized == "py" {
         return Some(SourceLanguage::Python);
@@ -25,14 +35,20 @@ mod tests {
     #[test]
     fn classifies_runtime_extensions_case_insensitively() {
         assert_eq!(
-            classify_runtime_extension("TS"),
+            classify_runtime_extension("TS", JsExtensionProfile::FunctionsPush),
             Some(SourceLanguage::JsLike)
         );
         assert_eq!(
-            classify_runtime_extension("Py"),
+            classify_runtime_extension("Py", JsExtensionProfile::FunctionsPush),
             Some(SourceLanguage::Python)
         );
-        assert_eq!(classify_runtime_extension("mjs"), None);
-        assert_eq!(classify_runtime_extension("cjs"), None);
+        assert_eq!(
+            classify_runtime_extension("mjs", JsExtensionProfile::FunctionsPush),
+            None
+        );
+        assert_eq!(
+            classify_runtime_extension("cjs", JsExtensionProfile::FunctionsPush),
+            None
+        );
     }
 }

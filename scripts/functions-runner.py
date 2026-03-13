@@ -3,6 +3,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sys
 from contextlib import nullcontext
 from typing import Any
@@ -28,9 +29,9 @@ def to_json_value(value: Any) -> Any:
         return [to_json_value(item) for item in value]
     if isinstance(value, dict):
         return {str(key): to_json_value(val) for key, val in value.items()}
-    if hasattr(value, "model_dump"):
+    if hasattr(value, "model_dump") and not isinstance(value, type):
         return to_json_value(value.model_dump())
-    if hasattr(value, "dict"):
+    if hasattr(value, "dict") and not isinstance(value, type):
         return to_json_value(value.dict())
     if hasattr(value, "__dict__"):
         result: dict[str, Any] = {}
@@ -42,7 +43,7 @@ def to_json_value(value: Any) -> Any:
     return str(value)
 
 
-def load_framework_globals() -> tuple[Any, Any, Any]:
+def load_framework_globals() -> tuple[Any, Any, Any, Any]:
     # Prefer current SDK layout first:
     # - braintrust.framework2 exposes module-level `global_`
     # - braintrust.framework exposes `_set_lazy_load`
@@ -50,13 +51,23 @@ def load_framework_globals() -> tuple[Any, Any, Any]:
         from braintrust.framework import _set_lazy_load as lazy
         from braintrust.framework2 import global_ as global_state
 
-        return global_state.functions, global_state.prompts, lazy
+        try:
+            from braintrust.framework import _evals
+        except (ImportError, ModuleNotFoundError):
+            _evals = None
+
+        return global_state.functions, global_state.prompts, lazy, _evals
     except (ImportError, ModuleNotFoundError):
         # Backward compatibility with older SDK layout.
         from braintrust.framework2.global_ import functions, prompts
         from braintrust.framework2.lazy_load import _set_lazy_load as lazy
 
-        return functions, prompts, lazy
+        try:
+            from braintrust.framework import _evals
+        except (ImportError, ModuleNotFoundError):
+            _evals = None
+
+        return functions, prompts, lazy, _evals
 
 
 def normalize_project_selector(project: Any) -> tuple[str | None, str | None]:
@@ -277,16 +288,113 @@ async def collect_function_event_entries(prompts_registry: Any) -> list[dict[str
     return entries
 
 
+def slugify(text: str) -> str:
+    return re.sub(r"^-|-$", "", re.sub(r"[^a-z0-9]+", "-", text.lower()))
+
+
+def collect_evaluator_entries(evals_registry: Any, source_file: str) -> list[dict[str, Any]]:
+    if evals_registry is None:
+        return []
+
+    evaluators = getattr(evals_registry, "evaluators", None)
+    if not evaluators or not isinstance(evaluators, dict):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    stem_base, _ = os.path.splitext(os.path.basename(source_file))
+    stem = re.sub(r"\.eval$", "", stem_base)
+
+    for eval_name, instance in evaluators.items():
+        if instance is None:
+            continue
+        evaluator = getattr(instance, "evaluator", None)
+        if evaluator is None:
+            continue
+
+        project_name = getattr(evaluator, "project_name", None)
+        project_id, proj_name = normalize_project_selector(
+            {"project_name": project_name} if isinstance(project_name, str) else None
+        )
+
+        scores = getattr(evaluator, "scores", []) or []
+        score_descriptors = [
+            {"name": getattr(score, "__name__", f"scorer_{i}")}
+            for i, score in enumerate(scores)
+        ]
+
+        evaluator_definition: dict[str, Any] = {"scores": score_descriptors}
+
+        raw_params = getattr(evaluator, "parameters", None)
+        if raw_params is not None:
+            marker = getattr(raw_params, "__braintrust_parameters_marker", None)
+            if marker is True:
+                evaluator_definition["parameters"] = {
+                    "type": "braintrust.parameters",
+                    "schema": getattr(raw_params, "schema", None),
+                    "source": {
+                        "parametersId": getattr(raw_params, "id", None),
+                        "slug": getattr(raw_params, "slug", None),
+                        "name": getattr(raw_params, "name", None),
+                        "projectId": getattr(raw_params, "projectId", None),
+                        "version": getattr(raw_params, "version", None),
+                    },
+                }
+            else:
+                # Use the braintrust SDK's parameters_to_json_schema when
+                # available so that Pydantic model classes are converted to
+                # proper staticParametersSchema entries (type: "data" with a
+                # JSON Schema) that the UI can parse.
+                try:
+                    from braintrust.parameters import parameters_to_json_schema
+                    serialized = parameters_to_json_schema(raw_params)
+                except Exception:
+                    serialized = to_json_value(raw_params)
+                if serialized is not None:
+                    evaluator_definition["parameters"] = serialized
+
+        base_entry: dict[str, Any] = {"kind": "code"}
+        if project_id:
+            base_entry["project_id"] = project_id
+        if proj_name:
+            base_entry["project_name"] = proj_name
+
+        # Sandbox entry only — task and scorer entries are pushed separately
+        # when the eval is actually run, matching the Python SDK behavior.
+        sandbox_entry = {
+            **base_entry,
+            "name": f"Eval {eval_name} sandbox",
+            "slug": slugify(f"{stem}-{eval_name}-sandbox"),
+            "function_type": "sandbox",
+            "location": {
+                "type": "sandbox",
+                "sandbox_spec": {"provider": "lambda"},
+                "entrypoints": [os.path.relpath(source_file)],
+                "eval_name": eval_name,
+                "evaluator_definition": evaluator_definition,
+            },
+            "metadata": {"_bt_sandbox_group_name": stem},
+        }
+        entries.append(sandbox_entry)
+
+    return entries
+
+
 async def process_file(file_path: str) -> dict[str, Any]:
     abs_path = os.path.abspath(file_path)
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
 
-    purge_local_modules(cwd, preserve_modules={__name__, "python_runner_common"})
-    functions_registry, prompts_registry, lazy_loader = load_framework_globals()
+    functions_registry, prompts_registry, lazy_loader, evals_registry = load_framework_globals()
     clear_registry(functions_registry)
     clear_registry(prompts_registry)
+    if (
+        evals_registry is not None
+        and hasattr(evals_registry, "evaluators")
+        and isinstance(evals_registry.evaluators, dict)
+    ):
+        evals_registry.evaluators.clear()
+    purge_local_modules(cwd, preserve_modules={__name__, "python_runner_common"})
 
     module_name = import_module_name_from_cwd(cwd, abs_path)
     if module_name is None:
@@ -298,12 +406,13 @@ async def process_file(file_path: str) -> dict[str, Any]:
         import_file(module_name, abs_path, extra_paths)
         code_entries = collect_code_entries(functions_registry)
         event_entries = await collect_function_event_entries(prompts_registry)
-        entries = [*code_entries, *event_entries]
+        evaluator_entries = collect_evaluator_entries(evals_registry, abs_path)
+        entries = [*code_entries, *event_entries, *evaluator_entries]
         file_manifest: dict[str, Any] = {
             "source_file": abs_path,
             "entries": entries,
         }
-        if code_entries:
+        if code_entries or evaluator_entries:
             runner_root = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.abspath(cwd)
             path_rest: list[str] = []
@@ -350,13 +459,24 @@ async def process_file(file_path: str) -> dict[str, Any]:
                     continue
                 seen_sources.add(init_source)
                 bundled_sources.append(init_source)
+            # Compute entry_module as a CWD-relative dotted path so that the
+            # archive root inferred by push.rs walks back to CWD, matching
+            # the Python SDK behavior and allowing sibling-package imports.
+            rel_path = os.path.relpath(abs_path, cwd)
+            archive_module = re.sub(r"\.py$", "", rel_path).replace("-", "_").replace(os.sep, ".")
             file_manifest["python_bundle"] = {
-                "entry_module": module_name,
+                "entry_module": archive_module,
                 "sources": bundled_sources,
             }
 
     clear_registry(functions_registry)
     clear_registry(prompts_registry)
+    if (
+        evals_registry is not None
+        and hasattr(evals_registry, "evaluators")
+        and isinstance(evals_registry.evaluators, dict)
+    ):
+        evals_registry.evaluators.clear()
     return file_manifest
 
 
