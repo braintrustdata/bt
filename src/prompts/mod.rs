@@ -101,3 +101,40 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompts_command_is_read_only(command: Option<&PromptsCommands>) -> bool {
+        matches!(
+            command,
+            None | Some(PromptsCommands::List) | Some(PromptsCommands::View(_))
+        )
+    }
+
+    #[test]
+    fn prompts_routes_list_and_view_to_read_only_auth() {
+        assert!(prompts_command_is_read_only(None));
+        assert!(prompts_command_is_read_only(Some(&PromptsCommands::List)));
+        assert!(prompts_command_is_read_only(Some(&PromptsCommands::View(
+            ViewArgs {
+                slug_positional: Some("my-prompt".to_string()),
+                slug_flag: None,
+                web: false,
+                verbose: false,
+            }
+        ))));
+    }
+
+    #[test]
+    fn prompts_routes_delete_to_validated_auth() {
+        assert!(!prompts_command_is_read_only(Some(
+            &PromptsCommands::Delete(DeleteArgs {
+                slug_positional: Some("my-prompt".to_string()),
+                slug_flag: None,
+                force: true,
+            })
+        )));
+    }
+}

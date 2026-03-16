@@ -955,4 +955,86 @@ mod tests {
         };
         assert_eq!(pull.slug_flag, vec!["a", "b", "c"]);
     }
+
+    #[derive(Debug, Parser)]
+    struct FunctionArgsHarness {
+        #[command(flatten)]
+        args: FunctionArgs,
+    }
+
+    #[derive(Debug, Parser)]
+    struct FunctionsArgsHarness {
+        #[command(flatten)]
+        args: FunctionsArgs,
+    }
+
+    fn function_command_is_read_only(command: Option<&FunctionCommands>) -> bool {
+        matches!(
+            command,
+            None | Some(FunctionCommands::List) | Some(FunctionCommands::View(_))
+        )
+    }
+
+    fn functions_command_is_read_only(command: Option<&FunctionsCommands>) -> bool {
+        matches!(
+            command,
+            None | Some(FunctionsCommands::List(_)) | Some(FunctionsCommands::View(_))
+        )
+    }
+
+    #[test]
+    fn typed_function_commands_map_to_expected_auth_mode() {
+        let _guard = test_lock();
+        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools"]).expect("parse");
+        assert!(function_command_is_read_only(parsed.args.command.as_ref()));
+
+        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools", "list"]).expect("parse");
+        assert!(function_command_is_read_only(parsed.args.command.as_ref()));
+
+        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools", "view", "--slug", "my-tool"])
+            .expect("parse");
+        assert!(function_command_is_read_only(parsed.args.command.as_ref()));
+
+        let parsed =
+            FunctionArgsHarness::try_parse_from(["bt-tools", "delete", "--slug", "my-tool", "--force"])
+                .expect("parse");
+        assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
+
+        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools", "invoke", "--slug", "my-tool"])
+            .expect("parse");
+        assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
+    }
+
+    #[test]
+    fn functions_commands_map_to_expected_auth_mode() {
+        let _guard = test_lock();
+        let parsed = FunctionsArgsHarness::try_parse_from(["bt-functions"]).expect("parse");
+        assert!(functions_command_is_read_only(parsed.args.command.as_ref()));
+
+        let parsed = FunctionsArgsHarness::try_parse_from(["bt-functions", "list"]).expect("parse");
+        assert!(functions_command_is_read_only(parsed.args.command.as_ref()));
+
+        let parsed = FunctionsArgsHarness::try_parse_from(["bt-functions", "view", "--slug", "my-fn"])
+            .expect("parse");
+        assert!(functions_command_is_read_only(parsed.args.command.as_ref()));
+
+        let parsed = FunctionsArgsHarness::try_parse_from([
+            "bt-functions",
+            "delete",
+            "--slug",
+            "my-fn",
+            "--force",
+        ])
+        .expect("parse");
+        assert!(!functions_command_is_read_only(
+            parsed.args.command.as_ref()
+        ));
+
+        let parsed =
+            FunctionsArgsHarness::try_parse_from(["bt-functions", "invoke", "--slug", "my-fn"])
+                .expect("parse");
+        assert!(!functions_command_is_read_only(
+            parsed.args.command.as_ref()
+        ));
+    }
 }

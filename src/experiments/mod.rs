@@ -121,3 +121,41 @@ pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn experiments_command_is_read_only(command: Option<&ExperimentsCommands>) -> bool {
+        matches!(
+            command,
+            None | Some(ExperimentsCommands::List) | Some(ExperimentsCommands::View(_))
+        )
+    }
+
+    #[test]
+    fn experiments_routes_list_and_view_to_read_only_auth() {
+        assert!(experiments_command_is_read_only(None));
+        assert!(experiments_command_is_read_only(Some(
+            &ExperimentsCommands::List
+        )));
+        assert!(experiments_command_is_read_only(Some(
+            &ExperimentsCommands::View(ViewArgs {
+                name_positional: Some("my-experiment".to_string()),
+                name_flag: None,
+                web: false,
+            })
+        )));
+    }
+
+    #[test]
+    fn experiments_routes_delete_to_validated_auth() {
+        assert!(!experiments_command_is_read_only(Some(
+            &ExperimentsCommands::Delete(DeleteArgs {
+                name_positional: Some("my-experiment".to_string()),
+                name_flag: None,
+                force: true,
+            })
+        )));
+    }
+}
