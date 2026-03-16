@@ -340,7 +340,15 @@ def collect_evaluator_entries(evals_registry: Any, source_file: str) -> list[dic
                     },
                 }
             else:
-                serialized = to_json_value(raw_params)
+                # Use the braintrust SDK's parameters_to_json_schema when
+                # available so that Pydantic model classes are converted to
+                # proper staticParametersSchema entries (type: "data" with a
+                # JSON Schema) that the UI can parse.
+                try:
+                    from braintrust.parameters import parameters_to_json_schema
+                    serialized = parameters_to_json_schema(raw_params)
+                except Exception:
+                    serialized = to_json_value(raw_params)
                 if serialized is not None:
                     evaluator_definition["parameters"] = serialized
 

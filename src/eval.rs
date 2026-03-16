@@ -1218,9 +1218,21 @@ fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
         EvalEvent::Summary(summary) => serde_json::to_string(summary)
             .ok()
             .map(|data| serialize_sse_event("summary", &data)),
-        EvalEvent::Progress(progress) => serde_json::to_string(progress)
-            .ok()
-            .map(|data| serialize_sse_event("progress", &data)),
+        EvalEvent::Progress(progress) => {
+            // Filter out internal eval_progress events (start/increment/stop)
+            // which are used for CLI progress bars but crash the UI stream
+            // parser.  Only forward external progress events (e.g. json_delta).
+            if serde_json::from_str::<EvalProgressData>(&progress.data)
+                .map(|p| p.kind_type == "eval_progress")
+                .unwrap_or(false)
+            {
+                None
+            } else {
+                serde_json::to_string(progress)
+                    .ok()
+                    .map(|data| serialize_sse_event("progress", &data))
+            }
+        }
         EvalEvent::Dependencies { .. } => None,
         EvalEvent::Done => Some(serialize_sse_event("done", "")),
         EvalEvent::Error {
@@ -4010,7 +4022,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_eval_event_for_http_forwards_eval_progress() {
+    fn encode_eval_event_for_http_filters_internal_eval_progress() {
         let event = EvalEvent::Progress(SseProgressEventData {
             id: "id-1".to_string(),
             object_type: "task".to_string(),
@@ -4022,9 +4034,7 @@ mod tests {
             data: r#"{"type":"eval_progress","kind":"start","total":1}"#.to_string(),
         });
 
-        let encoded = encode_eval_event_for_http(&event).expect("eval_progress should be forwarded");
-        assert!(encoded.contains("event: progress"));
-        assert!(encoded.contains("eval_progress"));
+        assert!(encode_eval_event_for_http(&event).is_none());
     }
 
     #[test]
