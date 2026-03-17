@@ -51,6 +51,8 @@ struct PullFunctionRow {
 
 #[derive(Debug, Clone)]
 struct NormalizedPrompt {
+    id: String,
+    version: Option<String>,
     variable_seed: String,
     name: String,
     slug: String,
@@ -60,6 +62,8 @@ struct NormalizedPrompt {
     model: Option<Value>,
     params: Option<Value>,
     tools: Option<Value>,
+    raw_tools_json: Option<String>,
+    tool_functions: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -374,6 +378,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             &repo,
             args.force,
             args.language,
+            &project_id,
             &project_name,
             &file_name,
             &rows,
@@ -615,6 +620,7 @@ fn write_pull_file(
     repo: &Option<GitRepo>,
     force: bool,
     language: FunctionsLanguage,
+    project_id: &str,
     project_name: &str,
     file_name: &str,
     rows: &[PullFunctionRow],
@@ -655,18 +661,19 @@ fn write_pull_file(
         return;
     }
 
-    let rendered = match render_project_file(language, project_name, &display_target, rows) {
-        Ok(rendered) => rendered,
-        Err(err) => {
-            record_pull_file_failure(
-                summary,
-                target.display().to_string(),
-                HardFailureReason::ResponseInvalid,
-                err.to_string(),
-            );
-            return;
-        }
-    };
+    let rendered =
+        match render_project_file(language, project_id, project_name, &display_target, rows) {
+            Ok(rendered) => rendered,
+            Err(err) => {
+                record_pull_file_failure(
+                    summary,
+                    target.display().to_string(),
+                    HardFailureReason::ResponseInvalid,
+                    err.to_string(),
+                );
+                return;
+            }
+        };
     match write_text_atomic(&target, &rendered) {
         Ok(()) => {
             summary.files_written += 1;
@@ -959,6 +966,7 @@ fn display_output_path(target: &Path) -> String {
 
 fn render_project_file(
     language: FunctionsLanguage,
+    project_id: &str,
     project_name: &str,
     file_name: &str,
     rows: &[PullFunctionRow],
@@ -973,7 +981,7 @@ fn render_project_file(
 
     match language {
         FunctionsLanguage::Typescript => {
-            render_project_file_ts(project_name, file_name, &normalized)
+            render_project_file_ts(project_id, project_name, file_name, &normalized)
         }
         FunctionsLanguage::Python => render_project_file_py(project_name, file_name, &normalized),
     }
@@ -1042,27 +1050,31 @@ fn normalize_prompt_row(row: &PullFunctionRow) -> Result<NormalizedPrompt> {
         .filter(|value| !is_empty_render_value(value))
         .cloned();
 
-    let mut tools: Vec<Value> = prompt_data
-        .get("tool_functions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if let Some(raw_tools) = prompt_block.get("tools").and_then(Value::as_str) {
-        if !raw_tools.trim().is_empty() {
-            if let Ok(parsed) = serde_json::from_str::<Value>(raw_tools) {
-                if let Some(items) = parsed.as_array() {
-                    tools.extend(items.iter().cloned());
-                }
-            }
-        }
-    }
-    let tools = if tools.is_empty() {
-        None
-    } else {
-        Some(Value::Array(tools))
+    let raw_tools_json = prompt_block
+        .get("tools")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let tools = match prompt_block.get("tools") {
+        Some(Value::String(_)) | None => None,
+        Some(other) if is_empty_render_value(other) => None,
+        Some(other) => Some(other.clone()),
     };
+    let tool_functions = prompt_data
+        .get("tool_functions")
+        .filter(|value| !is_empty_render_value(value))
+        .cloned();
+    let version = row
+        ._xact_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
 
     Ok(NormalizedPrompt {
+        id: row.id.clone(),
+        version,
         variable_seed: row.slug.clone(),
         name: row.name.clone(),
         slug: row.slug.clone(),
@@ -1072,10 +1084,13 @@ fn normalize_prompt_row(row: &PullFunctionRow) -> Result<NormalizedPrompt> {
         model,
         params,
         tools,
+        raw_tools_json,
+        tool_functions,
     })
 }
 
 fn render_project_file_ts(
+    project_id: &str,
     project_name: &str,
     file_name: &str,
     prompts: &[NormalizedPrompt],
@@ -1098,6 +1113,7 @@ fn render_project_file_ts(
 
     out.push_str("import braintrust from \"braintrust\";\n\n");
     out.push_str("const project = braintrust.projects.create({\n");
+    out.push_str(&format!("  id: {},\n", serde_json::to_string(project_id)?));
     out.push_str(&format!(
         "  name: {},\n",
         serde_json::to_string(project_name)?
@@ -1114,8 +1130,12 @@ fn render_project_file_ts(
         );
 
         let mut body_lines = Vec::new();
+        body_lines.push(format!("  id: {},", serde_json::to_string(&row.id)?));
         body_lines.push(format!("  name: {},", serde_json::to_string(&row.name)?));
         body_lines.push(format!("  slug: {},", serde_json::to_string(&row.slug)?));
+        if let Some(version) = &row.version {
+            body_lines.push(format!("  version: {},", serde_json::to_string(version)?));
+        }
 
         if let Some(description) = &row.description {
             body_lines.push(format!(
@@ -1139,6 +1159,18 @@ fn render_project_file_ts(
         if let Some(tools) = &row.tools {
             body_lines.push(format!("  tools: {},", format_ts_value(tools, 2)));
         }
+        if let Some(raw_tools_json) = &row.raw_tools_json {
+            body_lines.push(format!(
+                "  tools: JSON.parse({}),",
+                serde_json::to_string(raw_tools_json)?
+            ));
+        }
+        if let Some(tool_functions) = &row.tool_functions {
+            body_lines.push(format!(
+                "  toolFunctions: {},",
+                format_ts_value(tool_functions, 2)
+            ));
+        }
 
         out.push_str(&format!(
             "export const {var_name} = project.prompts.create({{\n"
@@ -1155,6 +1187,7 @@ fn render_project_file_py(
     file_name: &str,
     prompts: &[NormalizedPrompt],
 ) -> Result<String> {
+    let needs_json_import = prompts.iter().any(|row| row.raw_tools_json.is_some());
     let mut out = String::new();
     out.push_str("# This file was automatically generated by bt functions pull. You can\n");
     out.push_str("# generate it again by running:\n");
@@ -1170,6 +1203,9 @@ fn render_project_file_py(
         "#  $ bt functions push --file {}\n\n",
         serde_json::to_string(file_name)?
     ));
+    if needs_json_import {
+        out.push_str("import json\n");
+    }
     out.push_str("import braintrust\n\n");
     out.push_str(&format!(
         "project = braintrust.projects.create(name={})\n\n",
@@ -1212,6 +1248,18 @@ fn render_project_file_py(
         }
         if let Some(tools) = &row.tools {
             out.push_str(&format!("    tools={},\n", format_py_value(tools, 4)));
+        }
+        if let Some(raw_tools_json) = &row.raw_tools_json {
+            out.push_str(&format!(
+                "    tools=json.loads({}),\n",
+                format_py_value(&Value::String(raw_tools_json.clone()), 4)
+            ));
+        }
+        if let Some(tool_functions) = &row.tool_functions {
+            out.push_str(&format!(
+                "    tool_functions={},\n",
+                format_py_value(tool_functions, 4)
+            ));
         }
         out.push_str(")\n\n");
     }
@@ -1738,6 +1786,7 @@ mod tests {
 
         let rendered = render_project_file(
             FunctionsLanguage::Python,
+            "p1",
             "woohoo",
             "braintrust/woohoo.py",
             &[row],
@@ -1751,6 +1800,48 @@ mod tests {
         assert!(rendered.contains("doc_search = project.prompts.create("));
         assert!(rendered.contains("messages=["));
         assert!(rendered.contains("model=\"gpt-4o-mini\""));
+    }
+
+    #[test]
+    fn render_project_file_typescript_includes_prompt_identity() {
+        let row = PullFunctionRow {
+            id: "f1".to_string(),
+            name: "Basic math".to_string(),
+            slug: "basic-math".to_string(),
+            project_id: "p1".to_string(),
+            project_name: Some("woohoo".to_string()),
+            description: None,
+            prompt_data: Some(serde_json::json!({
+                "prompt": {
+                    "type": "chat",
+                    "messages": [
+                        { "content": "Hello", "role": "system" }
+                    ]
+                },
+                "options": {
+                    "model": "gpt-4o-mini"
+                }
+            })),
+            function_data: Some(serde_json::json!({ "type": "prompt" })),
+            created: None,
+            _xact_id: Some("123".to_string()),
+        };
+
+        let rendered = render_project_file(
+            FunctionsLanguage::Typescript,
+            "p1",
+            "woohoo",
+            "braintrust/woohoo.ts",
+            &[row],
+        )
+        .expect("rendered");
+
+        assert!(rendered.contains("const project = braintrust.projects.create({"));
+        assert!(rendered.contains("  id: \"p1\","));
+        assert!(rendered.contains("  name: \"woohoo\","));
+        assert!(rendered.contains("export const basicMath = project.prompts.create({"));
+        assert!(rendered.contains("  id: \"f1\","));
+        assert!(rendered.contains("  version: \"123\","));
     }
 
     #[test]
