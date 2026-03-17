@@ -66,6 +66,15 @@ pub struct BaseArgs {
     )]
     pub app_url: Option<String>,
 
+    /// Path to a PEM-encoded CA bundle used for HTTPS requests.
+    #[arg(
+        long,
+        env = "BRAINTRUST_CA_BUNDLE",
+        hide_env_values = true,
+        global = true
+    )]
+    pub ca_bundle: Option<PathBuf>,
+
     /// Path to a .env file to load before running commands.
     #[arg(long, env = "BRAINTRUST_ENV_FILE", hide_env_values = true)]
     pub env_file: Option<PathBuf>,
