@@ -724,11 +724,17 @@ spec.loader.exec_module(module)
 class TypeEnum:
     value = "tool"
 
+class Params:
+    @staticmethod
+    def model_json_schema():
+        return {"type": "object", "properties": {}}
+
 class Item:
     def __init__(self):
         self.name = "my-tool"
         self.slug = "my-tool"
         self.type_ = TypeEnum()
+        self.parameters = Params
         self.preview = "def handler(x):\\n    return x"
 
 entries = module.collect_code_entries([Item()])
@@ -783,6 +789,7 @@ globalThis._evals.functions.push({
   name: "js-tool",
   slug: "js-tool",
   type: "tool",
+  parameters: { type: "object", properties: {} },
   preview: "export function handler() { return 1; }"
 });
 "#,
@@ -928,6 +935,7 @@ globalThis._evals.functions.push({
   name: "js-tool-b",
   slug: "js-tool-b",
   type: "tool",
+  parameters: { type: "object", properties: {} },
   preview: "export function b() { return 2; }"
 });
 export const b = 2;
@@ -944,6 +952,7 @@ globalThis._evals.functions.push({
   name: "js-tool-a",
   slug: "js-tool-a",
   type: "tool",
+  parameters: { type: "object", properties: {} },
   preview: "export function a() { return 1; }"
 });
 "#,
@@ -1091,11 +1100,17 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
 class TypeEnum:
     value = "tool"
 
+class Params:
+    @staticmethod
+    def model_json_schema():
+        return {"type": "object", "properties": {}}
+
 class Item:
     def __init__(self):
         self.name = "py-tool"
         self.slug = "py-tool"
         self.type_ = TypeEnum()
+        self.parameters = Params
         self.preview = "def handler(x):\n    return x"
 
 functions.append(Item())
@@ -1108,11 +1123,15 @@ functions.append(Item())
         python_path_entries.extend(std::env::split_paths(&existing));
     }
     let python_path = std::env::join_paths(python_path_entries).expect("join PYTHONPATH");
+    let expected_source = sample_path
+        .canonicalize()
+        .expect("canonicalize sample file");
 
     let output = Command::new(&python)
+        .current_dir(tmp.path())
         .env("PYTHONPATH", python_path)
         .arg(&runner_script)
-        .arg(&sample_path)
+        .arg(&expected_source)
         .output()
         .expect("run python functions runner");
     if !output.status.success() {
@@ -1141,9 +1160,6 @@ functions.append(Item())
             .and_then(Value::as_str)
             .expect("source_file"),
     );
-    let expected_source = sample_path
-        .canonicalize()
-        .expect("canonicalize sample file");
     assert_eq!(
         reported_source
             .canonicalize()

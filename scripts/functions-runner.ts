@@ -233,6 +233,11 @@ function schemaToJsonSchema(schema: unknown): JsonObject | undefined {
     return undefined;
   }
 
+  const normalizedSchema = toJsonValue(schema as JsonValue);
+  if (isJsonObject(normalizedSchema)) {
+    return normalizedSchema;
+  }
+
   const converter = loadZodToJsonSchemaFn();
   if (!converter) {
     return undefined;
@@ -411,12 +416,17 @@ function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
     const tags = Array.isArray(item.tags)
       ? item.tags.filter((tag): tag is string => typeof tag === "string")
       : [];
-    const parametersSchema = schemaToJsonSchema(item.parameters);
-    const returnsSchema = schemaToJsonSchema(item.returns);
-    const functionSchema: JsonObject = {};
-    if (parametersSchema) {
-      functionSchema.parameters = parametersSchema;
+    if (item.parameters === undefined || item.parameters === null) {
+      throw new Error(`Function ${item.name} has no supplied parameters`);
     }
+    const parametersSchema = schemaToJsonSchema(item.parameters);
+    if (!parametersSchema) {
+      throw new Error(`Function ${item.name} has invalid parameters schema`);
+    }
+    const returnsSchema = schemaToJsonSchema(item.returns);
+    const functionSchema: JsonObject = {
+      parameters: parametersSchema,
+    };
     if (returnsSchema) {
       functionSchema.returns = returnsSchema;
     }

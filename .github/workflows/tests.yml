@@ -71,6 +71,8 @@ jobs:
           corepack prepare pnpm@10.28.2 --activate
       - name: Run eval fixtures
         run: cargo test --test eval_fixtures
+      - name: Run functions fixtures
+        run: cargo test --test functions
 
   eval-tests-python:
     name: eval-tests-python (py ${{ matrix.python-version }})
