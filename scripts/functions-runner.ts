@@ -1,4 +1,5 @@
 import path from "node:path";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -24,6 +25,9 @@ type CodeRegistryItem = {
   functionType?: string;
   ifExists?: string;
   metadata?: JsonValue;
+  tags?: unknown;
+  parameters?: unknown;
+  returns?: unknown;
   preview?: string;
 };
 
@@ -58,6 +62,8 @@ type CodeEntry = {
   function_type?: string;
   if_exists?: string;
   metadata?: JsonValue;
+  tags?: string[];
+  function_schema?: JsonValue;
   preview?: string;
   location: JsonValue;
 };
@@ -83,7 +89,24 @@ type Manifest = {
 };
 
 type EvalRegistry = NonNullable<typeof globalThis._evals>;
+type ZodToJsonSchemaFn = (schema: unknown) => unknown;
+
 let moduleImportNonce = 0;
+let zodToJsonSchemaFn: ZodToJsonSchemaFn | null | undefined;
+
+const runtimeRequire: NodeRequire | null =
+  typeof require === "function" ? require : null;
+
+function safeCreateRequire(modulePath: string): NodeRequire | null {
+  try {
+    return createRequire(modulePath);
+  } catch {
+    return null;
+  }
+}
+
+const localRequire =
+  runtimeRequire ?? safeCreateRequire(path.join(process.cwd(), "package.json"));
 
 function freshRegistry(): EvalRegistry {
   return {
@@ -123,6 +146,105 @@ function buildIsolatedImportUrl(absolutePath: string): string {
   moduleUrl.searchParams.set("bt_runner_input_nonce", `${moduleImportNonce}`);
   moduleImportNonce += 1;
   return moduleUrl.href;
+}
+
+function loadZodToJsonSchemaFn(): ZodToJsonSchemaFn | null {
+  if (zodToJsonSchemaFn !== undefined) {
+    return zodToJsonSchemaFn;
+  }
+
+  const extractConverter = (module: unknown): ZodToJsonSchemaFn | null => {
+    if (
+      module &&
+      typeof module === "object" &&
+      "zodToJsonSchema" in module &&
+      typeof (module as { zodToJsonSchema?: unknown }).zodToJsonSchema ===
+        "function"
+    ) {
+      return (module as { zodToJsonSchema: ZodToJsonSchemaFn }).zodToJsonSchema;
+    }
+    if (
+      module &&
+      typeof module === "object" &&
+      "default" in module &&
+      typeof (module as { default?: unknown }).default === "function"
+    ) {
+      return (module as { default: ZodToJsonSchemaFn }).default;
+    }
+    return null;
+  };
+
+  const requireCandidates: NodeRequire[] = [];
+  if (localRequire) {
+    requireCandidates.push(localRequire);
+  }
+  const cwdRequire = safeCreateRequire(
+    path.join(process.cwd(), "package.json"),
+  );
+  if (cwdRequire) {
+    let exists = false;
+    for (const candidate of requireCandidates) {
+      if (candidate === cwdRequire) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) {
+      requireCandidates.push(cwdRequire);
+    }
+  }
+
+  for (const candidateRequire of requireCandidates) {
+    try {
+      const converter = extractConverter(
+        candidateRequire("zod-to-json-schema"),
+      );
+      if (converter) {
+        zodToJsonSchemaFn = converter;
+        return zodToJsonSchemaFn;
+      }
+    } catch {
+      // Try the next location.
+    }
+  }
+
+  for (const candidateRequire of requireCandidates) {
+    try {
+      const braintrustPkg = candidateRequire.resolve("braintrust/package.json");
+      const braintrustRequire = createRequire(braintrustPkg);
+      const converter = extractConverter(
+        braintrustRequire("zod-to-json-schema"),
+      );
+      if (converter) {
+        zodToJsonSchemaFn = converter;
+        return zodToJsonSchemaFn;
+      }
+    } catch {
+      // Try the next location.
+    }
+  }
+
+  zodToJsonSchemaFn = null;
+  return zodToJsonSchemaFn;
+}
+
+function schemaToJsonSchema(schema: unknown): JsonObject | undefined {
+  if (schema === undefined || schema === null) {
+    return undefined;
+  }
+
+  const converter = loadZodToJsonSchemaFn();
+  if (!converter) {
+    return undefined;
+  }
+
+  try {
+    const converted = converter(schema);
+    const normalized = toJsonValue(converted as JsonValue);
+    return isJsonObject(normalized) ? normalized : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function collectFunctionEvents(
@@ -286,8 +408,20 @@ function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
     }
 
     const selector = asProjectSelector(item.project);
+    const tags = Array.isArray(item.tags)
+      ? item.tags.filter((tag): tag is string => typeof tag === "string")
+      : [];
+    const parametersSchema = schemaToJsonSchema(item.parameters);
+    const returnsSchema = schemaToJsonSchema(item.returns);
+    const functionSchema: JsonObject = {};
+    if (parametersSchema) {
+      functionSchema.parameters = parametersSchema;
+    }
+    if (returnsSchema) {
+      functionSchema.returns = returnsSchema;
+    }
 
-    entries.push({
+    const entry: CodeEntry = {
       kind: "code",
       project_id:
         typeof selector.project_id === "string"
@@ -314,7 +448,16 @@ function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
         type: "function",
         index,
       },
-    });
+    };
+
+    if (tags.length > 0) {
+      entry.tags = tags;
+    }
+    if (Object.keys(functionSchema).length > 0) {
+      entry.function_schema = functionSchema;
+    }
+
+    entries.push(entry);
   }
 
   return entries;

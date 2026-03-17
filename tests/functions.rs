@@ -540,6 +540,7 @@ fn functions_push_help_includes_expected_flags() {
     assert!(stdout.contains("--file"));
     assert!(stdout.contains("--if-exists"));
     assert!(stdout.contains("--terminate-on-failure"));
+    assert!(stdout.contains("--create-missing-projects"));
     assert!(stdout.contains("--language"));
     assert!(stdout.contains("--requirements"));
     assert!(stdout.contains("--tsconfig"));

@@ -288,6 +288,15 @@ pub(crate) struct PushArgs {
     )]
     pub terminate_on_failure: bool,
 
+    /// Create referenced projects automatically when they do not exist.
+    #[arg(
+        long = "create-missing-projects",
+        env = "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
+        default_value_t = true,
+        value_parser = BoolishValueParser::new()
+    )]
+    pub create_missing_projects: bool,
+
     /// Override runner binary (e.g. tsx, vite-node, deno, python).
     #[arg(long, env = "BT_FUNCTIONS_PUSH_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,

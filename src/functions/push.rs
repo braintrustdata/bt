@@ -23,7 +23,7 @@ use crate::functions::report::{
     SoftSkipReason,
 };
 use crate::js_runner;
-use crate::projects::api::{get_project_by_name, list_projects};
+use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
 use crate::source_language::{classify_runtime_extension, JsExtensionProfile, SourceLanguage};
 use crate::ui::{animations_enabled, is_interactive, is_quiet};
@@ -46,6 +46,10 @@ const RUNNER_COMMON_SOURCE: &str = include_str!("../../scripts/runner-common.ts"
 const PYTHON_RUNNER_COMMON_SOURCE: &str = include_str!("../../scripts/python_runner_common.py");
 const PYTHON_BASELINE_DEPS: &[&str] =
     &["pydantic", "braintrust", "autoevals", "requests", "openai"];
+// Compatibility shim for existing test harnesses and eval workflows that set
+// Python interpreter via BT_EVAL_* variables. Preferred path is still
+// --runner / BT_FUNCTIONS_PUSH_RUNNER.
+const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
 
 #[derive(Debug, Deserialize)]
 struct RunnerManifest {
@@ -101,6 +105,10 @@ struct CodeEntry {
     if_exists: Option<String>,
     #[serde(default)]
     metadata: Option<Value>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    function_schema: Option<Value>,
     #[serde(default)]
     location: Option<Value>,
     #[serde(default)]
@@ -421,17 +429,22 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         }
     }
 
-    let mut project_name_cache =
-        match resolve_named_projects(&auth_ctx, &preflight.named_projects).await {
-            Ok(cache) => cache,
-            Err(err) => {
-                let message = format!("failed to resolve target projects for push: {err}");
-                return fail_manifest_preflight(
-                    message,
-                    "skipped because project target resolution failed",
-                );
-            }
-        };
+    let mut project_name_cache = match resolve_named_projects(
+        &auth_ctx,
+        &preflight.named_projects,
+        args.create_missing_projects,
+    )
+    .await
+    {
+        Ok(cache) => cache,
+        Err(err) => {
+            let message = format!("failed to resolve target projects for push: {err}");
+            return fail_manifest_preflight(
+                message,
+                "skipped because project target resolution failed",
+            );
+        }
+    };
 
     if let Err(err) = validate_direct_project_ids(&auth_ctx, &preflight.direct_project_ids).await {
         let message = format!("failed to validate project ids for push: {err}");
@@ -454,6 +467,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         default_project_id.as_deref(),
         &manifest,
         &mut project_name_cache,
+        args.create_missing_projects,
     )
     .await
     {
@@ -784,6 +798,15 @@ async fn push_file(
             if let Some(metadata) = &code.metadata {
                 obj.insert("metadata".to_string(), metadata.clone());
             }
+            if let Some(tags) = &code.tags {
+                obj.insert(
+                    "tags".to_string(),
+                    Value::Array(tags.iter().cloned().map(Value::String).collect()),
+                );
+            }
+            if let Some(function_schema) = &code.function_schema {
+                obj.insert("function_schema".to_string(), function_schema.clone());
+            }
             let if_exists = code
                 .if_exists
                 .as_deref()
@@ -820,6 +843,7 @@ async fn push_file(
                 None,
                 Some(&project_name),
                 project_name_cache,
+                args.create_missing_projects,
             )
             .await
             .map_err(|err| FileFailure {
@@ -848,7 +872,6 @@ async fn push_file(
                     Value::String(args.if_exists.as_str().to_string()),
                 );
             }
-            default_prompt_function_type(object);
         }
 
         function_events.push(event);
@@ -963,36 +986,6 @@ fn calculate_upload_counts(total_entries: usize, ignored_entries: Option<usize>)
     (uploaded_entries, ignored_entries)
 }
 
-fn default_prompt_function_type(event: &mut Map<String, Value>) {
-    if !is_prompt_function_event(event) {
-        return;
-    }
-
-    if function_type_missing_or_empty(event.get("function_type")) {
-        event.insert(
-            "function_type".to_string(),
-            Value::String("prompt".to_string()),
-        );
-    }
-}
-
-fn is_prompt_function_event(event: &Map<String, Value>) -> bool {
-    event
-        .get("function_data")
-        .and_then(Value::as_object)
-        .and_then(|function_data| function_data.get("type"))
-        .and_then(Value::as_str)
-        == Some("prompt")
-}
-
-fn function_type_missing_or_empty(value: Option<&Value>) -> bool {
-    match value {
-        None | Some(Value::Null) => true,
-        Some(Value::String(s)) => s.trim().is_empty(),
-        Some(_) => false,
-    }
-}
-
 fn run_functions_runner(
     args: &PushArgs,
     files: &[PathBuf],
@@ -1040,9 +1033,10 @@ fn run_functions_runner(
                 reason: HardFailureReason::RunnerSpawnFailed,
                 message: format!("failed to materialize Python functions runner: {err}"),
             })?;
-            let Some(python) =
-                python_runner::resolve_python_interpreter(args.runner.as_deref(), &[])
-            else {
+            let Some(python) = python_runner::resolve_python_interpreter(
+                args.runner.as_deref(),
+                PYTHON_INTERPRETER_ENV_OVERRIDES,
+            ) else {
                 return Err(FileFailure {
                     reason: HardFailureReason::RunnerSpawnFailed,
                     message: "No Python interpreter found. Install python or pass --runner."
@@ -1113,6 +1107,11 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     let mut js_like = BTreeSet::new();
     let mut python = BTreeSet::new();
     let mut allowed_roots = BTreeSet::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(canonical_cwd) = cwd.canonicalize() {
+            allowed_roots.insert(canonical_cwd);
+        }
+    }
     let mut explicit_file_inputs = 0usize;
     let mut explicit_supported_files = 0usize;
     let mut explicit_js_like = 0usize;
@@ -1568,7 +1567,9 @@ fn build_python_bundle_archive(
     requirements_path: Option<&Path>,
     runner: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let Some(python) = python_runner::resolve_python_interpreter(runner, &[]) else {
+    let Some(python) =
+        python_runner::resolve_python_interpreter(runner, PYTHON_INTERPRETER_ENV_OVERRIDES)
+    else {
         bail!("No Python interpreter found. Install python or pass --runner.")
     };
 
@@ -2256,16 +2257,37 @@ fn resolve_default_project_id(
 async fn resolve_named_projects(
     auth_ctx: &super::AuthContext,
     named_projects: &BTreeSet<String>,
+    create_missing_projects: bool,
 ) -> Result<BTreeMap<String, String>> {
     let mut project_name_cache = BTreeMap::new();
     let mut missing = Vec::new();
 
     for project_name in named_projects {
-        let project = get_project_by_name(&auth_ctx.client, project_name).await?;
-        if let Some(project) = project {
+        if let Some(project) = get_project_by_name(&auth_ctx.client, project_name).await? {
             project_name_cache.insert(project_name.clone(), project.id);
-        } else {
+            continue;
+        }
+
+        if !create_missing_projects {
             missing.push(project_name.clone());
+            continue;
+        }
+
+        match create_project(&auth_ctx.client, project_name).await {
+            Ok(project) => {
+                project_name_cache.insert(project_name.clone(), project.id);
+            }
+            Err(_) => {
+                // Another writer may have created the project concurrently.
+                if let Some(project) = get_project_by_name(&auth_ctx.client, project_name).await? {
+                    project_name_cache.insert(project_name.clone(), project.id);
+                } else {
+                    bail!(
+                        "failed to create project '{project_name}' in org '{}'",
+                        current_org_label(auth_ctx)
+                    );
+                }
+            }
         }
     }
 
@@ -2311,6 +2333,7 @@ async fn resolve_manifest_targets(
     default_project_id: Option<&str>,
     manifest: &RunnerManifest,
     project_name_cache: &mut BTreeMap<String, String>,
+    create_missing_projects: bool,
 ) -> Result<ResolvedManifestTargets> {
     let mut entries = Vec::new();
     let mut per_file = Vec::with_capacity(manifest.files.len());
@@ -2328,6 +2351,7 @@ async fn resolve_manifest_targets(
                 default_project_id,
                 &selector,
                 project_name_cache,
+                create_missing_projects,
             )
             .await?;
             entry_project_ids.push(project_id.clone());
@@ -2374,6 +2398,7 @@ async fn resolve_project_selector(
     default_project_id: Option<&str>,
     selector: &ProjectSelector,
     project_name_cache: &mut BTreeMap<String, String>,
+    create_missing_projects: bool,
 ) -> Result<String> {
     match selector {
         ProjectSelector::Id(project_id) => {
@@ -2383,6 +2408,7 @@ async fn resolve_project_selector(
                 Some(project_id.as_str()),
                 None,
                 project_name_cache,
+                create_missing_projects,
             )
             .await
         }
@@ -2393,11 +2419,20 @@ async fn resolve_project_selector(
                 None,
                 Some(project_name.as_str()),
                 project_name_cache,
+                create_missing_projects,
             )
             .await
         }
         ProjectSelector::Fallback => {
-            resolve_project_id(client, default_project_id, None, None, project_name_cache).await
+            resolve_project_id(
+                client,
+                default_project_id,
+                None,
+                None,
+                project_name_cache,
+                create_missing_projects,
+            )
+            .await
         }
     }
 }
@@ -2408,18 +2443,31 @@ async fn resolve_project_id(
     project_id: Option<&str>,
     project_name: Option<&str>,
     project_name_cache: &mut BTreeMap<String, String>,
+    create_missing_projects: bool,
 ) -> Result<String> {
     let normalized_project_id = normalize_project_id_field(project_id)?;
     if let Some(project_id) = normalized_project_id {
         if let Some(name) = project_id.strip_prefix("name:") {
-            return resolve_project_name(client, name.trim(), project_name_cache).await;
+            return resolve_project_name(
+                client,
+                name.trim(),
+                project_name_cache,
+                create_missing_projects,
+            )
+            .await;
         }
         return Ok(project_id);
     }
 
     let normalized_project_name = normalize_project_name_field(project_name)?;
     if let Some(project_name) = normalized_project_name {
-        return resolve_project_name(client, project_name.trim(), project_name_cache).await;
+        return resolve_project_name(
+            client,
+            project_name.trim(),
+            project_name_cache,
+            create_missing_projects,
+        )
+        .await;
     }
 
     default_project_id.map(ToOwned::to_owned).ok_or_else(|| {
@@ -2431,6 +2479,7 @@ async fn resolve_project_name(
     client: &crate::http::ApiClient,
     project_name: &str,
     project_name_cache: &mut BTreeMap<String, String>,
+    create_missing_projects: bool,
 ) -> Result<String> {
     let project_name = project_name.trim();
     if project_name.is_empty() {
@@ -2441,9 +2490,18 @@ async fn resolve_project_name(
         return Ok(cached.clone());
     }
 
-    let project = get_project_by_name(client, project_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
+    let project = if let Some(project) = get_project_by_name(client, project_name).await? {
+        project
+    } else if create_missing_projects {
+        match create_project(client, project_name).await {
+            Ok(project) => project,
+            Err(_) => get_project_by_name(client, project_name)
+                .await?
+                .ok_or_else(|| anyhow!("failed to create project '{project_name}'"))?,
+        }
+    } else {
+        return Err(anyhow!("project '{project_name}' not found"));
+    };
 
     project_name_cache.insert(project_name.to_string(), project.id.clone());
     Ok(project.id)
@@ -2734,6 +2792,8 @@ mod tests {
                     function_type: Some("tool".to_string()),
                     if_exists: None,
                     metadata: None,
+                    tags: None,
+                    function_schema: None,
                     location: None,
                     preview: None,
                 })],
@@ -2770,6 +2830,7 @@ mod tests {
             file_flag: vec![],
             if_exists: IfExistsMode::Error,
             terminate_on_failure: false,
+            create_missing_projects: true,
             runner: None,
             language: PushLanguage::Auto,
             requirements: None,
@@ -2798,6 +2859,7 @@ mod tests {
             file_flag: vec![],
             if_exists: IfExistsMode::Error,
             terminate_on_failure: false,
+            create_missing_projects: true,
             runner: None,
             language: PushLanguage::Auto,
             requirements: None,
@@ -2880,61 +2942,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_event_defaults_function_type_when_missing() {
-        let mut event = Map::new();
-        event.insert(
-            "function_data".to_string(),
-            serde_json::json!({
-                "type": "prompt"
-            }),
-        );
-
-        default_prompt_function_type(&mut event);
-
-        assert_eq!(
-            event.get("function_type"),
-            Some(&Value::String("prompt".to_string()))
-        );
-    }
-
-    #[test]
-    fn prompt_event_preserves_existing_function_type() {
-        let mut event = Map::new();
-        event.insert(
-            "function_data".to_string(),
-            serde_json::json!({
-                "type": "prompt"
-            }),
-        );
-        event.insert(
-            "function_type".to_string(),
-            Value::String("scorer".to_string()),
-        );
-
-        default_prompt_function_type(&mut event);
-
-        assert_eq!(
-            event.get("function_type"),
-            Some(&Value::String("scorer".to_string()))
-        );
-    }
-
-    #[test]
-    fn non_prompt_event_does_not_default_function_type() {
-        let mut event = Map::new();
-        event.insert(
-            "function_data".to_string(),
-            serde_json::json!({
-                "type": "code"
-            }),
-        );
-
-        default_prompt_function_type(&mut event);
-
-        assert!(!event.contains_key("function_type"));
-    }
-
-    #[test]
     fn requirements_reference_escape_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("root");
@@ -3009,6 +3016,8 @@ mod tests {
                     function_type: Some("tool".to_string()),
                     if_exists: None,
                     metadata: None,
+                    tags: None,
+                    function_schema: None,
                     location: Some(serde_json::json!({"type":"function","index":0})),
                     preview: None,
                 })],
@@ -3051,6 +3060,8 @@ mod tests {
                     function_type: Some("tool".to_string()),
                     if_exists: None,
                     metadata: None,
+                    tags: None,
+                    function_schema: None,
                     location: Some(serde_json::json!({"type":"function","index":0})),
                     preview: None,
                 })],
@@ -3094,6 +3105,8 @@ mod tests {
                     function_type: Some("tool".to_string()),
                     if_exists: None,
                     metadata: None,
+                    tags: None,
+                    function_schema: None,
                     location: Some(serde_json::json!({"type":"function","index":0})),
                     preview: None,
                 })],

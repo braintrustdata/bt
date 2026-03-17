@@ -81,4 +81,16 @@ mod tests {
         let resolved = resolve_python_interpreter(Some("/tmp/python"), &["BT_UNUSED"]);
         assert_eq!(resolved, Some(PathBuf::from("/tmp/python")));
     }
+
+    #[test]
+    fn env_override_python_runner_is_used() {
+        unsafe {
+            std::env::set_var("BT_TEST_PYTHON_RUNNER", "/tmp/from-env-python");
+        }
+        let resolved = resolve_python_interpreter(None, &["BT_TEST_PYTHON_RUNNER"]);
+        unsafe {
+            std::env::remove_var("BT_TEST_PYTHON_RUNNER");
+        }
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/from-env-python")));
+    }
 }
