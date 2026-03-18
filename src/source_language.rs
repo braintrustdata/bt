@@ -7,6 +7,7 @@ pub enum SourceLanguage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsExtensionProfile {
     FunctionsPush,
+    #[allow(dead_code)]
     Eval,
 }
 

@@ -2188,7 +2188,7 @@ fn build_python_command(
         .or_else(|| std::env::var("BT_EVAL_PYTHON_RUNNER").ok())
         .or_else(|| std::env::var("BT_EVAL_PYTHON").ok());
 
-    let mut command = if let Some(explicit) = runner_override {
+    let command = if let Some(explicit) = runner_override {
         let mut command = Command::new(explicit);
         command.arg(runner).args(files);
         command
