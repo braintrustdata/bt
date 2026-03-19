@@ -640,6 +640,139 @@ struct FileSuccess {
     bundle_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PublishedSandboxFunction {
+    pub slug: String,
+    pub project_id: String,
+    pub function_id: String,
+}
+
+pub(crate) async fn publish_eval_sandbox_functions(
+    base: &BaseArgs,
+    source_file: &Path,
+    runner_override: Option<&str>,
+    language: SourceLanguage,
+) -> Result<Vec<PublishedSandboxFunction>> {
+    let available_orgs = list_available_orgs(base)
+        .await
+        .context("failed to list available orgs")?;
+    validate_explicit_org_selection(base, &available_orgs)?;
+    let auth_ctx = resolve_auth_context(base)
+        .await
+        .context("failed to resolve auth context")?;
+
+    let args = PushArgs {
+        files: vec![source_file.to_path_buf()],
+        file_flag: Vec::new(),
+        if_exists: super::IfExistsMode::Replace,
+        terminate_on_failure: true,
+        create_missing_projects: true,
+        runner: runner_override.map(ToOwned::to_owned),
+        language: match language {
+            SourceLanguage::JsLike => PushLanguage::JavaScript,
+            SourceLanguage::Python => PushLanguage::Python,
+        },
+        requirements: None,
+        tsconfig: None,
+        external_packages: Vec::new(),
+        yes: true,
+    };
+
+    let input_files = args.resolved_files();
+    let classified = collect_classified_files(&input_files)?;
+    let files = classified.files_for_language(language);
+    if files.is_empty() {
+        bail!(
+            "no eligible {} files found for sandbox publish: {}",
+            language_label(language),
+            source_file.display()
+        );
+    }
+
+    let mut manifest = run_functions_runner(&args, &files, language, auth_ctx.client.api_key())
+        .map_err(|failure| anyhow!(failure.message))?;
+
+    for file in &mut manifest.files {
+        file.entries.retain(|entry| match entry {
+            ManifestEntry::Code(code) => code.function_type.as_deref() == Some("sandbox"),
+            ManifestEntry::FunctionEvent(_) => false,
+        });
+    }
+    manifest
+        .files
+        .retain(|file| !file.entries.is_empty() || file.python_bundle.is_some());
+
+    if manifest.files.is_empty() {
+        bail!("no sandbox evaluators found in {}", source_file.display());
+    }
+
+    validate_manifest_paths(&manifest, &files, language, &classified.allowed_roots)
+        .map_err(|failure| anyhow!(failure.message))?;
+
+    let preflight = collect_project_preflight(base, &manifest)?;
+    let mut project_name_cache =
+        resolve_named_projects(&auth_ctx, &preflight.named_projects, true).await?;
+    validate_direct_project_ids(&auth_ctx, &preflight.direct_project_ids).await?;
+    let default_project_id = resolve_default_project_id(&preflight, &project_name_cache)?;
+    let resolved_targets = resolve_manifest_targets(
+        &auth_ctx,
+        default_project_id.as_deref(),
+        &manifest,
+        &mut project_name_cache,
+        true,
+    )
+    .await?;
+    validate_duplicate_slugs(&resolved_targets.entries)?;
+
+    let mut published = Vec::new();
+    for (manifest_file, resolved_file) in
+        manifest.files.iter().zip(resolved_targets.per_file.iter())
+    {
+        let source_path = PathBuf::from(&manifest_file.source_file);
+        push_file(
+            &auth_ctx,
+            default_project_id.as_deref(),
+            &manifest.runtime_context,
+            &source_path,
+            manifest_file,
+            &resolved_file.entry_project_ids,
+            &args,
+            language,
+            None,
+            &classified.allowed_roots,
+            &mut project_name_cache,
+        )
+        .await
+        .map_err(|failure| anyhow!(failure.message))?;
+
+        for (entry_index, entry) in manifest_file.entries.iter().enumerate() {
+            let ManifestEntry::Code(code) = entry else {
+                continue;
+            };
+            let project_id = resolved_file
+                .entry_project_ids
+                .get(entry_index)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing resolved project id for sandbox entry"))?;
+            let function = api::get_function_by_slug(&auth_ctx.client, &project_id, &code.slug)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "sandbox function '{}' was not found after publish",
+                        code.slug
+                    )
+                })?;
+            published.push(PublishedSandboxFunction {
+                slug: code.slug.clone(),
+                project_id,
+                function_id: function.id,
+            });
+        }
+    }
+
+    Ok(published)
+}
+
 fn default_code_location(index: usize) -> Value {
     json!({
         "type": "function",
@@ -3294,12 +3427,8 @@ mod tests {
                 "scores": [{ "name": "accuracy" }]
             }
         });
-        let value = build_code_function_data(
-            &runtime,
-            sandbox_location.clone(),
-            "bundle-sandbox-1",
-            None,
-        );
+        let value =
+            build_code_function_data(&runtime, sandbox_location.clone(), "bundle-sandbox-1", None);
 
         assert_eq!(value["type"], "code");
         assert_eq!(value["data"]["type"], "bundle");
@@ -3319,12 +3448,8 @@ mod tests {
             "eval_name": "my-eval",
             "position": { "type": "task" }
         });
-        let value = build_code_function_data(
-            &runtime,
-            experiment_location.clone(),
-            "bundle-task-1",
-            None,
-        );
+        let value =
+            build_code_function_data(&runtime, experiment_location.clone(), "bundle-task-1", None);
 
         assert_eq!(value["type"], "code");
         assert_eq!(value["data"]["location"], experiment_location);

@@ -2,13 +2,27 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-type EvaluatorEntry = {
-  evaluator: {
-    evalName: string;
-    projectName: string;
-  } & Record<string, unknown>;
-  reporter?: unknown;
-};
+import {
+  envFlag,
+  filterEvaluators,
+  formatError,
+  getBraintrustStateGetter,
+  getEvaluators,
+  getReporters,
+  initRegistry,
+  isObject,
+  loadBraintrust,
+  loadBraintrustUtilParseParent,
+  loadFiles,
+  normalizeFiles,
+  parseSerializedFilters,
+  propagateInheritedBraintrustState,
+  resolveBraintrustPath,
+  type EvalFilter,
+  type EvaluatorEntry,
+  type GlobalEvals,
+  type ParseParentFunction,
+} from "./runner-common";
 
 type EvalResult = {
   results: Array<{ error?: unknown }>;
@@ -43,23 +57,6 @@ type InitDatasetFunction = (
 ) => unknown;
 type InvokeFunction = (options: Record<string, unknown>) => Promise<unknown>;
 
-type BraintrustModule = {
-  Eval?: EvalFunction;
-  login?: LoginFunction;
-  initDataset?: InitDatasetFunction;
-  invoke?: InvokeFunction;
-  _internalGetGlobalState?: () => unknown;
-  default?: BraintrustModule;
-};
-
-type GlobalEvals = {
-  functions: unknown[];
-  prompts: unknown[];
-  parameters: unknown[];
-  evaluators: Record<string, EvaluatorEntry>;
-  reporters: Record<string, unknown>;
-};
-
 type BtEvalMain = (context: BtEvalContext) => void | Promise<void>;
 
 type BtEvalContext = {
@@ -81,16 +78,6 @@ type BtEvalContext = {
 type SseWriter = {
   send: (event: string, data: unknown) => void;
   close: () => void;
-};
-
-type EvalFilter = {
-  path: string[];
-  pattern: RegExp;
-};
-
-type SerializedEvalFilter = {
-  path: string[];
-  pattern: string;
 };
 
 type EvalScoreSpec = {
@@ -145,8 +132,6 @@ type EvalRunner = {
 type ParameterContainerSerializer = (parameters: unknown) => unknown;
 type PromptDefinitionSerializer = (prompt: unknown) => unknown;
 type ZodSchemaSerializer = (schema: unknown) => Record<string, unknown>;
-type ParseParentFunction = (parent: unknown) => string | undefined;
-
 type ParameterSerializationHelpers = {
   sdkSerializeParameters: ParameterContainerSerializer | null;
   promptDefinitionToPromptData: PromptDefinitionSerializer | null;
@@ -162,88 +147,9 @@ declare global {
   var __inherited_braintrust_state: unknown;
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function isBraintrustModule(value: unknown): value is BraintrustModule {
-  return isObject(value) && ("Eval" in value || "login" in value);
-}
-
-function normalizeBraintrustModule(value: unknown): BraintrustModule {
-  if (isBraintrustModule(value)) {
-    return value;
-  }
-  if (isObject(value) && isBraintrustModule(value.default)) {
-    return value.default;
-  }
-  throw new Error("Unable to load braintrust module.");
-}
-
-function normalizeFiles(files: string[]): string[] {
-  return files.map((file) => path.resolve(process.cwd(), file));
-}
-
-function envFlag(name: string): boolean {
-  const value = process.env[name];
-  if (!value) {
-    return false;
-  }
-  const normalized = value.toLowerCase();
-  return !["0", "false", "no", "off", ""].includes(normalized);
-}
-
-function serializeJSONWithPlainString(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  return JSON.stringify(value);
-}
-
-function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
-  if (!serialized) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(serialized);
-    if (!Array.isArray(parsed)) {
-      throw new Error("BT_EVAL_FILTER_PARSED must be a JSON array.");
-    }
-    return parsed.map((value) => {
-      if (!isObject(value)) {
-        throw new Error(
-          "BT_EVAL_FILTER_PARSED entries must be objects with {path, pattern}.",
-        );
-      }
-      const { path: rawPath, pattern: rawPattern } =
-        value as SerializedEvalFilter;
-      if (
-        !Array.isArray(rawPath) ||
-        !rawPath.every((part) => typeof part === "string")
-      ) {
-        throw new Error(
-          "BT_EVAL_FILTER_PARSED entry path must be an array of strings.",
-        );
-      }
-      if (typeof rawPattern !== "string") {
-        throw new Error(
-          "BT_EVAL_FILTER_PARSED entry pattern must be a string.",
-        );
-      }
-      return {
-        path: rawPath,
-        pattern: new RegExp(rawPattern),
-      };
-    });
-  } catch (err) {
-    throw new Error(
-      `Invalid BT_EVAL_FILTER_PARSED value: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-function parseDevMode(value: string | undefined): "list" | "eval" | null {
+function parseDevMode(
+  value: string | undefined,
+): "list" | "eval" | null {
   if (!value) {
     return null;
   }
@@ -283,6 +189,7 @@ type NetModule = {
     setNoDelay: (value?: boolean) => void;
     on: (event: string, listener: (...args: unknown[]) => void) => void;
     write: (data: string) => void;
+    [Symbol.asyncIterator]?: () => AsyncIterator<string | Buffer>;
   };
 };
 
@@ -766,65 +673,6 @@ function createSseWriter(): SseWriter | null {
   return { send, close };
 }
 
-function initRegistry() {
-  globalThis._evals = {
-    functions: [],
-    prompts: [],
-    parameters: [],
-    evaluators: {},
-    reporters: {},
-  };
-  globalThis._lazy_load = true;
-}
-
-function ensureBraintrustAvailable() {
-  resolveBraintrustPath();
-}
-
-function resolveBraintrustPath(): string {
-  const files = normalizeFiles(process.argv.slice(2));
-  for (const file of files) {
-    try {
-      const require = createRequire(pathToFileURL(file).href);
-      return require.resolve("braintrust");
-    } catch {
-      continue;
-    }
-  }
-
-  try {
-    const require = createRequire(process.cwd() + "/");
-    return require.resolve("braintrust");
-  } catch {
-    const message =
-      "Unable to resolve the `braintrust` package. " +
-      "Please install it in your project (e.g. `pnpm add braintrust` or `npm install braintrust`).";
-    throw new Error(message);
-  }
-}
-
-async function loadBraintrust() {
-  const cjsPath = resolveBraintrustPath();
-  const cjsUrl = pathToFileURL(cjsPath).href;
-
-  try {
-    const mod: unknown = await import(cjsUrl);
-    return normalizeBraintrustModule(mod);
-  } catch {}
-
-  const esmPath = cjsPath.replace(/\.js$/, ".mjs");
-  if (esmPath !== cjsPath && fsMutable.existsSync(esmPath)) {
-    try {
-      const mod: unknown = await import(pathToFileURL(esmPath).href);
-      return normalizeBraintrustModule(mod);
-    } catch {}
-  }
-
-  const require = createRequire(cjsUrl);
-  const mod: unknown = require(cjsPath);
-  return normalizeBraintrustModule(mod);
-}
-
 function extractParameterSerializer(
   mod: unknown,
 ): ParameterContainerSerializer | null {
@@ -964,7 +812,7 @@ function loadZodSchemaSerializer(
 }
 
 async function loadParameterSerializationHelpers(): Promise<ParameterSerializationHelpers> {
-  const braintrustPath = resolveBraintrustPath();
+  const braintrustPath = resolveBraintrustPath(process.argv.slice(2));
   const zodToJsonSchema = loadZodSchemaSerializer(braintrustPath);
   try {
     const mod: unknown = await import(pathToFileURL(braintrustPath).href);
@@ -980,169 +828,6 @@ async function loadParameterSerializationHelpers(): Promise<ParameterSerializati
       zodToJsonSchema,
     };
   }
-}
-
-function extractParseParent(mod: unknown): ParseParentFunction | null {
-  if (!isObject(mod)) {
-    return null;
-  }
-  const candidate = Reflect.get(mod, "parseParent");
-  if (typeof candidate === "function") {
-    return candidate as ParseParentFunction;
-  }
-  const defaultExport = Reflect.get(mod, "default");
-  if (isObject(defaultExport)) {
-    const fromDefault = Reflect.get(defaultExport, "parseParent");
-    if (typeof fromDefault === "function") {
-      return fromDefault as ParseParentFunction;
-    }
-  }
-  return null;
-}
-
-function extractGlobalStateGetter(mod: unknown): (() => unknown) | null {
-  if (!isObject(mod)) {
-    return null;
-  }
-  const candidate = Reflect.get(mod, "_internalGetGlobalState");
-  if (typeof candidate === "function") {
-    return candidate as () => unknown;
-  }
-  const defaultExport = Reflect.get(mod, "default");
-  if (isObject(defaultExport)) {
-    const fromDefault = Reflect.get(defaultExport, "_internalGetGlobalState");
-    if (typeof fromDefault === "function") {
-      return fromDefault as () => unknown;
-    }
-  }
-  return null;
-}
-
-function loadBraintrustUtilParseParent(): ParseParentFunction | null {
-  const braintrustPath = resolveBraintrustPath();
-  const requireFromBraintrust = createRequire(
-    pathToFileURL(braintrustPath).href,
-  );
-  try {
-    const utilMod: unknown = requireFromBraintrust("braintrust/util");
-    return extractParseParent(utilMod);
-  } catch {
-    return null;
-  }
-}
-
-function propagateInheritedBraintrustState(braintrust: BraintrustModule) {
-  const getter = (braintrust as Record<string, unknown>)
-    ._internalGetGlobalState;
-  if (typeof getter !== "function") {
-    return;
-  }
-  const state = getter();
-  if (state !== undefined && state !== null) {
-    globalThis.__inherited_braintrust_state = state;
-  }
-}
-
-async function loadFiles(files: string[]): Promise<unknown[]> {
-  const modules: unknown[] = [];
-  // Internal CLI-controlled flag for ESM retry; not user-facing config.
-  const forceEsm = envFlag("BT_EVAL_FORCE_ESM");
-  // vite-node installs transform hooks that handle TypeScript (including
-  // extension-less imports) and CJS named-export interop natively. A failed
-  // require() corrupts Node's module cache and causes the subsequent import()
-  // to hit the "module imported again after being required" bug, so we skip
-  // require() for .ts/.tsx files entirely when running under vite-node.
-  const isViteNode = process.env.BT_EVAL_RUNNER_KIND === "vite-node";
-  for (const file of files) {
-    const fileUrl = pathToFileURL(file).href;
-    const isTypeScript = file.endsWith(".ts") || file.endsWith(".tsx");
-    const preferRequire =
-      !forceEsm &&
-      !(isViteNode && isTypeScript) &&
-      (isTypeScript || file.endsWith(".cjs"));
-
-    if (preferRequire) {
-      try {
-        const require = createRequire(fileUrl);
-        const mod = require(file);
-        modules.push(mod);
-        continue;
-      } catch (requireErr) {
-        try {
-          const mod = await import(fileUrl);
-          modules.push(mod);
-          continue;
-        } catch (esmErr) {
-          throw new Error(
-            `Failed to load ${file} as CJS (${formatError(requireErr)}) or ESM (${formatError(esmErr)}).`,
-          );
-        }
-      }
-    }
-
-    try {
-      const mod = await import(fileUrl);
-      modules.push(mod);
-      continue;
-    } catch (err) {
-      if (!shouldTryRequire(file, err)) {
-        throw err;
-      }
-      try {
-        const require = createRequire(fileUrl);
-        const mod = require(file);
-        modules.push(mod);
-        continue;
-      } catch (requireErr) {
-        throw new Error(
-          `Failed to load ${file} as ESM (${formatError(err)}) or CJS (${formatError(requireErr)}).`,
-        );
-      }
-    }
-  }
-  return modules;
-}
-
-function shouldTryRequire(file: string, err: unknown): boolean {
-  if (envFlag("BT_EVAL_FORCE_ESM")) {
-    return false;
-  }
-  if (process.env.BT_EVAL_RUNNER_KIND === "vite-node") {
-    return false;
-  }
-  if (process.env.BT_EVAL_CJS === "1" || file.endsWith(".cjs")) {
-    return true;
-  }
-  if (
-    (file.endsWith(".ts") || file.endsWith(".tsx")) &&
-    isNodeErrorCode(err, "ERR_UNKNOWN_FILE_EXTENSION")
-  ) {
-    return true;
-  }
-  if (!(err instanceof Error)) {
-    return false;
-  }
-  const message = err.message || "";
-  return (
-    message.includes("require is not defined") ||
-    message.includes("exports is not defined") ||
-    message.includes("module is not defined") ||
-    message.includes("Cannot use import statement outside a module")
-  );
-}
-
-function isNodeErrorCode(err: unknown, code: string): boolean {
-  if (!isObject(err) || !("code" in err)) {
-    return false;
-  }
-  return typeof err.code === "string" && err.code === code;
-}
-
-function formatError(err: unknown): string {
-  if (err instanceof Error) {
-    return err.message;
-  }
-  return String(err);
 }
 
 function createEvalProgressReporter(
@@ -1216,22 +901,6 @@ function sendConsole(
   sse.send("console", { stream, message });
 }
 
-function getEvaluators(): EvaluatorEntry[] {
-  const evals = globalThis._evals;
-  if (!evals || !evals.evaluators) {
-    return [];
-  }
-  return Object.values(evals.evaluators) as EvaluatorEntry[];
-}
-
-function getReporters(): Record<string, unknown> {
-  const evals = globalThis._evals;
-  if (!evals || !evals.reporters) {
-    return {};
-  }
-  return evals.reporters as Record<string, unknown>;
-}
-
 function resolveReporter(
   reporter: unknown,
   reporters: Record<string, unknown>,
@@ -1256,34 +925,6 @@ function resolveReporter(
   const names = Object.keys(reporters).join(", ");
   throw new Error(
     `Multiple reporters found (${names}). Please specify a reporter explicitly.`,
-  );
-}
-
-function evaluateFilter(
-  object: Record<string, unknown>,
-  filter: EvalFilter,
-): boolean {
-  const key = filter.path.reduce<unknown>((acc, part) => {
-    if (!isObject(acc)) {
-      return undefined;
-    }
-    return acc[part];
-  }, object);
-  if (key === undefined) {
-    return false;
-  }
-  return filter.pattern.test(serializeJSONWithPlainString(key));
-}
-
-function filterEvaluators(
-  evaluators: EvaluatorEntry[],
-  filters: EvalFilter[],
-): EvaluatorEntry[] {
-  if (filters.length === 0) {
-    return evaluators;
-  }
-  return evaluators.filter((entry) =>
-    filters.every((filter) => evaluateFilter(entry.evaluator, filter)),
   );
 }
 
@@ -1831,9 +1472,12 @@ function mergeProgress(
   };
 }
 
-async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
-  const braintrust = await loadBraintrust();
-  const Eval = braintrust.Eval;
+async function createEvalRunner(
+  config: RunnerConfig,
+  files: string[],
+): Promise<EvalRunner> {
+  const braintrust = await loadBraintrust(files);
+  const Eval = braintrust.Eval as EvalFunction | undefined;
   if (typeof Eval !== "function") {
     throw new Error("Unable to load Eval() from braintrust package.");
   }
@@ -1843,8 +1487,8 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
 
   const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
-  const parseParent = loadBraintrustUtilParseParent();
-  const getState = extractGlobalStateGetter(braintrust);
+  const parseParent = loadBraintrustUtilParseParent(files);
+  const getState = getBraintrustStateGetter(braintrust);
 
   const makeEvalOptions = (
     evaluatorName: string,
@@ -1996,8 +1640,7 @@ async function main() {
     maybeRecordDependency(file);
   }
   collectStaticLocalDependencies(normalized);
-  ensureBraintrustAvailable();
-  const braintrust = await loadBraintrust();
+  const braintrust = await loadBraintrust(normalized);
   propagateInheritedBraintrustState(braintrust);
   initRegistry();
   // Replace process.argv with [runtime, script, ...extraArgs] so that user
@@ -2010,7 +1653,7 @@ async function main() {
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 
-  const runner = await createEvalRunner(config);
+  const runner = await createEvalRunner(config, normalized);
   if (!runner.noSendLogs && typeof runner.login === "function") {
     try {
       await runner.login({});
