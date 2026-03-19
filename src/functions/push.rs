@@ -689,9 +689,8 @@ pub(crate) async fn publish_eval_sandbox_functions(
         );
     }
 
-    let mut manifest =
-        run_functions_runner(&args, &files, language, auth_ctx.client.api_key())
-            .map_err(|failure| anyhow!(failure.message))?;
+    let mut manifest = run_functions_runner(&args, &files, language, auth_ctx.client.api_key())
+        .map_err(|failure| anyhow!(failure.message))?;
 
     for file in &mut manifest.files {
         file.entries.retain(|entry| match entry {
@@ -707,13 +706,8 @@ pub(crate) async fn publish_eval_sandbox_functions(
         bail!("no sandbox evaluators found in {}", source_file.display());
     }
 
-    validate_manifest_paths(
-        &manifest,
-        &files,
-        language,
-        &classified.allowed_roots,
-    )
-    .map_err(|failure| anyhow!(failure.message))?;
+    validate_manifest_paths(&manifest, &files, language, &classified.allowed_roots)
+        .map_err(|failure| anyhow!(failure.message))?;
 
     let preflight = collect_project_preflight(base, &manifest)?;
     let mut project_name_cache =

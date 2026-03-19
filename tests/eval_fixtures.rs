@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(unix)]
+use std::io::Write;
 use std::io::{BufRead, BufReader, Read};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -8,6 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+#[cfg(unix)]
+use serde_json::json;
 use serde_json::Value;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -435,9 +441,332 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn eval_runner_rows_mode_streams_js_rows_and_trials() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but unavailable for rows-mode test");
+        }
+        eprintln!(
+            "Skipping eval_runner_rows_mode_streams_js_rows_and_trials (node not installed)."
+        );
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-ts-cjs");
+    ensure_dependencies(&fixture_dir);
+    let runner = local_tsx_path(&fixture_dir).expect("resolve tsx runner");
+    let runner_script = root.join("scripts").join("eval-runner.ts");
+    let fixture_name = format!("sandbox_rows_{}.eval.ts", unique_test_suffix());
+    let fixture_path = fixture_dir.join(&fixture_name);
+    let fixture_source = r#"import { Eval } from "braintrust";
+
+async function* rows() {
+  yield { input: { case_id: "row-1" }, expected: "alpha" };
+  yield { input: { case_id: "row-2" }, expected: "bravo" };
+}
+
+Eval("sandbox-rows-js", {
+  data: rows,
+  task: async (input: { case_id: string }) =>
+    input.case_id === "row-1" ? "alpha" : "bravo",
+  scores: [
+    ({ output, expected }: { output: string; expected?: string }) => ({
+      name: "match",
+      score: output === expected ? 1 : 0,
+    }),
+  ],
+  maxConcurrency: 3,
+  trialCount: 2,
+});
+"#;
+    fs::write(&fixture_path, fixture_source).expect("write js rows fixture");
+
+    let socket_path = unique_socket_path("bt-eval-js-rows");
+    let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener nonblocking");
+
+    let mut child = Command::new(&runner)
+        .arg(&runner_script)
+        .arg(&fixture_name)
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_DEV_MODE", "rows")
+        .env(
+            "BT_EVAL_DEV_REQUEST_JSON",
+            json!({
+                "name": "sandbox-rows-js",
+                "parameters": {},
+            })
+            .to_string(),
+        )
+        .env("BT_EVAL_PULL_SOCK", &socket_path)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_EVAL_NO_SEND_LOGS", "1")
+        .env("BRAINTRUST_API_KEY", "local")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn js eval runner");
+
+    let stream = accept_pull_stream(&listener, &mut child, Duration::from_secs(10));
+    let mut reader = BufReader::new(stream.try_clone().expect("clone pull stream"));
+    let mut writer = stream;
+
+    let ready = read_pull_message(&mut reader);
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["evaluator_name"], "sandbox-rows-js");
+    assert_eq!(ready["max_concurrency"], 3);
+    assert!(ready["experiment_name"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("sandbox-rows-js-")));
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let first = read_pull_message(&mut reader);
+    assert_eq!(first["type"], "row");
+    assert_eq!(first["trial_index"], 0);
+    assert_eq!(first["datum"]["input"]["case_id"], "row-1");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let second = read_pull_message(&mut reader);
+    assert_eq!(second["type"], "row");
+    assert_eq!(second["trial_index"], 1);
+    assert_eq!(second["datum"]["input"]["case_id"], "row-1");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let third = read_pull_message(&mut reader);
+    assert_eq!(third["type"], "row");
+    assert_eq!(third["trial_index"], 0);
+    assert_eq!(third["datum"]["input"]["case_id"], "row-2");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let fourth = read_pull_message(&mut reader);
+    assert_eq!(fourth["type"], "row");
+    assert_eq!(fourth["trial_index"], 1);
+    assert_eq!(fourth["datum"]["input"]["case_id"], "row-2");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let eof = read_pull_message(&mut reader);
+    assert_eq!(eof["type"], "eof");
+
+    write_pull_message(&mut writer, &json!({ "type": "close" }));
+    drop(writer);
+    drop(reader);
+
+    let output = child.wait_with_output().expect("wait for js rows runner");
+    if !output.status.success() {
+        panic!(
+            "js rows runner failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&fixture_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_runner_rows_mode_streams_python_rows_and_trials() {
+    let _guard = test_lock();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("py").join("local_import");
+    let python = match ensure_python_env(&fixtures_root.join("py")) {
+        Some(python) => python,
+        None => {
+            if required_runtimes().contains("python") {
+                panic!("python runtime unavailable for rows-mode test");
+            }
+            eprintln!(
+                "Skipping eval_runner_rows_mode_streams_python_rows_and_trials (python runtime unavailable)."
+            );
+            return;
+        }
+    };
+
+    let runner_script = root.join("scripts").join("eval-runner.py");
+    let fixture_name = format!("sandbox_rows_{}.py", unique_test_suffix());
+    let fixture_path = fixture_dir.join(&fixture_name);
+    let fixture_source = r#"from braintrust import Eval
+
+def rows():
+    yield {"input": {"case_id": "row-1"}, "expected": "alpha"}
+    yield {"input": {"case_id": "row-2"}, "expected": "bravo"}
+
+def task(input):
+    return "alpha" if input["case_id"] == "row-1" else "bravo"
+
+def match(output, expected):
+    return {"name": "match", "score": 1 if output == expected else 0}
+
+Eval(
+    "sandbox-rows-py",
+    data=rows,
+    task=task,
+    scores=[match],
+    max_concurrency=4,
+    trial_count=2,
+)
+"#;
+    fs::write(&fixture_path, fixture_source).expect("write python rows fixture");
+
+    let socket_path = unique_socket_path("bt-eval-py-rows");
+    let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener nonblocking");
+
+    let mut child = Command::new(&python)
+        .arg(&runner_script)
+        .arg(&fixture_name)
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_DEV_MODE", "rows")
+        .env(
+            "BT_EVAL_DEV_REQUEST_JSON",
+            json!({
+                "name": "sandbox-rows-py",
+                "parameters": {},
+            })
+            .to_string(),
+        )
+        .env("BT_EVAL_PULL_SOCK", &socket_path)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_EVAL_NO_SEND_LOGS", "1")
+        .env("BRAINTRUST_API_KEY", "local")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn python eval runner");
+
+    let stream = accept_pull_stream(&listener, &mut child, Duration::from_secs(10));
+    let mut reader = BufReader::new(stream.try_clone().expect("clone pull stream"));
+    let mut writer = stream;
+
+    let ready = read_pull_message(&mut reader);
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["evaluator_name"], "sandbox-rows-py");
+    assert_eq!(ready["max_concurrency"], 4);
+    assert!(ready["experiment_name"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("sandbox-rows-py-")));
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let first = read_pull_message(&mut reader);
+    assert_eq!(first["type"], "row");
+    assert_eq!(first["trial_index"], 0);
+    assert_eq!(first["datum"]["input"]["case_id"], "row-1");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let second = read_pull_message(&mut reader);
+    assert_eq!(second["type"], "row");
+    assert_eq!(second["trial_index"], 1);
+    assert_eq!(second["datum"]["input"]["case_id"], "row-1");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let third = read_pull_message(&mut reader);
+    assert_eq!(third["type"], "row");
+    assert_eq!(third["trial_index"], 0);
+    assert_eq!(third["datum"]["input"]["case_id"], "row-2");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let fourth = read_pull_message(&mut reader);
+    assert_eq!(fourth["type"], "row");
+    assert_eq!(fourth["trial_index"], 1);
+    assert_eq!(fourth["datum"]["input"]["case_id"], "row-2");
+
+    write_pull_message(&mut writer, &json!({ "type": "next" }));
+    let eof = read_pull_message(&mut reader);
+    assert_eq!(eof["type"], "eof");
+
+    write_pull_message(&mut writer, &json!({ "type": "close" }));
+    drop(writer);
+    drop(reader);
+
+    let output = child
+        .wait_with_output()
+        .expect("wait for python rows runner");
+    if !output.status.success() {
+        panic!(
+            "python rows runner failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&fixture_path);
+}
+
 fn read_fixture_config(path: &Path) -> FixtureConfig {
     let raw = fs::read_to_string(path).expect("read fixture.json");
     serde_json::from_str(&raw).expect("parse fixture.json")
+}
+
+#[cfg(unix)]
+fn unique_test_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    )
+}
+
+#[cfg(unix)]
+fn unique_socket_path(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{prefix}-{}.sock", unique_test_suffix()))
+}
+
+#[cfg(unix)]
+fn accept_pull_stream(listener: &UnixListener, child: &mut Child, timeout: Duration) -> UnixStream {
+    let started = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => panic!("accept pull stream: {err}"),
+        }
+
+        if let Some(status) = child.try_wait().expect("try_wait runner") {
+            panic!("runner exited early with status {status}");
+        }
+
+        if started.elapsed() > timeout {
+            panic!("timed out waiting for runner pull socket connection");
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn read_pull_message(reader: &mut BufReader<UnixStream>) -> Value {
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).expect("read pull message");
+    assert!(read > 0, "pull channel closed unexpectedly");
+    serde_json::from_str(line.trim()).expect("parse pull message json")
+}
+
+#[cfg(unix)]
+fn write_pull_message(writer: &mut UnixStream, payload: &Value) {
+    writer
+        .write_all(format!("{payload}\n").as_bytes())
+        .expect("write pull message");
+    writer.flush().expect("flush pull message");
 }
 
 fn collect_deno_eval_diagnostics(dir: &Path, files: &[String]) -> Option<String> {

@@ -4160,6 +4160,46 @@ mod tests {
         eval: EvalArgs,
     }
 
+    fn base_args() -> BaseArgs {
+        BaseArgs {
+            json: false,
+            quiet: false,
+            no_color: false,
+            profile: None,
+            org_name: None,
+            project: None,
+            api_key: None,
+            prefer_profile: false,
+            no_input: false,
+            api_url: None,
+            app_url: None,
+            env_file: None,
+        }
+    }
+
+    fn make_eval_args(files: Vec<String>) -> EvalArgs {
+        EvalArgs {
+            files,
+            runner: None,
+            language: None,
+            sandbox: EvalSandbox::Local,
+            no_send_logs: false,
+            jsonl: false,
+            terminate_on_failure: false,
+            num_workers: None,
+            list: false,
+            filter: Vec::new(),
+            verbose: false,
+            watch: false,
+            extra_args: Vec::new(),
+            dev: false,
+            dev_host: "localhost".to_string(),
+            dev_port: 8300,
+            dev_org_name: None,
+            dev_allowed_origin: Vec::new(),
+        }
+    }
+
     fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -4213,6 +4253,12 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn write_eval_file(dir: &Path, name: &str) -> String {
+        let path = dir.join(name);
+        fs::write(&path, "export {};").expect("eval file should be written");
+        path.to_string_lossy().to_string()
     }
 
     #[test]
@@ -5005,6 +5051,105 @@ mod tests {
         for (key, value) in previous {
             restore_env_var(key, value);
         }
+    }
+
+    #[test]
+    fn eval_args_parse_sandbox_flag() {
+        let parsed =
+            EvalArgsHarness::try_parse_from(["bt", "--sandbox", "lambda", "sample.eval.ts"])
+                .expect("sandbox flag should parse");
+        assert_eq!(parsed.eval.sandbox, EvalSandbox::Lambda);
+        assert_eq!(parsed.eval.files, vec!["sample.eval.ts".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sandbox_eval_rejects_dev_mode() {
+        let dir = make_temp_dir("sandbox-dev");
+        let file = write_eval_file(&dir, "sample.eval.ts");
+        let mut args = make_eval_args(vec![file]);
+        args.sandbox = EvalSandbox::Lambda;
+        args.dev = true;
+
+        let err = run(base_args(), args)
+            .await
+            .expect_err("sandbox+dev should fail");
+        assert!(err
+            .to_string()
+            .contains("--sandbox is not supported with --dev."));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sandbox_eval_rejects_watch_mode() {
+        let dir = make_temp_dir("sandbox-watch");
+        let file = write_eval_file(&dir, "sample.eval.ts");
+        let mut args = make_eval_args(vec![file]);
+        args.sandbox = EvalSandbox::Lambda;
+        args.watch = true;
+
+        let err = run(base_args(), args)
+            .await
+            .expect_err("sandbox+watch should fail");
+        assert!(err
+            .to_string()
+            .contains("--sandbox is not supported with --watch."));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sandbox_eval_rejects_list_mode() {
+        let dir = make_temp_dir("sandbox-list");
+        let file = write_eval_file(&dir, "sample.eval.ts");
+        let mut args = make_eval_args(vec![file]);
+        args.sandbox = EvalSandbox::Lambda;
+        args.list = true;
+
+        let err = run(base_args(), args)
+            .await
+            .expect_err("sandbox+list should fail");
+        assert!(err
+            .to_string()
+            .contains("--sandbox is not supported with --list."));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sandbox_eval_rejects_no_send_logs() {
+        let dir = make_temp_dir("sandbox-local");
+        let file = write_eval_file(&dir, "sample.eval.ts");
+        let mut args = make_eval_args(vec![file]);
+        args.sandbox = EvalSandbox::Lambda;
+        args.no_send_logs = true;
+
+        let err = run(base_args(), args)
+            .await
+            .expect_err("sandbox+no-send-logs should fail");
+        assert!(err
+            .to_string()
+            .contains("--sandbox lambda is not supported with --no-send-logs."));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sandbox_eval_rejects_multiple_files() {
+        let dir = make_temp_dir("sandbox-multi");
+        let first = write_eval_file(&dir, "first.eval.ts");
+        let second = write_eval_file(&dir, "second.eval.ts");
+        let mut args = make_eval_args(vec![first, second]);
+        args.sandbox = EvalSandbox::Lambda;
+
+        let err = run(base_args(), args)
+            .await
+            .expect_err("sandbox+multiple files should fail");
+        assert!(err
+            .to_string()
+            .contains("`bt eval --sandbox lambda` currently supports exactly one eval file."));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
