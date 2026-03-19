@@ -90,9 +90,14 @@ type Manifest = {
 
 type EvalRegistry = NonNullable<typeof globalThis._evals>;
 type ZodToJsonSchemaFn = (schema: unknown) => unknown;
+type ZodV4ToJsonSchemaFn = (
+  schema: unknown,
+  options?: { target?: string },
+) => unknown;
+type ZodSchemaSerializer = (schema: unknown) => JsonObject | undefined;
 
 let moduleImportNonce = 0;
-let zodToJsonSchemaFn: ZodToJsonSchemaFn | null | undefined;
+let zodSchemaSerializer: ZodSchemaSerializer | null | undefined;
 
 const runtimeRequire: NodeRequire | null =
   typeof require === "function" ? require : null;
@@ -107,6 +112,61 @@ function safeCreateRequire(modulePath: string): NodeRequire | null {
 
 const localRequire =
   runtimeRequire ?? safeCreateRequire(path.join(process.cwd(), "package.json"));
+
+function requireCandidates(): NodeRequire[] {
+  const candidates: NodeRequire[] = [];
+  if (localRequire) {
+    candidates.push(localRequire);
+  }
+  const cwdRequire = safeCreateRequire(
+    path.join(process.cwd(), "package.json"),
+  );
+  if (cwdRequire) {
+    let exists = false;
+    for (const candidate of candidates) {
+      if (candidate === cwdRequire) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) {
+      candidates.push(cwdRequire);
+    }
+  }
+  return candidates;
+}
+
+function resolveWithBraintrustFallback<T>(
+  moduleId: string,
+  extract: (module: unknown) => T | null,
+): T | null {
+  const candidates = requireCandidates();
+  for (const candidateRequire of candidates) {
+    try {
+      const converted = extract(candidateRequire(moduleId));
+      if (converted) {
+        return converted;
+      }
+    } catch {
+      // Try the next location.
+    }
+  }
+
+  for (const candidateRequire of candidates) {
+    try {
+      const braintrustPkg = candidateRequire.resolve("braintrust/package.json");
+      const braintrustRequire = createRequire(braintrustPkg);
+      const converted = extract(braintrustRequire(moduleId));
+      if (converted) {
+        return converted;
+      }
+    } catch {
+      // Try the next location.
+    }
+  }
+
+  return null;
+}
 
 function freshRegistry(): EvalRegistry {
   return {
@@ -148,84 +208,106 @@ function buildIsolatedImportUrl(absolutePath: string): string {
   return moduleUrl.href;
 }
 
-function loadZodToJsonSchemaFn(): ZodToJsonSchemaFn | null {
-  if (zodToJsonSchemaFn !== undefined) {
-    return zodToJsonSchemaFn;
+function isZodV4Schema(schema: unknown): boolean {
+  return (
+    schema !== null &&
+    typeof schema === "object" &&
+    "_zod" in schema &&
+    (schema as { _zod?: unknown })._zod !== undefined
+  );
+}
+
+function isLikelyZodSchema(schema: unknown): boolean {
+  return (
+    isZodV4Schema(schema) ||
+    (schema !== null &&
+      typeof schema === "object" &&
+      "_def" in schema &&
+      typeof (schema as { safeParse?: unknown }).safeParse === "function")
+  );
+}
+
+function extractZodToJsonSchemaV3(module: unknown): ZodToJsonSchemaFn | null {
+  if (typeof module === "function") {
+    return module as ZodToJsonSchemaFn;
+  }
+  if (module && typeof module === "object") {
+    const direct = (module as { zodToJsonSchema?: unknown }).zodToJsonSchema;
+    if (typeof direct === "function") {
+      return direct as ZodToJsonSchemaFn;
+    }
+
+    const defaultExport = (module as { default?: unknown }).default;
+    if (typeof defaultExport === "function") {
+      return defaultExport as ZodToJsonSchemaFn;
+    }
+    if (defaultExport && typeof defaultExport === "object") {
+      const fromDefault = (defaultExport as { zodToJsonSchema?: unknown })
+        .zodToJsonSchema;
+      if (typeof fromDefault === "function") {
+        return fromDefault as ZodToJsonSchemaFn;
+      }
+    }
+  }
+  return null;
+}
+
+function extractZodToJsonSchemaV4(module: unknown): ZodV4ToJsonSchemaFn | null {
+  if (module && typeof module === "object") {
+    const direct = (module as { toJSONSchema?: unknown }).toJSONSchema;
+    if (typeof direct === "function") {
+      return direct as ZodV4ToJsonSchemaFn;
+    }
+
+    const defaultExport = (module as { default?: unknown }).default;
+    if (defaultExport && typeof defaultExport === "object") {
+      const fromDefault = (defaultExport as { toJSONSchema?: unknown })
+        .toJSONSchema;
+      if (typeof fromDefault === "function") {
+        return fromDefault as ZodV4ToJsonSchemaFn;
+      }
+    }
+  }
+  return null;
+}
+
+function loadZodSchemaSerializer(): ZodSchemaSerializer | null {
+  if (zodSchemaSerializer !== undefined) {
+    return zodSchemaSerializer;
   }
 
-  const extractConverter = (module: unknown): ZodToJsonSchemaFn | null => {
-    if (
-      module &&
-      typeof module === "object" &&
-      "zodToJsonSchema" in module &&
-      typeof (module as { zodToJsonSchema?: unknown }).zodToJsonSchema ===
-        "function"
-    ) {
-      return (module as { zodToJsonSchema: ZodToJsonSchemaFn }).zodToJsonSchema;
+  const zodToJsonSchemaV3 = resolveWithBraintrustFallback(
+    "zod-to-json-schema",
+    extractZodToJsonSchemaV3,
+  );
+  const zodToJsonSchemaV4 = resolveWithBraintrustFallback(
+    "zod/v4",
+    extractZodToJsonSchemaV4,
+  );
+
+  if (!zodToJsonSchemaV3 && !zodToJsonSchemaV4) {
+    zodSchemaSerializer = null;
+    return zodSchemaSerializer;
+  }
+
+  zodSchemaSerializer = (schema: unknown): JsonObject | undefined => {
+    try {
+      const converted =
+        isZodV4Schema(schema) && zodToJsonSchemaV4
+          ? zodToJsonSchemaV4(schema, { target: "draft-7" })
+          : zodToJsonSchemaV3
+            ? zodToJsonSchemaV3(schema)
+            : zodToJsonSchemaV4
+              ? zodToJsonSchemaV4(schema, { target: "draft-7" })
+              : undefined;
+      const normalized = toJsonValue(converted as JsonValue);
+      return isJsonObject(normalized) ? normalized : undefined;
+    } catch {
+      return undefined;
     }
-    if (
-      module &&
-      typeof module === "object" &&
-      "default" in module &&
-      typeof (module as { default?: unknown }).default === "function"
-    ) {
-      return (module as { default: ZodToJsonSchemaFn }).default;
-    }
-    return null;
   };
 
-  const requireCandidates: NodeRequire[] = [];
-  if (localRequire) {
-    requireCandidates.push(localRequire);
-  }
-  const cwdRequire = safeCreateRequire(
-    path.join(process.cwd(), "package.json"),
-  );
-  if (cwdRequire) {
-    let exists = false;
-    for (const candidate of requireCandidates) {
-      if (candidate === cwdRequire) {
-        exists = true;
-        break;
-      }
-    }
-    if (!exists) {
-      requireCandidates.push(cwdRequire);
-    }
-  }
-
-  for (const candidateRequire of requireCandidates) {
-    try {
-      const converter = extractConverter(
-        candidateRequire("zod-to-json-schema"),
-      );
-      if (converter) {
-        zodToJsonSchemaFn = converter;
-        return zodToJsonSchemaFn;
-      }
-    } catch {
-      // Try the next location.
-    }
-  }
-
-  for (const candidateRequire of requireCandidates) {
-    try {
-      const braintrustPkg = candidateRequire.resolve("braintrust/package.json");
-      const braintrustRequire = createRequire(braintrustPkg);
-      const converter = extractConverter(
-        braintrustRequire("zod-to-json-schema"),
-      );
-      if (converter) {
-        zodToJsonSchemaFn = converter;
-        return zodToJsonSchemaFn;
-      }
-    } catch {
-      // Try the next location.
-    }
-  }
-
-  zodToJsonSchemaFn = null;
-  return zodToJsonSchemaFn;
+  return zodSchemaSerializer;
 }
 
 function schemaToJsonSchema(schema: unknown): JsonObject | undefined {
@@ -233,23 +315,21 @@ function schemaToJsonSchema(schema: unknown): JsonObject | undefined {
     return undefined;
   }
 
+  const serializer = loadZodSchemaSerializer();
+  const zodSchema = isLikelyZodSchema(schema);
+  if (serializer) {
+    const converted = serializer(schema);
+    if (converted) {
+      return converted;
+    }
+  }
+
+  if (zodSchema) {
+    return undefined;
+  }
+
   const normalizedSchema = toJsonValue(schema as JsonValue);
-  if (isJsonObject(normalizedSchema)) {
-    return normalizedSchema;
-  }
-
-  const converter = loadZodToJsonSchemaFn();
-  if (!converter) {
-    return undefined;
-  }
-
-  try {
-    const converted = converter(schema);
-    const normalized = toJsonValue(converted as JsonValue);
-    return isJsonObject(normalized) ? normalized : undefined;
-  } catch {
-    return undefined;
-  }
+  return isJsonObject(normalizedSchema) ? normalizedSchema : undefined;
 }
 
 async function collectFunctionEvents(

@@ -814,8 +814,9 @@ globalThis._evals.functions.push({
         .output()
         .expect("compile functions runner");
     if !compile_output.status.success() {
+        let stdout = String::from_utf8_lossy(&compile_output.stdout);
         let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\n{stderr}");
+        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
     }
 
     let runner_js = runner_dir.join("functions-runner.js");
@@ -908,6 +909,204 @@ globalThis._evals.functions.push({
             .and_then(Value::as_str),
         Some("function")
     );
+    let function_schema = entry
+        .get("function_schema")
+        .and_then(Value::as_object)
+        .expect("function_schema object");
+    let parameters_schema = function_schema
+        .get("parameters")
+        .and_then(Value::as_object)
+        .expect("function_schema.parameters object");
+    assert_eq!(
+        parameters_schema.get("type").and_then(Value::as_str),
+        Some("object"),
+        "raw JSON-schema parameters should pass through unchanged"
+    );
+    assert!(
+        parameters_schema
+            .get("properties")
+            .is_some_and(Value::is_object),
+        "raw JSON-schema properties should be preserved"
+    );
+}
+
+#[test]
+fn functions_js_runner_converts_zod_v4_schema_to_json_schema() {
+    if !command_exists("node") {
+        eprintln!(
+            "Skipping functions_js_runner_converts_zod_v4_schema_to_json_schema (node not installed)."
+        );
+        return;
+    }
+    let Some(tsc) = find_tsc() else {
+        eprintln!(
+            "Skipping functions_js_runner_converts_zod_v4_schema_to_json_schema (tsc not installed)."
+        );
+        return;
+    };
+
+    let root = repo_root();
+    let fixture_root = root
+        .join("tests")
+        .join("functions-fixtures")
+        .join("push-multiple-files-accepted");
+    let zod_module = fixture_root.join("node_modules").join("zod");
+    if !zod_module.join("package.json").is_file() {
+        eprintln!(
+            "Skipping functions_js_runner_converts_zod_v4_schema_to_json_schema (fixture zod package missing)."
+        );
+        return;
+    }
+
+    let zod_module_literal = serde_json::to_string(
+        zod_module
+            .to_str()
+            .expect("zod module path should be valid UTF-8"),
+    )
+    .expect("serialize zod module path");
+
+    let tmp = tempdir().expect("tempdir");
+    let sample_path = tmp.path().join("sample.cjs");
+    std::fs::write(
+        &sample_path,
+        format!(
+            r#"const {{ z }} = require({zod_module_literal});
+globalThis._evals ??= {{ functions: [], prompts: [], parameters: [], evaluators: {{}}, reporters: {{}} }};
+globalThis._evals.functions.push({{
+  name: "zod-tool",
+  slug: "zod-tool",
+  type: "tool",
+  parameters: z.object({{ orderId: z.string().describe("The order ID") }}),
+  returns: z.object({{ status: z.string() }}),
+  preview: "module.exports.handler = () => null;"
+}});
+"#
+        ),
+    )
+    .expect("write sample.cjs");
+
+    let runner_dir = tmp.path().join("runner");
+    let compile_output = Command::new(&tsc)
+        .current_dir(&root)
+        .args([
+            "scripts/functions-runner.ts",
+            "scripts/runner-common.ts",
+            "--module",
+            "esnext",
+            "--target",
+            "es2020",
+            "--moduleResolution",
+            "bundler",
+            "--outDir",
+        ])
+        .arg(&runner_dir)
+        .output()
+        .expect("compile functions runner");
+    if !compile_output.status.success() {
+        let stdout = String::from_utf8_lossy(&compile_output.stdout);
+        let stderr = String::from_utf8_lossy(&compile_output.stderr);
+        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+
+    let runner_js = runner_dir.join("functions-runner.js");
+    let runner_common_js = runner_dir.join("runner-common.js");
+    assert!(runner_js.is_file(), "compiled functions-runner.js missing");
+    assert!(
+        runner_common_js.is_file(),
+        "compiled runner-common.js missing"
+    );
+
+    let runner_code = std::fs::read_to_string(&runner_js).expect("read compiled runner");
+    let patched_runner_code = runner_code
+        .replace("\"./runner-common\"", "\"./runner-common.js\"")
+        .replace("'./runner-common'", "'./runner-common.js'");
+    assert_ne!(
+        runner_code, patched_runner_code,
+        "compiled runner import path did not contain ./runner-common"
+    );
+    std::fs::write(&runner_js, patched_runner_code).expect("write patched compiled runner");
+    std::fs::write(runner_dir.join("package.json"), r#"{ "type": "module" }"#)
+        .expect("write runner package.json");
+
+    let output = Command::new("node")
+        .current_dir(&fixture_root)
+        .arg(&runner_js)
+        .arg(&sample_path)
+        .output()
+        .expect("run compiled functions runner");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("compiled functions runner failed:\n{stderr}");
+    }
+
+    let manifest: Value = serde_json::from_slice(&output.stdout).expect("parse manifest JSON");
+    let files = manifest["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "expected one manifest file");
+    let file = files[0].as_object().expect("manifest file object");
+    let entries = file
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("entries array");
+    assert_eq!(entries.len(), 1, "expected one code entry");
+    let entry = entries[0].as_object().expect("entry object");
+    let function_schema = entry
+        .get("function_schema")
+        .and_then(Value::as_object)
+        .expect("function_schema object");
+
+    let parameters_schema = function_schema
+        .get("parameters")
+        .and_then(Value::as_object)
+        .expect("function_schema.parameters object");
+    assert_eq!(
+        parameters_schema.get("type").and_then(Value::as_str),
+        Some("object"),
+    );
+    assert_eq!(
+        parameters_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|props| props.get("orderId"))
+            .and_then(Value::as_object)
+            .and_then(|order_id| order_id.get("type"))
+            .and_then(Value::as_str),
+        Some("string"),
+        "zod parameters should serialize to JSON schema"
+    );
+    assert_eq!(
+        parameters_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|props| props.get("orderId"))
+            .and_then(Value::as_object)
+            .and_then(|order_id| order_id.get("description"))
+            .and_then(Value::as_str),
+        Some("The order ID"),
+    );
+    assert!(
+        parameters_schema.get("_def").is_none(),
+        "serialized schema should not include zod internals"
+    );
+    assert!(
+        parameters_schema.get("def").is_none(),
+        "serialized schema should not include zod internals"
+    );
+
+    let returns_schema = function_schema
+        .get("returns")
+        .and_then(Value::as_object)
+        .expect("function_schema.returns object");
+    assert_eq!(
+        returns_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|props| props.get("status"))
+            .and_then(Value::as_object)
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str),
+        Some("string"),
+        "zod return schema should serialize to JSON schema"
+    );
 }
 
 #[test]
@@ -977,8 +1176,9 @@ globalThis._evals.functions.push({
         .output()
         .expect("compile functions runner");
     if !compile_output.status.success() {
+        let stdout = String::from_utf8_lossy(&compile_output.stdout);
         let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\n{stderr}");
+        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
     }
 
     let runner_js = runner_dir.join("functions-runner.js");
