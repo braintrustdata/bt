@@ -390,7 +390,7 @@ pub(crate) struct PullArgs {
     #[arg(long, env = "BT_FUNCTIONS_PULL_VERSION")]
     pub version: Option<String>,
 
-    /// Overwrite targets even when dirty or already existing.
+    /// Overwrite targets even when dirty.
     #[arg(
         long,
         env = "BT_FUNCTIONS_PULL_FORCE",

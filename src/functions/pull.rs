@@ -1220,6 +1220,7 @@ fn render_project_file_py(
             &mut seen_names,
         );
         out.push_str(&format!("{var_name} = project.prompts.create(\n"));
+        out.push_str(&format!("    id={},\n", serde_json::to_string(&row.id)?));
         out.push_str(&format!(
             "    name={},\n",
             serde_json::to_string(&row.name)?
@@ -1228,6 +1229,12 @@ fn render_project_file_py(
             "    slug={},\n",
             serde_json::to_string(&row.slug)?
         ));
+        if let Some(version) = &row.version {
+            out.push_str(&format!(
+                "    version={},\n",
+                serde_json::to_string(version)?
+            ));
+        }
         if let Some(description) = &row.description {
             out.push_str(&format!(
                 "    description={},\n",
@@ -1798,6 +1805,8 @@ mod tests {
         assert!(rendered.contains("import braintrust"));
         assert!(rendered.contains("project = braintrust.projects.create(name=\"woohoo\")"));
         assert!(rendered.contains("doc_search = project.prompts.create("));
+        assert!(rendered.contains("    id=\"f1\","));
+        assert!(rendered.contains("    version=\"123\","));
         assert!(rendered.contains("messages=["));
         assert!(rendered.contains("model=\"gpt-4o-mini\""));
     }
