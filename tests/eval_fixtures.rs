@@ -4,6 +4,8 @@ use std::fs;
 use std::io::Write;
 use std::io::{BufRead, BufReader, Read};
 #[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,6 +17,8 @@ use serde::Deserialize;
 #[cfg(unix)]
 use serde_json::json;
 use serde_json::Value;
+#[cfg(unix)]
+use tempfile::tempdir;
 
 #[derive(Debug, Deserialize, Clone)]
 struct FixtureConfig {
@@ -463,9 +467,20 @@ fn eval_runner_rows_mode_streams_js_rows_and_trials() {
         .join("eval-ts-cjs");
     ensure_dependencies(&fixture_dir);
     let runner = local_tsx_path(&fixture_dir).expect("resolve tsx runner");
-    let runner_script = root.join("scripts").join("eval-runner.ts");
-    let fixture_name = format!("sandbox_rows_{}.eval.ts", unique_test_suffix());
-    let fixture_path = fixture_dir.join(&fixture_name);
+    let runner_script = root.join("scripts").join("data-runner.ts");
+    let temp_fixture_dir = tempdir().expect("create js rows tempdir");
+    fs::copy(
+        fixture_dir.join("package.json"),
+        temp_fixture_dir.path().join("package.json"),
+    )
+    .expect("copy js fixture package.json");
+    symlink(
+        fixture_dir.join("node_modules"),
+        temp_fixture_dir.path().join("node_modules"),
+    )
+    .expect("symlink js fixture node_modules");
+    let fixture_name = "sandbox_rows.eval.ts";
+    let fixture_path = temp_fixture_dir.path().join(fixture_name);
     let fixture_source = r#"import { Eval } from "braintrust";
 
 async function* rows() {
@@ -475,10 +490,9 @@ async function* rows() {
 
 Eval("sandbox-rows-js", {
   data: rows,
-  task: async (input: { case_id: string }) =>
-    input.case_id === "row-1" ? "alpha" : "bravo",
+  task: async (input) => (input.case_id === "row-1" ? "alpha" : "bravo"),
   scores: [
-    ({ output, expected }: { output: string; expected?: string }) => ({
+    ({ output, expected }) => ({
       name: "match",
       score: output === expected ? 1 : 0,
     }),
@@ -497,17 +511,8 @@ Eval("sandbox-rows-js", {
 
     let mut child = Command::new(&runner)
         .arg(&runner_script)
-        .arg(&fixture_name)
-        .current_dir(&fixture_dir)
-        .env("BT_EVAL_DEV_MODE", "rows")
-        .env(
-            "BT_EVAL_DEV_REQUEST_JSON",
-            json!({
-                "name": "sandbox-rows-js",
-                "parameters": {},
-            })
-            .to_string(),
-        )
+        .arg(fixture_name)
+        .current_dir(temp_fixture_dir.path())
         .env("BT_EVAL_PULL_SOCK", &socket_path)
         .env("BT_EVAL_LOCAL", "1")
         .env("BT_EVAL_NO_SEND_LOGS", "1")
@@ -521,6 +526,13 @@ Eval("sandbox-rows-js", {
     let mut reader = BufReader::new(stream.try_clone().expect("clone pull stream"));
     let mut writer = stream;
 
+    write_pull_message(
+        &mut writer,
+        &json!({
+            "type": "start",
+            "name": "sandbox-rows-js",
+        }),
+    );
     let ready = read_pull_message(&mut reader);
     assert_eq!(ready["type"], "ready");
     assert_eq!(ready["evaluator_name"], "sandbox-rows-js");
@@ -572,7 +584,6 @@ Eval("sandbox-rows-js", {
     }
 
     let _ = fs::remove_file(&socket_path);
-    let _ = fs::remove_file(&fixture_path);
 }
 
 #[cfg(unix)]
@@ -581,7 +592,6 @@ fn eval_runner_rows_mode_streams_python_rows_and_trials() {
     let _guard = test_lock();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let fixtures_root = root.join("tests").join("evals");
-    let fixture_dir = fixtures_root.join("py").join("local_import");
     let python = match ensure_python_env(&fixtures_root.join("py")) {
         Some(python) => python,
         None => {
@@ -595,9 +605,10 @@ fn eval_runner_rows_mode_streams_python_rows_and_trials() {
         }
     };
 
-    let runner_script = root.join("scripts").join("eval-runner.py");
-    let fixture_name = format!("sandbox_rows_{}.py", unique_test_suffix());
-    let fixture_path = fixture_dir.join(&fixture_name);
+    let runner_script = root.join("scripts").join("data-runner.py");
+    let temp_fixture_dir = tempdir().expect("create python rows tempdir");
+    let fixture_name = "sandbox_rows.py";
+    let fixture_path = temp_fixture_dir.path().join(fixture_name);
     let fixture_source = r#"from braintrust import Eval
 
 def rows():
@@ -629,17 +640,8 @@ Eval(
 
     let mut child = Command::new(&python)
         .arg(&runner_script)
-        .arg(&fixture_name)
-        .current_dir(&fixture_dir)
-        .env("BT_EVAL_DEV_MODE", "rows")
-        .env(
-            "BT_EVAL_DEV_REQUEST_JSON",
-            json!({
-                "name": "sandbox-rows-py",
-                "parameters": {},
-            })
-            .to_string(),
-        )
+        .arg(fixture_name)
+        .current_dir(temp_fixture_dir.path())
         .env("BT_EVAL_PULL_SOCK", &socket_path)
         .env("BT_EVAL_LOCAL", "1")
         .env("BT_EVAL_NO_SEND_LOGS", "1")
@@ -653,6 +655,13 @@ Eval(
     let mut reader = BufReader::new(stream.try_clone().expect("clone pull stream"));
     let mut writer = stream;
 
+    write_pull_message(
+        &mut writer,
+        &json!({
+            "type": "start",
+            "name": "sandbox-rows-py",
+        }),
+    );
     let ready = read_pull_message(&mut reader);
     assert_eq!(ready["type"], "ready");
     assert_eq!(ready["evaluator_name"], "sandbox-rows-py");
@@ -706,7 +715,6 @@ Eval(
     }
 
     let _ = fs::remove_file(&socket_path);
-    let _ = fs::remove_file(&fixture_path);
 }
 
 fn read_fixture_config(path: &Path) -> FixtureConfig {

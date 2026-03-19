@@ -179,6 +179,7 @@ struct EvalPullRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum EvalPullClientMessage {
+    Start { name: String },
     Next,
     Close,
 }
@@ -253,9 +254,17 @@ struct RunnerFilter {
 }
 
 const JS_RUNNER_FILE: &str = "eval-runner.ts";
+const JS_DATA_RUNNER_FILE: &str = "data-runner.ts";
+const JS_RUNNER_COMMON_FILE: &str = "runner-common.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
+const PY_DATA_RUNNER_FILE: &str = "data-runner.py";
+const PY_RUNNER_COMMON_FILE: &str = "runner_common.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
+const JS_DATA_RUNNER_SOURCE: &str = include_str!("../scripts/data-runner.ts");
+const JS_RUNNER_COMMON_SOURCE: &str = include_str!("../scripts/runner-common.ts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
+const PY_DATA_RUNNER_SOURCE: &str = include_str!("../scripts/data-runner.py");
+const PY_RUNNER_COMMON_SOURCE: &str = include_str!("../scripts/runner_common.py");
 
 #[derive(Debug)]
 struct SocketCleanupGuard {
@@ -890,110 +899,131 @@ async fn spawn_eval_data_puller(
 ) -> Result<EvalDataPuller> {
     let (listener, socket_path, socket_cleanup_guard) =
         bind_unix_listener("bt-eval-pull").context("failed to bind sandbox pull socket")?;
-    let request_json =
-        serde_json::to_string(request).context("failed to serialize sandbox pull request")?;
-    let extra_env = vec![
-        ("BT_EVAL_DEV_MODE".to_string(), "rows".to_string()),
-        ("BT_EVAL_DEV_REQUEST_JSON".to_string(), request_json),
-        (
-            "BT_EVAL_PULL_SOCK".to_string(),
-            socket_path.to_string_lossy().to_string(),
-        ),
-    ];
-    let child = spawn_eval_support_process(
-        base,
-        language,
-        runner_override,
-        files,
-        no_send_logs,
-        options,
-        &extra_env,
-        JsMode::Auto,
-    )
-    .await?;
+    let child = match language {
+        EvalLanguage::JavaScript => {
+            let js_runner = prepare_js_data_runner()?;
+            let mut extra_env = vec![(
+                "BT_EVAL_PULL_SOCK".to_string(),
+                socket_path.to_string_lossy().to_string(),
+            )];
+            let mut plan = build_js_plan_with_entrypoint(
+                runner_override,
+                &js_runner,
+                files,
+                JS_DATA_RUNNER_FILE,
+                JS_DATA_RUNNER_SOURCE,
+            )?;
+            if should_set_node_heap_size(plan.kind) {
+                set_node_heap_size_env(&mut plan.cmd);
+            }
+            plan.cmd.envs(build_env(base).await?);
+            for (key, value) in extra_env.drain(..) {
+                plan.cmd.env(key, value);
+            }
+            if no_send_logs {
+                plan.cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
+                plan.cmd.env("BT_EVAL_LOCAL", "1");
+            }
+            if options.jsonl {
+                plan.cmd.env("BT_EVAL_JSONL", "1");
+            }
+            if options.terminate_on_failure {
+                plan.cmd.env("BT_EVAL_TERMINATE_ON_FAILURE", "1");
+            }
+            if options.list {
+                plan.cmd.env("BT_EVAL_LIST", "1");
+            }
+            if let Some(num_workers) = options.num_workers {
+                plan.cmd.env("BT_EVAL_NUM_WORKERS", num_workers.to_string());
+            }
+            if !options.filter.is_empty() {
+                let parsed = parse_eval_filter_expressions(&options.filter)?;
+                let serialized =
+                    serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
+                plan.cmd.env("BT_EVAL_FILTER_PARSED", serialized);
+            }
+            if !options.extra_args.is_empty() {
+                let serialized = serde_json::to_string(&options.extra_args)
+                    .context("failed to serialize eval extra args")?;
+                plan.cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
+            }
+            let runner_name = match plan.kind {
+                RunnerKind::Tsx => "tsx",
+                RunnerKind::ViteNode => "vite-node",
+                RunnerKind::Deno => "deno",
+                RunnerKind::Bun => "bun",
+                RunnerKind::Other => "other",
+            };
+            plan.cmd.env("BT_EVAL_RUNNER_KIND", runner_name);
+            plan.cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            plan.cmd
+                .spawn()
+                .context("failed to spawn sandbox pull runner")?
+        }
+        EvalLanguage::Python => {
+            let py_runner = prepare_py_data_runner()?;
+            let mut cmd = build_python_command(runner_override, &py_runner, files)?;
+            cmd.envs(build_env(base).await?);
+            cmd.env(
+                "BT_EVAL_PULL_SOCK",
+                socket_path.to_string_lossy().to_string(),
+            );
+            if no_send_logs {
+                cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
+                cmd.env("BT_EVAL_LOCAL", "1");
+            }
+            if options.jsonl {
+                cmd.env("BT_EVAL_JSONL", "1");
+            }
+            if options.terminate_on_failure {
+                cmd.env("BT_EVAL_TERMINATE_ON_FAILURE", "1");
+            }
+            if options.list {
+                cmd.env("BT_EVAL_LIST", "1");
+            }
+            if let Some(num_workers) = options.num_workers {
+                cmd.env("BT_EVAL_NUM_WORKERS", num_workers.to_string());
+            }
+            if !options.filter.is_empty() {
+                let parsed = parse_eval_filter_expressions(&options.filter)?;
+                let serialized =
+                    serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
+                cmd.env("BT_EVAL_FILTER_PARSED", serialized);
+            }
+            if !options.extra_args.is_empty() {
+                let serialized = serde_json::to_string(&options.extra_args)
+                    .context("failed to serialize eval extra args")?;
+                cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            cmd.spawn().context("failed to spawn sandbox pull runner")?
+        }
+    };
 
     let (stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
         .await
         .context("timed out waiting for sandbox pull runner to connect")?
         .context("sandbox pull runner failed to connect")?;
     let (read_half, write_half) = stream.into_split();
-    Ok(EvalDataPuller {
+    let mut puller = EvalDataPuller {
         child,
         writer: write_half,
         reader: BufReader::new(read_half),
         _socket_cleanup_guard: socket_cleanup_guard,
-    })
-}
-
-async fn spawn_eval_support_process(
-    base: &BaseArgs,
-    language: EvalLanguage,
-    runner_override: Option<&str>,
-    files: &[String],
-    no_send_logs: bool,
-    options: &EvalRunOptions,
-    extra_env: &[(String, String)],
-    js_mode: JsMode,
-) -> Result<tokio::process::Child> {
-    let (js_runner, py_runner) = prepare_eval_runners()?;
-    let force_esm = matches!(js_mode, JsMode::ForceEsm);
-    let (mut cmd, runner_kind) = match language {
-        EvalLanguage::Python => (
-            build_python_command(runner_override, &py_runner, files)?,
-            RunnerKind::Other,
-        ),
-        EvalLanguage::JavaScript => {
-            if force_esm {
-                (
-                    build_vite_node_fallback_command(&js_runner, files)?,
-                    RunnerKind::ViteNode,
-                )
-            } else {
-                let plan = build_js_plan(runner_override, &js_runner, files)?;
-                (plan.cmd, plan.kind)
-            }
-        }
     };
-    if language == EvalLanguage::JavaScript && should_set_node_heap_size(runner_kind) {
-        set_node_heap_size_env(&mut cmd);
+    if matches!(language, EvalLanguage::JavaScript | EvalLanguage::Python) {
+        puller
+            .send_message(&EvalPullClientMessage::Start {
+                name: request.name.clone(),
+            })
+            .await?;
     }
-    cmd.envs(build_env(base).await?);
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
-    if no_send_logs {
-        cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
-        cmd.env("BT_EVAL_LOCAL", "1");
-    }
-    if options.jsonl {
-        cmd.env("BT_EVAL_JSONL", "1");
-    }
-    if options.terminate_on_failure {
-        cmd.env("BT_EVAL_TERMINATE_ON_FAILURE", "1");
-    }
-    if options.list {
-        cmd.env("BT_EVAL_LIST", "1");
-    }
-    if let Some(num_workers) = options.num_workers {
-        cmd.env("BT_EVAL_NUM_WORKERS", num_workers.to_string());
-    }
-    if !options.filter.is_empty() {
-        let parsed = parse_eval_filter_expressions(&options.filter)?;
-        let serialized =
-            serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
-        cmd.env("BT_EVAL_FILTER_PARSED", serialized);
-    }
-    if language == EvalLanguage::JavaScript && force_esm {
-        cmd.env("BT_EVAL_FORCE_ESM", "1");
-    }
-    if !options.extra_args.is_empty() {
-        let serialized =
-            serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
-        cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
-    }
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-    cmd.spawn().context("failed to start eval support runner")
+    Ok(puller)
 }
 
 async fn run_eval_runner_command_to_completion(
@@ -2859,17 +2889,39 @@ fn build_js_plan(
     runner: &Path,
     files: &[String],
 ) -> Result<JsRunnerPlan> {
+    build_js_plan_with_entrypoint(
+        runner_override,
+        runner,
+        files,
+        JS_RUNNER_FILE,
+        JS_RUNNER_SOURCE,
+    )
+}
+
+fn build_js_plan_with_entrypoint(
+    runner_override: Option<&str>,
+    runner: &Path,
+    files: &[String],
+    embedded_file_name: &str,
+    embedded_source: &str,
+) -> Result<JsRunnerPlan> {
     if let Some(explicit) = runner_override {
         let resolved_runner = resolve_js_runner_command(explicit, files);
         if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
-            let runner_script = prepare_js_runner_in_cwd()?;
+            let runner_script =
+                prepare_js_embedded_runner_in_cwd(embedded_file_name, embedded_source)?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
                 kind: RunnerKind::Deno,
             });
         }
         let kind = runner_kind_for_bin(resolved_runner.as_ref());
-        let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
+        let runner_script = select_js_runner_entrypoint_with_source(
+            runner,
+            resolved_runner.as_ref(),
+            embedded_file_name,
+            embedded_source,
+        )?;
         let mut command = Command::new(resolved_runner);
         command.arg(runner_script).args(files);
         return Ok(JsRunnerPlan { cmd: command, kind });
@@ -2877,14 +2929,20 @@ fn build_js_plan(
 
     if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
-            let runner_script = prepare_js_runner_in_cwd()?;
+            let runner_script =
+                prepare_js_embedded_runner_in_cwd(embedded_file_name, embedded_source)?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
                 kind: RunnerKind::Deno,
             });
         }
         let kind = runner_kind_for_bin(auto_runner.as_ref());
-        let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
+        let runner_script = select_js_runner_entrypoint_with_source(
+            runner,
+            auto_runner.as_ref(),
+            embedded_file_name,
+            embedded_source,
+        )?;
         let mut command = Command::new(auto_runner);
         command.arg(runner_script).args(files);
         return Ok(JsRunnerPlan { cmd: command, kind });
@@ -3039,14 +3097,19 @@ fn is_deno_runner_path(runner: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
+fn select_js_runner_entrypoint_with_source(
+    default_runner: &Path,
+    runner_command: &Path,
+    embedded_file_name: &str,
+    embedded_source: &str,
+) -> Result<PathBuf> {
     if is_ts_node_runner(runner_command) {
-        return prepare_js_runner_in_cwd();
+        return prepare_js_embedded_runner_in_cwd(embedded_file_name, embedded_source);
     }
     Ok(default_runner.to_path_buf())
 }
 
-fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
+fn prepare_js_embedded_runner_in_cwd(file_name: &str, source: &str) -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
     let cache_dir = cwd
         .join(".bt")
@@ -3058,7 +3121,8 @@ fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
             cache_dir.display()
         )
     })?;
-    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+    materialize_runner_script(&cache_dir, JS_RUNNER_COMMON_FILE, JS_RUNNER_COMMON_SOURCE)?;
+    materialize_runner_script(&cache_dir, file_name, source)
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
@@ -3208,6 +3272,14 @@ fn prepare_eval_runners() -> Result<(PathBuf, PathBuf)> {
     prepare_eval_runners_in_dir(&eval_runner_cache_dir())
 }
 
+fn prepare_js_data_runner() -> Result<PathBuf> {
+    prepare_js_data_runner_in_dir(&eval_runner_cache_dir())
+}
+
+fn prepare_py_data_runner() -> Result<PathBuf> {
+    prepare_py_data_runner_in_dir(&eval_runner_cache_dir())
+}
+
 fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(cache_dir).with_context(|| {
         format!(
@@ -3216,9 +3288,33 @@ fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
         )
     })?;
 
+    materialize_runner_script(cache_dir, JS_RUNNER_COMMON_FILE, JS_RUNNER_COMMON_SOURCE)?;
+    materialize_runner_script(cache_dir, PY_RUNNER_COMMON_FILE, PY_RUNNER_COMMON_SOURCE)?;
     let js_runner = materialize_runner_script(cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
     let py_runner = materialize_runner_script(cache_dir, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
     Ok((js_runner, py_runner))
+}
+
+fn prepare_js_data_runner_in_dir(cache_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+    materialize_runner_script(cache_dir, JS_RUNNER_COMMON_FILE, JS_RUNNER_COMMON_SOURCE)?;
+    materialize_runner_script(cache_dir, JS_DATA_RUNNER_FILE, JS_DATA_RUNNER_SOURCE)
+}
+
+fn prepare_py_data_runner_in_dir(cache_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
+    materialize_runner_script(cache_dir, PY_RUNNER_COMMON_FILE, PY_RUNNER_COMMON_SOURCE)?;
+    materialize_runner_script(cache_dir, PY_DATA_RUNNER_FILE, PY_DATA_RUNNER_SOURCE)
 }
 
 fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
@@ -4324,11 +4420,27 @@ mod tests {
         let dir = make_temp_dir("embedded");
         let (js_runner, py_runner) =
             prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
+        let js_data_runner = prepare_js_data_runner_in_dir(&dir)
+            .expect("embedded data runner should be materialized");
+        let py_data_runner = prepare_py_data_runner_in_dir(&dir)
+            .expect("embedded py data runner should be materialized");
 
         let js = fs::read_to_string(js_runner).expect("js runner should be readable");
+        let js_data =
+            fs::read_to_string(js_data_runner).expect("js data runner should be readable");
+        let js_common = fs::read_to_string(dir.join(JS_RUNNER_COMMON_FILE))
+            .expect("js common should be readable");
         let py = fs::read_to_string(py_runner).expect("python runner should be readable");
+        let py_data =
+            fs::read_to_string(py_data_runner).expect("python data runner should be readable");
+        let py_common = fs::read_to_string(dir.join(PY_RUNNER_COMMON_FILE))
+            .expect("python common should be readable");
         assert_eq!(js, JS_RUNNER_SOURCE);
+        assert_eq!(js_data, JS_DATA_RUNNER_SOURCE);
+        assert_eq!(js_common, JS_RUNNER_COMMON_SOURCE);
         assert_eq!(py, PY_RUNNER_SOURCE);
+        assert_eq!(py_data, PY_DATA_RUNNER_SOURCE);
+        assert_eq!(py_common, PY_RUNNER_COMMON_SOURCE);
 
         let _ = fs::remove_dir_all(&dir);
     }
