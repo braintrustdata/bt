@@ -9,9 +9,10 @@ import os
 import re
 import socket
 import sys
+import time
 import traceback
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 try:
     from braintrust import init_dataset, invoke, login
@@ -79,6 +80,41 @@ class SseWriter:
         self.sock.close()
 
 
+@dataclass
+class PullChannel:
+    sock: socket.socket
+
+    def send(self, payload: Any) -> None:
+        self.sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+
+    async def lines(self) -> AsyncIterator[str]:
+        buffer = ""
+        while True:
+            chunk = await asyncio.to_thread(self.sock.recv, 4096)
+            if not chunk:
+                break
+            buffer += chunk.decode("utf-8")
+            while True:
+                newline = buffer.find("\n")
+                if newline == -1:
+                    break
+                line = buffer[:newline].strip()
+                buffer = buffer[newline + 1 :]
+                if line:
+                    yield line
+
+        trailing = buffer.strip()
+        if trailing:
+            yield trailing
+
+    def close(self) -> None:
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+
+
 def serialize_sse_event(event: str, data: Any) -> str:
     if isinstance(data, (dict, list)):
         data_str = json.dumps(data)
@@ -103,6 +139,16 @@ def create_sse_writer() -> SseWriter | None:
         return SseWriter(sock)
 
     return None
+
+
+def create_pull_channel() -> PullChannel | None:
+    sock_path = os.getenv("BT_EVAL_PULL_SOCK")
+    if not sock_path:
+        return None
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sock_path)
+    return PullChannel(sock)
 
 
 def env_flag(name: str) -> bool:
@@ -137,7 +183,7 @@ def parse_serialized_filters(serialized: str | None) -> list[EvalFilter]:
 def parse_dev_mode(value: str | None) -> str | None:
     if value is None or value == "":
         return None
-    if value in {"list", "eval"}:
+    if value in {"list", "eval", "rows"}:
         return value
     raise ValueError(f"Invalid BT_EVAL_DEV_MODE value: {value}")
 
@@ -302,6 +348,26 @@ def parse_eval_request(raw: str | None) -> dict[str, Any]:
     return parsed
 
 
+def parse_eval_pull_request(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        raise ValueError("Missing BT_EVAL_DEV_REQUEST_JSON")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid BT_EVAL_DEV_REQUEST_JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("BT_EVAL_DEV_REQUEST_JSON must be a JSON object.")
+    if not isinstance(parsed.get("name"), str) or not parsed["name"]:
+        raise ValueError("Pull request must include a non-empty evaluator name.")
+
+    parameters = parsed.get("parameters")
+    if parameters is not None and not isinstance(parameters, dict):
+        raise ValueError("Pull request parameters must be an object.")
+
+    return parsed
+
+
 def resolve_eval_data(data: dict[str, Any]) -> Any:
     if "data" in data:
         return data["data"]
@@ -322,6 +388,33 @@ def resolve_eval_data(data: dict[str, Any]) -> Any:
             )
 
     raise ValueError("Invalid eval data payload.")
+
+
+async def call_evaluator_data(data: Any) -> tuple[Any, str | None]:
+    data_result = data
+    if inspect.isclass(data_result):
+        data_result = data_result()
+    if inspect.isfunction(data_result) or inspect.isroutine(data_result):
+        data_result = data_result()
+    if inspect.isawaitable(data_result):
+        data_result = await data_result
+
+    base_experiment_name = None
+    if isinstance(data_result, BaseExperiment):
+        base_experiment_name = data_result.name
+
+    return data_result, base_experiment_name
+
+
+def to_async_iterator(value: Any) -> AsyncIterator[Any]:
+    if inspect.isasyncgen(value):
+        return value
+
+    async def to_async(it):
+        for item in it:
+            yield item
+
+    return to_async(value)
 
 
 def make_eval_scorer(
@@ -851,6 +944,108 @@ async def run_requested_eval(
     return True
 
 
+async def run_dataset_pull(
+    evaluator_instances: list[EvaluatorInstance],
+    config: RunnerConfig,
+) -> bool:
+    channel = create_pull_channel()
+    if channel is None:
+        raise ValueError("Missing BT_EVAL_PULL_SOCK")
+
+    try:
+        request = parse_eval_pull_request(config.dev_request_json)
+    except Exception as exc:
+        channel.send({"type": "error", "message": str(exc)})
+        channel.close()
+        return False
+
+    target_name = request["name"]
+    evaluator_instance = next(
+        (candidate for candidate in evaluator_instances if candidate.evaluator.eval_name == target_name),
+        None,
+    )
+    if evaluator_instance is None:
+        channel.send({"type": "error", "message": f"Evaluator '{target_name}' not found"})
+        channel.close()
+        return False
+
+    evaluator = evaluator_instance.evaluator
+    try:
+        raw_data, _base_experiment_name = await call_evaluator_data(evaluator.data)
+        data_iterator = to_async_iterator(raw_data)
+        iterator = data_iterator.__aiter__()
+        trial_count = getattr(evaluator, "trial_count", 1)
+        try:
+            trial_count = int(trial_count)
+        except Exception:
+            trial_count = 1
+        if trial_count < 1:
+            trial_count = 1
+
+        max_concurrency = getattr(evaluator, "max_concurrency", None)
+        try:
+            max_concurrency = int(max_concurrency) if max_concurrency is not None else 10
+        except Exception:
+            max_concurrency = 10
+        if max_concurrency < 1:
+            max_concurrency = 1
+
+        experiment_name = getattr(evaluator, "experiment_name", None)
+        if not isinstance(experiment_name, str) or not experiment_name:
+            experiment_name = f"{evaluator.eval_name}-{int(time.time() * 1000)}"
+
+        channel.send(
+            {
+                "type": "ready",
+                "evaluator_name": evaluator.eval_name,
+                "max_concurrency": max_concurrency,
+                "experiment_name": experiment_name,
+            }
+        )
+
+        current_datum = None
+        trial_index = 0
+        async for line in channel.lines():
+            parsed = json.loads(line)
+            command_type = parsed.get("type") if isinstance(parsed, dict) else None
+            if command_type == "close":
+                break
+            if command_type != "next":
+                channel.send(
+                    {
+                        "type": "error",
+                        "message": f"Unsupported pull command '{command_type}'",
+                    }
+                )
+                break
+
+            if current_datum is None:
+                try:
+                    current_datum = await iterator.__anext__()
+                    trial_index = 0
+                except StopAsyncIteration:
+                    channel.send({"type": "eof"})
+                    continue
+
+            channel.send(
+                {
+                    "type": "row",
+                    "datum": current_datum,
+                    "trial_index": trial_index,
+                }
+            )
+            trial_index += 1
+            if trial_index >= trial_count:
+                current_datum = None
+    except Exception as exc:
+        channel.send({"type": "error", "message": str(exc)})
+        channel.close()
+        return False
+
+    channel.close()
+    return True
+
+
 async def run_once(
     files: list[str],
     no_send_logs: bool,
@@ -872,6 +1067,8 @@ async def run_once(
         return True
     if config.dev_mode == "eval":
         return await run_requested_eval(evaluators, reporters, no_send_logs, sse, config)
+    if config.dev_mode == "rows":
+        return await run_dataset_pull(evaluators, config)
 
     if config.list_only:
         for evaluator_instance in evaluators:

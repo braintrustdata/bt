@@ -2,11 +2,17 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+type EvaluatorDefinition = {
+  evalName: string;
+  projectName: string;
+  data?: unknown;
+  trialCount?: unknown;
+  maxConcurrency?: unknown;
+  experimentName?: unknown;
+} & Record<string, unknown>;
+
 type EvaluatorEntry = {
-  evaluator: {
-    evalName: string;
-    projectName: string;
-  } & Record<string, unknown>;
+  evaluator: EvaluatorDefinition;
   reporter?: unknown;
 };
 
@@ -111,12 +117,17 @@ type EvalRequest = {
   scores?: EvalScoreSpec[];
 };
 
+type EvalPullRequest = {
+  name: string;
+  parameters?: Record<string, unknown>;
+};
+
 type RunnerConfig = {
   jsonl: boolean;
   list: boolean;
   terminateOnFailure: boolean;
   filters: EvalFilter[];
-  devMode: "list" | "eval" | null;
+  devMode: "list" | "eval" | "rows" | null;
   devRequestJson: string | null;
 };
 
@@ -243,11 +254,13 @@ function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
   }
 }
 
-function parseDevMode(value: string | undefined): "list" | "eval" | null {
+function parseDevMode(
+  value: string | undefined,
+): "list" | "eval" | "rows" | null {
   if (!value) {
     return null;
   }
-  if (value === "list" || value === "eval") {
+  if (value === "list" || value === "eval" || value === "rows") {
     return value;
   }
   throw new Error(`Invalid BT_EVAL_DEV_MODE value: ${value}`);
@@ -283,6 +296,7 @@ type NetModule = {
     setNoDelay: (value?: boolean) => void;
     on: (event: string, listener: (...args: unknown[]) => void) => void;
     write: (data: string) => void;
+    [Symbol.asyncIterator]?: () => AsyncIterator<string | Buffer>;
   };
 };
 
@@ -764,6 +778,69 @@ function createSseWriter(): SseWriter | null {
   };
 
   return { send, close };
+}
+
+type PullChannel = {
+  send: (payload: unknown) => void;
+  close: () => void;
+  lines: () => AsyncGenerator<string>;
+};
+
+function createPullChannel(): PullChannel | null {
+  const netModule = (() => {
+    try {
+      return runtimeRequire("node:net") as NetModule;
+    } catch {
+      return null;
+    }
+  })();
+  const sock = process.env.BT_EVAL_PULL_SOCK;
+  if (!sock) {
+    return null;
+  }
+  if (!netModule) {
+    return null;
+  }
+
+  const socket = netModule.createConnection({ path: sock });
+  socket.setNoDelay(true);
+
+  const send = (payload: unknown) => {
+    if (!socket.writable) {
+      return;
+    }
+    socket.write(`${JSON.stringify(payload)}\n`);
+  };
+
+  const close = () => {
+    socket.end();
+  };
+
+  const lines = async function* () {
+    let buffer = "";
+    for await (const chunk of socket as unknown as AsyncIterable<
+      Buffer | string
+    >) {
+      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      while (true) {
+        const newline = buffer.indexOf("\n");
+        if (newline === -1) {
+          break;
+        }
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (line.length > 0) {
+          yield line;
+        }
+      }
+    }
+    const trailing = buffer.trim();
+    if (trailing.length > 0) {
+      yield trailing;
+    }
+  };
+
+  return { send, close, lines };
 }
 
 function initRegistry() {
@@ -1405,6 +1482,24 @@ async function buildEvaluatorDefinitions(evaluators: EvaluatorEntry[]) {
   return result;
 }
 
+function parseEvalPullRequest(raw: string | null): EvalPullRequest {
+  if (!raw) {
+    throw new Error("Missing BT_EVAL_DEV_REQUEST_JSON");
+  }
+  const parsed = JSON.parse(raw);
+  if (!isObject(parsed) || typeof parsed.name !== "string" || parsed.name.length === 0) {
+    throw new Error("Pull request must include a non-empty evaluator name.");
+  }
+  const request = parsed as EvalPullRequest;
+  if (
+    request.parameters !== undefined &&
+    (!isObject(request.parameters) || Array.isArray(request.parameters))
+  ) {
+    throw new Error("Pull request parameters must be an object.");
+  }
+  return request;
+}
+
 function parseEvalRequest(raw: string | null): EvalRequest {
   if (!raw) {
     throw new Error("Missing BT_EVAL_DEV_REQUEST_JSON");
@@ -1485,6 +1580,48 @@ function resolveEvalData(
     });
   }
   throw new Error("Invalid eval data payload.");
+}
+
+function callEvaluatorData(
+  data: unknown,
+): { data: unknown; baseExperiment: string | undefined } {
+  const dataResult = typeof data === "function" ? (data as () => unknown)() : data;
+  let baseExperiment: string | undefined = undefined;
+  if (
+    isObject(dataResult) &&
+    Reflect.get(dataResult, "_type") === "BaseExperiment" &&
+    typeof Reflect.get(dataResult, "name") === "string"
+  ) {
+    baseExperiment = Reflect.get(dataResult, "name") as string;
+  }
+  return { data: dataResult, baseExperiment };
+}
+
+function toAsyncIterable<T>(value: unknown): AsyncIterable<T> {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    Symbol.asyncIterator in value &&
+    typeof (value as AsyncIterable<T>)[Symbol.asyncIterator] === "function"
+  ) {
+    return value as AsyncIterable<T>;
+  }
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    Symbol.iterator in value &&
+    typeof (value as Iterable<T>)[Symbol.iterator] === "function"
+  ) {
+    const iterable = value as Iterable<T>;
+    return (async function* () {
+      for (const item of iterable) {
+        yield item;
+      }
+    })();
+  }
+  throw new Error(
+    "Evaluator data must be an array, iterable, or async iterable",
+  );
 }
 
 function convertFunctionId(
@@ -1658,6 +1795,102 @@ async function runRequestedEval(config: RunnerConfig, runner: EvalRunner) {
     );
   } catch (err) {
     sendEvalError(runner.sse, err, inferEvalErrorStatus(err));
+  }
+}
+
+async function runDatasetPull(config: RunnerConfig, runner: EvalRunner) {
+  const channel = createPullChannel();
+  if (!channel) {
+    throw new Error("Missing BT_EVAL_PULL_SOCK");
+  }
+
+  try {
+    const request = parseEvalPullRequest(config.devRequestJson);
+    const entry = getEvaluators().find(
+      (candidate) => candidate.evaluator.evalName === request.name,
+    );
+    if (!entry) {
+      channel.send({
+        type: "error",
+        message: `Evaluator '${request.name}' not found`,
+      });
+      return;
+    }
+
+    const state = runner.getState ? runner.getState() : undefined;
+    const evaluator = {
+      ...entry.evaluator,
+      ...(state !== undefined && state !== null ? { state } : {}),
+    };
+    const { data: rawData } = callEvaluatorData(evaluator.data);
+    const dataIterable = toAsyncIterable<unknown>(rawData);
+    const iterator = dataIterable[Symbol.asyncIterator]();
+    const trialCountRaw = Number(evaluator.trialCount ?? 1);
+    const trialCount =
+      Number.isFinite(trialCountRaw) && trialCountRaw > 0
+        ? Math.floor(trialCountRaw)
+        : 1;
+    const maxConcurrencyRaw = Number(evaluator.maxConcurrency ?? 10);
+    const maxConcurrency =
+      Number.isFinite(maxConcurrencyRaw) && maxConcurrencyRaw > 0
+        ? Math.floor(maxConcurrencyRaw)
+        : 10;
+    const experimentName =
+      typeof evaluator.experimentName === "string" &&
+      evaluator.experimentName.length > 0
+        ? evaluator.experimentName
+        : `${entry.evaluator.evalName}-${Date.now()}`;
+
+    channel.send({
+      type: "ready",
+      evaluator_name: entry.evaluator.evalName,
+      max_concurrency: maxConcurrency,
+      experiment_name: experimentName,
+    });
+
+    let currentDatum: unknown | undefined = undefined;
+    let trialIndex = 0;
+    for await (const line of channel.lines()) {
+      const parsed = JSON.parse(line) as { type?: string };
+      if (parsed.type === "close") {
+        break;
+      }
+      if (parsed.type !== "next") {
+        channel.send({
+          type: "error",
+          message: `Unsupported pull command '${String(parsed.type)}'`,
+        });
+        break;
+      }
+
+      if (currentDatum === undefined) {
+        const next = await iterator.next();
+        if (next.done) {
+          channel.send({ type: "eof" });
+          continue;
+        }
+        currentDatum = next.value;
+        trialIndex = 0;
+      }
+
+      channel.send({
+        type: "row",
+        datum: currentDatum,
+        trial_index: trialIndex,
+      });
+
+      trialIndex += 1;
+      if (trialIndex >= trialCount) {
+        currentDatum = undefined;
+      }
+    }
+  } catch (err) {
+    channel.send({
+      type: "error",
+      message: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    channel.close();
   }
 }
 
@@ -2058,6 +2291,11 @@ async function main() {
 
     if (config.devMode === "eval") {
       await runRequestedEval(config, runner);
+      return;
+    }
+
+    if (config.devMode === "rows") {
+      await runDatasetPull(config, runner);
       return;
     }
 

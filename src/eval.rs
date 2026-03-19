@@ -15,6 +15,7 @@ use actix_web::http::header::{
 };
 use actix_web::{guard, web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
+use chrono::{SecondsFormat, Utc};
 use clap::{Args, ValueEnum};
 use crossterm::queue;
 use crossterm::style::{
@@ -22,11 +23,13 @@ use crossterm::style::{
     Stylize,
 };
 use futures_util::stream;
+use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use strip_ansi_escapes::strip;
+use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
@@ -41,7 +44,12 @@ use ratatui::widgets::{Cell, Row, Table};
 use ratatui::Terminal;
 
 use crate::args::BaseArgs;
+use crate::auth::login;
 use crate::auth::resolved_auth_env;
+use crate::experiments::api::create_experiment;
+use crate::functions::publish_eval_sandbox_functions;
+use crate::http::ApiClient;
+use crate::source_language::SourceLanguage;
 use crate::ui::{animations_enabled, is_quiet};
 
 const MAX_NAME_LENGTH: usize = 40;
@@ -161,6 +169,61 @@ struct ResolvedDatasetEvalData {
     _internal_btql: Option<Value>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct EvalPullRequest {
+    name: String,
+    #[serde(default)]
+    parameters: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EvalPullClientMessage {
+    Next,
+    Close,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EvalPullResponse {
+    Ready {
+        evaluator_name: String,
+        max_concurrency: usize,
+        experiment_name: String,
+    },
+    Row {
+        datum: Value,
+        trial_index: usize,
+    },
+    Eof,
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+struct EvalDataPuller {
+    child: tokio::process::Child,
+    writer: tokio::net::unix::OwnedWriteHalf,
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    _socket_cleanup_guard: SocketCleanupGuard,
+}
+
+#[derive(Debug, Clone)]
+struct EvalSandboxPlan {
+    evaluator_name: String,
+    function_id: String,
+    project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SandboxSummaryRow {
+    #[serde(default)]
+    scores: HashMap<String, Option<f64>>,
+    #[serde(default)]
+    metrics: HashMap<String, Value>,
+}
+
 #[derive(Clone)]
 struct DevServerState {
     base: BaseArgs,
@@ -194,6 +257,7 @@ const PY_RUNNER_FILE: &str = "eval-runner.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 
+#[derive(Debug)]
 struct SocketCleanupGuard {
     path: PathBuf,
 }
@@ -216,6 +280,12 @@ pub enum EvalLanguage {
     JavaScript,
     #[value(alias = "py")]
     Python,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EvalSandbox {
+    Local,
+    Lambda,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -244,6 +314,10 @@ pub struct EvalArgs {
         value_name = "LANGUAGE"
     )]
     pub language: Option<EvalLanguage>,
+
+    /// Execute evals locally or in a remote sandbox.
+    #[arg(long, env = "BT_EVAL_SANDBOX", value_enum, default_value = "local")]
+    pub sandbox: EvalSandbox,
 
     /// Run evals locally (do not send logs to Braintrust).
     #[arg(
@@ -389,6 +463,31 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         extra_args: args.extra_args,
     };
 
+    if args.sandbox != EvalSandbox::Local {
+        if args.dev {
+            anyhow::bail!("--sandbox is not supported with --dev.");
+        }
+        if args.watch {
+            anyhow::bail!("--sandbox is not supported with --watch.");
+        }
+        if args.list {
+            anyhow::bail!("--sandbox is not supported with --list.");
+        }
+        if files.len() != 1 {
+            anyhow::bail!("`bt eval --sandbox lambda` currently supports exactly one eval file.");
+        }
+        return run_eval_files_sandbox(
+            &base,
+            args.sandbox,
+            args.language,
+            args.runner.as_deref(),
+            &files,
+            args.no_send_logs,
+            &options,
+        )
+        .await;
+    }
+
     if args.dev {
         let language = detect_eval_language(&files, args.language)?;
         let app_url = resolve_app_url(&base);
@@ -497,6 +596,667 @@ async fn run_eval_files_watch(
             "Detected changes in {}. Re-running evals.\n",
             format_watch_paths(&changed)
         );
+    }
+}
+
+async fn run_eval_files_sandbox(
+    base: &BaseArgs,
+    sandbox: EvalSandbox,
+    language_override: Option<EvalLanguage>,
+    runner_override: Option<&str>,
+    files: &[String],
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+) -> Result<()> {
+    if sandbox != EvalSandbox::Lambda {
+        anyhow::bail!("unsupported sandbox mode");
+    }
+    if no_send_logs {
+        anyhow::bail!("--sandbox lambda is not supported with --no-send-logs.");
+    }
+    let language = detect_eval_language(files, language_override)?;
+    let source_language = match language {
+        EvalLanguage::JavaScript => SourceLanguage::JsLike,
+        EvalLanguage::Python => SourceLanguage::Python,
+    };
+
+    let source_file = PathBuf::from(
+        files
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing sandbox source file"))?,
+    );
+    let published =
+        publish_eval_sandbox_functions(base, &source_file, runner_override, source_language)
+            .await?;
+    let evaluator_names = list_sandbox_evaluator_names(
+        base,
+        language,
+        runner_override,
+        files,
+        no_send_logs,
+        options,
+    )
+    .await?;
+    if evaluator_names.is_empty() {
+        anyhow::bail!("No evaluators found. Did you call Eval() in the file?");
+    }
+
+    let mut plans = Vec::new();
+    for evaluator_name in evaluator_names {
+        let slug = sandbox_slug_from_source(&source_file, &evaluator_name);
+        let published_entry = published
+            .iter()
+            .find(|entry| entry.slug == slug)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sandbox function '{}' for evaluator '{}' was not published",
+                    slug,
+                    evaluator_name
+                )
+            })?;
+        plans.push(EvalSandboxPlan {
+            evaluator_name,
+            function_id: published_entry.function_id.clone(),
+            project_id: published_entry.project_id.clone(),
+        });
+    }
+
+    let login_ctx = login(base).await?;
+    let client = ApiClient::new(&login_ctx)?;
+    let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    for plan in plans {
+        let mut puller = spawn_eval_data_puller(
+            base,
+            language,
+            runner_override,
+            files,
+            no_send_logs,
+            options,
+            &EvalPullRequest {
+                name: plan.evaluator_name.clone(),
+                parameters: Some(json!({})),
+            },
+        )
+        .await?;
+        let ready = puller.read_message().await?;
+        let (max_concurrency, experiment_name) = match ready {
+            EvalPullResponse::Ready {
+                evaluator_name,
+                max_concurrency,
+                experiment_name,
+            } => {
+                if evaluator_name != plan.evaluator_name {
+                    anyhow::bail!(
+                        "sandbox runner selected unexpected evaluator '{}', expected '{}'",
+                        evaluator_name,
+                        plan.evaluator_name
+                    );
+                }
+                (max_concurrency.max(1), experiment_name)
+            }
+            EvalPullResponse::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!("unexpected initial sandbox pull response: {other:?}"),
+        };
+
+        let experiment = create_experiment(&client, &plan.project_id, &experiment_name, true)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create sandbox parent experiment '{}' for evaluator '{}'",
+                    experiment_name, plan.evaluator_name
+                )
+            })?;
+        let mut in_flight: tokio::task::JoinSet<Result<Option<ExperimentStart>>> =
+            tokio::task::JoinSet::new();
+        let mut saw_eof = false;
+        let mut experiment_url: Option<String> = None;
+
+        while !saw_eof || !in_flight.is_empty() {
+            while !saw_eof && in_flight.len() < max_concurrency {
+                puller.send_message(&EvalPullClientMessage::Next).await?;
+                match puller.read_message().await? {
+                    EvalPullResponse::Row {
+                        datum,
+                        trial_index: _trial_index,
+                    } => {
+                        let function_id = plan.function_id.clone();
+                        let evaluator_name = plan.evaluator_name.clone();
+                        let project_id = plan.project_id.clone();
+                        let body = json!({
+                            "api_version": 1,
+                            "function_id": { "function_id": function_id },
+                            "name": evaluator_name,
+                            "project_id": project_id,
+                            "scores": [],
+                            "stream": true,
+                            "experiment_name": experiment.name,
+                            "parent": {
+                                "object_type": "experiment",
+                                "object_id": experiment.id,
+                            },
+                            "data": { "data": [datum] },
+                        });
+                        let client_cloned = client.clone();
+                        let org_name = login_ctx.login.org_name.clone();
+                        let project_id = plan.project_id.clone();
+                        in_flight.spawn(async move {
+                            invoke_sandbox_eval(&client_cloned, &org_name, &project_id, body).await
+                        });
+                    }
+                    EvalPullResponse::Eof => saw_eof = true,
+                    EvalPullResponse::Error { message } => anyhow::bail!("{message}"),
+                    other => anyhow::bail!("unexpected sandbox pull response: {other:?}"),
+                }
+            }
+
+            if let Some(joined) = in_flight.join_next().await {
+                if let Some(start) = joined?? {
+                    if experiment_url.is_none() {
+                        experiment_url = start.experiment_url.clone();
+                    }
+                }
+            }
+        }
+
+        puller.send_message(&EvalPullClientMessage::Close).await?;
+        puller.wait().await?;
+
+        let summary = summarize_sandbox_experiment(
+            &client,
+            &plan.project_id,
+            &plan.project_id,
+            &experiment.name,
+            &experiment.id,
+            experiment_url,
+            &started_at,
+        )
+        .await?;
+        let rendered = format_experiment_summary(&summary);
+        println!("{rendered}");
+    }
+
+    Ok(())
+}
+
+impl EvalDataPuller {
+    async fn send_message(&mut self, message: &EvalPullClientMessage) -> Result<()> {
+        let mut payload =
+            serde_json::to_string(message).context("failed to serialize pull request")?;
+        payload.push('\n');
+        self.writer
+            .write_all(payload.as_bytes())
+            .await
+            .context("failed to write pull request")?;
+        self.writer
+            .flush()
+            .await
+            .context("failed to flush pull request")?;
+        Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<EvalPullResponse> {
+        let mut line = String::new();
+        let read = self
+            .reader
+            .read_line(&mut line)
+            .await
+            .context("failed to read sandbox pull response")?;
+        if read == 0 {
+            let status = self
+                .child
+                .wait()
+                .await
+                .context("sandbox pull runner exited unexpectedly")?;
+            anyhow::bail!("sandbox pull runner exited with status {status}");
+        }
+        serde_json::from_str(line.trim()).context("failed to parse sandbox pull response JSON")
+    }
+
+    async fn wait(mut self) -> Result<()> {
+        let status = self
+            .child
+            .wait()
+            .await
+            .context("sandbox pull runner failed")?;
+        if !status.success() {
+            anyhow::bail!("sandbox pull runner exited with status {status}");
+        }
+        Ok(())
+    }
+}
+
+fn sandbox_slugify(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut previous_dash = false;
+    for ch in input.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            previous_dash = false;
+        } else if !previous_dash {
+            out.push('-');
+            previous_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn sandbox_slug_from_source(source_file: &Path, eval_name: &str) -> String {
+    let stem = source_file
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.strip_suffix(".eval").unwrap_or(value))
+        .unwrap_or("eval");
+    sandbox_slugify(&format!("{stem}-{eval_name}-sandbox"))
+}
+
+async fn list_sandbox_evaluator_names(
+    base: &BaseArgs,
+    language: EvalLanguage,
+    runner_override: Option<&str>,
+    files: &[String],
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+) -> Result<Vec<String>> {
+    let output = run_eval_runner_command_to_completion(
+        base,
+        language,
+        runner_override,
+        files,
+        no_send_logs,
+        options,
+        &[("BT_EVAL_DEV_MODE".to_string(), "list".to_string())],
+        JsMode::Auto,
+    )
+    .await?;
+
+    let parsed: Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse sandbox evaluator list")?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("sandbox evaluator list was not a JSON object"))?;
+    Ok(object.keys().cloned().collect())
+}
+
+async fn spawn_eval_data_puller(
+    base: &BaseArgs,
+    language: EvalLanguage,
+    runner_override: Option<&str>,
+    files: &[String],
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+    request: &EvalPullRequest,
+) -> Result<EvalDataPuller> {
+    let (listener, socket_path, socket_cleanup_guard) =
+        bind_unix_listener("bt-eval-pull").context("failed to bind sandbox pull socket")?;
+    let request_json =
+        serde_json::to_string(request).context("failed to serialize sandbox pull request")?;
+    let extra_env = vec![
+        ("BT_EVAL_DEV_MODE".to_string(), "rows".to_string()),
+        ("BT_EVAL_DEV_REQUEST_JSON".to_string(), request_json),
+        (
+            "BT_EVAL_PULL_SOCK".to_string(),
+            socket_path.to_string_lossy().to_string(),
+        ),
+    ];
+    let child = spawn_eval_support_process(
+        base,
+        language,
+        runner_override,
+        files,
+        no_send_logs,
+        options,
+        &extra_env,
+        JsMode::Auto,
+    )
+    .await?;
+
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+        .await
+        .context("timed out waiting for sandbox pull runner to connect")?
+        .context("sandbox pull runner failed to connect")?;
+    let (read_half, write_half) = stream.into_split();
+    Ok(EvalDataPuller {
+        child,
+        writer: write_half,
+        reader: BufReader::new(read_half),
+        _socket_cleanup_guard: socket_cleanup_guard,
+    })
+}
+
+async fn spawn_eval_support_process(
+    base: &BaseArgs,
+    language: EvalLanguage,
+    runner_override: Option<&str>,
+    files: &[String],
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+    extra_env: &[(String, String)],
+    js_mode: JsMode,
+) -> Result<tokio::process::Child> {
+    let (js_runner, py_runner) = prepare_eval_runners()?;
+    let force_esm = matches!(js_mode, JsMode::ForceEsm);
+    let (mut cmd, runner_kind) = match language {
+        EvalLanguage::Python => (
+            build_python_command(runner_override, &py_runner, files)?,
+            RunnerKind::Other,
+        ),
+        EvalLanguage::JavaScript => {
+            if force_esm {
+                (
+                    build_vite_node_fallback_command(&js_runner, files)?,
+                    RunnerKind::ViteNode,
+                )
+            } else {
+                let plan = build_js_plan(runner_override, &js_runner, files)?;
+                (plan.cmd, plan.kind)
+            }
+        }
+    };
+    if language == EvalLanguage::JavaScript && should_set_node_heap_size(runner_kind) {
+        set_node_heap_size_env(&mut cmd);
+    }
+    cmd.envs(build_env(base).await?);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    if no_send_logs {
+        cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
+        cmd.env("BT_EVAL_LOCAL", "1");
+    }
+    if options.jsonl {
+        cmd.env("BT_EVAL_JSONL", "1");
+    }
+    if options.terminate_on_failure {
+        cmd.env("BT_EVAL_TERMINATE_ON_FAILURE", "1");
+    }
+    if options.list {
+        cmd.env("BT_EVAL_LIST", "1");
+    }
+    if let Some(num_workers) = options.num_workers {
+        cmd.env("BT_EVAL_NUM_WORKERS", num_workers.to_string());
+    }
+    if !options.filter.is_empty() {
+        let parsed = parse_eval_filter_expressions(&options.filter)?;
+        let serialized =
+            serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
+        cmd.env("BT_EVAL_FILTER_PARSED", serialized);
+    }
+    if language == EvalLanguage::JavaScript && force_esm {
+        cmd.env("BT_EVAL_FORCE_ESM", "1");
+    }
+    if !options.extra_args.is_empty() {
+        let serialized =
+            serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
+        cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
+    }
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    cmd.spawn().context("failed to start eval support runner")
+}
+
+async fn run_eval_runner_command_to_completion(
+    base: &BaseArgs,
+    language: EvalLanguage,
+    runner_override: Option<&str>,
+    files: &[String],
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+    extra_env: &[(String, String)],
+    js_mode: JsMode,
+) -> Result<std::process::Output> {
+    let (js_runner, py_runner) = prepare_eval_runners()?;
+    let force_esm = matches!(js_mode, JsMode::ForceEsm);
+    let (mut cmd, runner_kind) = match language {
+        EvalLanguage::Python => (
+            build_python_command(runner_override, &py_runner, files)?,
+            RunnerKind::Other,
+        ),
+        EvalLanguage::JavaScript => {
+            if force_esm {
+                (
+                    build_vite_node_fallback_command(&js_runner, files)?,
+                    RunnerKind::ViteNode,
+                )
+            } else {
+                let plan = build_js_plan(runner_override, &js_runner, files)?;
+                (plan.cmd, plan.kind)
+            }
+        }
+    };
+    if language == EvalLanguage::JavaScript && should_set_node_heap_size(runner_kind) {
+        set_node_heap_size_env(&mut cmd);
+    }
+    cmd.envs(build_env(base).await?);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    if no_send_logs {
+        cmd.env("BT_EVAL_NO_SEND_LOGS", "1");
+        cmd.env("BT_EVAL_LOCAL", "1");
+    }
+    if let Some(num_workers) = options.num_workers {
+        cmd.env("BT_EVAL_NUM_WORKERS", num_workers.to_string());
+    }
+    if !options.filter.is_empty() {
+        let parsed = parse_eval_filter_expressions(&options.filter)?;
+        let serialized =
+            serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
+        cmd.env("BT_EVAL_FILTER_PARSED", serialized);
+    }
+    if !options.extra_args.is_empty() {
+        let serialized =
+            serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
+        cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
+    }
+    let output = cmd
+        .output()
+        .await
+        .context("failed to run eval support runner")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "eval support runner exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
+async fn invoke_sandbox_eval(
+    client: &ApiClient,
+    org_name: &str,
+    project_id: &str,
+    body: Value,
+) -> Result<Option<ExperimentStart>> {
+    let response = client
+        .post_with_headers_raw(
+            "/function/sandbox",
+            &body,
+            &[("x-bt-org-name", org_name), ("x-bt-project-id", project_id)],
+        )
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("sandbox invoke failed ({status}): {body}");
+    }
+
+    let mut bytes = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut current_event: Option<String> = None;
+    let mut data_lines: Vec<String> = Vec::new();
+    let mut start: Option<ExperimentStart> = None;
+    let mut saw_done = false;
+
+    while let Some(chunk) = bytes.next().await {
+        let chunk = chunk.context("failed to read sandbox SSE response")?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buffer.find('\n') {
+            let mut line: String = buffer.drain(..=pos).collect();
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            if line.is_empty() {
+                if current_event.is_some() || !data_lines.is_empty() {
+                    let event_name = current_event.take().unwrap_or_default();
+                    let data = data_lines.join("\n");
+                    data_lines.clear();
+                    match event_name.as_str() {
+                        "start" => {
+                            if let Ok(parsed) = serde_json::from_str::<ExperimentStart>(&data) {
+                                if start.is_none() {
+                                    start = Some(parsed);
+                                }
+                            }
+                        }
+                        "error" => {
+                            if let Ok(payload) = serde_json::from_str::<Value>(&data) {
+                                let message = payload
+                                    .get("message")
+                                    .or_else(|| payload.get("error"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("sandbox eval failed");
+                                anyhow::bail!("{message}");
+                            }
+                            anyhow::bail!("{data}");
+                        }
+                        "done" => {
+                            saw_done = true;
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("event:") {
+                current_event = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data_lines.push(value.trim_start().to_string());
+            }
+        }
+    }
+
+    if !saw_done {
+        anyhow::bail!("sandbox SSE stream ended before a done event");
+    }
+    Ok(start)
+}
+
+async fn summarize_sandbox_experiment(
+    client: &ApiClient,
+    project_name: &str,
+    _project_id: &str,
+    experiment_name: &str,
+    experiment_id: &str,
+    experiment_url: Option<String>,
+    started_at: &str,
+) -> Result<ExperimentSummary> {
+    let query = build_sandbox_summary_query(experiment_id, started_at);
+    let response = client.btql::<SandboxSummaryRow>(&query).await?;
+    Ok(aggregate_sandbox_summary(
+        project_name,
+        experiment_name,
+        experiment_id,
+        experiment_url,
+        &response.data,
+    ))
+}
+
+fn build_sandbox_summary_query(experiment_id: &str, started_at: &str) -> String {
+    format!(
+        "select: scores, metrics | from: experiment('{}') summary | filter: created >= '{}' | limit: 1000",
+        experiment_id.replace('\'', "''"),
+        started_at.replace('\'', "''")
+    )
+}
+
+fn aggregate_sandbox_summary(
+    project_name: &str,
+    experiment_name: &str,
+    experiment_id: &str,
+    experiment_url: Option<String>,
+    rows: &[SandboxSummaryRow],
+) -> ExperimentSummary {
+    let mut scores: HashMap<String, (f64, usize)> = HashMap::new();
+    let mut metrics: HashMap<String, (f64, usize)> = HashMap::new();
+    for row in rows {
+        for (name, value) in &row.scores {
+            if let Some(value) = value {
+                let entry = scores.entry(name.clone()).or_insert((0.0, 0));
+                entry.0 += value;
+                entry.1 += 1;
+            }
+        }
+        for (name, value) in &row.metrics {
+            let Some(number) = value.as_f64() else {
+                continue;
+            };
+            let entry = metrics.entry(name.clone()).or_insert((0.0, 0));
+            entry.0 += number;
+            entry.1 += 1;
+        }
+    }
+
+    ExperimentSummary {
+        project_name: project_name.to_string(),
+        experiment_name: experiment_name.to_string(),
+        project_id: None,
+        experiment_id: Some(experiment_id.to_string()),
+        project_url: None,
+        experiment_url,
+        comparison_experiment_name: None,
+        scores: scores
+            .into_iter()
+            .map(|(name, (total, count))| {
+                let average = if count == 0 {
+                    0.0
+                } else {
+                    total / count as f64
+                };
+                (
+                    name.clone(),
+                    ScoreSummary {
+                        name,
+                        score: average,
+                        diff: None,
+                        improvements: 0,
+                        regressions: 0,
+                    },
+                )
+            })
+            .collect(),
+        metrics: if metrics.is_empty() {
+            None
+        } else {
+            Some(
+                metrics
+                    .into_iter()
+                    .map(|(name, (total, count))| {
+                        let average = if count == 0 {
+                            0.0
+                        } else {
+                            total / count as f64
+                        };
+                        (
+                            name.clone(),
+                            MetricSummary {
+                                name,
+                                metric: average,
+                                unit: String::new(),
+                                diff: None,
+                                improvements: 0,
+                                regressions: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        },
     }
 }
 
@@ -2386,20 +3146,20 @@ fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
     None
 }
 
-fn build_sse_socket_path() -> Result<PathBuf> {
+fn build_socket_path(prefix: &str) -> Result<PathBuf> {
     let pid = std::process::id();
     let serial = SSE_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("failed to read system time")?
         .as_nanos();
-    Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}-{serial}.sock")))
+    Ok(std::env::temp_dir().join(format!("{prefix}-{pid}-{now}-{serial}.sock")))
 }
 
-fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
+fn bind_unix_listener(prefix: &str) -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
     let mut last_bind_err: Option<std::io::Error> = None;
     for _ in 0..SSE_SOCKET_BIND_MAX_ATTEMPTS {
-        let socket_path = build_sse_socket_path()?;
+        let socket_path = build_socket_path(prefix)?;
         let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
         let _ = std::fs::remove_file(&socket_path);
         match UnixListener::bind(&socket_path) {
@@ -2425,8 +3185,12 @@ fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
         )
     });
     Err(err).context(format!(
-        "failed to bind SSE unix socket after {SSE_SOCKET_BIND_MAX_ATTEMPTS} attempts"
+        "failed to bind unix socket after {SSE_SOCKET_BIND_MAX_ATTEMPTS} attempts"
     ))
+}
+
+fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
+    bind_unix_listener("bt-eval")
 }
 
 fn eval_runner_cache_dir() -> PathBuf {
@@ -4016,8 +4780,8 @@ mod tests {
 
     #[test]
     fn build_sse_socket_path_is_unique_for_consecutive_calls() {
-        let first = build_sse_socket_path().expect("first socket path");
-        let second = build_sse_socket_path().expect("second socket path");
+        let first = build_socket_path("bt-eval").expect("first socket path");
+        let second = build_socket_path("bt-eval").expect("second socket path");
         assert_ne!(first, second);
     }
 
@@ -4193,6 +4957,7 @@ mod tests {
             "BT_EVAL_TERMINATE_ON_FAILURE",
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
+            "BT_EVAL_SANDBOX",
             "BT_EVAL_FILTER",
             "BT_EVAL_VERBOSE",
             "BT_EVAL_WATCH",
@@ -4207,6 +4972,7 @@ mod tests {
         set_env_var("BT_EVAL_TERMINATE_ON_FAILURE", "1");
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
+        set_env_var("BT_EVAL_SANDBOX", "lambda");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
         set_env_var("BT_EVAL_VERBOSE", "1");
         set_env_var("BT_EVAL_WATCH", "on");
@@ -4221,6 +4987,7 @@ mod tests {
         assert!(parsed.eval.terminate_on_failure);
         assert_eq!(parsed.eval.num_workers, Some(4));
         assert!(parsed.eval.list);
+        assert_eq!(parsed.eval.sandbox, EvalSandbox::Lambda);
         assert_eq!(
             parsed.eval.filter,
             vec![
@@ -4238,5 +5005,19 @@ mod tests {
         for (key, value) in previous {
             restore_env_var(key, value);
         }
+    }
+
+    #[test]
+    fn build_sandbox_summary_query_includes_timestamp_filter() {
+        let query = build_sandbox_summary_query("exp'123", "2026-03-19T12:00:00.000Z");
+        assert!(query.contains("from: experiment('exp''123') summary"));
+        assert!(query.contains("filter: created >= '2026-03-19T12:00:00.000Z'"));
+        assert!(query.contains("select: scores, metrics"));
+    }
+
+    #[test]
+    fn sandbox_slug_from_source_uses_source_stem_and_eval_name() {
+        let slug = sandbox_slug_from_source(Path::new("/tmp/My Eval.ts"), "Demo Eval");
+        assert_eq!(slug, "my-eval-demo-eval-sandbox");
     }
 }

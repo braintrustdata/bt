@@ -70,11 +70,13 @@ pub async fn create_experiment(
     client: &ApiClient,
     project_id: &str,
     name: &str,
+    ensure_new: bool,
 ) -> Result<Experiment> {
     let body = serde_json::json!({
         "name": name,
         "project_id": project_id,
         "org_name": client.org_name(),
+        "ensure_new": ensure_new,
     });
     client.post("/v1/experiment", &body).await
 }
