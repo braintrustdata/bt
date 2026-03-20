@@ -40,7 +40,7 @@ impl GitRepo {
             );
         }
 
-        Ok(has_tracked_changes(&String::from_utf8_lossy(
+        Ok(has_tracked_or_untracked_changes(&String::from_utf8_lossy(
             &output.stdout,
         )))
     }
@@ -50,12 +50,12 @@ impl GitRepo {
     }
 }
 
-fn has_tracked_changes(porcelain: &str) -> bool {
+fn has_tracked_or_untracked_changes(porcelain: &str) -> bool {
     porcelain
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.is_empty())
-        .any(|line| !line.starts_with("?? ") && !line.starts_with("!! "))
+        .any(|line| !line.starts_with("!! "))
 }
 
 pub fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn untracked_file_is_not_treated_as_dirty_for_pull_compat() {
+    fn untracked_file_is_treated_as_dirty() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -176,7 +176,7 @@ mod tests {
         fs::write(&untracked, "local-only\n").expect("write untracked file");
 
         let repo = GitRepo { root: root.clone() };
-        assert!(!repo.is_dirty_or_untracked(&untracked).expect("git status"));
+        assert!(repo.is_dirty_or_untracked(&untracked).expect("git status"));
 
         let _ = fs::remove_dir_all(root);
     }

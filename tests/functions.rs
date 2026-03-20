@@ -102,6 +102,23 @@ fn command_exists(command: &str) -> bool {
     false
 }
 
+fn run_git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("run git");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "git command failed in {}: git {}\n{}",
+            cwd.display(),
+            args.join(" "),
+            stderr.trim()
+        );
+    }
+}
+
 fn find_tsc() -> Option<PathBuf> {
     let local = if cfg!(windows) {
         repo_root()
@@ -626,6 +643,26 @@ fn functions_push_rejects_invalid_language() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("typescript"));
+}
+
+#[test]
+fn functions_push_requires_app_url_with_custom_api_url() {
+    let output = Command::new(bt_binary_path())
+        .arg("functions")
+        .arg("--json")
+        .arg("push")
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_API_URL", "http://127.0.0.1:1")
+        .env_remove("BRAINTRUST_APP_URL")
+        .env_remove("BRAINTRUST_ORG_NAME")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run push with custom API URL and no app URL");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--app-url or BRAINTRUST_APP_URL"));
+    assert!(!stderr.contains("https://www.braintrust.dev/api/apikey/login"));
 }
 
 #[test]
@@ -2216,6 +2253,106 @@ async fn functions_pull_works_against_mock_api() {
         }),
         "pull request should include selector query params"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_pull_skips_untracked_existing_file_without_force() {
+    if !command_exists("git") {
+        eprintln!(
+            "Skipping functions_pull_skips_untracked_existing_file_without_force (git not installed)."
+        );
+        return;
+    }
+
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    state
+        .pull_rows
+        .lock()
+        .expect("pull rows lock")
+        .push(serde_json::json!({
+            "id": "fn_123",
+            "name": "Doc Search",
+            "slug": "doc-search",
+            "project_id": "proj_mock",
+            "description": "",
+            "function_data": { "type": "prompt" },
+            "prompt_data": {
+                "prompt": {
+                    "type": "chat",
+                    "messages": [
+                        { "role": "system", "content": "You answer from docs." }
+                    ]
+                },
+                "options": {
+                    "model": "gpt-4o-mini"
+                }
+            },
+            "_xact_id": "0000000000000001"
+        }));
+
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let out_dir = tmp.path().join("pulled");
+    std::fs::create_dir_all(&out_dir).expect("create output dir");
+    let rendered_file = out_dir.join("mock-project.ts");
+    std::fs::write(&rendered_file, "LOCAL\n").expect("seed untracked output file");
+
+    run_git(tmp.path(), &["init"]);
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "pull",
+            "--project-id",
+            "proj_mock",
+            "--slug",
+            "doc-search",
+            "--output-dir",
+            out_dir
+                .to_str()
+                .expect("output dir should be valid UTF-8 for test"),
+            "--language",
+            "typescript",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions pull");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock pull failed:\n{stderr}");
+    }
+
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("parse pull summary");
+    assert_eq!(summary["status"].as_str(), Some("partial"));
+    assert_eq!(summary["files_written"].as_u64(), Some(0));
+    assert_eq!(summary["files_skipped"].as_u64(), Some(1));
+    let files = summary["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["status"].as_str(), Some("skipped"));
+    assert_eq!(files[0]["skipped_reason"].as_str(), Some("dirty_target"));
+
+    let rendered = std::fs::read_to_string(&rendered_file).expect("read rendered file");
+    assert_eq!(rendered, "LOCAL\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

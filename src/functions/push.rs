@@ -15,8 +15,9 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::args::BaseArgs;
+use crate::args::DEFAULT_API_URL;
 
-use crate::auth::list_available_orgs;
+use crate::auth::{list_available_orgs, resolve_auth};
 use crate::config;
 use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PushFileReport, PushSummary, ReportError,
@@ -25,7 +26,7 @@ use crate::functions::report::{
 use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
-use crate::source_language::{classify_runtime_extension, JsExtensionProfile, SourceLanguage};
+use crate::source_language::{classify_runtime_extension, SourceLanguage};
 use crate::ui::{animations_enabled, is_interactive, is_quiet};
 
 use super::api;
@@ -189,30 +190,74 @@ impl ClassifiedFiles {
 }
 
 pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
-    let available_orgs = match list_available_orgs(&base)
-        .await
-        .context("failed to list available orgs")
-    {
-        Ok(orgs) => orgs,
+    let resolved_auth = match resolve_auth(&base).await {
+        Ok(auth) => auth,
         Err(err) => {
             return fail_push(
                 &base,
                 0,
                 HardFailureReason::AuthFailed,
                 error_chain(&err),
-                "failed to list available orgs",
+                "failed to resolve auth context",
             );
         }
     };
-
-    if let Err(err) = validate_explicit_org_selection(&base, &available_orgs) {
+    let has_app_url = resolved_auth
+        .app_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let custom_api_without_app_url = resolved_auth
+        .api_url
+        .as_deref()
+        .map(str::trim)
+        .map(|value| value.trim_end_matches('/'))
+        .is_some_and(|api_url| {
+            !api_url.eq_ignore_ascii_case(DEFAULT_API_URL.trim_end_matches('/'))
+        })
+        && !has_app_url;
+    if custom_api_without_app_url {
         return fail_push(
             &base,
             0,
-            HardFailureReason::ResponseInvalid,
-            error_chain(&err),
-            "invalid org selection",
+            HardFailureReason::AuthFailed,
+            "functions push with a custom API URL requires --app-url or BRAINTRUST_APP_URL"
+                .to_string(),
+            "missing app URL for custom API URL",
         );
+    }
+
+    let explicit_org_selected = base
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if explicit_org_selected {
+        let available_orgs = match list_available_orgs(&base)
+            .await
+            .context("failed to list available orgs")
+        {
+            Ok(orgs) => orgs,
+            Err(err) => {
+                return fail_push(
+                    &base,
+                    0,
+                    HardFailureReason::AuthFailed,
+                    error_chain(&err),
+                    "failed to list available orgs",
+                );
+            }
+        };
+
+        if let Err(err) = validate_explicit_org_selection(&base, &available_orgs) {
+            return fail_push(
+                &base,
+                0,
+                HardFailureReason::ResponseInvalid,
+                error_chain(&err),
+                "invalid org selection",
+            );
+        }
     }
 
     let auth_ctx = match resolve_auth_context(&base)
@@ -1100,7 +1145,7 @@ fn parse_runner_manifest_output(
 fn classify_source_file(path: &Path) -> Option<SourceLanguage> {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .and_then(|ext| classify_runtime_extension(ext, JsExtensionProfile::FunctionsPush))
+        .and_then(classify_runtime_extension)
 }
 
 fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
