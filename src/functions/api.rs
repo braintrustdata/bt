@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use urlencoding::encode;
 
 use crate::http::ApiClient;
@@ -30,6 +31,36 @@ pub struct Function {
     pub created: Option<String>,
     #[serde(default)]
     pub _xact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FunctionListQuery {
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub slug: Option<String>,
+    pub id: Option<String>,
+    pub version: Option<String>,
+    pub cursor: Option<String>,
+    pub snapshot: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionListPage {
+    pub objects: Vec<Value>,
+    pub next_cursor: Option<String>,
+    pub snapshot: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeUploadSlot {
+    pub url: String,
+    #[serde(rename = "bundleId")]
+    pub bundle_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertFunctionsResult {
+    pub ignored_entries: Option<usize>,
 }
 
 pub async fn list_functions(
@@ -82,4 +113,181 @@ pub async fn invoke_function(
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
     let path = format!("/v1/function/{}", encode(function_id));
     client.delete(&path).await
+}
+
+pub async fn list_functions_page(
+    client: &ApiClient,
+    query: &FunctionListQuery,
+) -> Result<FunctionListPage> {
+    let mut params = Vec::new();
+    if let Some(project_id) = &query.project_id {
+        params.push(("project_id", project_id.clone()));
+    }
+    if let Some(project_name) = &query.project_name {
+        params.push(("project_name", project_name.clone()));
+    }
+    if let Some(slug) = &query.slug {
+        params.push(("slug", slug.clone()));
+    }
+    if let Some(id) = &query.id {
+        params.push(("ids", id.clone()));
+    }
+    if let Some(version) = &query.version {
+        params.push(("version", version.clone()));
+    }
+    if let Some(cursor) = &query.cursor {
+        params.push(("cursor", cursor.clone()));
+    }
+    if let Some(snapshot) = &query.snapshot {
+        params.push(("snapshot", snapshot.clone()));
+    }
+
+    let path = if params.is_empty() {
+        "/v1/function".to_string()
+    } else {
+        let query = params
+            .into_iter()
+            .map(|(key, value)| format!("{}={}", encode(key), encode(&value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("/v1/function?{query}")
+    };
+
+    let raw: Value = client
+        .get(&path)
+        .await
+        .with_context(|| format!("failed to list functions via {path}"))?;
+
+    parse_function_list_page(raw)
+}
+
+fn parse_function_list_page(raw: Value) -> Result<FunctionListPage> {
+    let objects = raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing 'objects' array in /v1/function response"))?;
+
+    let next_cursor = raw
+        .get("next_cursor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let snapshot = raw
+        .get("snapshot")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    Ok(FunctionListPage {
+        objects,
+        next_cursor,
+        snapshot,
+    })
+}
+
+pub async fn request_code_upload_slot(
+    client: &ApiClient,
+    org_id: &str,
+    runtime: &str,
+    version: &str,
+) -> Result<CodeUploadSlot> {
+    let body = serde_json::json!({
+        "org_id": org_id,
+        "runtime_context": {
+            "runtime": runtime,
+            "version": version,
+        }
+    });
+
+    client
+        .post("/function/code", &body)
+        .await
+        .context("failed to request code upload slot")
+}
+
+pub async fn upload_bundle(
+    url: &str,
+    bundle_bytes: Vec<u8>,
+    content_encoding: Option<&str>,
+) -> Result<()> {
+    crate::http::put_signed_url(url, bundle_bytes, content_encoding)
+        .await
+        .context("failed to upload code bundle to signed URL")
+}
+
+pub async fn insert_functions(
+    client: &ApiClient,
+    functions: &[Value],
+) -> Result<InsertFunctionsResult> {
+    let body = serde_json::json!({ "functions": functions });
+    let raw: Value = client
+        .post("/insert-functions", &body)
+        .await
+        .context("failed to insert functions")?;
+
+    Ok(InsertFunctionsResult {
+        ignored_entries: ignored_count(&raw),
+    })
+}
+
+fn ignored_count(raw: &Value) -> Option<usize> {
+    raw.get("ignored_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_count_extracts_canonical_shape() {
+        let first = serde_json::json!({ "ignored_count": 3 });
+        assert_eq!(ignored_count(&first), Some(3));
+
+        let second = serde_json::json!({ "ignored": [1, 2] });
+        assert_eq!(ignored_count(&second), None);
+
+        let third = serde_json::json!({ "stats": { "ignored": 5 } });
+        assert_eq!(ignored_count(&third), None);
+
+        assert_eq!(ignored_count(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn parse_function_list_page_allows_non_paginated_shape() {
+        let raw = serde_json::json!({
+            "objects": [],
+        });
+
+        let page = parse_function_list_page(raw).expect("parse function page");
+        assert!(page.objects.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn parse_function_list_page_detects_next_pagination_field() {
+        let raw = serde_json::json!({
+            "objects": [],
+            "next_cursor": "cursor-1",
+        });
+
+        let page = parse_function_list_page(raw).expect("parse function page");
+        assert_eq!(page.next_cursor.as_deref(), Some("cursor-1"));
+    }
+
+    #[test]
+    fn parse_function_list_page_extracts_snapshot() {
+        let raw = serde_json::json!({
+            "objects": [],
+            "snapshot": "snapshot-1",
+        });
+
+        let page = parse_function_list_page(raw).expect("parse function page");
+        assert_eq!(page.snapshot.as_deref(), Some("snapshot-1"));
+    }
 }

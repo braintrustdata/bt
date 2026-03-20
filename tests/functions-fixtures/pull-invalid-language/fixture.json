@@ -1,0 +1,8 @@
+{
+  "command": ["functions", "pull", "--language", "ruby"],
+  "expect_success": false,
+  "stderr_contains": [
+    "invalid value 'ruby'",
+    "possible values: typescript, python"
+  ]
+}

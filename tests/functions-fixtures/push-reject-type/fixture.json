@@ -1,0 +1,5 @@
+{
+  "command": ["functions", "push", "--type", "tool"],
+  "expect_success": false,
+  "stderr_contains": ["--type"]
+}
