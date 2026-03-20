@@ -484,6 +484,11 @@ async function resolveLegacyToolFunction(
 
 function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
   const entries: CodeEntry[] = [];
+  const emptyParametersSchema: JsonObject = {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  };
 
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index];
@@ -496,10 +501,10 @@ function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
     const tags = Array.isArray(item.tags)
       ? item.tags.filter((tag): tag is string => typeof tag === "string")
       : [];
-    if (item.parameters === undefined || item.parameters === null) {
-      throw new Error(`Function ${item.name} has no supplied parameters`);
-    }
-    const parametersSchema = schemaToJsonSchema(item.parameters);
+    const parametersSchema =
+      item.parameters === undefined || item.parameters === null
+        ? emptyParametersSchema
+        : schemaToJsonSchema(item.parameters);
     if (!parametersSchema) {
       throw new Error(`Function ${item.name} has invalid parameters schema`);
     }
