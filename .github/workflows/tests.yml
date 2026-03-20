@@ -69,6 +69,8 @@ jobs:
         run: |
           corepack enable
           corepack prepare pnpm@10.28.2 --activate
+      - name: Install JS toolchain dependencies
+        run: pnpm install --ignore-scripts
       - name: Run eval fixtures
         run: cargo test --test eval_fixtures
       - name: Run functions fixtures
