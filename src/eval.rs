@@ -22,7 +22,9 @@ mod dev_server;
 mod events;
 mod ui;
 
-use self::dev_server::{collect_allowed_dev_origins, resolve_app_url, run_dev_server, DevServerState};
+use self::dev_server::{
+    collect_allowed_dev_origins, resolve_app_url, run_dev_server, DevServerState,
+};
 use self::events::{
     EvalErrorPayload, EvalEvent, ExperimentStart, ExperimentSummary, ProcessingEventData,
     SseConsoleEventData, SseDependenciesEventData, SseProgressEventData,
