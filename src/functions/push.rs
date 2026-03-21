@@ -775,7 +775,7 @@ async fn push_file(
                 let bundle = validate_python_bundle(manifest_file, source_path, allowed_roots)
                     .map_err(|err| FileFailure {
                         reason: HardFailureReason::ManifestSchemaInvalid,
-                        message: err.to_string(),
+                        message: format!("{err:#}"),
                     })?;
                 let archive = build_python_bundle_archive(
                     &bundle.entry_module,
@@ -786,7 +786,7 @@ async fn push_file(
                 )
                 .map_err(|err| FileFailure {
                     reason: HardFailureReason::BundleUploadFailed,
-                    message: err.to_string(),
+                    message: format!("{err:#}"),
                 })?;
                 (archive, None)
             }
@@ -801,14 +801,14 @@ async fn push_file(
         .await
         .map_err(|err| FileFailure {
             reason: HardFailureReason::UploadSlotFailed,
-            message: err.to_string(),
+            message: format!("{err:#}"),
         })?;
 
         api::upload_bundle(&slot.url, upload_bytes, content_encoding)
             .await
             .map_err(|err| FileFailure {
                 reason: HardFailureReason::BundleUploadFailed,
-                message: err.to_string(),
+                message: format!("{err:#}"),
             })?;
 
         bundle_id = Some(slot.bundle_id.clone());
@@ -876,7 +876,7 @@ async fn push_file(
         collect_project_name_placeholders_checked(&event, &mut placeholders).map_err(|err| {
             FileFailure {
                 reason: HardFailureReason::ManifestSchemaInvalid,
-                message: err.to_string(),
+                message: format!("{err:#}"),
             }
         })?;
 
@@ -893,7 +893,7 @@ async fn push_file(
             .await
             .map_err(|err| FileFailure {
                 reason: HardFailureReason::ManifestSchemaInvalid,
-                message: err.to_string(),
+                message: format!("{err:#}"),
             })?;
             resolved_placeholders.insert(project_name, resolved);
         }
@@ -970,7 +970,7 @@ fn build_js_bundle(
 ) -> std::result::Result<Vec<u8>, FileFailure> {
     let build_dir = TempBuildDir::create("bt-functions-js-bundle").map_err(|err| FileFailure {
         reason: HardFailureReason::BundleUploadFailed,
-        message: err.to_string(),
+        message: format!("{err:#}"),
     })?;
     let output_bundle = build_dir.path.join("bundle.js");
 
@@ -1368,7 +1368,7 @@ fn validate_manifest_paths(
         if language == SourceLanguage::Python && has_code_entries {
             validate_python_bundle(file, &path, allowed_roots).map_err(|err| FileFailure {
                 reason: HardFailureReason::ManifestSchemaInvalid,
-                message: err.to_string(),
+                message: format!("{err:#}"),
             })?;
         }
         seen.insert(path);
