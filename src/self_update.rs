@@ -77,6 +77,7 @@ impl UpdateChannel {
 }
 
 const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
+const CURL_CA_BUNDLE_ENV_VAR: &str = "CURL_CA_BUNDLE";
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -117,7 +118,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(channel)?;
+    run_installer(channel, base.ca_bundle.as_deref())?;
     Ok(())
 }
 
@@ -187,17 +188,25 @@ async fn fetch_release(base: &BaseArgs, channel: UpdateChannel) -> Result<GitHub
         .context("failed to parse GitHub release response")
 }
 
-fn run_installer(channel: UpdateChannel) -> Result<()> {
+#[cfg(not(windows))]
+fn installer_env_vars(ca_bundle: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
+    ca_bundle
+        .map(|path| vec![(CURL_CA_BUNDLE_ENV_VAR, path.to_path_buf())])
+        .unwrap_or_default()
+}
+
+fn run_installer(channel: UpdateChannel, ca_bundle: Option<&Path>) -> Result<()> {
     #[cfg(not(windows))]
     {
         let installer_url = channel.installer_url();
         println!("updating bt from {} channel...", channel.name());
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .status()
-            .context("failed to execute installer")?;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(cmd);
+        for (key, value) in installer_env_vars(ca_bundle) {
+            command.env(key, value);
+        }
+        let status = command.status().context("failed to execute installer")?;
 
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
@@ -209,6 +218,7 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
 
     #[cfg(windows)]
     {
+        let _ = ca_bundle;
         let installer_url = match channel {
             UpdateChannel::Stable => {
                 "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1"
@@ -483,6 +493,22 @@ mod tests {
         assert_eq!(
             inferred_update_channel(Some("canary")),
             UpdateChannel::Canary
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn installer_env_vars_omit_ca_bundle_when_unset() {
+        assert!(installer_env_vars(None).is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn installer_env_vars_set_curl_ca_bundle_from_cli_ca_bundle() {
+        let ca_bundle = Path::new("/tmp/custom-ca.pem");
+        assert_eq!(
+            installer_env_vars(Some(ca_bundle)),
+            vec![(CURL_CA_BUNDLE_ENV_VAR, ca_bundle.to_path_buf())]
         );
     }
 }
