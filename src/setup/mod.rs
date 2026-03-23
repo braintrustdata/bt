@@ -686,7 +686,7 @@ async fn execute_skills_setup(
         notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
     } else {
         prefetch_workflow_docs(
-            &base,
+            base,
             show_progress,
             scope,
             local_root.as_deref(),
