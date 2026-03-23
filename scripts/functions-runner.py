@@ -360,6 +360,29 @@ async def process_file(file_path: str) -> dict[str, Any]:
     return file_manifest
 
 
+BASELINE_DEPS = ["pydantic", "braintrust", "autoevals", "requests", "openai"]
+
+
+def resolve_baseline_dep_versions() -> list[str]:
+    import importlib.metadata
+
+    pinned: list[str] = []
+    for pkg in BASELINE_DEPS:
+        try:
+            dist = importlib.metadata.distribution(pkg)
+            direct_url_path = dist._path / "direct_url.json"
+            if direct_url_path.exists():
+                with open(direct_url_path) as f:
+                    j = json.loads(f.read())
+                    if "url" in j:
+                        pinned.append(j["url"])
+                        continue
+            pinned.append(f"{pkg}=={dist.version}")
+        except importlib.metadata.PackageNotFoundError:
+            pinned.append(pkg)
+    return pinned
+
+
 async def main() -> None:
     files = normalize_file_list(sys.argv[1:])
     if not files:
@@ -368,6 +391,7 @@ async def main() -> None:
     manifest: dict[str, Any] = {
         "runtime_context": {"runtime": "python", "version": python_version()},
         "files": [],
+        "baseline_dep_versions": resolve_baseline_dep_versions(),
     }
     for file_path in files:
         manifest["files"].append(await process_file(file_path))
