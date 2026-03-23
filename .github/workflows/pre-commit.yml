@@ -21,7 +21,7 @@ jobs:
           BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: 1.92.0
           components: rustfmt, clippy
