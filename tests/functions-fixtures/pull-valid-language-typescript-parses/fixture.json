@@ -1,0 +1,16 @@
+{
+  "command": [
+    "functions",
+    "pull",
+    "--language",
+    "typescript",
+    "--id",
+    "abc",
+    "--slug",
+    "slug",
+    "--help"
+  ],
+  "expect_success": true,
+  "stdout_contains": ["--id", "--slug"],
+  "stderr_not_contains": ["invalid value 'typescript'"]
+}

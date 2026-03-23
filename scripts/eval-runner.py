@@ -23,9 +23,10 @@ try:
         run_evaluator,
         set_thread_pool_max_workers,
     )
-    from braintrust.logger import Dataset, init as init_logger_experiment
+    from braintrust.logger import Dataset, init as init_logger_experiment, parent_context, _internal_get_global_state
     from braintrust.parameters import parameters_to_json_schema, validate_parameters
     from braintrust.util import eprint
+    from braintrust.span_identifier_v4 import parse_parent
 except Exception as exc:  # pragma: no cover - runtime guard
     print(
         "Unable to import the braintrust package. Please install it in your Python environment.",
@@ -534,10 +535,12 @@ def send_experiment_start(
             sse.send(
                 "start",
                 {
-                    "project_name": getattr(summary, "project_name", None),
-                    "experiment_name": getattr(summary, "experiment_name", None),
-                    "project_url": getattr(summary, "project_url", None),
-                    "experiment_url": getattr(summary, "experiment_url", None),
+                    "projectName": getattr(summary, "project_name", None),
+                    "experimentName": getattr(summary, "experiment_name", None),
+                    "projectId": getattr(summary, "project_id", None),
+                    "experimentId": getattr(summary, "experiment_id", None),
+                    "projectUrl": getattr(summary, "project_url", None),
+                    "experimentUrl": getattr(summary, "experiment_url", None),
                 },
             )
             return
@@ -548,14 +551,12 @@ def send_experiment_start(
         evaluator, "eval_name", None
     )
     if experiment_name:
-        sse.send("start", {"experiment_name": experiment_name})
+        sse.send("start", {"experimentName": experiment_name})
 
 
 def run_evaluator_progress_mode() -> str:
     try:
-        from inspect import signature
-
-        parameters = signature(run_evaluator).parameters
+        parameters = inspect.signature(run_evaluator).parameters
         if "progress" in parameters:
             return "progress"
         if "stream" in parameters:
@@ -621,8 +622,14 @@ def infer_evaluator_total(evaluator: Any) -> int | None:
     return data_total * trial_count
 
 
-def wrap_task_with_progress(task: Any, progress_cb: Callable[[str, int | None], None] | None) -> Any:
-    if not callable(task) or progress_cb is None:
+def wrap_task(
+    task: Any,
+    progress_cb: Callable[[str, int | None], None] | None = None,
+    stream_results: bool = False,
+) -> Any:
+    if not callable(task):
+        return task
+    if progress_cb is None and not stream_results:
         return task
 
     task_signature = None
@@ -631,17 +638,32 @@ def wrap_task_with_progress(task: Any, progress_cb: Callable[[str, int | None], 
     except Exception:
         task_signature = None
 
-    async def wrapped_task(*args: Any, **kwargs: Any) -> Any:
+    takes_hooks = task_signature is not None and len(task_signature.parameters) >= 2
+
+    async def wrapped_task(input, hooks):
+        result = None
         try:
-            result = task(*args, **kwargs)
+            if takes_hooks:
+                result = task(input, hooks)
+            else:
+                result = task(input)
             if inspect.isawaitable(result):
-                return await result
+                result = await result
             return result
         finally:
-            progress_cb("increment", None)
+            if progress_cb is not None:
+                progress_cb("increment", None)
+            if stream_results and result is not None:
+                try:
+                    hooks.report_progress({
+                        "format": "code",
+                        "output_type": "completion",
+                        "event": "json_delta",
+                        "data": json.dumps(result),
+                    })
+                except Exception:
+                    pass
 
-    if task_signature is not None:
-        setattr(wrapped_task, "__signature__", task_signature)
     if hasattr(task, "__name__"):
         setattr(wrapped_task, "__name__", getattr(task, "__name__"))
     if hasattr(task, "__qualname__"):
@@ -650,37 +672,62 @@ def wrap_task_with_progress(task: Any, progress_cb: Callable[[str, int | None], 
     return wrapped_task
 
 
+def run_evaluator_supports_stream() -> bool:
+    try:
+        return "stream" in inspect.signature(run_evaluator).parameters
+    except Exception:
+        return False
+
+
 async def run_evaluator_task(
-    evaluator, position: int, no_send_logs: bool, progress_cb, progress_mode: str, sse: SseWriter | None
+    evaluator, position: int, no_send_logs: bool, progress_cb, progress_mode: str, sse: SseWriter | None,
+    parent: str | None = None,
 ):
     experiment = None
-    if not no_send_logs:
+    if not no_send_logs and parent is None:
         experiment = _init_experiment_for_eval(evaluator)
     send_experiment_start(sse, evaluator, experiment)
 
     fallback_progress = progress_cb is not None and progress_mode != "progress"
-    original_task = None
+    original_task = evaluator.task
+    supports_stream = run_evaluator_supports_stream()
+
     if fallback_progress:
         progress_cb("start", infer_evaluator_total(evaluator))
-        original_task = getattr(evaluator, "task", None)
-        if original_task is not None:
-            evaluator.task = wrap_task_with_progress(original_task, progress_cb)
+
+    evaluator.task = wrap_task(
+        original_task,
+        progress_cb=progress_cb if fallback_progress else None,
+        stream_results=bool(sse and supports_stream),
+    )
 
     try:
         kwargs = {}
         if progress_cb and progress_mode == "progress":
             kwargs["progress"] = progress_cb
-        return await run_evaluator(
-            experiment,
-            evaluator,
-            None,
-            [],
-            **kwargs,
-        )
+        if sse and supports_stream:
+            kwargs["stream"] = lambda event: sse.send("progress", event if isinstance(event, dict) else event.__dict__)
+
+        if parent:
+            with parent_context(parent):
+                return await run_evaluator(
+                    experiment,
+                    evaluator,
+                    None,
+                    [],
+                    **kwargs,
+                )
+        else:
+            return await run_evaluator(
+                experiment,
+                evaluator,
+                None,
+                [],
+                **kwargs,
+            )
     finally:
+        evaluator.task = original_task
         if fallback_progress:
-            if original_task is not None:
-                evaluator.task = original_task
             progress_cb("stop", None)
         if experiment:
             experiment.flush()
@@ -717,15 +764,17 @@ async def run_requested_eval(
         if "project_id" in request:
             evaluator.project_id = request["project_id"]
 
+        request_parameters = request.get("parameters")
         if evaluator.parameters is not None:
-            request_parameters = request.get("parameters", {})
+            if request_parameters is None:
+                request_parameters = {}
             if not isinstance(request_parameters, dict):
                 raise ValueError("parameters must be an object")
             evaluator.parameters = validate_parameters(request_parameters, evaluator.parameters)
-        elif "parameters" in request:
-            if not isinstance(request["parameters"], dict):
+        elif request_parameters is not None:
+            if not isinstance(request_parameters, dict):
                 raise ValueError("parameters must be an object")
-            evaluator.parameters = request["parameters"]
+            evaluator.parameters = request_parameters
 
         if "scores" in request and request["scores"]:
             scorer_functions = [
@@ -751,6 +800,10 @@ async def run_requested_eval(
     progress_mode = run_evaluator_progress_mode()
     progress_cb = create_progress_reporter(sse, evaluator.eval_name)
 
+    parent = request.get("parent")
+    if parent is not None:
+        parent = parse_parent(parent)
+
     try:
         result = await run_evaluator_task(
             evaluator,
@@ -759,6 +812,7 @@ async def run_requested_eval(
             progress_cb,
             progress_mode,
             sse,
+            parent=parent,
         )
     except Exception as exc:
         message = str(exc)
@@ -918,6 +972,15 @@ def main(argv: list[str] | None = None) -> int:
     cwd = os.path.abspath(os.getcwd())
     try:
         success = asyncio.run(run_once(files, local, sse, config))
+
+        if not local:
+            try:
+                state = _internal_get_global_state()
+                if state:
+                    state.flush()
+            except Exception:
+                pass
+
         if sse:
             sse.send("dependencies", {"files": collect_dependency_files(cwd, files)})
             sse.send("done", {"success": success})

@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "bt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -492,6 +492,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "dotenvy",
+ "flate2",
  "futures-util",
  "getrandom 0.3.4",
  "glob",
@@ -511,6 +512,7 @@ dependencies = [
  "tokio",
  "unicode-width 0.1.14",
  "urlencoding",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

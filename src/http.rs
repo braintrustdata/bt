@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use reqwest::header::HeaderValue;
 use reqwest::{Client, ClientBuilder};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,10 @@ impl ApiClient {
     pub fn url(&self, path: &str) -> String {
         let path = path.trim_start_matches('/');
         format!("{}/{}", self.base_url, path)
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.api_key
     }
 
     pub fn org_name(&self) -> &str {
@@ -227,4 +232,36 @@ impl ApiClient {
 
         self.post_with_headers("/btql", &body, &headers).await
     }
+}
+
+const UPLOAD_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+pub async fn put_signed_url(
+    url: &str,
+    body: Vec<u8>,
+    content_encoding: Option<&str>,
+) -> Result<()> {
+    let client = Client::builder()
+        .timeout(UPLOAD_HTTP_TIMEOUT)
+        .build()
+        .context("failed to build signed-url HTTP client")?;
+
+    let mut request = client.put(url).body(body);
+    if let Some(encoding) = content_encoding {
+        request = request.header("Content-Encoding", encoding);
+    }
+    if url.contains(".blob.core.windows.net") {
+        request = request.header("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
+    }
+
+    let response = request
+        .send()
+        .await
+        .context("signed-url upload request failed")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(HttpError { status, body }.into());
+    }
+    Ok(())
 }

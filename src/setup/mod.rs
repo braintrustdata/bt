@@ -2367,7 +2367,10 @@ fn scope_root<'a>(
 }
 
 fn find_git_root() -> Option<PathBuf> {
-    let mut current = std::env::current_dir().ok()?;
+    find_git_root_from(std::env::current_dir().ok()?)
+}
+
+fn find_git_root_from(mut current: PathBuf) -> Option<PathBuf> {
     loop {
         if current.join(".git").exists() {
             return Some(current);
@@ -2607,13 +2610,7 @@ mod tests {
         fs::create_dir_all(&nested).expect("create nested");
         fs::write(root.join(".git"), "gitdir: /tmp/fake").expect("write git file");
 
-        let old = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&nested).expect("cd nested");
-        let detected = find_git_root();
-        std::env::set_current_dir(old).expect("restore cwd");
-
-        let detected = detected
-            .as_deref()
+        let detected = find_git_root_from(nested)
             .and_then(|p| p.canonicalize().ok())
             .expect("canonical detected path");
         let expected = root.canonicalize().expect("canonical expected path");
