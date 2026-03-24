@@ -56,6 +56,8 @@ const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT
 struct RunnerManifest {
     runtime_context: RuntimeContext,
     files: Vec<ManifestFile>,
+    #[serde(default)]
+    baseline_dep_versions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -608,6 +610,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             requirements_path.as_deref(),
             &classified.allowed_roots,
             &mut project_name_cache,
+            &manifest.baseline_dep_versions,
         )
         .await;
 
@@ -735,6 +738,7 @@ async fn push_file(
     requirements_path: Option<&Path>,
     allowed_roots: &[PathBuf],
     project_name_cache: &mut BTreeMap<String, String>,
+    baseline_dep_versions: &[String],
 ) -> std::result::Result<FileSuccess, FileFailure> {
     let mut code_entries = Vec::new();
     let mut events = Vec::new();
@@ -783,6 +787,8 @@ async fn push_file(
                     &bundle.archive_root,
                     requirements_path,
                     args.runner.as_deref(),
+                    baseline_dep_versions,
+                    &runtime_context.version,
                 )
                 .map_err(|err| FileFailure {
                     reason: HardFailureReason::BundleUploadFailed,
@@ -1611,6 +1617,8 @@ fn build_python_bundle_archive(
     archive_root: &Path,
     requirements_path: Option<&Path>,
     runner: Option<&str>,
+    baseline_dep_versions: &[String],
+    python_version: &str,
 ) -> Result<Vec<u8>> {
     let Some(python) =
         python_runner::resolve_python_interpreter(runner, PYTHON_INTERPRETER_ENV_OVERRIDES)
@@ -1623,7 +1631,13 @@ fn build_python_bundle_archive(
     std::fs::create_dir_all(&pkg_dir)
         .with_context(|| format!("failed to create {}", pkg_dir.display()))?;
 
-    install_python_dependencies(&pkg_dir, requirements_path, &python)?;
+    install_python_dependencies(
+        &pkg_dir,
+        requirements_path,
+        &python,
+        baseline_dep_versions,
+        python_version,
+    )?;
 
     let stage_dir = build_dir.path.join("stage");
     std::fs::create_dir_all(&stage_dir)
@@ -1756,7 +1770,16 @@ with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compressle
     );
 }
 
-fn baseline_uv_install_args(pkg_dir: &Path, python: &Path) -> Vec<OsString> {
+fn baseline_uv_install_args(
+    pkg_dir: &Path,
+    python: &Path,
+    baseline_dep_versions: &[String],
+    python_version: &str,
+) -> Vec<OsString> {
+    let platform = std::env::var("BRAINTRUST_INTERNAL_PY_BUNDLE_PLATFORM_OVERRIDE")
+        .unwrap_or_else(|_| "linux".to_string());
+    let version = std::env::var("BRAINTRUST_INTERNAL_PY_BUNDLE_VERSION_OVERRIDE")
+        .unwrap_or_else(|_| python_version.to_string());
     let mut args = vec![
         OsString::from("pip"),
         OsString::from("install"),
@@ -1764,8 +1787,16 @@ fn baseline_uv_install_args(pkg_dir: &Path, python: &Path) -> Vec<OsString> {
         python.as_os_str().to_os_string(),
         OsString::from("--target"),
         pkg_dir.as_os_str().to_os_string(),
+        OsString::from("--python-platform"),
+        OsString::from(&platform),
+        OsString::from("--python-version"),
+        OsString::from(&version),
     ];
-    args.extend(PYTHON_BASELINE_DEPS.iter().map(OsString::from));
+    if baseline_dep_versions.is_empty() {
+        args.extend(PYTHON_BASELINE_DEPS.iter().map(OsString::from));
+    } else {
+        args.extend(baseline_dep_versions.iter().map(OsString::from));
+    }
     args
 }
 
@@ -1773,7 +1804,12 @@ fn requirements_uv_install_args(
     pkg_dir: &Path,
     requirements: &Path,
     python: &Path,
+    python_version: &str,
 ) -> Vec<OsString> {
+    let platform = std::env::var("BRAINTRUST_INTERNAL_PY_BUNDLE_PLATFORM_OVERRIDE")
+        .unwrap_or_else(|_| "linux".to_string());
+    let version = std::env::var("BRAINTRUST_INTERNAL_PY_BUNDLE_VERSION_OVERRIDE")
+        .unwrap_or_else(|_| python_version.to_string());
     vec![
         OsString::from("pip"),
         OsString::from("install"),
@@ -1781,6 +1817,10 @@ fn requirements_uv_install_args(
         python.as_os_str().to_os_string(),
         OsString::from("--target"),
         pkg_dir.as_os_str().to_os_string(),
+        OsString::from("--python-platform"),
+        OsString::from(&platform),
+        OsString::from("--python-version"),
+        OsString::from(&version),
         OsString::from("-r"),
         requirements.as_os_str().to_os_string(),
     ]
@@ -1790,12 +1830,15 @@ fn install_python_dependencies(
     pkg_dir: &Path,
     requirements_path: Option<&Path>,
     python: &Path,
+    baseline_dep_versions: &[String],
+    python_version: &str,
 ) -> Result<()> {
     let uv = python_runner::find_binary_in_path(&["uv"]).ok_or_else(|| {
         anyhow!("`uv` is required to build Python code bundles; please install uv")
     })?;
 
-    let baseline_args = baseline_uv_install_args(pkg_dir, python);
+    let baseline_args =
+        baseline_uv_install_args(pkg_dir, python, baseline_dep_versions, python_version);
     run_uv_command(
         &uv,
         &baseline_args,
@@ -1803,7 +1846,7 @@ fn install_python_dependencies(
     )?;
 
     if let Some(requirements) = requirements_path {
-        let args = requirements_uv_install_args(pkg_dir, requirements, python);
+        let args = requirements_uv_install_args(pkg_dir, requirements, python, python_version);
         run_uv_command(&uv, &args, "installing requirements file dependencies")?;
     }
 
@@ -2844,6 +2887,7 @@ mod tests {
                 })],
                 python_bundle: None,
             }],
+            baseline_dep_versions: vec![],
         };
 
         let preflight = collect_project_preflight(&base, &manifest).expect("preflight");
@@ -3022,6 +3066,7 @@ mod tests {
                     sources: vec![source.to_string_lossy().to_string()],
                 }),
             }],
+            baseline_dep_versions: vec![],
         };
 
         let err = validate_manifest_paths(
@@ -3068,6 +3113,7 @@ mod tests {
                 })],
                 python_bundle: None,
             }],
+            baseline_dep_versions: vec![],
         };
 
         let err = validate_manifest_paths(
@@ -3115,6 +3161,7 @@ mod tests {
                     sources: vec![source.to_string_lossy().to_string()],
                 }),
             }],
+            baseline_dep_versions: vec![],
         };
 
         validate_manifest_paths(
@@ -3160,6 +3207,7 @@ mod tests {
                     sources: vec![source.to_string_lossy().to_string()],
                 }),
             }],
+            baseline_dep_versions: vec![],
         };
 
         let err = validate_manifest_paths(
@@ -3215,7 +3263,7 @@ mod tests {
     fn uv_install_args_include_selected_python() {
         let pkg_dir = PathBuf::from("/tmp/pkg");
         let python = PathBuf::from("/tmp/custom-python");
-        let rendered = baseline_uv_install_args(&pkg_dir, &python)
+        let rendered = baseline_uv_install_args(&pkg_dir, &python, &[], "3.12")
             .into_iter()
             .map(|value| value.to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -3234,7 +3282,7 @@ mod tests {
         let pkg_dir = PathBuf::from("/tmp/pkg");
         let requirements = PathBuf::from("/tmp/requirements.txt");
         let python = PathBuf::from("/tmp/custom-python");
-        let rendered = requirements_uv_install_args(&pkg_dir, &requirements, &python)
+        let rendered = requirements_uv_install_args(&pkg_dir, &requirements, &python, "3.12")
             .into_iter()
             .map(|value| value.to_string_lossy().to_string())
             .collect::<Vec<_>>();
