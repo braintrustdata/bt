@@ -28,6 +28,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use strip_ansi_escapes::strip;
 use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(not(unix))]
+use tokio::net::TcpListener;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -71,7 +74,7 @@ struct EvalRunnerProcess {
     rx: mpsc::UnboundedReceiver<EvalEvent>,
     sse_task: tokio::task::JoinHandle<()>,
     sse_connected: Arc<AtomicBool>,
-    _socket_cleanup_guard: SocketCleanupGuard,
+    _socket_cleanup_guard: Option<SocketCleanupGuard>,
 }
 
 struct EvalProcessOutput {
@@ -208,6 +211,20 @@ impl Drop for SocketCleanupGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+enum SseListener {
+    #[cfg(unix)]
+    Unix(UnixListener),
+    #[cfg(not(unix))]
+    Tcp(TcpListener),
+}
+
+struct BoundSseListener {
+    listener: SseListener,
+    env_key: &'static str,
+    env_value: String,
+    socket_cleanup_guard: Option<SocketCleanupGuard>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -659,32 +676,60 @@ async fn spawn_eval_runner(
     let (js_runner, py_runner) = prepare_eval_runners()?;
     let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
-    let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
+    let BoundSseListener {
+        listener,
+        env_key,
+        env_value,
+        socket_cleanup_guard,
+    } = bind_sse_listener()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
     let tx_sse = tx.clone();
     let sse_connected_for_task = Arc::clone(&sse_connected);
     let sse_task = tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                sse_connected_for_task.store(true, Ordering::Relaxed);
-                if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
+        match listener {
+            #[cfg(unix)]
+            SseListener::Unix(listener) => match listener.accept().await {
+                Ok((stream, _)) => {
+                    sse_connected_for_task.store(true, Ordering::Relaxed);
+                    if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
+                        let _ = tx_sse.send(EvalEvent::Error {
+                            message: format!("SSE stream error: {err}"),
+                            stack: None,
+                            status: None,
+                        });
+                    }
+                }
+                Err(err) => {
                     let _ = tx_sse.send(EvalEvent::Error {
-                        message: format!("SSE stream error: {err}"),
+                        message: format!("Failed to accept SSE connection: {err}"),
                         stack: None,
                         status: None,
                     });
                 }
-            }
-            Err(err) => {
-                let _ = tx_sse.send(EvalEvent::Error {
-                    message: format!("Failed to accept SSE connection: {err}"),
-                    stack: None,
-                    status: None,
-                });
-            }
-        };
+            },
+            #[cfg(not(unix))]
+            SseListener::Tcp(listener) => match listener.accept().await {
+                Ok((stream, _)) => {
+                    sse_connected_for_task.store(true, Ordering::Relaxed);
+                    if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
+                        let _ = tx_sse.send(EvalEvent::Error {
+                            message: format!("SSE stream error: {err}"),
+                            stack: None,
+                            status: None,
+                        });
+                    }
+                }
+                Err(err) => {
+                    let _ = tx_sse.send(EvalEvent::Error {
+                        message: format!("Failed to accept SSE connection: {err}"),
+                        stack: None,
+                        status: None,
+                    });
+                }
+            },
+        }
     });
 
     let (mut cmd, runner_kind) = match language {
@@ -752,10 +797,7 @@ async fn spawn_eval_runner(
             serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
         cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
     }
-    cmd.env(
-        "BT_EVAL_SSE_SOCK",
-        socket_path.to_string_lossy().to_string(),
-    );
+    cmd.env(env_key, env_value);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -2303,7 +2345,11 @@ fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
     let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
-    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+    let trimmed = name
+        .strip_suffix(".cmd")
+        .or_else(|| name.strip_suffix(".exe"))
+        .unwrap_or(&name);
+    Some(trimmed.to_string())
 }
 
 fn runner_kind_for_bin(runner_command: &Path) -> RunnerKind {
@@ -2341,9 +2387,15 @@ fn is_ts_node_runner(runner_command: &Path) -> bool {
 
 fn find_python_binary() -> Option<PathBuf> {
     if let Some(venv_root) = std::env::var_os("VIRTUAL_ENV") {
-        let candidate = PathBuf::from(venv_root).join("bin").join("python");
-        if candidate.is_file() {
-            return Some(candidate);
+        let venv_root = PathBuf::from(venv_root);
+        let unix = venv_root.join("bin").join("python");
+        if unix.is_file() {
+            return Some(unix);
+        }
+
+        let windows = venv_root.join("Scripts").join("python.exe");
+        if windows.is_file() {
+            return Some(windows);
         }
     }
     find_binary_in_path(&["python3", "python"])
@@ -2357,9 +2409,10 @@ fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
             return Some(base);
         }
         if cfg!(windows) {
-            let cmd = base.with_extension("cmd");
-            if cmd.is_file() {
-                return Some(cmd);
+            for candidate in with_windows_extensions(&base) {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
         current = dir.parent();
@@ -2376,14 +2429,25 @@ fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
                 return Some(path);
             }
             if cfg!(windows) {
-                let cmd = path.with_extension("cmd");
-                if cmd.is_file() {
-                    return Some(cmd);
+                for candidate_path in with_windows_extensions(&path) {
+                    if candidate_path.is_file() {
+                        return Some(candidate_path);
+                    }
                 }
             }
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn with_windows_extensions(path: &Path) -> [PathBuf; 2] {
+    [path.with_extension("exe"), path.with_extension("cmd")]
+}
+
+#[cfg(not(windows))]
+fn with_windows_extensions(_path: &Path) -> [PathBuf; 0] {
+    []
 }
 
 fn build_sse_socket_path() -> Result<PathBuf> {
@@ -2396,14 +2460,22 @@ fn build_sse_socket_path() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}-{serial}.sock")))
 }
 
-fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
+#[cfg(unix)]
+fn bind_sse_listener() -> Result<BoundSseListener> {
     let mut last_bind_err: Option<std::io::Error> = None;
     for _ in 0..SSE_SOCKET_BIND_MAX_ATTEMPTS {
         let socket_path = build_sse_socket_path()?;
         let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
         let _ = std::fs::remove_file(&socket_path);
         match UnixListener::bind(&socket_path) {
-            Ok(listener) => return Ok((listener, socket_path, socket_cleanup_guard)),
+            Ok(listener) => {
+                return Ok(BoundSseListener {
+                    listener: SseListener::Unix(listener),
+                    env_key: "BT_EVAL_SSE_SOCK",
+                    env_value: socket_path.to_string_lossy().to_string(),
+                    socket_cleanup_guard: Some(socket_cleanup_guard),
+                })
+            }
             Err(err)
                 if matches!(
                     err.kind(),
@@ -2427,6 +2499,32 @@ fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
     Err(err).context(format!(
         "failed to bind SSE unix socket after {SSE_SOCKET_BIND_MAX_ATTEMPTS} attempts"
     ))
+}
+
+#[cfg(not(unix))]
+fn bind_sse_listener() -> Result<BoundSseListener> {
+    bind_sse_tcp_listener()
+}
+
+#[cfg(not(unix))]
+fn bind_sse_tcp_listener() -> Result<BoundSseListener> {
+    let std_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .context("failed to bind SSE TCP listener")?;
+    let addr = std_listener
+        .local_addr()
+        .context("failed to resolve SSE TCP listener address")?;
+    std_listener
+        .set_nonblocking(true)
+        .context("failed to set SSE TCP listener non-blocking mode")?;
+    let listener =
+        TcpListener::from_std(std_listener).context("failed to create tokio SSE TCP listener")?;
+
+    Ok(BoundSseListener {
+        listener: SseListener::Tcp(listener),
+        env_key: "BT_EVAL_SSE_ADDR",
+        env_value: format!("127.0.0.1:{}", addr.port()),
+        socket_cleanup_guard: None,
+    })
 }
 
 fn eval_runner_cache_dir() -> PathBuf {
@@ -3952,8 +4050,41 @@ mod tests {
     #[test]
     fn runner_kind_for_bin_detects_bun() {
         assert_eq!(runner_kind_for_bin(Path::new("bun")), RunnerKind::Bun);
+        assert_eq!(runner_kind_for_bin(Path::new("bun.exe")), RunnerKind::Bun);
         assert_eq!(runner_kind_for_bin(Path::new("bunx")), RunnerKind::Bun);
+        assert_eq!(runner_kind_for_bin(Path::new("bunx.cmd")), RunnerKind::Bun);
         assert_eq!(runner_kind_for_bin(Path::new("deno")), RunnerKind::Other);
+    }
+
+    #[test]
+    fn find_python_binary_uses_virtual_env_scripts_python_exe() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = make_temp_dir("venv-scripts-python");
+        let scripts_dir = dir.join("Scripts");
+        fs::create_dir_all(&scripts_dir).expect("create scripts directory");
+        let scripts_python = scripts_dir.join("python.exe");
+        fs::write(&scripts_python, "").expect("write scripts python");
+
+        let previous = set_env_var("VIRTUAL_ENV", &dir.to_string_lossy());
+        let found = find_python_binary();
+        restore_env_var("VIRTUAL_ENV", previous);
+
+        assert_eq!(found, Some(scripts_python));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn bind_sse_tcp_listener_sets_sse_addr_env() {
+        let bound = bind_sse_tcp_listener().expect("bind tcp sse listener");
+        assert_eq!(bound.env_key, "BT_EVAL_SSE_ADDR");
+        assert!(
+            bound.env_value.starts_with("127.0.0.1:"),
+            "expected loopback host in SSE address env"
+        );
+        assert!(bound.socket_cleanup_guard.is_none());
     }
 
     #[test]
