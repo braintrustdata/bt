@@ -12,7 +12,7 @@ repository = "https://github.com/braintrustdata/bt"
 actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "6330e78aca76f39870e5bdc947fb04d52e0ae7ca" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "8f0237ef2d17f80e8cc1a7152c7483b68d5c3e29" }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 futures-util = "0.3.31"
