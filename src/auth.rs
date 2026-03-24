@@ -13,18 +13,19 @@ use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
 use oauth2::basic::{BasicClient, BasicTokenType};
+use oauth2::reqwest::async_http_client;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, EmptyExtraTokenFields, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, StandardTokenResponse, TokenResponse,
     TokenUrl,
 };
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
-    http::{build_http_client, build_http_client_from_builder},
     ui,
 };
 
@@ -39,7 +40,6 @@ pub struct LoginContext {
     pub login: LoginState,
     pub api_url: String,
     pub app_url: String,
-    pub ca_bundle: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,14 +169,10 @@ pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let api_key = match resolved.api_key {
         Some(api_key) => api_key,
-        None => login(base)
-            .await?
-            .login
-            .api_key()
-            .context("login state missing API key")?,
+        None => login(base).await?.login.api_key,
     };
 
-    let mut orgs = fetch_login_orgs(&api_key, &app_url, base.ca_bundle.as_deref()).await?;
+    let mut orgs = fetch_login_orgs(&api_key, &app_url).await?;
     orgs.sort_by(|a, b| {
         a.name
             .to_ascii_lowercase()
@@ -357,9 +353,6 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     if let Some(project) = &project {
         builder = builder.default_project(project);
     }
-    if let Some(ca_bundle) = &base.ca_bundle {
-        builder = builder.ca_bundle(ca_bundle.clone());
-    }
 
     let login = match builder.build().await {
         Ok(client) => client.wait_for_login().await?,
@@ -368,25 +361,19 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
                 .org_name
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("oauth profile is missing org_name: {err}"))?;
-            let login = LoginState::new();
-            login.set(
-                api_key.clone(),
-                String::new(),
+            LoginState {
+                api_key: api_key.clone(),
+                org_id: String::new(),
                 org_name,
-                auth.api_url
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
-                auth.app_url
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_APP_URL.to_string()),
-            );
-            login
+                api_url: auth.api_url.clone(),
+            }
         }
         Err(err) => return Err(err.into()),
     };
 
     let api_url = login
-        .api_url()
+        .api_url
+        .clone()
         .or(auth.api_url.clone())
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
@@ -399,7 +386,6 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         login,
         api_url,
         app_url,
-        ca_bundle: base.ca_bundle.clone(),
     })
 }
 
@@ -485,13 +471,7 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
             "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
         )
     })?;
-    let refreshed = refresh_oauth_access_token(
-        &api_url,
-        &refresh_token,
-        client_id,
-        base.ca_bundle.as_deref(),
-    )
-    .await?;
+    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
     save_profile_oauth_access_token(&profile_name, &refreshed.access_token)?;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
         if next_refresh_token != &refresh_token {
@@ -659,7 +639,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let login_orgs = fetch_login_orgs(&api_key, &login_app_url, base.ca_bundle.as_deref()).await?;
+    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -764,15 +744,9 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         &redirect_uri,
         &auth_code,
         pkce_verifier,
-        base.ca_bundle.as_deref(),
     )
     .await?;
-    let login_orgs = fetch_login_orgs(
-        &oauth_tokens.access_token,
-        &app_url,
-        base.ca_bundle.as_deref(),
-    )
-    .await?;
+    let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -823,7 +797,7 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let login_orgs = fetch_login_orgs(&api_key, &login_app_url, base.ca_bundle.as_deref()).await?;
+    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -911,16 +885,10 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
         &redirect_uri,
         &auth_code,
         pkce_verifier,
-        base.ca_bundle.as_deref(),
     )
     .await?;
 
-    let login_orgs = fetch_login_orgs(
-        &oauth_tokens.access_token,
-        &app_url,
-        base.ca_bundle.as_deref(),
-    )
-    .await?;
+    let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -1071,13 +1039,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         println!("Cached access token expiry before refresh: unknown");
     }
 
-    let refreshed = refresh_oauth_access_token(
-        &api_url,
-        &refresh_token,
-        &client_id,
-        base.ca_bundle.as_deref(),
-    )
-    .await?;
+    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &client_id).await?;
     save_profile_oauth_access_token(profile_name.as_str(), &refreshed.access_token)?;
     let mut refresh_rotated = false;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
@@ -1207,7 +1169,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
         return Ok(());
     }
 
-    let verifications = verify_all_profiles_from_store(&store, base.ca_bundle.clone()).await;
+    let verifications = verify_all_profiles_from_store(&store).await;
     let all_network_errors = verifications
         .iter()
         .all(|v| v.status == "error" && !v.error.as_deref().unwrap_or("").contains("invalid"));
@@ -1388,11 +1350,7 @@ fn build_verification(
     }
 }
 
-async fn verify_profile_full(
-    name: &str,
-    profile: &AuthProfile,
-    ca_bundle: Option<PathBuf>,
-) -> ProfileVerification {
+async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerification {
     let app_url = profile.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
     let auth_kind = match profile.auth_kind {
         AuthKind::ApiKey => "api_key",
@@ -1421,7 +1379,7 @@ async fn verify_profile_full(
         AuthKind::ApiKey => (None, profile.api_key_hint.clone()),
     };
 
-    match fetch_login_orgs(&credential, app_url, ca_bundle.as_deref()).await {
+    match fetch_login_orgs(&credential, app_url).await {
         Ok(_) => mk(ProfileStatus::Ok, jwt_id, hint),
         Err(e) => {
             let msg = e.to_string();
@@ -1439,16 +1397,12 @@ async fn verify_profile_full(
     }
 }
 
-async fn verify_all_profiles_from_store(
-    store: &AuthStore,
-    ca_bundle: Option<PathBuf>,
-) -> Vec<ProfileVerification> {
+async fn verify_all_profiles_from_store(store: &AuthStore) -> Vec<ProfileVerification> {
     let mut set = tokio::task::JoinSet::new();
     for (name, profile) in store.profiles.iter() {
         let name = name.clone();
         let profile = profile.clone();
-        let ca_bundle = ca_bundle.clone();
-        set.spawn(async move { verify_profile_full(&name, &profile, ca_bundle).await });
+        set.spawn(async move { verify_profile_full(&name, &profile).await });
     }
 
     let mut results = Vec::new();
@@ -1532,13 +1486,11 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_login_orgs(
-    api_key: &str,
-    app_url: &str,
-    ca_bundle: Option<&Path>,
-) -> Result<Vec<LoginOrgInfo>> {
+async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
     let login_url = format!("{}/api/apikey/login", app_url.trim_end_matches('/'));
-    let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT, ca_bundle)
+    let client = Client::builder()
+        .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
+        .build()
         .context("failed to initialize HTTP client")?;
     let response = client
         .post(&login_url)
@@ -1932,20 +1884,12 @@ async fn exchange_oauth_authorization_code(
     redirect_uri: &str,
     code: &str,
     code_verifier: PkceCodeVerifier,
-    ca_bundle: Option<&Path>,
 ) -> Result<OAuthTokenResponse> {
     let oauth_client = build_oauth_client(api_url, client_id, Some(redirect_uri))?;
-    let http_client = build_http_client_from_builder(
-        reqwest::Client::builder()
-            .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none()),
-        ca_bundle,
-    )
-    .context("failed to initialize oauth HTTP client")?;
     let token_response = oauth_client
         .exchange_code(AuthorizationCode::new(code.to_string()))
         .set_pkce_verifier(code_verifier)
-        .request_async(move |request| oauth_async_http_client(request, http_client))
+        .request_async(async_http_client)
         .await
         .with_context(|| {
             format!(
@@ -1960,19 +1904,11 @@ async fn refresh_oauth_access_token(
     api_url: &str,
     refresh_token: &str,
     client_id: &str,
-    ca_bundle: Option<&Path>,
 ) -> Result<OAuthTokenResponse> {
     let oauth_client = build_oauth_client(api_url, client_id, None)?;
-    let http_client = build_http_client_from_builder(
-        reqwest::Client::builder()
-            .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none()),
-        ca_bundle,
-    )
-    .context("failed to initialize oauth HTTP client")?;
     let token_response = oauth_client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-        .request_async(move |request| oauth_async_http_client(request, http_client))
+        .request_async(async_http_client)
         .await
         .with_context(|| {
             format!(
@@ -1984,62 +1920,6 @@ async fn refresh_oauth_access_token(
 }
 
 type OAuth2StdTokenResponse = StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType>;
-
-#[derive(Debug)]
-struct OAuthHttpClientError(String);
-
-impl std::fmt::Display for OAuthHttpClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for OAuthHttpClientError {}
-
-async fn oauth_async_http_client(
-    request: oauth2::HttpRequest,
-    client: reqwest::Client,
-) -> std::result::Result<oauth2::HttpResponse, OAuthHttpClientError> {
-    let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
-        .map_err(|err| OAuthHttpClientError(format!("invalid oauth request method: {err}")))?;
-    let mut request_builder = client
-        .request(method, request.url.as_str())
-        .body(request.body);
-    for (name, value) in &request.headers {
-        request_builder = request_builder.header(name.as_str(), value.as_bytes());
-    }
-    let request = request_builder
-        .build()
-        .map_err(|err| OAuthHttpClientError(format!("failed to build oauth request: {err}")))?;
-
-    let response = client
-        .execute(request)
-        .await
-        .map_err(|err| OAuthHttpClientError(format!("failed to send oauth request: {err}")))?;
-    let status_code = oauth2::http::StatusCode::from_u16(response.status().as_u16())
-        .map_err(|err| OAuthHttpClientError(format!("invalid oauth response status: {err}")))?;
-    let mut headers = oauth2::http::HeaderMap::with_capacity(response.headers().len());
-    for (name, value) in response.headers() {
-        let name = oauth2::http::header::HeaderName::from_bytes(name.as_str().as_bytes()).map_err(
-            |err| OAuthHttpClientError(format!("invalid oauth response header name: {err}")),
-        )?;
-        let value = oauth2::http::HeaderValue::from_bytes(value.as_bytes()).map_err(|err| {
-            OAuthHttpClientError(format!("invalid oauth response header value: {err}"))
-        })?;
-        headers.append(name, value);
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| OAuthHttpClientError(format!("failed to read oauth response body: {err}")))?
-        .to_vec();
-
-    Ok(oauth2::HttpResponse {
-        status_code,
-        headers,
-        body,
-    })
-}
 
 fn build_oauth_client(
     api_url: &str,
@@ -2710,7 +2590,6 @@ mod tests {
             no_input: false,
             api_url: None,
             app_url: None,
-            ca_bundle: None,
             env_file: None,
         }
     }

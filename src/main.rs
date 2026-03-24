@@ -86,7 +86,6 @@ Flags
       --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
-      --ca-bundle <PATH>     PEM-encoded CA bundle for HTTPS [env: BRAINTRUST_CA_BUNDLE]
       --env-file <PATH>      Path to a .env file to load
   -h, --help                 Print help
   -V, --version              Print version
@@ -228,7 +227,7 @@ async fn try_main() -> Result<()> {
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
         Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
-        Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
+        Commands::SelfCommand(cmd) => self_update::run(cmd.args).await?,
         Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
         Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
     }
