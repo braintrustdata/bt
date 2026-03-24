@@ -255,6 +255,7 @@ mod tests {
             no_input: false,
             api_url: None,
             app_url: None,
+            ca_bundle: None,
             env_file: None,
         }
     }

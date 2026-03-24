@@ -12,13 +12,13 @@ repository = "https://github.com/braintrustdata/bt"
 actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "c8c7c7a8d9189164584adef71449a26d4ae8be2b" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "6330e78aca76f39870e5bdc947fb04d52e0ae7ca" }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 futures-util = "0.3.31"
 indicatif = "0.17.8"
 ratatui = "0.29.0"
-reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
 sha2 = "0.10.8"
