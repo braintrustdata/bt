@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{builder::BoolishValueParser, Args, Subcommand, ValueEnum};
 
 use crate::{
@@ -468,7 +468,7 @@ pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext>
     Ok(AuthContext {
         client,
         app_url: ctx.app_url,
-        org_id: ctx.login.org_id().context("login state missing org id")?,
+        org_id: ctx.login.org_id,
     })
 }
 

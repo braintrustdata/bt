@@ -760,15 +760,14 @@ async fn run_pull(
     )?;
 
     if json_output {
-        let login_org_name = ctx.login.org_name().unwrap_or_default();
         let warning = if state.items_done == 0 {
             Some(format!(
                 "no rows found for {} in org '{}'; verify object id and active credentials",
                 spec.object_ref,
-                if login_org_name.trim().is_empty() {
+                if ctx.login.org_name.trim().is_empty() {
                     "(default)".to_string()
                 } else {
-                    login_org_name.clone()
+                    ctx.login.org_name.clone()
                 }
             ))
         } else {
@@ -796,11 +795,10 @@ async fn run_pull(
         let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
         let bytes_per_sec = state.bytes_written as f64 / elapsed_secs as f64;
         if state.items_done == 0 {
-            let login_org_name = ctx.login.org_name().unwrap_or_default();
-            let org_label = if login_org_name.trim().is_empty() {
+            let org_label = if ctx.login.org_name.trim().is_empty() {
                 "(default)".to_string()
             } else {
-                login_org_name
+                ctx.login.org_name.clone()
             };
             println!(
                 "Warning: no rows found for {} in org '{}'; verify object id and active credentials.",
@@ -1698,15 +1696,10 @@ async fn run_push(
         }
     });
 
-    let login_api_key = ctx
-        .login
-        .api_key()
-        .context("login state missing API key for upload")?;
-    let login_org_name = ctx.login.org_name().unwrap_or_default();
     let uploader_template = Logs3BatchUploader::new(
         ctx.api_url.clone(),
-        login_api_key,
-        (!login_org_name.trim().is_empty()).then_some(login_org_name.clone()),
+        ctx.login.api_key.clone(),
+        (!ctx.login.org_name.trim().is_empty()).then_some(ctx.login.org_name.clone()),
     )
     .context("failed to initialize logs3 uploader")?;
 
@@ -2065,7 +2058,7 @@ async fn execute_btql_query(
         "fmt": "json",
         "query_source": "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
     });
-    let org_name = ctx.login.org_name().unwrap_or_default();
+    let org_name = ctx.login.org_name.clone();
     let client = client.clone();
     let attempt_counter = Arc::new(AtomicUsize::new(0));
 

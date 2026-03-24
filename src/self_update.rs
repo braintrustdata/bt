@@ -7,7 +7,6 @@ use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::args::BaseArgs;
 use crate::http::DEFAULT_HTTP_TIMEOUT;
 
 #[derive(Debug, Clone, Args)]
@@ -77,32 +76,31 @@ impl UpdateChannel {
 }
 
 const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
-const CURL_CA_BUNDLE_ENV_VAR: &str = "CURL_CA_BUNDLE";
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
 }
 
-pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
+pub async fn run(args: SelfArgs) -> Result<()> {
     match args.command {
-        SelfSubcommand::Update(args) => run_update(&base, args).await,
+        SelfSubcommand::Update(args) => run_update(args).await,
     }
 }
 
-async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
+async fn run_update(args: UpdateArgs) -> Result<()> {
     ensure_installer_managed_install()?;
     let channel = args
         .channel
         .unwrap_or_else(|| inferred_update_channel(BUILD_UPDATE_CHANNEL));
 
     if args.check {
-        check_for_update(base, channel).await?;
+        check_for_update(channel).await?;
         return Ok(());
     }
 
     if channel == UpdateChannel::Stable {
-        match fetch_release(base, channel).await {
+        match fetch_release(channel).await {
             Ok(release) => {
                 let current = env!("CARGO_PKG_VERSION");
                 if stable_is_up_to_date(current, &release.tag_name) {
@@ -118,7 +116,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(channel, base.ca_bundle.as_deref())?;
+    run_installer(channel)?;
     Ok(())
 }
 
@@ -137,8 +135,8 @@ fn ensure_installer_managed_install() -> Result<()> {
     );
 }
 
-async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
-    let release = fetch_release(base, channel).await?;
+async fn check_for_update(channel: UpdateChannel) -> Result<()> {
+    let release = fetch_release(channel).await?;
     let current = env!("CARGO_PKG_VERSION");
 
     match channel {
@@ -153,14 +151,12 @@ async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()>
     Ok(())
 }
 
-async fn fetch_release(base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
-    let client = crate::http::build_http_client_from_builder(
-        Client::builder()
-            .user_agent("bt-self-update")
-            .timeout(DEFAULT_HTTP_TIMEOUT),
-        base.ca_bundle.as_deref(),
-    )
-    .context("failed to initialize HTTP client")?;
+async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
+    let client = Client::builder()
+        .user_agent("bt-self-update")
+        .timeout(DEFAULT_HTTP_TIMEOUT)
+        .build()
+        .context("failed to initialize HTTP client")?;
 
     let mut request = client
         .get(channel.github_release_api_url())
@@ -188,25 +184,17 @@ async fn fetch_release(base: &BaseArgs, channel: UpdateChannel) -> Result<GitHub
         .context("failed to parse GitHub release response")
 }
 
-#[cfg(not(windows))]
-fn installer_env_vars(ca_bundle: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
-    ca_bundle
-        .map(|path| vec![(CURL_CA_BUNDLE_ENV_VAR, path.to_path_buf())])
-        .unwrap_or_default()
-}
-
-fn run_installer(channel: UpdateChannel, ca_bundle: Option<&Path>) -> Result<()> {
+fn run_installer(channel: UpdateChannel) -> Result<()> {
     #[cfg(not(windows))]
     {
         let installer_url = channel.installer_url();
         println!("updating bt from {} channel...", channel.name());
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(cmd);
-        for (key, value) in installer_env_vars(ca_bundle) {
-            command.env(key, value);
-        }
-        let status = command.status().context("failed to execute installer")?;
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .status()
+            .context("failed to execute installer")?;
 
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
@@ -218,7 +206,6 @@ fn run_installer(channel: UpdateChannel, ca_bundle: Option<&Path>) -> Result<()>
 
     #[cfg(windows)]
     {
-        let _ = ca_bundle;
         let installer_url = match channel {
             UpdateChannel::Stable => {
                 "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1"
@@ -493,22 +480,6 @@ mod tests {
         assert_eq!(
             inferred_update_channel(Some("canary")),
             UpdateChannel::Canary
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn installer_env_vars_omit_ca_bundle_when_unset() {
-        assert!(installer_env_vars(None).is_empty());
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn installer_env_vars_set_curl_ca_bundle_from_cli_ca_bundle() {
-        let ca_bundle = Path::new("/tmp/custom-ca.pem");
-        assert_eq!(
-            installer_env_vars(Some(ca_bundle)),
-            vec![(CURL_CA_BUNDLE_ENV_VAR, ca_bundle.to_path_buf())]
         );
     }
 }
