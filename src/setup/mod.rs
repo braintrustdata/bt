@@ -20,9 +20,11 @@ use crate::ui::{self, with_spinner};
 
 mod agent_stream;
 mod docs;
+mod sdk_install_docs;
 
 pub use docs::DocsArgs;
 
+const INSTRUMENT_TASK_TEMPLATE: &str = include_str!("../../skills/sdk-install/instrument-task.md");
 const SHARED_SKILL_BODY: &str = include_str!("../../skills/shared/braintrust-cli-body.md");
 const SHARED_WORKFLOW_GUIDE: &str = include_str!("../../skills/shared/workflows.md");
 const SHARED_SKILL_TEMPLATE: &str = include_str!("../../skills/shared/skill_template.md");
@@ -800,14 +802,14 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
         }
     }
 
+    let docs_output_dir = root.join(".bt").join("skills").join("docs");
+    sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
+
     let task_path = root
         .join(".bt")
         .join("skills")
         .join("AGENT_TASK.instrument.md");
-    write_text_file(
-        &task_path,
-        &render_instrument_task(&root, &selected_workflows),
-    )?;
+    write_text_file(&task_path, &render_instrument_task(&docs_output_dir))?;
 
     let invocation =
         resolve_instrument_invocation(selected, args.agent_cmd.as_deref(), &task_path)?;
@@ -1160,31 +1162,9 @@ async fn run_agent_invocation(
     }
 }
 
-fn render_instrument_task(repo_root: &Path, workflows: &[WorkflowArg]) -> String {
-    let docs_output_dir = repo_root.join(".bt").join("skills").join("docs");
-    let workflow_list = workflows
-        .iter()
-        .map(|workflow| workflow.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        r#"Instrument this repository with Braintrust tracing.
-
-Requirements:
-1. Review the Braintrust instrumentation docs in `{}`.
-2. Focus on these workflow docs: {}.
-3. Use the installed Braintrust agent skills in this repo and prefer local `bt` CLI commands to verify setup.
-4. Do not rely on the Braintrust MCP server for this setup flow.
-5. Add tracing/instrumentation to the application code.
-6. Keep behavior intact; avoid unrelated refactors.
-7. If tests exist, run the smallest relevant tests after instrumentation.
-
-Output:
-- Updated source files with Braintrust instrumentation.
-- A short summary of what was instrumented and why."#,
-        docs_output_dir.display(),
-        workflow_list
-    )
+fn render_instrument_task(docs_output_dir: &Path) -> String {
+    let sdk_install_dir = docs_output_dir.join("sdk-install");
+    INSTRUMENT_TASK_TEMPLATE.replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
 }
 
 struct McpSetupOutcome {
