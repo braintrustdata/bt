@@ -592,7 +592,9 @@ function collectEvaluatorEntries(
 
     const evalObj = evaluator as Record<string, unknown>;
     const projectName =
-      typeof evalObj.project_name === "string" ? evalObj.project_name : undefined;
+      typeof evalObj.project_name === "string"
+        ? evalObj.project_name
+        : undefined;
     const scores = Array.isArray(evalObj.scores) ? evalObj.scores : [];
 
     const selector = asProjectSelector(
@@ -618,7 +620,8 @@ function collectEvaluatorEntries(
       const marker =
         rawParams !== null &&
         typeof rawParams === "object" &&
-        (rawParams as Record<string, unknown>).__braintrust_parameters_marker === true;
+        (rawParams as Record<string, unknown>)
+          .__braintrust_parameters_marker === true;
       if (marker) {
         const paramObj = rawParams as Record<string, unknown>;
         evaluatorDefinition.parameters = toJsonValue({

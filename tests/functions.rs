@@ -2304,7 +2304,9 @@ exit 24
         "expected 1 inserted function (sandbox only)"
     );
 
-    let sandbox_obj = inserted[0].as_object().expect("sandbox should be an object");
+    let sandbox_obj = inserted[0]
+        .as_object()
+        .expect("sandbox should be an object");
     assert_eq!(
         sandbox_obj.get("slug").and_then(Value::as_str),
         Some("my-eval-my-eval-sandbox")
@@ -2355,7 +2357,6 @@ exit 24
             .and_then(Value::as_str),
         Some("my-eval")
     );
-
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

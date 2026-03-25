@@ -3461,12 +3461,8 @@ mod tests {
                 "scores": [{ "name": "accuracy" }]
             }
         });
-        let value = build_code_function_data(
-            &runtime,
-            sandbox_location.clone(),
-            "bundle-sandbox-1",
-            None,
-        );
+        let value =
+            build_code_function_data(&runtime, sandbox_location.clone(), "bundle-sandbox-1", None);
 
         assert_eq!(value["type"], "code");
         assert_eq!(value["data"]["type"], "bundle");
@@ -3486,12 +3482,8 @@ mod tests {
             "eval_name": "my-eval",
             "position": { "type": "task" }
         });
-        let value = build_code_function_data(
-            &runtime,
-            experiment_location.clone(),
-            "bundle-task-1",
-            None,
-        );
+        let value =
+            build_code_function_data(&runtime, experiment_location.clone(), "bundle-task-1", None);
 
         assert_eq!(value["type"], "code");
         assert_eq!(value["data"]["location"], experiment_location);
