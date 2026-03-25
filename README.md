@@ -2,7 +2,7 @@
 
 ## Current Limitations
 
-- `bt eval` is currently Unix-only (Linux/macOS). Windows support is planned.
+- `bt eval` supports Linux, macOS, and Windows.
 
 ## Install
 
@@ -114,7 +114,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt auth`        | Authenticate with Braintrust                                       |
 | `bt switch`      | Switch org and project context                                     |
 | `bt status`      | Show current org and project context                               |
-| `bt eval`        | Run eval files (Unix only)                                         |
+| `bt eval`        | Run eval files                                                     |
 | `bt sql`         | Run SQL queries against Braintrust                                 |
 | `bt view`        | View logs, traces, and spans                                       |
 | `bt projects`    | Manage projects (list, create, view, delete)                       |
@@ -326,5 +326,5 @@ Skill smoke-test harness:
 
 - Add richer channel controls for self-update (for example pinned/branch canary selection).
 - Expand release verification and smoke tests for installer flows across more architectures/environments.
-- Add `bt eval` support on Windows (today, `bt eval` is Unix-only due to Unix socket usage).
+- Expand `bt eval` cross-platform CI coverage, especially on Windows.
 - Add signed artifact verification guidance (signature flow) in install and upgrade docs.

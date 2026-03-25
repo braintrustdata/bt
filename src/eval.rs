@@ -797,7 +797,13 @@ async fn spawn_eval_runner(
             serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
         cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
     }
+    let conflicting_sse_env_key = if env_key == "BT_EVAL_SSE_SOCK" {
+        "BT_EVAL_SSE_ADDR"
+    } else {
+        "BT_EVAL_SSE_SOCK"
+    };
     cmd.env(env_key, env_value);
+    cmd.env_remove(conflicting_sse_env_key);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
