@@ -152,6 +152,13 @@ struct InstrumentSetupArgs {
     /// Suppress streaming agent output; show a spinner and print results at the end
     #[arg(long, short = 'q')]
     quiet: bool,
+
+    /// Language(s) to instrument (repeatable; case-insensitive).
+    /// When provided, the agent skips language auto-detection and instruments
+    /// the specified language(s) directly.
+    /// Accepted values: python, typescript, javascript, go, csharp, c#, java, ruby
+    #[arg(long = "language", value_enum, ignore_case = true)]
+    languages: Vec<LanguageArg>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -475,6 +482,7 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
                     quiet: false,
+                    languages: Vec::new(),
                 },
             )
             .await?;
@@ -720,6 +728,35 @@ enum InstrumentAgentArg {
     Opencode,
 }
 
+/// Languages supported by `--language`.  Variants map to canonical display
+/// names used in the agent task prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ValueEnum)]
+enum LanguageArg {
+    Python,
+    /// TypeScript / JavaScript
+    #[value(name = "typescript", alias = "javascript")]
+    TypeScript,
+    Go,
+    /// C# / csharp
+    #[value(name = "csharp", alias = "c#")]
+    CSharp,
+    Java,
+    Ruby,
+}
+
+impl LanguageArg {
+    fn display_name(self) -> &'static str {
+        match self {
+            LanguageArg::Python => "Python",
+            LanguageArg::TypeScript => "TypeScript",
+            LanguageArg::Go => "Go",
+            LanguageArg::CSharp => "C#",
+            LanguageArg::Java => "Java",
+            LanguageArg::Ruby => "Ruby",
+        }
+    }
+}
+
 fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
     if base.json || !ui::is_interactive() {
         return false;
@@ -809,7 +846,10 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
         .join(".bt")
         .join("skills")
         .join("AGENT_TASK.instrument.md");
-    write_text_file(&task_path, &render_instrument_task(&docs_output_dir))?;
+    write_text_file(
+        &task_path,
+        &render_instrument_task(&docs_output_dir, &selected_workflows, &args.languages),
+    )?;
 
     let invocation =
         resolve_instrument_invocation(selected, args.agent_cmd.as_deref(), &task_path)?;
@@ -1162,9 +1202,57 @@ async fn run_agent_invocation(
     }
 }
 
-fn render_instrument_task(docs_output_dir: &Path) -> String {
+fn render_instrument_task(
+    docs_output_dir: &Path,
+    workflows: &[WorkflowArg],
+    languages: &[LanguageArg],
+) -> String {
+    use std::collections::BTreeSet;
     let sdk_install_dir = docs_output_dir.join("sdk-install");
-    INSTRUMENT_TASK_TEMPLATE.replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
+
+    // Deduplicate languages (TypeScript and JavaScript both map to the same variant).
+    let unique_langs: BTreeSet<LanguageArg> = languages.iter().copied().collect();
+    let language_context = if unique_langs.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = unique_langs
+            .iter()
+            .map(|l| format!("**{}**", l.display_name()))
+            .collect();
+        let list = if names.len() == 1 {
+            names[0].clone()
+        } else {
+            let (last, rest) = names.split_last().unwrap();
+            format!("{} and {}", rest.join(", "), last)
+        };
+        format!(
+            "### Language Override\n\n\
+             Instrument {}. \
+             Skip Step 2 (language auto-detection) and proceed directly to Step 3 \
+             for the specified language(s).\n",
+            list
+        )
+    };
+
+    // When non-instrument workflows are selected the agent should use local
+    // bt CLI skills rather than the MCP server.
+    let workflow_context = if workflows
+        .iter()
+        .any(|w| !matches!(w, WorkflowArg::Instrument))
+    {
+        "## Agent Skills\n\n\
+             Use the installed Braintrust agent skills from `.agents/skills/braintrust/`. \
+             When verifying data in Braintrust, prefer local `bt` CLI commands over direct \
+             API calls. Do not rely on the Braintrust MCP server for data queries.\n"
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    INSTRUMENT_TASK_TEMPLATE
+        .replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
+        .replace("{LANGUAGE_CONTEXT}", &language_context)
+        .replace("{WORKFLOW_CONTEXT}", &workflow_context)
 }
 
 struct McpSetupOutcome {
@@ -2679,6 +2767,7 @@ mod tests {
             refresh_docs: false,
             workers: crate::sync::default_workers(),
             quiet: false,
+            languages: Vec::new(),
         };
 
         let selected =
@@ -2699,6 +2788,7 @@ mod tests {
             refresh_docs: false,
             workers: crate::sync::default_workers(),
             quiet: false,
+            languages: Vec::new(),
         };
 
         let selected =
@@ -2709,7 +2799,8 @@ mod tests {
     #[test]
     fn render_instrument_task_includes_local_cli_and_no_mcp_guidance() {
         let root = PathBuf::from("/tmp/repo");
-        let task = render_instrument_task(&root, &[WorkflowArg::Instrument, WorkflowArg::Observe]);
+        let task =
+            render_instrument_task(&root, &[WorkflowArg::Instrument, WorkflowArg::Observe], &[]);
         assert!(task.contains("Use the installed Braintrust agent skills"));
         assert!(task.contains("prefer local `bt` CLI commands"));
         assert!(task.contains("Do not rely on the Braintrust MCP server"));

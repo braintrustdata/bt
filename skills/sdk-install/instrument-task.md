@@ -26,6 +26,8 @@ Before writing any code:
 
 ## Steps
 
+{LANGUAGE_CONTEXT}
+
 ### 1. Verify API Key (Install Precondition)
 
 Check if `BRAINTRUST_API_KEY` is exported:
@@ -127,3 +129,5 @@ Summarize:
 - Where code was modified
 - What logs/traces were emitted
 - The Braintrust permalink (required)
+
+{WORKFLOW_CONTEXT}
