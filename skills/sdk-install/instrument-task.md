@@ -2,6 +2,8 @@
 
 ## Hard Rules
 
+{RUN_MODE_CONTEXT}
+
 - **Only add Braintrust code.** Do not refactor or modify unrelated code.
 - **Pin exact versions.** Never use `latest`.
 - **Set the project name in code.** Do NOT configure project name via env vars.
@@ -55,7 +57,7 @@ If the language is not obvious from standard build/dependency files:
 
 - infer it from concrete repo evidence (e.g., entrypoint file extensions, build scripts, framework config)
 - State the single strongest piece of evidence you used
-- If still ambiguous (polyglot/monorepo), ask the user which service/app to instrument
+- If still ambiguous (polyglot/monorepo), ask the user which service/app to instrument and wait for the response before proceeding
 - If the inferred language is not in the supported list, **abort the install**.
 
 If none match, **abort installation**.
@@ -66,8 +68,8 @@ If none match, **abort installation**.
 
 Read the install guide for the detected language from the local docs:
 
-| Language   | Local doc                               |
-| ---------- | --------------------------------------- |
+| Language   | Local doc                         |
+| ---------- | --------------------------------- |
 | Java       | `{SDK_INSTALL_DIR}/java.md`       |
 | TypeScript | `{SDK_INSTALL_DIR}/typescript.md` |
 | Python     | `{SDK_INSTALL_DIR}/python.md`     |
@@ -90,34 +92,29 @@ Requirements:
 - Confirm no runtime errors.
 - Confirm the app still runs if `BRAINTRUST_API_KEY` is unset.
 
-If you do not know how to run the app, ask the user.
+If you do not know how to run the app, ask the user and wait for the response before proceeding.
 
 ---
 
 ### 5. Verify in Braintrust (CRITICAL)
 
-Using the Braintrust MCP (preferred):
+The permalink must be included in the final output. This confirms the full installation succeeded.
 
-1. Query for the emitted logs/traces.
-2. Generate a **permalink to the data**.
-3. Print the permalink clearly.
+The project must be set in code during installation — do not guess the project name from context.
 
-The permalink must be included in the final output.
-This confirms the full installation succeeded.
+**How to obtain the permalink:**
 
-Notes:
+Most language SDKs print a direct URL to the emitted trace after the app runs. Capture that URL and print it.
 
-- The agent must not "guess" the project from Braintrust UI. The project must be set in code during installation.
-- If a language SDK provides a deterministic URL to the emitted trace/log (e.g. a `/logs?r=<traceId>&s=<spanId>` link), it is acceptable to print that as the permalink, but it still must point to the specific emitted data.
+If the SDK does not print a URL, construct one manually using the URL format documented in `{SDK_INSTALL_DIR}/braintrust-url-formats.md`:
 
-Minimal MCP workflow to generate a permalink (use this if the SDK does not provide a deterministic URL):
+```
+https://www.braintrust.dev/app/{org}/p/{project_name}/logs?r={root_span_id}
+```
 
-1. Resolve the project ID using the project name that was configured in code:
-   - Call `resolve_object` with `object_type="project_logs"` and `project_name=<your project name>`
-2. Find the newest emitted row in that project:
-   - Call `sql_query` with `object_type="project_logs"`, `object_ids=[<project id>]`, and a time filter, e.g. `created > now() - interval 1 hour`, ordered by `created DESC`, `limit 1`
-3. Generate a permalink to that row:
-   - Call `generate_permalink` with `object_type="project_logs"`, `object_id=<project id>`, `row_id=<row id from sql_query>`
+- `org`: your Braintrust organization slug
+- `project_name`: the project name set in code
+- `root_span_id`: the trace/span ID returned or logged by the SDK
 
 ---
 

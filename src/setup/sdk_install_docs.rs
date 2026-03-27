@@ -10,6 +10,7 @@ const GO_DOCS: &str = include_str!("../../skills/sdk-install/go.md");
 const RUBY_DOCS: &str = include_str!("../../skills/sdk-install/ruby.md");
 const JAVA_DOCS: &str = include_str!("../../skills/sdk-install/java.md");
 const CSHARP_DOCS: &str = include_str!("../../skills/sdk-install/csharp.md");
+const URL_FORMATS_DOCS: &str = include_str!("../../skills/sdk-install/braintrust-url-formats.md");
 
 const INDEX: &str = "# SDK Install Docs
 
@@ -21,6 +22,7 @@ Per-language SDK installation guides. Read the file for the detected language.
 - [Ruby](ruby.md)
 - [Java](java.md)
 - [C#](csharp.md)
+- [Braintrust URL Formats](braintrust-url-formats.md)
 ";
 
 /// Write all SDK install docs to `<output_dir>/sdk-install/`.
@@ -32,6 +34,7 @@ pub fn write_sdk_install_docs(output_dir: &Path) -> Result<()> {
     write_text_file(&dir.join("ruby.md"), RUBY_DOCS)?;
     write_text_file(&dir.join("java.md"), JAVA_DOCS)?;
     write_text_file(&dir.join("csharp.md"), CSHARP_DOCS)?;
+    write_text_file(&dir.join("braintrust-url-formats.md"), URL_FORMATS_DOCS)?;
     write_text_file(&dir.join("_index.md"), INDEX)?;
     Ok(())
 }

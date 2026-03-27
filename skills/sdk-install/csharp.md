@@ -152,4 +152,4 @@ if (braintrust != null && activitySource != null)
 
 The final assistant response must include the printed URL.
 
-If the SDK-generated URL is not available, fall back to the generic MCP permalink workflow described in the agent task (Step 5).
+If the SDK-generated URL is not available, construct the permalink manually using the URL format documented in `braintrust-url-formats.md` as described in the agent task (Step 5).

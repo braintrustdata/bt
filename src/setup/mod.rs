@@ -102,6 +102,11 @@ struct AgentsSetupArgs {
     /// Number of concurrent workers for docs prefetch/download.
     #[arg(long, default_value_t = crate::sync::default_workers())]
     workers: usize,
+
+    /// Grant the agent full permissions and run it in the background without prompting.
+    /// Equivalent to choosing "Background" with all tool restrictions lifted.
+    #[arg(long)]
+    yolo: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -159,6 +164,16 @@ struct InstrumentSetupArgs {
     /// Accepted values: python, typescript, javascript, go, csharp, c#, java, ruby
     #[arg(long = "language", value_enum, ignore_case = true)]
     languages: Vec<LanguageArg>,
+
+    /// Run the agent in interactive mode: inherits the terminal so the user can
+    /// approve/deny tool uses directly. Conflicts with --quiet and --yolo.
+    #[arg(long, short = 'i', conflicts_with_all = ["quiet", "yolo"])]
+    interactive: bool,
+
+    /// Grant the agent full permissions and run it in the background without prompting.
+    /// Skips the run-mode selection question. Conflicts with --interactive.
+    #[arg(long, conflicts_with = "interactive")]
+    yolo: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -353,7 +368,7 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             if should_prompt_setup_action(&base, &args.agents) {
-                run_setup_wizard(base).await
+                run_setup_wizard(base, args.agents.yolo).await
             } else {
                 run_setup(base, args.agents).await
             }
@@ -363,7 +378,7 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
 
 pub use docs::run_docs_top;
 
-async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
+async fn run_setup_wizard(mut base: BaseArgs, yolo: bool) -> Result<()> {
     let mut had_failures = false;
 
     // ── Step 1: Auth ──
@@ -408,12 +423,7 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
         let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
-        let agent_defaults = resolve_selected_agents(&[], &detected);
-        let agents =
-            prompt_agents_selection(&agent_defaults)?.ok_or_else(|| anyhow!("setup cancelled"))?;
-        if agents.is_empty() {
-            bail!("no agents selected");
-        }
+        let agents = resolve_selected_agents(&[], &detected);
         Some((scope, agents, home))
     } else {
         None
@@ -422,7 +432,8 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
     if wants_skills {
         eprintln!("   {}", style("Skills:").bold());
         if let Some((scope, ref agents, _)) = setup_context {
-            let agent_args: Vec<AgentArg> = agents.iter().map(|a| agent_to_agent_arg(*a)).collect();
+            let agent_args: Vec<AgentArg> =
+                agents.iter().map(|a| map_agent_to_agent_arg(*a)).collect();
             let args = AgentsSetupArgs {
                 agents: agent_args,
                 local: matches!(scope, InstallScope::Local),
@@ -432,6 +443,7 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                 no_fetch_docs: true,
                 refresh_docs: false,
                 workers: crate::sync::default_workers(),
+                yolo: false,
             };
             let outcome = execute_skills_setup(&base, &args, true).await?;
             for r in &outcome.results {
@@ -454,7 +466,7 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                     had_failures = true;
                 }
             }
-            if outcome.installed_count == 0 {
+            if outcome.installed_count == 0 && !agents.is_empty() {
                 had_failures = true;
             }
         }
@@ -483,6 +495,8 @@ async fn run_setup_wizard(mut base: BaseArgs) -> Result<()> {
                     workers: crate::sync::default_workers(),
                     quiet: false,
                     languages: Vec::new(),
+                    interactive: false,
+                    yolo,
                 },
             )
             .await?;
@@ -588,15 +602,6 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
     };
     config::save_local(&cfg, true)?;
     Ok(true)
-}
-
-fn agent_to_agent_arg(agent: Agent) -> AgentArg {
-    match agent {
-        Agent::Claude => AgentArg::Claude,
-        Agent::Codex => AgentArg::Codex,
-        Agent::Cursor => AgentArg::Cursor,
-        Agent::Opencode => AgentArg::Opencode,
-    }
 }
 
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
@@ -792,6 +797,18 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
     }
 
     let selected_workflows = resolve_instrument_workflow_selection(&args)?;
+
+    let selected_languages: Vec<LanguageArg> = if !args.languages.is_empty() {
+        args.languages.clone()
+    } else if ui::is_interactive() && !args.yes {
+        let Some(langs) = prompt_instrument_language_selection()? else {
+            bail!("instrument setup cancelled by user");
+        };
+        langs
+    } else {
+        Vec::new()
+    };
+
     let show_progress = !base.json;
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
@@ -828,6 +845,7 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
             no_fetch_docs: false,
             refresh_docs: args.refresh_docs,
             workers: args.workers,
+            yolo: false,
         };
         let outcome = execute_skills_setup(&base, &setup_args, false).await?;
         detected = outcome.detected_agents;
@@ -839,6 +857,40 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
         }
     }
 
+    // Determine run mode: interactive TUI vs background (autonomous).
+    // --yolo:        background, full bypassPermissions (no restrictions)
+    // --interactive: interactive TUI
+    // --yes or non-interactive terminal: background, restricted to language package managers
+    // Otherwise: ask the user.
+    let (run_interactive, bypass_permissions) = if args.interactive {
+        (true, false)
+    } else if args.yolo {
+        (false, true)
+    } else if args.yes || !ui::is_interactive() {
+        (false, false)
+    } else {
+        let pkg_mgrs = package_manager_cmds_for_languages(&selected_languages).join(", ");
+        let background_label = format!(
+            "Background (automatic) — runs autonomously; \
+             allowed package managers: {pkg_mgrs}"
+        );
+        let choices = [
+            background_label.as_str(),
+            "Interactive TUI — agent opens in its terminal UI; \
+             you review and approve each tool use",
+        ];
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("How do you want to run the agent?")
+            .items(&choices)
+            .default(0)
+            .interact_opt()?;
+        let Some(index) = selection else {
+            bail!("instrument setup cancelled by user");
+        };
+        let interactive = index == 1;
+        (interactive, false)
+    };
+
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
 
@@ -848,15 +900,35 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
         .join("AGENT_TASK.instrument.md");
     write_text_file(
         &task_path,
-        &render_instrument_task(&docs_output_dir, &selected_workflows, &args.languages),
+        &render_instrument_task(
+            &docs_output_dir,
+            &selected_workflows,
+            &selected_languages,
+            run_interactive,
+        ),
     )?;
 
-    let invocation =
-        resolve_instrument_invocation(selected, args.agent_cmd.as_deref(), &task_path)?;
     notes.push(format!(
         "Instrumentation task prompt written to {}.",
         task_path.display()
     ));
+
+    let invocation = resolve_instrument_invocation(
+        selected,
+        args.agent_cmd.as_deref(),
+        &task_path,
+        run_interactive,
+        bypass_permissions,
+        &selected_languages,
+    )?;
+
+    if run_interactive {
+        eprintln!();
+        eprintln!("Claude Code is opening in interactive mode.");
+        eprintln!("The instrumentation task is pre-loaded. Press Enter to begin.");
+        eprintln!("Task file: {}", task_path.display());
+        eprintln!();
+    }
 
     let show_output = !base.json && !args.quiet;
     let status = if args.quiet && !base.json {
@@ -954,6 +1026,42 @@ fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
             }
         }
         workflows
+    }))
+}
+
+fn prompt_instrument_language_selection() -> Result<Option<Vec<LanguageArg>>> {
+    // Index 0 = "All / auto-detect".  Indices 1-6 map to specific languages.
+    let choices = [
+        "All languages (auto-detect)",
+        "Python",
+        "TypeScript / JavaScript",
+        "Go",
+        "Java",
+        "Ruby",
+        "C#",
+    ];
+    let defaults = [true, false, false, false, false, false, false];
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Which language(s) to instrument?")
+        .items(&choices)
+        .defaults(&defaults)
+        .interact_opt()?;
+    Ok(selected.map(|indices| {
+        if indices.is_empty() || indices.contains(&0) {
+            return Vec::new(); // auto-detect
+        }
+        indices
+            .iter()
+            .filter_map(|&i| match i {
+                1 => Some(LanguageArg::Python),
+                2 => Some(LanguageArg::TypeScript),
+                3 => Some(LanguageArg::Go),
+                4 => Some(LanguageArg::Java),
+                5 => Some(LanguageArg::Ruby),
+                6 => Some(LanguageArg::CSharp),
+                _ => None,
+            })
+            .collect()
     }))
 }
 
@@ -1061,13 +1169,55 @@ fn prompt_instrument_agent(default_agent: Agent) -> Result<Agent> {
     Ok(ALL_AGENTS[index])
 }
 
+/// Returns the package-manager command names allowed in background (non-yolo) mode.
+///
+/// When `languages` is empty (auto-detect), every supported package manager is included.
+/// Otherwise only the managers for the specified languages are returned.
+fn package_manager_cmds_for_languages(languages: &[LanguageArg]) -> Vec<&'static str> {
+    use std::collections::BTreeSet;
+    let unique: BTreeSet<LanguageArg> = languages.iter().copied().collect();
+
+    if unique.is_empty() {
+        return vec![
+            "uv", "pip", "pip3", "poetry", "pipenv", "npm", "npx", "yarn", "pnpm", "bun", "deno",
+            "go", "gradle", "gradlew", "mvn", "mvnw", "gem", "bundle", "dotnet",
+        ];
+    }
+
+    let mut v: Vec<&'static str> = Vec::new();
+    for lang in &unique {
+        match lang {
+            LanguageArg::Python => v.extend(["uv", "pip", "pip3", "poetry", "pipenv"]),
+            LanguageArg::TypeScript => v.extend(["npm", "npx", "yarn", "pnpm", "bun", "deno"]),
+            LanguageArg::Go => v.extend(["go"]),
+            LanguageArg::Java => v.extend(["gradle", "gradlew", "mvn", "mvnw"]),
+            LanguageArg::Ruby => v.extend(["gem", "bundle"]),
+            LanguageArg::CSharp => v.extend(["dotnet"]),
+        }
+    }
+    v
+}
+
+/// Returns the `--allowedTools` string for Claude from a language list.
+fn allowed_bash_tools_for_languages(languages: &[LanguageArg]) -> String {
+    package_manager_cmds_for_languages(languages)
+        .iter()
+        .map(|c| format!("Bash({c}:*)"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 enum InstrumentInvocation {
     Program {
         program: String,
         args: Vec<String>,
         stdin_file: Option<PathBuf>,
+        /// Path to a file whose content is passed as the initial user prompt (positional arg).
         prompt_file_arg: Option<PathBuf>,
+        /// Hardcoded initial user prompt string (alternative to prompt_file_arg).
+        initial_prompt: Option<String>,
         stream_json: bool,
+        interactive: bool,
     },
     Shell(String),
 }
@@ -1076,6 +1226,9 @@ fn resolve_instrument_invocation(
     agent: Agent,
     agent_cmd: Option<&str>,
     task_path: &Path,
+    interactive: bool,
+    bypass_permissions: bool,
+    languages: &[LanguageArg],
 ) -> Result<InstrumentInvocation> {
     if let Some(command) = agent_cmd {
         let trimmed = command.trim();
@@ -1091,31 +1244,77 @@ fn resolve_instrument_invocation(
             args: vec!["exec".to_string(), "-".to_string()],
             stdin_file: Some(task_path.to_path_buf()),
             prompt_file_arg: None,
+            initial_prompt: None,
             stream_json: false,
+            interactive,
         },
-        Agent::Claude => InstrumentInvocation::Program {
-            program: "claude".to_string(),
-            args: vec![
-                "-p".to_string(),
-                "--permission-mode".to_string(),
-                "acceptEdits".to_string(),
-                "--verbose".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--include-partial-messages".to_string(),
-                "--disallowedTools".to_string(),
-                "EnterPlanMode".to_string(),
-            ],
-            stdin_file: Some(task_path.to_path_buf()),
-            prompt_file_arg: None,
-            stream_json: true,
-        },
+        Agent::Claude => {
+            if interactive {
+                // In interactive mode the full task goes into --append-system-prompt so
+                // Claude already knows what to do.  A short initial user message is passed
+                // as the positional arg so Claude immediately starts working — the user only
+                // needs to press Enter once on a short, clear prompt rather than a wall of
+                // raw task markdown.
+                let task_content = std::fs::read_to_string(task_path)
+                    .with_context(|| format!("failed to read task file {}", task_path.display()))?;
+                InstrumentInvocation::Program {
+                    program: "claude".to_string(),
+                    args: vec![
+                        "--append-system-prompt".to_string(),
+                        task_content,
+                        "--disallowedTools".to_string(),
+                        "EnterPlanMode".to_string(),
+                        "--name".to_string(),
+                        "Braintrust: Instrument".to_string(),
+                    ],
+                    stdin_file: None,
+                    prompt_file_arg: None,
+                    initial_prompt: Some(
+                        "Please begin the Braintrust instrumentation task.".to_string(),
+                    ),
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                let mut claude_args = vec![
+                    "-p".to_string(),
+                    "--permission-mode".to_string(),
+                    if bypass_permissions {
+                        "bypassPermissions".to_string()
+                    } else {
+                        "acceptEdits".to_string()
+                    },
+                    "--verbose".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--include-partial-messages".to_string(),
+                ];
+                if !bypass_permissions {
+                    let allowed = allowed_bash_tools_for_languages(languages);
+                    claude_args.push("--allowedTools".to_string());
+                    claude_args.push(allowed);
+                }
+                claude_args.push("--disallowedTools".to_string());
+                claude_args.push("EnterPlanMode".to_string());
+                InstrumentInvocation::Program {
+                    program: "claude".to_string(),
+                    args: claude_args,
+                    stdin_file: Some(task_path.to_path_buf()),
+                    prompt_file_arg: None,
+                    initial_prompt: None,
+                    stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
         Agent::Opencode => InstrumentInvocation::Program {
             program: "opencode".to_string(),
             args: vec!["run".to_string()],
             stdin_file: None,
             prompt_file_arg: Some(task_path.to_path_buf()),
+            initial_prompt: None,
             stream_json: false,
+            interactive,
         },
         Agent::Cursor => InstrumentInvocation::Program {
             program: "cursor-agent".to_string(),
@@ -1128,7 +1327,9 @@ fn resolve_instrument_invocation(
             ],
             stdin_file: None,
             prompt_file_arg: Some(task_path.to_path_buf()),
+            initial_prompt: None,
             stream_json: true,
+            interactive,
         },
     };
     Ok(invocation)
@@ -1157,7 +1358,9 @@ async fn run_agent_invocation(
             args,
             stdin_file,
             prompt_file_arg,
+            initial_prompt,
             stream_json,
+            interactive,
         } => {
             let mut command = Command::new(program);
             command.args(args).current_dir(root);
@@ -1171,11 +1374,22 @@ async fn run_agent_invocation(
                 }
                 command.arg(prompt);
             }
+            if let Some(prompt) = initial_prompt {
+                command.arg(prompt);
+            }
             if let Some(path) = stdin_file {
                 let file = fs::File::open(path).with_context(|| {
                     format!("failed to open task prompt file {}", path.display())
                 })?;
                 command.stdin(Stdio::from(file));
+            }
+
+            if *interactive {
+                // Inherit all streams so the user can interact with the agent directly.
+                return command
+                    .status()
+                    .await
+                    .with_context(|| format!("failed to run agent command in {}", root.display()));
             }
 
             if !show_output {
@@ -1206,6 +1420,7 @@ fn render_instrument_task(
     docs_output_dir: &Path,
     workflows: &[WorkflowArg],
     languages: &[LanguageArg],
+    interactive: bool,
 ) -> String {
     use std::collections::BTreeSet;
     let sdk_install_dir = docs_output_dir.join("sdk-install");
@@ -1249,10 +1464,19 @@ fn render_instrument_task(
         String::new()
     };
 
+    let run_mode_context = if interactive {
+        "- **Interactive mode:** You can ask the user questions through the chat interface.\n"
+    } else {
+        "- **Non-interactive mode:** You cannot ask the user questions. \
+         If a step requires user input (e.g., ambiguous language in a polyglot repo, \
+         unknown run command), abort with a clear explanation of what is needed.\n"
+    };
+
     INSTRUMENT_TASK_TEMPLATE
         .replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
         .replace("{LANGUAGE_CONTEXT}", &language_context)
         .replace("{WORKFLOW_CONTEXT}", &workflow_context)
+        .replace("{RUN_MODE_CONTEXT}", run_mode_context)
 }
 
 struct McpSetupOutcome {
@@ -2488,7 +2712,7 @@ fn print_wizard_step(number: u8, label: &str) {
 fn print_wizard_agent_result(result: &AgentInstallResult) {
     let (indicator, status_text) = match result.status {
         InstallStatus::Installed => (style("✓").green(), "installed"),
-        InstallStatus::Skipped => (style("—").dim(), "skipped"),
+        InstallStatus::Skipped => (style("—").dim(), "already configured"),
         InstallStatus::Failed => (style("✗").red(), "failed"),
     };
     eprintln!(
@@ -2741,6 +2965,7 @@ mod tests {
             no_fetch_docs: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
+            yolo: false,
         };
         let home = std::env::temp_dir();
         let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
@@ -2768,6 +2993,8 @@ mod tests {
             workers: crate::sync::default_workers(),
             quiet: false,
             languages: Vec::new(),
+            interactive: false,
+            yolo: false,
         };
 
         let selected =
@@ -2789,6 +3016,8 @@ mod tests {
             workers: crate::sync::default_workers(),
             quiet: false,
             languages: Vec::new(),
+            interactive: false,
+            yolo: false,
         };
 
         let selected =
@@ -2799,8 +3028,12 @@ mod tests {
     #[test]
     fn render_instrument_task_includes_local_cli_and_no_mcp_guidance() {
         let root = PathBuf::from("/tmp/repo");
-        let task =
-            render_instrument_task(&root, &[WorkflowArg::Instrument, WorkflowArg::Observe], &[]);
+        let task = render_instrument_task(
+            &root,
+            &[WorkflowArg::Instrument, WorkflowArg::Observe],
+            &[],
+            false,
+        );
         assert!(task.contains("Use the installed Braintrust agent skills"));
         assert!(task.contains("prefer local `bt` CLI commands"));
         assert!(task.contains("Do not rely on the Braintrust MCP server"));
@@ -2815,8 +3048,9 @@ mod tests {
     #[test]
     fn codex_instrument_invocation_uses_exec_with_stdin_prompt() {
         let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
-        let invocation = resolve_instrument_invocation(Agent::Codex, None, &task_path)
-            .expect("resolve instrument invocation");
+        let invocation =
+            resolve_instrument_invocation(Agent::Codex, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
 
         match invocation {
             InstrumentInvocation::Program {
@@ -2825,6 +3059,7 @@ mod tests {
                 stdin_file,
                 prompt_file_arg,
                 stream_json,
+                ..
             } => {
                 assert_eq!(program, "codex");
                 assert_eq!(args, vec!["exec".to_string(), "-".to_string()]);
@@ -2837,10 +3072,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_instrument_invocation_uses_print_with_stdin_prompt() {
+    fn claude_instrument_invocation_uses_print_with_bypass_permissions() {
         let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
-        let invocation = resolve_instrument_invocation(Agent::Claude, None, &task_path)
-            .expect("resolve instrument invocation");
+        let invocation =
+            resolve_instrument_invocation(Agent::Claude, None, &task_path, false, true, &[])
+                .expect("resolve instrument invocation");
 
         match invocation {
             InstrumentInvocation::Program {
@@ -2849,6 +3085,7 @@ mod tests {
                 stdin_file,
                 prompt_file_arg,
                 stream_json,
+                ..
             } => {
                 assert_eq!(program, "claude");
                 assert_eq!(
@@ -2856,7 +3093,7 @@ mod tests {
                     vec![
                         "-p".to_string(),
                         "--permission-mode".to_string(),
-                        "acceptEdits".to_string(),
+                        "bypassPermissions".to_string(),
                         "--verbose".to_string(),
                         "--output-format".to_string(),
                         "stream-json".to_string(),
@@ -2874,10 +3111,119 @@ mod tests {
     }
 
     #[test]
+    fn claude_background_invocation_uses_accept_edits_with_language_scoped_tools() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        // Python only → only Python package managers should be allowed.
+        let invocation = resolve_instrument_invocation(
+            Agent::Claude,
+            None,
+            &task_path,
+            false,
+            false,
+            &[LanguageArg::Python],
+        )
+        .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program { program, args, .. } => {
+                assert_eq!(program, "claude");
+                let pm_idx = args.iter().position(|a| a == "--permission-mode").unwrap();
+                assert_eq!(args[pm_idx + 1], "acceptEdits");
+
+                let at_idx = args.iter().position(|a| a == "--allowedTools").unwrap();
+                let allowed = &args[at_idx + 1];
+                // Python managers present
+                assert!(allowed.contains("Bash(uv:*)"), "uv should be allowed");
+                assert!(allowed.contains("Bash(pip:*)"), "pip should be allowed");
+                // Non-Python managers absent
+                assert!(
+                    !allowed.contains("Bash(npm:*)"),
+                    "npm must not appear for Python-only"
+                );
+                assert!(
+                    !allowed.contains("Bash(go:*)"),
+                    "go must not appear for Python-only"
+                );
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn claude_background_invocation_with_no_language_allows_all_package_managers() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Claude, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program { args, .. } => {
+                let at_idx = args.iter().position(|a| a == "--allowedTools").unwrap();
+                let allowed = &args[at_idx + 1];
+                assert!(allowed.contains("Bash(uv:*)"));
+                assert!(allowed.contains("Bash(npm:*)"));
+                assert!(allowed.contains("Bash(go:*)"));
+                assert!(allowed.contains("Bash(gradle:*)"));
+                assert!(allowed.contains("Bash(gem:*)"));
+                assert!(allowed.contains("Bash(dotnet:*)"));
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn claude_interactive_instrument_invocation_uses_system_prompt_no_print_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task_path = dir.path().join("AGENT_TASK.instrument.md");
+        std::fs::write(&task_path, "## Task\nInstrument this repo.").expect("write task");
+
+        let invocation =
+            resolve_instrument_invocation(Agent::Claude, None, &task_path, true, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                initial_prompt,
+                stream_json,
+                interactive,
+            } => {
+                assert_eq!(program, "claude");
+                assert!(
+                    !args.contains(&"-p".to_string()),
+                    "interactive mode must not pass -p"
+                );
+                assert!(
+                    args.contains(&"--append-system-prompt".to_string()),
+                    "task should be in system prompt"
+                );
+                assert!(args.contains(&"--disallowedTools".to_string()));
+                assert!(args.contains(&"--name".to_string()));
+                assert_eq!(stdin_file, None);
+                assert_eq!(
+                    prompt_file_arg, None,
+                    "task is in system prompt, not prompt_file_arg"
+                );
+                assert!(
+                    initial_prompt.is_some(),
+                    "short initial message must be set to trigger Claude"
+                );
+                assert!(!stream_json);
+                assert!(interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
     fn opencode_instrument_invocation_uses_run_with_prompt_arg() {
         let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
-        let invocation = resolve_instrument_invocation(Agent::Opencode, None, &task_path)
-            .expect("resolve instrument invocation");
+        let invocation =
+            resolve_instrument_invocation(Agent::Opencode, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
 
         match invocation {
             InstrumentInvocation::Program {
@@ -2886,6 +3232,7 @@ mod tests {
                 stdin_file,
                 prompt_file_arg,
                 stream_json,
+                ..
             } => {
                 assert_eq!(program, "opencode");
                 assert_eq!(args, vec!["run".to_string()]);
@@ -2900,8 +3247,9 @@ mod tests {
     #[test]
     fn cursor_instrument_invocation_uses_print_with_prompt_arg() {
         let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
-        let invocation = resolve_instrument_invocation(Agent::Cursor, None, &task_path)
-            .expect("resolve instrument invocation");
+        let invocation =
+            resolve_instrument_invocation(Agent::Cursor, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
 
         match invocation {
             InstrumentInvocation::Program {
@@ -2910,6 +3258,7 @@ mod tests {
                 stdin_file,
                 prompt_file_arg,
                 stream_json,
+                ..
             } => {
                 assert_eq!(program, "cursor-agent");
                 assert_eq!(
