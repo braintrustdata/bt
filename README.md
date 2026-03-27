@@ -1,5 +1,4 @@
 # Braintrust CLI (`bt`)
-triggering the ci
 
 ## Current Limitations
 
