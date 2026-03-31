@@ -383,6 +383,7 @@ async fn run_setup_wizard(mut base: BaseArgs, yolo: bool) -> Result<()> {
 
     // ── Step 1: Auth ──
     print_wizard_step(1, "Auth");
+    let project_flag = base.project.clone();
     let login_ctx = ensure_auth(&mut base).await?;
     let client = ApiClient::new(&login_ctx)?;
     let org = client.org_name().to_string();
@@ -390,7 +391,7 @@ async fn run_setup_wizard(mut base: BaseArgs, yolo: bool) -> Result<()> {
 
     // ── Step 2: Project ──
     print_wizard_step(2, "Project");
-    let project = select_project_with_skip(&client).await?;
+    let project = select_project_with_skip(&client, project_flag.as_deref()).await?;
     if let Some(ref project) = project {
         if find_git_root().is_some() && maybe_init(&org, project)? {
             eprintln!(
@@ -543,7 +544,27 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
 
 async fn select_project_with_skip(
     client: &ApiClient,
+    project_name: Option<&str>,
 ) -> Result<Option<crate::projects::api::Project>> {
+    if let Some(name) = project_name {
+        let project = with_spinner(
+            "Loading project...",
+            crate::projects::api::get_project_by_name(client, name),
+        )
+        .await?;
+        match project {
+            Some(p) => {
+                eprintln!("{} Select project · {}", style("✔").green(), p.name);
+                return Ok(Some(p));
+            }
+            None => bail!(
+                "project '{}' not found in org '{}'",
+                name,
+                client.org_name()
+            ),
+        }
+    }
+
     let mut projects = with_spinner(
         "Loading projects...",
         crate::projects::api::list_projects(client),
