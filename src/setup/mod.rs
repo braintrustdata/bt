@@ -53,6 +53,14 @@ pub struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupSubcommand>,
 
+    /// Set up coding-agent skills (skips interactive selection in wizard)
+    #[arg(long)]
+    skills: bool,
+
+    /// Set up MCP server (skips interactive selection in wizard)
+    #[arg(long)]
+    mcp: bool,
+
     #[command(flatten)]
     agents: AgentsSetupArgs,
 }
@@ -368,7 +376,15 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             if should_prompt_setup_action(&base, &args.agents) {
-                run_setup_wizard(base, args.agents.yolo).await
+                run_setup_wizard(
+                    base,
+                    args.agents.yolo,
+                    args.skills,
+                    args.mcp,
+                    args.agents.local,
+                    args.agents.global,
+                )
+                .await
             } else {
                 run_setup(base, args.agents).await
             }
@@ -378,7 +394,14 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
 
 pub use docs::run_docs_top;
 
-async fn run_setup_wizard(mut base: BaseArgs, yolo: bool) -> Result<()> {
+async fn run_setup_wizard(
+    mut base: BaseArgs,
+    yolo: bool,
+    flag_skills: bool,
+    flag_mcp: bool,
+    flag_local: bool,
+    flag_global: bool,
+) -> Result<()> {
     let mut had_failures = false;
 
     // ── Step 1: Auth ──
@@ -407,20 +430,52 @@ async fn run_setup_wizard(mut base: BaseArgs, yolo: bool) -> Result<()> {
 
     // ── Step 3: Agent tools (skills + MCP) ──
     print_wizard_step(3, "Agents");
-    let choices = ["Skills", "MCP"];
-    let defaults = [true, true];
-    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("What would you like to set up?")
-        .items(&choices)
-        .defaults(&defaults)
-        .interact()?;
+    let (wants_skills, wants_mcp) = if flag_skills || flag_mcp {
+        let chosen: Vec<&str> = [("Skills", flag_skills), ("MCP", flag_mcp)]
+            .iter()
+            .filter(|(_, v)| *v)
+            .map(|(s, _)| *s)
+            .collect();
+        let chosen_styled: Vec<String> = chosen
+            .iter()
+            .map(|s| style(s).green().to_string())
+            .collect();
+        eprintln!(
+            "{} What would you like to set up? · {}",
+            style("✔").green(),
+            chosen_styled.join(", ")
+        );
+        (flag_skills, flag_mcp)
+    } else {
+        let choices = ["Skills", "MCP"];
+        let defaults = [true, true];
+        let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+            .with_prompt("What would you like to set up?")
+            .items(&choices)
+            .defaults(&defaults)
+            .interact()?;
+        (selected.contains(&0), selected.contains(&1))
+    };
 
-    let wants_skills = selected.contains(&0);
-    let wants_mcp = selected.contains(&1);
-
-    let setup_context = if !selected.is_empty() {
-        let scope = prompt_scope_selection("Select install scope")?
-            .ok_or_else(|| anyhow!("setup cancelled"))?;
+    let setup_context = if wants_skills || wants_mcp {
+        let scope = if flag_local {
+            eprintln!(
+                "{} Select install scope · {}",
+                style("✔").green(),
+                style("local (current git repo)").green()
+            );
+            InstallScope::Local
+        } else if flag_global {
+            eprintln!(
+                "{} Select install scope · {}",
+                style("✔").green(),
+                style("global (user-wide)").green()
+            );
+            InstallScope::Global
+        } else {
+            prompt_scope_selection("Select install scope")?
+                .ok_or_else(|| anyhow!("setup cancelled"))?
+        };
         let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
@@ -788,8 +843,6 @@ fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
         return false;
     }
     args.agents.is_empty()
-        && !args.local
-        && !args.global
         && args.workflows.is_empty()
         && !args.yes
         && !args.no_fetch_docs
