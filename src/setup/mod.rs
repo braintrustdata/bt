@@ -417,55 +417,78 @@ async fn run_setup_wizard(
     flag_no_mcp_skill: bool,
 ) -> Result<()> {
     let mut had_failures = false;
+    let quiet = base.quiet;
 
     // ── Step 1: Auth ──
-    print_wizard_step(1, "Auth");
+    if !quiet {
+        print_wizard_step(1, "Auth");
+    }
     let project_flag = base.project.clone();
     let login_ctx = ensure_auth(&mut base).await?;
     let client = ApiClient::new(&login_ctx)?;
     let org = client.org_name().to_string();
-    eprintln!("   {} Using org '{}'", style("✓").green(), org);
+    if !quiet {
+        eprintln!("   {} Using org '{}'", style("✓").green(), org);
+    }
 
     // ── Step 2: Project ──
-    print_wizard_step(2, "Project");
-    let project = select_project_with_skip(&client, project_flag.as_deref()).await?;
-    if let Some(ref project) = project {
-        if find_git_root().is_some() && maybe_init(&org, project)? {
-            eprintln!(
-                "   {} Linked to {}/{}",
-                style("✓").green(),
-                org,
-                project.name
-            );
+    if !quiet {
+        print_wizard_step(2, "Project");
+    }
+    let project = select_project_with_skip(&client, project_flag.as_deref(), quiet).await?;
+    if !quiet {
+        if let Some(ref project) = project {
+            if find_git_root().is_some() && maybe_init(&org, project)? {
+                eprintln!(
+                    "   {} Linked to {}/{}",
+                    style("✓").green(),
+                    org,
+                    project.name
+                );
+            }
+        } else {
+            eprintln!("   {}", style("Skipped").dim());
         }
-    } else {
-        eprintln!("   {}", style("Skipped").dim());
+        eprintln!(
+            "   {}",
+            style("(Un)select option with Space, confirm selection with Enter.").dim()
+        );
+    } else if let Some(ref project) = project {
+        if find_git_root().is_some() {
+            let _ = maybe_init(&org, project)?;
+        }
     }
 
     // ── Step 3: Agent tools (skills + MCP) ──
-    print_wizard_step(3, "Agents");
+    if !quiet {
+        print_wizard_step(3, "Agents");
+    }
     let (wants_skills, wants_mcp) = if flag_no_mcp_skill {
-        eprintln!(
-            "{} What would you like to set up? · {}",
-            style("✔").green(),
-            style("(none)").dim()
-        );
+        if !quiet {
+            eprintln!(
+                "{} What would you like to set up? · {}",
+                style("✔").green(),
+                style("(none)").dim()
+            );
+        }
         (false, false)
     } else if flag_skills || flag_mcp {
-        let chosen: Vec<&str> = [("Skills", flag_skills), ("MCP", flag_mcp)]
-            .iter()
-            .filter(|(_, v)| *v)
-            .map(|(s, _)| *s)
-            .collect();
-        let chosen_styled: Vec<String> = chosen
-            .iter()
-            .map(|s| style(s).green().to_string())
-            .collect();
-        eprintln!(
-            "{} What would you like to set up? · {}",
-            style("✔").green(),
-            chosen_styled.join(", ")
-        );
+        if !quiet {
+            let chosen: Vec<&str> = [("Skills", flag_skills), ("MCP", flag_mcp)]
+                .iter()
+                .filter(|(_, v)| *v)
+                .map(|(s, _)| *s)
+                .collect();
+            let chosen_styled: Vec<String> = chosen
+                .iter()
+                .map(|s| style(s).green().to_string())
+                .collect();
+            eprintln!(
+                "{} What would you like to set up? · {}",
+                style("✔").green(),
+                chosen_styled.join(", ")
+            );
+        }
         (flag_skills, flag_mcp)
     } else {
         let choices = ["Skills", "MCP"];
@@ -480,18 +503,22 @@ async fn run_setup_wizard(
 
     let setup_context = if wants_skills || wants_mcp {
         let scope = if flag_local {
-            eprintln!(
-                "{} Select install scope · {}",
-                style("✔").green(),
-                style("local (current git repo)").green()
-            );
+            if !quiet {
+                eprintln!(
+                    "{} Select install scope · {}",
+                    style("✔").green(),
+                    style("local (current git repo)").green()
+                );
+            }
             InstallScope::Local
         } else if flag_global {
-            eprintln!(
-                "{} Select install scope · {}",
-                style("✔").green(),
-                style("global (user-wide)").green()
-            );
+            if !quiet {
+                eprintln!(
+                    "{} Select install scope · {}",
+                    style("✔").green(),
+                    style("global (user-wide)").green()
+                );
+            }
             InstallScope::Global
         } else {
             prompt_scope_selection("Select install scope")?
@@ -501,7 +528,7 @@ async fn run_setup_wizard(
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
         let agents = resolve_selected_agents(&flag_agents, &detected);
-        if !flag_agents.is_empty() {
+        if !quiet && !flag_agents.is_empty() {
             let agent_names: Vec<String> = agents
                 .iter()
                 .map(|a| style(a.as_str()).green().to_string())
@@ -518,7 +545,9 @@ async fn run_setup_wizard(
     };
 
     if wants_skills {
-        eprintln!("   {}", style("Skills:").bold());
+        if !quiet {
+            eprintln!("   {}", style("Skills:").bold());
+        }
         if let Some((scope, ref agents, _)) = setup_context {
             let agent_args: Vec<AgentArg> =
                 agents.iter().map(|a| map_agent_to_agent_arg(*a)).collect();
@@ -535,7 +564,9 @@ async fn run_setup_wizard(
             };
             let outcome = execute_skills_setup(&base, &args, true).await?;
             for r in &outcome.results {
-                print_wizard_agent_result(r);
+                if !quiet {
+                    print_wizard_agent_result(r);
+                }
                 if matches!(r.status, InstallStatus::Failed) {
                     had_failures = true;
                 }
@@ -544,12 +575,16 @@ async fn run_setup_wizard(
     }
 
     if wants_mcp {
-        eprintln!("   {}", style("MCP:").bold());
+        if !quiet {
+            eprintln!("   {}", style("MCP:").bold());
+        }
         if let Some((scope, ref agents, ref home)) = setup_context {
             let local_root = resolve_local_root_for_scope(scope)?;
             let outcome = execute_mcp_install(scope, local_root.as_deref(), home, agents);
             for r in &outcome.results {
-                print_wizard_agent_result(r);
+                if !quiet {
+                    print_wizard_agent_result(r);
+                }
                 if matches!(r.status, InstallStatus::Failed) {
                     had_failures = true;
                 }
@@ -561,17 +596,23 @@ async fn run_setup_wizard(
     }
 
     if !wants_skills && !wants_mcp {
-        eprintln!("   {}", style("Skipped").dim());
+        if !quiet {
+            eprintln!("   {}", style("Skipped").dim());
+        }
     }
 
     // ── Step 4: Instrument ──
-    print_wizard_step(4, "Instrument");
+    if !quiet {
+        print_wizard_step(4, "Instrument");
+    }
     if find_git_root().is_some() {
         let instrument = if flag_instrument {
-            eprintln!(
-                "Run instrumentation agent to set up tracing in this repo? {}",
-                style("yes").green()
-            );
+            if !quiet {
+                eprintln!(
+                    "Run instrumentation agent to set up tracing in this repo? {}",
+                    style("yes").green()
+                );
+            }
             true
         } else {
             Confirm::with_theme(&ColorfulTheme::default())
@@ -607,14 +648,20 @@ async fn run_setup_wizard(
             )
             .await?;
         } else {
-            eprintln!("   {}", style("Skipped").dim());
+            if !quiet {
+                eprintln!("   {}", style("Skipped").dim());
+            }
         }
     } else {
-        eprintln!("   {}", style("Skipped").dim());
+        if !quiet {
+            eprintln!("   {}", style("Skipped").dim());
+        }
     }
 
     // ── Done ──
-    print_wizard_done(had_failures);
+    if !quiet {
+        print_wizard_done(had_failures);
+    }
     if had_failures {
         bail!("setup completed with failures");
     }
@@ -650,6 +697,7 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
 async fn select_project_with_skip(
     client: &ApiClient,
     project_name: Option<&str>,
+    quiet: bool,
 ) -> Result<Option<crate::projects::api::Project>> {
     if let Some(name) = project_name {
         let project = with_spinner(
@@ -659,7 +707,9 @@ async fn select_project_with_skip(
         .await?;
         match project {
             Some(p) => {
-                eprintln!("{} Select project · {}", style("✔").green(), p.name);
+                if !quiet {
+                    eprintln!("{} Select project · {}", style("✔").green(), p.name);
+                }
                 return Ok(Some(p));
             }
             None => bail!(
@@ -778,7 +828,7 @@ async fn execute_skills_setup(
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut results = Vec::new();
-    let show_progress = !base.json && !quiet;
+    let show_progress = !base.json && !quiet && !base.quiet;
 
     if show_progress {
         println!("Configuring coding agents for Braintrust");
@@ -918,11 +968,13 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
     if args.agent.is_none() && ui::is_interactive() && !args.yes {
         selected = prompt_instrument_agent(selected)?;
     } else if args.agent.is_some() {
-        eprintln!(
-            "{} Select agent to instrument this repo · {}",
-            style("✔").green(),
-            style(selected.as_str()).green()
-        );
+        if !base.quiet {
+            eprintln!(
+                "{} Select agent to instrument this repo · {}",
+                style("✔").green(),
+                style(selected.as_str()).green()
+            );
+        }
     }
 
     let selected_workflows = resolve_instrument_workflow_selection(&args)?;
