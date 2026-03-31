@@ -1010,7 +1010,7 @@ fn resolve_instrument_workflow_selection(args: &InstrumentSetupArgs) -> Result<V
 
 fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
     let choices = ["observe", "evaluate"];
-    let defaults = [true, false];
+    let defaults = [true, true];
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Select additional workflow docs to prefetch (instrument is always included)")
         .items(&choices)
