@@ -61,6 +61,14 @@ pub struct SetupArgs {
     #[arg(long)]
     mcp: bool,
 
+    /// Run instrumentation agent (skips interactive prompt in wizard)
+    #[arg(long)]
+    instrument: bool,
+
+    /// Skip skills and MCP setup (skips interactive selection in wizard)
+    #[arg(long, conflicts_with_all = ["skills", "mcp"])]
+    no_mcp_skill: bool,
+
     #[command(flatten)]
     agents: AgentsSetupArgs,
 }
@@ -383,6 +391,9 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
                     args.mcp,
                     args.agents.local,
                     args.agents.global,
+                    args.instrument,
+                    args.agents.agents,
+                    args.no_mcp_skill,
                 )
                 .await
             } else {
@@ -401,6 +412,9 @@ async fn run_setup_wizard(
     flag_mcp: bool,
     flag_local: bool,
     flag_global: bool,
+    flag_instrument: bool,
+    flag_agents: Vec<AgentArg>,
+    flag_no_mcp_skill: bool,
 ) -> Result<()> {
     let mut had_failures = false;
 
@@ -430,7 +444,14 @@ async fn run_setup_wizard(
 
     // ── Step 3: Agent tools (skills + MCP) ──
     print_wizard_step(3, "Agents");
-    let (wants_skills, wants_mcp) = if flag_skills || flag_mcp {
+    let (wants_skills, wants_mcp) = if flag_no_mcp_skill {
+        eprintln!(
+            "{} What would you like to set up? · {}",
+            style("✔").green(),
+            style("(none)").dim()
+        );
+        (false, false)
+    } else if flag_skills || flag_mcp {
         let chosen: Vec<&str> = [("Skills", flag_skills), ("MCP", flag_mcp)]
             .iter()
             .filter(|(_, v)| *v)
@@ -479,7 +500,18 @@ async fn run_setup_wizard(
         let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
-        let agents = resolve_selected_agents(&[], &detected);
+        let agents = resolve_selected_agents(&flag_agents, &detected);
+        if !flag_agents.is_empty() {
+            let agent_names: Vec<String> = agents
+                .iter()
+                .map(|a| style(a.as_str()).green().to_string())
+                .collect();
+            eprintln!(
+                "{} Select agents to configure · {}",
+                style("✔").green(),
+                agent_names.join(", ")
+            );
+        }
         Some((scope, agents, home))
     } else {
         None
@@ -535,15 +567,33 @@ async fn run_setup_wizard(
     // ── Step 4: Instrument ──
     print_wizard_step(4, "Instrument");
     if find_git_root().is_some() {
-        let instrument = Confirm::new()
-            .with_prompt("Run instrumentation agent to set up tracing in this repo?")
-            .default(false)
-            .interact()?;
+        let instrument = if flag_instrument {
+            eprintln!(
+                "Run instrumentation agent to set up tracing in this repo? {}",
+                style("yes").green()
+            );
+            true
+        } else {
+            Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Run instrumentation agent to set up tracing in this repo?")
+                .default(false)
+                .interact()?
+        };
         if instrument {
+            let instrument_agent = match flag_agents.as_slice() {
+                [single] => match single {
+                    AgentArg::Claude => Some(InstrumentAgentArg::Claude),
+                    AgentArg::Codex => Some(InstrumentAgentArg::Codex),
+                    AgentArg::Cursor => Some(InstrumentAgentArg::Cursor),
+                    AgentArg::Opencode => Some(InstrumentAgentArg::Opencode),
+                    AgentArg::All => None,
+                },
+                _ => None,
+            };
             run_instrument_setup(
                 base,
                 InstrumentSetupArgs {
-                    agent: None,
+                    agent: instrument_agent,
                     agent_cmd: None,
                     workflows: Vec::new(),
                     yes: false,
@@ -842,8 +892,7 @@ fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
     if base.json || !ui::is_interactive() {
         return false;
     }
-    args.agents.is_empty()
-        && args.workflows.is_empty()
+    args.workflows.is_empty()
         && !args.yes
         && !args.no_fetch_docs
         && !args.refresh_docs
@@ -868,6 +917,12 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
 
     if args.agent.is_none() && ui::is_interactive() && !args.yes {
         selected = prompt_instrument_agent(selected)?;
+    } else if args.agent.is_some() {
+        eprintln!(
+            "{} Select agent to instrument this repo · {}",
+            style("✔").green(),
+            style(selected.as_str()).green()
+        );
     }
 
     let selected_workflows = resolve_instrument_workflow_selection(&args)?;
@@ -875,7 +930,8 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
     let selected_languages: Vec<LanguageArg> = if !args.languages.is_empty() {
         args.languages.clone()
     } else if ui::is_interactive() && !args.yes {
-        let Some(langs) = prompt_instrument_language_selection()? else {
+        let detected_langs = detect_languages_from_dir(&std::env::current_dir()?);
+        let Some(langs) = prompt_instrument_language_selection(&detected_langs)? else {
             bail!("instrument setup cancelled by user");
         };
         langs
@@ -1103,7 +1159,74 @@ fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
     }))
 }
 
-fn prompt_instrument_language_selection() -> Result<Option<Vec<LanguageArg>>> {
+fn detect_languages_from_dir(dir: &std::path::Path) -> Vec<LanguageArg> {
+    // (indicator filename suffix, language)
+    let indicators: &[(&str, LanguageArg)] = &[
+        ("pyproject.toml", LanguageArg::Python),
+        ("setup.py", LanguageArg::Python),
+        ("requirements.txt", LanguageArg::Python),
+        ("package.json", LanguageArg::TypeScript),
+        ("tsconfig.json", LanguageArg::TypeScript),
+        ("go.mod", LanguageArg::Go),
+        ("pom.xml", LanguageArg::Java),
+        ("build.gradle", LanguageArg::Java),
+        ("build.gradle.kts", LanguageArg::Java),
+        ("Gemfile", LanguageArg::Ruby),
+    ];
+    // Glob-style suffix indicators (checked by extension)
+    let ext_indicators: &[(&str, LanguageArg)] = &[
+        ("csproj", LanguageArg::CSharp),
+        ("sln", LanguageArg::CSharp),
+        ("gemspec", LanguageArg::Ruby),
+    ];
+
+    let scan = |dir: &std::path::Path, found: &mut std::collections::BTreeSet<LanguageArg>| {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        for &(indicator, lang) in indicators {
+                            if name.eq_ignore_ascii_case(indicator) {
+                                found.insert(lang);
+                            }
+                        }
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            for &(indicator_ext, lang) in ext_indicators {
+                                if ext.eq_ignore_ascii_case(indicator_ext) {
+                                    found.insert(lang);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let mut found = std::collections::BTreeSet::new();
+
+    // Scan the current directory first.
+    scan(dir, &mut found);
+
+    // Only recurse into immediate subdirectories if nothing was found at the top level.
+    if found.is_empty() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, &mut found);
+                }
+            }
+        }
+    }
+
+    found.into_iter().collect()
+}
+
+fn prompt_instrument_language_selection(
+    detected: &[LanguageArg],
+) -> Result<Option<Vec<LanguageArg>>> {
     // Index 0 = "All / auto-detect".  Indices 1-6 map to specific languages.
     let choices = [
         "All languages (auto-detect)",
@@ -1114,7 +1237,23 @@ fn prompt_instrument_language_selection() -> Result<Option<Vec<LanguageArg>>> {
         "Ruby",
         "C#",
     ];
-    let defaults = [true, false, false, false, false, false, false];
+    // Map detected languages to their choice indices (1-based)
+    let lang_to_idx = |lang: LanguageArg| match lang {
+        LanguageArg::Python => 1usize,
+        LanguageArg::TypeScript => 2,
+        LanguageArg::Go => 3,
+        LanguageArg::Java => 4,
+        LanguageArg::Ruby => 5,
+        LanguageArg::CSharp => 6,
+    };
+    let defaults = if detected.len() != 1 {
+        // Zero or multiple detected → pre-select "All languages (auto-detect)"
+        [true, false, false, false, false, false, false]
+    } else {
+        let mut d = [false; 7];
+        d[lang_to_idx(detected[0])] = true;
+        d
+    };
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Which language(s) to instrument?")
         .items(&choices)
