@@ -378,7 +378,7 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
     match args.command {
         Some(SetupSubcommand::Skills(setup)) => run_setup(base, setup).await,
         Some(SetupSubcommand::Instrument(instrument)) => {
-            run_instrument_setup(base, instrument).await
+            run_instrument_setup(base, instrument, false).await
         }
         Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp),
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
@@ -462,10 +462,6 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         } else {
             eprintln!("   {}", style("Skipped").dim());
         }
-        eprintln!(
-            "   {}",
-            style("(Un)select option with Space, confirm selection with Enter.").dim()
-        );
     } else if let Some(ref project) = project {
         if find_git_root().is_some() {
             let _ = maybe_init(&org, project)?;
@@ -476,6 +472,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if !quiet {
         print_wizard_step(3, "Agents");
     }
+    let mut multiselect_hint_shown = false;
     let (wants_skills, wants_mcp) = if flag_no_mcp_skill {
         if !quiet {
             eprintln!(
@@ -504,6 +501,13 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
         (flag_skills, flag_mcp)
     } else {
+        if !quiet {
+            eprintln!(
+                "   {}",
+                style("(Un)select option with Space, confirm selection with Enter.").dim()
+            );
+            multiselect_hint_shown = true;
+        }
         let choices = ["Skills", "MCP"];
         let defaults = [true, true];
         let selected = MultiSelect::with_theme(&ColorfulTheme::default())
@@ -656,6 +660,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     interactive: false,
                     yolo,
                 },
+                !multiselect_hint_shown,
             )
             .await?;
         } else if !quiet {
@@ -955,7 +960,11 @@ fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
         && args.workers == crate::sync::default_workers()
 }
 
-async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Result<()> {
+async fn run_instrument_setup(
+    base: BaseArgs,
+    args: InstrumentSetupArgs,
+    print_hint: bool,
+) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let root = find_git_root().ok_or_else(|| {
         anyhow!(
@@ -981,11 +990,18 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
         );
     }
 
-    let selected_workflows = resolve_instrument_workflow_selection(&args)?;
+    let mut hint_pending = print_hint && !base.quiet;
+    let selected_workflows = resolve_instrument_workflow_selection(&args, &mut hint_pending)?;
 
     let selected_languages: Vec<LanguageArg> = if !args.languages.is_empty() {
         args.languages.clone()
     } else if ui::is_interactive() && !args.yes {
+        if hint_pending {
+            eprintln!(
+                "   {}",
+                style("(Un)select option with Space, confirm selection with Enter.").dim()
+            );
+        }
         let detected_langs = detect_languages_from_dir(&std::env::current_dir()?);
         let Some(langs) = prompt_instrument_language_selection(&detected_langs)? else {
             bail!("instrument setup cancelled by user");
@@ -1173,7 +1189,10 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
     Ok(())
 }
 
-fn resolve_instrument_workflow_selection(args: &InstrumentSetupArgs) -> Result<Vec<WorkflowArg>> {
+fn resolve_instrument_workflow_selection(
+    args: &InstrumentSetupArgs,
+    hint_pending: &mut bool,
+) -> Result<Vec<WorkflowArg>> {
     if !args.workflows.is_empty() {
         let mut selected = resolve_workflow_selection(&args.workflows);
         if !selected.contains(&WorkflowArg::Instrument) {
@@ -1185,6 +1204,13 @@ fn resolve_instrument_workflow_selection(args: &InstrumentSetupArgs) -> Result<V
     }
 
     if ui::is_interactive() && !args.yes {
+        if *hint_pending {
+            eprintln!(
+                "   {}",
+                style("(Un)select option with Space, confirm selection with Enter.").dim()
+            );
+            *hint_pending = false;
+        }
         let Some(selected) = prompt_instrument_workflow_selection()? else {
             bail!("instrument setup cancelled by user");
         };
@@ -3268,8 +3294,8 @@ mod tests {
             yolo: false,
         };
 
-        let selected =
-            resolve_instrument_workflow_selection(&args).expect("resolve instrument workflows");
+        let selected = resolve_instrument_workflow_selection(&args, &mut false)
+            .expect("resolve instrument workflows");
         assert_eq!(
             selected,
             vec![WorkflowArg::Instrument, WorkflowArg::Evaluate]
@@ -3291,8 +3317,8 @@ mod tests {
             yolo: false,
         };
 
-        let selected =
-            resolve_instrument_workflow_selection(&args).expect("resolve instrument workflows");
+        let selected = resolve_instrument_workflow_selection(&args, &mut false)
+            .expect("resolve instrument workflows");
         assert_eq!(selected, vec![WorkflowArg::Instrument]);
     }
 
