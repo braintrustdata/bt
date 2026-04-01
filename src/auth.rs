@@ -825,7 +825,7 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
     Ok(profile_name)
 }
 
-async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
+pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     let api_url = base
         .api_url
         .clone()
@@ -863,7 +863,9 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
 
     let _ = open::that(&authorize_url);
     eprintln!("Complete authorization in your browser.");
+    eprintln!();
     eprintln!("{}", dialoguer::console::style(&authorize_url).dim());
+    eprintln!();
 
     let callback = collect_oauth_callback(listener, is_ssh_session()).await?;
     if let Some(error) = callback.error {
@@ -1717,6 +1719,7 @@ async fn collect_oauth_callback(
     let pasted = Input::<String>::new()
         .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
         .allow_empty(true)
+        .report(false)
         .interact_text()
         .context("failed to read callback URL")?;
     if pasted.trim().is_empty() {

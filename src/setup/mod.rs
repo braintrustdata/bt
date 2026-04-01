@@ -69,6 +69,22 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with_all = ["skills", "mcp"])]
     no_mcp_skill: bool,
 
+    /// Do not set up coding-agent skills
+    #[arg(long)]
+    no_skill: bool,
+
+    /// Do not set up MCP server
+    #[arg(long)]
+    no_mcp: bool,
+
+    /// Do not run instrumentation agent (overrides default)
+    #[arg(long, conflicts_with = "instrument")]
+    no_instrument: bool,
+
+    /// Run the agent in background (non-interactive) mode instead of TUI
+    #[arg(long)]
+    background: bool,
+
     #[command(flatten)]
     agents: AgentsSetupArgs,
 }
@@ -388,9 +404,13 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
                     yolo: args.agents.yolo,
                     skills: args.skills,
                     mcp: args.mcp,
+                    no_skill: args.no_skill,
+                    no_mcp: args.no_mcp,
                     local: args.agents.local,
                     global: args.agents.global,
                     instrument: args.instrument,
+                    no_instrument: args.no_instrument,
+                    background: args.background,
                     agents: args.agents.agents,
                     no_mcp_skill: args.no_mcp_skill,
                     workflows: args.agents.workflows,
@@ -409,9 +429,13 @@ struct WizardFlags {
     yolo: bool,
     skills: bool,
     mcp: bool,
+    no_skill: bool,
+    no_mcp: bool,
     local: bool,
     global: bool,
     instrument: bool,
+    no_instrument: bool,
+    background: bool,
     agents: Vec<AgentArg>,
     no_mcp_skill: bool,
     workflows: Vec<WorkflowArg>,
@@ -422,15 +446,21 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         yolo,
         skills: flag_skills,
         mcp: flag_mcp,
+        no_skill: flag_no_skill,
+        no_mcp: flag_no_mcp,
         local: flag_local,
-        global: flag_global,
-        instrument: flag_instrument,
+        global: _flag_global,
+        instrument: _flag_instrument,
+        no_instrument: flag_no_instrument,
+        background: flag_background,
         agents: flag_agents,
         no_mcp_skill: flag_no_mcp_skill,
         workflows: flag_workflows,
     } = flags;
     let mut had_failures = false;
     let quiet = base.quiet;
+    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let git_root = find_git_root();
 
     // ── Step 1: Auth ──
     if !quiet {
@@ -448,115 +478,60 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if !quiet {
         print_wizard_step(2, "Project");
     }
-    let project = select_project_with_skip(&client, project_flag.as_deref(), quiet).await?;
-    if !quiet {
-        if let Some(ref project) = project {
-            if find_git_root().is_some() && maybe_init(&org, project)? {
-                eprintln!(
-                    "   {} Linked to {}/{}",
-                    style("✓").green(),
-                    org,
-                    project.name
-                );
-            }
-        } else {
-            eprintln!("   {}", style("Skipped").dim());
+    let project = auto_select_project(&client, project_flag.as_deref()).await?;
+    if let Some(ref project) = project {
+        if git_root.is_some() {
+            let _ = maybe_init(&org, project);
         }
-    } else if let Some(ref project) = project {
-        if find_git_root().is_some() {
-            let _ = maybe_init(&org, project)?;
+        if !quiet {
+            eprintln!(
+                "   {} Project: {}/{}",
+                style("✓").green(),
+                org,
+                project.name
+            );
         }
+    } else if !quiet {
+        eprintln!(
+            "   {} {}",
+            style("—").dim(),
+            style("Using existing project(s)").dim()
+        );
     }
 
     // ── Step 3: Agent tools (skills + MCP) ──
     if !quiet {
         print_wizard_step(3, "Agents");
     }
-    let mut multiselect_hint_shown = false;
-    let (wants_skills, wants_mcp) = if flag_no_mcp_skill {
-        if !quiet {
-            eprintln!(
-                "{} What would you like to set up? · {}",
-                style("✔").green(),
-                style("(none)").dim()
-            );
-        }
-        (false, false)
-    } else if flag_skills || flag_mcp {
-        if !quiet {
-            let chosen: Vec<&str> = [("Skills", flag_skills), ("MCP", flag_mcp)]
-                .iter()
-                .filter(|(_, v)| *v)
-                .map(|(s, _)| *s)
-                .collect();
-            let chosen_styled: Vec<String> = chosen
-                .iter()
-                .map(|s| style(s).green().to_string())
-                .collect();
-            eprintln!(
-                "{} What would you like to set up? · {}",
-                style("✔").green(),
-                chosen_styled.join(", ")
-            );
-        }
-        (flag_skills, flag_mcp)
+    // Default: install both skills and MCP with global scope.
+    // --no-skill / --no-mcp / --no-mcp-skill opt out.
+    let _ = flag_skills; // kept as flag but superseded by default-on behavior
+    let _ = flag_mcp; // kept as flag but superseded by default-on behavior
+    let wants_skills = !flag_no_mcp_skill && !flag_no_skill;
+    let wants_mcp = !flag_no_mcp_skill && !flag_no_mcp;
+
+    // Scope: default global; --local overrides.
+    let scope = if flag_local {
+        InstallScope::Local
     } else {
-        if !quiet {
-            eprintln!(
-                "   {}",
-                style("(Un)select option with Space, confirm selection with Enter.").dim()
-            );
-            multiselect_hint_shown = true;
-        }
-        let choices = ["Skills", "MCP"];
-        let defaults = [true, true];
-        let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-            .with_prompt("What would you like to set up?")
-            .items(&choices)
-            .defaults(&defaults)
-            .interact()?;
-        (selected.contains(&0), selected.contains(&1))
+        InstallScope::Global
     };
 
-    let setup_context = if wants_skills || wants_mcp {
-        let scope = if flag_local {
-            if !quiet {
-                eprintln!(
-                    "{} Select install scope · {}",
-                    style("✔").green(),
-                    style("local (current git repo)").green()
-                );
-            }
-            InstallScope::Local
-        } else if flag_global {
-            if !quiet {
-                eprintln!(
-                    "{} Select install scope · {}",
-                    style("✔").green(),
-                    style("global (user-wide)").green()
-                );
-            }
-            InstallScope::Global
+    let local_root = resolve_local_root_for_scope(scope)?;
+    let detected = detect_agents(local_root.as_deref(), &home);
+    let agents = resolve_selected_agents(&flag_agents, &detected);
+
+    if !quiet {
+        let scope_label = if flag_local {
+            "local (current git repo)"
         } else {
-            prompt_scope_selection("Select install scope")?
-                .ok_or_else(|| anyhow!("setup cancelled"))?
+            "global (user-wide)"
         };
-        let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-        let local_root = resolve_local_root_for_scope(scope)?;
-        let detected = detect_agents(local_root.as_deref(), &home);
-        let agents = resolve_selected_agents(&flag_agents, &detected);
-        if !quiet && !flag_agents.is_empty() {
-            let agent_names: Vec<String> = agents
-                .iter()
-                .map(|a| style(a.as_str()).green().to_string())
-                .collect();
-            eprintln!(
-                "{} Select agents to configure · {}",
-                style("✔").green(),
-                agent_names.join(", ")
-            );
-        }
-        Some((scope, agents, home))
+        eprintln!("   {} Scope: {}", style("✓").green(), scope_label);
+    }
+
+    let setup_context = if wants_skills || wants_mcp {
+        Some((scope, agents.clone()))
     } else {
         None
     };
@@ -565,7 +540,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if !quiet {
             eprintln!("   {}", style("Skills:").bold());
         }
-        if let Some((scope, ref agents, _)) = setup_context {
+        if let Some((scope, ref agents)) = setup_context {
             let agent_args: Vec<AgentArg> =
                 agents.iter().map(|a| map_agent_to_agent_arg(*a)).collect();
             let args = AgentsSetupArgs {
@@ -595,9 +570,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if !quiet {
             eprintln!("   {}", style("MCP:").bold());
         }
-        if let Some((scope, ref agents, ref home)) = setup_context {
+        if let Some((scope, ref agents)) = setup_context {
             let local_root = resolve_local_root_for_scope(scope)?;
-            let outcome = execute_mcp_install(scope, local_root.as_deref(), home, agents);
+            let outcome = execute_mcp_install(scope, local_root.as_deref(), &home, agents);
             for r in &outcome.results {
                 if !quiet {
                     print_wizard_agent_result(r);
@@ -620,47 +595,71 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if !quiet {
         print_wizard_step(4, "Instrument");
     }
-    if find_git_root().is_some() {
-        let instrument = if flag_instrument {
-            if !quiet {
-                eprintln!(
-                    "Run instrumentation agent to set up tracing in this repo? {}",
-                    style("yes").green()
-                );
-            }
-            true
-        } else {
-            Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt("Run instrumentation agent to set up tracing in this repo?")
-                .default(false)
-                .interact()?
-        };
-        if instrument {
-            let instrument_agent = match flag_agents.as_slice() {
-                [single] => match single {
-                    AgentArg::Claude => Some(InstrumentAgentArg::Claude),
-                    AgentArg::Codex => Some(InstrumentAgentArg::Codex),
-                    AgentArg::Cursor => Some(InstrumentAgentArg::Cursor),
-                    AgentArg::Opencode => Some(InstrumentAgentArg::Opencode),
-                    AgentArg::All => None,
-                },
-                _ => None,
+    if git_root.is_some() {
+        // Default: instrument. --no-instrument opts out.
+        let do_instrument = !flag_no_instrument;
+        if do_instrument {
+            // Determine agent: explicit flag > single detected > ask user
+            let instrument_agent =
+                determine_wizard_instrument_agent(&flag_agents, git_root.as_deref(), &home);
+
+            let instrument_agent = if instrument_agent.is_none() && ui::is_interactive() {
+                // Multiple or zero detected agents — ask the user
+                let detected2 = detect_agents(git_root.as_deref(), &home);
+                let detected_set: BTreeSet<Agent> = detected2.iter().map(|s| s.agent).collect();
+                let candidates: Vec<Agent> = if detected_set.is_empty() {
+                    ALL_AGENTS.to_vec()
+                } else {
+                    detected_set.into_iter().collect()
+                };
+                let default = pick_agent_mode_target(&candidates).unwrap_or(Agent::Claude);
+                let selected = prompt_instrument_agent(default)?;
+                Some(match selected {
+                    Agent::Claude => InstrumentAgentArg::Claude,
+                    Agent::Codex => InstrumentAgentArg::Codex,
+                    Agent::Cursor => InstrumentAgentArg::Cursor,
+                    Agent::Opencode => InstrumentAgentArg::Opencode,
+                })
+            } else {
+                instrument_agent
             };
+
+            // Auto-detect languages from the git root (no prompt)
+            let detected_languages = git_root
+                .as_deref()
+                .map(detect_languages_from_dir)
+                .unwrap_or_default();
+
+            // Default workflows: instrument + observe. --workflow flags override.
+            let wizard_workflows = if flag_workflows.is_empty() {
+                vec![WorkflowArg::Instrument, WorkflowArg::Observe]
+            } else {
+                let mut selected = resolve_workflow_selection(&flag_workflows);
+                if !selected.contains(&WorkflowArg::Instrument) {
+                    selected.push(WorkflowArg::Instrument);
+                    selected.sort();
+                    selected.dedup();
+                }
+                selected
+            };
+
             run_instrument_setup(
                 base,
                 InstrumentSetupArgs {
                     agent: instrument_agent,
                     agent_cmd: None,
-                    workflows: flag_workflows,
-                    yes: false,
+                    workflows: wizard_workflows,
+                    // yes=true suppresses remaining prompts; all decisions are made above.
+                    yes: true,
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
                     quiet: false,
-                    languages: Vec::new(),
-                    interactive: false,
+                    languages: detected_languages,
+                    // TUI by default; --background switches to non-interactive.
+                    interactive: !flag_background,
                     yolo,
                 },
-                !multiselect_hint_shown,
+                false,
             )
             .await?;
         } else if !quiet {
@@ -681,78 +680,50 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 }
 
 async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
-    if base.api_key.is_some() {
+    // 1. --api-key flag (or BRAINTRUST_API_KEY env) without --prefer-profile: use directly.
+    if base.api_key.is_some() && !base.prefer_profile {
         return auth::login(base).await;
     }
 
+    // 2. --prefer-profile or no api key: try stored profiles first.
     let profiles = auth::list_profiles()?;
-    match profiles.len() {
-        0 => {
-            eprintln!("No auth profiles found. Let's set one up.\n");
-            auth::login_interactive(base).await?;
-            auth::login(base).await
-        }
-        1 => {
-            let p = &profiles[0];
-            base.profile = Some(p.name.clone());
-            auth::login(base).await
-        }
-        _ => {
-            let name = auth::select_profile_interactive(None)?
-                .ok_or_else(|| anyhow!("no profile selected"))?;
-            base.profile = Some(name);
-            auth::login(base).await
+    if !profiles.is_empty() {
+        let profile_name = if let Some(ref p) = base.profile {
+            p.clone()
+        } else if profiles.len() == 1 {
+            profiles[0].name.clone()
+        } else {
+            auth::select_profile_interactive(None)?.ok_or_else(|| anyhow!("no profile selected"))?
+        };
+        base.profile = Some(profile_name.clone());
+
+        // Try to login; if credentials are missing/inaccessible, re-auth via OAuth.
+        match auth::login(base).await {
+            Ok(ctx) => return Ok(ctx),
+            Err(err) if is_missing_credential_error(&err) => {
+                eprintln!(
+                    "   Profile '{}' credentials inaccessible ({}). Re-authenticating via OAuth...",
+                    profile_name, err
+                );
+                base.profile = None;
+                auth::login_interactive_oauth(base).await?;
+                return auth::login(base).await;
+            }
+            Err(err) => return Err(err),
         }
     }
+
+    // 3. No profiles: start OAuth flow.
+    eprintln!("No auth profiles found. Starting OAuth login.\n");
+    auth::login_interactive_oauth(base).await?;
+    auth::login(base).await
 }
 
-async fn select_project_with_skip(
-    client: &ApiClient,
-    project_name: Option<&str>,
-    quiet: bool,
-) -> Result<Option<crate::projects::api::Project>> {
-    if let Some(name) = project_name {
-        let project = with_spinner(
-            "Loading project...",
-            crate::projects::api::get_project_by_name(client, name),
-        )
-        .await?;
-        match project {
-            Some(p) => {
-                if !quiet {
-                    eprintln!("{} Select project · {}", style("✔").green(), p.name);
-                }
-                return Ok(Some(p));
-            }
-            None => bail!(
-                "project '{}' not found in org '{}'",
-                name,
-                client.org_name()
-            ),
-        }
-    }
-
-    let mut projects = with_spinner(
-        "Loading projects...",
-        crate::projects::api::list_projects(client),
-    )
-    .await?;
-
-    if projects.is_empty() {
-        bail!("no projects found in org '{}'", client.org_name());
-    }
-
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut labels: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
-    labels.push("Skip (not recommended)".to_string());
-
-    let selection = ui::fuzzy_select("Select project", &labels, 0)?;
-
-    if selection == labels.len() - 1 {
-        Ok(None)
-    } else {
-        Ok(Some(projects[selection].clone()))
-    }
+fn is_missing_credential_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("no keychain credential found")
+        || msg.contains("oauth refresh token missing")
+        || msg.contains("no login credentials found")
 }
 
 /// Returns `true` if config was written or already matched, `false` if user declined.
@@ -790,6 +761,108 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
     };
     config::save_local(&cfg, true)?;
     Ok(true)
+}
+
+/// Automatically select or create a project for the wizard (no interactive prompts).
+///
+/// - If `--project` was specified, look it up and return it.
+/// - If the org has 2+ projects, return `None` (no change).
+/// - If the org has exactly 1 project and it is the default "My Project", create
+///   `{whoami}-test` and return it.
+/// - If the org has 0 projects, create `{whoami}-test` and return it.
+async fn auto_select_project(
+    client: &ApiClient,
+    project_name: Option<&str>,
+) -> Result<Option<crate::projects::api::Project>> {
+    if let Some(name) = project_name {
+        let project = with_spinner(
+            "Loading project...",
+            crate::projects::api::get_project_by_name(client, name),
+        )
+        .await?;
+        return match project {
+            Some(p) => Ok(Some(p)),
+            None => bail!(
+                "project '{}' not found in org '{}'",
+                name,
+                client.org_name()
+            ),
+        };
+    }
+
+    let projects = with_spinner(
+        "Loading projects...",
+        crate::projects::api::list_projects(client),
+    )
+    .await?;
+
+    // 2+ real projects: leave the user's setup untouched.
+    if projects.len() >= 2 {
+        return Ok(None);
+    }
+
+    // Exactly one project: only proceed if it is the placeholder "My Project".
+    if projects.len() == 1 && projects[0].name != "My Project" {
+        return Ok(None);
+    }
+
+    // 0 projects, or the sole project is the default placeholder: create a real one.
+    let username = get_whoami_username();
+    let new_name = format!("{username}-test");
+    let project = with_spinner(
+        &format!("Creating project '{new_name}'..."),
+        crate::projects::api::create_project(client, &new_name),
+    )
+    .await?;
+    Ok(Some(project))
+}
+
+fn get_whoami_username() -> String {
+    std::process::Command::new("whoami")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "user".to_string())
+}
+
+/// Determine which agent to use for instrumentation in the wizard.
+///
+/// Returns `Some(agent)` when exactly one agent is unambiguously determined:
+/// - A single `--agent` flag (not `all`)
+/// - Exactly one agent detected on the system
+///
+/// Returns `None` when the choice is ambiguous (0 or multiple detected agents,
+/// no explicit `--agent` flag), letting the caller prompt the user.
+fn determine_wizard_instrument_agent(
+    flag_agents: &[AgentArg],
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Option<InstrumentAgentArg> {
+    if flag_agents.len() == 1 {
+        return match flag_agents[0] {
+            AgentArg::Claude => Some(InstrumentAgentArg::Claude),
+            AgentArg::Codex => Some(InstrumentAgentArg::Codex),
+            AgentArg::Cursor => Some(InstrumentAgentArg::Cursor),
+            AgentArg::Opencode => Some(InstrumentAgentArg::Opencode),
+            AgentArg::All => None,
+        };
+    }
+
+    // Auto-detect: only use unambiguous single detection.
+    let detected = detect_agents(local_root, home);
+    let detected_agents: BTreeSet<Agent> = detected.iter().map(|s| s.agent).collect();
+    if detected_agents.len() == 1 {
+        return Some(match detected_agents.into_iter().next().unwrap() {
+            Agent::Claude => InstrumentAgentArg::Claude,
+            Agent::Codex => InstrumentAgentArg::Codex,
+            Agent::Cursor => InstrumentAgentArg::Cursor,
+            Agent::Opencode => InstrumentAgentArg::Opencode,
+        });
+    }
+
+    None
 }
 
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
@@ -982,7 +1055,7 @@ async fn run_instrument_setup(
 
     if args.agent.is_none() && ui::is_interactive() && !args.yes {
         selected = prompt_instrument_agent(selected)?;
-    } else if args.agent.is_some() && !base.quiet {
+    } else if args.agent.is_some() && !base.quiet && !args.yes {
         eprintln!(
             "{} Select agent to instrument this repo · {}",
             style("✔").green(),
