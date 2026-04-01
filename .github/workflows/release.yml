@@ -98,6 +98,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      HAS_SSLDOTCOM_SIGNING: ${{ secrets.SSLDOTCOM_USERNAME != '' && secrets.SSLDOTCOM_PASSWORD != '' && secrets.SSLDOTCOM_CREDENTIAL_ID != '' && secrets.SSLDOTCOM_TOTP_SECRET != '' }}
     steps:
       - name: Enable windows longpaths
         run: git config --global core.longpaths true
@@ -136,6 +137,31 @@ jobs:
 
       - name: Install dependencies
         run: ${{ matrix.packages_install }}
+
+      - name: Configure SSL.com signing env
+        if: ${{ runner.os == 'Windows' && env.HAS_SSLDOTCOM_SIGNING == 'true' }}
+        shell: bash
+        env:
+          SSLDOTCOM_USERNAME: ${{ secrets.SSLDOTCOM_USERNAME }}
+          SSLDOTCOM_PASSWORD: ${{ secrets.SSLDOTCOM_PASSWORD }}
+          SSLDOTCOM_CREDENTIAL_ID: ${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}
+          SSLDOTCOM_TOTP_SECRET: ${{ secrets.SSLDOTCOM_TOTP_SECRET }}
+        run: |
+          write_github_env() {
+            local key="$1"
+            local value="$2"
+            local delimiter="EOF_${key}_$$"
+            {
+              echo "${key}<<${delimiter}"
+              echo "${value}"
+              echo "${delimiter}"
+            } >> "$GITHUB_ENV"
+          }
+
+          write_github_env "SSLDOTCOM_USERNAME" "$SSLDOTCOM_USERNAME"
+          write_github_env "SSLDOTCOM_PASSWORD" "$SSLDOTCOM_PASSWORD"
+          write_github_env "SSLDOTCOM_CREDENTIAL_ID" "$SSLDOTCOM_CREDENTIAL_ID"
+          write_github_env "SSLDOTCOM_TOTP_SECRET" "$SSLDOTCOM_TOTP_SECRET"
 
       - name: Build artifacts
         shell: bash
