@@ -595,10 +595,8 @@ async fn run_setup_wizard(
         }
     }
 
-    if !wants_skills && !wants_mcp {
-        if !quiet {
-            eprintln!("   {}", style("Skipped").dim());
-        }
+    if !wants_skills && !wants_mcp && !quiet {
+        eprintln!("   {}", style("Skipped").dim());
     }
 
     // ── Step 4: Instrument ──
@@ -647,15 +645,11 @@ async fn run_setup_wizard(
                 },
             )
             .await?;
-        } else {
-            if !quiet {
-                eprintln!("   {}", style("Skipped").dim());
-            }
-        }
-    } else {
-        if !quiet {
+        } else if !quiet {
             eprintln!("   {}", style("Skipped").dim());
         }
+    } else if !quiet {
+        eprintln!("   {}", style("Skipped").dim());
     }
 
     // ── Done ──
@@ -967,14 +961,12 @@ async fn run_instrument_setup(base: BaseArgs, args: InstrumentSetupArgs) -> Resu
 
     if args.agent.is_none() && ui::is_interactive() && !args.yes {
         selected = prompt_instrument_agent(selected)?;
-    } else if args.agent.is_some() {
-        if !base.quiet {
-            eprintln!(
-                "{} Select agent to instrument this repo · {}",
-                style("✔").green(),
-                style(selected.as_str()).green()
-            );
-        }
+    } else if args.agent.is_some() && !base.quiet {
+        eprintln!(
+            "{} Select agent to instrument this repo · {}",
+            style("✔").green(),
+            style(selected.as_str()).green()
+        );
     }
 
     let selected_workflows = resolve_instrument_workflow_selection(&args)?;
@@ -1191,8 +1183,8 @@ fn resolve_instrument_workflow_selection(args: &InstrumentSetupArgs) -> Result<V
 }
 
 fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
-    let choices = ["observe", "evaluate"];
-    let defaults = [true, true];
+    let choices = ["observe", "annotate", "evaluate", "deploy"];
+    let defaults = [true, false, true, false];
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Select additional workflow docs to prefetch (instrument is always included)")
         .items(&choices)
@@ -1203,7 +1195,9 @@ fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
         for index in indexes {
             match index {
                 0 => workflows.push(WorkflowArg::Observe),
-                1 => workflows.push(WorkflowArg::Evaluate),
+                1 => workflows.push(WorkflowArg::Annotate),
+                2 => workflows.push(WorkflowArg::Evaluate),
+                3 => workflows.push(WorkflowArg::Deploy),
                 _ => {}
             }
         }
