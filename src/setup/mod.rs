@@ -384,18 +384,18 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             if should_prompt_setup_action(&base, &args.agents) {
-                run_setup_wizard(
-                    base,
-                    args.agents.yolo,
-                    args.skills,
-                    args.mcp,
-                    args.agents.local,
-                    args.agents.global,
-                    args.instrument,
-                    args.agents.agents,
-                    args.no_mcp_skill,
-                )
-                .await
+                let wizard_flags = WizardFlags {
+                    yolo: args.agents.yolo,
+                    skills: args.skills,
+                    mcp: args.mcp,
+                    local: args.agents.local,
+                    global: args.agents.global,
+                    instrument: args.instrument,
+                    agents: args.agents.agents,
+                    no_mcp_skill: args.no_mcp_skill,
+                    workflows: args.agents.workflows,
+                };
+                run_setup_wizard(base, wizard_flags).await
             } else {
                 run_setup(base, args.agents).await
             }
@@ -405,17 +405,30 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
 
 pub use docs::run_docs_top;
 
-async fn run_setup_wizard(
-    mut base: BaseArgs,
+struct WizardFlags {
     yolo: bool,
-    flag_skills: bool,
-    flag_mcp: bool,
-    flag_local: bool,
-    flag_global: bool,
-    flag_instrument: bool,
-    flag_agents: Vec<AgentArg>,
-    flag_no_mcp_skill: bool,
-) -> Result<()> {
+    skills: bool,
+    mcp: bool,
+    local: bool,
+    global: bool,
+    instrument: bool,
+    agents: Vec<AgentArg>,
+    no_mcp_skill: bool,
+    workflows: Vec<WorkflowArg>,
+}
+
+async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> {
+    let WizardFlags {
+        yolo,
+        skills: flag_skills,
+        mcp: flag_mcp,
+        local: flag_local,
+        global: flag_global,
+        instrument: flag_instrument,
+        agents: flag_agents,
+        no_mcp_skill: flag_no_mcp_skill,
+        workflows: flag_workflows,
+    } = flags;
     let mut had_failures = false;
     let quiet = base.quiet;
 
@@ -634,7 +647,7 @@ async fn run_setup_wizard(
                 InstrumentSetupArgs {
                     agent: instrument_agent,
                     agent_cmd: None,
-                    workflows: Vec::new(),
+                    workflows: flag_workflows,
                     yes: false,
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
@@ -936,8 +949,7 @@ fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
     if base.json || !ui::is_interactive() {
         return false;
     }
-    args.workflows.is_empty()
-        && !args.yes
+    !args.yes
         && !args.no_fetch_docs
         && !args.refresh_docs
         && args.workers == crate::sync::default_workers()
