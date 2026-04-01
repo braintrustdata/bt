@@ -399,6 +399,11 @@ struct McpSelection {
     selected_agents: Vec<Agent>,
 }
 
+struct SetupAuthContext {
+    client: ApiClient,
+    api_key: String,
+}
+
 struct SkillsSetupOutcome {
     scope: InstallScope,
     selected_agents: Vec<Agent>,
@@ -437,7 +442,7 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Instrument(instrument)) => {
             run_instrument_setup(base, instrument, false).await
         }
-        Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp),
+        Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp).await,
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             let wizard_flags = WizardFlags {
@@ -513,14 +518,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(1, "Auth");
     }
     let project_flag = will_instrument.then(|| base.project.clone()).flatten();
-    let setup_client = if will_instrument {
+    let mut setup_auth = if will_instrument {
         Some(ensure_setup_auth(&mut base, !flag_no_instrument, !flag_no_instrument).await?)
     } else {
         None
     };
-    let org = setup_client
+    let org = setup_auth
         .as_ref()
-        .map(|client| client.org_name().to_string());
+        .map(|auth| auth.client.org_name().to_string());
 
     if verbose {
         if let Some(org) = org.as_deref() {
@@ -534,8 +539,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(2, "Project");
     }
-    let project = if let Some(client) = setup_client.as_ref() {
-        select_project_with_skip(client, project_flag.as_deref(), !verbose).await?
+    let project = if let Some(auth) = setup_auth.as_ref() {
+        select_project_with_skip(&auth.client, project_flag.as_deref(), !verbose).await?
     } else {
         None
     };
@@ -687,10 +692,22 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if verbose {
             eprintln!("   {}", style("MCP:").bold());
         }
-        if let Some((scope, selected_agent, home)) = setup_context.as_ref() {
+        if setup_auth.is_none() {
+            setup_auth = Some(ensure_setup_auth(&mut base, false, true).await?);
+        }
+        if let (Some((scope, selected_agent, home)), Some(auth)) =
+            (setup_context.as_ref(), setup_auth.as_ref())
+        {
             let local_root = resolve_local_root_for_scope(*scope)?;
-            let outcome =
-                execute_mcp_install(*scope, local_root.as_deref(), home, &[*selected_agent]);
+            let api_url = auth.client.url("");
+            let outcome = execute_mcp_install(
+                *scope,
+                local_root.as_deref(),
+                home,
+                &[*selected_agent],
+                &auth.api_key,
+                &mcp_url_from_api_url(&api_url),
+            );
             for r in &outcome.results {
                 if verbose {
                     print_wizard_agent_result(r);
@@ -788,9 +805,9 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     let will_instrument = !args.no_instrument && find_git_root().is_some();
     if will_instrument {
         let project_flag = base.project.clone();
-        let client = ensure_setup_auth(&mut base, false, true).await?;
-        let org = client.org_name().to_string();
-        let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
+        let auth = ensure_setup_auth(&mut base, false, true).await?;
+        let org = auth.client.org_name().to_string();
+        let project = select_project_with_skip(&auth.client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
             let _ = maybe_init(&org, project)?;
         }
@@ -834,7 +851,8 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 global: matches!(scope, InstallScope::Global),
                 yes: true,
             },
-        )?;
+        )
+        .await?;
     }
 
     if !args.no_instrument {
@@ -1183,8 +1201,8 @@ async fn ensure_profile_or_oauth_auth(
 async fn ensure_setup_auth(
     base: &mut BaseArgs,
     prompt_for_profile_choice: bool,
-    will_instrument: bool,
-) -> Result<ApiClient> {
+    needs_api_key: bool,
+) -> Result<SetupAuthContext> {
     apply_setup_config_fallbacks(base);
 
     let explicit_api_key = base
@@ -1248,7 +1266,7 @@ async fn ensure_setup_auth(
                         bail!("project '{project_name}' not found in org '{}'", org.name);
                     }
                 }
-                return Ok(client);
+                return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let (login_ctx, is_oauth) =
@@ -1262,10 +1280,7 @@ async fn ensure_setup_auth(
                     );
                 }
             }
-            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                maybe_create_api_key_for_instrumentation(base, &client).await?;
-            }
-            return Ok(client);
+            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
 
         if let Some(org_name) = org_name.as_deref() {
@@ -1284,7 +1299,7 @@ async fn ensure_setup_auth(
                         bail!("project '{project_name}' not found in org '{org_name}'");
                     }
                 }
-                return Ok(client);
+                return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let (login_ctx, is_oauth) =
@@ -1298,10 +1313,7 @@ async fn ensure_setup_auth(
                     );
                 }
             }
-            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                maybe_create_api_key_for_instrumentation(base, &client).await?;
-            }
-            return Ok(client);
+            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
 
         if base.prefer_profile {
@@ -1316,10 +1328,7 @@ async fn ensure_setup_auth(
                     let (login_ctx, is_oauth) =
                         ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
                     let client = ApiClient::new(&login_ctx)?;
-                    if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                        maybe_create_api_key_for_instrumentation(base, &client).await?;
-                    }
-                    return Ok(client);
+                    return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
                 }
                 let org = select_api_key_org_for_setup(
                     base,
@@ -1340,7 +1349,7 @@ async fn ensure_setup_auth(
                     base.app_url.clone(),
                     Some(org.name.clone()),
                 )?;
-                return Ok(client);
+                return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let preferred_org_names = matching_profile_org_names(&stored_profiles, None);
@@ -1353,10 +1362,7 @@ async fn ensure_setup_auth(
                 let (login_ctx, is_oauth) =
                     ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
                 let client = ApiClient::new(&login_ctx)?;
-                if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                    maybe_create_api_key_for_instrumentation(base, &client).await?;
-                }
-                return Ok(client);
+                return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
             }
 
             let candidate_orgs = match project_name.as_deref() {
@@ -1369,10 +1375,7 @@ async fn ensure_setup_auth(
                 let (login_ctx, is_oauth) =
                     ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
                 let client = ApiClient::new(&login_ctx)?;
-                if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                    maybe_create_api_key_for_instrumentation(base, &client).await?;
-                }
-                return Ok(client);
+                return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
             }
             let org = select_api_key_org_for_setup(
                 base,
@@ -1380,7 +1383,8 @@ async fn ensure_setup_auth(
                 project_name.as_deref(),
                 &preferred_org_names,
             )?;
-            return build_api_key_client(base, api_key, &org).await;
+            let client = build_api_key_client(base, api_key, &org).await?;
+            return build_setup_auth_context(base, client, false, needs_api_key).await;
         }
 
         let candidate_orgs = match project_name.as_deref() {
@@ -1393,31 +1397,37 @@ async fn ensure_setup_auth(
             let (login_ctx, is_oauth) =
                 ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
             let client = ApiClient::new(&login_ctx)?;
-            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                maybe_create_api_key_for_instrumentation(base, &client).await?;
-            }
-            return Ok(client);
+            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
         let org =
             select_api_key_org_for_setup(base, &candidate_orgs, project_name.as_deref(), &[])?;
-        return build_api_key_client(base, api_key, &org).await;
+        let client = build_api_key_client(base, api_key, &org).await?;
+        return build_setup_auth_context(base, client, false, needs_api_key).await;
     }
 
     let (login_ctx, is_oauth) =
         ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
     let client = ApiClient::new(&login_ctx)?;
-    if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-        maybe_create_api_key_for_instrumentation(base, &client).await?;
-    }
-    Ok(client)
+    build_setup_auth_context(base, client, is_oauth, needs_api_key).await
 }
 
-fn should_create_api_key_for_instrumentation(
-    is_oauth: bool,
+async fn build_setup_auth_context(
     base: &BaseArgs,
-    will_instrument: bool,
-) -> bool {
-    will_instrument
+    client: ApiClient,
+    is_oauth: bool,
+    needs_api_key: bool,
+) -> Result<SetupAuthContext> {
+    let api_key = if should_create_api_key_for_setup(is_oauth, base, needs_api_key) {
+        maybe_create_api_key_for_oauth(base, &client).await?
+    } else {
+        client.api_key().to_string()
+    };
+
+    Ok(SetupAuthContext { client, api_key })
+}
+
+fn should_create_api_key_for_setup(is_oauth: bool, base: &BaseArgs, needs_api_key: bool) -> bool {
+    needs_api_key
         && is_oauth
         && !matches!(
             base.api_key_source,
@@ -1425,10 +1435,7 @@ fn should_create_api_key_for_instrumentation(
         )
 }
 
-async fn maybe_create_api_key_for_instrumentation(
-    base: &BaseArgs,
-    client: &ApiClient,
-) -> Result<()> {
+async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> Result<String> {
     let username = std::process::Command::new("whoami")
         .output()
         .ok()
@@ -1491,7 +1498,7 @@ async fn maybe_create_api_key_for_instrumentation(
         eprintln!();
     }
 
-    Ok(())
+    Ok(created.key)
 }
 
 async fn select_project_for_setup(
@@ -2557,12 +2564,14 @@ fn execute_mcp_install(
     local_root: Option<&Path>,
     home: &Path,
     agents: &[Agent],
+    api_key: &str,
+    mcp_url: &str,
 ) -> McpSetupOutcome {
     let mut warnings = Vec::new();
     let mut results = Vec::new();
 
     for agent in agents.iter().copied() {
-        let result = install_mcp_for_agent(agent, scope, local_root, home);
+        let result = install_mcp_for_agent(agent, scope, local_root, home, api_key, mcp_url);
         match result {
             Ok(r) => {
                 if matches!(r.status, InstallStatus::Skipped)
@@ -2595,7 +2604,7 @@ fn execute_mcp_install(
     }
 }
 
-fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
+async fn run_mcp_setup(mut base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let selection = resolve_mcp_selection(&args, &home)?;
     let scope = selection.scope;
@@ -2603,7 +2612,16 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let detected = selection.detected;
     let selected_agents = selection.selected_agents;
 
-    let outcome = execute_mcp_install(scope, local_root.as_deref(), &home, &selected_agents);
+    let auth = ensure_setup_auth(&mut base, false, true).await?;
+    let api_url = auth.client.url("");
+    let outcome = execute_mcp_install(
+        scope,
+        local_root.as_deref(),
+        &home,
+        &selected_agents,
+        &auth.api_key,
+        &mcp_url_from_api_url(&api_url),
+    );
 
     if base.json {
         let report = SetupJsonReport {
@@ -3487,7 +3505,13 @@ fn install_mcp_for_agent(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
+    api_key: &str,
+    mcp_url: &str,
 ) -> Result<AgentInstallResult> {
+    if matches!(agent, Agent::Claude) && matches!(scope, InstallScope::Global) {
+        return install_mcp_for_claude_user(mcp_url, api_key);
+    }
+
     let path = match agent {
         Agent::Cursor => {
             if matches!(scope, InstallScope::Global) {
@@ -3511,7 +3535,7 @@ fn install_mcp_for_agent(
         }
     };
 
-    merge_mcp_config(&path)?;
+    merge_mcp_config(&path, api_key, mcp_url)?;
 
     Ok(AgentInstallResult {
         agent,
@@ -3521,7 +3545,41 @@ fn install_mcp_for_agent(
     })
 }
 
-fn merge_mcp_config(path: &Path) -> Result<()> {
+fn install_mcp_for_claude_user(mcp_url: &str, api_key: &str) -> Result<AgentInstallResult> {
+    let status = std::process::Command::new("claude")
+        .args([
+            "mcp",
+            "add",
+            "-s",
+            "user",
+            "--transport",
+            "http",
+            "braintrust",
+            mcp_url,
+            "--header",
+            &format!("Authorization: Bearer {api_key}"),
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .context("failed to run `claude mcp add -s user`")?;
+
+    if !status.success() {
+        bail!("`claude mcp add -s user` exited with status {status}");
+    }
+
+    Ok(AgentInstallResult {
+        agent: Agent::Claude,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec!["claude:user".to_string()],
+    })
+}
+
+fn mcp_url_from_api_url(api_url: &str) -> String {
+    format!("{}/mcp", api_url.trim_end_matches('/'))
+}
+
+fn merge_mcp_config(path: &Path, api_key: &str, mcp_url: &str) -> Result<()> {
     let mut root = load_json_object_or_default(path)?;
     let servers_value = root
         .entry("mcpServers".to_string())
@@ -3537,9 +3595,9 @@ fn merge_mcp_config(path: &Path) -> Result<()> {
         "braintrust".to_string(),
         serde_json::json!({
             "type": "http",
-            "url": "https://api.braintrust.dev/mcp",
+            "url": mcp_url,
             "headers": {
-                "Authorization": "Bearer ${BRAINTRUST_API_KEY}"
+                "Authorization": format!("Bearer {api_key}")
             }
         }),
     );
@@ -4023,15 +4081,13 @@ mod tests {
     #[test]
     fn oauth_instrumentation_creates_api_key_when_no_env_key_exists() {
         let base = make_base_args();
-        assert!(should_create_api_key_for_instrumentation(true, &base, true));
+        assert!(should_create_api_key_for_setup(true, &base, true));
     }
 
     #[test]
     fn oauth_non_instrumentation_does_not_create_api_key() {
         let base = make_base_args();
-        assert!(!should_create_api_key_for_instrumentation(
-            true, &base, false
-        ));
+        assert!(!should_create_api_key_for_setup(true, &base, false));
     }
 
     #[test]
@@ -4039,9 +4095,7 @@ mod tests {
         let mut base = make_base_args();
         base.api_key = Some("env-key".to_string());
         base.api_key_source = Some(ArgValueSource::EnvVariable);
-        assert!(!should_create_api_key_for_instrumentation(
-            true, &base, true
-        ));
+        assert!(!should_create_api_key_for_setup(true, &base, true));
     }
 
     #[test]
@@ -4060,7 +4114,8 @@ mod tests {
         )
         .expect("seed mcp");
 
-        merge_mcp_config(&path).expect("merge mcp");
+        merge_mcp_config(&path, "test-api-key", "https://api.braintrust.dev/mcp")
+            .expect("merge mcp");
 
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("read mcp")).expect("json");
@@ -4070,6 +4125,14 @@ mod tests {
             .expect("servers object");
         assert!(servers.contains_key("existing"));
         assert!(servers.contains_key("braintrust"));
+        assert_eq!(
+            servers["braintrust"]["url"].as_str(),
+            Some("https://api.braintrust.dev/mcp")
+        );
+        assert_eq!(
+            servers["braintrust"]["headers"]["Authorization"].as_str(),
+            Some("Bearer test-api-key")
+        );
     }
 
     #[test]
@@ -4704,8 +4767,15 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result = install_mcp_for_agent(Agent::Codex, InstallScope::Local, Some(&root), &home)
-            .expect("install local mcp");
+        let result = install_mcp_for_agent(
+            Agent::Codex,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "embedded-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install local mcp");
         assert!(matches!(result.status, InstallStatus::Installed));
 
         let mcp_path = root.join(".mcp.json");
@@ -4717,6 +4787,14 @@ mod tests {
             .and_then(|v| v.as_object())
             .expect("servers object");
         assert!(servers.contains_key("braintrust"));
+        assert_eq!(
+            servers["braintrust"]["url"].as_str(),
+            Some("https://api.example.com/mcp")
+        );
+        assert_eq!(
+            servers["braintrust"]["headers"]["Authorization"].as_str(),
+            Some("Bearer embedded-api-key")
+        );
     }
 
     #[test]
