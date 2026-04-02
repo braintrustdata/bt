@@ -10,8 +10,8 @@ pub struct BaseArgs {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Show additional output
-    #[arg(long, short = 'v', env = "BRAINTRUST_VERBOSE", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
+    /// Verbose mode — set at runtime by subcommands that support it
+    #[arg(skip)]
     pub verbose: bool,
 
     /// Disable ANSI color output

@@ -85,6 +85,10 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with = "tui")]
     background: bool,
 
+    /// Show additional setup output
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
     #[command(flatten)]
     agents: AgentsSetupArgs,
 }
@@ -386,7 +390,12 @@ struct SkillsAliasResult {
     path: PathBuf,
 }
 
-pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
+pub async fn run_setup_top(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
+    if args.verbose {
+        base.verbose = true;
+        crate::ui::set_quiet(false);
+        crate::ui::set_animations_enabled(true);
+    }
     match args.command {
         Some(SetupSubcommand::Skills(setup)) => run_setup(base, setup).await,
         Some(SetupSubcommand::Instrument(instrument)) => {
@@ -542,7 +551,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 local: matches!(scope, InstallScope::Local),
                 global: matches!(scope, InstallScope::Global),
                 workflows: Vec::new(),
-                yes: false,
+                yes: true,
                 no_fetch_docs: true,
                 refresh_docs: false,
                 workers: crate::sync::default_workers(),
