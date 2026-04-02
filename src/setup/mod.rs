@@ -1612,11 +1612,15 @@ fn resolve_instrument_invocation(
 
     let invocation = match agent {
         Agent::Codex => {
+            let mut codex_args = vec![];
+            if bypass_permissions {
+                codex_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+            }
             if interactive {
                 // TUI mode: `codex "<task>"` opens the interactive TUI with the task pre-loaded.
                 InstrumentInvocation::Program {
                     program: "codex".to_string(),
-                    args: vec![],
+                    args: codex_args,
                     stdin_file: None,
                     prompt_file_arg: Some(task_path.to_path_buf()),
                     initial_prompt: None,
@@ -1625,9 +1629,10 @@ fn resolve_instrument_invocation(
                 }
             } else {
                 // Background mode: `codex exec -` reads the task from stdin.
+                codex_args.extend(["exec".to_string(), "-".to_string()]);
                 InstrumentInvocation::Program {
                     program: "codex".to_string(),
-                    args: vec!["exec".to_string(), "-".to_string()],
+                    args: codex_args,
                     stdin_file: Some(task_path.to_path_buf()),
                     prompt_file_arg: None,
                     initial_prompt: None,
@@ -1638,28 +1643,26 @@ fn resolve_instrument_invocation(
         }
         Agent::Claude => {
             if interactive {
-                // In interactive mode the full task goes into --append-system-prompt so
-                // Claude already knows what to do.  A short initial user message is passed
-                // as the positional arg so Claude immediately starts working — the user only
-                // needs to press Enter once on a short, clear prompt rather than a wall of
-                // raw task markdown.
-                let task_content = std::fs::read_to_string(task_path)
-                    .with_context(|| format!("failed to read task file {}", task_path.display()))?;
+                // TUI mode: pass the full task as a positional arg so Claude loads it
+                // as the initial user message and starts working immediately.
+                // --permission-mode acceptEdits overrides any "plan" defaultMode the
+                // user may have set globally, which would otherwise cause an immediate
+                // ExitPlanMode tool call with invalid parameters.
                 InstrumentInvocation::Program {
                     program: "claude".to_string(),
                     args: vec![
-                        "--append-system-prompt".to_string(),
-                        task_content,
-                        "--disallowedTools".to_string(),
-                        "EnterPlanMode".to_string(),
+                        "--permission-mode".to_string(),
+                        if bypass_permissions {
+                            "bypassPermissions".to_string()
+                        } else {
+                            "acceptEdits".to_string()
+                        },
                         "--name".to_string(),
                         "Braintrust: Instrument".to_string(),
                     ],
                     stdin_file: None,
-                    prompt_file_arg: None,
-                    initial_prompt: Some(
-                        "Please begin the Braintrust instrumentation task.".to_string(),
-                    ),
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
                     stream_json: false,
                     interactive: true,
                 }
@@ -1696,36 +1699,30 @@ fn resolve_instrument_invocation(
             }
         }
         Agent::Opencode => {
-            if interactive {
-                // TUI mode: `opencode` opens the interactive TUI.
-                InstrumentInvocation::Program {
-                    program: "opencode".to_string(),
-                    args: vec![],
-                    stdin_file: None,
-                    prompt_file_arg: None,
-                    initial_prompt: None,
-                    stream_json: false,
-                    interactive: true,
-                }
-            } else {
-                // Background mode: `opencode run "<task>"` runs non-interactively.
-                InstrumentInvocation::Program {
-                    program: "opencode".to_string(),
-                    args: vec!["run".to_string()],
-                    stdin_file: None,
-                    prompt_file_arg: Some(task_path.to_path_buf()),
-                    initial_prompt: None,
-                    stream_json: false,
-                    interactive: false,
-                }
+            // `opencode` TUI does not accept an initial message (its positional arg is a
+            // project path).  `opencode run [message..]` is the only way to deliver a
+            // prompt, so we use it for both interactive and background modes.  In
+            // interactive mode we inherit all streams so the user can watch and steer.
+            InstrumentInvocation::Program {
+                program: "opencode".to_string(),
+                args: vec!["run".to_string()],
+                stdin_file: None,
+                prompt_file_arg: Some(task_path.to_path_buf()),
+                initial_prompt: None,
+                stream_json: false,
+                interactive,
             }
         }
         Agent::Cursor => {
+            let mut cursor_args = vec![];
+            if bypass_permissions {
+                cursor_args.push("--yolo".to_string());
+            }
             if interactive {
                 // TUI mode: `cursor-agent "<task>"` opens the interactive TUI with task pre-loaded.
                 InstrumentInvocation::Program {
                     program: "cursor-agent".to_string(),
-                    args: vec![],
+                    args: cursor_args,
                     stdin_file: None,
                     prompt_file_arg: Some(task_path.to_path_buf()),
                     initial_prompt: None,
@@ -1734,14 +1731,15 @@ fn resolve_instrument_invocation(
                 }
             } else {
                 // Background mode: `-p` enables non-interactive print mode.
+                cursor_args.extend([
+                    "-p".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--stream-partial-output".to_string(),
+                ]);
                 InstrumentInvocation::Program {
                     program: "cursor-agent".to_string(),
-                    args: vec![
-                        "-p".to_string(),
-                        "--output-format".to_string(),
-                        "stream-json".to_string(),
-                        "--stream-partial-output".to_string(),
-                    ],
+                    args: cursor_args,
                     stdin_file: None,
                     prompt_file_arg: Some(task_path.to_path_buf()),
                     initial_prompt: None,
@@ -3586,29 +3584,22 @@ mod tests {
                 args,
                 stdin_file,
                 prompt_file_arg,
-                initial_prompt,
                 stream_json,
                 interactive,
+                ..
             } => {
                 assert_eq!(program, "claude");
                 assert!(
                     !args.contains(&"-p".to_string()),
                     "interactive mode must not pass -p"
                 );
-                assert!(
-                    args.contains(&"--append-system-prompt".to_string()),
-                    "task should be in system prompt"
-                );
-                assert!(args.contains(&"--disallowedTools".to_string()));
+                assert!(args.contains(&"--permission-mode".to_string()));
                 assert!(args.contains(&"--name".to_string()));
                 assert_eq!(stdin_file, None);
                 assert_eq!(
-                    prompt_file_arg, None,
-                    "task is in system prompt, not prompt_file_arg"
-                );
-                assert!(
-                    initial_prompt.is_some(),
-                    "short initial message must be set to trigger Claude"
+                    prompt_file_arg,
+                    Some(task_path),
+                    "task passed as positional arg"
                 );
                 assert!(!stream_json);
                 assert!(interactive);
@@ -3664,7 +3655,6 @@ mod tests {
                     args,
                     vec![
                         "-p".to_string(),
-                        "-f".to_string(),
                         "--output-format".to_string(),
                         "stream-json".to_string(),
                         "--stream-partial-output".to_string(),
