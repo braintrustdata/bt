@@ -53,36 +53,36 @@ pub struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupSubcommand>,
 
-    /// Set up coding-agent skills (skips interactive selection in wizard)
+    /// Set up coding-agent skills [default]
     #[arg(long)]
     skills: bool,
 
-    /// Set up MCP server (skips interactive selection in wizard)
-    #[arg(long)]
-    mcp: bool,
-
-    /// Run instrumentation agent (skips interactive prompt in wizard)
-    #[arg(long)]
-    instrument: bool,
-
-    /// Skip skills and MCP setup (skips interactive selection in wizard)
-    #[arg(long, conflicts_with_all = ["skills", "mcp"])]
-    no_mcp_skill: bool,
-
     /// Do not set up coding-agent skills
     #[arg(long)]
-    no_skill: bool,
+    no_skills: bool,
+
+    /// Set up MCP server [default]
+    #[arg(long)]
+    mcp: bool,
 
     /// Do not set up MCP server
     #[arg(long)]
     no_mcp: bool,
 
-    /// Do not run instrumentation agent (overrides default)
+    /// Run instrumentation agent [default]
+    #[arg(long)]
+    instrument: bool,
+
+    /// Do not run instrumentation agent
     #[arg(long, conflicts_with = "instrument")]
     no_instrument: bool,
 
-    /// Run the agent in background (non-interactive) mode instead of TUI
-    #[arg(long)]
+    /// Run the agent in interactive TUI mode [default]
+    #[arg(long, conflicts_with = "background")]
+    tui: bool,
+
+    /// Run the agent in background (non-interactive) mode
+    #[arg(long, conflicts_with = "tui")]
     background: bool,
 
     #[command(flatten)]
@@ -103,9 +103,9 @@ enum SetupSubcommand {
 
 #[derive(Debug, Clone, Args)]
 struct AgentsSetupArgs {
-    /// Agent(s) to configure (repeatable)
-    #[arg(long = "agent", value_enum)]
-    agents: Vec<AgentArg>,
+    /// Agent to configure
+    #[arg(long, value_enum)]
+    agent: Option<AgentArg>,
 
     /// Configure the current git repo root
     #[arg(long, conflicts_with = "global")]
@@ -135,17 +135,16 @@ struct AgentsSetupArgs {
     #[arg(long, default_value_t = crate::sync::default_workers())]
     workers: usize,
 
-    /// Grant the agent full permissions and run it in the background without prompting.
-    /// Equivalent to choosing "Background" with all tool restrictions lifted.
+    /// Grant the agent full permissions (bypass permission prompts)
     #[arg(long)]
     yolo: bool,
 }
 
 #[derive(Debug, Clone, Args)]
 struct AgentsMcpSetupArgs {
-    /// Agent(s) to configure MCP for (repeatable)
-    #[arg(long = "agent", value_enum)]
-    agents: Vec<AgentArg>,
+    /// Agent to configure MCP for
+    #[arg(long, value_enum)]
+    agent: Option<AgentArg>,
 
     /// Configure MCP in the current git repo root
     #[arg(long, conflicts_with = "global")]
@@ -186,10 +185,6 @@ struct InstrumentSetupArgs {
     #[arg(long, default_value_t = crate::sync::default_workers())]
     workers: usize,
 
-    /// Suppress streaming agent output; show a spinner and print results at the end
-    #[arg(long, short = 'q')]
-    quiet: bool,
-
     /// Language(s) to instrument (repeatable; case-insensitive).
     /// When provided, the agent skips language auto-detection and instruments
     /// the specified language(s) directly.
@@ -197,14 +192,16 @@ struct InstrumentSetupArgs {
     #[arg(long = "language", value_enum, ignore_case = true)]
     languages: Vec<LanguageArg>,
 
-    /// Run the agent in interactive mode: inherits the terminal so the user can
-    /// approve/deny tool uses directly. Conflicts with --quiet and --yolo.
-    #[arg(long, short = 'i', conflicts_with_all = ["quiet", "yolo"])]
-    interactive: bool,
+    /// Run the agent in interactive TUI mode [default]
+    #[arg(long, short = 'i', conflicts_with = "background")]
+    tui: bool,
 
-    /// Grant the agent full permissions and run it in the background without prompting.
-    /// Skips the run-mode selection question. Conflicts with --interactive.
-    #[arg(long, conflicts_with = "interactive")]
+    /// Run the agent in background (non-interactive) mode
+    #[arg(long, conflicts_with = "tui")]
+    background: bool,
+
+    /// Grant the agent full permissions (bypass permission prompts)
+    #[arg(long)]
     yolo: bool,
 }
 
@@ -226,7 +223,6 @@ enum AgentArg {
     Codex,
     Cursor,
     Opencode,
-    All,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize)]
@@ -404,15 +400,15 @@ pub async fn run_setup_top(base: BaseArgs, args: SetupArgs) -> Result<()> {
                     yolo: args.agents.yolo,
                     skills: args.skills,
                     mcp: args.mcp,
-                    no_skill: args.no_skill,
+                    no_skills: args.no_skills,
                     no_mcp: args.no_mcp,
                     local: args.agents.local,
                     global: args.agents.global,
                     instrument: args.instrument,
                     no_instrument: args.no_instrument,
+                    tui: args.tui,
                     background: args.background,
-                    agents: args.agents.agents,
-                    no_mcp_skill: args.no_mcp_skill,
+                    agent: args.agents.agent,
                     workflows: args.agents.workflows,
                 };
                 run_setup_wizard(base, wizard_flags).await
@@ -429,15 +425,15 @@ struct WizardFlags {
     yolo: bool,
     skills: bool,
     mcp: bool,
-    no_skill: bool,
+    no_skills: bool,
     no_mcp: bool,
     local: bool,
     global: bool,
     instrument: bool,
     no_instrument: bool,
+    tui: bool,
     background: bool,
-    agents: Vec<AgentArg>,
-    no_mcp_skill: bool,
+    agent: Option<AgentArg>,
     workflows: Vec<WorkflowArg>,
 }
 
@@ -446,36 +442,36 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         yolo,
         skills: flag_skills,
         mcp: flag_mcp,
-        no_skill: flag_no_skill,
+        no_skills: flag_no_skills,
         no_mcp: flag_no_mcp,
         local: flag_local,
         global: _flag_global,
         instrument: _flag_instrument,
         no_instrument: flag_no_instrument,
+        tui: flag_tui,
         background: flag_background,
-        agents: flag_agents,
-        no_mcp_skill: flag_no_mcp_skill,
+        agent: flag_agent,
         workflows: flag_workflows,
     } = flags;
     let mut had_failures = false;
-    let quiet = base.quiet;
+    let verbose = base.verbose;
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let git_root = find_git_root();
 
     // ── Step 1: Auth ──
-    if !quiet {
+    if verbose {
         print_wizard_step(1, "Auth");
     }
     let project_flag = base.project.clone();
     let login_ctx = ensure_auth(&mut base).await?;
     let client = ApiClient::new(&login_ctx)?;
     let org = client.org_name().to_string();
-    if !quiet {
+    if verbose {
         eprintln!("   {} Using org '{}'", style("✓").green(), org);
     }
 
     // ── Step 2: Project ──
-    if !quiet {
+    if verbose {
         print_wizard_step(2, "Project");
     }
     let project = auto_select_project(&client, project_flag.as_deref()).await?;
@@ -483,7 +479,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if git_root.is_some() {
             let _ = maybe_init(&org, project);
         }
-        if !quiet {
+        if verbose {
             eprintln!(
                 "   {} Project: {}/{}",
                 style("✓").green(),
@@ -491,7 +487,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 project.name
             );
         }
-    } else if !quiet {
+    } else if verbose {
         eprintln!(
             "   {} {}",
             style("—").dim(),
@@ -500,15 +496,15 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     }
 
     // ── Step 3: Agent tools (skills + MCP) ──
-    if !quiet {
+    if verbose {
         print_wizard_step(3, "Agents");
     }
     // Default: install both skills and MCP with global scope.
     // --no-skill / --no-mcp / --no-mcp-skill opt out.
     let _ = flag_skills; // kept as flag but superseded by default-on behavior
     let _ = flag_mcp; // kept as flag but superseded by default-on behavior
-    let wants_skills = !flag_no_mcp_skill && !flag_no_skill;
-    let wants_mcp = !flag_no_mcp_skill && !flag_no_mcp;
+    let wants_skills = !flag_no_skills;
+    let wants_mcp = !flag_no_mcp;
 
     // Scope: default global; --local overrides.
     let scope = if flag_local {
@@ -519,9 +515,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 
     let local_root = resolve_local_root_for_scope(scope)?;
     let detected = detect_agents(local_root.as_deref(), &home);
-    let agents = resolve_selected_agents(&flag_agents, &detected);
+    let agents = resolve_selected_agents(flag_agent, &detected);
 
-    if !quiet {
+    if verbose {
         let scope_label = if flag_local {
             "local (current git repo)"
         } else {
@@ -537,14 +533,12 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     };
 
     if wants_skills {
-        if !quiet {
+        if verbose {
             eprintln!("   {}", style("Skills:").bold());
         }
         if let Some((scope, ref agents)) = setup_context {
-            let agent_args: Vec<AgentArg> =
-                agents.iter().map(|a| map_agent_to_agent_arg(*a)).collect();
             let args = AgentsSetupArgs {
-                agents: agent_args,
+                agent: flag_agent,
                 local: matches!(scope, InstallScope::Local),
                 global: matches!(scope, InstallScope::Global),
                 workflows: Vec::new(),
@@ -554,9 +548,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 workers: crate::sync::default_workers(),
                 yolo: false,
             };
-            let outcome = execute_skills_setup(&base, &args, true).await?;
+            let outcome = execute_skills_setup(&base, &args).await?;
             for r in &outcome.results {
-                if !quiet {
+                if verbose {
                     print_wizard_agent_result(r);
                 }
                 if matches!(r.status, InstallStatus::Failed) {
@@ -567,14 +561,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     }
 
     if wants_mcp {
-        if !quiet {
+        if verbose {
             eprintln!("   {}", style("MCP:").bold());
         }
         if let Some((scope, ref agents)) = setup_context {
             let local_root = resolve_local_root_for_scope(scope)?;
             let outcome = execute_mcp_install(scope, local_root.as_deref(), &home, agents);
             for r in &outcome.results {
-                if !quiet {
+                if verbose {
                     print_wizard_agent_result(r);
                 }
                 if matches!(r.status, InstallStatus::Failed) {
@@ -587,12 +581,12 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
     }
 
-    if !wants_skills && !wants_mcp && !quiet {
+    if !wants_skills && !wants_mcp && verbose {
         eprintln!("   {}", style("Skipped").dim());
     }
 
     // ── Step 4: Instrument ──
-    if !quiet {
+    if verbose {
         print_wizard_step(4, "Instrument");
     }
     if git_root.is_some() {
@@ -601,7 +595,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if do_instrument {
             // Determine agent: explicit flag > single detected > ask user
             let instrument_agent =
-                determine_wizard_instrument_agent(&flag_agents, git_root.as_deref(), &home);
+                determine_wizard_instrument_agent(flag_agent, git_root.as_deref(), &home);
 
             let instrument_agent = if instrument_agent.is_none() && ui::is_interactive() {
                 // Multiple or zero detected agents — ask the user
@@ -653,24 +647,23 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     yes: true,
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
-                    quiet: false,
                     languages: detected_languages,
-                    // TUI by default; --background switches to non-interactive.
-                    interactive: !flag_background,
+                    tui: flag_tui || !flag_background,
+                    background: flag_background,
                     yolo,
                 },
                 false,
             )
             .await?;
-        } else if !quiet {
+        } else if verbose {
             eprintln!("   {}", style("Skipped").dim());
         }
-    } else if !quiet {
+    } else if verbose {
         eprintln!("   {}", style("Skipped").dim());
     }
 
     // ── Done ──
-    if !quiet {
+    if verbose {
         print_wizard_done(had_failures);
     }
     if had_failures {
@@ -701,10 +694,12 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
         match auth::login(base).await {
             Ok(ctx) => return Ok(ctx),
             Err(err) if is_missing_credential_error(&err) => {
-                eprintln!(
-                    "   Profile '{}' credentials inaccessible ({}). Re-authenticating via OAuth...",
-                    profile_name, err
-                );
+                if base.verbose {
+                    eprintln!(
+                        "   Profile '{}' credentials inaccessible ({}). Re-authenticating via OAuth...",
+                        profile_name, err
+                    );
+                }
                 base.profile = None;
                 auth::login_interactive_oauth(base).await?;
                 return auth::login(base).await;
@@ -714,7 +709,9 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
     }
 
     // 3. No profiles: start OAuth flow.
-    eprintln!("No auth profiles found. Starting OAuth login.\n");
+    if base.verbose {
+        eprintln!("No auth profiles found. Starting OAuth login.\n");
+    }
     auth::login_interactive_oauth(base).await?;
     auth::login(base).await
 }
@@ -830,24 +827,23 @@ fn get_whoami_username() -> String {
 /// Determine which agent to use for instrumentation in the wizard.
 ///
 /// Returns `Some(agent)` when exactly one agent is unambiguously determined:
-/// - A single `--agent` flag (not `all`)
+/// - A single `--agent` flag
 /// - Exactly one agent detected on the system
 ///
 /// Returns `None` when the choice is ambiguous (0 or multiple detected agents,
 /// no explicit `--agent` flag), letting the caller prompt the user.
 fn determine_wizard_instrument_agent(
-    flag_agents: &[AgentArg],
+    flag_agent: Option<AgentArg>,
     local_root: Option<&Path>,
     home: &Path,
 ) -> Option<InstrumentAgentArg> {
-    if flag_agents.len() == 1 {
-        return match flag_agents[0] {
-            AgentArg::Claude => Some(InstrumentAgentArg::Claude),
-            AgentArg::Codex => Some(InstrumentAgentArg::Codex),
-            AgentArg::Cursor => Some(InstrumentAgentArg::Cursor),
-            AgentArg::Opencode => Some(InstrumentAgentArg::Opencode),
-            AgentArg::All => None,
-        };
+    if let Some(arg) = flag_agent {
+        return Some(match arg {
+            AgentArg::Claude => InstrumentAgentArg::Claude,
+            AgentArg::Codex => InstrumentAgentArg::Codex,
+            AgentArg::Cursor => InstrumentAgentArg::Cursor,
+            AgentArg::Opencode => InstrumentAgentArg::Opencode,
+        });
     }
 
     // Auto-detect: only use unambiguous single detection.
@@ -866,7 +862,7 @@ fn determine_wizard_instrument_agent(
 }
 
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
-    let outcome = execute_skills_setup(&base, &args, false).await?;
+    let outcome = execute_skills_setup(&base, &args).await?;
     if base.json {
         let report = SetupJsonReport {
             scope: outcome.scope.as_str().to_string(),
@@ -901,7 +897,6 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
 async fn execute_skills_setup(
     base: &BaseArgs,
     args: &AgentsSetupArgs,
-    quiet: bool,
 ) -> Result<SkillsSetupOutcome> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let selection = resolve_setup_selection(args, &home)?;
@@ -913,7 +908,7 @@ async fn execute_skills_setup(
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut results = Vec::new();
-    let show_progress = !base.json && !quiet && !base.quiet;
+    let show_progress = !base.json && base.verbose;
 
     if show_progress {
         println!("Configuring coding agents for Braintrust");
@@ -1049,13 +1044,13 @@ async fn run_instrument_setup(
     let mut selected = if let Some(agent_arg) = args.agent {
         map_instrument_agent_arg(agent_arg)
     } else {
-        pick_agent_mode_target(&resolve_selected_agents(&[], &detected))
+        pick_agent_mode_target(&resolve_selected_agents(None, &detected))
             .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
     };
 
     if args.agent.is_none() && ui::is_interactive() && !args.yes {
         selected = prompt_instrument_agent(selected)?;
-    } else if args.agent.is_some() && !base.quiet && !args.yes {
+    } else if args.agent.is_some() && base.verbose && !args.yes {
         eprintln!(
             "{} Select agent to instrument this repo · {}",
             style("✔").green(),
@@ -1063,7 +1058,7 @@ async fn run_instrument_setup(
         );
     }
 
-    let mut hint_pending = print_hint && !base.quiet;
+    let mut hint_pending = print_hint && base.verbose;
     let selected_workflows = resolve_instrument_workflow_selection(&args, &mut hint_pending)?;
 
     let selected_languages: Vec<LanguageArg> = if !args.languages.is_empty() {
@@ -1112,7 +1107,7 @@ async fn run_instrument_setup(
         .await?;
     } else {
         let setup_args = AgentsSetupArgs {
-            agents: vec![map_agent_to_agent_arg(selected)],
+            agent: Some(map_agent_to_agent_arg(selected)),
             local: true,
             global: false,
             workflows: selected_workflows.clone(),
@@ -1122,7 +1117,7 @@ async fn run_instrument_setup(
             workers: args.workers,
             yolo: false,
         };
-        let outcome = execute_skills_setup(&base, &setup_args, false).await?;
+        let outcome = execute_skills_setup(&base, &setup_args).await?;
         detected = outcome.detected_agents;
         results.extend(outcome.results);
         warnings.extend(outcome.warnings);
@@ -1133,16 +1128,13 @@ async fn run_instrument_setup(
     }
 
     // Determine run mode: interactive TUI vs background (autonomous).
-    // --yolo:        background, full bypassPermissions (no restrictions)
-    // --interactive: interactive TUI
-    // --yes or non-interactive terminal: background, restricted to language package managers
+    // --tui:         interactive TUI (inherits terminal)
+    // --background / --yes / non-interactive terminal: background (autonomous)
     // Otherwise: ask the user.
-    let (run_interactive, bypass_permissions) = if args.interactive {
-        (true, false)
-    } else if args.yolo {
-        (false, true)
-    } else if args.yes || !ui::is_interactive() {
-        (false, false)
+    let run_interactive = if args.tui {
+        true
+    } else if args.background || args.yes || !ui::is_interactive() {
+        false
     } else {
         let pkg_mgrs = package_manager_cmds_for_languages(&selected_languages).join(", ");
         let background_label = format!(
@@ -1162,9 +1154,10 @@ async fn run_instrument_setup(
         let Some(index) = selection else {
             bail!("instrument setup cancelled by user");
         };
-        let interactive = index == 1;
-        (interactive, false)
+        index == 1
     };
+    // --yolo grants full permissions regardless of TUI/background mode.
+    let bypass_permissions = args.yolo;
 
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
@@ -1205,8 +1198,8 @@ async fn run_instrument_setup(
         eprintln!();
     }
 
-    let show_output = !base.json && !args.quiet;
-    let status = if args.quiet && !base.json {
+    let show_output = !base.json && base.verbose;
+    let status = if !base.verbose && !base.json {
         with_spinner(
             "Running agent instrumentation…",
             run_agent_invocation(&root, &invocation, false),
@@ -1609,15 +1602,31 @@ fn resolve_instrument_invocation(
     }
 
     let invocation = match agent {
-        Agent::Codex => InstrumentInvocation::Program {
-            program: "codex".to_string(),
-            args: vec!["exec".to_string(), "-".to_string()],
-            stdin_file: Some(task_path.to_path_buf()),
-            prompt_file_arg: None,
-            initial_prompt: None,
-            stream_json: false,
-            interactive,
-        },
+        Agent::Codex => {
+            if interactive {
+                // TUI mode: `codex "<task>"` opens the interactive TUI with the task pre-loaded.
+                InstrumentInvocation::Program {
+                    program: "codex".to_string(),
+                    args: vec![],
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                // Background mode: `codex exec -` reads the task from stdin.
+                InstrumentInvocation::Program {
+                    program: "codex".to_string(),
+                    args: vec!["exec".to_string(), "-".to_string()],
+                    stdin_file: Some(task_path.to_path_buf()),
+                    prompt_file_arg: None,
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: false,
+                }
+            }
+        }
         Agent::Claude => {
             if interactive {
                 // In interactive mode the full task goes into --append-system-prompt so
@@ -1677,30 +1686,61 @@ fn resolve_instrument_invocation(
                 }
             }
         }
-        Agent::Opencode => InstrumentInvocation::Program {
-            program: "opencode".to_string(),
-            args: vec!["run".to_string()],
-            stdin_file: None,
-            prompt_file_arg: Some(task_path.to_path_buf()),
-            initial_prompt: None,
-            stream_json: false,
-            interactive,
-        },
-        Agent::Cursor => InstrumentInvocation::Program {
-            program: "cursor-agent".to_string(),
-            args: vec![
-                "-p".to_string(),
-                "-f".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--stream-partial-output".to_string(),
-            ],
-            stdin_file: None,
-            prompt_file_arg: Some(task_path.to_path_buf()),
-            initial_prompt: None,
-            stream_json: true,
-            interactive,
-        },
+        Agent::Opencode => {
+            if interactive {
+                // TUI mode: `opencode` opens the interactive TUI.
+                InstrumentInvocation::Program {
+                    program: "opencode".to_string(),
+                    args: vec![],
+                    stdin_file: None,
+                    prompt_file_arg: None,
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                // Background mode: `opencode run "<task>"` runs non-interactively.
+                InstrumentInvocation::Program {
+                    program: "opencode".to_string(),
+                    args: vec!["run".to_string()],
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: false,
+                }
+            }
+        }
+        Agent::Cursor => {
+            if interactive {
+                // TUI mode: `cursor-agent "<task>"` opens the interactive TUI with task pre-loaded.
+                InstrumentInvocation::Program {
+                    program: "cursor-agent".to_string(),
+                    args: vec![],
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                // Background mode: `-p` enables non-interactive print mode.
+                InstrumentInvocation::Program {
+                    program: "cursor-agent".to_string(),
+                    args: vec![
+                        "-p".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--stream-partial-output".to_string(),
+                    ],
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
     };
     Ok(invocation)
 }
@@ -1960,7 +2000,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
         if scope.is_none() {
             steps.push(SetupWizardStep::Scope);
         }
-        if args.agents.is_empty() {
+        if args.agent.is_none() {
             steps.push(SetupWizardStep::Agents);
         }
         if !args.no_fetch_docs && args.workflows.is_empty() {
@@ -1986,7 +2026,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
                     let current_scope = scope.ok_or_else(|| anyhow!("scope not selected"))?;
                     let local_root = resolve_local_root_for_scope(current_scope)?;
                     let detected = detect_agents(local_root.as_deref(), home);
-                    let defaults = resolve_selected_agents(&[], &detected);
+                    let defaults = resolve_selected_agents(None, &detected);
                     match prompt_agents_selection(&defaults)? {
                         Some(selected) => {
                             prompted_agents = Some(selected);
@@ -2033,7 +2073,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
     let detected = detect_agents(local_root.as_deref(), home);
     let selected_agents = match prompted_agents {
         Some(value) => value,
-        None => resolve_selected_agents(&args.agents, &detected),
+        None => resolve_selected_agents(args.agent, &detected),
     };
     if selected_agents.is_empty() {
         bail!("no agents selected for installation");
@@ -2072,7 +2112,7 @@ fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSe
         if scope.is_none() {
             steps.push(McpWizardStep::Scope);
         }
-        if args.agents.is_empty() {
+        if args.agent.is_none() {
             steps.push(McpWizardStep::Agents);
         }
 
@@ -2095,7 +2135,7 @@ fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSe
                     let current_scope = scope.ok_or_else(|| anyhow!("scope not selected"))?;
                     let local_root = resolve_local_root_for_scope(current_scope)?;
                     let detected = detect_agents(local_root.as_deref(), home);
-                    let defaults = resolve_selected_agents(&[], &detected);
+                    let defaults = resolve_selected_agents(None, &detected);
                     match prompt_agents_selection(&defaults)? {
                         Some(selected) => {
                             prompted_agents = Some(selected);
@@ -2127,7 +2167,7 @@ fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSe
     let detected = detect_agents(local_root.as_deref(), home);
     let selected_agents = match prompted_agents {
         Some(value) => value,
-        None => resolve_selected_agents(&args.agents, &detected),
+        None => resolve_selected_agents(args.agent, &detected),
     };
     if selected_agents.is_empty() {
         bail!("no agents selected for MCP setup");
@@ -2427,8 +2467,11 @@ fn resolve_scope_from_flags(
     })
 }
 
-fn resolve_selected_agents(requested: &[AgentArg], detected: &[DetectionSignal]) -> Vec<Agent> {
-    if requested.is_empty() {
+fn resolve_selected_agents(
+    requested: Option<AgentArg>,
+    detected: &[DetectionSignal],
+) -> Vec<Agent> {
+    let Some(arg) = requested else {
         let mut inferred = BTreeSet::new();
         for signal in detected {
             inferred.insert(signal.agent);
@@ -2437,26 +2480,13 @@ fn resolve_selected_agents(requested: &[AgentArg], detected: &[DetectionSignal])
             return ALL_AGENTS.to_vec();
         }
         return inferred.into_iter().collect();
-    }
-
-    if requested.contains(&AgentArg::All) {
-        return ALL_AGENTS.to_vec();
-    }
-
-    let mut out = BTreeSet::new();
-    for value in requested {
-        let mapped = match value {
-            AgentArg::Claude => Some(Agent::Claude),
-            AgentArg::Codex => Some(Agent::Codex),
-            AgentArg::Cursor => Some(Agent::Cursor),
-            AgentArg::Opencode => Some(Agent::Opencode),
-            AgentArg::All => None,
-        };
-        if let Some(agent) = mapped {
-            out.insert(agent);
-        }
-    }
-    out.into_iter().collect()
+    };
+    vec![match arg {
+        AgentArg::Claude => Agent::Claude,
+        AgentArg::Codex => Agent::Codex,
+        AgentArg::Cursor => Agent::Cursor,
+        AgentArg::Opencode => Agent::Opencode,
+    }]
 }
 
 fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
@@ -3210,22 +3240,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn all_agent_arg_expands_to_all_agents() {
-        let detected = vec![];
-        let resolved = resolve_selected_agents(&[AgentArg::All], &detected);
-        assert_eq!(
-            resolved,
-            vec![Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode]
-        );
-    }
-
-    #[test]
     fn detection_drives_default_selection() {
         let detected = vec![DetectionSignal {
             agent: Agent::Codex,
             reason: "hint".to_string(),
         }];
-        let resolved = resolve_selected_agents(&[], &detected);
+        let resolved = resolve_selected_agents(None, &detected);
         assert_eq!(resolved, vec![Agent::Codex]);
     }
 
@@ -3361,9 +3381,9 @@ mod tests {
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
-            quiet: false,
             languages: Vec::new(),
-            interactive: false,
+            tui: false,
+            background: false,
             yolo: false,
         };
 
@@ -3384,9 +3404,9 @@ mod tests {
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
-            quiet: false,
             languages: Vec::new(),
-            interactive: false,
+            tui: false,
+            background: false,
             yolo: false,
         };
 

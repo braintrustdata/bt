@@ -10,9 +10,9 @@ pub struct BaseArgs {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Suppress non-essential output
-    #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
-    pub quiet: bool,
+    /// Show additional output
+    #[arg(long, short = 'v', env = "BRAINTRUST_VERBOSE", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
+    pub verbose: bool,
 
     /// Disable ANSI color output
     #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]

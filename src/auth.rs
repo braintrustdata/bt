@@ -2583,7 +2583,7 @@ mod tests {
     fn make_base() -> BaseArgs {
         BaseArgs {
             json: false,
-            quiet: false,
+            verbose: false,
             no_color: false,
             profile: None,
             project: None,

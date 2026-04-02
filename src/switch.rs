@@ -245,7 +245,7 @@ mod tests {
     fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
         BaseArgs {
             json: false,
-            quiet: false,
+            verbose: false,
             no_color: false,
             profile: None,
             org_name: org.map(String::from),

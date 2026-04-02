@@ -6058,7 +6058,7 @@ mod tests {
     fn base_args() -> BaseArgs {
         BaseArgs {
             json: false,
-            quiet: false,
+            verbose: false,
             no_color: false,
             profile: None,
             org_name: None,
