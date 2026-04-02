@@ -536,7 +536,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if verbose {
             eprintln!("   {}", style("Skills:").bold());
         }
-        if let Some((scope, ref agents)) = setup_context {
+        if let Some((scope, _)) = setup_context {
             let args = AgentsSetupArgs {
                 agent: flag_agent,
                 local: matches!(scope, InstallScope::Local),

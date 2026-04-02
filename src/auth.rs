@@ -779,17 +779,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
-pub async fn login_interactive(base: &mut BaseArgs) -> Result<String> {
-    let methods = ["OAuth (browser)", "API key"];
-    let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
-
-    if selected == 0 {
-        login_interactive_oauth(base).await
-    } else {
-        login_interactive_api_key(base).await
-    }
-}
-
 async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
     let api_key = prompt_api_key()?;
 
