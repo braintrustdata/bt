@@ -779,6 +779,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
     let api_key = prompt_api_key()?;
 

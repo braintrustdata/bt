@@ -3347,7 +3347,7 @@ mod tests {
     #[test]
     fn resolve_setup_selection_honors_no_fetch_docs() {
         let args = AgentsSetupArgs {
-            agents: vec![AgentArg::Codex],
+            agent: Some(AgentArg::Codex),
             local: false,
             global: true,
             workflows: vec![WorkflowArg::Evaluate],
