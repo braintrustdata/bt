@@ -73,16 +73,22 @@ pub struct SetupArgs {
     #[arg(long)]
     instrument: bool,
 
-    /// Do not run instrumentation agent
-    #[arg(long, conflicts_with = "instrument")]
+    /// Do not run instrumentation agent (skills and MCP are still configured)
+    #[arg(
+        long,
+        conflicts_with = "instrument",
+        conflicts_with = "tui",
+        conflicts_with = "background",
+        conflicts_with = "yolo"
+    )]
     no_instrument: bool,
 
     /// Run the agent in interactive TUI mode [default]
-    #[arg(long, conflicts_with = "background")]
+    #[arg(long, conflicts_with = "background", conflicts_with = "no_instrument")]
     tui: bool,
 
     /// Run the agent in background (non-interactive) mode
-    #[arg(long, conflicts_with = "tui")]
+    #[arg(long, conflicts_with = "tui", conflicts_with = "no_instrument")]
     background: bool,
 
     /// Language(s) to instrument (repeatable; case-insensitive).
@@ -150,7 +156,7 @@ struct AgentsSetupArgs {
     workers: usize,
 
     /// Grant the agent full permissions (bypass permission prompts)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_instrument")]
     yolo: bool,
 }
 
@@ -215,6 +221,10 @@ struct InstrumentSetupArgs {
     /// Grant the agent full permissions (bypass permission prompts)
     #[arg(long)]
     yolo: bool,
+
+    /// Set up skills and write the task file but do not launch the agent.
+    #[arg(skip)]
+    skip_launch: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -651,9 +661,6 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     any_installed = true;
                 }
             }
-            if outcome.installed_count == 0 && !agents.is_empty() {
-                had_failures = true;
-            }
             if !verbose {
                 let label = if any_installed {
                     "configured"
@@ -681,8 +688,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(4, "Instrument");
     }
     if git_root.is_some() {
-        // --no-instrument opts out; --instrument opts in; otherwise prompt or default on.
-        let do_instrument = if flag_no_instrument {
+        // Whether to launch the agent at the end of this step.
+        // --no-instrument / interactive "no": set up skills/docs but skip the launch.
+        // --instrument / non-interactive: always launch.
+        let launch_agent = if flag_no_instrument {
             false
         } else if flag_instrument || !interactive {
             true
@@ -692,7 +701,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 .default(true)
                 .interact()?
         };
-        if do_instrument {
+
+        // Skills, docs, and the task file are always set up when a git root exists.
+        // Only the agent launch is conditional.
+        {
             // Determine agent: explicit flag > single detected > ask user
             let instrument_agent =
                 determine_wizard_instrument_agent(flag_agent, git_root.as_deref(), &home);
@@ -749,32 +761,35 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 vec![WorkflowArg::Instrument, WorkflowArg::Observe]
             };
 
-            // Run mode: --tui / --background flag > interactive prompt > default TUI.
-            let run_tui = if flag_tui {
-                true
-            } else if flag_background {
-                false
-            } else if interactive {
-                let idx = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("How do you want to run the agent?")
-                    .items(&["Interactive (TUI)", "Background"])
-                    .default(0)
-                    .interact()?;
-                idx == 0
+            // Run mode and yolo are only meaningful when actually launching.
+            let (run_tui, effective_yolo) = if launch_agent {
+                let tui = if flag_tui {
+                    true
+                } else if flag_background {
+                    false
+                } else if interactive {
+                    let idx = Select::with_theme(&ColorfulTheme::default())
+                        .with_prompt("How do you want to run the agent?")
+                        .items(&["Interactive (TUI)", "Background"])
+                        .default(0)
+                        .interact()?;
+                    idx == 0
+                } else {
+                    true
+                };
+                let yolo = if flag_yolo {
+                    true
+                } else if interactive {
+                    Confirm::new()
+                        .with_prompt("Grant agent full permissions? (bypass permission prompts)")
+                        .default(false)
+                        .interact()?
+                } else {
+                    false
+                };
+                (tui, yolo)
             } else {
-                true
-            };
-
-            // Yolo: explicit flag > interactive prompt > default false.
-            let effective_yolo = if flag_yolo {
-                true
-            } else if interactive {
-                Confirm::new()
-                    .with_prompt("Grant agent full permissions? (bypass permission prompts)")
-                    .default(false)
-                    .interact()?
-            } else {
-                false
+                (false, false)
             };
 
             run_instrument_setup(
@@ -791,12 +806,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     tui: run_tui,
                     background: !run_tui,
                     yolo: effective_yolo,
+                    skip_launch: !launch_agent,
                 },
                 false,
             )
             .await?;
-        } else if verbose {
-            eprintln!("   {}", style("Skipped").dim());
         }
     } else if verbose {
         eprintln!("   {}", style("Skipped").dim());
@@ -1274,8 +1288,11 @@ async fn run_instrument_setup(
     // Determine run mode: interactive TUI vs background (autonomous).
     // --tui:         interactive TUI (inherits terminal)
     // --background / --yes / non-interactive terminal: background (autonomous)
+    // skip_launch:   not launching at all — default to non-interactive for task rendering
     // Otherwise: ask the user.
-    let run_interactive = if args.tui {
+    let run_interactive = if args.skip_launch {
+        false
+    } else if args.tui {
         true
     } else if args.background || args.yes || !ui::is_interactive() {
         false
@@ -1324,6 +1341,37 @@ async fn run_instrument_setup(
         "Instrumentation task prompt written to {}.",
         task_path.display()
     ));
+
+    // --no-instrument (skip_launch): skills configured, task file written — done.
+    if args.skip_launch {
+        if base.json {
+            let report = SetupJsonReport {
+                scope: InstallScope::Local.as_str().to_string(),
+                selected_agents: vec![selected],
+                detected_agents: detected,
+                results: results.clone(),
+                warnings,
+                notes,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .context("failed to serialize setup report")?
+            );
+        } else {
+            eprintln!();
+            for result in &results {
+                print_wizard_agent_result(result);
+            }
+            eprintln!(
+                "   {} Task file: {}",
+                style("✓").green(),
+                task_path.display()
+            );
+            print_wizard_done(false);
+        }
+        return Ok(());
+    }
 
     let invocation = resolve_instrument_invocation(
         selected,
@@ -3027,6 +3075,8 @@ fn install_mcp_for_agent(
 /// Install the Braintrust MCP server into Claude Code's user-wide config (~/.claude.json).
 /// Falls back to ~/.mcp.json if the `claude` CLI is not available.
 fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<AgentInstallResult> {
+    let claude_json_path = home.join(".claude.json");
+
     let Some(key) = api_key else {
         // No API key available — fall back to ~/.mcp.json with env-var placeholder and
         // tell the user they need BRAINTRUST_API_KEY set for Claude Code to authenticate.
@@ -3040,6 +3090,25 @@ fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<Age
             paths: vec![path.display().to_string()],
         });
     };
+
+    // If braintrust is already registered in ~/.claude.json (written by a prior `claude mcp add
+    // -s user`), skip the subprocess call — `claude mcp add` exits non-zero when the name
+    // already exists.
+    if let Ok(root) = load_json_object_or_default(&claude_json_path) {
+        if root
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .map(|m| m.contains_key("braintrust"))
+            .unwrap_or(false)
+        {
+            return Ok(AgentInstallResult {
+                agent: Agent::Claude,
+                status: InstallStatus::Skipped,
+                message: "already configured".to_string(),
+                paths: vec![claude_json_path.display().to_string()],
+            });
+        }
+    }
 
     let header = format!("Authorization: Bearer {key}");
     let output = std::process::Command::new("claude")
@@ -3062,7 +3131,7 @@ fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<Age
             agent: Agent::Claude,
             status: InstallStatus::Installed,
             message: "installed MCP config".to_string(),
-            paths: vec![home.join(".claude.json").display().to_string()],
+            paths: vec![claude_json_path.display().to_string()],
         }),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -3618,6 +3687,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            skip_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -3641,6 +3711,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            skip_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)

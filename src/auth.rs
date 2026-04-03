@@ -405,11 +405,11 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
 
     if let Some(profile_name) = ignored_profile {
         eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
+            "Info: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY to use a profile with OAuth login.",
         );
     } else {
         eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY."
+            "Info: using --api-key/BRAINTRUST_API_KEY credentials for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY to use a registered profile."
         );
     }
 }
