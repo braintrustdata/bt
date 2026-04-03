@@ -44,10 +44,6 @@ pub struct BaseArgs {
     #[arg(long, global = true)]
     pub prefer_profile: bool,
 
-    /// Disable all interactive prompts
-    #[arg(long, global = true)]
-    pub no_input: bool,
-
     /// Override API URL (or via BRAINTRUST_API_URL)
     #[arg(
         long,

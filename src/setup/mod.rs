@@ -54,19 +54,19 @@ pub struct SetupArgs {
     command: Option<SetupSubcommand>,
 
     /// Set up coding-agent skills [default]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_skills")]
     skills: bool,
 
     /// Do not set up coding-agent skills
-    #[arg(long)]
+    #[arg(long, conflicts_with = "skills")]
     no_skills: bool,
 
     /// Set up MCP server [default]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_mcp")]
     mcp: bool,
 
     /// Do not set up MCP server
-    #[arg(long)]
+    #[arg(long, conflicts_with = "mcp")]
     no_mcp: bool,
 
     /// Run instrumentation agent [default]
@@ -84,6 +84,12 @@ pub struct SetupArgs {
     /// Run the agent in background (non-interactive) mode
     #[arg(long, conflicts_with = "tui")]
     background: bool,
+
+    /// Language(s) to instrument (repeatable; case-insensitive).
+    /// When provided, the agent skips language auto-detection and instruments
+    /// the specified language(s) directly.
+    #[arg(long = "language", value_enum, ignore_case = true)]
+    languages: Vec<LanguageArg>,
 
     /// Show additional setup output
     #[arg(long, short = 'v')]
@@ -115,16 +121,15 @@ struct AgentsSetupArgs {
     #[arg(long, conflicts_with = "global")]
     local: bool,
 
-    /// Configure user-wide state
+    /// Configure user-wide state [default]
     #[arg(long)]
     global: bool,
 
-    /// Workflow docs to prefetch (repeatable)
+    /// Workflow docs to prefetch (repeatable) [default: all]
     #[arg(long = "workflow", value_enum)]
     workflows: Vec<WorkflowArg>,
 
-    /// Skip confirmation prompts and use defaults
-    #[arg(long, short = 'y')]
+    #[arg(skip)]
     yes: bool,
 
     /// Do not auto-fetch workflow docs during setup
@@ -154,12 +159,11 @@ struct AgentsMcpSetupArgs {
     #[arg(long, conflicts_with = "global")]
     local: bool,
 
-    /// Configure MCP in user-wide state
+    /// Configure MCP in user-wide state [default]
     #[arg(long)]
     global: bool,
 
-    /// Skip confirmation prompts and use defaults
-    #[arg(long, short = 'y')]
+    #[arg(skip)]
     yes: bool,
 }
 
@@ -173,12 +177,11 @@ struct InstrumentSetupArgs {
     #[arg(long)]
     agent_cmd: Option<String>,
 
-    /// Workflow docs to prefetch alongside instrument (repeatable; always includes instrument)
+    /// Workflow docs to prefetch alongside instrument (repeatable; always includes instrument) [default: all]
     #[arg(long = "workflow", value_enum)]
     workflows: Vec<WorkflowArg>,
 
-    /// Skip confirmation prompts and use defaults
-    #[arg(long, short = 'y')]
+    #[arg(skip)]
     yes: bool,
 
     /// Refresh prefetched docs by clearing existing output before download
@@ -197,7 +200,7 @@ struct InstrumentSetupArgs {
     languages: Vec<LanguageArg>,
 
     /// Run the agent in interactive TUI mode [default]
-    #[arg(long, short = 'i', conflicts_with = "background")]
+    #[arg(long, conflicts_with = "background")]
     tui: bool,
 
     /// Run the agent in background (non-interactive) mode
@@ -215,7 +218,7 @@ struct AgentsDoctorArgs {
     #[arg(long, conflicts_with = "global")]
     local: bool,
 
-    /// Diagnose user-wide setup
+    /// Diagnose user-wide setup [default]
     #[arg(long)]
     global: bool,
 }
@@ -419,6 +422,7 @@ pub async fn run_setup_top(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                     background: args.background,
                     agent: args.agents.agent,
                     workflows: args.agents.workflows,
+                    languages: args.languages,
                 };
                 run_setup_wizard(base, wizard_flags).await
             } else {
@@ -444,6 +448,7 @@ struct WizardFlags {
     background: bool,
     agent: Option<AgentArg>,
     workflows: Vec<WorkflowArg>,
+    languages: Vec<LanguageArg>,
 }
 
 async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> {
@@ -461,6 +466,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         background: flag_background,
         agent: flag_agent,
         workflows: flag_workflows,
+        languages: flag_languages,
     } = flags;
     let mut had_failures = false;
     let verbose = base.verbose;
@@ -627,11 +633,21 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 instrument_agent
             };
 
-            // Auto-detect languages from the git root (no prompt)
-            let detected_languages = git_root
-                .as_deref()
-                .map(detect_languages_from_dir)
-                .unwrap_or_default();
+            // Resolve languages: explicit flag > auto-detect from git root > prompt.
+            let detected_languages = if !flag_languages.is_empty() {
+                flag_languages.clone()
+            } else {
+                let auto = git_root
+                    .as_deref()
+                    .map(detect_languages_from_dir)
+                    .unwrap_or_default();
+                if !auto.is_empty() || !ui::is_interactive() {
+                    auto
+                } else {
+                    // Could not auto-detect and we have a TTY — ask the user.
+                    prompt_instrument_language_selection(&[])?.unwrap_or_default()
+                }
+            };
 
             // Default workflows: instrument + observe. --workflow flags override.
             let wizard_workflows = if flag_workflows.is_empty() {
@@ -1028,10 +1044,8 @@ impl LanguageArg {
 }
 
 fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
-    if base.json || !ui::is_interactive() {
-        return false;
-    }
-    !args.yes
+    !base.json
+        && ui::is_interactive()
         && !args.no_fetch_docs
         && !args.refresh_docs
         && args.workers == crate::sync::default_workers()

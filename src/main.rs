@@ -251,10 +251,6 @@ fn configure_output(base: &BaseArgs) {
     ui::set_quiet(true);
     ui::set_animations_enabled(false);
 
-    if base.no_input {
-        ui::set_no_input(true);
-    }
-
     if disable_color {
         dialoguer::console::set_colors_enabled(false);
         dialoguer::console::set_colors_enabled_stderr(false);
