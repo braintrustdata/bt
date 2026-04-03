@@ -16,7 +16,7 @@ use crate::auth;
 use crate::auth::LoginContext;
 use crate::config;
 use crate::http::ApiClient;
-use crate::ui::{self, with_spinner};
+use crate::ui::{self, print_command_status, with_spinner, CommandStatus};
 
 mod agent_stream;
 mod docs;
@@ -90,6 +90,11 @@ pub struct SetupArgs {
     /// the specified language(s) directly.
     #[arg(long = "language", value_enum, ignore_case = true)]
     languages: Vec<LanguageArg>,
+
+    /// Run the interactive setup wizard, prompting for every choice not already
+    /// specified as a flag.
+    #[arg(long, short = 'i')]
+    interactive: bool,
 
     /// Show additional setup output
     #[arg(long, short = 'v')]
@@ -404,11 +409,14 @@ pub async fn run_setup_top(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Instrument(instrument)) => {
             run_instrument_setup(base, instrument, false).await
         }
-        Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp),
+        Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp).await,
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
-            if should_prompt_setup_action(&base, &args.agents) {
+            let run_wizard = (args.interactive && ui::is_interactive())
+                || should_prompt_setup_action(&base, &args.agents);
+            if run_wizard {
                 let wizard_flags = WizardFlags {
+                    interactive: args.interactive,
                     yolo: args.agents.yolo,
                     skills: args.skills,
                     mcp: args.mcp,
@@ -435,6 +443,7 @@ pub async fn run_setup_top(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
 pub use docs::run_docs_top;
 
 struct WizardFlags {
+    interactive: bool,
     yolo: bool,
     skills: bool,
     mcp: bool,
@@ -453,14 +462,15 @@ struct WizardFlags {
 
 async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> {
     let WizardFlags {
-        yolo,
+        interactive,
+        yolo: flag_yolo,
         skills: flag_skills,
         mcp: flag_mcp,
         no_skills: flag_no_skills,
         no_mcp: flag_no_mcp,
         local: flag_local,
-        global: _flag_global,
-        instrument: _flag_instrument,
+        global: flag_global,
+        instrument: flag_instrument,
         no_instrument: flag_no_instrument,
         tui: flag_tui,
         background: flag_background,
@@ -479,6 +489,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     }
     let project_flag = base.project.clone();
     let login_ctx = ensure_auth(&mut base).await?;
+    let mcp_api_key: String = login_ctx.login.api_key.clone();
     let client = ApiClient::new(&login_ctx)?;
     let org = client.org_name().to_string();
     if verbose {
@@ -514,18 +525,40 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(3, "Agents");
     }
-    // Default: install both skills and MCP with global scope.
-    // --no-skill / --no-mcp / --no-mcp-skill opt out.
-    let _ = flag_skills; // kept as flag but superseded by default-on behavior
-    let _ = flag_mcp; // kept as flag but superseded by default-on behavior
-    let wants_skills = !flag_no_skills;
-    let wants_mcp = !flag_no_mcp;
 
-    // Scope: default global; --local overrides.
+    // Scope: --local / --global flag > interactive prompt > default global.
     let scope = if flag_local {
         InstallScope::Local
+    } else if flag_global {
+        InstallScope::Global
+    } else if interactive {
+        prompt_scope_selection("Install scope")?.unwrap_or(InstallScope::Global)
     } else {
         InstallScope::Global
+    };
+
+    // Skills: --no-skills opts out; --skills opts in; otherwise prompt or default on.
+    let wants_skills = if flag_no_skills {
+        false
+    } else if flag_skills || !interactive {
+        true
+    } else {
+        Confirm::new()
+            .with_prompt("Set up coding-agent skills?")
+            .default(true)
+            .interact()?
+    };
+
+    // MCP: same pattern.
+    let wants_mcp = if flag_no_mcp {
+        false
+    } else if flag_mcp || !interactive {
+        true
+    } else {
+        Confirm::new()
+            .with_prompt("Set up MCP server?")
+            .default(true)
+            .interact()?
     };
 
     let local_root = resolve_local_root_for_scope(scope)?;
@@ -533,10 +566,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     let agents = resolve_selected_agents(flag_agent, &detected);
 
     if verbose {
-        let scope_label = if flag_local {
-            "local (current git repo)"
-        } else {
-            "global (user-wide)"
+        let scope_label = match scope {
+            InstallScope::Local => "local (current git repo)",
+            InstallScope::Global => "global (user-wide)",
         };
         eprintln!("   {} Scope: {}", style("✓").green(), scope_label);
     }
@@ -564,6 +596,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 yolo: false,
             };
             let outcome = execute_skills_setup(&base, &args).await?;
+            let mut any_installed = false;
             for r in &outcome.results {
                 if verbose {
                     print_wizard_agent_result(r);
@@ -571,6 +604,24 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 if matches!(r.status, InstallStatus::Failed) {
                     had_failures = true;
                 }
+                if matches!(r.status, InstallStatus::Installed) {
+                    any_installed = true;
+                }
+            }
+            if !verbose && !outcome.results.is_empty() {
+                let label = if any_installed {
+                    "installed"
+                } else {
+                    "already configured"
+                };
+                print_command_status(
+                    if any_installed {
+                        CommandStatus::Success
+                    } else {
+                        CommandStatus::Warning
+                    },
+                    &format!("Skills: {label} (use /braintrust in Claude Code)"),
+                );
             }
         }
     }
@@ -581,7 +632,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
         if let Some((scope, ref agents)) = setup_context {
             let local_root = resolve_local_root_for_scope(scope)?;
-            let outcome = execute_mcp_install(scope, local_root.as_deref(), &home, agents);
+            let outcome = execute_mcp_install(
+                scope,
+                local_root.as_deref(),
+                &home,
+                agents,
+                Some(mcp_api_key.as_str()),
+            );
+            let mut any_installed = false;
             for r in &outcome.results {
                 if verbose {
                     print_wizard_agent_result(r);
@@ -589,9 +647,27 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 if matches!(r.status, InstallStatus::Failed) {
                     had_failures = true;
                 }
+                if matches!(r.status, InstallStatus::Installed) {
+                    any_installed = true;
+                }
             }
             if outcome.installed_count == 0 && !agents.is_empty() {
                 had_failures = true;
+            }
+            if !verbose {
+                let label = if any_installed {
+                    "configured"
+                } else {
+                    "already configured"
+                };
+                print_command_status(
+                    if any_installed {
+                        CommandStatus::Success
+                    } else {
+                        CommandStatus::Warning
+                    },
+                    &format!("MCP: {label}"),
+                );
             }
         }
     }
@@ -605,8 +681,17 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(4, "Instrument");
     }
     if git_root.is_some() {
-        // Default: instrument. --no-instrument opts out.
-        let do_instrument = !flag_no_instrument;
+        // --no-instrument opts out; --instrument opts in; otherwise prompt or default on.
+        let do_instrument = if flag_no_instrument {
+            false
+        } else if flag_instrument || !interactive {
+            true
+        } else {
+            Confirm::new()
+                .with_prompt("Run instrumentation agent?")
+                .default(true)
+                .interact()?
+        };
         if do_instrument {
             // Determine agent: explicit flag > single detected > ask user
             let instrument_agent =
@@ -649,10 +734,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 }
             };
 
-            // Default workflows: instrument + observe. --workflow flags override.
-            let wizard_workflows = if flag_workflows.is_empty() {
-                vec![WorkflowArg::Instrument, WorkflowArg::Observe]
-            } else {
+            // Workflows: explicit flag > interactive prompt > default instrument+observe.
+            let wizard_workflows = if !flag_workflows.is_empty() {
                 let mut selected = resolve_workflow_selection(&flag_workflows);
                 if !selected.contains(&WorkflowArg::Instrument) {
                     selected.push(WorkflowArg::Instrument);
@@ -660,6 +743,38 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     selected.dedup();
                 }
                 selected
+            } else if interactive {
+                prompt_instrument_workflow_selection()?.unwrap_or_default()
+            } else {
+                vec![WorkflowArg::Instrument, WorkflowArg::Observe]
+            };
+
+            // Run mode: --tui / --background flag > interactive prompt > default TUI.
+            let run_tui = if flag_tui {
+                true
+            } else if flag_background {
+                false
+            } else if interactive {
+                let idx = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("How do you want to run the agent?")
+                    .items(&["Interactive (TUI)", "Background"])
+                    .default(0)
+                    .interact()?;
+                idx == 0
+            } else {
+                true
+            };
+
+            // Yolo: explicit flag > interactive prompt > default false.
+            let effective_yolo = if flag_yolo {
+                true
+            } else if interactive {
+                Confirm::new()
+                    .with_prompt("Grant agent full permissions? (bypass permission prompts)")
+                    .default(false)
+                    .interact()?
+            } else {
+                false
             };
 
             run_instrument_setup(
@@ -673,9 +788,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
                     languages: detected_languages,
-                    tui: flag_tui || !flag_background,
-                    background: flag_background,
-                    yolo,
+                    tui: run_tui,
+                    background: !run_tui,
+                    yolo: effective_yolo,
                 },
                 false,
             )
@@ -1107,13 +1222,19 @@ async fn run_instrument_setup(
     let mut notes = Vec::new();
     let mut results = Vec::new();
     let skill_path = skill_config_path(selected, InstallScope::Local, Some(&root), &home)?;
+    let global_skill_path = skill_config_path(selected, InstallScope::Global, None, &home)?;
 
-    if skill_path.exists() {
+    if skill_path.exists() || global_skill_path.exists() {
+        let existing_path = if skill_path.exists() {
+            skill_path.clone()
+        } else {
+            global_skill_path
+        };
         results.push(AgentInstallResult {
             agent: selected,
             status: InstallStatus::Skipped,
             message: "already configured".to_string(),
-            paths: vec![skill_path.display().to_string()],
+            paths: vec![existing_path.display().to_string()],
         });
         notes.push("Skipped skills setup (already configured).".to_string());
         prefetch_workflow_docs(
@@ -1215,8 +1336,10 @@ async fn run_instrument_setup(
 
     if run_interactive {
         eprintln!();
-        eprintln!("Claude Code is opening in interactive mode.");
-        eprintln!("The instrumentation task is pre-loaded. Press Enter to begin.");
+        eprintln!(
+            "{} is opening in interactive mode.",
+            selected.display_name()
+        );
         eprintln!("Task file: {}", task_path.display());
         eprintln!();
     }
@@ -1659,18 +1782,25 @@ fn resolve_instrument_invocation(
             if interactive {
                 // TUI mode: pass the full task as a positional arg so Claude loads it
                 // as the initial user message and starts working immediately.
-                // --permission-mode acceptEdits overrides any "plan" defaultMode the
-                // user may have set globally, which would otherwise cause an immediate
-                // ExitPlanMode tool call with invalid parameters.
+                // --permission-mode acceptEdits overrides the permission mode, but the
+                // user's global "defaultMode": "plan" in ~/.claude/settings.json can still
+                // cause Claude to start in plan mode and try to call ExitPlanMode (which
+                // produces "Invalid tool parameters"). We override defaultMode explicitly
+                // via --settings and also disallow ExitPlanMode to be safe.
+                let permission_mode = if bypass_permissions {
+                    "bypassPermissions"
+                } else {
+                    "acceptEdits"
+                };
                 InstrumentInvocation::Program {
                     program: "claude".to_string(),
                     args: vec![
                         "--permission-mode".to_string(),
-                        if bypass_permissions {
-                            "bypassPermissions".to_string()
-                        } else {
-                            "acceptEdits".to_string()
-                        },
+                        permission_mode.to_string(),
+                        "--settings".to_string(),
+                        format!(r#"{{"defaultMode": "{permission_mode}"}}"#),
+                        "--disallowedTools".to_string(),
+                        "ExitPlanMode,EnterPlanMode".to_string(),
                         "--name".to_string(),
                         "Braintrust: Instrument".to_string(),
                     ],
@@ -1921,12 +2051,13 @@ fn execute_mcp_install(
     local_root: Option<&Path>,
     home: &Path,
     agents: &[Agent],
+    api_key: Option<&str>,
 ) -> McpSetupOutcome {
     let mut warnings = Vec::new();
     let mut results = Vec::new();
 
     for agent in agents.iter().copied() {
-        let result = install_mcp_for_agent(agent, scope, local_root, home);
+        let result = install_mcp_for_agent(agent, scope, local_root, home, api_key);
         match result {
             Ok(r) => {
                 if matches!(r.status, InstallStatus::Skipped)
@@ -1959,15 +2090,25 @@ fn execute_mcp_install(
     }
 }
 
-fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
+async fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let api_key = crate::auth::resolve_auth(&base)
+        .await
+        .ok()
+        .and_then(|a| a.api_key);
     let selection = resolve_mcp_selection(&args, &home)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
     let detected = selection.detected;
     let selected_agents = selection.selected_agents;
 
-    let outcome = execute_mcp_install(scope, local_root.as_deref(), &home, &selected_agents);
+    let outcome = execute_mcp_install(
+        scope,
+        local_root.as_deref(),
+        &home,
+        &selected_agents,
+        api_key.as_deref(),
+    );
 
     if base.json {
         let report = SetupJsonReport {
@@ -2841,7 +2982,15 @@ fn install_mcp_for_agent(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
+    api_key: Option<&str>,
 ) -> Result<AgentInstallResult> {
+    // For Claude with global scope, write to ~/.claude.json top-level mcpServers via
+    // `claude mcp add -s user`. This is the only path Claude Code reliably reads for
+    // user-wide MCP — it does not expand ${VAR} placeholders in .mcp.json headers.
+    if matches!(agent, Agent::Claude) && matches!(scope, InstallScope::Global) {
+        return install_mcp_for_claude_user(home, api_key);
+    }
+
     let path = match agent {
         Agent::Cursor => {
             if matches!(scope, InstallScope::Global) {
@@ -2865,7 +3014,7 @@ fn install_mcp_for_agent(
         }
     };
 
-    merge_mcp_config(&path)?;
+    merge_mcp_config(&path, api_key)?;
 
     Ok(AgentInstallResult {
         agent,
@@ -2875,7 +3024,70 @@ fn install_mcp_for_agent(
     })
 }
 
-fn merge_mcp_config(path: &Path) -> Result<()> {
+/// Install the Braintrust MCP server into Claude Code's user-wide config (~/.claude.json).
+/// Falls back to ~/.mcp.json if the `claude` CLI is not available.
+fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<AgentInstallResult> {
+    let Some(key) = api_key else {
+        // No API key available — fall back to ~/.mcp.json with env-var placeholder and
+        // tell the user they need BRAINTRUST_API_KEY set for Claude Code to authenticate.
+        let path = home.join(".mcp.json");
+        merge_mcp_config(&path, None)?;
+        return Ok(AgentInstallResult {
+            agent: Agent::Claude,
+            status: InstallStatus::Installed,
+            message: "installed MCP config (set BRAINTRUST_API_KEY env var for Claude Code)"
+                .to_string(),
+            paths: vec![path.display().to_string()],
+        });
+    };
+
+    let header = format!("Authorization: Bearer {key}");
+    let output = std::process::Command::new("claude")
+        .args([
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            "braintrust",
+            "https://api.braintrust.dev/mcp",
+            "-H",
+            &header,
+            "-s",
+            "user",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => Ok(AgentInstallResult {
+            agent: Agent::Claude,
+            status: InstallStatus::Installed,
+            message: "installed MCP config".to_string(),
+            paths: vec![home.join(".claude.json").display().to_string()],
+        }),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Err(anyhow!("claude mcp add failed: {stderr}"))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `claude` not in PATH — fall back to ~/.mcp.json
+            let path = home.join(".mcp.json");
+            merge_mcp_config(&path, Some(key))?;
+            Ok(AgentInstallResult {
+                agent: Agent::Claude,
+                status: InstallStatus::Installed,
+                message: "installed MCP config".to_string(),
+                paths: vec![path.display().to_string()],
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn merge_mcp_config(path: &Path, api_key: Option<&str>) -> Result<()> {
+    let auth_value = match api_key {
+        Some(key) => format!("Bearer {key}"),
+        None => "Bearer ${BRAINTRUST_API_KEY}".to_string(),
+    };
     let mut root = load_json_object_or_default(path)?;
     let servers_value = root
         .entry("mcpServers".to_string())
@@ -2893,7 +3105,7 @@ fn merge_mcp_config(path: &Path) -> Result<()> {
             "type": "http",
             "url": "https://api.braintrust.dev/mcp",
             "headers": {
-                "Authorization": "Bearer ${BRAINTRUST_API_KEY}"
+                "Authorization": auth_value
             }
         }),
     );
@@ -3286,7 +3498,7 @@ mod tests {
         )
         .expect("seed mcp");
 
-        merge_mcp_config(&path).expect("merge mcp");
+        merge_mcp_config(&path, None).expect("merge mcp");
 
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("read mcp")).expect("json");
@@ -3762,8 +3974,9 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result = install_mcp_for_agent(Agent::Codex, InstallScope::Local, Some(&root), &home)
-            .expect("install local mcp");
+        let result =
+            install_mcp_for_agent(Agent::Codex, InstallScope::Local, Some(&root), &home, None)
+                .expect("install local mcp");
         assert!(matches!(result.status, InstallStatus::Installed));
 
         let mcp_path = root.join(".mcp.json");
