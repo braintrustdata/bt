@@ -316,6 +316,9 @@ struct AuthLogoutArgs {
 }
 
 pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
+    if !base.json {
+        crate::ui::set_quiet(false);
+    }
     match args.command {
         AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
