@@ -408,7 +408,13 @@ struct SkillsAliasResult {
     path: PathBuf,
 }
 
-pub async fn run_setup_top(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
+pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()> {
+    if base.json && args.instrument {
+        bail!("--json conflicts with --instrument: JSON mode implies --no-instrument");
+    }
+    if base.json {
+        args.no_instrument = true;
+    }
     if args.verbose {
         base.verbose = true;
         crate::ui::set_quiet(false);
@@ -500,6 +506,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     let project_flag = base.project.clone();
     let login_ctx = ensure_auth(&mut base).await?;
     let mcp_api_key: String = login_ctx.login.api_key.clone();
+    let mcp_api_url: String = login_ctx.api_url.clone();
     let client = ApiClient::new(&login_ctx)?;
     let org = client.org_name().to_string();
     if verbose {
@@ -510,7 +517,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(2, "Project");
     }
-    let project = auto_select_project(&client, project_flag.as_deref()).await?;
+    let project = select_project(&client, project_flag.as_deref()).await?;
     if let Some(ref project) = project {
         if git_root.is_some() {
             let _ = maybe_init(&org, project);
@@ -648,6 +655,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 &home,
                 agents,
                 Some(mcp_api_key.as_str()),
+                Some(mcp_api_url.as_str()),
             );
             let mut any_installed = false;
             for r in &outcome.results {
@@ -914,14 +922,12 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
     Ok(true)
 }
 
-/// Automatically select or create a project for the wizard (no interactive prompts).
+/// Prompt the user to select a project from the org.
 ///
 /// - If `--project` was specified, look it up and return it.
-/// - If the org has 2+ projects, return `None` (no change).
-/// - If the org has exactly 1 project and it is the default "My Project", create
-///   `{whoami}-test` and return it.
-/// - If the org has 0 projects, create `{whoami}-test` and return it.
-async fn auto_select_project(
+/// - If the only project is the default "My Project" placeholder, auto-create `{whoami}-test`.
+/// - Otherwise, list all projects sorted alphabetically and let the user fuzzy-search and pick one.
+async fn select_project(
     client: &ApiClient,
     project_name: Option<&str>,
 ) -> Result<Option<crate::projects::api::Project>> {
@@ -941,31 +947,34 @@ async fn auto_select_project(
         };
     }
 
-    let projects = with_spinner(
+    let mut projects = with_spinner(
         "Loading projects...",
         crate::projects::api::list_projects(client),
     )
     .await?;
 
-    // 2+ real projects: leave the user's setup untouched.
-    if projects.len() >= 2 {
-        return Ok(None);
+    if projects.is_empty() {
+        bail!("no projects found in org '{}'", client.org_name());
     }
 
-    // Exactly one project: only proceed if it is the placeholder "My Project".
-    if projects.len() == 1 && projects[0].name != "My Project" {
-        return Ok(None);
+    // If the only project is the default "My Project" placeholder, auto-create one.
+    if projects.len() == 1 && projects[0].name == "My Project" {
+        let username = get_whoami_username();
+        let new_name = format!("{username}-test");
+        let project = with_spinner(
+            &format!("Creating project '{new_name}'..."),
+            crate::projects::api::create_project(client, &new_name),
+        )
+        .await?;
+        return Ok(Some(project));
     }
 
-    // 0 projects, or the sole project is the default placeholder: create a real one.
-    let username = get_whoami_username();
-    let new_name = format!("{username}-test");
-    let project = with_spinner(
-        &format!("Creating project '{new_name}'..."),
-        crate::projects::api::create_project(client, &new_name),
-    )
-    .await?;
-    Ok(Some(project))
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    let labels: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
+
+    let selection = ui::fuzzy_select("Select project", &labels, 0)?;
+
+    Ok(Some(projects[selection].clone()))
 }
 
 fn get_whoami_username() -> String {
@@ -1053,7 +1062,7 @@ async fn execute_skills_setup(
     args: &AgentsSetupArgs,
 ) -> Result<SkillsSetupOutcome> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let selection = resolve_setup_selection(args, &home)?;
+    let selection = resolve_setup_selection(args, &home, base.json)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
     let detected = selection.detected;
@@ -1200,7 +1209,7 @@ async fn run_instrument_setup(
             .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
     };
 
-    if args.agent.is_none() && ui::is_interactive() && !args.yes {
+    if args.agent.is_none() && ui::is_interactive() && !args.yes && !base.json {
         selected = prompt_instrument_agent(selected)?;
     } else if args.agent.is_some() && base.verbose && !args.yes {
         eprintln!(
@@ -1215,7 +1224,7 @@ async fn run_instrument_setup(
 
     let selected_languages: Vec<LanguageArg> = if !args.languages.is_empty() {
         args.languages.clone()
-    } else if ui::is_interactive() && !args.yes {
+    } else if ui::is_interactive() && !args.yes && !base.json {
         if hint_pending {
             eprintln!(
                 "   {}",
@@ -1294,7 +1303,7 @@ async fn run_instrument_setup(
         false
     } else if args.tui {
         true
-    } else if args.background || args.yes || !ui::is_interactive() {
+    } else if args.background || args.yes || !ui::is_interactive() || base.json {
         false
     } else {
         let pkg_mgrs = package_manager_cmds_for_languages(&selected_languages).join(", ");
@@ -2100,12 +2109,13 @@ fn execute_mcp_install(
     home: &Path,
     agents: &[Agent],
     api_key: Option<&str>,
+    api_url: Option<&str>,
 ) -> McpSetupOutcome {
     let mut warnings = Vec::new();
     let mut results = Vec::new();
 
     for agent in agents.iter().copied() {
-        let result = install_mcp_for_agent(agent, scope, local_root, home, api_key);
+        let result = install_mcp_for_agent(agent, scope, local_root, home, api_key, api_url);
         match result {
             Ok(r) => {
                 if matches!(r.status, InstallStatus::Skipped)
@@ -2140,10 +2150,9 @@ fn execute_mcp_install(
 
 async fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let api_key = crate::auth::resolve_auth(&base)
-        .await
-        .ok()
-        .and_then(|a| a.api_key);
+    let resolved = crate::auth::resolve_auth(&base).await.ok();
+    let api_key = resolved.as_ref().and_then(|a| a.api_key.clone());
+    let api_url = resolved.as_ref().and_then(|a| a.api_url.clone());
     let selection = resolve_mcp_selection(&args, &home)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
@@ -2156,6 +2165,7 @@ async fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
         &home,
         &selected_agents,
         api_key.as_deref(),
+        api_url.as_deref(),
     );
 
     if base.json {
@@ -2183,14 +2193,18 @@ async fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupSelection> {
+fn resolve_setup_selection(
+    args: &AgentsSetupArgs,
+    home: &Path,
+    json: bool,
+) -> Result<SetupSelection> {
     let mut scope = initial_scope(
         args.local,
         args.global,
-        args.yes,
+        args.yes || json,
         YesScopeDefault::LocalIfGit,
     );
-    let interactive = ui::is_interactive() && !args.yes;
+    let interactive = ui::is_interactive() && !args.yes && !json;
     let mut prompted_agents: Option<Vec<Agent>> = None;
     let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs {
         Some(Vec::new())
@@ -3031,12 +3045,13 @@ fn install_mcp_for_agent(
     local_root: Option<&Path>,
     home: &Path,
     api_key: Option<&str>,
+    api_url: Option<&str>,
 ) -> Result<AgentInstallResult> {
     // For Claude with global scope, write to ~/.claude.json top-level mcpServers via
     // `claude mcp add -s user`. This is the only path Claude Code reliably reads for
     // user-wide MCP — it does not expand ${VAR} placeholders in .mcp.json headers.
     if matches!(agent, Agent::Claude) && matches!(scope, InstallScope::Global) {
-        return install_mcp_for_claude_user(home, api_key);
+        return install_mcp_for_claude_user(home, api_key, api_url);
     }
 
     let path = match agent {
@@ -3062,7 +3077,8 @@ fn install_mcp_for_agent(
         }
     };
 
-    merge_mcp_config(&path, api_key)?;
+    let mcp_url = mcp_url_from_api_url(api_url);
+    merge_mcp_config(&path, api_key, &mcp_url)?;
 
     Ok(AgentInstallResult {
         agent,
@@ -3074,14 +3090,20 @@ fn install_mcp_for_agent(
 
 /// Install the Braintrust MCP server into Claude Code's user-wide config (~/.claude.json).
 /// Falls back to ~/.mcp.json if the `claude` CLI is not available.
-fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<AgentInstallResult> {
+fn install_mcp_for_claude_user(
+    home: &Path,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+) -> Result<AgentInstallResult> {
     let claude_json_path = home.join(".claude.json");
+
+    let mcp_url = mcp_url_from_api_url(api_url);
 
     let Some(key) = api_key else {
         // No API key available — fall back to ~/.mcp.json with env-var placeholder and
         // tell the user they need BRAINTRUST_API_KEY set for Claude Code to authenticate.
         let path = home.join(".mcp.json");
-        merge_mcp_config(&path, None)?;
+        merge_mcp_config(&path, None, &mcp_url)?;
         return Ok(AgentInstallResult {
             agent: Agent::Claude,
             status: InstallStatus::Installed,
@@ -3118,7 +3140,7 @@ fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<Age
             "--transport",
             "http",
             "braintrust",
-            "https://api.braintrust.dev/mcp",
+            mcp_url.as_str(),
             "-H",
             &header,
             "-s",
@@ -3140,7 +3162,7 @@ fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<Age
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // `claude` not in PATH — fall back to ~/.mcp.json
             let path = home.join(".mcp.json");
-            merge_mcp_config(&path, Some(key))?;
+            merge_mcp_config(&path, Some(key), &mcp_url)?;
             Ok(AgentInstallResult {
                 agent: Agent::Claude,
                 status: InstallStatus::Installed,
@@ -3152,7 +3174,12 @@ fn install_mcp_for_claude_user(home: &Path, api_key: Option<&str>) -> Result<Age
     }
 }
 
-fn merge_mcp_config(path: &Path, api_key: Option<&str>) -> Result<()> {
+fn mcp_url_from_api_url(api_url: Option<&str>) -> String {
+    let base = api_url.unwrap_or("https://api.braintrust.dev");
+    format!("{}/mcp", base.trim_end_matches('/'))
+}
+
+fn merge_mcp_config(path: &Path, api_key: Option<&str>, mcp_url: &str) -> Result<()> {
     let auth_value = match api_key {
         Some(key) => format!("Bearer {key}"),
         None => "Bearer ${BRAINTRUST_API_KEY}".to_string(),
@@ -3172,7 +3199,7 @@ fn merge_mcp_config(path: &Path, api_key: Option<&str>) -> Result<()> {
         "braintrust".to_string(),
         serde_json::json!({
             "type": "http",
-            "url": "https://api.braintrust.dev/mcp",
+            "url": mcp_url,
             "headers": {
                 "Authorization": auth_value
             }
@@ -3567,7 +3594,7 @@ mod tests {
         )
         .expect("seed mcp");
 
-        merge_mcp_config(&path, None).expect("merge mcp");
+        merge_mcp_config(&path, None, &mcp_url_from_api_url(None)).expect("merge mcp");
 
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("read mcp")).expect("json");
@@ -3660,7 +3687,8 @@ mod tests {
             yolo: false,
         };
         let home = std::env::temp_dir();
-        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
+        let selection =
+            resolve_setup_selection(&args, &home, false).expect("resolve setup selection");
         assert!(selection.selected_workflows.is_empty());
     }
 
