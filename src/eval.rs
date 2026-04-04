@@ -2147,13 +2147,9 @@ fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<C
         return Ok(command);
     }
 
-    let mut command = Command::new("npx");
-    command
-        .arg("--yes")
-        .arg("vite-node")
-        .arg(runner)
-        .args(files);
-    Ok(command)
+    anyhow::bail!(
+        "ESM retry requires vite-node, but no local or PATH vite-node binary was found. Install it in the eval workspace (for example `pnpm add -D vite-node`) or run `bt eval --runner vite-node ...` after installing it."
+    )
 }
 
 fn build_deno_js_command(
@@ -3539,6 +3535,30 @@ mod tests {
         let resolved = resolve_js_runner_command("vite-node", &files);
         assert_eq!(resolved, local_runner);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_vite_node_fallback_command_errors_when_vite_node_is_missing() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let previous_path = clear_env_var("PATH");
+
+        let dir = make_temp_dir("missing-vite-node");
+        let eval_dir = dir.join("evals");
+        std::fs::create_dir_all(&eval_dir).expect("eval dir should be created");
+
+        let file = eval_dir.join("sample.eval.ts");
+        std::fs::write(&file, "").expect("eval file should be written");
+
+        let err = build_vite_node_fallback_command(
+            Path::new("runner.ts"),
+            &[file.to_string_lossy().to_string()],
+        )
+        .expect_err("missing vite-node should error");
+
+        assert!(err.to_string().contains("ESM retry requires vite-node"));
+
+        restore_env_var("PATH", previous_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
