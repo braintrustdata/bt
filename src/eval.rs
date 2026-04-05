@@ -430,6 +430,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             &files,
             args.no_send_logs,
             &options,
+            false,
         )
         .await?;
         if !output.status.success() {
@@ -464,6 +465,7 @@ async fn run_eval_files_watch(
             files,
             no_send_logs,
             options,
+            true,
         )
         .await
         {
@@ -546,6 +548,7 @@ async fn run_eval_files_once(
     files: &[String],
     no_send_logs: bool,
     options: &EvalRunOptions,
+    collect_dependencies: bool,
 ) -> Result<EvalRunOutput> {
     let plan = build_eval_plan(files, language_override, runner_override)?;
     let console_policy = match plan.retry_policy {
@@ -590,12 +593,21 @@ async fn run_eval_files_once(
         eprintln!("Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`.");
     }
 
-    let mut dependencies =
-        normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
-    if plan.language == EvalLanguage::JavaScript {
-        let static_dependencies = collect_js_static_dependencies(files)?;
-        dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+    if let Some(message) = missing_vite_node_retry_message(&output) {
+        anyhow::bail!(message);
     }
+
+    let dependencies = if collect_dependencies {
+        let mut dependencies =
+            normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
+        if plan.language == EvalLanguage::JavaScript {
+            let static_dependencies = collect_js_static_dependencies(files)?;
+            dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+        }
+        dependencies
+    } else {
+        Vec::new()
+    };
 
     Ok(EvalRunOutput {
         status: output.status,
@@ -899,6 +911,26 @@ fn should_retry_esm(plan: &EvalPlan<'_>, output: &EvalAttemptOutput) -> bool {
         .iter()
         .chain(&output.error_messages)
         .any(|line| is_esm_interop_error(line))
+}
+
+fn missing_vite_node_retry_message(output: &EvalAttemptOutput) -> Option<&'static str> {
+    if output.runner_kind != RunnerKind::ViteNode {
+        return None;
+    }
+
+    let missing_runner = output
+        .stderr_lines
+        .iter()
+        .chain(&output.error_messages)
+        .any(|line| line.contains("vite-node: command not found"));
+    let exited_with_command_not_found = output.status.code() == Some(127);
+    if !missing_runner && !exited_with_command_not_found {
+        return None;
+    }
+
+    Some(
+        "The eval could not be retried in ESM mode. The initial `tsx` load hit an ESM/CJS interop error while loading the eval (for example an ESM-only dependency), and the `vite-node` fallback exited before the eval started. This usually means `vite-node` is not installed in this workspace or available on PATH. Install `vite-node` in the eval workspace, for example `pnpm add -D vite-node`, then rerun `bt eval`.",
+    )
 }
 
 fn has_ts_eval_files(files: &[String]) -> bool {
@@ -3428,6 +3460,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
+    }
+
+    fn success_status() -> ExitStatus {
+        exit_status(0)
+    }
+
     fn get_command_env(command: &Command, key: &str) -> Option<String> {
         command.as_std().get_envs().find_map(|(env_key, value)| {
             if env_key == OsStr::new(key) {
@@ -4012,6 +4060,37 @@ mod tests {
         assert!(should_set_node_heap_size(RunnerKind::Other));
         assert!(!should_set_node_heap_size(RunnerKind::Deno));
         assert!(!should_set_node_heap_size(RunnerKind::Bun));
+    }
+
+    #[test]
+    fn missing_vite_node_retry_message_is_user_facing() {
+        let output = EvalAttemptOutput {
+            status: success_status(),
+            dependency_files: Vec::new(),
+            error_messages: Vec::new(),
+            stderr_lines: vec!["sh: vite-node: command not found".to_string()],
+            runner_kind: RunnerKind::ViteNode,
+        };
+
+        let message = missing_vite_node_retry_message(&output).expect("missing vite-node message");
+        assert!(message.contains("could not be retried in ESM mode"));
+        assert!(message.contains("pnpm add -D vite-node"));
+        assert!(message.contains("`tsx` load hit an ESM/CJS interop error"));
+    }
+
+    #[test]
+    fn missing_vite_node_retry_message_uses_exit_code_127_fallback() {
+        let output = EvalAttemptOutput {
+            status: exit_status(127),
+            dependency_files: Vec::new(),
+            error_messages: Vec::new(),
+            stderr_lines: Vec::new(),
+            runner_kind: RunnerKind::ViteNode,
+        };
+
+        let message = missing_vite_node_retry_message(&output).expect("missing vite-node message");
+        assert!(message.contains("`vite-node` fallback exited before the eval started"));
+        assert!(message.contains("pnpm add -D vite-node"));
     }
 
     #[test]
