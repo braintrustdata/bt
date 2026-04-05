@@ -430,6 +430,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             &files,
             args.no_send_logs,
             &options,
+            false,
         )
         .await?;
         if !output.status.success() {
@@ -464,6 +465,7 @@ async fn run_eval_files_watch(
             files,
             no_send_logs,
             options,
+            true,
         )
         .await
         {
@@ -546,6 +548,7 @@ async fn run_eval_files_once(
     files: &[String],
     no_send_logs: bool,
     options: &EvalRunOptions,
+    collect_dependencies: bool,
 ) -> Result<EvalRunOutput> {
     let plan = build_eval_plan(files, language_override, runner_override)?;
     let console_policy = match plan.retry_policy {
@@ -590,12 +593,17 @@ async fn run_eval_files_once(
         eprintln!("Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`.");
     }
 
-    let mut dependencies =
-        normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
-    if plan.language == EvalLanguage::JavaScript {
-        let static_dependencies = collect_js_static_dependencies(files)?;
-        dependencies = merge_watch_paths(&dependencies, &static_dependencies);
-    }
+    let dependencies = if collect_dependencies {
+        let mut dependencies =
+            normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
+        if plan.language == EvalLanguage::JavaScript {
+            let static_dependencies = collect_js_static_dependencies(files)?;
+            dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+        }
+        dependencies
+    } else {
+        Vec::new()
+    };
 
     Ok(EvalRunOutput {
         status: output.status,
