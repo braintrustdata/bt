@@ -260,6 +260,7 @@ Examples:
   bt auth login
   bt auth profiles
   bt auth refresh
+  bt auth token --header
   bt auth logout --profile work
 ")]
 pub struct AuthArgs {
@@ -273,6 +274,8 @@ enum AuthCommand {
     Login(AuthLoginArgs),
     /// Force-refresh OAuth access token for a profile
     Refresh,
+    /// Print the resolved bearer token for the current auth context
+    Token(AuthTokenArgs),
     /// List auth profiles and check connection status
     Profiles(AuthProfilesArgs),
     /// Log out by removing a saved profile
@@ -283,6 +286,13 @@ enum AuthCommand {
 struct AuthProfilesArgs {
     #[arg(long)]
     verbose: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct AuthTokenArgs {
+    /// Print a full Authorization header instead of only the token
+    #[arg(long)]
+    header: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -319,8 +329,56 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     match args.command {
         AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
+        AuthCommand::Token(token_args) => run_token(&base, token_args).await,
         AuthCommand::Profiles(profile_args) => run_profiles(&base, profile_args).await,
         AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthTokenOutput {
+    token: String,
+    authorization_header: String,
+    api_url: Option<String>,
+    app_url: Option<String>,
+    org_name: Option<String>,
+}
+
+async fn run_token(base: &BaseArgs, args: AuthTokenArgs) -> Result<()> {
+    let auth = resolve_auth(base).await?;
+    let token = auth.api_key.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
+        )
+    })?;
+
+    if base.json {
+        println!(
+            "{}",
+            serde_json::to_string(&build_auth_token_output(&token, &auth))?
+        );
+        return Ok(());
+    }
+
+    if args.header {
+        println!("{}", format_authorization_header(&token));
+    } else {
+        println!("{token}");
+    }
+    Ok(())
+}
+
+fn format_authorization_header(token: &str) -> String {
+    format!("Authorization: Bearer {token}")
+}
+
+fn build_auth_token_output(token: &str, auth: &ResolvedAuth) -> AuthTokenOutput {
+    AuthTokenOutput {
+        token: token.to_string(),
+        authorization_header: format_authorization_header(token),
+        api_url: auth.api_url.clone(),
+        app_url: auth.app_url.clone(),
+        org_name: auth.org_name.clone(),
     }
 }
 
@@ -2981,6 +3039,37 @@ mod tests {
         let id = decode_jwt_identity("not-a-jwt");
         assert_eq!(id.name, None);
         assert_eq!(id.email, None);
+    }
+
+    #[test]
+    fn format_authorization_header_uses_standard_bearer_scheme() {
+        assert_eq!(
+            format_authorization_header("secret-token"),
+            "Authorization: Bearer secret-token"
+        );
+    }
+
+    #[test]
+    fn build_auth_token_output_includes_context() {
+        let output = build_auth_token_output(
+            "secret-token",
+            &ResolvedAuth {
+                api_key: Some("secret-token".to_string()),
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: Some("https://www.example.com".to_string()),
+                org_name: Some("acme".to_string()),
+                is_oauth: true,
+            },
+        );
+
+        assert_eq!(output.token, "secret-token");
+        assert_eq!(
+            output.authorization_header,
+            "Authorization: Bearer secret-token"
+        );
+        assert_eq!(output.api_url.as_deref(), Some("https://api.example.com"));
+        assert_eq!(output.app_url.as_deref(), Some("https://www.example.com"));
+        assert_eq!(output.org_name.as_deref(), Some("acme"));
     }
 
     #[test]
