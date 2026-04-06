@@ -84,9 +84,7 @@ fn init_creates_config_and_bt_gitignore_with_expected_tracking() {
     std::fs::create_dir_all(skills_doc.parent().unwrap()).expect("create skills docs dir");
     std::fs::write(&skills_doc, "docs").expect("write skills doc");
 
-    let cache_file = tmp
-        .path()
-        .join(".bt/cache/functions-runners/v1/functions-runner.ts");
+    let cache_file = tmp.path().join(".bt/cache/runners/v1/functions-runner.ts");
     std::fs::create_dir_all(cache_file.parent().unwrap()).expect("create cache dir");
     std::fs::write(&cache_file, "runner").expect("write cache file");
 
@@ -97,7 +95,7 @@ fn init_creates_config_and_bt_gitignore_with_expected_tracking() {
     ));
     assert!(git_check_ignore(
         tmp.path(),
-        ".bt/cache/functions-runners/v1/functions-runner.ts"
+        ".bt/cache/runners/v1/functions-runner.ts"
     ));
 }
 

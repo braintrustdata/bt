@@ -27,16 +27,18 @@ pub fn materialize_runner_script(
     Ok(path)
 }
 
-pub fn materialize_runner_script_in_cwd(
-    cache_subdir: &str,
+pub fn materialize_runner_script_in_cwd(file_name: &str, source: &str) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    materialize_runner_script_in_root(&cwd, file_name, source)
+}
+
+pub fn materialize_runner_script_in_root(
+    root: &Path,
     file_name: &str,
     source: &str,
 ) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = crate::bt_dir::cache_dir(&cwd)
-        .join(cache_subdir)
-        .join(env!("CARGO_PKG_VERSION"));
-    ensure_descendant_components_not_symlinks(&cwd, &cache_dir)?;
+    let cache_dir = crate::bt_dir::runners_cache_dir(root);
+    ensure_descendant_components_not_symlinks(root, &cache_dir)?;
     materialize_runner_script(&cache_dir, file_name, source)
 }
 

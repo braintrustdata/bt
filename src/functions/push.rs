@@ -981,7 +981,6 @@ fn build_js_bundle(
     let output_bundle = build_dir.path.join("bundle.js");
 
     let bundler_script = js_runner::materialize_runner_script_in_cwd(
-        "functions-runners",
         FUNCTIONS_JS_BUNDLER_FILE,
         FUNCTIONS_JS_BUNDLER_SOURCE,
     )
@@ -1046,7 +1045,6 @@ fn run_functions_runner(
     let mut command = match language {
         SourceLanguage::JsLike => {
             let _common = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
                 RUNNER_COMMON_FILE,
                 RUNNER_COMMON_SOURCE,
             )
@@ -1055,7 +1053,6 @@ fn run_functions_runner(
                 message: format!("failed to materialize shared runner helper: {err}"),
             })?;
             let runner_script = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
                 FUNCTIONS_JS_RUNNER_FILE,
                 FUNCTIONS_JS_RUNNER_SOURCE,
             )
@@ -1067,7 +1064,6 @@ fn run_functions_runner(
         }
         SourceLanguage::Python => {
             let _common = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
                 PYTHON_RUNNER_COMMON_FILE,
                 PYTHON_RUNNER_COMMON_SOURCE,
             )
@@ -1076,7 +1072,6 @@ fn run_functions_runner(
                 message: format!("failed to materialize shared Python runner helper: {err}"),
             })?;
             let runner_script = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
                 FUNCTIONS_PY_RUNNER_FILE,
                 FUNCTIONS_PY_RUNNER_SOURCE,
             )
