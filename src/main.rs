@@ -4,6 +4,7 @@ use std::ffi::{OsStr, OsString};
 
 mod args;
 mod auth;
+mod bt_dir;
 #[allow(dead_code)]
 mod config;
 mod env;

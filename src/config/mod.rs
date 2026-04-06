@@ -173,8 +173,8 @@ pub fn find_local_config_dir() -> Option<PathBuf> {
     let mut current_dir = std::env::current_dir().ok()?;
 
     loop {
-        if current_dir.join(".bt").is_dir() {
-            return Some(current_dir.join(".bt"));
+        if current_dir.join(crate::bt_dir::BT_DIR).is_dir() {
+            return Some(current_dir.join(crate::bt_dir::BT_DIR));
         }
         if current_dir.join(".git").exists() {
             return None;
@@ -189,7 +189,7 @@ pub fn find_local_config_dir() -> Option<PathBuf> {
 }
 
 pub fn local_path() -> Option<PathBuf> {
-    find_local_config_dir().map(|dir| dir.join("config.json"))
+    find_local_config_dir().map(|dir| dir.join(crate::bt_dir::CONFIG_FILE))
 }
 
 pub enum WriteTarget {
@@ -222,12 +222,10 @@ pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
     }
 }
 
-pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
-    let dir = std::env::current_dir()?.join(".bt");
-    if create_dir && !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
-    save_file(&dir.join("config.json"), config)
+pub fn save_local(config: &Config) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    crate::bt_dir::ensure_repo_layout(&cwd)?;
+    save_file(&crate::bt_dir::config_path(&cwd), config)
 }
 
 // --- CLI commands ---

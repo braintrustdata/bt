@@ -18,8 +18,11 @@ Examples:
 pub struct InitArgs {}
 
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
-    let bt_dir = std::env::current_dir()?.join(".bt");
-    if bt_dir.join("config.json").exists() {
+    let cwd = std::env::current_dir()?;
+    let config_path = crate::bt_dir::config_path(&cwd);
+
+    if config_path.exists() {
+        crate::bt_dir::ensure_repo_layout(&cwd)?;
         print_command_status(CommandStatus::Warning, "Already Initialized");
         return Ok(());
     }
@@ -52,7 +55,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         ..Default::default()
     };
 
-    config::save_local(&cfg, true)?;
+    config::save_local(&cfg)?;
 
     print_command_status(
         CommandStatus::Success,
