@@ -973,6 +973,11 @@ async fn select_project(
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     let labels: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
 
+    if ui::is_interactive() {
+        println!(
+            "A Braintrust project tracks one AI feature and contains its logs, experiments, datasets, and prompts."
+        );
+    }
     let selection = ui::fuzzy_select("Select project", &labels, 0)?;
 
     Ok(Some(projects[selection].clone()))

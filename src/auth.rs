@@ -1574,6 +1574,7 @@ fn select_login_org(
         }
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    println!("\n\nA Braintrust organization is usually a team or a company.");
     let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
     if allow_cross_org && selection == 0 {
         return Ok(None);
