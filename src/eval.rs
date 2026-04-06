@@ -2320,7 +2320,7 @@ fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> 
 
 fn prepare_js_runner_in_repo_cache() -> Result<PathBuf> {
     let root = resolve_runner_cache_root()?;
-    crate::js_runner::materialize_runner_script_in_root(&root, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+    crate::runner::materialize_runner_script_in_root(&root, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
@@ -2458,16 +2458,10 @@ fn prepare_eval_runners() -> Result<(PathBuf, PathBuf)> {
 
 fn prepare_eval_runners_in_root(root: &Path) -> Result<(PathBuf, PathBuf)> {
     crate::bt_dir::ensure_repo_layout(root)?;
-    let js_runner = crate::js_runner::materialize_runner_script_in_root(
-        root,
-        JS_RUNNER_FILE,
-        JS_RUNNER_SOURCE,
-    )?;
-    let py_runner = crate::js_runner::materialize_runner_script_in_root(
-        root,
-        PY_RUNNER_FILE,
-        PY_RUNNER_SOURCE,
-    )?;
+    let js_runner =
+        crate::runner::materialize_runner_script_in_root(root, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
+    let py_runner =
+        crate::runner::materialize_runner_script_in_root(root, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
     Ok((js_runner, py_runner))
 }
 
@@ -3520,7 +3514,7 @@ mod tests {
     fn materialize_runner_script_writes_file() {
         let root = make_temp_dir("write");
 
-        let path = crate::js_runner::materialize_runner_script_in_root(
+        let path = crate::runner::materialize_runner_script_in_root(
             &root,
             "runner.ts",
             "console.log('ok');",
@@ -3540,7 +3534,7 @@ mod tests {
         let path = cache_dir.join("runner.py");
         fs::write(&path, "stale").expect("stale file should be written");
 
-        crate::js_runner::materialize_runner_script_in_root(&root, "runner.py", "fresh")
+        crate::runner::materialize_runner_script_in_root(&root, "runner.py", "fresh")
             .expect("runner script should be updated");
         let contents = fs::read_to_string(path).expect("runner script should be readable");
         assert_eq!(contents, "fresh");
