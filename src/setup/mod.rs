@@ -717,26 +717,27 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             let instrument_agent =
                 determine_wizard_instrument_agent(flag_agent, git_root.as_deref(), &home);
 
-            let instrument_agent = if instrument_agent.is_none() && ui::is_interactive() {
-                // Multiple or zero detected agents — ask the user
-                let detected2 = detect_agents(git_root.as_deref(), &home);
-                let detected_set: BTreeSet<Agent> = detected2.iter().map(|s| s.agent).collect();
-                let candidates: Vec<Agent> = if detected_set.is_empty() {
-                    ALL_AGENTS.to_vec()
+            let instrument_agent =
+                if launch_agent && instrument_agent.is_none() && ui::is_interactive() {
+                    // Multiple or zero detected agents — ask the user
+                    let detected2 = detect_agents(git_root.as_deref(), &home);
+                    let detected_set: BTreeSet<Agent> = detected2.iter().map(|s| s.agent).collect();
+                    let candidates: Vec<Agent> = if detected_set.is_empty() {
+                        ALL_AGENTS.to_vec()
+                    } else {
+                        detected_set.into_iter().collect()
+                    };
+                    let default = pick_agent_mode_target(&candidates).unwrap_or(Agent::Claude);
+                    let selected = prompt_instrument_agent(default)?;
+                    Some(match selected {
+                        Agent::Claude => InstrumentAgentArg::Claude,
+                        Agent::Codex => InstrumentAgentArg::Codex,
+                        Agent::Cursor => InstrumentAgentArg::Cursor,
+                        Agent::Opencode => InstrumentAgentArg::Opencode,
+                    })
                 } else {
-                    detected_set.into_iter().collect()
+                    instrument_agent
                 };
-                let default = pick_agent_mode_target(&candidates).unwrap_or(Agent::Claude);
-                let selected = prompt_instrument_agent(default)?;
-                Some(match selected {
-                    Agent::Claude => InstrumentAgentArg::Claude,
-                    Agent::Codex => InstrumentAgentArg::Codex,
-                    Agent::Cursor => InstrumentAgentArg::Cursor,
-                    Agent::Opencode => InstrumentAgentArg::Opencode,
-                })
-            } else {
-                instrument_agent
-            };
 
             // Resolve languages: explicit flag > auto-detect from git root > prompt.
             let detected_languages = if !flag_languages.is_empty() {
@@ -1009,16 +1010,34 @@ fn determine_wizard_instrument_agent(
         });
     }
 
-    // Auto-detect: only use unambiguous single detection.
+    // Prefer runnable agents for instrumentation. Config directories can exist for
+    // agents that are not actually installed in this environment.
+    let runnable_agents = detect_runnable_agents();
     let detected = detect_agents(local_root, home);
-    let detected_agents: BTreeSet<Agent> = detected.iter().map(|s| s.agent).collect();
-    if detected_agents.len() == 1 {
-        return Some(match detected_agents.into_iter().next().unwrap() {
-            Agent::Claude => InstrumentAgentArg::Claude,
-            Agent::Codex => InstrumentAgentArg::Codex,
-            Agent::Cursor => InstrumentAgentArg::Cursor,
-            Agent::Opencode => InstrumentAgentArg::Opencode,
-        });
+    resolve_unambiguous_instrument_agent(&runnable_agents, &detected).map(map_agent_to_instrument)
+}
+
+fn map_agent_to_instrument(agent: Agent) -> InstrumentAgentArg {
+    match agent {
+        Agent::Claude => InstrumentAgentArg::Claude,
+        Agent::Codex => InstrumentAgentArg::Codex,
+        Agent::Cursor => InstrumentAgentArg::Cursor,
+        Agent::Opencode => InstrumentAgentArg::Opencode,
+    }
+}
+
+fn resolve_unambiguous_instrument_agent(
+    runnable_agents: &[Agent],
+    detected: &[DetectionSignal],
+) -> Option<Agent> {
+    let runnable_set: BTreeSet<Agent> = runnable_agents.iter().copied().collect();
+    if runnable_set.len() == 1 {
+        return runnable_set.into_iter().next();
+    }
+
+    let detected_set: BTreeSet<Agent> = detected.iter().map(|signal| signal.agent).collect();
+    if detected_set.len() == 1 {
+        return detected_set.into_iter().next();
     }
 
     None
@@ -1205,11 +1224,22 @@ async fn run_instrument_setup(
     let mut selected = if let Some(agent_arg) = args.agent {
         map_instrument_agent_arg(agent_arg)
     } else {
-        pick_agent_mode_target(&resolve_selected_agents(None, &detected))
+        let runnable_agents = detect_runnable_agents();
+        let candidate_agents = if runnable_agents.is_empty() {
+            resolve_selected_agents(None, &detected)
+        } else {
+            runnable_agents
+        };
+        pick_agent_mode_target(&candidate_agents)
             .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
     };
 
-    if args.agent.is_none() && ui::is_interactive() && !args.yes && !base.json {
+    if args.agent.is_none()
+        && ui::is_interactive()
+        && !args.yes
+        && !base.json
+        && detect_runnable_agents().len() != 1
+    {
         selected = prompt_instrument_agent(selected)?;
     } else if args.agent.is_some() && base.verbose && !args.yes {
         eprintln!(
@@ -2251,6 +2281,11 @@ fn resolve_setup_selection(
                     let local_root = resolve_local_root_for_scope(current_scope)?;
                     let detected = detect_agents(local_root.as_deref(), home);
                     let defaults = resolve_selected_agents(None, &detected);
+                    if defaults.len() == 1 {
+                        prompted_agents = Some(defaults);
+                        idx += 1;
+                        continue;
+                    }
                     match prompt_agents_selection(&defaults)? {
                         Some(selected) => {
                             prompted_agents = Some(selected);
@@ -2360,6 +2395,11 @@ fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSe
                     let local_root = resolve_local_root_for_scope(current_scope)?;
                     let detected = detect_agents(local_root.as_deref(), home);
                     let defaults = resolve_selected_agents(None, &detected);
+                    if defaults.len() == 1 {
+                        prompted_agents = Some(defaults);
+                        idx += 1;
+                        continue;
+                    }
                     match prompt_agents_selection(&defaults)? {
                         Some(selected) => {
                             prompted_agents = Some(selected);
@@ -2736,6 +2776,23 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
     candidates.first().copied()
 }
 
+fn detect_runnable_agents() -> Vec<Agent> {
+    let mut agents = Vec::new();
+    if command_exists("codex") {
+        agents.push(Agent::Codex);
+    }
+    if command_exists("claude") {
+        agents.push(Agent::Claude);
+    }
+    if command_exists("cursor-agent") {
+        agents.push(Agent::Cursor);
+    }
+    if command_exists("opencode") {
+        agents.push(Agent::Opencode);
+    }
+    agents
+}
+
 fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
     if requested.is_empty() || requested.contains(&WorkflowArg::All) {
         return ALL_WORKFLOWS.to_vec();
@@ -2773,11 +2830,6 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
                 Agent::Codex,
                 ".agents/skills exists in repo root",
             );
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                ".agents/skills exists in repo root",
-            );
         }
         if root.join("AGENTS.md").exists() {
             add_signal(&mut by_agent, Agent::Codex, "AGENTS.md exists in repo root");
@@ -2795,7 +2847,6 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
     }
     if home.join(".agents/skills").exists() {
         add_signal(&mut by_agent, Agent::Codex, "~/.agents/skills exists");
-        add_signal(&mut by_agent, Agent::Opencode, "~/.agents/skills exists");
     }
     if home.join(".opencode").exists() || home.join(".config/opencode").exists() {
         add_signal(
@@ -2805,11 +2856,28 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
         );
     }
 
+    if command_exists("codex") {
+        add_signal(&mut by_agent, Agent::Codex, "`codex` binary found in PATH");
+    }
     if command_exists("claude") {
         add_signal(
             &mut by_agent,
             Agent::Claude,
             "`claude` binary found in PATH",
+        );
+    }
+    if command_exists("cursor-agent") {
+        add_signal(
+            &mut by_agent,
+            Agent::Cursor,
+            "`cursor-agent` binary found in PATH",
+        );
+    }
+    if command_exists("opencode") {
+        add_signal(
+            &mut by_agent,
+            Agent::Opencode,
+            "`opencode` binary found in PATH",
         );
     }
 
@@ -3576,6 +3644,56 @@ mod tests {
         }];
         let resolved = resolve_selected_agents(None, &detected);
         assert_eq!(resolved, vec![Agent::Codex]);
+    }
+
+    #[test]
+    fn instrument_agent_resolution_prefers_single_runnable_agent() {
+        let detected = vec![
+            DetectionSignal {
+                agent: Agent::Claude,
+                reason: "config".to_string(),
+            },
+            DetectionSignal {
+                agent: Agent::Codex,
+                reason: "binary".to_string(),
+            },
+            DetectionSignal {
+                agent: Agent::Opencode,
+                reason: "config".to_string(),
+            },
+        ];
+
+        let resolved = resolve_unambiguous_instrument_agent(&[Agent::Codex], &detected);
+        assert_eq!(resolved, Some(Agent::Codex));
+    }
+
+    #[test]
+    fn instrument_agent_resolution_falls_back_to_single_detected_agent() {
+        let detected = vec![DetectionSignal {
+            agent: Agent::Codex,
+            reason: "config".to_string(),
+        }];
+
+        let resolved = resolve_unambiguous_instrument_agent(&[], &detected);
+        assert_eq!(resolved, Some(Agent::Codex));
+    }
+
+    #[test]
+    fn codex_shared_skill_path_does_not_imply_opencode() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("bt-detect-codex-home-{unique}"));
+        fs::create_dir_all(home.join(".agents/skills")).expect("create codex skill dir");
+
+        let detected = detect_agents(None, &home);
+        let inferred = resolve_selected_agents(None, &detected);
+
+        assert_eq!(inferred, vec![Agent::Codex]);
+        assert!(!detected
+            .iter()
+            .any(|signal| signal.agent == Agent::Opencode));
     }
 
     #[test]
