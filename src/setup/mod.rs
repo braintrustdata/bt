@@ -758,7 +758,6 @@ async fn select_project_with_skip(
 /// Returns `true` if config was written or already matched, `false` if user declined.
 fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool> {
     let cwd = std::env::current_dir()?;
-    crate::bt_dir::ensure_repo_layout(&cwd)?;
     let config_path = crate::bt_dir::config_path(&cwd);
 
     if config_path.exists() {
