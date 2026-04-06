@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use anyhow::bail;
 use anyhow::Result;
 
 use crate::utils::write_text_atomic;
@@ -28,6 +29,12 @@ pub fn cache_dir(root: &Path) -> PathBuf {
     bt_dir(root).join("cache")
 }
 
+pub fn runners_cache_dir(root: &Path) -> PathBuf {
+    cache_dir(root)
+        .join("runners")
+        .join(env!("CARGO_PKG_VERSION"))
+}
+
 pub fn state_dir(root: &Path) -> PathBuf {
     bt_dir(root).join("state")
 }
@@ -41,12 +48,18 @@ pub fn skills_docs_dir(root: &Path) -> PathBuf {
 }
 
 pub fn ensure_repo_layout(root: &Path) -> Result<()> {
-    std::fs::create_dir_all(bt_dir(root))?;
+    let dir = bt_dir(root);
+    ensure_not_symlink(&dir)?;
+    std::fs::create_dir_all(&dir)?;
+    ensure_not_symlink(&dir)?;
     ensure_bt_gitignore(root)
 }
 
 pub fn ensure_bt_gitignore(root: &Path) -> Result<()> {
+    let dir = bt_dir(root);
+    ensure_not_symlink(&dir)?;
     let path = gitignore_path(root);
+    ensure_not_symlink(&path)?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -70,8 +83,30 @@ fn upsert_managed_block(existing: &str) -> String {
     if user_tail.is_empty() {
         managed
     } else {
-        format!("{managed}\n{user_tail}\n")
+        let mut out = String::with_capacity(managed.len() + user_tail.len() + 2);
+        out.push_str(&managed);
+        if !user_tail.starts_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&user_tail);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out
     }
+}
+
+fn ensure_not_symlink(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("refusing to use symlink path {}", path.display());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
 }
 
 fn strip_managed_block(existing: &str) -> String {
@@ -126,5 +161,36 @@ mod tests {
     fn strip_managed_block_returns_input_when_markers_incomplete() {
         let existing = "# BEGIN bt-managed\nno-end";
         assert_eq!(strip_managed_block(existing), existing);
+    }
+
+    #[test]
+    fn upsert_is_idempotent_with_custom_rules() {
+        let existing =
+            "custom-before\n\n# BEGIN bt-managed\nold\n# END bt-managed\n\ncustom-after\n\n";
+        let once = upsert_managed_block(existing);
+        let twice = upsert_managed_block(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_repo_layout_rejects_symlinked_bt_dir() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-layout-symlink-{unique}"));
+        let target = std::env::temp_dir().join(format!("bt-layout-symlink-target-{unique}"));
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&target).expect("create target");
+        symlink(&target, root.join(BT_DIR)).expect("create symlinked .bt");
+
+        let err = ensure_repo_layout(&root).expect_err("must reject symlinked .bt");
+        assert!(err.to_string().contains("symlink"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
     }
 }
