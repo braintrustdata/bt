@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -2807,91 +2807,22 @@ fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
     out.into_iter().collect()
 }
 
-fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal> {
-    let mut by_agent: BTreeMap<Agent, BTreeSet<String>> = BTreeMap::new();
-
-    if let Some(root) = local_root {
-        if root.join(".claude").exists() {
-            add_signal(&mut by_agent, Agent::Claude, ".claude exists in repo root");
-        }
-        if root.join(".cursor").exists() {
-            add_signal(&mut by_agent, Agent::Cursor, ".cursor exists in repo root");
-        }
-        if root.join(".opencode").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                ".opencode exists in repo root",
-            );
-        }
-        if root.join(".agents").exists() || root.join(".agents/skills").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Codex,
-                ".agents/skills exists in repo root",
-            );
-        }
-        if root.join("AGENTS.md").exists() {
-            add_signal(&mut by_agent, Agent::Codex, "AGENTS.md exists in repo root");
+fn detect_agents(_local_root: Option<&Path>, _home: &Path) -> Vec<DetectionSignal> {
+    let mut signals = Vec::new();
+    for (binary, agent) in [
+        ("claude", Agent::Claude),
+        ("codex", Agent::Codex),
+        ("cursor-agent", Agent::Cursor),
+        ("opencode", Agent::Opencode),
+    ] {
+        if command_exists(binary) {
+            signals.push(DetectionSignal {
+                agent,
+                reason: format!("`{binary}` binary found in PATH"),
+            });
         }
     }
-
-    if home.join(".claude").exists() {
-        add_signal(&mut by_agent, Agent::Claude, "~/.claude exists");
-    }
-    if home.join(".cursor").exists() {
-        add_signal(&mut by_agent, Agent::Cursor, "~/.cursor exists");
-    }
-    if home.join(".codex").exists() {
-        add_signal(&mut by_agent, Agent::Codex, "~/.codex exists");
-    }
-    if home.join(".agents/skills").exists() {
-        add_signal(&mut by_agent, Agent::Codex, "~/.agents/skills exists");
-    }
-    if home.join(".opencode").exists() || home.join(".config/opencode").exists() {
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            "opencode config directory exists",
-        );
-    }
-
-    if command_exists("codex") {
-        add_signal(&mut by_agent, Agent::Codex, "`codex` binary found in PATH");
-    }
-    if command_exists("claude") {
-        add_signal(
-            &mut by_agent,
-            Agent::Claude,
-            "`claude` binary found in PATH",
-        );
-    }
-    if command_exists("cursor-agent") {
-        add_signal(
-            &mut by_agent,
-            Agent::Cursor,
-            "`cursor-agent` binary found in PATH",
-        );
-    }
-    if command_exists("opencode") {
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            "`opencode` binary found in PATH",
-        );
-    }
-
-    let mut out = Vec::new();
-    for (agent, reasons) in by_agent {
-        for reason in reasons {
-            out.push(DetectionSignal { agent, reason });
-        }
-    }
-    out
-}
-
-fn add_signal(map: &mut BTreeMap<Agent, BTreeSet<String>>, agent: Agent, reason: &str) {
-    map.entry(agent).or_default().insert(reason.to_string());
+    signals
 }
 
 fn install_claude(
@@ -3676,24 +3607,6 @@ mod tests {
 
         let resolved = resolve_unambiguous_instrument_agent(&[], &detected);
         assert_eq!(resolved, Some(Agent::Codex));
-    }
-
-    #[test]
-    fn codex_shared_skill_path_does_not_imply_opencode() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let home = std::env::temp_dir().join(format!("bt-detect-codex-home-{unique}"));
-        fs::create_dir_all(home.join(".agents/skills")).expect("create codex skill dir");
-
-        let detected = detect_agents(None, &home);
-        let inferred = resolve_selected_agents(None, &detected);
-
-        assert_eq!(inferred, vec![Agent::Codex]);
-        assert!(!detected
-            .iter()
-            .any(|signal| signal.agent == Agent::Opencode));
     }
 
     #[test]
