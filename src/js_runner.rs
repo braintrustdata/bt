@@ -33,8 +33,7 @@ pub fn materialize_runner_script_in_cwd(
     source: &str,
 ) -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = cwd
-        .join(".bt")
+    let cache_dir = crate::bt_dir::cache_dir(&cwd)
         .join(cache_subdir)
         .join(env!("CARGO_PKG_VERSION"));
     ensure_descendant_components_not_symlinks(&cwd, &cache_dir)?;

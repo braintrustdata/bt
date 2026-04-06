@@ -407,8 +407,10 @@ pub async fn stream_agent_output(
     display.finish();
 
     if let Some(result) = result_json {
-        let result_path = repo_root.join(".bt").join("last_instrument.json");
+        let state_dir = crate::bt_dir::state_dir(repo_root);
+        let result_path = state_dir.join("last_instrument.json");
         if let Ok(json) = serde_json::to_string_pretty(&result) {
+            let _ = std::fs::create_dir_all(&state_dir);
             let _ = std::fs::write(&result_path, json);
         }
     }

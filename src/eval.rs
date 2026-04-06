@@ -2320,8 +2320,7 @@ fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> 
 
 fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = cwd
-        .join(".bt")
+    let cache_dir = crate::bt_dir::cache_dir(&cwd)
         .join("eval-runners")
         .join(env!("CARGO_PKG_VERSION"));
     std::fs::create_dir_all(&cache_dir).with_context(|| {
