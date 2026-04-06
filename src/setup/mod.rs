@@ -4073,9 +4073,15 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result =
-            install_mcp_for_agent(Agent::Codex, InstallScope::Local, Some(&root), &home, None)
-                .expect("install local mcp");
+        let result = install_mcp_for_agent(
+            Agent::Codex,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            None,
+            None,
+        )
+        .expect("install local mcp");
         assert!(matches!(result.status, InstallStatus::Installed));
 
         let mcp_path = root.join(".mcp.json");
