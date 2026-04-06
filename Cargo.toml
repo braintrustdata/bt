@@ -76,6 +76,7 @@ install-success-msg = ""
 tempfile = "3"
 assert_cmd = "2.2.0"
 predicates = "3.1.4"
+rexpect = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
