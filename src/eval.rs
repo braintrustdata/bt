@@ -2313,7 +2313,7 @@ fn is_deno_runner_path(runner: &Path) -> bool {
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
     if is_ts_node_runner(runner_command) {
-        return crate::runner::materialize_runner_script_in_cwd(JS_RUNNER_FILE, JS_RUNNER_SOURCE);
+        return prepare_js_runner_in_repo_cache();
     }
     Ok(default_runner.to_path_buf())
 }
@@ -3717,13 +3717,14 @@ mod tests {
     }
 
     #[test]
-    fn select_js_runner_entrypoint_materializes_ts_node_in_cwd_cache() {
+    fn select_js_runner_entrypoint_materializes_ts_node_at_repo_cache_root() {
         let _guard = env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = make_temp_dir("ts-node-entrypoint");
         let cwd = root.join("package");
         fs::create_dir_all(&cwd).expect("create package directory");
+        fs::create_dir_all(root.join(".git")).expect("create git marker");
 
         let original_cwd = std::env::current_dir().expect("read current directory");
         std::env::set_current_dir(&cwd).expect("set cwd");
@@ -3732,7 +3733,7 @@ mod tests {
             let entrypoint =
                 select_js_runner_entrypoint(Path::new("repo-runner.ts"), Path::new(runner))
                     .expect("select runner entrypoint");
-            let expected_root = cwd
+            let expected_root = root
                 .join(".bt")
                 .join("cache")
                 .join("runners")
@@ -3754,6 +3755,10 @@ mod tests {
             let contents = fs::read_to_string(&entrypoint).expect("read materialized entrypoint");
             assert_eq!(contents, JS_RUNNER_SOURCE);
         }
+        assert!(
+            !cwd.join(".bt").exists(),
+            "ts-node runner cache should be written at repo root, not cwd"
+        );
 
         std::env::set_current_dir(&original_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(&root);
