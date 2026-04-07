@@ -494,6 +494,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         workflows: flag_workflows,
         languages: flag_languages,
     } = flags;
+    const LOGO: &str = include_str!("../../ascii-logo-blue-small.txt");
+    eprintln!("{LOGO}");
+    eprintln!("\x1b[34mBraintrust");
+    eprintln!("Eval everything\x1b[0m\n");
+
     let mut had_failures = false;
     let verbose = base.verbose;
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
