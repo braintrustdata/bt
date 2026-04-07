@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use anyhow::{bail, Result};
 use dialoguer::console::Term;
-use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 
 use crate::{http::ApiClient, projects::api, ui::with_spinner};
 
@@ -74,12 +74,29 @@ pub async fn select_project_interactive(
     }
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+
+    const CREATE_OPTION: &str = "+ Create new project";
+
+    let mut names: Vec<&str> = vec![CREATE_OPTION];
+    names.extend(projects.iter().map(|p| p.name.as_str()));
     let default = current
         .and_then(|c| names.iter().position(|n| *n == c))
-        .unwrap_or(0);
+        .unwrap_or(1);
 
     let label = select_label.unwrap_or("Select project");
     let selection = fuzzy_select(label, &names, default)?;
-    Ok(projects[selection].name.clone())
+
+    if selection == 0 {
+        let name: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("New project name")
+            .interact_text()?;
+        let project = with_spinner(
+            &format!("Creating project '{name}'..."),
+            api::create_project(client, &name),
+        )
+        .await?;
+        return Ok(project.name);
+    }
+
+    Ok(projects[selection - 1].name.clone())
 }
