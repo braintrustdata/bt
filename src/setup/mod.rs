@@ -503,6 +503,12 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     let verbose = base.verbose;
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let git_root = find_git_root();
+    if git_root.is_none() {
+        eprintln!(
+            "{} Not inside a git repository — the agent may edit files in the current directory.",
+            style("!").yellow()
+        );
+    }
 
     // ── Step 1: Auth ──
     if verbose {
@@ -700,7 +706,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(4, "Instrument");
     }
-    if git_root.is_some() {
+    {
         // Whether to launch the agent at the end of this step.
         // --no-instrument / interactive "no": set up skills/docs but skip the launch.
         // --instrument / non-interactive: always launch.
@@ -748,10 +754,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             let detected_languages = if !flag_languages.is_empty() {
                 flag_languages.clone()
             } else {
-                let auto = git_root
+                let detect_dir = git_root
                     .as_deref()
-                    .map(detect_languages_from_dir)
-                    .unwrap_or_default();
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let auto = detect_languages_from_dir(&detect_dir);
                 if !auto.is_empty() || !ui::is_interactive() {
                     auto
                 } else {
@@ -826,8 +833,6 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             )
             .await?;
         }
-    } else if verbose {
-        eprintln!("   {}", style("Skipped").dim());
     }
 
     // ── Done ──
@@ -1245,11 +1250,9 @@ async fn run_instrument_setup(
     print_hint: bool,
 ) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let root = find_git_root().ok_or_else(|| {
-        anyhow!(
-            "instrument setup requires running inside a git repository (could not find .git in parent chain)"
-        )
-    })?;
+    let root = find_git_root()
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().context("failed to get current directory"))?;
     let mut detected = detect_agents(Some(&root), &home);
 
     let mut selected = if let Some(agent_arg) = args.agent {
