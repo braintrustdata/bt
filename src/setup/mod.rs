@@ -976,16 +976,32 @@ async fn select_project(
     }
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
-    let labels: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
 
     if ui::is_interactive() {
         println!(
             "A Braintrust project tracks one AI feature and contains its logs, experiments, datasets, and prompts."
         );
     }
-    let selection = ui::fuzzy_select("Select project", &labels, 0)?;
 
-    Ok(Some(projects[selection].clone()))
+    const CREATE_OPTION: &str = "+ Create new project";
+    let mut labels: Vec<&str> = vec![CREATE_OPTION];
+    labels.extend(projects.iter().map(|p| p.name.as_str()));
+    let selection = ui::fuzzy_select("Select project", &labels, 1)?;
+
+    if selection == 0 {
+        let name: String =
+            dialoguer::Input::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                .with_prompt("New project name")
+                .interact_text()?;
+        let project = with_spinner(
+            &format!("Creating project '{name}'..."),
+            crate::projects::api::create_project(client, &name),
+        )
+        .await?;
+        return Ok(Some(project));
+    }
+
+    Ok(Some(projects[selection - 1].clone()))
 }
 
 fn get_whoami_username() -> String {
