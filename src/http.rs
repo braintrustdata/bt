@@ -168,6 +168,57 @@ impl ApiClient {
         request.send().await.context("request failed")
     }
 
+    pub async fn get_with_headers<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<T> {
+        let url = self.url(path);
+        let mut request = self.http.get(&url).bearer_auth(&self.api_key);
+
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+
+        let response = request.send().await.context("request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(HttpError { status, body }.into());
+        }
+
+        response.json().await.context("failed to parse response")
+    }
+
+    pub async fn put_with_headers<T, B>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
+        let url = self.url(path);
+        let mut request = self.http.put(&url).bearer_auth(&self.api_key).json(body);
+
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+
+        let response = request.send().await.context("request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(HttpError { status, body }.into());
+        }
+
+        response.json().await.context("failed to parse response")
+    }
+
     pub async fn delete(&self, path: &str) -> Result<()> {
         let url = self.url(path);
         let response = self
