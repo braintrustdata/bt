@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 
@@ -18,6 +20,7 @@ pub(crate) struct ResolvedContext {
 mod api;
 mod delete;
 mod list;
+mod push;
 mod view;
 
 #[derive(Debug, Clone, Args)]
@@ -25,6 +28,8 @@ mod view;
 Examples:
   bt prompts list
   bt prompts view my-prompt
+  bt prompts push my-prompt --file prompt.json
+  bt prompts push my-prompt --file prompt.json --environments staging,prod
   bt prompts delete my-prompt
 ")]
 pub struct PromptsArgs {
@@ -38,8 +43,50 @@ enum PromptsCommands {
     List,
     /// View a prompt's content
     View(ViewArgs),
+    /// Create or update a prompt
+    Push(PushArgs),
     /// Delete a prompt
     Delete(DeleteArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PushArgs {
+    /// Prompt slug — used as the unique identifier for upsert (positional)
+    #[arg(value_name = "SLUG")]
+    slug_positional: Option<String>,
+
+    /// Prompt slug (flag)
+    #[arg(long = "slug", short = 's')]
+    slug_flag: Option<String>,
+
+    /// Display name for the prompt (defaults to slug if omitted)
+    #[arg(long, short = 'n')]
+    name: Option<String>,
+
+    /// Path to a JSON file containing prompt_data
+    #[arg(long, short = 'f', value_name = "FILE")]
+    file: Option<PathBuf>,
+
+    /// Environments to associate with the prompt (comma-separated slugs)
+    #[arg(
+        long,
+        env = "BT_PROMPTS_PUSH_ENVIRONMENTS",
+        value_delimiter = ',',
+        value_name = "ENV"
+    )]
+    environments: Vec<String>,
+
+    /// Skip confirmation prompt
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+impl PushArgs {
+    fn slug(&self) -> Option<&str> {
+        self.slug_positional
+            .as_deref()
+            .or(self.slug_flag.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -118,6 +165,22 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         None | Some(PromptsCommands::List) => list::run(&ctx, base.json).await,
         Some(PromptsCommands::View(p)) => {
             view::run(&ctx, p.slug(), base.json, p.web, p.verbose).await
+        }
+        Some(PromptsCommands::Push(p)) => {
+            let slug = match p.slug() {
+                Some(s) => s.to_owned(),
+                None => anyhow::bail!("slug required. Use: bt prompts push <slug>"),
+            };
+            push::run(
+                &ctx,
+                &slug,
+                p.name.as_deref(),
+                p.file.as_deref(),
+                p.environments,
+                p.yes,
+                base.json,
+            )
+            .await
         }
         Some(PromptsCommands::Delete(p)) => delete::run(&ctx, p.slug(), p.force).await,
     }

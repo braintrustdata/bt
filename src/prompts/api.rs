@@ -16,6 +16,24 @@ pub struct Prompt {
     pub prompt_data: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct EnvironmentSlug {
+    pub slug: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpsertPromptPayload {
+    pub project_id: String,
+    pub name: String,
+    pub slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<EnvironmentSlug>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ListResponse {
     objects: Vec<Prompt>,
@@ -50,4 +68,8 @@ pub async fn get_prompt_by_slug(
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
     client.delete(&path).await
+}
+
+pub async fn upsert_prompt(client: &ApiClient, payload: &UpsertPromptPayload) -> Result<Prompt> {
+    client.post("/v1/prompt", payload).await
 }
