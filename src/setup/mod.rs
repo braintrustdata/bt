@@ -496,8 +496,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     } = flags;
     const LOGO: &str = include_str!("../../ascii-logo-blue-small.txt");
     eprintln!("{LOGO}");
-    eprintln!("\x1b[34mBraintrust");
-    eprintln!("Eval everything\x1b[0m\n");
+    eprintln!("\x1b[34mBraintrust\x1b[0m\n");
+    eprintln!("Welcome to the Braintrust SDK setup wizard");
+    eprintln!("Your coding agent will add instrumentation to your code and your first trace will be available in braintrust.dev (url provided by the agent).\n");
 
     let mut had_failures = false;
     let verbose = base.verbose;
@@ -987,9 +988,10 @@ async fn select_project(
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
     if ui::is_interactive() {
-        println!(
-            "A Braintrust project tracks one AI feature and contains its logs, experiments, datasets, and prompts."
-        );
+        println!("We advise you use one project per feature.");
+        println!("Evals and trace comparison only make sense between traces of the same feature.");
+        println!("Comparing traces is much easier when they are in the same project.");
+        println!("Moreover, access control can be tweaked per project.");
     }
 
     const CREATE_OPTION: &str = "+ Create new project";
