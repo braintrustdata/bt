@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::header::{HeaderValue, CONTENT_TYPE};
+use reqwest::header::HeaderValue;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,7 @@ impl ApiClient {
             return Err(HttpError { status, body }.into());
         }
 
-        parse_json_response(response).await
+        response.json().await.context("failed to parse response")
     }
 
     pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
@@ -100,7 +100,7 @@ impl ApiClient {
             return Err(HttpError { status, body }.into());
         }
 
-        parse_json_response(response).await
+        response.json().await.context("failed to parse response")
     }
 
     pub async fn post_with_headers<T, B>(
@@ -146,7 +146,7 @@ impl ApiClient {
             return Err(HttpError { status, body }.into());
         }
 
-        parse_json_response(response).await
+        response.json().await.context("failed to parse response")
     }
 
     pub async fn post_with_headers_raw<B>(
@@ -202,42 +202,6 @@ impl ApiClient {
 
         self.post_with_headers("/btql", &body, &headers).await
     }
-}
-
-async fn parse_json_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let body = response
-        .text()
-        .await
-        .context("failed to read response body")?;
-    serde_json::from_str(&body).with_context(|| {
-        let mut message = String::from("failed to parse response");
-        if let Some(content_type) = content_type.as_deref() {
-            message.push_str(&format!(" (content-type: {content_type})"));
-        }
-        let preview = preview_response_body(&body, 512);
-        if !preview.is_empty() {
-            message.push_str(&format!("; body: {preview}"));
-        }
-        message
-    })
-}
-
-fn preview_response_body(body: &str, max_chars: usize) -> String {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let mut preview = trimmed.chars().take(max_chars).collect::<String>();
-    if trimmed.chars().count() > max_chars {
-        preview.push_str("...");
-    }
-    preview
 }
 
 const UPLOAD_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
