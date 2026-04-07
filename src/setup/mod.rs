@@ -909,8 +909,16 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
             config::save_local(&existing, true)?;
             return Ok(true);
         }
+        let current = format!(
+            "{}/{}",
+            existing.org.as_deref().unwrap_or("?"),
+            existing.project.as_deref().unwrap_or("?")
+        );
         let update = Confirm::new()
-            .with_prompt(format!("Update .bt/config.json to {org}/{}?", project.name))
+            .with_prompt(format!(
+                "Update .bt/config.json from {current} to {org}/{}?",
+                project.name
+            ))
             .default(true)
             .interact()?;
         if !update {
@@ -959,10 +967,6 @@ async fn select_project(
     )
     .await?;
 
-    if projects.is_empty() {
-        bail!("no projects found in org '{}'", client.org_name());
-    }
-
     // If the only project is the default "My Project" placeholder, auto-create one.
     if projects.len() == 1 && projects[0].name == "My Project" {
         let username = get_whoami_username();
@@ -986,7 +990,8 @@ async fn select_project(
     const CREATE_OPTION: &str = "+ Create new project";
     let mut labels: Vec<&str> = vec![CREATE_OPTION];
     labels.extend(projects.iter().map(|p| p.name.as_str()));
-    let selection = ui::fuzzy_select("Select project", &labels, 1)?;
+    let default = if projects.is_empty() { 0 } else { 1 };
+    let selection = ui::fuzzy_select("Select project", &labels, default)?;
 
     if selection == 0 {
         let name: String =
