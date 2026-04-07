@@ -201,6 +201,7 @@ struct MockServerState {
     projects: Mutex<Vec<MockProject>>,
     pull_rows: Mutex<Vec<Value>>,
     environment_objects: Mutex<BTreeMap<String, Vec<Value>>>,
+    environment_upserts: Mutex<Vec<Value>>,
     uploaded_bundles: Mutex<Vec<Vec<u8>>>,
     inserted_functions: Mutex<Vec<Value>>,
     bundle_counter: Mutex<usize>,
@@ -231,6 +232,10 @@ impl MockServer {
                 .route(
                     "/environment-object/{object_type}/{object_id}",
                     web::get().to(mock_list_environment_objects),
+                )
+                .route(
+                    "/environment-object/{object_type}/{object_id}/{environment_slug}",
+                    web::put().to(mock_upsert_environment_object),
                 )
         })
         .workers(1)
@@ -368,7 +373,33 @@ async fn mock_insert_functions(
         .lock()
         .expect("inserted functions lock");
     inserted.extend(body.functions.clone());
-    HttpResponse::Ok().json(serde_json::json!({ "ignored_count": 0 }))
+    let functions = body
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(index, function)| {
+            let slug = function
+                .get("slug")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let project_id = function
+                .get("project_id")
+                .and_then(Value::as_str)
+                .unwrap_or("proj_mock");
+            serde_json::json!({
+                "id": format!("fn_inserted_{index}"),
+                "slug": slug,
+                "project_id": project_id,
+                "found_existing": false
+            })
+        })
+        .collect::<Vec<_>>();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "ignored_count": 0,
+        "xact_id": "0000000000000001",
+        "functions": functions
+    }))
 }
 
 async fn mock_list_functions(
@@ -423,6 +454,56 @@ async fn mock_list_environment_objects(
         .unwrap_or_default();
 
     HttpResponse::Ok().json(serde_json::json!({ "objects": rows }))
+}
+
+async fn mock_upsert_environment_object(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    body: web::Json<Value>,
+) -> HttpResponse {
+    log_request(&state, &req);
+    let object_type = req.match_info().get("object_type").unwrap_or_default();
+    let object_id = req.match_info().get("object_id").unwrap_or_default();
+    let environment_slug = req.match_info().get("environment_slug").unwrap_or_default();
+    let object_version = body
+        .get("object_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let org_name = body
+        .get("org_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    state
+        .environment_upserts
+        .lock()
+        .expect("environment upserts lock")
+        .push(serde_json::json!({
+            "object_type": object_type,
+            "object_id": object_id,
+            "environment_slug": environment_slug,
+            "object_version": object_version,
+            "org_name": org_name
+        }));
+
+    if object_type == "prompt"
+        && !object_id.trim().is_empty()
+        && !environment_slug.trim().is_empty()
+        && !object_version.trim().is_empty()
+    {
+        state
+            .environment_objects
+            .lock()
+            .expect("environment objects lock")
+            .entry(object_id.to_string())
+            .or_default()
+            .push(serde_json::json!({
+                "environment_slug": environment_slug,
+                "object_version": object_version
+            }));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({}))
 }
 
 fn log_request(state: &Arc<MockServerState>, req: &HttpRequest) {
@@ -1745,6 +1826,199 @@ exit 24
     assert!(
         decompressed.contains("globalThis._evals"),
         "uploaded bundle should contain original source"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_prompt_environments_upsert_after_insert() {
+    if !command_exists("node") {
+        eprintln!(
+            "Skipping functions_push_prompt_environments_upsert_after_insert (node not installed)."
+        );
+        return;
+    }
+
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("prompt.js");
+    std::fs::write(
+        &source,
+        "globalThis._evals ??= { functions: [], prompts: [], parameters: [], evaluators: {}, reporters: {} };\n",
+    )
+    .expect("write source file");
+
+    let runner = tmp.path().join("mock-runner.sh");
+    std::fs::write(
+        &runner,
+        r#"#!/bin/sh
+set -eu
+_runner_script="$1"
+shift
+_runner_name="$(basename "$_runner_script")"
+
+if [ "$_runner_name" = "functions-runner.ts" ]; then
+node - "$@" <<'NODE'
+const path = require("node:path");
+const files = process.argv.slice(2);
+const manifest = {
+  runtime_context: { runtime: "node", version: process.versions.node || "unknown" },
+  files: files.map((file) => ({
+    source_file: path.resolve(file),
+    entries: [
+      {
+        kind: "function_event",
+        project_id: "proj_mock",
+        event: {
+          project_id: "proj_mock",
+          name: "mock-prompt",
+          slug: "mock-prompt",
+          function_data: { type: "prompt" },
+          prompt_data: {
+            prompt: {
+              type: "chat",
+              messages: [{ role: "system", content: "Hello" }]
+            },
+            options: { model: "gpt-4o-mini" }
+          },
+          if_exists: "replace",
+          environments: [{ slug: "staging" }, "prod"]
+        }
+      }
+    ]
+  }))
+};
+process.stdout.write(JSON.stringify(manifest));
+NODE
+exit 0
+fi
+
+if [ "$_runner_name" = "functions-bundler.ts" ]; then
+  _source_file="$1"
+  _output_file="$2"
+  cp "$_source_file" "$_output_file"
+  exit 0
+fi
+
+echo "unexpected runner script: $_runner_name" >&2
+exit 24
+"#,
+    )
+    .expect("write mock runner");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&runner)
+        .expect("runner metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&runner, perms).expect("runner permissions");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--file",
+            source
+                .to_str()
+                .expect("source path should be valid UTF-8 for test"),
+            "--language",
+            "javascript",
+            "--runner",
+            runner
+                .to_str()
+                .expect("runner path should be valid UTF-8 for test"),
+            "--if-exists",
+            "replace",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions push");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock push failed:\n{stderr}");
+    }
+
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("parse push summary");
+    assert_eq!(summary["status"].as_str(), Some("success"));
+    assert_eq!(summary["uploaded_files"].as_u64(), Some(1));
+    assert_eq!(summary["failed_files"].as_u64(), Some(0));
+
+    let inserted = state
+        .inserted_functions
+        .lock()
+        .expect("inserted functions lock")
+        .clone();
+    assert_eq!(inserted.len(), 1, "exactly one function should be inserted");
+    let first = inserted[0].as_object().expect("inserted function object");
+    assert!(
+        first.get("environments").is_none(),
+        "insert payload should strip environments and use environment-object endpoint"
+    );
+
+    let upserts = state
+        .environment_upserts
+        .lock()
+        .expect("environment upserts lock")
+        .clone();
+    assert_eq!(upserts.len(), 2, "expected one upsert per environment");
+    let mut slugs = upserts
+        .iter()
+        .filter_map(|entry| entry.get("environment_slug").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    slugs.sort();
+    assert_eq!(slugs, vec!["prod".to_string(), "staging".to_string()]);
+    for upsert in &upserts {
+        assert_eq!(
+            upsert.get("object_type").and_then(Value::as_str),
+            Some("prompt")
+        );
+        assert_eq!(
+            upsert.get("object_id").and_then(Value::as_str),
+            Some("fn_inserted_0")
+        );
+        assert_eq!(
+            upsert.get("object_version").and_then(Value::as_str),
+            Some("0000000000000001")
+        );
+        assert_eq!(
+            upsert.get("org_name").and_then(Value::as_str),
+            Some("test-org")
+        );
+    }
+
+    let requests = state.requests.lock().expect("requests lock").clone();
+    assert!(
+        requests
+            .iter()
+            .any(|entry| entry == "/environment-object/prompt/fn_inserted_0/staging"),
+        "push should upsert staging environment for the inserted prompt"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|entry| entry == "/environment-object/prompt/fn_inserted_0/prod"),
+        "push should upsert prod environment for the inserted prompt"
     );
 }
 

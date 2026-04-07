@@ -23,6 +23,7 @@ use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PushFileReport, PushSummary, ReportError,
     SoftSkipReason,
 };
+use crate::http::ApiClient;
 use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
@@ -131,6 +132,12 @@ struct FunctionEventEntry {
 struct FileFailure {
     reason: HardFailureReason,
     message: String,
+}
+
+#[derive(Debug, Clone)]
+struct EnvironmentPlanEntry {
+    environment_slugs: Vec<String>,
+    if_exists: String,
 }
 
 fn error_chain(err: &anyhow::Error) -> String {
@@ -936,7 +943,7 @@ async fn push_file(
         });
     }
 
-    let insert_result = api::insert_functions(&auth_ctx.client, &function_events)
+    let insert_result = insert_functions_with_environment_workaround(&auth_ctx.client, &function_events)
         .await
         .map_err(|err| FileFailure {
             reason: HardFailureReason::InsertFunctionsFailed,
@@ -968,6 +975,194 @@ async fn push_file(
         ignored_entries,
         bundle_id,
     })
+}
+
+async fn insert_functions_with_environment_workaround(
+    client: &ApiClient,
+    function_events: &[Value],
+) -> Result<api::InsertFunctionsResult> {
+    let environment_plan = collect_environment_plan(function_events)?;
+    if !environment_plan.iter().any(Option::is_some) {
+        return api::insert_functions(client, function_events).await;
+    }
+
+    let stripped_events = strip_environments_from_function_events(function_events);
+    let insert_result = api::insert_functions(client, &stripped_events)
+        .await
+        .context("failed to insert functions")?;
+    apply_environment_plan(client, &insert_result, &environment_plan).await?;
+    Ok(insert_result)
+}
+
+fn collect_environment_plan(
+    function_events: &[Value],
+) -> Result<Vec<Option<EnvironmentPlanEntry>>> {
+    let mut plan = Vec::with_capacity(function_events.len());
+
+    for (index, function_event) in function_events.iter().enumerate() {
+        let object = function_event
+            .as_object()
+            .ok_or_else(|| anyhow!("function event entry {index} is not a JSON object"))?;
+
+        let Some(environments) = object.get("environments") else {
+            plan.push(None);
+            continue;
+        };
+        if environments.is_null() {
+            plan.push(None);
+            continue;
+        }
+
+        let environment_list = environments.as_array().ok_or_else(|| {
+            anyhow!("function event entry {index} has invalid 'environments' (expected array)")
+        })?;
+        if environment_list.len() > 10 {
+            bail!("function event entry {index} exceeds the maximum of 10 environments");
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut slugs = Vec::new();
+        for (env_index, env) in environment_list.iter().enumerate() {
+            let slug = env
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    env.as_object()
+                        .and_then(|value| value.get("slug"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "function event entry {index} has invalid environments[{env_index}] (expected string or object with non-empty slug)"
+                    )
+                })?;
+            if seen.insert(slug.to_string()) {
+                slugs.push(slug.to_string());
+            }
+        }
+        if slugs.is_empty() {
+            plan.push(None);
+            continue;
+        }
+
+        let function_type = object
+            .get("function_data")
+            .and_then(Value::as_object)
+            .and_then(|data| data.get("type"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let is_prompt_function = function_type.is_none() || function_type == Some("prompt");
+        if !is_prompt_function {
+            let function_type = function_type.unwrap_or("unknown");
+            bail!(
+                "environments is only supported for prompt functions, but got function_data.type=\"{function_type}\""
+            );
+        }
+
+        let if_exists = object
+            .get("if_exists")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("error")
+            .to_ascii_lowercase();
+        plan.push(Some(EnvironmentPlanEntry {
+            environment_slugs: slugs,
+            if_exists,
+        }));
+    }
+
+    Ok(plan)
+}
+
+fn strip_environments_from_function_events(function_events: &[Value]) -> Vec<Value> {
+    function_events
+        .iter()
+        .map(|function_event| {
+            let mut stripped = function_event.clone();
+            if let Some(object) = stripped.as_object_mut() {
+                object.remove("environments");
+            }
+            stripped
+        })
+        .collect()
+}
+
+async fn apply_environment_plan(
+    client: &ApiClient,
+    insert_result: &api::InsertFunctionsResult,
+    environment_plan: &[Option<EnvironmentPlanEntry>],
+) -> Result<()> {
+    if !environment_plan.iter().any(Option::is_some) {
+        return Ok(());
+    }
+    if insert_result.functions.len() != environment_plan.len() {
+        bail!(
+            "insert-functions response returned {} function records for {} inputs while applying environments",
+            insert_result.functions.len(),
+            environment_plan.len()
+        );
+    }
+
+    let has_updates = insert_result
+        .functions
+        .iter()
+        .zip(environment_plan.iter())
+        .any(|(inserted_function, plan_entry)| {
+            plan_entry.as_ref().is_some_and(|entry| {
+                !entry.environment_slugs.is_empty()
+                    && (!inserted_function.found_existing || entry.if_exists == "replace")
+            })
+        });
+    if !has_updates {
+        return Ok(());
+    }
+
+    let object_version = insert_result
+        .xact_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!("insert-functions response missing xact_id while applying environments")
+        })?
+        .to_string();
+
+    for (inserted_function, plan_entry) in
+        insert_result.functions.iter().zip(environment_plan.iter())
+    {
+        let Some(plan_entry) = plan_entry else {
+            continue;
+        };
+        if inserted_function.found_existing && plan_entry.if_exists != "replace" {
+            continue;
+        }
+
+        for environment_slug in &plan_entry.environment_slugs {
+            api::upsert_environment_object_for_prompt(
+                client,
+                &inserted_function.id,
+                environment_slug,
+                &object_version,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to upsert environment association for prompt '{}' ({}) in project '{}' and environment '{}'",
+                    inserted_function.slug,
+                    inserted_function.id,
+                    inserted_function.project_id,
+                    environment_slug
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn build_js_bundle(
@@ -3028,6 +3223,61 @@ mod tests {
         assert_eq!(calculate_upload_counts(3, Some(1)), (2, 1));
         assert_eq!(calculate_upload_counts(3, Some(10)), (0, 10));
         assert_eq!(calculate_upload_counts(3, None), (3, 0));
+    }
+
+    #[test]
+    fn environment_plan_collects_prompt_environments() {
+        let function_events = vec![serde_json::json!({
+            "project_id": "proj_1",
+            "slug": "hello",
+            "if_exists": "replace",
+            "function_data": { "type": "prompt" },
+            "environments": [{ "slug": "staging" }, "prod"],
+        })];
+
+        let plan = collect_environment_plan(&function_events).expect("collect plan");
+        assert_eq!(plan.len(), 1);
+        let entry = plan[0].as_ref().expect("plan entry");
+        assert_eq!(entry.environment_slugs, vec!["staging", "prod"]);
+        assert_eq!(entry.if_exists, "replace");
+    }
+
+    #[test]
+    fn environment_plan_rejects_non_prompt_function_type() {
+        let function_events = vec![serde_json::json!({
+            "project_id": "proj_1",
+            "slug": "hello",
+            "if_exists": "replace",
+            "function_data": { "type": "code" },
+            "environments": [{ "slug": "staging" }],
+        })];
+
+        let err = collect_environment_plan(&function_events).expect_err("must fail");
+        assert!(err
+            .to_string()
+            .contains("environments is only supported for prompt functions"));
+    }
+
+    #[test]
+    fn strip_environments_removes_environment_field() {
+        let function_events = vec![serde_json::json!({
+            "project_id": "proj_1",
+            "slug": "hello",
+            "environments": [{ "slug": "staging" }],
+            "metadata": { "source": "test" }
+        })];
+
+        let stripped = strip_environments_from_function_events(&function_events);
+        assert_eq!(stripped.len(), 1);
+        let obj = stripped[0].as_object().expect("object");
+        assert!(!obj.contains_key("environments"));
+        assert_eq!(
+            obj.get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("source"))
+                .and_then(Value::as_str),
+            Some("test")
+        );
     }
 
     #[test]
