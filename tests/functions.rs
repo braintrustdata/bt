@@ -200,6 +200,7 @@ struct MockServerState {
     requests: Mutex<Vec<String>>,
     projects: Mutex<Vec<MockProject>>,
     pull_rows: Mutex<Vec<Value>>,
+    environment_objects: Mutex<BTreeMap<String, Vec<Value>>>,
     uploaded_bundles: Mutex<Vec<Vec<u8>>>,
     inserted_functions: Mutex<Vec<Value>>,
     bundle_counter: Mutex<usize>,
@@ -227,6 +228,10 @@ impl MockServer {
                 .route("/upload/{bundle_id}", web::put().to(mock_upload_bundle))
                 .route("/insert-functions", web::post().to(mock_insert_functions))
                 .route("/v1/function", web::get().to(mock_list_functions))
+                .route(
+                    "/environment-object/{object_type}/{object_id}",
+                    web::get().to(mock_list_environment_objects),
+                )
         })
         .workers(1)
         .listen(listener)
@@ -397,6 +402,27 @@ async fn mock_list_functions(
     HttpResponse::Ok().json(serde_json::json!({
         "objects": filtered
     }))
+}
+
+async fn mock_list_environment_objects(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+) -> HttpResponse {
+    log_request(&state, &req);
+    let object_type = req.match_info().get("object_type").unwrap_or_default();
+    if object_type != "prompt" {
+        return HttpResponse::Ok().json(serde_json::json!({ "objects": [] }));
+    }
+    let object_id = req.match_info().get("object_id").unwrap_or_default();
+    let rows = state
+        .environment_objects
+        .lock()
+        .expect("environment objects lock")
+        .get(object_id)
+        .cloned()
+        .unwrap_or_default();
+
+    HttpResponse::Ok().json(serde_json::json!({ "objects": rows }))
 }
 
 fn log_request(state: &Arc<MockServerState>, req: &HttpRequest) {
@@ -2182,6 +2208,23 @@ async fn functions_pull_works_against_mock_api() {
             },
             "_xact_id": "0000000000000001"
         }));
+    state
+        .environment_objects
+        .lock()
+        .expect("environment objects lock")
+        .insert(
+            "fn_123".to_string(),
+            vec![
+                serde_json::json!({
+                    "environment_slug": "staging",
+                    "object_version": "0000000000000001"
+                }),
+                serde_json::json!({
+                    "environment_slug": "prod",
+                    "object_version": "0000000000000000"
+                }),
+            ],
+        );
 
     let server = MockServer::start(state.clone()).await;
 
@@ -2243,6 +2286,18 @@ async fn functions_pull_works_against_mock_api() {
         rendered.contains("gpt-4o-mini"),
         "rendered file should include model config"
     );
+    assert!(
+        rendered.contains("environments: ["),
+        "rendered file should include environments field"
+    );
+    assert!(
+        rendered.contains("\"staging\""),
+        "rendered file should include matching environment slug"
+    );
+    assert!(
+        !rendered.contains("\"prod\""),
+        "rendered file should omit non-matching environment versions"
+    );
 
     let requests = state.requests.lock().expect("requests lock").clone();
     assert!(
@@ -2252,6 +2307,12 @@ async fn functions_pull_works_against_mock_api() {
                 && entry.contains("slug=doc-search")
         }),
         "pull request should include selector query params"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|entry| entry == "/environment-object/prompt/fn_123"),
+        "pull should hydrate prompt environments from environment-object endpoint"
     );
 }
 
