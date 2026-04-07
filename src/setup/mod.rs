@@ -3710,6 +3710,12 @@ mod tests {
     }
 
     #[test]
+    fn rendered_skill_frontmatter_name_matches_braintrust_directory() {
+        let content = render_braintrust_skill();
+        assert!(content.starts_with("---\nname: braintrust\n"));
+    }
+
+    #[test]
     fn docs_cache_has_required_files_checks_workflows_and_sql_reference() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
