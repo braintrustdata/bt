@@ -2047,7 +2047,7 @@ async fn run_agent_invocation(
                 return command
                     .status()
                     .await
-                    .with_context(|| format!("failed to run agent command in {}", root.display()));
+                    .map_err(|e| agent_launch_error(e, program));
             }
 
             if !show_output {
@@ -2055,22 +2055,35 @@ async fn run_agent_invocation(
                 return command
                     .status()
                     .await
-                    .with_context(|| format!("failed to run agent command in {}", root.display()));
+                    .map_err(|e| agent_launch_error(e, program));
             }
 
             if *stream_json {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
                 let child = command
                     .spawn()
-                    .with_context(|| format!("failed to start {program}"))?;
+                    .map_err(|e| agent_launch_error(e, program))?;
                 agent_stream::stream_agent_output(child, root).await
             } else {
                 command
                     .status()
                     .await
-                    .with_context(|| format!("failed to run agent command in {}", root.display()))
+                    .map_err(|e| agent_launch_error(e, program))
             }
         }
+    }
+}
+
+fn agent_launch_error(e: std::io::Error, program: &str) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        let path = std::env::var("PATH").unwrap_or_default();
+        anyhow::anyhow!(
+            "tried to launch {} but didn't find it, PATH={}\n",
+            program,
+            path
+        )
+    } else {
+        anyhow::Error::new(e)
     }
 }
 

@@ -127,4 +127,14 @@ Summarize:
 - What logs/traces were emitted
 - The Braintrust permalink (required)
 
+---
+
+### 7. Next Steps
+
+Tell the user:
+
+- Braintrust agent skills have been installed and are available to your coding agent to help you integrate Braintrust into your product.
+- The Braintrust MCP server can be added to make your coding agent even more helpful when working with Braintrust — run `bt setup mcp` to install it. More information at https://www.braintrust.dev/docs/integrations/developer-tools/mcp
+- For more information on Braintrust, visit https://www.braintrust.dev/docs
+
 {WORKFLOW_CONTEXT}
