@@ -61,11 +61,11 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with = "skills")]
     no_skills: bool,
 
-    /// Set up MCP server [default]
+    /// Set up MCP server
     #[arg(long, conflicts_with = "no_mcp")]
     mcp: bool,
 
-    /// Do not set up MCP server
+    /// Do not set up MCP server [default]
     #[arg(long, conflicts_with = "mcp")]
     no_mcp: bool,
 
@@ -571,15 +571,15 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             .interact()?
     };
 
-    // MCP: same pattern.
-    let wants_mcp = if flag_no_mcp {
-        false
-    } else if flag_mcp || !interactive {
+    // MCP: opt-in via --mcp; off by default.
+    let wants_mcp = if flag_mcp {
         true
+    } else if flag_no_mcp || !interactive {
+        false
     } else {
         Confirm::new()
             .with_prompt("Set up MCP server?")
-            .default(true)
+            .default(false)
             .interact()?
     };
 
