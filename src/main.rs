@@ -94,7 +94,7 @@ Flags
 
 LEARN MORE
 Use `bt <command> <subcommand> --help` for more information about a command.
-Read the manual at https://braintrust.dev/docs/cli
+Read the manual at https://braintrust.dev/docs/reference/cli
 
 ";
 
