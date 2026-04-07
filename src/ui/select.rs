@@ -69,10 +69,6 @@ pub async fn select_project_interactive(
 ) -> Result<String> {
     let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
 
-    if projects.is_empty() {
-        bail!("no projects found in org '{}'", &client.org_name());
-    }
-
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
     const CREATE_OPTION: &str = "+ Create new project";
@@ -81,7 +77,7 @@ pub async fn select_project_interactive(
     names.extend(projects.iter().map(|p| p.name.as_str()));
     let default = current
         .and_then(|c| names.iter().position(|n| *n == c))
-        .unwrap_or(1);
+        .unwrap_or(if projects.is_empty() { 0 } else { 1 });
 
     let label = select_label.unwrap_or("Select project");
     let selection = fuzzy_select(label, &names, default)?;
