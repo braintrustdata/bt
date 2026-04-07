@@ -33,7 +33,13 @@ const BT_README: &str = include_str!("../../README.md");
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
     "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
 ];
-const ALL_AGENTS: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode];
+const ALL_AGENTS: [Agent; 5] = [
+    Agent::Claude,
+    Agent::Codex,
+    Agent::Cursor,
+    Agent::Gemini,
+    Agent::Opencode,
+];
 const ALL_WORKFLOWS: [WorkflowArg; 5] = [
     WorkflowArg::Instrument,
     WorkflowArg::Observe,
@@ -244,6 +250,7 @@ enum AgentArg {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Opencode,
 }
 
@@ -253,6 +260,7 @@ enum Agent {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Opencode,
 }
 
@@ -262,6 +270,7 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Cursor => "cursor",
+            Agent::Gemini => "gemini",
             Agent::Opencode => "opencode",
         }
     }
@@ -271,6 +280,7 @@ impl Agent {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",
             Agent::Cursor => "Cursor",
+            Agent::Gemini => "Gemini CLI",
             Agent::Opencode => "Opencode",
         }
     }
@@ -738,6 +748,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                         Agent::Claude => InstrumentAgentArg::Claude,
                         Agent::Codex => InstrumentAgentArg::Codex,
                         Agent::Cursor => InstrumentAgentArg::Cursor,
+                        Agent::Gemini => InstrumentAgentArg::Gemini,
                         Agent::Opencode => InstrumentAgentArg::Opencode,
                     })
                 } else {
@@ -1016,6 +1027,7 @@ fn determine_wizard_instrument_agent(
             AgentArg::Claude => InstrumentAgentArg::Claude,
             AgentArg::Codex => InstrumentAgentArg::Codex,
             AgentArg::Cursor => InstrumentAgentArg::Cursor,
+            AgentArg::Gemini => InstrumentAgentArg::Gemini,
             AgentArg::Opencode => InstrumentAgentArg::Opencode,
         });
     }
@@ -1032,6 +1044,7 @@ fn map_agent_to_instrument(agent: Agent) -> InstrumentAgentArg {
         Agent::Claude => InstrumentAgentArg::Claude,
         Agent::Codex => InstrumentAgentArg::Codex,
         Agent::Cursor => InstrumentAgentArg::Cursor,
+        Agent::Gemini => InstrumentAgentArg::Gemini,
         Agent::Opencode => InstrumentAgentArg::Opencode,
     }
 }
@@ -1111,6 +1124,7 @@ async fn execute_skills_setup(
             Agent::Claude => install_claude(scope, local_root.as_deref(), &home),
             Agent::Codex => install_codex(scope, local_root.as_deref(), &home),
             Agent::Cursor => install_cursor(scope, local_root.as_deref(), &home),
+            Agent::Gemini => install_gemini(scope, local_root.as_deref(), &home),
             Agent::Opencode => install_opencode(scope, local_root.as_deref(), &home),
         };
 
@@ -1178,6 +1192,7 @@ enum InstrumentAgentArg {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Opencode,
 }
 
@@ -1676,6 +1691,7 @@ fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
         Agent::Claude => AgentArg::Claude,
         Agent::Codex => AgentArg::Codex,
         Agent::Cursor => AgentArg::Cursor,
+        Agent::Gemini => AgentArg::Gemini,
         Agent::Opencode => AgentArg::Opencode,
     }
 }
@@ -1691,6 +1707,7 @@ fn skill_config_path(
         Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
         Agent::Codex | Agent::Opencode => root.join(".agents/skills/braintrust/SKILL.md"),
         Agent::Cursor => root.join(".cursor/rules/braintrust.mdc"),
+        Agent::Gemini => root.join(".gemini/GEMINI.md"),
     };
     Ok(path)
 }
@@ -1935,6 +1952,36 @@ fn resolve_instrument_invocation(
                     prompt_file_arg: None,
                     initial_prompt: None,
                     stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
+        Agent::Gemini => {
+            let mut gemini_args = vec![];
+            if bypass_permissions {
+                gemini_args.push("--yolo".to_string());
+            }
+            if interactive {
+                // Interactive TUI mode: positional prompt loads the task and starts the session.
+                InstrumentInvocation::Program {
+                    program: "gemini".to_string(),
+                    args: gemini_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                // Headless mode: `-p` reads the prompt as its value (passed via prompt_file_arg).
+                gemini_args.push("-p".to_string());
+                InstrumentInvocation::Program {
+                    program: "gemini".to_string(),
+                    args: gemini_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
                     interactive: false,
                 }
             }
@@ -2598,6 +2645,12 @@ fn doctor_agent_status(
                 .display()
                 .to_string(),
         ),
+        (Agent::Gemini, InstallScope::Local) => local_root
+            .map(|root| root.join(".gemini/GEMINI.md"))
+            .map(|p| p.display().to_string()),
+        (Agent::Gemini, InstallScope::Global) => {
+            Some(home.join(".gemini/GEMINI.md").display().to_string())
+        }
     };
 
     let configured = config_path
@@ -2772,6 +2825,7 @@ fn resolve_selected_agents(
         AgentArg::Claude => Agent::Claude,
         AgentArg::Codex => Agent::Codex,
         AgentArg::Cursor => Agent::Cursor,
+        AgentArg::Gemini => Agent::Gemini,
         AgentArg::Opencode => Agent::Opencode,
     }]
 }
@@ -2781,6 +2835,7 @@ fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
         InstrumentAgentArg::Claude => Agent::Claude,
         InstrumentAgentArg::Codex => Agent::Codex,
         InstrumentAgentArg::Cursor => Agent::Cursor,
+        InstrumentAgentArg::Gemini => Agent::Gemini,
         InstrumentAgentArg::Opencode => Agent::Opencode,
     }
 }
@@ -2810,6 +2865,9 @@ fn detect_runnable_agents() -> Vec<Agent> {
     if command_exists("cursor-agent") {
         agents.push(Agent::Cursor);
     }
+    if command_exists("gemini") {
+        agents.push(Agent::Gemini);
+    }
     if command_exists("opencode") {
         agents.push(Agent::Opencode);
     }
@@ -2836,6 +2894,7 @@ fn detect_agents(_local_root: Option<&Path>, _home: &Path) -> Vec<DetectionSigna
         ("claude", Agent::Claude),
         ("codex", Agent::Codex),
         ("cursor-agent", Agent::Cursor),
+        ("gemini", Agent::Gemini),
         ("opencode", Agent::Opencode),
     ] {
         if command_exists(binary) {
@@ -2955,6 +3014,34 @@ fn install_cursor(
             skill_path.display().to_string(),
             alias.path.display().to_string(),
         ],
+    })
+}
+
+fn install_gemini(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Result<AgentInstallResult> {
+    let root = scope_root(scope, local_root, home)?;
+    let skill_content = render_braintrust_skill();
+    let (skill_changed, _) = install_canonical_skill(root, &skill_content)?;
+    let gemini_path = root.join(".gemini/GEMINI.md");
+    let gemini_changed = write_text_file_if_changed(&gemini_path, &skill_content)?;
+    let changed = skill_changed || gemini_changed;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Gemini,
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
+        paths: vec![gemini_path.display().to_string()],
     })
 }
 
@@ -3089,6 +3176,13 @@ fn install_mcp_for_agent(
             }
             let root = scope_root(scope, local_root, home)?;
             root.join(".cursor/mcp.json")
+        }
+        Agent::Gemini => {
+            let root = scope_root(scope, local_root, home)?;
+            match scope {
+                InstallScope::Local => root.join(".gemini/settings.json"),
+                InstallScope::Global => home.join(".gemini/settings.json"),
+            }
         }
         Agent::Claude | Agent::Codex | Agent::Opencode => {
             let root = scope_root(scope, local_root, home)?;
