@@ -509,6 +509,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         no_workflow: flag_no_workflow,
         languages: flag_languages,
     } = flags;
+    const LOGO: &str = include_str!("../../ascii-logo-blue-small.txt");
+    eprintln!("{LOGO}");
+    eprintln!("\x1b[34mBraintrust");
+    eprintln!("Eval everything\x1b[0m\n");
+
     let mut had_failures = false;
     let verbose = base.verbose;
     let will_instrument = !flag_no_instrument && find_git_root().is_some();
