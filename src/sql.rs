@@ -58,15 +58,22 @@ struct SqlResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FreshnessState {
-    pub last_considered_xact_id: String,
-    pub last_processed_xact_id: String,
+    #[serde(default)]
+    pub last_considered_xact_id: Option<String>,
+    #[serde(default)]
+    pub last_processed_xact_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RealtimeState {
-    pub actual_xact_id: String,
-    pub minimum_xact_id: String,
-    pub read_bytes: u64,
+    #[serde(default)]
+    pub actual_xact_id: Option<String>,
+    #[serde(default)]
+    pub minimum_xact_id: Option<String>,
+    #[serde(default)]
+    pub read_bytes: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     #[serde(rename = "type")]
     pub state_type: String,
 }
