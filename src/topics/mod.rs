@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::{args::BaseArgs, projects::context::resolve_project_context};
+use crate::{
+    args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode,
+};
 
 pub(crate) mod api;
 mod config;
@@ -11,7 +13,7 @@ mod poke;
 mod rewind;
 mod status;
 
-pub(crate) type ResolvedContext = crate::projects::context::ProjectContext;
+pub(crate) type ResolvedContext = crate::project_context::ProjectContext;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -250,7 +252,7 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         Some(TopicsCommands::Config(config_args)) => config_args.command.is_none(),
         Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
     };
-    let ctx = resolve_project_context(&base, read_only).await?;
+    let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
     match args.command {
         None => {
