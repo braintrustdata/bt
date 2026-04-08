@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -517,10 +518,21 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     }
     let project_flag = base.project.clone();
     let login_ctx = ensure_auth(&mut base).await?;
-    let mcp_api_key: String = login_ctx.login.api_key.clone();
-    let mcp_api_url: String = login_ctx.api_url.clone();
     let client = ApiClient::new(&login_ctx)?;
     let org = client.org_name().to_string();
+
+    // After OAuth login, create a permanent API key if the user has none.
+    let resolved = auth::resolve_auth(&base).await.ok();
+    let is_oauth = resolved.map(|r| r.is_oauth).unwrap_or(false);
+    let has_explicit_key = base.api_key.is_some() || std::env::var("BRAINTRUST_API_KEY").is_ok();
+    let created_key = if is_oauth && !has_explicit_key {
+        maybe_create_api_key_for_oauth(&client).await?
+    } else {
+        None
+    };
+    let mcp_api_key: String = created_key.unwrap_or_else(|| login_ctx.login.api_key.clone());
+    let mcp_api_url: String = login_ctx.api_url.clone();
+
     if verbose {
         eprintln!("   {} Using org '{}'", style("✓").green(), org);
     }
@@ -1024,6 +1036,77 @@ fn get_whoami_username() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "user".to_string())
+}
+
+/// After an OAuth login in `bt setup`, create a permanent Braintrust API key so the user
+/// has a key they can use outside this session.
+///
+/// The key is stored in `BRAINTRUST_API_KEY` for the rest of the current process, printed
+/// once to stderr, and returned so it can be embedded in MCP config.
+async fn maybe_create_api_key_for_oauth(client: &ApiClient) -> Result<Option<String>> {
+    let username = get_whoami_username();
+    let base_name = format!("{username}-created-by-bt-setup");
+
+    // List existing keys to pick a non-duplicate name.
+    #[derive(serde::Deserialize)]
+    struct ApiKeyEntry {
+        name: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ApiKeyList {
+        objects: Vec<ApiKeyEntry>,
+    }
+
+    let existing: Vec<String> = client
+        .get::<ApiKeyList>("/v1/api_key")
+        .await
+        .map(|r| r.objects.into_iter().map(|k| k.name).collect())
+        .unwrap_or_default();
+
+    let name = if !existing.iter().any(|n| n == &base_name) {
+        base_name
+    } else {
+        (1u32..)
+            .map(|i| format!("{base_name}{i}"))
+            .find(|candidate| !existing.iter().any(|n| n == candidate))
+            .expect("name sequence is infinite")
+    };
+
+    #[derive(serde::Deserialize)]
+    struct CreatedKey {
+        key: String,
+    }
+
+    let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
+    let created: CreatedKey = client.post("/v1/api_key", &body).await?;
+
+    // Expose the key in the current process so later steps can use it.
+    std::env::set_var("BRAINTRUST_API_KEY", &created.key);
+
+    // Print once to stderr — the raw key is never retrievable again.
+    // Also print the export line so the user can add it to their shell.
+    eprintln!();
+    eprintln!(
+        "{} New API key '{}' created — displayed only once:",
+        style("!").yellow().bold(),
+        name,
+    );
+    eprintln!();
+    eprintln!("   {}", style(&created.key).bold());
+    eprintln!();
+    eprintln!("   To export it in your shell, run:");
+    eprintln!(
+        "   {}",
+        style(format!("export BRAINTRUST_API_KEY={}", created.key)).dim()
+    );
+    eprintln!(
+        "It is safe to cancel the setup now, export the key and restart the setup (with bt setup)."
+    );
+    eprintln!();
+    eprint!("   Press Enter to continue...");
+    let _ = std::io::stdin().lock().read_line(&mut String::new());
+
+    Ok(Some(created.key))
 }
 
 /// Determine which agent to use for instrumentation in the wizard.
