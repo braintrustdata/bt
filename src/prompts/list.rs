@@ -4,13 +4,14 @@ use anyhow::Result;
 use dialoguer::console;
 
 use crate::{
+    project_context::ProjectContext,
     ui::{apply_column_padding, header, print_with_pager, styled_table, truncate, with_spinner},
     utils::pluralize,
 };
 
-use super::{api, ResolvedContext};
+use super::api;
 
-pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
+pub async fn run(ctx: &ProjectContext, json: bool) -> Result<()> {
     let project_name = &ctx.project.name;
     let prompts = with_spinner(
         "Loading prompts...",

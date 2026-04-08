@@ -3,13 +3,12 @@ use dialoguer::Confirm;
 
 use crate::{
     http::ApiClient,
+    project_context::ProjectContext,
     prompts::api::{self, Prompt},
     ui::{self, is_interactive, print_command_status, with_spinner, CommandStatus},
 };
 
-use super::ResolvedContext;
-
-pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Result<()> {
+pub async fn run(ctx: &ProjectContext, slug: Option<&str>, force: bool) -> Result<()> {
     let project_name = &ctx.project.name;
     if force && slug.is_none() {
         bail!("slug required when using --force. Use: bt prompts delete <slug> --force");

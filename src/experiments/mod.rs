@@ -1,13 +1,11 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 
 use crate::{
     args::BaseArgs,
-    auth::login,
-    config,
     http::ApiClient,
-    projects::api::{get_project_by_name, Project},
-    ui::{self, is_interactive, select_project_interactive, with_spinner},
+    project_context::resolve_project_command_context,
+    ui::{self, with_spinner},
 };
 
 pub(crate) mod api;
@@ -17,11 +15,7 @@ mod view;
 
 use api::{self as experiments_api, Experiment};
 
-pub(crate) struct ResolvedContext {
-    pub client: ApiClient,
-    pub app_url: String,
-    pub project: Project,
-}
+pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -112,24 +106,7 @@ pub(crate) async fn select_experiment_interactive(
 }
 
 pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
-    let auth = login(&base).await?;
-    let client = ApiClient::new(&auth)?;
-    let config_project = config::load().ok().and_then(|c| c.project);
-    let project_name = match base.project.as_deref().or(config_project.as_deref()) {
-        Some(p) => p.to_string(),
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
-        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
-    };
-
-    let project = get_project_by_name(&client, &project_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
-
-    let ctx = ResolvedContext {
-        client,
-        app_url: auth.app_url,
-        project,
-    };
+    let ctx = resolve_project_command_context(&base).await?;
 
     match args.command {
         None | Some(ExperimentsCommands::List) => list::run(&ctx, base.json).await,

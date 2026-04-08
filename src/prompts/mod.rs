@@ -1,19 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::{
-    args::BaseArgs,
-    auth::login,
-    http::ApiClient,
-    projects::api::{get_project_by_name, Project},
-    ui::{is_interactive, select_project_interactive},
-};
-
-pub(crate) struct ResolvedContext {
-    pub client: ApiClient,
-    pub app_url: String,
-    pub project: Project,
-}
+use crate::{args::BaseArgs, project_context::resolve_project_command_context};
 
 mod api;
 mod delete;
@@ -93,26 +81,7 @@ impl DeleteArgs {
 }
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
-    let auth = login(&base).await?;
-    let client = ApiClient::new(&auth)?;
-    let project_name = match base
-        .project
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project))
-    {
-        Some(p) => p,
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
-        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
-    };
-
-    let project = get_project_by_name(&client, &project_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
-
-    let ctx = ResolvedContext {
-        client,
-        app_url: auth.app_url,
-        project,
-    };
+    let ctx = resolve_project_command_context(&base).await?;
 
     match args.command {
         None | Some(PromptsCommands::List) => list::run(&ctx, base.json).await,

@@ -4,14 +4,15 @@ use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
 use urlencoding::encode;
 
+use crate::project_context::ProjectContext;
 use crate::prompts::delete::select_prompt_interactive;
 use crate::ui::prompt_render::{render_options, render_prompt_block};
 use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
 
-use super::{api, ResolvedContext};
+use super::api;
 
 pub async fn run(
-    ctx: &ResolvedContext,
+    ctx: &ProjectContext,
     slug: Option<&str>,
     json: bool,
     web: bool,
