@@ -2851,7 +2851,7 @@ fn resolve_scope_from_flags(
     }
 
     if !ui::is_interactive() {
-        bail!("scope required in non-interactive mode: pass --local or --global");
+        return Ok(InstallScope::Global);
     }
 
     let choices = ["local (current git repo)", "global (user-wide)"];
