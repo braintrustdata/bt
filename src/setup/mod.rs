@@ -1295,6 +1295,17 @@ impl LanguageArg {
             LanguageArg::Ruby => "Ruby",
         }
     }
+
+    fn doc_filename(self) -> &'static str {
+        match self {
+            LanguageArg::Python => "python.md",
+            LanguageArg::TypeScript => "typescript.md",
+            LanguageArg::Go => "go.md",
+            LanguageArg::CSharp => "csharp.md",
+            LanguageArg::Java => "java.md",
+            LanguageArg::Ruby => "ruby.md",
+        }
+    }
 }
 
 fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
@@ -2184,7 +2195,21 @@ fn render_instrument_task(
     // Deduplicate languages (TypeScript and JavaScript both map to the same variant).
     let unique_langs: BTreeSet<LanguageArg> = languages.iter().copied().collect();
     let language_context = if unique_langs.is_empty() {
-        String::new()
+        "### 2. Detect Language\n\n\
+         Determine the project language using concrete signals:\n\n\
+         - `package.json` → TypeScript\n\
+         - `requirements.txt`, `setup.py` or `pyproject.toml` → Python\n\
+         - `pom.xml` or `build.gradle` → Java\n\
+         - `go.mod` → Go\n\
+         - `Gemfile` → Ruby\n\
+         - `.csproj` → C#\n\n\
+         If the language is not obvious from standard build/dependency files:\n\n\
+         - infer it from concrete repo evidence (e.g., entrypoint file extensions, build scripts, framework config)\n\
+         - State the single strongest piece of evidence you used\n\
+         - If still ambiguous (polyglot/monorepo), ask the user which service/app to instrument and wait for the response before proceeding\n\
+         - If the inferred language is not in the supported list, **abort the install**.\n\n\
+         If none match, **abort installation**."
+            .to_string()
     } else {
         let names: Vec<String> = unique_langs
             .iter()
@@ -2197,11 +2222,61 @@ fn render_instrument_task(
             format!("{} and {}", rest.join(", "), last)
         };
         format!(
-            "### Language Override\n\n\
-             Instrument {}. \
-             Skip Step 2 (language auto-detection) and proceed directly to Step 3 \
-             for the specified language(s).\n",
+            "### 2. Language\n\n\
+             The target language has been specified: {}. \
+             Proceed directly to Step 3.",
             list
+        )
+    };
+
+    let install_sdk_requirements = "- Pin an exact SDK version (resolve via package manager).\n\
+         - Modify only dependency files and a minimal application entry point (e.g., main/bootstrap). \
+         Auto-instrument the app (except for Java and C# which don't support auto-instrumentation).\n\
+         - Do not change unrelated code.";
+
+    let install_sdk_context = if unique_langs.is_empty() {
+        format!(
+            "### 3. Install SDK (Language-Specific)\n\n\
+             Read the install guide for the detected language from the local docs:\n\n\
+             | Language   | Local doc                         |\n\
+             | ---------- | --------------------------------- |\n\
+             | Java       | `{{SDK_INSTALL_DIR}}/java.md`       |\n\
+             | TypeScript | `{{SDK_INSTALL_DIR}}/typescript.md` |\n\
+             | Python     | `{{SDK_INSTALL_DIR}}/python.md`     |\n\
+             | Go         | `{{SDK_INSTALL_DIR}}/go.md`         |\n\
+             | Ruby       | `{{SDK_INSTALL_DIR}}/ruby.md`       |\n\
+             | C#         | `{{SDK_INSTALL_DIR}}/csharp.md`     |\n\n\
+             Requirements:\n\n\
+             {install_sdk_requirements}"
+        )
+    } else if unique_langs.len() == 1 {
+        let lang = *unique_langs.iter().next().unwrap();
+        format!(
+            "### 3. Install SDK\n\n\
+             Read the install guide from the local docs: `{{SDK_INSTALL_DIR}}/{}`\n\n\
+             Requirements:\n\n\
+             {install_sdk_requirements}",
+            lang.doc_filename()
+        )
+    } else {
+        let rows: String = unique_langs
+            .iter()
+            .map(|l| {
+                format!(
+                    "| {} | `{{SDK_INSTALL_DIR}}/{}` |\n",
+                    l.display_name(),
+                    l.doc_filename()
+                )
+            })
+            .collect();
+        format!(
+            "### 3. Install SDK\n\n\
+             Read the install guide for each language from the local docs:\n\n\
+             | Language | Local doc |\n\
+             | -------- | --------- |\n\
+             {rows}\n\
+             Requirements:\n\n\
+             {install_sdk_requirements}"
         )
     };
 
@@ -2229,10 +2304,11 @@ fn render_instrument_task(
     };
 
     INSTRUMENT_TASK_TEMPLATE
-        .replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
         .replace("{LANGUAGE_CONTEXT}", &language_context)
+        .replace("{INSTALL_SDK_CONTEXT}", &install_sdk_context)
         .replace("{WORKFLOW_CONTEXT}", &workflow_context)
         .replace("{RUN_MODE_CONTEXT}", run_mode_context)
+        .replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
 }
 
 struct McpSetupOutcome {
