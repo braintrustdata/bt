@@ -59,6 +59,17 @@ const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-ne
 const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
 const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
 const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
+const DEFAULT_EVAL_SAMPLE_SEED: u64 = 0;
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer '{value}'"))?;
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(parsed)
+}
 static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct EvalRunOutput {
@@ -295,6 +306,34 @@ pub struct EvalArgs {
     )]
     pub filter: Vec<String>,
 
+    /// Run only the first N dataset records. Marks the run as non-final.
+    #[arg(
+        long,
+        env = "BT_EVAL_FIRST",
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        conflicts_with = "sample"
+    )]
+    pub first: Option<usize>,
+
+    /// Run a deterministic random sample of N dataset records. Marks the run as non-final.
+    #[arg(
+        long,
+        env = "BT_EVAL_SAMPLE",
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        conflicts_with = "first"
+    )]
+    pub sample: Option<usize>,
+
+    /// Seed used with --sample.
+    #[arg(
+        long = "sample-seed",
+        env = "BT_EVAL_SAMPLE_SEED",
+        value_name = "SEED",
+        requires = "sample"
+    )]
+    pub sample_seed: Option<u64>,
     /// Re-run evals when input files change.
     #[arg(
         long,
@@ -342,6 +381,13 @@ pub struct EvalArgs {
     pub dev_allowed_origin: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalSamplingMode {
+    Full,
+    First { count: usize },
+    Sample { count: usize, seed: u64 },
+}
+
 #[derive(Debug, Clone)]
 struct EvalRunOptions {
     jsonl: bool,
@@ -349,6 +395,7 @@ struct EvalRunOptions {
     num_workers: Option<usize>,
     list: bool,
     filter: Vec<String>,
+    sampling: EvalSamplingMode,
     verbose: bool,
     extra_args: Vec<String>,
 }
@@ -371,6 +418,17 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     }
     validate_eval_input_files(&files)?;
 
+    let sampling = if let Some(first) = args.first {
+        EvalSamplingMode::First { count: first }
+    } else if let Some(sample) = args.sample {
+        EvalSamplingMode::Sample {
+            count: sample,
+            seed: args.sample_seed.unwrap_or(DEFAULT_EVAL_SAMPLE_SEED),
+        }
+    } else {
+        EvalSamplingMode::Full
+    };
+
     let options = EvalRunOptions {
         jsonl: args.jsonl,
         terminate_on_failure: args.terminate_on_failure,
@@ -378,6 +436,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         list: args.list,
         filter: args.filter,
         verbose: base.verbose,
+        sampling,
         extra_args: args.extra_args,
     };
 
@@ -737,6 +796,16 @@ async fn spawn_eval_runner(
         let serialized =
             serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
         cmd.env("BT_EVAL_FILTER_PARSED", serialized);
+    }
+    match options.sampling {
+        EvalSamplingMode::Full => {}
+        EvalSamplingMode::First { count } => {
+            cmd.env("BT_EVAL_FIRST", count.to_string());
+        }
+        EvalSamplingMode::Sample { count, seed } => {
+            cmd.env("BT_EVAL_SAMPLE", count.to_string());
+            cmd.env("BT_EVAL_SAMPLE_SEED", seed.to_string());
+        }
     }
     if language == EvalLanguage::JavaScript && force_esm {
         cmd.env("BT_EVAL_FORCE_ESM", "1");
@@ -2558,6 +2627,16 @@ struct ExperimentSummary {
     comparison_experiment_name: Option<String>,
     scores: HashMap<String, ScoreSummary>,
     metrics: Option<HashMap<String, MetricSummary>>,
+    #[serde(default)]
+    run_mode: Option<String>,
+    #[serde(default)]
+    is_final: Option<bool>,
+    #[serde(default)]
+    run_label: Option<String>,
+    #[serde(default)]
+    sample_count: Option<u64>,
+    #[serde(default)]
+    sample_seed: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -3038,6 +3117,15 @@ fn format_start_line(start: &ExperimentStart) -> Option<String> {
 
 fn format_experiment_summary(summary: &ExperimentSummary) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    if let Some(run_label) = summary.run_label.as_deref() {
+        let line = if summary.is_final == Some(false) {
+            run_label.yellow().to_string()
+        } else {
+            run_label.to_string()
+        };
+        parts.push(line);
+    }
 
     if let Some(comparison) = summary.comparison_experiment_name.as_deref() {
         let line = format!(
@@ -4233,6 +4321,63 @@ mod tests {
     }
 
     #[test]
+    fn handle_sse_event_parses_summary_run_metadata() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(
+            Some("summary".to_string()),
+            r#"{
+              "projectName":"Topics",
+              "experimentName":"sample-run",
+              "scores":{},
+              "runMode":"sample",
+              "isFinal":false,
+              "runLabel":"Run mode: random sample of 20 examples (seed 7, non-final smoke run)",
+              "sampleCount":20,
+              "sampleSeed":7
+            }"#
+            .to_string(),
+            &tx,
+        );
+
+        match rx.try_recv().expect("summary event should be emitted") {
+            EvalEvent::Summary(summary) => {
+                assert_eq!(summary.run_mode.as_deref(), Some("sample"));
+                assert_eq!(summary.is_final, Some(false));
+                assert_eq!(
+                    summary.run_label.as_deref(),
+                    Some("Run mode: random sample of 20 examples (seed 7, non-final smoke run)")
+                );
+                assert_eq!(summary.sample_count, Some(20));
+                assert_eq!(summary.sample_seed, Some(7));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_experiment_summary_includes_run_label() {
+        let summary = ExperimentSummary {
+            project_name: "Demo".to_string(),
+            experiment_name: "sample-run".to_string(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: None,
+            scores: HashMap::new(),
+            metrics: None,
+            run_mode: Some("first".to_string()),
+            is_final: Some(false),
+            run_label: Some("Run mode: first 20 examples (non-final smoke run)".to_string()),
+            sample_count: Some(20),
+            sample_seed: None,
+        };
+
+        let rendered = format_experiment_summary(&summary);
+        assert!(rendered.contains("Run mode: first 20 examples (non-final smoke run)"));
+    }
+
+    #[test]
     fn parse_eval_filter_expression_splits_path_and_pattern() {
         let parsed =
             parse_eval_filter_expression("metadata.case=smoke.*").expect("parse should succeed");
@@ -4265,6 +4410,52 @@ mod tests {
     }
 
     #[test]
+    fn eval_args_parse_first_sampling_flag() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+
+        let parsed = EvalArgsHarness::try_parse_from(["bt", "--first", "20", "sample.eval.ts"])
+            .expect("first flag should parse");
+        assert_eq!(parsed.eval.first, Some(20));
+        assert_eq!(parsed.eval.sample, None);
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
+    fn eval_args_parse_sample_and_seed_flags() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+
+        let parsed = EvalArgsHarness::try_parse_from([
+            "bt",
+            "--sample",
+            "20",
+            "--sample-seed",
+            "7",
+            "sample.eval.ts",
+        ])
+        .expect("sample flags should parse");
+        assert_eq!(parsed.eval.sample, Some(20));
+        assert_eq!(parsed.eval.sample_seed, Some(7));
+        assert_eq!(parsed.eval.first, None);
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
     fn eval_args_from_env_populates_supported_fields() {
         let _guard = env_test_lock()
             .lock()
@@ -4275,6 +4466,9 @@ mod tests {
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
+            "BT_EVAL_FIRST",
+            "BT_EVAL_SAMPLE",
+            "BT_EVAL_SAMPLE_SEED",
             "BT_EVAL_WATCH",
             "BT_EVAL_DEV",
             "BT_EVAL_DEV_HOST",

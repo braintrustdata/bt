@@ -116,6 +116,9 @@ type RunnerConfig = {
   list: boolean;
   terminateOnFailure: boolean;
   filters: EvalFilter[];
+  first: number | null;
+  sample: number | null;
+  sampleSeed: number | null;
   devMode: "list" | "eval" | null;
   devRequestJson: string | null;
 };
@@ -253,12 +256,45 @@ function parseDevMode(value: string | undefined): "list" | "eval" | null {
   throw new Error(`Invalid BT_EVAL_DEV_MODE value: ${value}`);
 }
 
+function parsePositiveIntegerEnv(name: string): number | null {
+  const value = process.env[name];
+  if (!value) {
+    return null;
+  }
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function parseIntegerEnv(name: string): number | null {
+  const value = process.env[name];
+  if (!value) {
+    return null;
+  }
+  if (!/^-?[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be an integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be an integer.`);
+  }
+  return parsed;
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
+    first: parsePositiveIntegerEnv("BT_EVAL_FIRST"),
+    sample: parsePositiveIntegerEnv("BT_EVAL_SAMPLE"),
+    sampleSeed: parseIntegerEnv("BT_EVAL_SAMPLE_SEED"),
     devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
     devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
   };
@@ -1487,6 +1523,218 @@ function resolveEvalData(
   throw new Error("Invalid eval data payload.");
 }
 
+type SamplingMetadata = {
+  runMode: "full" | "first" | "sample";
+  isFinal: boolean;
+  runLabel: string;
+  sampleCount?: number;
+  sampleSeed?: number;
+};
+
+function samplingMetadata(config: RunnerConfig): SamplingMetadata {
+  if (config.first !== null) {
+    return {
+      runMode: "first",
+      isFinal: false,
+      runLabel: `Run mode: first ${config.first} examples (non-final smoke run)`,
+      sampleCount: config.first,
+    };
+  }
+  if (config.sample !== null) {
+    const seed = config.sampleSeed ?? 0;
+    return {
+      runMode: "sample",
+      isFinal: false,
+      runLabel: `Run mode: random sample of ${config.sample} examples (seed ${seed}, non-final smoke run)`,
+      sampleCount: config.sample,
+      sampleSeed: seed,
+    };
+  }
+  return {
+    runMode: "full",
+    isFinal: true,
+    runLabel: "Run mode: full dataset",
+  };
+}
+
+function attachSamplingSummary(
+  summary: unknown,
+  config: RunnerConfig,
+): unknown {
+  const metadata = samplingMetadata(config);
+  if (isObject(summary)) {
+    return {
+      ...summary,
+      runMode: metadata.runMode,
+      isFinal: metadata.isFinal,
+      runLabel: metadata.runLabel,
+      ...(metadata.sampleCount !== undefined
+        ? { sampleCount: metadata.sampleCount }
+        : {}),
+      ...(metadata.sampleSeed !== undefined
+        ? { sampleSeed: metadata.sampleSeed }
+        : {}),
+    };
+  }
+  return {
+    summary,
+    runMode: metadata.runMode,
+    isFinal: metadata.isFinal,
+    runLabel: metadata.runLabel,
+    ...(metadata.sampleCount !== undefined
+      ? { sampleCount: metadata.sampleCount }
+      : {}),
+    ...(metadata.sampleSeed !== undefined
+      ? { sampleSeed: metadata.sampleSeed }
+      : {}),
+  };
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, "then") === "function"
+  );
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, Symbol.asyncIterator) === "function"
+  );
+}
+
+function isIterable(value: unknown): value is Iterable<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, Symbol.iterator) === "function"
+  );
+}
+
+function isDatasetLike(value: unknown): value is {
+  fetch: (options?: { batchSize?: number }) => AsyncIterable<unknown>;
+} {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, "fetch") === "function" &&
+    typeof Reflect.get(value, "summarize") === "function"
+  );
+}
+
+function createSeededRandom(seed: number): () => number {
+  let state = seed >>> 0 || 0x9e3779b9;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+async function resolveSamplingSource(source: unknown): Promise<unknown> {
+  let current: unknown = source;
+  while (true) {
+    current = isPromiseLike(current) ? await current : current;
+    if (typeof current !== "function") {
+      return current;
+    }
+    current = (current as () => unknown)();
+  }
+}
+
+async function* iterateDataSource(
+  source: unknown,
+  batchSizeHint?: number,
+): AsyncGenerator<unknown> {
+  const resolved = await resolveSamplingSource(source);
+  if (Array.isArray(resolved)) {
+    for (const item of resolved) {
+      yield item;
+    }
+    return;
+  }
+  if (isDatasetLike(resolved)) {
+    const options =
+      batchSizeHint !== undefined ? { batchSize: batchSizeHint } : undefined;
+    for await (const item of resolved.fetch(options)) {
+      yield item;
+    }
+    return;
+  }
+  if (isAsyncIterable(resolved)) {
+    for await (const item of resolved) {
+      yield item;
+    }
+    return;
+  }
+  if (typeof resolved !== "string" && isIterable(resolved)) {
+    for (const item of resolved) {
+      yield item;
+    }
+    return;
+  }
+  throw new Error(
+    "Sampling is only supported for arrays, iterables, async iterables, and Braintrust datasets.",
+  );
+}
+
+async function collectFirstRecords(
+  source: unknown,
+  count: number,
+): Promise<unknown[]> {
+  const items: unknown[] = [];
+  for await (const item of iterateDataSource(source, count)) {
+    items.push(item);
+    if (items.length >= count) {
+      break;
+    }
+  }
+  return items;
+}
+
+async function reservoirSampleRecords(
+  source: unknown,
+  count: number,
+  seed: number,
+): Promise<unknown[]> {
+  const random = createSeededRandom(seed);
+  const sample: unknown[] = [];
+  let seen = 0;
+  for await (const item of iterateDataSource(source)) {
+    seen += 1;
+    if (sample.length < count) {
+      sample.push(item);
+      continue;
+    }
+    const index = Math.floor(random() * seen);
+    if (index < count) {
+      sample[index] = item;
+    }
+  }
+  return sample;
+}
+
+async function applySamplingToData(
+  data: unknown,
+  config: RunnerConfig,
+): Promise<unknown> {
+  if (config.first !== null) {
+    return await collectFirstRecords(data, config.first);
+  }
+  if (config.sample !== null) {
+    return await reservoirSampleRecords(
+      data,
+      config.sample,
+      config.sampleSeed ?? 0,
+    );
+  }
+  return data;
+}
+
 function convertFunctionId(
   functionId: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -1886,8 +2134,13 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     const opts = makeEvalOptions(evaluatorName, options);
-    const wrappedEvaluator = wrapTaskForStreamingProgress(evaluator);
+    const sampledData = await applySamplingToData(evaluator.data, config);
+    const wrappedEvaluator = wrapTaskForStreamingProgress({
+      ...evaluator,
+      data: sampledData,
+    });
     const result = await Eval(projectName, wrappedEvaluator, opts);
+    const summary = attachSamplingSummary(result.summary, config);
     const failingResults = result.results.filter(
       (r: { error?: unknown }) => r.error !== undefined,
     );
@@ -1898,9 +2151,9 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
       );
     }
     if (sse) {
-      sse.send("summary", result.summary);
+      sse.send("summary", summary);
     } else if (config.jsonl) {
-      console.log(JSON.stringify(result.summary));
+      console.log(JSON.stringify(summary));
     }
     return result;
   };
