@@ -71,6 +71,10 @@ impl ApiClient {
         &self.api_key
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn org_name(&self) -> &str {
         &self.org_name
     }
