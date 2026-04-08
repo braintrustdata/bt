@@ -909,38 +909,16 @@ fn is_missing_credential_error(err: &anyhow::Error) -> bool {
         || msg.contains("no login credentials found")
 }
 
-/// Returns `true` if config was written or already matched, `false` if user declined.
+/// Returns `true` if config was written or already matched.
 fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool> {
     let config_path = std::env::current_dir()?.join(".bt").join("config.json");
 
     if config_path.exists() {
-        let mut existing = config::load_file(&config_path);
+        let existing = config::load_file(&config_path);
         let matches = existing.org.as_deref() == Some(org)
             && existing.project.as_deref() == Some(project.name.as_str());
         if matches && existing.project_id.as_deref() == Some(project.id.as_str()) {
             return Ok(true);
-        }
-        if matches {
-            existing.org = Some(org.to_string());
-            existing.project = Some(project.name.clone());
-            existing.project_id = Some(project.id.clone());
-            config::save_local(&existing, true)?;
-            return Ok(true);
-        }
-        let current = format!(
-            "{}/{}",
-            existing.org.as_deref().unwrap_or("?"),
-            existing.project.as_deref().unwrap_or("?")
-        );
-        let update = Confirm::new()
-            .with_prompt(format!(
-                "Update .bt/config.json from {current} to {org}/{}?",
-                project.name
-            ))
-            .default(true)
-            .interact()?;
-        if !update {
-            return Ok(false);
         }
     }
 
@@ -1100,7 +1078,7 @@ async fn maybe_create_api_key_for_oauth(client: &ApiClient) -> Result<Option<Str
         style(format!("export BRAINTRUST_API_KEY={}", created.key)).dim()
     );
     eprintln!(
-        "It is safe to cancel the setup now, export the key and restart the setup (with bt setup)."
+        "   It is safe to cancel the setup now, export the key and restart the setup (with bt setup)."
     );
     eprintln!();
     eprint!("   Press Enter to continue...");
