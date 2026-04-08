@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::BufRead as _;
+use std::io::{BufRead as _, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -737,19 +737,27 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         // Skills, docs, and the task file are always set up when a git root exists.
         // Only the agent launch is conditional.
         {
-            // Determine agent: explicit flag > single detected > ask user
+            // Determine agent: explicit flag > ask user (when terminal available) > auto-detect
             let instrument_agent =
                 determine_wizard_instrument_agent(flag_agent, git_root.as_deref(), &home);
 
             let instrument_agent =
-                if launch_agent && instrument_agent.is_none() && ui::is_interactive() {
-                    // Multiple or zero detected agents — ask the user
-                    let detected2 = detect_agents(git_root.as_deref(), &home);
-                    let detected_set: BTreeSet<Agent> = detected2.iter().map(|s| s.agent).collect();
-                    let candidates: Vec<Agent> = if detected_set.is_empty() {
-                        ALL_AGENTS.to_vec()
+                if launch_agent && flag_agent.is_none() && std::io::stderr().is_terminal() {
+                    // No explicit --agent flag and we have a terminal — always ask the user.
+                    // console reads input from /dev/tty when stdin is piped, so this works
+                    // even when bt is launched from a shell script (e.g. echo "bt setup" | sh).
+                    let runnable = detect_runnable_agents();
+                    let candidates: Vec<Agent> = if !runnable.is_empty() {
+                        runnable
                     } else {
-                        detected_set.into_iter().collect()
+                        let detected2 = detect_agents(git_root.as_deref(), &home);
+                        let detected_set: BTreeSet<Agent> =
+                            detected2.iter().map(|s| s.agent).collect();
+                        if detected_set.is_empty() {
+                            ALL_AGENTS.to_vec()
+                        } else {
+                            detected_set.into_iter().collect()
+                        }
                     };
                     let default = pick_agent_mode_target(&candidates).unwrap_or(Agent::Claude);
                     let selected = prompt_instrument_agent(default)?;
@@ -809,7 +817,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                         .interact()?;
                     idx == 0
                 } else {
-                    true
+                    // Default to TUI when the agent was explicitly chosen (user expects it)
+                    // or when a terminal is available. Fall back to background only when
+                    // auto-selecting an agent in a fully headless environment.
+                    flag_agent.is_some() || std::io::stderr().is_terminal()
                 };
                 let yolo = if flag_yolo {
                     true
@@ -1310,7 +1321,6 @@ impl LanguageArg {
 
 fn should_prompt_setup_action(base: &BaseArgs, args: &AgentsSetupArgs) -> bool {
     !base.json
-        && ui::is_interactive()
         && !args.no_fetch_docs
         && !args.refresh_docs
         && args.workers == crate::sync::default_workers()
@@ -1861,7 +1871,7 @@ fn prompt_instrument_agent(default_agent: Agent) -> Result<Agent> {
         .position(|agent| *agent == default_agent)
         .unwrap_or(0);
     let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agent to instrument this repo")
+        .with_prompt("Select an agent to instrument this repo. This agent must already be installed, and will run in the current folder to install the Braintrust SDK.")
         .items(&choices)
         .default(default_index)
         .interact_opt()?;
@@ -2140,6 +2150,12 @@ async fn run_agent_invocation(
 
             if *interactive {
                 // Inherit all streams so the user can interact with the agent directly.
+                #[cfg(unix)]
+                if !std::io::stdin().is_terminal() {
+                    if let Ok(tty) = fs::File::open("/dev/tty") {
+                        command.stdin(Stdio::from(tty));
+                    }
+                }
                 return command
                     .status()
                     .await
