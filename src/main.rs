@@ -14,6 +14,7 @@ mod functions;
 mod http;
 mod init;
 mod js_runner;
+mod project_context;
 mod projects;
 mod prompts;
 mod python_runner;

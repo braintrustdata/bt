@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use clap::{builder::BoolishValueParser, Args, Subcommand, ValueEnum};
 
 use crate::{
     args::BaseArgs,
     auth::{login, AvailableOrg},
-    config,
     http::ApiClient,
-    projects::api::{get_project_by_name, Project},
-    ui::{self, is_interactive, select_project_interactive, with_spinner},
+    project_context::{resolve_project_optional, resolve_required_project},
+    projects::api::Project,
+    ui::{self, with_spinner},
 };
 
 pub(crate) mod api;
@@ -456,11 +456,7 @@ pub(crate) struct AuthContext {
     pub org_id: String,
 }
 
-pub(crate) struct ResolvedContext {
-    pub client: ApiClient,
-    pub app_url: String,
-    pub project: Project,
-}
+pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 
 pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext> {
     let ctx = login(base).await?;
@@ -512,9 +508,7 @@ pub(crate) async fn resolve_project_context(
     base: &BaseArgs,
     auth_ctx: &AuthContext,
 ) -> Result<Project> {
-    resolve_project_context_optional(base, auth_ctx, true)
-        .await?
-        .ok_or_else(|| anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))
+    resolve_required_project(base, &auth_ctx.client, true).await
 }
 
 pub(crate) async fn resolve_project_context_optional(
@@ -522,22 +516,7 @@ pub(crate) async fn resolve_project_context_optional(
     auth_ctx: &AuthContext,
     allow_interactive_selection: bool,
 ) -> Result<Option<Project>> {
-    let config_project = config::load().ok().and_then(|c| c.project);
-    let project_name = match base.project.as_deref().or(config_project.as_deref()) {
-        Some(p) => Some(p.to_string()),
-        None if allow_interactive_selection && is_interactive() => {
-            Some(select_project_interactive(&auth_ctx.client, None, None).await?)
-        }
-        None => None,
-    };
-
-    match project_name {
-        Some(project_name) => get_project_by_name(&auth_ctx.client, &project_name)
-            .await?
-            .map(Some)
-            .ok_or_else(|| anyhow!("project '{project_name}' not found")),
-        None => Ok(None),
-    }
+    resolve_project_optional(base, &auth_ctx.client, allow_interactive_selection).await
 }
 
 async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
@@ -995,13 +974,15 @@ mod tests {
             .expect("parse");
         assert!(function_command_is_read_only(parsed.args.command.as_ref()));
 
-        let parsed =
-            FunctionArgsHarness::try_parse_from(["bt-tools", "delete", "--slug", "my-tool", "--force"])
-                .expect("parse");
+        let parsed = FunctionArgsHarness::try_parse_from([
+            "bt-tools", "delete", "--slug", "my-tool", "--force",
+        ])
+        .expect("parse");
         assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
 
-        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools", "invoke", "--slug", "my-tool"])
-            .expect("parse");
+        let parsed =
+            FunctionArgsHarness::try_parse_from(["bt-tools", "invoke", "--slug", "my-tool"])
+                .expect("parse");
         assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
     }
 
@@ -1014,8 +995,9 @@ mod tests {
         let parsed = FunctionsArgsHarness::try_parse_from(["bt-functions", "list"]).expect("parse");
         assert!(functions_command_is_read_only(parsed.args.command.as_ref()));
 
-        let parsed = FunctionsArgsHarness::try_parse_from(["bt-functions", "view", "--slug", "my-fn"])
-            .expect("parse");
+        let parsed =
+            FunctionsArgsHarness::try_parse_from(["bt-functions", "view", "--slug", "my-fn"])
+                .expect("parse");
         assert!(functions_command_is_read_only(parsed.args.command.as_ref()));
 
         let parsed = FunctionsArgsHarness::try_parse_from([
