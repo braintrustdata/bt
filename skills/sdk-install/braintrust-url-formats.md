@@ -4,19 +4,19 @@
 
 ### Experiments
 
-`https://www.braintrust.dev/app/{org}/p/{project}/experiments/{experiment_name}?r={root_span_id}&s={span_id}`
+`https://BRAINTRUST_APP_URL/{org}/p/{project}/experiments/{experiment_name}?r={root_span_id}&s={span_id}`
 
 ### Datasets
 
-`https://www.braintrust.dev/app/{org}/p/{project}/datasets/{dataset_name}?r={root_span_id}`
+`https://BRAINTRUST_APP_URL/{org}/p/{project}/datasets/{dataset_name}?r={root_span_id}`
 
 ### Project Logs
 
-`https://www.braintrust.dev/app/{org}/p/{project}/logs?r={root_span_id}&s={span_id}`
+`https://BRAINTRUST_APP_URL/{org}/p/{project}/logs?r={root_span_id}&s={span_id}`
 
 ## Legacy Object URLs
 
-`https://www.braintrust.dev/app/object?object_type=...&object_id=...&id=...`
+`https://BRAINTRUST_APP_URL/object?object_type=...&object_id=...&id=...`
 
 ## URL Parameters
 
@@ -25,6 +25,8 @@
 | r         | The root_span_id - identifies a trace                     |
 | s         | The span_id - identifies a specific span within the trace |
 | id        | Legacy parameter for root_span_id in object URLs          |
+| BRAINTRUST_APP_URL | url where the app is accessible, www.braintrust.dev/app for non self-hosted instances. See the env variable BRAINTRUST_APP_URL 9and use www.braintrust.dev/app if it is not set) |
+
 
 ## Notes
 
