@@ -6,6 +6,7 @@ mod args;
 mod auth;
 #[allow(dead_code)]
 mod config;
+mod datasets;
 mod env;
 #[cfg(unix)]
 mod eval;
@@ -60,6 +61,7 @@ Core
 
 Projects & resources
   projects     Manage projects
+  datasets     Manage datasets
   prompts      Manage prompts
   functions    Manage functions (tools, scorers, and more)
   tools        Manage tools
@@ -130,6 +132,8 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Manage datasets
+    Datasets(CLIArgs<datasets::DatasetsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
@@ -167,6 +171,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
+            Commands::Datasets(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
             Commands::SelfCommand(cmd) => &cmd.base,
             Commands::Tools(cmd) => &cmd.base,
@@ -221,6 +226,7 @@ async fn try_main() -> Result<()> {
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+        Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
