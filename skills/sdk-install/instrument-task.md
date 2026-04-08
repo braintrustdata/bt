@@ -47,7 +47,7 @@ If not set, **abort installation immediately**.
 Determine the project language using concrete signals:
 
 - `package.json` → TypeScript
-- `requirements.txt` or `pyproject.toml` → Python
+- `requirements.txt`, `setup.py` or `pyproject.toml` → Python
 - `pom.xml` or `build.gradle` → Java
 - `go.mod` → Go
 - `Gemfile` → Ruby
@@ -80,7 +80,7 @@ Read the install guide for the detected language from the local docs:
 Requirements:
 
 - Pin an exact SDK version (resolve via package manager).
-- Modify only dependency files and a minimal application entry point (e.g., main/bootstrap).
+- Modify only dependency files and a minimal application entry point (e.g., main/bootstrap). Auto-instrument the app (except for Java and C# which don't support auto-instrumentation).
 - Do not change unrelated code.
 
 ---
@@ -108,13 +108,7 @@ Most language SDKs print a direct URL to the emitted trace after the app runs. C
 
 If the SDK does not print a URL, construct one manually using the URL format documented in `{SDK_INSTALL_DIR}/braintrust-url-formats.md`:
 
-```
-https://www.braintrust.dev/app/{org}/p/{project_name}/logs?r={root_span_id}
-```
-
-- `org`: your Braintrust organization slug
-- `project_name`: the project name set in code
-- `root_span_id`: the trace/span ID returned or logged by the SDK
+See `{SDK_INSTALL_DIR}/braintrust-url-formats.md` for the url format.
 
 ---
 
