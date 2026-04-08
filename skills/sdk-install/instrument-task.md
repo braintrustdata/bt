@@ -71,8 +71,6 @@ Most language SDKs print a direct URL to the emitted trace after the app runs. C
 
 If the SDK does not print a URL, construct one manually using the URL format documented in `{SDK_INSTALL_DIR}/braintrust-url-formats.md`:
 
-See `{SDK_INSTALL_DIR}/braintrust-url-formats.md` for the url format.
-
 ---
 
 ### 6. Final Summary
