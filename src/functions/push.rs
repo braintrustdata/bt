@@ -1448,23 +1448,18 @@ fn validate_python_bundle(
     }
 
     let source_list: Vec<PathBuf> = sources.into_iter().collect();
+    let archive_root = infer_python_archive_root(entry_module, source_path)?;
+    for source in &source_list {
+        let archive_path = archive_source_path(source, &archive_root)?;
+        validate_python_archive_path(&archive_path)?;
+    }
+
     if !entry_module_matches_sources(entry_module, &source_list, allowed_roots) {
         bail!(
             "python_bundle.entry_module '{}' does not match any bundled source module for '{}'",
             entry_module,
             source_path.display()
         );
-    }
-
-    let archive_root = infer_python_archive_root(entry_module, source_path)?;
-    for source in &source_list {
-        if !source.starts_with(&archive_root) {
-            bail!(
-                "python source '{}' is outside inferred archive root '{}'",
-                source.display(),
-                archive_root.display()
-            );
-        }
     }
 
     Ok(ValidatedPythonBundle {
@@ -1675,6 +1670,25 @@ fn archive_source_path(source: &Path, archive_root: &Path) -> Result<PathBuf> {
         );
     }
     Ok(rel.to_path_buf())
+}
+
+fn validate_python_archive_path(archive_path: &Path) -> Result<()> {
+    for component in archive_path.iter() {
+        let component = component.to_str().ok_or_else(|| {
+            anyhow!(
+                "python bundle source path contains invalid utf-8: {}",
+                archive_path.display()
+            )
+        })?;
+        if component.chars().any(char::is_whitespace) {
+            bail!(
+                "python bundle source path '{}' contains whitespace in path component '{}'; rename the file or directory before running `bt functions push`",
+                archive_path.display(),
+                component
+            );
+        }
+    }
+    Ok(())
 }
 
 fn copy_directory_files_into_stage(source_root: &Path, stage_root: &Path) -> Result<()> {
@@ -3221,6 +3235,66 @@ mod tests {
         assert!(err
             .message
             .contains("does not match any bundled source module"));
+    }
+
+    fn assert_whitespace_in_filename_rejected(filename: &str, entry_module: &str) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join(filename);
+        std::fs::write(&source, "VALUE = 1\n").expect("write source file");
+        let source = source.canonicalize().expect("canonicalize source");
+        let root = dir.path().canonicalize().expect("canonicalize root");
+
+        let manifest = RunnerManifest {
+            runtime_context: RuntimeContext {
+                runtime: "python".to_string(),
+                version: "3.12.0".to_string(),
+            },
+            files: vec![ManifestFile {
+                source_file: source.to_string_lossy().to_string(),
+                entries: vec![ManifestEntry::Code(CodeEntry {
+                    project_id: None,
+                    project_name: None,
+                    name: "Tool".to_string(),
+                    slug: "tool".to_string(),
+                    description: None,
+                    function_type: Some("tool".to_string()),
+                    if_exists: None,
+                    metadata: None,
+                    tags: None,
+                    function_schema: None,
+                    location: Some(serde_json::json!({"type":"function","index":0})),
+                    preview: None,
+                })],
+                python_bundle: Some(PythonBundle {
+                    entry_module: entry_module.to_string(),
+                    sources: vec![source.to_string_lossy().to_string()],
+                }),
+            }],
+            baseline_dep_versions: vec![],
+        };
+
+        let err = validate_manifest_paths(
+            &manifest,
+            std::slice::from_ref(&source),
+            SourceLanguage::Python,
+            std::slice::from_ref(&root),
+        )
+        .expect_err("must fail");
+        assert_eq!(err.reason, HardFailureReason::ManifestSchemaInvalid);
+        assert!(err
+            .message
+            .contains("contains whitespace in path component"));
+    }
+
+    #[test]
+    fn validate_manifest_paths_rejects_python_bundle_with_whitespace_in_filename() {
+        assert_whitespace_in_filename_rejected("my tool.py", "my tool");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_manifest_paths_rejects_python_bundle_with_leading_whitespace_in_filename() {
+        assert_whitespace_in_filename_rejected(" tool.py", " tool");
     }
 
     #[test]
