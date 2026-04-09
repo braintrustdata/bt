@@ -1626,31 +1626,53 @@ function isDatasetLike(value: unknown): value is {
 }
 
 function createSeededRandom(seed: number): () => number {
-  let state = seed >>> 0 || 0x9e3779b9;
+  // SplitMix64 keeps seed entropy beyond 32 bits so distinct seeds stay distinct.
+  let state = BigInt.asUintN(64, BigInt(seed));
   return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    state = BigInt.asUintN(64, state + 0x9e3779b97f4a7c15n);
+    let z = state;
+    z = BigInt.asUintN(64, (z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n);
+    z = BigInt.asUintN(64, (z ^ (z >> 27n)) * 0x94d049bb133111ebn);
+    z = BigInt.asUintN(64, z ^ (z >> 31n));
+    return Number(z & 0x1fffffffffffffn) / 9007199254740992;
   };
 }
 
-async function resolveSamplingSource(source: unknown): Promise<unknown> {
+type SamplingSourceOptions = {
+  initialCallReceiver?: unknown;
+};
+
+async function resolveSamplingSource(
+  source: unknown,
+  options?: SamplingSourceOptions,
+): Promise<unknown> {
   let current: unknown = source;
+  let firstCall = true;
   while (true) {
     current = isPromiseLike(current) ? await current : current;
     if (typeof current !== "function") {
       return current;
     }
+    if (firstCall && options?.initialCallReceiver !== undefined) {
+      current = Reflect.apply(
+        current as (...args: unknown[]) => unknown,
+        options.initialCallReceiver,
+        [],
+      );
+      firstCall = false;
+      continue;
+    }
     current = (current as () => unknown)();
+    firstCall = false;
   }
 }
 
 async function* iterateDataSource(
   source: unknown,
   batchSizeHint?: number,
+  options?: SamplingSourceOptions,
 ): AsyncGenerator<unknown> {
-  const resolved = await resolveSamplingSource(source);
+  const resolved = await resolveSamplingSource(source, options);
   if (Array.isArray(resolved)) {
     for (const item of resolved) {
       yield item;
@@ -1685,9 +1707,10 @@ async function* iterateDataSource(
 async function collectFirstRecords(
   source: unknown,
   count: number,
+  options?: SamplingSourceOptions,
 ): Promise<unknown[]> {
   const items: unknown[] = [];
-  for await (const item of iterateDataSource(source, count)) {
+  for await (const item of iterateDataSource(source, count, options)) {
     items.push(item);
     if (items.length >= count) {
       break;
@@ -1700,11 +1723,12 @@ async function reservoirSampleRecords(
   source: unknown,
   count: number,
   seed: number,
+  options?: SamplingSourceOptions,
 ): Promise<unknown[]> {
   const random = createSeededRandom(seed);
   const sample: unknown[] = [];
   let seen = 0;
-  for await (const item of iterateDataSource(source)) {
+  for await (const item of iterateDataSource(source, undefined, options)) {
     seen += 1;
     if (sample.length < count) {
       sample.push(item);
@@ -1721,15 +1745,17 @@ async function reservoirSampleRecords(
 async function applySamplingToData(
   data: unknown,
   config: RunnerConfig,
+  options?: SamplingSourceOptions,
 ): Promise<unknown> {
   if (config.first !== null) {
-    return await collectFirstRecords(data, config.first);
+    return await collectFirstRecords(data, config.first, options);
   }
   if (config.sample !== null) {
     return await reservoirSampleRecords(
       data,
       config.sample,
       config.sampleSeed ?? 0,
+      options,
     );
   }
   return data;
@@ -2134,7 +2160,9 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     const opts = makeEvalOptions(evaluatorName, options);
-    const sampledData = await applySamplingToData(evaluator.data, config);
+    const sampledData = await applySamplingToData(evaluator.data, config, {
+      initialCallReceiver: evaluator,
+    });
     const wrappedEvaluator = wrapTaskForStreamingProgress({
       ...evaluator,
       data: sampledData,
