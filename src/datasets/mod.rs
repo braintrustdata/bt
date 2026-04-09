@@ -26,11 +26,11 @@ pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 #[derive(Debug, Clone, Args)]
 struct DatasetNameArgs {
     /// Dataset name (positional)
-    #[arg(value_name = "NAME", conflicts_with = "name_flag")]
+    #[arg(value_name = "NAME")]
     name_positional: Option<String>,
 
     /// Dataset name (flag)
-    #[arg(long = "name", short = 'n', conflicts_with = "name_positional")]
+    #[arg(long = "name", short = 'n')]
     name_flag: Option<String>,
 }
 
@@ -446,8 +446,8 @@ mod tests {
     }
 
     #[test]
-    fn dataset_name_rejects_positional_and_name_flag_together() {
-        let err = parse(&[
+    fn dataset_name_positional_takes_precedence_over_flag() {
+        let parsed = parse(&[
             "datasets",
             "delete",
             "positional-name",
@@ -455,9 +455,10 @@ mod tests {
             "flag-name",
             "--force",
         ])
-        .expect_err("name should be ambiguous when both positional and --name are set");
-        let rendered = err.to_string();
-        assert!(rendered.contains("cannot be used with"));
-        assert!(rendered.contains("--name"));
+        .expect("both positional and --name should parse");
+        let DatasetsCommands::Delete(delete) = parsed.command.expect("subcommand") else {
+            panic!("expected delete command");
+        };
+        assert_eq!(delete.name(), Some("positional-name"));
     }
 }
