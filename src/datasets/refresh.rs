@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::json;
 
-use crate::ui::{print_command_status, with_spinner, CommandStatus};
+use crate::ui::{print_command_status, with_spinner, with_spinner_visible, CommandStatus};
 
 use super::{
     api,
@@ -23,10 +25,10 @@ pub async fn run(
     let dataset_name = upload::resolve_dataset_name(name, "refresh")?;
     let local_records = load_refresh_records(input_path, inline_rows, id_field)?;
 
-    let (dataset, created_dataset) = crate::ui::with_spinner_visible(
+    let (dataset, created_dataset) = with_spinner_visible(
         "Resolving remote dataset...",
         api::get_or_create_dataset(&ctx.client, &ctx.project.id, &dataset_name),
-        std::time::Duration::from_millis(300),
+        Duration::from_millis(300),
     )
     .await?;
 
@@ -42,7 +44,7 @@ pub async fn run(
     };
 
     let mut upload_rows = Vec::new();
-    let mut local_ids = std::collections::HashSet::new();
+    let mut local_ids = HashSet::new();
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut unchanged = 0usize;
