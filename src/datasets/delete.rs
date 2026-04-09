@@ -11,9 +11,12 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
     }
 
     let dataset = match name {
-        Some(name) => api::get_dataset_by_name(&ctx.client, &ctx.project.id, name)
-            .await?
-            .ok_or_else(|| anyhow!("dataset '{name}' not found"))?,
+        Some(name) => with_spinner(
+            "Loading dataset...",
+            api::get_dataset_by_name(&ctx.client, &ctx.project.id, name),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("dataset '{name}' not found"))?,
         None => {
             if !is_interactive() {
                 bail!("dataset name required. Use: bt datasets delete <name>");
