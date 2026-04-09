@@ -65,7 +65,6 @@ pub fn fuzzy_select_opt<T: ToString>(
 pub async fn select_project_interactive(
     client: &ApiClient,
     select_label: Option<&str>,
-    current: Option<&str>,
 ) -> Result<String> {
     let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
 
@@ -75,12 +74,18 @@ pub async fn select_project_interactive(
 
     let mut names: Vec<&str> = vec![CREATE_OPTION];
     names.extend(projects.iter().map(|p| p.name.as_str()));
-    let default = current
-        .and_then(|c| names.iter().position(|n| *n == c))
-        .unwrap_or(if projects.is_empty() { 0 } else { 1 });
-
     let label = select_label.unwrap_or("Select project");
-    let selection = fuzzy_select(label, &names, default)?;
+
+    let Some(term) = tty_term() else {
+        bail!("interactive mode requires TTY");
+    };
+    let labels: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt(label)
+        .items(&labels)
+        .default(0)
+        .max_length(12)
+        .interact_on(&term)?;
 
     if selection == 0 {
         let name: String = Input::with_theme(&ColorfulTheme::default())

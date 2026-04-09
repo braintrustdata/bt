@@ -29,7 +29,7 @@ pub(crate) async fn resolve_project_context(
     let config_project = config::load().ok().and_then(|c| c.project);
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(p) => p.to_string(),
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
+        None if is_interactive() => select_project_interactive(&client, None).await?,
         None => bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
     let project = get_project_by_name(&client, &project_name)

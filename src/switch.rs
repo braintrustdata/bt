@@ -116,8 +116,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
-            let selected_name =
-                select_project_interactive(&client, None, current_cfg.project.as_deref()).await?;
+            let selected_name = select_project_interactive(&client, None).await?;
             with_spinner(
                 "Loading project...",
                 api::get_project_by_name(&client, &selected_name),
