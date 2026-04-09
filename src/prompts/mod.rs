@@ -100,7 +100,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         .or_else(|| crate::config::load().ok().and_then(|c| c.project))
     {
         Some(p) => p,
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
+        None if is_interactive() => select_project_interactive(&client, None).await?,
         None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
     };
 

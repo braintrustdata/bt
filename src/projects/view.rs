@@ -20,7 +20,7 @@ pub async fn run(
             if !is_interactive() {
                 bail!("project name required. Use: bt projects view <name>")
             }
-            select_project_interactive(client, None, None).await?
+            select_project_interactive(client, None).await?
         }
     };
 

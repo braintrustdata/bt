@@ -119,7 +119,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
-            Some(select_project_interactive(&client, None, current_cfg.project.as_deref()).await?)
+            Some(select_project_interactive(&client, None).await?)
         }
     };
 
