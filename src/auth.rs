@@ -778,42 +778,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
-    let api_key = prompt_api_key()?;
-
-    let login_app_url = base
-        .app_url
-        .clone()
-        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org(
-        login_orgs.clone(),
-        base.org_name.as_deref(),
-        true,
-        false,
-        false,
-    )?;
-    let selected_api_url =
-        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
-        base.profile.as_deref(),
-        selected_org.as_ref().map(|org| org.name.as_str()),
-    )?;
-    confirm_profile_overwrite(&profile_name)?;
-
-    commit_api_key_profile(
-        &profile_name,
-        &api_key,
-        selected_api_url,
-        base.app_url.clone(),
-        selected_org.as_ref().map(|org| org.name.clone()),
-    )?;
-
-    base.profile = Some(profile_name.clone());
-    Ok(profile_name)
-}
-
 pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     let api_url = base
         .api_url
