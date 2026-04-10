@@ -1278,21 +1278,32 @@ async fn run_instrument_setup(
     print_hint: bool,
 ) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let root = find_git_root().ok_or_else(|| {
-        anyhow!(
-            "instrument setup requires running inside a git repository (could not find .git in parent chain)"
-        )
-    })?;
+    let root = find_git_root()
+        .map(Ok)
+        .unwrap_or_else(|| std::env::current_dir().context("failed to get current directory"))?;
     let mut detected = detect_agents(Some(&root), &home);
 
-    let selected = resolve_default_agent_selection(
-        args.agent.map(map_instrument_agent_arg_to_agent_arg),
-        &detected,
-        "Select agent to instrument this repo",
-        ui::is_interactive() && !args.yes,
-    )?;
+    let runnable_agents = detect_runnable_agents();
+    let mut selected = if let Some(agent_arg) = args.agent {
+        map_instrument_agent_arg(agent_arg)
+    } else {
+        let candidate_agents: Vec<Agent> = if runnable_agents.is_empty() {
+            ALL_AGENTS.to_vec()
+        } else {
+            runnable_agents.clone()
+        };
+        pick_agent_mode_target(&candidate_agents)
+            .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
+    };
 
-    if args.agent.is_some() && base.verbose {
+    if args.agent.is_none()
+        && ui::is_interactive()
+        && !args.yes
+        && !base.json
+        && runnable_agents.len() != 1
+    {
+        selected = prompt_instrument_agent(selected)?;
+    } else if args.agent.is_some() && base.verbose && !args.yes {
         eprintln!(
             "{} Select agent to instrument this repo · {}",
             style("✔").green(),
@@ -1998,10 +2009,16 @@ async fn run_agent_invocation(
 
             if *interactive {
                 // Inherit all streams so the user can interact with the agent directly.
+                #[cfg(unix)]
+                if !ui::is_interactive() {
+                    if let Ok(tty) = fs::File::open("/dev/tty") {
+                        command.stdin(Stdio::from(tty));
+                    }
+                }
                 return command
                     .status()
                     .await
-                    .with_context(|| format!("failed to run agent command in {}", root.display()));
+                    .map_err(|e| agent_launch_error(e, program));
             }
 
             if !show_output {
@@ -2009,22 +2026,35 @@ async fn run_agent_invocation(
                 return command
                     .status()
                     .await
-                    .with_context(|| format!("failed to run agent command in {}", root.display()));
+                    .map_err(|e| agent_launch_error(e, program));
             }
 
             if *stream_json {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
                 let child = command
                     .spawn()
-                    .with_context(|| format!("failed to start {program}"))?;
+                    .map_err(|e| agent_launch_error(e, program))?;
                 agent_stream::stream_agent_output(child, root).await
             } else {
                 command
                     .status()
                     .await
-                    .with_context(|| format!("failed to run agent command in {}", root.display()))
+                    .map_err(|e| agent_launch_error(e, program))
             }
         }
+    }
+}
+
+fn agent_launch_error(e: std::io::Error, program: &str) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        let path = std::env::var("PATH").unwrap_or_default();
+        anyhow::anyhow!(
+            "tried to launch {} but didn't find it, PATH={}\n",
+            program,
+            path
+        )
+    } else {
+        anyhow::Error::new(e)
     }
 }
 
@@ -2680,6 +2710,23 @@ fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
     out.into_iter().collect()
 }
 
+fn detect_runnable_agents() -> Vec<Agent> {
+    let mut agents = Vec::new();
+    if command_exists("codex") {
+        agents.push(Agent::Codex);
+    }
+    if command_exists("claude") {
+        agents.push(Agent::Claude);
+    }
+    if command_exists("cursor-agent") {
+        agents.push(Agent::Cursor);
+    }
+    if command_exists("opencode") {
+        agents.push(Agent::Opencode);
+    }
+    agents
+}
+
 fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal> {
     let mut by_agent: BTreeMap<Agent, BTreeSet<(bool, String)>> = BTreeMap::new();
 
@@ -2819,6 +2866,23 @@ fn add_signal(
     map.entry(agent)
         .or_default()
         .insert((on_path, reason.to_string()));
+}
+
+fn resolve_unambiguous_instrument_agent(
+    runnable_agents: &[Agent],
+    detected: &[DetectionSignal],
+) -> Option<Agent> {
+    let runnable_set: BTreeSet<Agent> = runnable_agents.iter().copied().collect();
+    if runnable_set.len() == 1 {
+        return runnable_set.into_iter().next();
+    }
+
+    let detected_set: BTreeSet<Agent> = detected.iter().map(|signal| signal.agent).collect();
+    if detected_set.len() == 1 {
+        return detected_set.into_iter().next();
+    }
+
+    None
 }
 
 fn install_claude(
@@ -4219,5 +4283,41 @@ mod tests {
             &root,
             &[WorkflowArg::Evaluate]
         ));
+    }
+
+    #[test]
+    fn instrument_agent_resolution_prefers_single_runnable_agent() {
+        let detected = vec![
+            DetectionSignal {
+                agent: Agent::Claude,
+                on_path: false,
+                reason: "config".to_string(),
+            },
+            DetectionSignal {
+                agent: Agent::Codex,
+                on_path: false,
+                reason: "binary".to_string(),
+            },
+            DetectionSignal {
+                agent: Agent::Opencode,
+                on_path: false,
+                reason: "config".to_string(),
+            },
+        ];
+
+        let resolved = resolve_unambiguous_instrument_agent(&[Agent::Codex], &detected);
+        assert_eq!(resolved, Some(Agent::Codex));
+    }
+
+    #[test]
+    fn instrument_agent_resolution_falls_back_to_single_detected_agent() {
+        let detected = vec![DetectionSignal {
+            agent: Agent::Codex,
+            on_path: false,
+            reason: "config".to_string(),
+        }];
+
+        let resolved = resolve_unambiguous_instrument_agent(&[], &detected);
+        assert_eq!(resolved, Some(Agent::Codex));
     }
 }
