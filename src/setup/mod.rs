@@ -1026,8 +1026,10 @@ async fn maybe_create_api_key_for_oauth(client: &ApiClient) -> Result<Option<Str
         "   It is safe to cancel the setup now, export the key and restart the setup (with bt setup)."
     );
     eprintln!();
-    eprint!("   Press Enter to continue...");
-    let _ = std::io::stdin().lock().read_line(&mut String::new());
+    if std::io::stdin().is_terminal() {
+        eprint!("   Press Enter to continue...");
+        let _ = std::io::stdin().lock().read_line(&mut String::new());
+    }
 
     Ok(Some(created.key))
 }
@@ -2090,7 +2092,7 @@ async fn run_agent_invocation(
             if *interactive {
                 // Inherit all streams so the user can interact with the agent directly.
                 #[cfg(unix)]
-                if !std::io::stdin().is_terminal() {
+                if !ui::is_interactive() {
                     if let Ok(tty) = fs::File::open("/dev/tty") {
                         command.stdin(Stdio::from(tty));
                     }
