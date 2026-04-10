@@ -1,19 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::{
     args::BaseArgs,
-    auth::login,
-    http::ApiClient,
-    projects::api::{get_project_by_name, Project},
-    ui::{is_interactive, select_project_interactive},
+    projects::context::{resolve_project_context, ProjectContext},
 };
 
-pub(crate) struct ResolvedContext {
-    pub client: ApiClient,
-    pub app_url: String,
-    pub project: Project,
-}
+pub(crate) type ResolvedContext = ProjectContext;
 
 mod api;
 mod delete;
@@ -93,32 +86,55 @@ impl DeleteArgs {
 }
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
-    let auth = login(&base).await?;
-    let client = ApiClient::new(&auth)?;
-    let project_name = match base
-        .project
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project))
-    {
-        Some(p) => p,
-        None if is_interactive() => select_project_interactive(&client, None, None).await?,
-        None => anyhow::bail!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"),
-    };
-
-    let project = get_project_by_name(&client, &project_name)
-        .await?
-        .ok_or_else(|| anyhow!("project '{project_name}' not found"))?;
-
-    let ctx = ResolvedContext {
-        client,
-        app_url: auth.app_url,
-        project,
-    };
-
     match args.command {
-        None | Some(PromptsCommands::List) => list::run(&ctx, base.json).await,
+        None | Some(PromptsCommands::List) => {
+            let ctx = resolve_project_context(&base, true).await?;
+            list::run(&ctx, base.json).await
+        }
         Some(PromptsCommands::View(p)) => {
+            let ctx = resolve_project_context(&base, true).await?;
             view::run(&ctx, p.slug(), base.json, p.web, p.verbose).await
         }
-        Some(PromptsCommands::Delete(p)) => delete::run(&ctx, p.slug(), p.force).await,
+        Some(PromptsCommands::Delete(p)) => {
+            let ctx = resolve_project_context(&base, false).await?;
+            delete::run(&ctx, p.slug(), p.force).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompts_command_is_read_only(command: Option<&PromptsCommands>) -> bool {
+        matches!(
+            command,
+            None | Some(PromptsCommands::List) | Some(PromptsCommands::View(_))
+        )
+    }
+
+    #[test]
+    fn prompts_routes_list_and_view_to_read_only_auth() {
+        assert!(prompts_command_is_read_only(None));
+        assert!(prompts_command_is_read_only(Some(&PromptsCommands::List)));
+        assert!(prompts_command_is_read_only(Some(&PromptsCommands::View(
+            ViewArgs {
+                slug_positional: Some("my-prompt".to_string()),
+                slug_flag: None,
+                web: false,
+                verbose: false,
+            }
+        ))));
+    }
+
+    #[test]
+    fn prompts_routes_delete_to_validated_auth() {
+        assert!(!prompts_command_is_read_only(Some(
+            &PromptsCommands::Delete(DeleteArgs {
+                slug_positional: Some("my-prompt".to_string()),
+                slug_flag: None,
+                force: true,
+            })
+        )));
     }
 }
