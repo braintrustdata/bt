@@ -16,6 +16,7 @@ pub(crate) struct ResolvedContext {
 }
 
 pub(crate) mod api;
+mod create;
 mod delete;
 mod list;
 mod view;
@@ -24,6 +25,7 @@ mod view;
 #[command(after_help = "\
 Examples:
   bt datasets list
+  bt datasets create my-dataset
   bt datasets view my-dataset
   bt datasets delete my-dataset
 ")]
@@ -36,10 +38,22 @@ pub struct DatasetsArgs {
 enum DatasetsCommands {
     /// List all datasets
     List,
+    /// Create a new dataset
+    Create(CreateArgs),
     /// View a dataset's metadata and sample rows
     View(ViewArgs),
     /// Delete a dataset
     Delete(DeleteArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CreateArgs {
+    /// Name of the dataset to create
+    name: Option<String>,
+
+    /// Description of the dataset
+    #[arg(long, short = 'd')]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -116,6 +130,9 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
 
     match args.command {
         None | Some(DatasetsCommands::List) => list::run(&ctx, base.json).await,
+        Some(DatasetsCommands::Create(c)) => {
+            create::run(&ctx, c.name.as_deref(), c.description.as_deref()).await
+        }
         Some(DatasetsCommands::View(v)) => {
             view::run(&ctx, v.name(), base.json, v.web, v.limit).await
         }

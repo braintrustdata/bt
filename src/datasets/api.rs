@@ -45,6 +45,23 @@ pub async fn get_dataset_by_name(
     Ok(list.objects.into_iter().next())
 }
 
+pub async fn create_dataset(
+    client: &ApiClient,
+    project_id: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Result<Dataset> {
+    let mut body = serde_json::json!({
+        "name": name,
+        "project_id": project_id,
+        "org_name": client.org_name(),
+    });
+    if let Some(desc) = description {
+        body["description"] = serde_json::Value::String(desc.to_string());
+    }
+    client.post("/v1/dataset", &body).await
+}
+
 pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> {
     let path = format!("/v1/dataset/{}", encode(dataset_id));
     client.delete(&path).await
