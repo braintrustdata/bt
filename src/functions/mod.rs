@@ -9,7 +9,7 @@ use crate::{
     config,
     http::ApiClient,
     projects::api::{get_project_by_name, Project},
-    ui::{self, is_interactive, select_project_interactive, with_spinner},
+    ui::{self, is_interactive, select_project, with_spinner},
 };
 
 pub(crate) mod api;
@@ -519,7 +519,7 @@ pub(crate) async fn resolve_project_context_optional(
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(p) => Some(p.to_string()),
         None if allow_interactive_selection && is_interactive() => {
-            Some(select_project_interactive(&auth_ctx.client, None).await?)
+            Some(select_project(&auth_ctx.client, None, None).await?.name)
         }
         None => None,
     };

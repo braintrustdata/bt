@@ -3,7 +3,7 @@ use urlencoding::encode;
 
 use crate::http::ApiClient;
 use crate::ui::{
-    is_interactive, print_command_status, select_project_interactive, with_spinner, CommandStatus,
+    is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
 };
 
 use super::api;
@@ -15,24 +15,19 @@ pub async fn run(
     name: Option<&str>,
 ) -> Result<()> {
     let project_name = match name {
-        Some(n) => n.to_string(),
+        Some(n) => {
+            with_spinner("Loading project...", api::get_project_by_name(client, n))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("project '{n}' not found"))?
+                .name
+        }
         None => {
             if !is_interactive() {
                 bail!("project name required. Use: bt projects view <name>")
             }
-            select_project_interactive(client, None).await?
+            select_project(client, None, None).await?.name
         }
     };
-
-    // Verify project exists
-    let exists = with_spinner(
-        "Loading project...",
-        api::get_project_by_name(client, &project_name),
-    )
-    .await?;
-    if exists.is_none() {
-        bail!("project '{project_name}' not found");
-    }
 
     let url = format!(
         "{}/app/{}/p/{}",
