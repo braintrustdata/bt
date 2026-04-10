@@ -2642,14 +2642,13 @@ mod tests {
     fn make_base() -> BaseArgs {
         BaseArgs {
             json: false,
-            quiet: false,
+            verbose: false,
             no_color: false,
             profile: None,
             project: None,
             org_name: None,
             api_key: None,
             prefer_profile: false,
-            no_input: false,
             api_url: None,
             app_url: None,
             env_file: None,
