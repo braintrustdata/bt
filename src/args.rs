@@ -4,6 +4,12 @@ use clap::Args;
 
 pub use braintrust_sdk_rust::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgValueSource {
+    CommandLine,
+    EnvVariable,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
     /// Output as JSON
@@ -39,6 +45,9 @@ pub struct BaseArgs {
     /// Override stored API key (or via BRAINTRUST_API_KEY)
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true, hide = true)]
     pub api_key: Option<String>,
+
+    #[arg(skip)]
+    pub api_key_source: Option<ArgValueSource>,
 
     /// Prefer profile credentials even if BRAINTRUST_API_KEY/--api-key is set.
     #[arg(long, global = true)]

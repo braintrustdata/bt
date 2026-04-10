@@ -259,6 +259,7 @@ mod tests {
             org_name: org.map(String::from),
             project: project.map(String::from),
             api_key: None,
+            api_key_source: None,
             prefer_profile: false,
             api_url: None,
             app_url: None,

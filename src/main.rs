@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
 mod args;
@@ -31,7 +31,7 @@ mod ui;
 mod util_cmd;
 mod utils;
 
-use crate::args::{BaseArgs, CLIArgs};
+use crate::args::{ArgValueSource, BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -176,6 +176,30 @@ impl Commands {
             Commands::Status(cmd) => &cmd.base,
         }
     }
+
+    fn base_mut(&mut self) -> &mut BaseArgs {
+        match self {
+            Commands::Init(cmd) => &mut cmd.base,
+            Commands::Setup(cmd) => &mut cmd.base,
+            Commands::Docs(cmd) => &mut cmd.base,
+            Commands::Sql(cmd) => &mut cmd.base,
+            Commands::Auth(cmd) => &mut cmd.base,
+            Commands::View(cmd) => &mut cmd.base,
+            #[cfg(unix)]
+            Commands::Eval(cmd) => &mut cmd.base,
+            Commands::Projects(cmd) => &mut cmd.base,
+            Commands::Prompts(cmd) => &mut cmd.base,
+            Commands::SelfCommand(cmd) => &mut cmd.base,
+            Commands::Tools(cmd) => &mut cmd.base,
+            Commands::Scorers(cmd) => &mut cmd.base,
+            Commands::Functions(cmd) => &mut cmd.base,
+            Commands::Experiments(cmd) => &mut cmd.base,
+            Commands::Sync(cmd) => &mut cmd.base,
+            Commands::Util(cmd) => &mut cmd.base,
+            Commands::Switch(cmd) => &mut cmd.base,
+            Commands::Status(cmd) => &mut cmd.base,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,7 +229,9 @@ async fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
-    let cli = Cli::parse_from(argv);
+    let matches = Cli::command().get_matches_from(&argv);
+    let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
+    apply_base_arg_sources(&matches, cli.command.base_mut());
     configure_output(cli.command.base());
 
     match cli.command {
@@ -231,6 +257,18 @@ async fn try_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
+    base.api_key_source = matches.value_source("api_key").and_then(map_value_source);
+}
+
+fn map_value_source(source: ValueSource) -> Option<ArgValueSource> {
+    match source {
+        ValueSource::CommandLine => Some(ArgValueSource::CommandLine),
+        ValueSource::EnvVariable => Some(ArgValueSource::EnvVariable),
+        _ => None,
+    }
 }
 
 fn configure_output(base: &BaseArgs) {

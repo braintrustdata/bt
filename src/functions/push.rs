@@ -3439,6 +3439,7 @@ mod tests {
             org_name: None,
             project: None,
             api_key: None,
+            api_key_source: None,
             prefer_profile: false,
             api_url: None,
             app_url: None,
