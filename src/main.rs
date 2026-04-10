@@ -6,6 +6,7 @@ mod args;
 mod auth;
 #[allow(dead_code)]
 mod config;
+mod datasets;
 mod env;
 #[cfg(unix)]
 mod eval;
@@ -64,6 +65,7 @@ Projects & resources
   tools        Manage tools
   scorers      Manage scorers
   experiments  Manage experiments
+  datasets     Manage datasets
 
 Data & evaluation
   eval         Run eval files
@@ -142,6 +144,8 @@ enum Commands {
     Functions(CLIArgs<functions::FunctionsArgs>),
     /// Manage experiments
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
+    /// Manage datasets
+    Datasets(CLIArgs<datasets::DatasetsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
     /// Local utility commands
@@ -172,6 +176,7 @@ impl Commands {
             Commands::Scorers(cmd) => &cmd.base,
             Commands::Functions(cmd) => &cmd.base,
             Commands::Experiments(cmd) => &cmd.base,
+            Commands::Datasets(cmd) => &cmd.base,
             Commands::Sync(cmd) => &cmd.base,
             Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
@@ -225,6 +230,7 @@ async fn try_main() -> Result<()> {
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
         Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
+        Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
         Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
         Commands::SelfCommand(cmd) => self_update::run(cmd.args).await?,
