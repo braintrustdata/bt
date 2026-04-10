@@ -141,6 +141,10 @@ struct AgentsSetupArgs {
     #[arg(long = "workflow", value_enum)]
     workflows: Vec<WorkflowArg>,
 
+    /// Do not fetch workflow docs during setup
+    #[arg(long, conflicts_with = "workflows")]
+    no_workflow: bool,
+
     #[arg(skip)]
     yes: bool,
 
@@ -410,6 +414,9 @@ struct SkillsAliasResult {
 }
 
 pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()> {
+    if base.api_key.is_some() && base.prefer_profile {
+        bail!("--api-key conflicts with --prefer-profile");
+    }
     if base.json && args.instrument {
         bail!("--json conflicts with --instrument: JSON mode implies --no-instrument");
     }
@@ -447,6 +454,7 @@ pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()
                     background: args.background,
                     agent: args.agents.agent,
                     workflows: args.agents.workflows,
+                    no_workflow: args.agents.no_workflow,
                     languages: args.languages,
                 };
                 run_setup_wizard(base, wizard_flags).await
@@ -474,6 +482,7 @@ struct WizardFlags {
     background: bool,
     agent: Option<AgentArg>,
     workflows: Vec<WorkflowArg>,
+    no_workflow: bool,
     languages: Vec<LanguageArg>,
 }
 
@@ -493,6 +502,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         background: flag_background,
         agent: flag_agent,
         workflows: flag_workflows,
+        no_workflow: flag_no_workflow,
         languages: flag_languages,
     } = flags;
     const LOGO: &str = include_str!("../../ascii-logo-blue-small.txt");
@@ -630,6 +640,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 local: matches!(scope, InstallScope::Local),
                 global: matches!(scope, InstallScope::Global),
                 workflows: Vec::new(),
+                no_workflow: false,
                 yes: true,
                 no_fetch_docs: true,
                 refresh_docs: false,
@@ -788,8 +799,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 }
             };
 
-            // Workflows: explicit flag > interactive prompt > default instrument+observe.
-            let wizard_workflows = if !flag_workflows.is_empty() {
+            // Workflows: --no-workflow > explicit flag > interactive prompt > default instrument+observe.
+            let wizard_workflows = if flag_no_workflow {
+                Vec::new()
+            } else if !flag_workflows.is_empty() {
                 let mut selected = resolve_workflow_selection(&flag_workflows);
                 if !selected.contains(&WorkflowArg::Instrument) {
                     selected.push(WorkflowArg::Instrument);
@@ -1241,6 +1254,8 @@ async fn execute_skills_setup(
         notes.push(
             "Skipped workflow docs prefetch (no agents configured successfully).".to_string(),
         );
+    } else if args.no_workflow {
+        notes.push("Skipped workflow docs prefetch (`--no-workflow`).".to_string());
     } else if args.no_fetch_docs {
         notes.push("Skipped workflow docs prefetch (`--no-fetch-docs`).".to_string());
     } else if selected_workflows.is_empty() {
@@ -1424,6 +1439,7 @@ async fn run_instrument_setup(
             local: true,
             global: false,
             workflows: selected_workflows.clone(),
+            no_workflow: false,
             yes: true,
             no_fetch_docs: false,
             refresh_docs: args.refresh_docs,
@@ -2436,7 +2452,8 @@ fn resolve_setup_selection(
     );
     let interactive = ui::is_interactive() && !args.yes && !json;
     let mut prompted_agents: Option<Vec<Agent>> = None;
-    let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs {
+    let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs || args.no_workflow
+    {
         Some(Vec::new())
     } else {
         None
@@ -2457,7 +2474,7 @@ fn resolve_setup_selection(
         if args.agent.is_none() {
             steps.push(SetupWizardStep::Agents);
         }
-        if !args.no_fetch_docs && args.workflows.is_empty() {
+        if !args.no_fetch_docs && !args.no_workflow && args.workflows.is_empty() {
             steps.push(SetupWizardStep::Workflows);
         }
 
@@ -3916,6 +3933,7 @@ mod tests {
             refresh_docs: false,
             workers: crate::sync::default_workers(),
             yolo: false,
+            no_workflow: false,
         };
         let home = std::env::temp_dir();
         let selection =
