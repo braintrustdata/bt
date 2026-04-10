@@ -505,9 +505,13 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         no_workflow: flag_no_workflow,
         languages: flag_languages,
     } = flags;
-    const LOGO: &str = include_str!("../../ascii-logo-blue-small.txt");
-    eprintln!("{LOGO}");
-    eprintln!("\x1b[34mBraintrust\x1b[0m\n");
+    const LOGO: &str = include_str!("../../ascii-logo-small.txt");
+    let no_color = base.no_color || std::env::var_os("NO_COLOR").is_some();
+    if no_color {
+        eprintln!("{LOGO}\nBraintrust\n");
+    } else {
+        eprintln!("\x1b[34m{LOGO}\nBraintrust\x1b[0m\n");
+    }
     eprintln!("Welcome to the Braintrust SDK setup wizard");
     eprintln!("This wizard will automatically instrument your application with Braintrust SDK tracing with a coding agent of your choice.\n");
 
