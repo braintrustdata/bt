@@ -1280,14 +1280,14 @@ async fn run_instrument_setup(
         .unwrap_or_else(|| std::env::current_dir().context("failed to get current directory"))?;
     let mut detected = detect_agents(Some(&root), &home);
 
+    let runnable_agents = detect_runnable_agents();
     let mut selected = if let Some(agent_arg) = args.agent {
         map_instrument_agent_arg(agent_arg)
     } else {
-        let runnable_agents = detect_runnable_agents();
         let candidate_agents = if runnable_agents.is_empty() {
             resolve_selected_agents(None, &detected)
         } else {
-            runnable_agents
+            runnable_agents.clone()
         };
         pick_agent_mode_target(&candidate_agents)
             .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
@@ -1297,7 +1297,7 @@ async fn run_instrument_setup(
         && ui::is_interactive()
         && !args.yes
         && !base.json
-        && detect_runnable_agents().len() != 1
+        && runnable_agents.len() != 1
     {
         selected = prompt_instrument_agent(selected)?;
     } else if args.agent.is_some() && base.verbose && !args.yes {
