@@ -25,7 +25,7 @@
 | r                  | The root_span_id - identifies a trace                                                                                                                                            |
 | s                  | The span_id - identifies a specific span within the trace                                                                                                                        |
 | id                 | Legacy parameter for root_span_id in object URLs                                                                                                                                 |
-| BRAINTRUST_APP_URL | url where the app is accessible, www.braintrust.dev/app for non self-hosted instances. See the env variable BRAINTRUST_APP_URL 9and use www.braintrust.dev/app if it is not set) |
+| BRAINTRUST_APP_URL | url where the app is accessible, www.braintrust.dev/app for non self-hosted instances. See the env variable BRAINTRUST_APP_URL (and use www.braintrust.dev/app if it is not set) |
 
 ## Notes
 
