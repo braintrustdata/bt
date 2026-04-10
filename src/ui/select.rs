@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use dialoguer::console::Term;
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 
@@ -53,43 +53,36 @@ pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> R
     Ok(selection)
 }
 
-/// Interactive selector for project data
-pub async fn select_project_interactive(
+pub async fn select_project(
     client: &ApiClient,
-    select_label: Option<&str>,
-) -> Result<String> {
-    let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
+    project_name: Option<&str>,
+    label: Option<&str>,
+) -> Result<api::Project> {
+    if let Some(name) = project_name {
+        return with_spinner("Loading project...", api::get_project_by_name(client, name))
+            .await?
+            .ok_or_else(|| anyhow!("project '{}' not found", name));
+    }
 
+    let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
     const CREATE_OPTION: &str = "+ Create new project";
-
-    let mut names: Vec<&str> = vec![CREATE_OPTION];
-    names.extend(projects.iter().map(|p| p.name.as_str()));
-    let label = select_label.unwrap_or("Select project");
-
-    let Some(term) = tty_term() else {
-        bail!("interactive mode requires TTY");
-    };
-    let labels: Vec<String> = names.iter().map(|s| s.to_string()).collect();
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt(label)
-        .items(&labels)
-        .default(0)
-        .max_length(12)
-        .interact_on(&term)?;
+    let mut labels: Vec<&str> = vec![CREATE_OPTION];
+    labels.extend(projects.iter().map(|p| p.name.as_str()));
+    let default = if projects.is_empty() { 0 } else { 1 };
+    let selection = fuzzy_select(label.unwrap_or("Select project"), &labels, default)?;
 
     if selection == 0 {
         let name: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("New project name")
             .interact_text()?;
-        let project = with_spinner(
+        return with_spinner(
             &format!("Creating project '{name}'..."),
             api::create_project(client, &name),
         )
-        .await?;
-        return Ok(project.name);
+        .await;
     }
 
-    Ok(projects[selection - 1].name.clone())
+    Ok(projects[selection - 1].clone())
 }

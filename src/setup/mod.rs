@@ -551,24 +551,20 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(2, "Project");
     }
-    let project = select_project(&client, project_flag.as_deref()).await?;
-    if let Some(ref project) = project {
-        if git_root.is_some() {
-            let _ = maybe_init(&org, project);
-        }
-        if verbose {
-            eprintln!(
-                "   {} Project: {}/{}",
-                style("✓").green(),
-                org,
-                project.name
-            );
-        }
-    } else if verbose {
+    if project_flag.is_none() && ui::is_interactive() {
+        println!("First, select a project, or create a new one.");
+        println!("Projects organize AI features in your application. Each project contains logs, experiments, datasets, prompts, and other functions.");
+    }
+    let project = ui::select_project(&client, project_flag.as_deref(), None).await?;
+    if git_root.is_some() {
+        let _ = maybe_init(&org, &project);
+    }
+    if verbose {
         eprintln!(
-            "   {} {}",
-            style("—").dim(),
-            style("Using existing project(s)").dim()
+            "   {} Project: {}/{}",
+            style("✓").green(),
+            org,
+            project.name
         );
     }
 
@@ -954,78 +950,6 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
     };
     config::save_local(&cfg, true)?;
     Ok(true)
-}
-
-/// Prompt the user to select a project from the org.
-///
-/// - If `--project` was specified, look it up and return it.
-/// - If the only project is the default "My Project" placeholder, auto-create `{whoami}-test`.
-/// - Otherwise, list all projects sorted alphabetically and let the user fuzzy-search and pick one.
-async fn select_project(
-    client: &ApiClient,
-    project_name: Option<&str>,
-) -> Result<Option<crate::projects::api::Project>> {
-    if let Some(name) = project_name {
-        let project = with_spinner(
-            "Loading project...",
-            crate::projects::api::get_project_by_name(client, name),
-        )
-        .await?;
-        return match project {
-            Some(p) => Ok(Some(p)),
-            None => bail!(
-                "project '{}' not found in org '{}'",
-                name,
-                client.org_name()
-            ),
-        };
-    }
-
-    let mut projects = with_spinner(
-        "Loading projects...",
-        crate::projects::api::list_projects(client),
-    )
-    .await?;
-
-    // If the only project is the default "My Project" placeholder, auto-create one.
-    if projects.len() == 1 && projects[0].name == "My Project" {
-        let username = get_whoami_username();
-        let new_name = format!("{username}-test");
-        let project = with_spinner(
-            &format!("Creating project '{new_name}'..."),
-            crate::projects::api::create_project(client, &new_name),
-        )
-        .await?;
-        return Ok(Some(project));
-    }
-
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
-
-    if ui::is_interactive() {
-        println!("First, select a project, or create a new one.");
-        println!("Projects organize AI features in your application. Each project contains logs, experiments, datasets, prompts, and other functions.");
-    }
-
-    const CREATE_OPTION: &str = "+ Create new project";
-    let mut labels: Vec<&str> = vec![CREATE_OPTION];
-    labels.extend(projects.iter().map(|p| p.name.as_str()));
-    let default = if projects.is_empty() { 0 } else { 1 };
-    let selection = ui::fuzzy_select("Select project", &labels, default)?;
-
-    if selection == 0 {
-        let name: String =
-            dialoguer::Input::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                .with_prompt("New project name")
-                .interact_text()?;
-        let project = with_spinner(
-            &format!("Creating project '{name}'..."),
-            crate::projects::api::create_project(client, &name),
-        )
-        .await?;
-        return Ok(Some(project));
-    }
-
-    Ok(Some(projects[selection - 1].clone()))
 }
 
 fn get_whoami_username() -> String {
