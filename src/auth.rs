@@ -359,6 +359,9 @@ struct AuthLogoutArgs {
 }
 
 pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
+    if !base.json {
+        crate::ui::set_quiet(false);
+    }
     match args.command {
         AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
@@ -500,11 +503,7 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
 
     if let Some(profile_name) = ignored_profile {
         eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
-        );
-    } else {
-        eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY."
+            "Info: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY to use a profile with OAuth login.",
         );
     }
 }
@@ -888,59 +887,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn login_interactive(base: &mut BaseArgs) -> Result<String> {
-    let methods = ["OAuth (browser)", "API key"];
-    let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
-
-    if selected == 0 {
-        login_interactive_oauth(base).await
-    } else {
-        login_interactive_api_key(base).await
-    }
-}
-
-pub async fn login_setup_oauth(base: &mut BaseArgs) -> Result<String> {
-    login_interactive_oauth(base).await
-}
-
-#[allow(dead_code)]
-async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
-    let api_key = prompt_api_key()?;
-
-    let login_app_url = base
-        .app_url
-        .clone()
-        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org(
-        login_orgs.clone(),
-        base.org_name.as_deref(),
-        true,
-        false,
-        false,
-    )?;
-    let selected_api_url =
-        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
-        base.profile.as_deref(),
-        selected_org.as_ref().map(|org| org.name.as_str()),
-    )?;
-    confirm_profile_overwrite(&profile_name)?;
-
-    commit_api_key_profile(
-        &profile_name,
-        &api_key,
-        selected_api_url,
-        base.app_url.clone(),
-        selected_org.as_ref().map(|org| org.name.clone()),
-    )?;
-
-    base.profile = Some(profile_name.clone());
-    Ok(profile_name)
-}
-
-async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
+pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     let api_url = base
         .api_url
         .clone()
@@ -978,7 +925,9 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
 
     let _ = open::that(&authorize_url);
     eprintln!("Complete authorization in your browser.");
+    eprintln!();
     eprintln!("{}", dialoguer::console::style(&authorize_url).dim());
+    eprintln!();
 
     let callback = collect_oauth_callback(listener, is_ssh_session()).await?;
     if let Some(error) = callback.error {
@@ -1694,6 +1643,7 @@ fn select_login_org(
         }
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    println!("\n\nA Braintrust organization is usually a team or a company.");
     let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
     if allow_cross_org && selection == 0 {
         return Ok(None);
@@ -1832,6 +1782,7 @@ async fn collect_oauth_callback(
     let pasted = Input::<String>::new()
         .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
         .allow_empty(true)
+        .report(false)
         .interact_text()
         .context("failed to read callback URL")?;
     if pasted.trim().is_empty() {

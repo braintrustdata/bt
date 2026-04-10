@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -530,6 +531,15 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     let login_ctx = ensure_auth(&mut base).await?;
     let client = ApiClient::new(&login_ctx)?;
     let org = client.org_name().to_string();
+
+    // After OAuth login, create a permanent API key so the user has one for external tooling.
+    let resolved = auth::resolve_auth(&base).await.ok();
+    let is_oauth = resolved.map(|r| r.is_oauth).unwrap_or(false);
+    let has_explicit_key = base.api_key.is_some() || std::env::var("BRAINTRUST_API_KEY").is_ok();
+    if is_oauth && !has_explicit_key {
+        maybe_create_api_key_for_oauth(&client).await?;
+    }
+
     if verbose {
         eprintln!("   {} Using org '{}'", style("✓").green(), org);
     }
@@ -894,7 +904,7 @@ async fn login_with_existing_or_oauth(
 ) -> Result<LoginContext> {
     if profiles.is_empty() {
         eprintln!("No auth profiles found. Let's set one up.\n");
-        auth::login_setup_oauth(base).await?;
+        auth::login_interactive_oauth(base).await?;
         return auth::login(base).await;
     }
 
@@ -905,11 +915,88 @@ async fn login_with_existing_or_oauth(
     match auth::login(base).await {
         Ok(ctx) => Ok(ctx),
         Err(err) if auth::is_missing_credential_error(&err) => {
-            auth::login_setup_oauth(base).await?;
+            auth::login_interactive_oauth(base).await?;
             auth::login(base).await
         }
         Err(err) => Err(err),
     }
+}
+
+/// After an OAuth login in `bt setup`, create a permanent Braintrust API key so the user
+/// has a key they can use outside this session.
+///
+/// The key is stored in `BRAINTRUST_API_KEY` for the rest of the current process and printed
+/// once to stderr (it is never retrievable again).
+async fn maybe_create_api_key_for_oauth(client: &ApiClient) -> Result<()> {
+    let username = std::process::Command::new("whoami")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "user".to_string());
+    let base_name = format!("{username}-created-by-bt-setup");
+
+    #[derive(serde::Deserialize)]
+    struct ApiKeyEntry {
+        name: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ApiKeyList {
+        objects: Vec<ApiKeyEntry>,
+    }
+
+    let existing: Vec<String> = client
+        .get::<ApiKeyList>("/v1/api_key")
+        .await
+        .map(|r| r.objects.into_iter().map(|k| k.name).collect())
+        .unwrap_or_default();
+
+    let name = if !existing.iter().any(|n| n == &base_name) {
+        base_name
+    } else {
+        (1u32..)
+            .map(|i| format!("{base_name}{i}"))
+            .find(|candidate| !existing.iter().any(|n| n == candidate))
+            .expect("name sequence is infinite")
+    };
+
+    #[derive(serde::Deserialize)]
+    struct CreatedKey {
+        key: String,
+    }
+
+    let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
+    let created: CreatedKey = client.post("/v1/api_key", &body).await?;
+
+    // Expose the key in the current process so later steps can use it.
+    std::env::set_var("BRAINTRUST_API_KEY", &created.key);
+
+    // Print once to stderr — the raw key is never retrievable again.
+    eprintln!();
+    eprintln!(
+        "{} New API key '{}' created — displayed only once:",
+        style("!").yellow().bold(),
+        name,
+    );
+    eprintln!();
+    eprintln!("   {}", style(&created.key).bold());
+    eprintln!();
+    eprintln!("   To export it in your shell, run:");
+    eprintln!(
+        "   {}",
+        style(format!("export BRAINTRUST_API_KEY={}", created.key)).dim()
+    );
+    eprintln!(
+        "   It is safe to cancel the setup now, export the key and restart the setup (with bt setup)."
+    );
+    eprintln!();
+    if std::io::stdin().is_terminal() {
+        eprint!("   Press Enter to continue...");
+        let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut String::new());
+    }
+
+    Ok(())
 }
 
 fn choose_setup_profile(
