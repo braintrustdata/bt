@@ -9,10 +9,23 @@ use crate::auth::LoginContext;
 
 pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceBase {
+    Api,
+    App,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawRequestBody {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
-    base_url: String,
+    api_url: String,
+    app_url: String,
     api_key: String,
     org_name: String,
 }
@@ -45,15 +58,24 @@ impl ApiClient {
 
         Ok(Self {
             http,
-            base_url: ctx.api_url.trim_end_matches('/').to_string(),
+            api_url: ctx.api_url.trim_end_matches('/').to_string(),
+            app_url: ctx.app_url.trim_end_matches('/').to_string(),
             api_key: ctx.login.api_key.clone(),
             org_name: ctx.login.org_name.clone(),
         })
     }
 
     pub fn url(&self, path: &str) -> String {
+        self.url_for_service(ServiceBase::Api, path)
+    }
+
+    pub fn url_for_service(&self, service: ServiceBase, path: &str) -> String {
         let path = path.trim_start_matches('/');
-        format!("{}/{}", self.base_url, path)
+        let base_url = match service {
+            ServiceBase::Api => &self.api_url,
+            ServiceBase::App => &self.app_url,
+        };
+        format!("{}/{}", base_url, path)
     }
 
     pub fn api_key(&self) -> &str {
@@ -62,6 +84,30 @@ impl ApiClient {
 
     pub fn org_name(&self) -> &str {
         &self.org_name
+    }
+
+    pub async fn request_raw(
+        &self,
+        method: reqwest::Method,
+        service: ServiceBase,
+        path: &str,
+        headers: &[(String, String)],
+        body: Option<RawRequestBody>,
+    ) -> Result<reqwest::Response> {
+        let url = self.url_for_service(service, path);
+        let mut request = self.http.request(method, &url).bearer_auth(&self.api_key);
+
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        if let Some(body) = body {
+            if let Some(content_type) = body.content_type {
+                request = request.header("Content-Type", content_type);
+            }
+            request = request.body(body.bytes);
+        }
+
+        request.send().await.context("request failed")
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
