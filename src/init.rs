@@ -41,7 +41,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         let client = ApiClient::new(&ctx)?;
 
         let org = client.org_name().to_string();
-        let project = select_project_interactive(&client, Some("Link to project"), None).await?;
+        let project = select_project_interactive(&client, Some("Link to project")).await?;
 
         (org, project)
     };

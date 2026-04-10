@@ -123,10 +123,10 @@ fn parse_sse_events(body: &str) -> Vec<SseEvent> {
     let mut current_data = Vec::<String>::new();
 
     for line in body.lines() {
-        if line.starts_with("event: ") {
-            current_event = line["event: ".len()..].to_string();
-        } else if line.starts_with("data: ") {
-            current_data.push(line["data: ".len()..].to_string());
+        if let Some(stripped) = line.strip_prefix("event: ") {
+            current_event = stripped.to_string();
+        } else if let Some(stripped) = line.strip_prefix("data: ") {
+            current_data.push(stripped.to_string());
         } else if line.is_empty() && !current_event.is_empty() {
             events.push(SseEvent {
                 event: std::mem::take(&mut current_event),
@@ -518,10 +518,10 @@ fn streaming_eval_post(
             Ok(l) => l,
             Err(_) => break,
         };
-        if line.starts_with("event: ") {
-            current_event = line["event: ".len()..].to_string();
-        } else if line.starts_with("data: ") {
-            current_data.push(line["data: ".len()..].to_string());
+        if let Some(stripped) = line.strip_prefix("event: ") {
+            current_event = stripped.to_string();
+        } else if let Some(stripped) = line.strip_prefix("data: ") {
+            current_data.push(stripped.to_string());
         } else if line.is_empty() && !current_event.is_empty() {
             let event = SseEvent {
                 event: std::mem::take(&mut current_event),

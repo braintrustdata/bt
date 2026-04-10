@@ -21,7 +21,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<
             if !is_interactive() {
                 bail!("project name required. Use: bt projects delete <name>");
             }
-            let name = select_project_interactive(client, None, None).await?;
+            let name = select_project_interactive(client, None).await?;
             with_spinner(
                 "Loading project...",
                 api::get_project_by_name(client, &name),

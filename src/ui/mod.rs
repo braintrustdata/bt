@@ -8,13 +8,8 @@ mod spinner;
 mod status;
 mod table;
 
-static NO_INPUT: AtomicBool = AtomicBool::new(false);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static ANIMATIONS_ENABLED: AtomicBool = AtomicBool::new(true);
-
-pub fn set_no_input(val: bool) {
-    NO_INPUT.store(val, Ordering::Relaxed);
-}
 
 pub fn set_quiet(val: bool) {
     QUIET.store(val, Ordering::Relaxed);
@@ -33,7 +28,7 @@ pub fn animations_enabled() -> bool {
 }
 
 pub fn is_interactive() -> bool {
-    std::io::stdin().is_terminal() && !NO_INPUT.load(Ordering::Relaxed)
+    std::io::stdin().is_terminal()
 }
 
 pub use pager::print_with_pager;

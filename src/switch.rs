@@ -119,7 +119,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
-            Some(select_project_interactive(&client, None, current_cfg.project.as_deref()).await?)
+            Some(select_project_interactive(&client, None).await?)
         }
     };
 
@@ -245,14 +245,13 @@ mod tests {
     fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
         BaseArgs {
             json: false,
-            quiet: false,
+            verbose: false,
             no_color: false,
             profile: None,
             org_name: org.map(String::from),
             project: project.map(String::from),
             api_key: None,
             prefer_profile: false,
-            no_input: false,
             api_url: None,
             app_url: None,
             env_file: None,

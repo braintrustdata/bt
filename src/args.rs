@@ -10,9 +10,9 @@ pub struct BaseArgs {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Suppress non-essential output
-    #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
-    pub quiet: bool,
+    /// Verbose mode — set at runtime by subcommands that support it
+    #[arg(skip)]
+    pub verbose: bool,
 
     /// Disable ANSI color output
     #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
@@ -43,10 +43,6 @@ pub struct BaseArgs {
     /// Prefer profile credentials even if BRAINTRUST_API_KEY/--api-key is set.
     #[arg(long, global = true)]
     pub prefer_profile: bool,
-
-    /// Disable all interactive prompts
-    #[arg(long, global = true)]
-    pub no_input: bool,
 
     /// Override API URL (or via BRAINTRUST_API_URL)
     #[arg(

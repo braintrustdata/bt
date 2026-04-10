@@ -80,7 +80,6 @@ Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
   -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
-  -q, --quiet                Suppress non-essential output
       --json                 Output as JSON
       --no-color             Disable ANSI color output
       --no-input             Disable all interactive prompts
@@ -249,14 +248,8 @@ fn configure_output(base: &BaseArgs) {
         ui::set_animations_enabled(false);
     }
 
-    if base.quiet {
-        ui::set_quiet(true);
-        ui::set_animations_enabled(false);
-    }
-
-    if base.no_input {
-        ui::set_no_input(true);
-    }
+    ui::set_quiet(true);
+    ui::set_animations_enabled(false);
 
     if disable_color {
         dialoguer::console::set_colors_enabled(false);
