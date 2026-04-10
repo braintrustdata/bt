@@ -6,7 +6,7 @@ use clap::{builder::BoolishValueParser, Args, Subcommand};
 use crate::{
     args::BaseArgs,
     http::ApiClient,
-    project_context::resolve_project_command_context,
+    project_context::resolve_project_command_context_with_auth_mode,
     ui::{self, with_spinner},
 };
 
@@ -22,6 +22,7 @@ mod view;
 use api::{self as datasets_api, Dataset};
 
 pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
+const DEFAULT_DATASETS_VIEW_ROW_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Args)]
 struct DatasetNameArgs {
@@ -79,9 +80,9 @@ struct DatasetInputArgs {
   bt datasets create my-dataset --file records.jsonl
   cat records.jsonl | bt datasets create my-dataset
   bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'
-  bt datasets add my-dataset --file more-records.jsonl
-  bt datasets append my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'
-  bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id --prune
+  bt datasets update my-dataset --file records.jsonl
+  bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'
+  bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id
   bt datasets view my-dataset
   bt datasets delete my-dataset
 "#)]
@@ -96,11 +97,9 @@ enum DatasetsCommands {
     List,
     /// Create a new dataset, optionally seeding rows from a file, --rows, or stdin
     Create(CreateArgs),
-    /// Add rows to a remote Braintrust dataset
-    #[command(visible_aliases = ["add", "append", "update"])]
-    Upload(UploadArgs),
-    /// Deterministically refresh a remote Braintrust dataset by record id
-    Refresh(RefreshArgs),
+    /// Deterministically update remote dataset rows by record id
+    #[command(visible_aliases = ["add", "refresh"])]
+    Update(UpdateArgs),
     /// View a dataset
     View(ViewArgs),
     /// Delete a dataset
@@ -123,30 +122,12 @@ impl CreateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct UploadArgs {
+struct UpdateArgs {
     #[command(flatten)]
     name: DatasetNameArgs,
 
     #[command(flatten)]
     input: DatasetInputArgs,
-}
-
-#[derive(Debug, Clone, Args)]
-struct RefreshArgs {
-    #[command(flatten)]
-    name: DatasetNameArgs,
-
-    #[command(flatten)]
-    input: DatasetInputArgs,
-
-    /// Delete remote rows whose ids are not present in the input.
-    #[arg(
-        long,
-        env = "BT_DATASETS_REFRESH_PRUNE",
-        value_parser = BoolishValueParser::new(),
-        default_value_t = false
-    )]
-    prune: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -171,6 +152,20 @@ struct ViewArgs {
         default_value_t = false
     )]
     verbose: bool,
+
+    /// Maximum number of rows to load. Defaults to 200 unless --all-rows is passed.
+    #[arg(long, env = "BT_DATASETS_VIEW_LIMIT", value_name = "N")]
+    limit: Option<usize>,
+
+    /// Load all rows (can be expensive for large datasets).
+    #[arg(
+        long = "all-rows",
+        env = "BT_DATASETS_VIEW_ALL",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false,
+        conflicts_with = "limit"
+    )]
+    all_rows: bool,
 }
 
 impl ViewArgs {
@@ -225,7 +220,8 @@ pub(crate) async fn select_dataset_interactive(
 }
 
 pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
-    let ctx = resolve_project_command_context(&base).await?;
+    let read_only = datasets_command_is_read_only(args.command.as_ref());
+    let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
     match args.command {
         None | Some(DatasetsCommands::List) => list::run(&ctx, base.json).await,
@@ -240,25 +236,13 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
             )
             .await
         }
-        Some(DatasetsCommands::Upload(upload_args)) => {
-            upload::run(
-                &ctx,
-                upload_args.name.name(),
-                upload_args.input.file.as_deref(),
-                upload_args.input.rows.as_deref(),
-                &upload_args.input.id_field,
-                base.json,
-            )
-            .await
-        }
-        Some(DatasetsCommands::Refresh(refresh_args)) => {
+        Some(DatasetsCommands::Update(update_args)) => {
             refresh::run(
                 &ctx,
-                refresh_args.name.name(),
-                refresh_args.input.file.as_deref(),
-                refresh_args.input.rows.as_deref(),
-                &refresh_args.input.id_field,
-                refresh_args.prune,
+                update_args.name.name(),
+                update_args.input.file.as_deref(),
+                update_args.input.rows.as_deref(),
+                &update_args.input.id_field,
                 base.json,
             )
             .await
@@ -270,12 +254,28 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
                 base.json,
                 view_args.web,
                 view_args.verbose,
+                resolve_view_row_limit(&view_args),
             )
             .await
         }
         Some(DatasetsCommands::Delete(delete_args)) => {
             delete::run(&ctx, delete_args.name(), delete_args.force).await
         }
+    }
+}
+
+fn datasets_command_is_read_only(command: Option<&DatasetsCommands>) -> bool {
+    matches!(
+        command,
+        None | Some(DatasetsCommands::List) | Some(DatasetsCommands::View(_))
+    )
+}
+
+fn resolve_view_row_limit(args: &ViewArgs) -> Option<usize> {
+    if args.all_rows {
+        None
+    } else {
+        Some(args.limit.unwrap_or(DEFAULT_DATASETS_VIEW_ROW_LIMIT))
     }
 }
 
@@ -358,28 +358,28 @@ mod tests {
     }
 
     #[test]
-    fn upload_parses_file_and_id_field() {
+    fn update_parses_file_and_id_field() {
         let parsed = parse(&[
             "datasets",
-            "upload",
+            "update",
             "my-dataset",
             "--file",
             "records.jsonl",
             "--id-field",
             "metadata.case_id",
         ])
-        .expect("parse upload");
-        let DatasetsCommands::Upload(upload) = parsed.command.expect("subcommand") else {
-            panic!("expected upload command");
+        .expect("parse update");
+        let DatasetsCommands::Update(update) = parsed.command.expect("subcommand") else {
+            panic!("expected update command");
         };
-        assert_eq!(upload.name.name(), Some("my-dataset"));
-        assert_eq!(upload.input.file, Some(PathBuf::from("records.jsonl")));
-        assert_eq!(upload.input.id_field, "metadata.case_id");
+        assert_eq!(update.name.name(), Some("my-dataset"));
+        assert_eq!(update.input.file, Some(PathBuf::from("records.jsonl")));
+        assert_eq!(update.input.id_field, "metadata.case_id");
     }
 
     #[test]
-    fn upload_visible_aliases_parse() {
-        for alias in ["add", "append", "update"] {
+    fn update_visible_aliases_parse() {
+        for alias in ["add", "refresh"] {
             let parsed = parse(&[
                 "datasets",
                 alias,
@@ -388,32 +388,30 @@ mod tests {
                 r#"[{"id":"case-1"}]"#,
             ])
             .unwrap_or_else(|err| panic!("parse {alias} alias: {err}"));
-            let DatasetsCommands::Upload(upload) = parsed.command.expect("subcommand") else {
-                panic!("expected upload command");
+            let DatasetsCommands::Update(update) = parsed.command.expect("subcommand") else {
+                panic!("expected update command");
             };
-            assert_eq!(upload.name.name(), Some("my-dataset"));
-            assert_eq!(upload.input.rows.as_deref(), Some(r#"[{"id":"case-1"}]"#));
+            assert_eq!(update.name.name(), Some("my-dataset"));
+            assert_eq!(update.input.rows.as_deref(), Some(r#"[{"id":"case-1"}]"#));
         }
     }
 
     #[test]
-    fn refresh_parses_prune() {
+    fn refresh_alias_parses_file_and_default_id_field() {
         let parsed = parse(&[
             "datasets",
             "refresh",
             "my-dataset",
             "--file",
             "records.jsonl",
-            "--prune",
         ])
         .expect("parse refresh");
-        let DatasetsCommands::Refresh(refresh) = parsed.command.expect("subcommand") else {
-            panic!("expected refresh command");
+        let DatasetsCommands::Update(update) = parsed.command.expect("subcommand") else {
+            panic!("expected update command");
         };
-        assert_eq!(refresh.name.name(), Some("my-dataset"));
-        assert_eq!(refresh.input.file, Some(PathBuf::from("records.jsonl")));
-        assert!(refresh.prune);
-        assert_eq!(refresh.input.id_field, "id");
+        assert_eq!(update.name.name(), Some("my-dataset"));
+        assert_eq!(update.input.file, Some(PathBuf::from("records.jsonl")));
+        assert_eq!(update.input.id_field, "id");
     }
 
     #[test]
@@ -425,6 +423,8 @@ mod tests {
             "my-dataset",
             "--web",
             "--verbose",
+            "--limit",
+            "25",
         ])
         .expect("parse view");
         let DatasetsCommands::View(view) = parsed.command.expect("subcommand") else {
@@ -433,6 +433,43 @@ mod tests {
         assert_eq!(view.name(), Some("my-dataset"));
         assert!(view.web);
         assert!(view.verbose);
+        assert_eq!(view.limit, Some(25));
+        assert!(!view.all_rows);
+    }
+
+    #[test]
+    fn view_parses_all_rows() {
+        let parsed = parse(&["datasets", "view", "my-dataset", "--all-rows"]).expect("parse view");
+        let DatasetsCommands::View(view) = parsed.command.expect("subcommand") else {
+            panic!("expected view command");
+        };
+        assert_eq!(view.name(), Some("my-dataset"));
+        assert!(view.all_rows);
+        assert!(view.limit.is_none());
+    }
+
+    #[test]
+    fn view_limit_defaults_and_all_rows_override() {
+        let default_args = ViewArgs {
+            name: DatasetNameArgs {
+                name_positional: Some("dataset".to_string()),
+                name_flag: None,
+            },
+            web: false,
+            verbose: false,
+            limit: None,
+            all_rows: false,
+        };
+        assert_eq!(
+            resolve_view_row_limit(&default_args),
+            Some(DEFAULT_DATASETS_VIEW_ROW_LIMIT)
+        );
+
+        let all_rows_args = ViewArgs {
+            all_rows: true,
+            ..default_args
+        };
+        assert_eq!(resolve_view_row_limit(&all_rows_args), None);
     }
 
     #[test]
@@ -460,5 +497,62 @@ mod tests {
             panic!("expected delete command");
         };
         assert_eq!(delete.name(), Some("positional-name"));
+    }
+
+    #[test]
+    fn datasets_routes_list_and_view_to_read_only_auth() {
+        assert!(datasets_command_is_read_only(None));
+        assert!(datasets_command_is_read_only(Some(&DatasetsCommands::List)));
+        assert!(datasets_command_is_read_only(Some(
+            &DatasetsCommands::View(ViewArgs {
+                name: DatasetNameArgs {
+                    name_positional: Some("dataset".to_string()),
+                    name_flag: None,
+                },
+                web: false,
+                verbose: false,
+                limit: None,
+                all_rows: false,
+            })
+        )));
+    }
+
+    #[test]
+    fn datasets_routes_write_commands_to_validated_auth() {
+        assert!(!datasets_command_is_read_only(Some(
+            &DatasetsCommands::Create(CreateArgs {
+                name: DatasetNameArgs {
+                    name_positional: Some("dataset".to_string()),
+                    name_flag: None,
+                },
+                input: DatasetInputArgs {
+                    file: None,
+                    rows: Some("[]".to_string()),
+                    id_field: "id".to_string(),
+                },
+            })
+        )));
+        assert!(!datasets_command_is_read_only(Some(
+            &DatasetsCommands::Update(UpdateArgs {
+                name: DatasetNameArgs {
+                    name_positional: Some("dataset".to_string()),
+                    name_flag: None,
+                },
+                input: DatasetInputArgs {
+                    file: None,
+                    rows: Some("[]".to_string()),
+                    id_field: "id".to_string(),
+                },
+            })
+        )));
+        assert!(!datasets_command_is_read_only(Some(
+            &DatasetsCommands::Delete(DeleteArgs {
+                name: DatasetNameArgs {
+                    name_positional: Some("dataset".to_string()),
+                    name_flag: None,
+                },
+                force: true,
+            })
+        )));
     }
 }

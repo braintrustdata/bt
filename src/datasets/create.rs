@@ -24,7 +24,7 @@ pub async fn run(
     .await?;
     if exists.is_some() {
         bail!(
-            "dataset '{name}' already exists in project '{}'; use `bt datasets upload {name}` to add rows",
+            "dataset '{name}' already exists in project '{}'; use `bt datasets update {name}` to add rows",
             ctx.project.name
         );
     }

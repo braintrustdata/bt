@@ -108,20 +108,20 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Commands
 
-| Command          | Description                                                          |
-| ---------------- | -------------------------------------------------------------------- |
-| `bt init`        | Initialize `.bt/` config directory and link to a project             |
-| `bt auth`        | Authenticate with Braintrust                                         |
-| `bt switch`      | Switch org and project context                                       |
-| `bt status`      | Show current org and project context                                 |
-| `bt eval`        | Run eval files (Unix only)                                           |
-| `bt sql`         | Run SQL queries against Braintrust                                   |
-| `bt view`        | View logs, traces, and spans                                         |
-| `bt projects`    | Manage projects (list, create, view, delete)                         |
-| `bt datasets`    | Manage remote datasets (list, create, upload, refresh, view, delete) |
-| `bt prompts`     | Manage prompts (list, view, delete)                                  |
-| `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files   |
-| `bt self update` | Update bt in-place                                                   |
+| Command          | Description                                                        |
+| ---------------- | ------------------------------------------------------------------ |
+| `bt init`        | Initialize `.bt/` config directory and link to a project           |
+| `bt auth`        | Authenticate with Braintrust                                       |
+| `bt switch`      | Switch org and project context                                     |
+| `bt status`      | Show current org and project context                               |
+| `bt eval`        | Run eval files (Unix only)                                         |
+| `bt sql`         | Run SQL queries against Braintrust                                 |
+| `bt view`        | View logs, traces, and spans                                       |
+| `bt projects`    | Manage projects (list, create, view, delete)                       |
+| `bt datasets`    | Manage remote datasets (list, create, update, view, delete)        |
+| `bt prompts`     | Manage prompts (list, view, delete)                                |
+| `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt self update` | Update bt in-place                                                 |
 
 ## `bt eval`
 
@@ -159,12 +159,11 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt datasets create my-dataset --file records.jsonl` — create the remote dataset and seed it from a JSON/JSONL file.
 - `cat records.jsonl | bt datasets create my-dataset` — create the dataset and seed it from stdin.
 - `bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'` — create the dataset from inline JSON rows.
-- `bt datasets add my-dataset --file records.jsonl` — add rows to an existing remote dataset.
-- `bt datasets append my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `add`/`upload` when you want to append rows explicitly.
-- `bt datasets upload my-dataset --file records.jsonl` — legacy-compatible alias for `add`.
-- `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id --prune` — deterministically upsert rows by stable record id and optionally prune stale remote rows.
-- `bt datasets view my-dataset` — show dataset metadata and the important row fields by default; pass `--verbose` to inspect full row payloads.
-- Accepted row fields for create/upload/update/refresh are `id` (or your `--id-field` path), `input`, `expected`, `metadata`, and `tags`.
+- `bt datasets update my-dataset --file records.jsonl` — deterministically upsert rows by stable record id.
+- `bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `update`.
+- `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id` — alias for `update` with explicit id path (fails if the dataset does not exist, and does not delete remote rows missing from the input).
+- `bt datasets view my-dataset` — show dataset metadata and row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust or `--all-rows` to load everything.
+- `update`/`add`/`refresh` require stable IDs (via `id` or your `--id-field` path). Accepted record fields are `id`, `input`, `expected`, `metadata`, and `tags`.
 
 ## `bt sql`
 

@@ -17,6 +17,7 @@ pub async fn run(
     json: bool,
     web: bool,
     verbose: bool,
+    max_rows: Option<usize>,
 ) -> Result<()> {
     let dataset = match name {
         Some(name) => with_spinner(
@@ -47,9 +48,9 @@ pub async fn run(
         return Ok(());
     }
 
-    let rows = with_spinner(
+    let (rows, rows_truncated) = with_spinner(
         "Loading dataset rows...",
-        api::list_dataset_rows(&ctx.client, &dataset.id),
+        api::list_dataset_rows_limited(&ctx.client, &dataset.id, max_rows),
     )
     .await?;
 
@@ -59,6 +60,8 @@ pub async fn run(
             serde_json::to_string(&serde_json::json!({
                 "dataset": dataset,
                 "rows": rows,
+                "rows_truncated": rows_truncated,
+                "row_limit": max_rows,
             }))?
         );
         return Ok(());
@@ -91,7 +94,14 @@ pub async fn run(
     if let Some(created) = dataset.created_text() {
         writeln!(output, "{} {}", console::style("Created:").dim(), created)?;
     }
-    writeln!(output, "{} {}", console::style("Rows:").dim(), rows.len())?;
+    if rows_truncated {
+        let label = max_rows
+            .map(|max_rows| format!("{} (truncated to {})", rows.len(), max_rows))
+            .unwrap_or_else(|| rows.len().to_string());
+        writeln!(output, "{} {}", console::style("Rows:").dim(), label)?;
+    } else {
+        writeln!(output, "{} {}", console::style("Rows:").dim(), rows.len())?;
+    }
 
     writeln!(
         output,
@@ -107,6 +117,16 @@ pub async fn run(
             "{}",
             console::style(
                 "Showing row id/input/expected/output/metadata/tags only. Re-run with --verbose to inspect full row payloads."
+            )
+            .dim()
+        )?;
+    }
+    if rows_truncated {
+        writeln!(
+            output,
+            "{}",
+            console::style(
+                "Row output was truncated. Re-run with --all-rows or a larger --limit to inspect more rows."
             )
             .dim()
         )?;

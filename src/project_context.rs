@@ -48,10 +48,6 @@ pub(crate) async fn resolve_required_project(
         .ok_or_else(|| anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))
 }
 
-pub(crate) async fn resolve_project_command_context(base: &BaseArgs) -> Result<ProjectContext> {
-    resolve_project_command_context_with_auth_mode(base, false).await
-}
-
 pub(crate) async fn resolve_project_command_context_with_auth_mode(
     base: &BaseArgs,
     read_only: bool,
