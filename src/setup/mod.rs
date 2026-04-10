@@ -106,6 +106,10 @@ pub struct SetupArgs {
     #[arg(long, short = 'v')]
     verbose: bool,
 
+    /// Deprecated: use --no-skills --no-mcp instead
+    #[arg(long, hide = true, conflicts_with = "skills", conflicts_with = "mcp")]
+    no_mcp_skill: bool,
+
     #[command(flatten)]
     agents: AgentsSetupArgs,
 }
@@ -215,11 +219,11 @@ struct InstrumentSetupArgs {
     languages: Vec<LanguageArg>,
 
     /// Run the agent in interactive TUI mode [default]
-    #[arg(long, conflicts_with = "background")]
+    #[arg(long, conflicts_with = "background", alias = "interactive")]
     tui: bool,
 
     /// Run the agent in background (non-interactive) mode
-    #[arg(long, conflicts_with = "tui")]
+    #[arg(long, conflicts_with = "tui", alias = "quiet")]
     background: bool,
 
     /// Grant the agent full permissions (bypass permission prompts)
@@ -419,8 +423,18 @@ pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()
         crate::ui::set_quiet(false);
         crate::ui::set_animations_enabled(true);
     }
+    // Deprecated flag: --no-mcp-skill is equivalent to --no-skills --no-mcp
+    if args.no_mcp_skill {
+        args.no_skills = true;
+        args.no_mcp = true;
+    }
     if base.json && args.instrument {
         bail!("--json conflicts with --instrument: JSON mode implies --no-instrument");
+    }
+    if base.json && args.tui {
+        bail!(
+            "--json conflicts with --tui: JSON output is not compatible with interactive TUI mode"
+        );
     }
     if base.json {
         args.no_instrument = true;
@@ -1951,7 +1965,8 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
     );
     let interactive = ui::is_interactive() && !args.yes;
     let mut prompted_agents: Option<Vec<Agent>> = None;
-    let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs || args.no_workflow {
+    let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs || args.no_workflow
+    {
         Some(Vec::new())
     } else {
         None
@@ -2436,7 +2451,10 @@ fn resolve_scope_from_flags(
     })
 }
 
-fn resolve_selected_agents(requested: Option<AgentArg>, detected: &[DetectionSignal]) -> Vec<Agent> {
+fn resolve_selected_agents(
+    requested: Option<AgentArg>,
+    detected: &[DetectionSignal],
+) -> Vec<Agent> {
     let Some(arg) = requested else {
         let mut inferred = BTreeSet::new();
         for signal in detected {
