@@ -188,6 +188,22 @@ fn sanitized_env_keys() -> &'static [&'static str] {
     ]
 }
 
+fn auth_profiles_command(cwd: &Path, config_dir: &Path) -> Command {
+    let mut cmd = Command::new(bt_binary_path());
+    cmd.arg("auth")
+        .arg("profiles")
+        .current_dir(cwd)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .env("APPDATA", config_dir)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_ORG_NAME")
+        .env_remove("BRAINTRUST_API_URL")
+        .env_remove("BRAINTRUST_APP_URL")
+        .env_remove("BRAINTRUST_ENV_FILE");
+    cmd
+}
+
 #[derive(Debug, Clone)]
 struct MockProject {
     id: String,
@@ -677,6 +693,43 @@ fn functions_help_lists_push_and_pull() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("push"));
     assert!(stdout.contains("pull"));
+}
+
+#[test]
+fn auth_profiles_ignores_api_key_env_override() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .output()
+        .expect("run bt auth profiles with api key env");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
+    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
+    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
+}
+
+#[test]
+fn auth_profiles_ignores_api_key_from_dotenv() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+    fs::write(cwd.path().join(".env"), "BRAINTRUST_API_KEY=test-key\n").expect("write .env");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .env_remove("BRAINTRUST_API_KEY")
+        .output()
+        .expect("run bt auth profiles with dotenv api key");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
+    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
+    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
 }
 
 #[test]

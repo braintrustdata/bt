@@ -466,8 +466,16 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
     }
 }
 
+fn has_explicit_profile_selection(base: &BaseArgs) -> bool {
+    base.profile_explicit
+        && base
+            .profile
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
-    if base.prefer_profile {
+    if base.prefer_profile || has_explicit_profile_selection(base) {
         return None;
     }
     let value = base.api_key.as_deref()?.trim();
@@ -1209,12 +1217,6 @@ fn format_login_success(
 }
 
 async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
-    if resolve_api_key_override(base).is_some() {
-        println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
-        eprintln!("Tip: pass --prefer-profile or unset BRAINTRUST_API_KEY to use profiles.");
-        return Ok(());
-    }
-
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
         println!("No saved profiles. Run `bt auth login` to create one.");
@@ -2645,6 +2647,7 @@ mod tests {
             quiet: false,
             no_color: false,
             profile: None,
+            profile_explicit: false,
             project: None,
             org_name: None,
             api_key: None,
@@ -2912,6 +2915,69 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn resolve_auth_explicit_profile_ignores_api_key_override() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".to_string());
+        base.profile = Some("work".to_string());
+        base.profile_explicit = true;
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: None,
+                org_name: Some("Example Org".to_string()),
+                oauth_client_id: None,
+                oauth_access_expires_at: None,
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn resolve_auth_env_profile_still_prefers_api_key_override() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".to_string());
+        base.profile = Some("work".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: None,
+                org_name: Some("Example Org".to_string()),
+                oauth_client_id: None,
+                oauth_access_expires_at: None,
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
+        assert!(!resolved.is_oauth);
     }
 
     #[test]

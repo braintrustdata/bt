@@ -3436,6 +3436,7 @@ mod tests {
             quiet: false,
             no_color: false,
             profile: None,
+            profile_explicit: false,
             org_name: None,
             project: None,
             api_key: None,
