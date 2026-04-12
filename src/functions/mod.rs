@@ -995,13 +995,15 @@ mod tests {
             .expect("parse");
         assert!(function_command_is_read_only(parsed.args.command.as_ref()));
 
-        let parsed =
-            FunctionArgsHarness::try_parse_from(["bt-tools", "delete", "--slug", "my-tool", "--force"])
-                .expect("parse");
+        let parsed = FunctionArgsHarness::try_parse_from([
+            "bt-tools", "delete", "--slug", "my-tool", "--force",
+        ])
+        .expect("parse");
         assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
 
-        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools", "invoke", "--slug", "my-tool"])
-            .expect("parse");
+        let parsed =
+            FunctionArgsHarness::try_parse_from(["bt-tools", "invoke", "--slug", "my-tool"])
+                .expect("parse");
         assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
     }
 
@@ -1014,8 +1016,9 @@ mod tests {
         let parsed = FunctionsArgsHarness::try_parse_from(["bt-functions", "list"]).expect("parse");
         assert!(functions_command_is_read_only(parsed.args.command.as_ref()));
 
-        let parsed = FunctionsArgsHarness::try_parse_from(["bt-functions", "view", "--slug", "my-fn"])
-            .expect("parse");
+        let parsed =
+            FunctionsArgsHarness::try_parse_from(["bt-functions", "view", "--slug", "my-fn"])
+                .expect("parse");
         assert!(functions_command_is_read_only(parsed.args.command.as_ref()));
 
         let parsed = FunctionsArgsHarness::try_parse_from([
