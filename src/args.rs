@@ -67,7 +67,12 @@ pub struct BaseArgs {
     pub app_url: Option<String>,
 
     /// Path to a .env file to load before running commands.
-    #[arg(long, env = "BRAINTRUST_ENV_FILE", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "BRAINTRUST_ENV_FILE",
+        hide_env_values = true,
+        global = true
+    )]
     pub env_file: Option<PathBuf>,
 }
 
