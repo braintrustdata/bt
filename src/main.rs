@@ -79,9 +79,10 @@ Additional
 Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
-  -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
+      -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
       --json                 Output as JSON
       --no-color             Disable ANSI color output
+      --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
       --env-file <PATH>      Path to a .env file to load
@@ -295,6 +296,7 @@ fn configure_output(base: &BaseArgs) {
     }
 
     ui::set_quiet(true);
+    ui::set_no_input(base.no_input);
     ui::set_animations_enabled(false);
 
     if disable_color {

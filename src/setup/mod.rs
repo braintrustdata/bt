@@ -111,6 +111,10 @@ pub struct SetupArgs {
     #[arg(long, short = 'v')]
     verbose: bool,
 
+    /// Deprecated: quiet is now the default; this flag is accepted as a no-op
+    #[arg(long, hide = true)]
+    quiet: bool,
+
     /// Deprecated: use --no-skills --no-mcp instead
     #[arg(long, hide = true, conflicts_with = "skills", conflicts_with = "mcp")]
     no_mcp_skill: bool,
@@ -204,6 +208,9 @@ struct InstrumentSetupArgs {
     /// Workflow docs to prefetch alongside instrument (repeatable; always includes instrument) [default: all]
     #[arg(long = "workflow", value_enum)]
     workflows: Vec<WorkflowArg>,
+
+    #[arg(skip)]
+    skip_workflow_docs: bool,
 
     #[arg(skip)]
     yes: bool,
@@ -517,7 +524,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         background: flag_background,
         agent: flag_agent,
         workflows: flag_workflows,
-        no_workflow: _,
+        no_workflow: flag_no_workflow,
         languages: flag_languages,
     } = flags;
     let mut had_failures = false;
@@ -671,7 +678,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 local: matches!(scope, InstallScope::Local),
                 global: matches!(scope, InstallScope::Global),
                 workflows: Vec::new(),
-                no_workflow: false,
+                no_workflow: flag_no_workflow,
                 yes: true,
                 no_fetch_docs: true,
                 refresh_docs: false,
@@ -755,6 +762,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     agent: instrument_agent,
                     agent_cmd: None,
                     workflows: flag_workflows,
+                    skip_workflow_docs: flag_no_workflow,
                     yes: false,
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
@@ -844,6 +852,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                     agent: Some(map_agent_to_instrument_agent_arg(selected_agent)),
                     agent_cmd: None,
                     workflows: args.agents.workflows,
+                    skip_workflow_docs: args.agents.no_workflow,
                     yes: true,
                     refresh_docs: args.agents.refresh_docs,
                     workers: args.agents.workers,
@@ -1291,9 +1300,9 @@ async fn run_instrument_setup(
             local: true,
             global: false,
             workflows: selected_workflows.clone(),
-            no_workflow: false,
+            no_workflow: args.skip_workflow_docs,
             yes: true,
-            no_fetch_docs: false,
+            no_fetch_docs: args.skip_workflow_docs,
             refresh_docs: args.refresh_docs,
             workers: args.workers,
             yolo: false,
@@ -1424,6 +1433,10 @@ fn resolve_instrument_workflow_selection(
     args: &InstrumentSetupArgs,
     _hint_pending: &mut bool,
 ) -> Result<Vec<WorkflowArg>> {
+    if args.skip_workflow_docs {
+        return Ok(Vec::new());
+    }
+
     if !args.workflows.is_empty() {
         let mut selected = resolve_workflow_selection(&args.workflows);
         if !selected.contains(&WorkflowArg::Instrument) {
@@ -3326,7 +3339,14 @@ fn print_mcp_human_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Parser)]
+    struct SetupArgsHarness {
+        #[command(flatten)]
+        setup: SetupArgs,
+    }
 
     #[test]
     fn single_path_agent_is_selected_by_default() {
@@ -3472,6 +3492,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_setup_selection_honors_no_workflow() {
+        let args = AgentsSetupArgs {
+            agent: Some(AgentArg::Codex),
+            local: false,
+            global: true,
+            workflows: vec![WorkflowArg::Evaluate],
+            no_workflow: true,
+            yes: true,
+            no_fetch_docs: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            yolo: false,
+        };
+        let home = std::env::temp_dir();
+        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
+        assert!(selection.selected_workflows.is_empty());
+    }
+
+    #[test]
     fn resolve_workflow_selection_resolves_explicit_values() {
         let selected =
             resolve_workflow_selection(&[WorkflowArg::Evaluate, WorkflowArg::Instrument]);
@@ -3487,6 +3526,7 @@ mod tests {
             agent: Some(InstrumentAgentArg::Codex),
             agent_cmd: None,
             workflows: vec![WorkflowArg::Evaluate],
+            skip_workflow_docs: false,
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
@@ -3511,6 +3551,7 @@ mod tests {
             agent: Some(InstrumentAgentArg::Codex),
             agent_cmd: None,
             workflows: Vec::new(),
+            skip_workflow_docs: false,
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
@@ -3524,6 +3565,35 @@ mod tests {
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
             .expect("resolve instrument workflows");
         assert_eq!(selected, resolve_workflow_selection(&[]));
+    }
+
+    #[test]
+    fn resolve_instrument_workflows_honors_skip_workflow_docs() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: vec![WorkflowArg::Evaluate],
+            skip_workflow_docs: true,
+            yes: true,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: false,
+            skip_launch: false,
+        };
+
+        let selected = resolve_instrument_workflow_selection(&args, &mut false)
+            .expect("resolve instrument workflows");
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn setup_accepts_deprecated_quiet_flag() {
+        let parsed = SetupArgsHarness::try_parse_from(["bt", "--quiet"]).expect("parse");
+        assert!(parsed.setup.quiet);
+        assert!(!parsed.setup.verbose);
     }
 
     #[test]

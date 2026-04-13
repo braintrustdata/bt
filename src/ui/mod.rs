@@ -12,7 +12,6 @@ static NO_INPUT: AtomicBool = AtomicBool::new(false);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static ANIMATIONS_ENABLED: AtomicBool = AtomicBool::new(true);
 
-#[allow(dead_code)]
 pub fn set_no_input(val: bool) {
     NO_INPUT.store(val, Ordering::Relaxed);
 }

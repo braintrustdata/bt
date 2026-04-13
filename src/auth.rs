@@ -2650,6 +2650,7 @@ mod tests {
             json: false,
             verbose: false,
             no_color: false,
+            no_input: false,
             profile: None,
             project: None,
             org_name: None,

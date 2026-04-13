@@ -3435,6 +3435,7 @@ mod tests {
             json: false,
             verbose: false,
             no_color: false,
+            no_input: false,
             profile: None,
             org_name: None,
             project: None,
