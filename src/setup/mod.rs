@@ -108,7 +108,7 @@ pub struct SetupArgs {
     interactive: bool,
 
     /// Show additional setup output
-    #[arg(long, short = 'v')]
+    #[arg(long, short = 'v', global = true)]
     verbose: bool,
 
     /// Deprecated: use --no-skills --no-mcp instead
@@ -190,7 +190,7 @@ struct AgentsMcpSetupArgs {
 #[derive(Debug, Clone, Args)]
 struct InstrumentSetupArgs {
     /// Agent to run for instrumentation
-    #[arg(long = "agent", value_enum)]
+    #[arg(long = "agent", alias = "agents", value_enum)]
     agent: Option<InstrumentAgentArg>,
 
     /// Command to run the selected agent (overrides built-in defaults)
@@ -201,8 +201,8 @@ struct InstrumentSetupArgs {
     #[arg(long = "workflow", value_enum)]
     workflows: Vec<WorkflowArg>,
 
-    #[arg(skip)]
-    skip_workflow_docs: bool,
+    #[arg(long = "no-workflow", conflicts_with = "workflows")]
+    no_workflow: bool,
 
     #[arg(skip)]
     yes: bool,
@@ -424,11 +424,9 @@ struct SkillsAliasResult {
 }
 
 pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()> {
-    if args.verbose {
-        base.verbose = true;
-        crate::ui::set_quiet(false);
-        crate::ui::set_animations_enabled(true);
-    }
+    base.verbose = args.verbose;
+    crate::ui::set_quiet(!args.verbose);
+    crate::ui::set_animations_enabled(args.verbose);
     // Deprecated flag: --no-mcp-skill is equivalent to --no-skills --no-mcp
     if args.no_mcp_skill {
         args.no_skills = true;
@@ -753,7 +751,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     agent: instrument_agent,
                     agent_cmd: None,
                     workflows: flag_workflows,
-                    skip_workflow_docs: flag_no_workflow,
+                    no_workflow: flag_no_workflow,
                     yes: false,
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
@@ -845,7 +843,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                     agent: Some(map_agent_to_instrument_agent_arg(selected_agent)),
                     agent_cmd: None,
                     workflows: args.agents.workflows,
-                    skip_workflow_docs: args.agents.no_workflow,
+                    no_workflow: args.agents.no_workflow,
                     yes: false,
                     refresh_docs: args.agents.refresh_docs,
                     workers: args.agents.workers,
@@ -1304,7 +1302,7 @@ async fn run_instrument_setup(
             local: true,
             global: false,
             workflows: selected_workflows.clone(),
-            no_workflow: args.skip_workflow_docs,
+            no_workflow: args.no_workflow,
             yes: true,
             refresh_docs: args.refresh_docs,
             workers: args.workers,
@@ -1436,7 +1434,7 @@ fn resolve_instrument_workflow_selection(
     args: &InstrumentSetupArgs,
     _hint_pending: &mut bool,
 ) -> Result<Vec<WorkflowArg>> {
-    if args.skip_workflow_docs {
+    if args.no_workflow {
         return Ok(Vec::new());
     }
 
@@ -3593,7 +3591,7 @@ mod tests {
             agent: Some(InstrumentAgentArg::Codex),
             agent_cmd: None,
             workflows: vec![WorkflowArg::Evaluate],
-            skip_workflow_docs: false,
+            no_workflow: false,
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
@@ -3618,7 +3616,7 @@ mod tests {
             agent: Some(InstrumentAgentArg::Codex),
             agent_cmd: None,
             workflows: Vec::new(),
-            skip_workflow_docs: false,
+            no_workflow: false,
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
@@ -3635,12 +3633,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_instrument_workflows_honors_skip_workflow_docs() {
+    fn resolve_instrument_workflows_honors_no_workflow() {
         let args = InstrumentSetupArgs {
             agent: Some(InstrumentAgentArg::Codex),
             agent_cmd: None,
             workflows: vec![WorkflowArg::Evaluate],
-            skip_workflow_docs: true,
+            no_workflow: true,
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),

@@ -20,8 +20,8 @@ pub struct BaseArgs {
     #[arg(skip)]
     pub verbose: bool,
 
-    /// Deprecated: quiet is now the default; this flag is accepted as a no-op
-    #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, hide = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
+    /// Reduce interactive UI output
+    #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub quiet: bool,
 
     /// Disable ANSI color output

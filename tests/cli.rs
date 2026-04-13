@@ -40,12 +40,12 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 }
 
 #[test]
-fn deprecated_global_quiet_flag_still_parses_for_other_commands() {
+fn global_quiet_flag_still_parses_for_other_commands() {
     bt_command().args(["status", "--quiet"]).assert().success();
 }
 
 #[test]
-fn deprecated_global_quiet_flag_still_parses_for_setup_subcommands() {
+fn quiet_flag_still_parses_for_setup_subcommands() {
     bt_command()
         .args(["setup", "skills", "--quiet", "--help"])
         .assert()
@@ -56,6 +56,30 @@ fn deprecated_global_quiet_flag_still_parses_for_setup_subcommands() {
 fn setup_instrument_quiet_no_longer_aliases_background() {
     bt_command()
         .args(["setup", "instrument", "--quiet", "--tui", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn setup_verbose_is_accepted_after_subcommand() {
+    bt_command()
+        .args(["setup", "skills", "--verbose", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn setup_instrument_accepts_no_workflow_flag() {
+    bt_command()
+        .args(["setup", "instrument", "--no-workflow", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn setup_instrument_accepts_deprecated_agents_alias() {
+    bt_command()
+        .args(["setup", "instrument", "--agents", "codex", "--help"])
         .assert()
         .success();
 }
