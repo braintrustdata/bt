@@ -38,6 +38,7 @@ pub fn is_interactive() -> bool {
 }
 
 pub use pager::print_with_pager;
+pub(crate) use select::tty_term;
 pub use select::{fuzzy_select, fuzzy_select_opt, select_project_interactive};
 
 pub use spinner::{with_spinner, with_spinner_visible};

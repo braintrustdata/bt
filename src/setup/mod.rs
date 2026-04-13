@@ -604,11 +604,12 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
         let choices = ["Skills", "MCP"];
         let defaults = [true, false];
+        let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
         let selected = MultiSelect::with_theme(&ColorfulTheme::default())
             .with_prompt("What would you like to set up?")
             .items(&choices)
             .defaults(&defaults)
-            .interact()?;
+            .interact_on(&term)?;
         (selected.contains(&0), selected.contains(&1))
     };
 
@@ -728,10 +729,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             }
             true
         } else {
+            let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
             Confirm::with_theme(&ColorfulTheme::default())
                 .with_prompt("Run instrumentation agent to set up tracing in this repo?")
                 .default(true)
-                .interact()?
+                .interact_on(&term)?
         };
         if instrument {
             let instrument_agent = setup_context
@@ -1012,10 +1014,11 @@ async fn select_project_for_setup(
 
     if selection == labels.len() - 1 {
         let default_name = default_setup_project_name();
+        let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
         let name: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Project name")
             .default(default_name)
-            .interact_text()?;
+            .interact_text_on(&term)?;
         let trimmed = name.trim();
         if trimmed.is_empty() {
             bail!("project name cannot be empty");
@@ -1092,7 +1095,9 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
         let update = Confirm::new()
             .with_prompt(format!("Update .bt/config.json to {org}/{}?", project.name))
             .default(true)
-            .interact()?;
+            .interact_on(
+                &ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?,
+            )?;
         if !update {
             return Ok(false);
         }
@@ -2536,11 +2541,12 @@ fn resolve_local_root_for_scope(scope: InstallScope) -> Result<Option<PathBuf>> 
 
 fn prompt_scope_selection(prompt: &str) -> Result<Option<InstallScope>> {
     let choices = ["local (current git repo)", "global (user-wide)"];
+    let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
     let idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&choices)
         .default(1)
-        .interact_opt()?;
+        .interact_on_opt(&term)?;
     Ok(idx.map(|i| {
         if i == 0 {
             InstallScope::Local
@@ -2574,13 +2580,14 @@ fn prompt_workflows_selection(defaults: &[WorkflowArg]) -> Result<Option<Vec<Wor
         .map(|workflow| default_set.contains(workflow))
         .collect::<Vec<_>>();
 
+    let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt(
             "Select the workflows you are interested in (will prefetch docs for them) (Esc: back)",
         )
         .items(&labels)
         .defaults(&default_flags)
-        .interact_opt()?;
+        .interact_on_opt(&term)?;
 
     Ok(selected.map(|indexes| {
         indexes
@@ -2632,6 +2639,9 @@ fn resolve_default_agent_selection(
 
     let path_agents = detected_agents_on_path(detected);
     if allow_prompt {
+        if path_agents.len() == 1 {
+            return Ok(path_agents[0]);
+        }
         let default = pick_agent_mode_target(&path_agents).unwrap_or(Agent::Codex);
         return prompt_agent_selection(prompt, default)?
             .ok_or_else(|| anyhow!("setup cancelled by user"));
@@ -3742,6 +3752,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_setup_selection_honors_no_workflow() {
+        let args = AgentsSetupArgs {
+            agent: Some(AgentArg::Codex),
+            local: false,
+            global: true,
+            workflows: vec![WorkflowArg::Evaluate],
+            no_workflow: true,
+            yes: true,
+            no_fetch_docs: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            yolo: false,
+        };
+        let home = std::env::temp_dir();
+        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
+        assert!(selection.selected_workflows.is_empty());
+    }
+
+    #[test]
     fn resolve_workflow_selection_resolves_explicit_values() {
         let selected =
             resolve_workflow_selection(&[WorkflowArg::Evaluate, WorkflowArg::Instrument]);
@@ -4309,5 +4338,18 @@ mod tests {
 
         let resolved = resolve_unambiguous_instrument_agent(&[], &detected);
         assert_eq!(resolved, Some(Agent::Codex));
+    }
+
+    #[test]
+    fn resolve_default_agent_selection_auto_selects_single_path_agent_even_when_prompt_allowed() {
+        let detected = vec![DetectionSignal {
+            agent: Agent::Codex,
+            on_path: true,
+            reason: "binary".to_string(),
+        }];
+
+        let resolved = resolve_default_agent_selection(None, &detected, "ignored", true)
+            .expect("resolve default agent selection");
+        assert_eq!(resolved, Agent::Codex);
     }
 }

@@ -13,7 +13,7 @@ use crate::{http::ApiClient, projects::api, ui::with_spinner};
 /// is invoked from a shell script: `echo "bt setup" | sh`.
 ///
 /// Returns `None` when no interactive terminal is available at all (headless CI).
-fn tty_term() -> Option<Term> {
+pub(crate) fn tty_term() -> Option<Term> {
     if std::io::stderr().is_terminal() {
         return Some(Term::stderr());
     }
