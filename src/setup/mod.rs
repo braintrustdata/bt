@@ -837,6 +837,9 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
 
     if !args.no_instrument {
         if find_git_root().is_some() {
+            let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+            let root = find_git_root().expect("git root already checked");
+            ensure_instrumentation_skill_prereq(selected_agent, &root, &home, args.no_skills)?;
             run_instrument_setup(
                 base,
                 InstrumentSetupArgs {
@@ -895,7 +898,8 @@ async fn login_with_existing_or_oauth(
         return auth::login(base).await;
     }
 
-    if let Some(profile_name) = choose_setup_profile(base, profiles)? {
+    let cfg_org = config::load().ok().and_then(|cfg| cfg.org);
+    if let Some(profile_name) = choose_setup_profile(base, profiles, cfg_org.as_deref())? {
         base.profile = Some(profile_name);
     }
     match auth::login(base).await {
@@ -908,7 +912,11 @@ async fn login_with_existing_or_oauth(
     }
 }
 
-fn choose_setup_profile(base: &BaseArgs, profiles: &[auth::ProfileInfo]) -> Result<Option<String>> {
+fn choose_setup_profile(
+    base: &BaseArgs,
+    profiles: &[auth::ProfileInfo],
+    cfg_org: Option<&str>,
+) -> Result<Option<String>> {
     if let Some(profile_name) = base.profile.as_ref().map(|value| value.trim()) {
         if !profile_name.is_empty() {
             return Ok(Some(profile_name.to_string()));
@@ -916,6 +924,10 @@ fn choose_setup_profile(base: &BaseArgs, profiles: &[auth::ProfileInfo]) -> Resu
     }
 
     if let Some(org) = base.org_name.as_deref() {
+        return auth::resolve_org_to_profile(org, profiles).map(Some);
+    }
+
+    if let Some(org) = cfg_org {
         return auth::resolve_org_to_profile(org, profiles).map(Some);
     }
 
@@ -928,6 +940,29 @@ fn choose_setup_profile(base: &BaseArgs, profiles: &[auth::ProfileInfo]) -> Resu
     }
 
     bail!("multiple auth profiles found; pass --profile <NAME> or --org <ORG>, or re-run in an interactive terminal")
+}
+
+fn ensure_instrumentation_skill_prereq(
+    agent: Agent,
+    root: &Path,
+    home: &Path,
+    no_skills: bool,
+) -> Result<()> {
+    if !no_skills {
+        return Ok(());
+    }
+
+    let skill_path = skill_config_path(agent, InstallScope::Local, Some(root), home)?;
+    if skill_path.exists() {
+        return Ok(());
+    }
+
+    bail!(
+        "--no-skills prevents automatic skill installation, but instrumentation requires a local {} skill at {}. Re-run without --no-skills, run `bt setup skills --local --agent {}` first, or add --no-instrument.",
+        agent.as_str(),
+        skill_path.display(),
+        agent.as_str(),
+    )
 }
 
 async fn select_project_for_setup(
@@ -3422,6 +3457,7 @@ fn print_mcp_human_report(
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Parser)]
@@ -3460,6 +3496,75 @@ mod tests {
         let err = resolve_default_agent_selection(None, &detected, "Select coding agent", false)
             .expect_err("ambiguous path detection should fail");
         assert!(err.to_string().contains("pass --agent"));
+    }
+
+    #[test]
+    fn choose_setup_profile_uses_configured_org_when_multiple_profiles_exist() {
+        let base = BaseArgs {
+            json: false,
+            verbose: false,
+            quiet: false,
+            no_color: false,
+            no_input: true,
+            profile: None,
+            org_name: None,
+            project: None,
+            api_key: None,
+            api_key_source: None,
+            prefer_profile: false,
+            api_url: None,
+            app_url: None,
+            env_file: None,
+        };
+        let profiles = vec![
+            auth::ProfileInfo {
+                name: "alpha".to_string(),
+                org_name: Some("alpha-org".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+            auth::ProfileInfo {
+                name: "beta".to_string(),
+                org_name: Some("beta-org".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+        ];
+
+        let selected = choose_setup_profile(&base, &profiles, Some("alpha-org"))
+            .expect("resolve profile from config org");
+
+        assert_eq!(selected, Some("alpha".to_string()));
+    }
+
+    #[test]
+    fn no_skills_blocks_instrumentation_when_local_skill_is_missing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+
+        let err = ensure_instrumentation_skill_prereq(Agent::Codex, root.path(), home.path(), true)
+            .expect_err("missing local skill should fail when --no-skills is set");
+
+        assert!(err
+            .to_string()
+            .contains("--no-skills prevents automatic skill installation"));
+        assert!(err
+            .to_string()
+            .contains("bt setup skills --local --agent codex"));
+    }
+
+    #[test]
+    fn no_skills_allows_instrumentation_when_local_skill_exists() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        let skill_path = root.path().join(".agents/skills/braintrust/SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("skill dir")).expect("create skill dir");
+        fs::write(&skill_path, "skill").expect("write skill");
+
+        ensure_instrumentation_skill_prereq(Agent::Codex, root.path(), home.path(), true)
+            .expect("existing local skill should satisfy --no-skills instrumentation prereq");
     }
 
     #[test]
