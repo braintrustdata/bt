@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use crate::{
     args::BaseArgs,
     http::ApiClient,
-    project_context::resolve_project_command_context,
+    project_context::resolve_project_command_context_with_auth_mode,
     ui::{self, with_spinner},
 };
 
@@ -106,11 +106,50 @@ pub(crate) async fn select_experiment_interactive(
 }
 
 pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
-    let ctx = resolve_project_command_context(&base).await?;
+    let read_only = experiments_command_is_read_only(args.command.as_ref());
+    let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
     match args.command {
         None | Some(ExperimentsCommands::List) => list::run(&ctx, base.json).await,
         Some(ExperimentsCommands::View(v)) => view::run(&ctx, v.name(), base.json, v.web).await,
         Some(ExperimentsCommands::Delete(d)) => delete::run(&ctx, d.name(), d.force).await,
+    }
+}
+
+fn experiments_command_is_read_only(command: Option<&ExperimentsCommands>) -> bool {
+    matches!(
+        command,
+        None | Some(ExperimentsCommands::List) | Some(ExperimentsCommands::View(_))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn experiments_routes_list_and_view_to_read_only_auth() {
+        assert!(experiments_command_is_read_only(None));
+        assert!(experiments_command_is_read_only(Some(
+            &ExperimentsCommands::List
+        )));
+        assert!(experiments_command_is_read_only(Some(
+            &ExperimentsCommands::View(ViewArgs {
+                name_positional: Some("my-experiment".to_string()),
+                name_flag: None,
+                web: false,
+            })
+        )));
+    }
+
+    #[test]
+    fn experiments_routes_delete_to_validated_auth() {
+        assert!(!experiments_command_is_read_only(Some(
+            &ExperimentsCommands::Delete(DeleteArgs {
+                name_positional: Some("my-experiment".to_string()),
+                name_flag: None,
+                force: true,
+            })
+        )));
     }
 }

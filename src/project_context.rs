@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 
 use crate::{
     args::BaseArgs,
-    auth::login,
+    auth::{login, login_read_only},
     config,
     http::ApiClient,
     projects::api::{get_project_by_name, Project},
@@ -48,8 +48,15 @@ pub(crate) async fn resolve_required_project(
         .ok_or_else(|| anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))
 }
 
-pub(crate) async fn resolve_project_command_context(base: &BaseArgs) -> Result<ProjectContext> {
-    let auth = login(base).await?;
+pub(crate) async fn resolve_project_command_context_with_auth_mode(
+    base: &BaseArgs,
+    read_only: bool,
+) -> Result<ProjectContext> {
+    let auth = if read_only {
+        login_read_only(base).await?
+    } else {
+        login(base).await?
+    };
     let client = ApiClient::new(&auth)?;
     let project = resolve_required_project(base, &client, true).await?;
     Ok(ProjectContext {

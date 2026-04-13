@@ -110,16 +110,23 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let ctx = login(&login_base).await?;
     let client = ApiClient::new(&ctx)?;
-    let org_name = client.org_name();
+    let org_name = client.org_name().to_string();
 
-    let project_name = match resolved_project {
-        Some(p) => Some(validate_or_create_project(&client, &p).await?),
+    let project = match resolved_project {
+        Some(p) => validate_or_create_project(&client, &p).await?,
         None => {
             if !is_interactive() {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
-            Some(select_project_interactive(&client, None, current_cfg.project.as_deref()).await?)
+            let selected_name =
+                select_project_interactive(&client, None, current_cfg.project.as_deref()).await?;
+            with_spinner(
+                "Loading project...",
+                api::get_project_by_name(&client, &selected_name),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("project '{selected_name}' not found"))?
         }
     };
 
@@ -138,15 +145,11 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     };
 
     let mut cfg = config::load_file(&path);
-    cfg.org = Some(org_name.to_string());
-    cfg.project = project_name.clone();
+    apply_switch_config(&mut cfg, &org_name, &project);
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 
-    let display = match &project_name {
-        Some(p) => format!("{org_name}/{p}"),
-        None => org_name.to_string(),
-    };
+    let display = format!("{org_name}/{}", project.name);
     print_command_status(CommandStatus::Success, &format!("Switched to {display}"));
     if args.verbose {
         eprintln!("Wrote to {}", path.display());
@@ -204,11 +207,11 @@ fn select_scope() -> Result<std::path::PathBuf> {
     }
 }
 
-async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<String> {
+async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<api::Project> {
     let exists = with_spinner("Loading project...", api::get_project_by_name(client, name)).await?;
 
-    if exists.is_some() {
-        return Ok(name.to_string());
+    if let Some(project) = exists {
+        return Ok(project);
     }
 
     if !is_interactive() {
@@ -221,11 +224,16 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<St
         .interact()?;
 
     if create {
-        with_spinner("Creating project...", api::create_project(client, name)).await?;
-        Ok(name.to_string())
+        with_spinner("Creating project...", api::create_project(client, name)).await
     } else {
         bail!("project '{name}' not found");
     }
+}
+
+fn apply_switch_config(cfg: &mut config::Config, org_name: &str, project: &api::Project) {
+    cfg.org = Some(org_name.to_string());
+    cfg.project = Some(project.name.clone());
+    cfg.project_id = Some(project.id.clone());
 }
 
 #[cfg(test)]
@@ -454,5 +462,22 @@ mod tests {
 
         assert_eq!(login_base.profile, Some("staging".into()));
         assert_eq!(login_base.org_name, Some("custom-org".into()));
+    }
+
+    #[test]
+    fn apply_switch_config_sets_project_id_with_project_name_and_org() {
+        let mut cfg = config::Config::default();
+        let project = api::Project {
+            id: "proj_123".to_string(),
+            name: "my-project".to_string(),
+            org_id: "org_123".to_string(),
+            description: None,
+        };
+
+        apply_switch_config(&mut cfg, "acme-org", &project);
+
+        assert_eq!(cfg.org.as_deref(), Some("acme-org"));
+        assert_eq!(cfg.project.as_deref(), Some("my-project"));
+        assert_eq!(cfg.project_id.as_deref(), Some("proj_123"));
     }
 }

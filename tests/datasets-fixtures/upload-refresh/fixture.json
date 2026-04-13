@@ -12,7 +12,7 @@
         "datasets",
         "--json",
         "--no-input",
-        "append",
+        "create",
         "qa-fixture",
         "--file",
         "upload.jsonl"
@@ -20,7 +20,22 @@
       "stdout_contains": [
         "\"uploaded\":2",
         "\"created_dataset\":true",
-        "\"mode\":\"upload\""
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--no-input",
+        "update",
+        "qa-fixture",
+        "--rows",
+        "[{\"input\":{\"prompt\":\"missing-id\"},\"expected\":\"nope\"}]"
+      ],
+      "expect_success": false,
+      "stderr_contains": [
+        "missing a stable id at 'id'",
+        "update`/`add`/`refresh` require explicit ids"
       ]
     },
     {
@@ -31,16 +46,13 @@
         "refresh",
         "qa-fixture",
         "--file",
-        "refresh.jsonl",
-        "--prune"
+        "refresh.jsonl"
       ],
       "stdout_contains": [
         "\"created\":1",
         "\"updated\":1",
-        "\"deleted\":1",
         "\"unchanged\":0",
-        "\"pruned\":true",
-        "\"mode\":\"refresh\""
+        "\"mode\":\"update\""
       ]
     },
     {
@@ -51,16 +63,13 @@
         "refresh",
         "qa-fixture",
         "--file",
-        "refresh.jsonl",
-        "--prune"
+        "refresh.jsonl"
       ],
       "stdout_contains": [
         "\"created\":0",
         "\"updated\":0",
-        "\"deleted\":0",
         "\"unchanged\":2",
-        "\"pruned\":true",
-        "\"mode\":\"refresh\""
+        "\"mode\":\"update\""
       ]
     },
     {
@@ -68,9 +77,10 @@
       "stdout_contains": [
         "\"id\":\"case-1\"",
         "\"expected\":\"A2\"",
-        "\"id\":\"case-3\""
+        "\"id\":\"case-3\"",
+        "\"id\":\"case-2\""
       ],
-      "stdout_not_contains": ["\"id\":\"case-2\""]
+      "stdout_not_contains": []
     }
   ],
   "expected_logs3_requests": 2

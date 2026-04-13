@@ -108,20 +108,20 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Commands
 
-| Command          | Description                                                          |
-| ---------------- | -------------------------------------------------------------------- |
-| `bt init`        | Initialize `.bt/` config directory and link to a project             |
-| `bt auth`        | Authenticate with Braintrust                                         |
-| `bt switch`      | Switch org and project context                                       |
-| `bt status`      | Show current org and project context                                 |
-| `bt eval`        | Run eval files (Unix only)                                           |
-| `bt sql`         | Run SQL queries against Braintrust                                   |
-| `bt view`        | View logs, traces, and spans                                         |
-| `bt projects`    | Manage projects (list, create, view, delete)                         |
-| `bt datasets`    | Manage remote datasets (list, create, upload, refresh, view, delete) and dataset versions                                   |
-| `bt prompts`     | Manage prompts (list, view, delete)                                  |
-| `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files   |
-| `bt self update` | Update bt in-place                                                   |
+| Command          | Description                                                        |
+| ---------------- | ------------------------------------------------------------------ |
+| `bt init`        | Initialize `.bt/` config directory and link to a project           |
+| `bt auth`        | Authenticate with Braintrust                                       |
+| `bt switch`      | Switch org and project context                                     |
+| `bt status`      | Show current org and project context                               |
+| `bt eval`        | Run eval files (Unix only)                                         |
+| `bt sql`         | Run SQL queries against Braintrust                                 |
+| `bt view`        | View logs, traces, and spans                                       |
+| `bt projects`    | Manage projects (list, create, view, delete)                       |
+| `bt datasets`    | Manage remote datasets (list, create, update, view, delete, versions) |
+| `bt prompts`     | Manage prompts (list, view, delete)                                |
+| `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt self update` | Update bt in-place                                                 |
 
 ## `bt eval`
 
@@ -156,25 +156,27 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 
 - `bt datasets` works directly against remote Braintrust datasets — no local `bt sync` artifact flow is required.
 - `bt datasets create my-dataset` — create an empty remote dataset in the current project.
+- `bt datasets create my-dataset --description "Dataset for smoke tests"` — create a dataset with a description.
 - `bt datasets create my-dataset --file records.jsonl` — create the remote dataset and seed it from a JSON/JSONL file.
 - `cat records.jsonl | bt datasets create my-dataset` — create the dataset and seed it from stdin.
 - `bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'` — create the dataset from inline JSON rows.
-- `bt datasets add my-dataset --file records.jsonl` — add rows to an existing remote dataset.
-- `bt datasets append my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `add`/`upload` when you want to append rows explicitly.
-- `bt datasets upload my-dataset --file records.jsonl` — legacy-compatible alias for `add`.
-- `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id --prune` — deterministically upsert rows by stable record id and optionally prune stale remote rows.
-- `bt datasets view my-dataset` — show dataset metadata and the important row fields by default; pass `--verbose` to inspect full row payloads.
-- `bt datasets versions create my-dataset` — create a named dataset version using a generated `<user>-<timestamp>` name and the dataset's current head xact.
-- `bt datasets versions create my-dataset baseline` — create a named dataset version from the dataset's current head xact.
+- `bt datasets create my-dataset --rows '[{"input":{"text":"hi"},"expected":"hello"}]'` — create a dataset when rows do not include `id`; bt auto-generates deterministic record IDs.
+- `bt datasets update my-dataset --file records.jsonl` — deterministically upsert rows by stable record id.
+- `bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `update`.
+- `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id` — alias for `update` with explicit id path (fails if the dataset does not exist, and does not delete remote rows missing from the input).
+- `bt datasets view my-dataset` — show dataset metadata and row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust or `--all-rows` to load everything.
 - `bt datasets versions list my-dataset` — list saved dataset versions for a dataset.
+- `bt datasets versions create my-dataset` — create a dataset version using a generated `<user>-<timestamp>` name and the dataset's current head xact.
+- `bt datasets versions create my-dataset baseline` — create a named dataset version from the dataset's current head xact.
+- `bt datasets versions create my-dataset baseline --xact-id 1000192656880881099` — create a named dataset version from a specific transaction id.
+- `bt datasets versions create my-dataset baseline --xact-id 1000192656880881099 --description "Initial snapshot"` — attach an optional description to the dataset version.
 - `bt datasets versions restore my-dataset` — on a TTY, interactively pick a saved version to restore.
 - `bt datasets versions restore my-dataset --name baseline` — preview restoring a dataset to a saved version, including `rows_to_restore` / `rows_to_delete`, then confirm before applying it.
 - `bt datasets versions restore my-dataset --version 1000192656880881099 --force` — preview and immediately restore a dataset to a transaction id without prompting.
 - Applied restores return `xact_id`, `rows_restored`, and `rows_deleted`.
-- `bt datasets versions create my-dataset baseline --xact-id 1000192656880881099` — create a named dataset version from a transaction id.
-- `bt datasets versions create my-dataset baseline --xact-id 1000192656880881099 --description "Initial snapshot"` — attach an optional description to the dataset version.
 - `bt datasets versions restore ...` resolves `--name` through the dataset snapshot list endpoint; if you already know the xact id, pass it directly with `--version`.
-- Accepted row fields for create/upload/update/refresh are `id` (or your `--id-field` path), `input`, `expected`, `metadata`, and `tags`.
+- `update`/`add`/`refresh` require explicit stable IDs via `id` or `--id-field`.
+- Accepted top-level record fields are `id`, `input`, `expected`, `output`, `metadata`, and `tags` (plus the root field referenced by `--id-field`, if different).
 
 ## `bt sql`
 

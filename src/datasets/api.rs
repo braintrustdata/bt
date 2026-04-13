@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::collections::HashSet;
+
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use urlencoding::encode;
@@ -6,6 +8,7 @@ use urlencoding::encode;
 use crate::http::ApiClient;
 
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
+const MAX_DATASET_ROWS_PAGES: usize = 10_000;
 const DATASET_ROWS_SINCE: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +128,11 @@ struct ListResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListResponseGeneric<T> {
+    objects: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DatasetRowsResponse {
     #[serde(default)]
     data: Vec<DatasetRow>,
@@ -158,10 +166,43 @@ pub async fn get_dataset_by_name(
 }
 
 pub async fn list_dataset_rows(client: &ApiClient, dataset_id: &str) -> Result<Vec<DatasetRow>> {
+    let (rows, _truncated) = list_dataset_rows_limited(client, dataset_id, None).await?;
+    Ok(rows)
+}
+
+pub async fn list_dataset_rows_limited(
+    client: &ApiClient,
+    dataset_id: &str,
+    max_rows: Option<usize>,
+) -> Result<(Vec<DatasetRow>, bool)> {
+    if matches!(max_rows, Some(0)) {
+        return Ok((Vec::new(), false));
+    }
+
     let mut rows = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut page_count = 0usize;
+    let mut truncated = false;
 
     loop {
+        page_count += 1;
+        if page_count > MAX_DATASET_ROWS_PAGES {
+            bail!(
+                "dataset rows pagination exceeded {} pages for dataset '{}'",
+                MAX_DATASET_ROWS_PAGES,
+                dataset_id
+            );
+        }
+        if let Some(current_cursor) = cursor.as_ref() {
+            if !seen_cursors.insert(current_cursor.clone()) {
+                bail!(
+                    "dataset rows pagination loop detected for dataset '{}'",
+                    dataset_id
+                );
+            }
+        }
+
         let query =
             build_dataset_rows_query(dataset_id, MAX_DATASET_ROWS_PAGE_LIMIT, cursor.as_deref());
         let body = serde_json::json!({
@@ -177,42 +218,63 @@ pub async fn list_dataset_rows(client: &ApiClient, dataset_id: &str) -> Result<V
         let response: DatasetRowsResponse =
             client.post_with_headers("/btql", &body, &headers).await?;
 
+        let next_cursor = response.cursor.filter(|cursor| !cursor.is_empty());
+
         if response.data.is_empty() {
+            if next_cursor.is_some() {
+                bail!(
+                    "dataset rows response for '{}' returned an empty page with a cursor",
+                    dataset_id
+                );
+            }
             break;
+        }
+
+        if let Some(max_rows) = max_rows {
+            let remaining = max_rows.saturating_sub(rows.len());
+            if remaining == 0 {
+                truncated = true;
+                break;
+            }
+            if response.data.len() > remaining {
+                rows.extend(response.data.into_iter().take(remaining));
+                truncated = true;
+                break;
+            }
         }
 
         rows.extend(response.data);
 
-        let next_cursor = response.cursor.filter(|cursor| !cursor.is_empty());
-        if next_cursor.is_none() {
-            break;
+        match next_cursor {
+            Some(next_cursor) => {
+                if max_rows.is_some_and(|max_rows| rows.len() >= max_rows) {
+                    truncated = true;
+                    break;
+                }
+                cursor = Some(next_cursor);
+            }
+            None => break,
         }
-        cursor = next_cursor;
     }
 
-    Ok(rows)
+    Ok((rows, truncated))
 }
 
-pub async fn create_dataset(client: &ApiClient, project_id: &str, name: &str) -> Result<Dataset> {
-    let body = serde_json::json!({
+pub async fn create_dataset(
+    client: &ApiClient,
+    project_id: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Result<Dataset> {
+    let mut body = serde_json::json!({
         "name": name,
         "project_id": project_id,
         "org_name": client.org_name(),
     });
-    client.post("/v1/dataset", &body).await
-}
-
-pub async fn get_or_create_dataset(
-    client: &ApiClient,
-    project_id: &str,
-    name: &str,
-) -> Result<(Dataset, bool)> {
-    if let Some(dataset) = get_dataset_by_name(client, project_id, name).await? {
-        return Ok((dataset, false));
+    if let Some(description) = description.filter(|description| !description.is_empty()) {
+        body["description"] = serde_json::Value::String(description.to_string());
     }
-
-    let dataset = create_dataset(client, project_id, name).await?;
-    Ok((dataset, true))
+    client.post("/v1/dataset", &body).await
 }
 
 pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> {
@@ -339,11 +401,6 @@ fn compare_xact_ids(left: &String, right: &String) -> std::cmp::Ordering {
         (Ok(left), Ok(right)) => left.cmp(&right),
         _ => left.cmp(right),
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct ListResponseGeneric<T> {
-    objects: Vec<T>,
 }
 
 #[cfg(test)]

@@ -1,15 +1,14 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::ui::{print_command_status, with_spinner, with_spinner_visible, CommandStatus};
 
 use super::{
     api,
-    records::{delete_row, load_refresh_records, remote_records_by_id},
+    records::{load_refresh_records, remote_records_by_id},
     upload, ResolvedContext,
 };
 
@@ -19,18 +18,25 @@ pub async fn run(
     input_path: Option<&Path>,
     inline_rows: Option<&str>,
     id_field: &str,
-    prune: bool,
     json_output: bool,
 ) -> Result<()> {
     let dataset_name = upload::resolve_dataset_name(name, "refresh")?;
     let local_records = load_refresh_records(input_path, inline_rows, id_field)?;
 
-    let (dataset, created_dataset) = with_spinner_visible(
+    let existing_dataset = with_spinner_visible(
         "Resolving remote dataset...",
-        api::get_or_create_dataset(&ctx.client, &ctx.project.id, &dataset_name),
+        api::get_dataset_by_name(&ctx.client, &ctx.project.id, &dataset_name),
         Duration::from_millis(300),
     )
     .await?;
+    let (dataset, created_dataset) = match existing_dataset {
+        Some(dataset) => (dataset, false),
+        None => bail!(
+            "dataset '{}' not found in project '{}'",
+            dataset_name,
+            ctx.project.name
+        ),
+    };
 
     let remote_records = if created_dataset {
         Default::default()
@@ -44,14 +50,11 @@ pub async fn run(
     };
 
     let mut upload_rows = Vec::new();
-    let mut local_ids = HashSet::new();
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut unchanged = 0usize;
-    let mut deleted = 0usize;
 
     for record in &local_records {
-        local_ids.insert(record.id.clone());
         match remote_records.get(&record.id) {
             None => {
                 created += 1;
@@ -63,15 +66,6 @@ pub async fn run(
             Some(_) => {
                 updated += 1;
                 upload_rows.push(record.to_upload_row(&dataset.id));
-            }
-        }
-    }
-
-    if prune {
-        for remote_id in remote_records.keys() {
-            if !local_ids.contains(remote_id) {
-                deleted += 1;
-                upload_rows.push(delete_row(remote_id, &dataset.id));
             }
         }
     }
@@ -94,10 +88,8 @@ pub async fn run(
                 "created_dataset": created_dataset,
                 "created": created,
                 "updated": updated,
-                "deleted": deleted,
                 "unchanged": unchanged,
-                "pruned": prune,
-                "mode": "refresh",
+                "mode": "update",
             }))?
         );
         return Ok(());
@@ -107,8 +99,8 @@ pub async fn run(
         format!("'{}' is already up to date.", dataset.name)
     } else {
         format!(
-            "Refreshed '{}' (created {}, updated {}, deleted {}, unchanged {}).",
-            dataset.name, created, updated, deleted, unchanged
+            "Updated '{}' (created {}, updated {}, unchanged {}).",
+            dataset.name, created, updated, unchanged
         )
     };
     print_command_status(CommandStatus::Success, &detail);

@@ -10,6 +10,7 @@ use super::{api, records::load_optional_upload_records, upload, ResolvedContext}
 pub async fn run(
     ctx: &ResolvedContext,
     name: Option<&str>,
+    description: Option<&str>,
     input_path: Option<&Path>,
     inline_rows: Option<&str>,
     id_field: &str,
@@ -24,7 +25,7 @@ pub async fn run(
     .await?;
     if exists.is_some() {
         bail!(
-            "dataset '{name}' already exists in project '{}'; use `bt datasets upload {name}` to add rows",
+            "dataset '{name}' already exists in project '{}'; use `bt datasets update {name}` to add rows",
             ctx.project.name
         );
     }
@@ -34,7 +35,7 @@ pub async fn run(
 
     let dataset = match with_spinner_visible(
         "Creating dataset...",
-        api::create_dataset(&ctx.client, &ctx.project.id, &name),
+        api::create_dataset(&ctx.client, &ctx.project.id, &name, description),
         Duration::from_millis(300),
     )
     .await

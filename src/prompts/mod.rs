@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::{args::BaseArgs, project_context::resolve_project_command_context};
+use crate::{args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode};
+
+pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 
 mod api;
 mod delete;
@@ -81,7 +83,8 @@ impl DeleteArgs {
 }
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
-    let ctx = resolve_project_command_context(&base).await?;
+    let read_only = prompts_command_is_read_only(args.command.as_ref());
+    let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
     match args.command {
         None | Some(PromptsCommands::List) => list::run(&ctx, base.json).await,
@@ -89,5 +92,42 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
             view::run(&ctx, p.slug(), base.json, p.web, p.verbose).await
         }
         Some(PromptsCommands::Delete(p)) => delete::run(&ctx, p.slug(), p.force).await,
+    }
+}
+
+fn prompts_command_is_read_only(command: Option<&PromptsCommands>) -> bool {
+    matches!(
+        command,
+        None | Some(PromptsCommands::List) | Some(PromptsCommands::View(_))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompts_routes_list_and_view_to_read_only_auth() {
+        assert!(prompts_command_is_read_only(None));
+        assert!(prompts_command_is_read_only(Some(&PromptsCommands::List)));
+        assert!(prompts_command_is_read_only(Some(&PromptsCommands::View(
+            ViewArgs {
+                slug_positional: Some("my-prompt".to_string()),
+                slug_flag: None,
+                web: false,
+                verbose: false,
+            }
+        ))));
+    }
+
+    #[test]
+    fn prompts_routes_delete_to_validated_auth() {
+        assert!(!prompts_command_is_read_only(Some(
+            &PromptsCommands::Delete(DeleteArgs {
+                slug_positional: Some("my-prompt".to_string()),
+                slug_flag: None,
+                force: true,
+            })
+        )));
     }
 }

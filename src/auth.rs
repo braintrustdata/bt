@@ -353,6 +353,51 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     }
 }
 
+pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
+    if !has_cached_project_id() {
+        return login(base).await;
+    }
+
+    let ctx = fast_login(base).await?;
+    if ctx.login.org_name.trim().is_empty() {
+        login(base).await
+    } else {
+        Ok(ctx)
+    }
+}
+
+/// Build login context from stored auth without forcing a login validation request.
+/// Use for read-oriented flows where downstream API calls can surface auth errors.
+pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
+    maybe_warn_api_key_override(base);
+    let auth = resolve_auth(base).await?;
+    let api_key = auth.api_key.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
+        )
+    })?;
+    let org_name = auth.org_name.clone().unwrap_or_default();
+    let api_url = auth
+        .api_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let app_url = auth
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+
+    Ok(LoginContext {
+        login: LoginState {
+            api_key,
+            org_id: String::new(),
+            org_name,
+            api_url: Some(api_url.clone()),
+        },
+        api_url,
+        app_url,
+    })
+}
+
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
@@ -416,6 +461,13 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         api_url,
         app_url,
     })
+}
+
+fn has_cached_project_id() -> bool {
+    crate::config::load()
+        .ok()
+        .and_then(|config| config.project_id)
+        .is_some_and(|project_id| !project_id.trim().is_empty())
 }
 
 fn maybe_warn_api_key_override(base: &BaseArgs) {
@@ -2603,8 +2655,18 @@ fn auth_store_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::lock::Mutex;
+    use tempfile::TempDir;
+
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        env,
+        ffi::OsString,
+        fs,
+        path::PathBuf,
+        sync::OnceLock,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn make_base() -> BaseArgs {
         BaseArgs {
@@ -2620,6 +2682,128 @@ mod tests {
             api_url: None,
             app_url: None,
             env_file: None,
+        }
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn setup_global_config(project_id: Option<&str>, org: Option<&str>) {
+        let cfg = crate::config::Config {
+            org: org.map(str::to_string),
+            project_id: project_id.map(str::to_string),
+            ..crate::config::Config::default()
+        };
+
+        crate::config::save_global(&cfg).expect("save global config");
+    }
+
+    fn setup_auth_store_profiles(profiles: &[(&str, &str, &str, &str)]) {
+        let mut store = AuthStore::default();
+        for (profile_name, org_name, api_url, app_url) in profiles {
+            store.profiles.insert(
+                (*profile_name).to_string(),
+                AuthProfile {
+                    auth_kind: AuthKind::ApiKey,
+                    api_url: Some((*api_url).to_string()),
+                    app_url: Some((*app_url).to_string()),
+                    org_name: Some((*org_name).to_string()),
+                    oauth_client_id: None,
+                    oauth_access_expires_at: None,
+                    user_name: None,
+                    email: None,
+                    api_key_hint: None,
+                },
+            );
+        }
+
+        save_auth_store(&store).expect("save auth store");
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected_substring: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing '{expected_substring}'"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(expected_substring),
+                    "expected error to contain '{expected_substring}', got '{msg}'",
+                );
+            }
+        }
+    }
+
+    fn assert_invalid_api_url<T>(result: Result<T>) {
+        assert_err_contains(result, "invalid api_url");
+    }
+
+    fn restore_env_var(key: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
+
+    fn base_args_for_path_probe(org_name: Option<&str>) -> BaseArgs {
+        let mut base = make_base();
+        base.api_key = Some("test-api-key".into());
+        base.api_url = Some("not-a-valid-url".into());
+        base.app_url = Some("https://app.example.test".into());
+        base.org_name = org_name.map(|s| s.into());
+        base
+    }
+
+    struct TestEnv {
+        _guard: futures_util::lock::MutexGuard<'static, ()>,
+        _config_dir: TempDir,
+        _cwd_dir: TempDir,
+        previous_cwd: PathBuf,
+        previous_xdg_config_home: Option<OsString>,
+        previous_appdata: Option<OsString>,
+    }
+
+    impl TestEnv {
+        async fn new(project_id: Option<&str>, org: Option<&str>) -> Self {
+            let guard = env_test_lock().lock().await;
+            let previous_cwd = env::current_dir().expect("read current dir");
+            let cwd_dir = TempDir::new().expect("create temp cwd");
+            // Prevent config::local_path from traversing parent directories.
+            fs::create_dir(cwd_dir.path().join(".git")).expect("create .git marker");
+            env::set_current_dir(cwd_dir.path()).expect("set test current dir");
+
+            let previous_xdg_config_home = env::var_os("XDG_CONFIG_HOME");
+            let previous_appdata = env::var_os("APPDATA");
+            let config_dir = TempDir::new().expect("create temp config dir");
+            env::set_var("XDG_CONFIG_HOME", config_dir.path());
+            env::set_var("APPDATA", config_dir.path());
+            setup_global_config(project_id, org);
+            Self {
+                _guard: guard,
+                _config_dir: config_dir,
+                _cwd_dir: cwd_dir,
+                previous_cwd,
+                previous_xdg_config_home,
+                previous_appdata,
+            }
+        }
+
+        async fn login_read_only_with_base(&self, base: BaseArgs) -> Result<LoginContext> {
+            login_read_only(&base).await
+        }
+
+        async fn login_read_only_probe(&self, org_name: Option<&str>) -> Result<LoginContext> {
+            self.login_read_only_with_base(base_args_for_path_probe(org_name))
+                .await
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.previous_cwd).expect("restore current dir");
+            restore_env_var("XDG_CONFIG_HOME", self.previous_xdg_config_home.clone());
+            restore_env_var("APPDATA", self.previous_appdata.clone());
         }
     }
 
@@ -3079,5 +3263,100 @@ mod tests {
             format_verification_line(&v),
             "bad — api_key — org: corp — invalid API key"
         );
+    }
+
+    #[tokio::test]
+    async fn login_read_only_no_cached_project_id_uses_validated_login_path() {
+        let env = TestEnv::new(None, None).await;
+        assert_invalid_api_url(env.login_read_only_probe(Some("acme")).await);
+    }
+
+    #[tokio::test]
+    async fn login_read_only_cached_project_id_and_org_uses_fast_path() {
+        let env = TestEnv::new(Some("proj_123"), None).await;
+        let ctx = env
+            .login_read_only_probe(Some("acme"))
+            .await
+            .expect("fast path should succeed");
+
+        assert_eq!(ctx.login.org_name, "acme");
+        assert_eq!(ctx.login.org_id, "");
+        assert_eq!(ctx.api_url, "not-a-valid-url");
+    }
+
+    #[tokio::test]
+    async fn login_read_only_cached_project_id_but_missing_org_falls_back_to_login() {
+        let env = TestEnv::new(Some("proj_123"), None).await;
+        assert_invalid_api_url(env.login_read_only_probe(None).await);
+    }
+
+    #[tokio::test]
+    async fn login_read_only_cached_project_id_but_whitespace_org_falls_back_to_login() {
+        let env = TestEnv::new(Some("proj_123"), None).await;
+        assert_invalid_api_url(env.login_read_only_probe(Some("     ")).await);
+    }
+
+    #[tokio::test]
+    async fn login_read_only_whitespace_project_id_is_treated_as_not_cached() {
+        let env = TestEnv::new(Some("     "), None).await; // has_cached_project_id => false
+        assert_invalid_api_url(env.login_read_only_probe(Some("acme")).await);
+    }
+
+    #[tokio::test]
+    async fn login_read_only_cached_project_id_and_config_org_uses_fast_path() {
+        let env = TestEnv::new(Some("proj_123"), Some("acme-org")).await;
+        setup_auth_store_profiles(&[
+            (
+                "acme-profile",
+                "acme-org",
+                "https://api.acme.example",
+                "https://www.acme.example",
+            ),
+            (
+                "other-profile",
+                "other-org",
+                "https://api.other.example",
+                "https://www.other.example",
+            ),
+        ]);
+        save_profile_secret_plaintext("acme-profile", "acme-secret").expect("save acme secret");
+        save_profile_secret_plaintext("other-profile", "other-secret").expect("save other secret");
+
+        let ctx = env
+            .login_read_only_with_base(make_base())
+            .await
+            .expect("fast path should succeed with cfg org");
+
+        assert_eq!(ctx.login.api_key, "acme-secret");
+        assert_eq!(ctx.login.org_name, "acme-org");
+        assert_eq!(ctx.api_url, "https://api.acme.example");
+        assert_eq!(ctx.app_url, "https://www.acme.example");
+    }
+
+    #[tokio::test]
+    async fn login_read_only_cached_project_id_and_org_uses_default_urls() {
+        let env = TestEnv::new(Some("proj_123"), None).await;
+        let mut base = make_base();
+        base.api_key = Some("test-api-key".into());
+        base.org_name = Some("acme".into());
+
+        let ctx = env
+            .login_read_only_with_base(base)
+            .await
+            .expect("fast path should succeed");
+
+        assert_eq!(ctx.login.org_name, "acme");
+        assert_eq!(ctx.api_url, DEFAULT_API_URL);
+        assert_eq!(ctx.app_url, DEFAULT_APP_URL);
+    }
+
+    #[tokio::test]
+    async fn login_read_only_cached_project_id_missing_api_key_returns_helpful_error() {
+        let env = TestEnv::new(Some("proj_123"), None).await;
+        let mut base = make_base();
+        base.org_name = Some("acme".into());
+
+        let result = env.login_read_only_with_base(base).await;
+        assert_err_contains(result, "no login credentials found");
     }
 }
