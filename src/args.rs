@@ -28,10 +28,6 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub no_color: bool,
 
-    /// Disable all interactive prompts
-    #[arg(long, env = "BRAINTRUST_NO_INPUT", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
-    pub no_input: bool,
-
     /// Use a saved login profile (or via BRAINTRUST_PROFILE)
     #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
     pub profile: Option<String>,

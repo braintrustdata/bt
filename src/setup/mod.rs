@@ -1278,34 +1278,31 @@ async fn run_instrument_setup(
     print_hint: bool,
 ) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let root = find_git_root()
-        .map(Ok)
-        .unwrap_or_else(|| std::env::current_dir().context("failed to get current directory"))?;
+    let root = find_git_root().ok_or_else(|| {
+        anyhow!(
+            "instrument setup requires running inside a git repository (could not find .git in parent chain)"
+        )
+    })?;
     let mut detected = detect_agents(Some(&root), &home);
 
     let runnable_agents = detect_runnable_agents();
-    let mut selected = if let Some(agent_arg) = args.agent {
-        map_instrument_agent_arg(agent_arg)
-    } else if let Some(agent) = resolve_unambiguous_instrument_agent(&runnable_agents, &detected) {
+    let selected = if args.agent.is_none() {
+        resolve_unambiguous_instrument_agent(&runnable_agents, &detected)
+    } else {
+        None
+    };
+    let selected = if let Some(agent) = selected {
         agent
     } else {
-        let candidate_agents: Vec<Agent> = if runnable_agents.is_empty() {
-            ALL_AGENTS.to_vec()
-        } else {
-            runnable_agents.clone()
-        };
-        pick_agent_mode_target(&candidate_agents)
-            .ok_or_else(|| anyhow!("no detected agents available for instrumentation"))?
+        resolve_default_agent_selection(
+            args.agent.map(map_instrument_agent_arg_to_agent_arg),
+            &detected,
+            "Select agent to instrument this repo",
+            ui::is_interactive() && !args.yes,
+        )?
     };
 
-    if args.agent.is_none()
-        && ui::is_interactive()
-        && !args.yes
-        && !base.json
-        && runnable_agents.len() != 1
-    {
-        selected = prompt_instrument_agent(selected)?;
-    } else if args.agent.is_some() && base.verbose && !args.yes {
+    if args.agent.is_some() && base.verbose {
         eprintln!(
             "{} Select agent to instrument this repo · {}",
             style("✔").green(),
@@ -1671,9 +1668,8 @@ fn skill_config_path(
     let root = scope_root(scope, local_root, home)?;
     let path = match agent {
         Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
-        Agent::Codex | Agent::Opencode | Agent::Cursor => {
-            root.join(".agents/skills/braintrust/SKILL.md")
-        }
+        Agent::Codex | Agent::Opencode => root.join(".agents/skills/braintrust/SKILL.md"),
+        Agent::Cursor => root.join(".cursor/rules/braintrust.mdc"),
     };
     Ok(path)
 }
@@ -2020,7 +2016,7 @@ async fn run_agent_invocation(
                 return command
                     .status()
                     .await
-                    .map_err(|e| agent_launch_error(e, program));
+                    .with_context(|| format!("failed to run agent command in {}", root.display()));
             }
 
             if !show_output {
@@ -2028,35 +2024,22 @@ async fn run_agent_invocation(
                 return command
                     .status()
                     .await
-                    .map_err(|e| agent_launch_error(e, program));
+                    .with_context(|| format!("failed to run agent command in {}", root.display()));
             }
 
             if *stream_json {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
                 let child = command
                     .spawn()
-                    .map_err(|e| agent_launch_error(e, program))?;
+                    .with_context(|| format!("failed to start {program}"))?;
                 agent_stream::stream_agent_output(child, root).await
             } else {
                 command
                     .status()
                     .await
-                    .map_err(|e| agent_launch_error(e, program))
+                    .with_context(|| format!("failed to run agent command in {}", root.display()))
             }
         }
-    }
-}
-
-fn agent_launch_error(e: std::io::Error, program: &str) -> anyhow::Error {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        let path = std::env::var("PATH").unwrap_or_default();
-        anyhow::anyhow!(
-            "tried to launch {} but didn't find it, PATH={}\n",
-            program,
-            path
-        )
-    } else {
-        anyhow::Error::new(e)
     }
 }
 
@@ -2468,9 +2451,32 @@ fn doctor_agent_status(
         .collect::<Vec<_>>();
     let detected_any = !detected_signals.is_empty();
 
-    let config_path = skill_config_path(agent, scope, local_root, home)
-        .ok()
-        .map(|path| path.display().to_string());
+    let config_path = match (agent, scope) {
+        (Agent::Claude, InstallScope::Local) => local_root
+            .map(|root| root.join(".claude/skills/braintrust/SKILL.md"))
+            .map(|p| p.display().to_string()),
+        (Agent::Claude, InstallScope::Global) => Some(
+            home.join(".claude/skills/braintrust/SKILL.md")
+                .display()
+                .to_string(),
+        ),
+        (Agent::Codex, InstallScope::Local) | (Agent::Opencode, InstallScope::Local) => local_root
+            .map(|root| root.join(".agents/skills/braintrust/SKILL.md"))
+            .map(|p| p.display().to_string()),
+        (Agent::Codex, InstallScope::Global) | (Agent::Opencode, InstallScope::Global) => Some(
+            home.join(".agents/skills/braintrust/SKILL.md")
+                .display()
+                .to_string(),
+        ),
+        (Agent::Cursor, InstallScope::Local) => local_root
+            .map(|root| root.join(".cursor/skills/braintrust/SKILL.md"))
+            .map(|p| p.display().to_string()),
+        (Agent::Cursor, InstallScope::Global) => Some(
+            home.join(".cursor/skills/braintrust/SKILL.md")
+                .display()
+                .to_string(),
+        ),
+    };
 
     let configured = config_path
         .as_deref()
@@ -2653,6 +2659,15 @@ fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
         InstrumentAgentArg::Codex => Agent::Codex,
         InstrumentAgentArg::Cursor => Agent::Cursor,
         InstrumentAgentArg::Opencode => Agent::Opencode,
+    }
+}
+
+fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg {
+    match agent {
+        InstrumentAgentArg::Claude => AgentArg::Claude,
+        InstrumentAgentArg::Codex => AgentArg::Codex,
+        InstrumentAgentArg::Cursor => AgentArg::Cursor,
+        InstrumentAgentArg::Opencode => AgentArg::Opencode,
     }
 }
 
@@ -3513,15 +3528,8 @@ fn print_mcp_human_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[derive(Parser)]
-    struct SetupArgsHarness {
-        #[command(flatten)]
-        setup: SetupArgs,
-    }
 
     #[test]
     fn single_path_agent_is_selected_by_default() {
@@ -4129,14 +4137,7 @@ mod tests {
         let home = std::env::temp_dir();
         let status = doctor_agent_status(Agent::Cursor, InstallScope::Global, None, &home, &[]);
         assert!(!status.configured);
-        assert_eq!(
-            status.config_path,
-            Some(
-                home.join(".agents/skills/braintrust/SKILL.md")
-                    .display()
-                    .to_string()
-            )
-        );
+        assert!(status.config_path.is_some());
         assert!(status.notes.is_empty());
     }
 

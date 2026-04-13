@@ -2708,7 +2708,6 @@ mod tests {
             verbose: false,
             quiet: false,
             no_color: false,
-            no_input: false,
             profile: None,
             project: None,
             org_name: None,
