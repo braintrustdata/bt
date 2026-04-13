@@ -3725,26 +3725,6 @@ mod tests {
             workers: crate::sync::default_workers(),
             yolo: false,
         };
-        let home = std::env::temp_dir();
-        let selection = resolve_setup_selection(&args).expect("resolve setup selection");
-        assert!(selection.selected_workflows.is_empty());
-    }
-
-    #[test]
-    fn resolve_setup_selection_honors_no_workflow() {
-        let args = AgentsSetupArgs {
-            agent: Some(AgentArg::Codex),
-            local: false,
-            global: true,
-            workflows: vec![WorkflowArg::Evaluate],
-            no_workflow: true,
-            yes: true,
-            no_fetch_docs: false,
-            refresh_docs: false,
-            workers: crate::sync::default_workers(),
-            yolo: false,
-        };
-        let home = std::env::temp_dir();
         let selection = resolve_setup_selection(&args).expect("resolve setup selection");
         assert!(selection.selected_workflows.is_empty());
     }
