@@ -528,17 +528,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(1, "Auth");
     }
     let project_flag = base.project.clone();
-    let login_ctx = ensure_auth(&mut base).await?;
-    let client = ApiClient::new(&login_ctx)?;
+    let (_login_ctx, client) = ensure_setup_auth(&mut base).await?;
     let org = client.org_name().to_string();
-
-    // After OAuth login, create a permanent API key so the user has one for external tooling.
-    let resolved = auth::resolve_auth(&base).await.ok();
-    let is_oauth = resolved.map(|r| r.is_oauth).unwrap_or(false);
-    let has_explicit_key = base.api_key.is_some() || std::env::var("BRAINTRUST_API_KEY").is_ok();
-    if is_oauth && !has_explicit_key {
-        maybe_create_api_key_for_oauth(&client).await?;
-    }
 
     if verbose {
         eprintln!("   {} Using org '{}'", style("✓").green(), org);
@@ -792,15 +783,16 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 }
 
 async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
-    let should_prepare_project = should_prepare_project_context(args.no_instrument);
-    if should_prepare_project {
+    let needs_auth = !args.no_instrument || (args.mcp && !args.no_mcp);
+    if needs_auth {
         let project_flag = base.project.clone();
-        let login_ctx = ensure_auth(&mut base).await?;
-        let client = ApiClient::new(&login_ctx)?;
+        let (_login_ctx, client) = ensure_setup_auth(&mut base).await?;
         let org = client.org_name().to_string();
         let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
-            let _ = maybe_init(&org, project)?;
+            if find_git_root().is_some() {
+                let _ = maybe_init(&org, project)?;
+            }
         }
     }
 
@@ -847,9 +839,6 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
 
     if !args.no_instrument {
         if find_git_root().is_some() {
-            let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-            let root = find_git_root().expect("git root already checked");
-            ensure_instrumentation_skill_prereq(selected_agent, &root, &home, args.no_skills)?;
             run_instrument_setup(
                 base,
                 InstrumentSetupArgs {
@@ -877,49 +866,85 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
-fn should_prepare_project_context(no_instrument: bool) -> bool {
-    !no_instrument && find_git_root().is_some()
-}
-
-async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
+async fn ensure_auth(base: &mut BaseArgs) -> Result<(LoginContext, bool)> {
     if matches!(base.api_key_source, Some(ArgValueSource::CommandLine)) {
-        return auth::login(base).await;
+        return Ok((auth::login(base).await?, false));
+    }
+
+    if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) && !base.prefer_profile {
+        return Ok((auth::login(base).await?, false));
     }
 
     let profiles = auth::list_profiles()?;
-    if base.prefer_profile {
-        return login_with_existing_or_oauth(base, &profiles).await;
+    if !profiles.is_empty() {
+        let profile_name = if let Some(profile_name) =
+            base.profile.as_ref().map(|value| value.trim())
+        {
+            if !profile_name.is_empty() {
+                profile_name.to_string()
+            } else if let Some(org) = base.org_name.as_deref() {
+                auth::resolve_org_to_profile(org, &profiles)?
+            } else if profiles.len() == 1 {
+                profiles[0].name.clone()
+            } else if !ui::is_interactive() {
+                bail!("multiple auth profiles found; pass --profile <NAME> or --org <ORG>, or re-run in an interactive terminal")
+            } else {
+                auth::select_profile_interactive(None)?
+                    .ok_or_else(|| anyhow!("no profile selected"))?
+            }
+        } else if let Some(org) = base.org_name.as_deref() {
+            auth::resolve_org_to_profile(org, &profiles)?
+        } else if profiles.len() == 1 {
+            profiles[0].name.clone()
+        } else if !ui::is_interactive() {
+            bail!("multiple auth profiles found; pass --profile <NAME> or --org <ORG>, or re-run in an interactive terminal")
+        } else {
+            auth::select_profile_interactive(None)?.ok_or_else(|| anyhow!("no profile selected"))?
+        };
+        base.profile = Some(profile_name.clone());
+
+        match auth::login(base).await {
+            Ok(ctx) => {
+                let is_oauth = profiles
+                    .iter()
+                    .find(|p| p.name == profile_name)
+                    .is_some_and(|p| p.is_oauth);
+                return Ok((ctx, is_oauth));
+            }
+            Err(err) if auth::is_missing_credential_error(&err) => {
+                if base.verbose {
+                    eprintln!(
+                        "   Profile '{}' credentials inaccessible ({}). Re-authenticating via OAuth...",
+                        profile_name, err
+                    );
+                }
+                base.profile = None;
+                auth::login_interactive_oauth(base).await?;
+                return Ok((auth::login(base).await?, true));
+            }
+            Err(err) => return Err(err),
+        }
     }
 
-    if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) {
-        return auth::login(base).await;
+    if base.verbose {
+        eprintln!("No auth profiles found. Starting OAuth login.\n");
     }
-
-    login_with_existing_or_oauth(base, &profiles).await
+    auth::login_interactive_oauth(base).await?;
+    Ok((auth::login(base).await?, true))
 }
 
-async fn login_with_existing_or_oauth(
-    base: &mut BaseArgs,
-    profiles: &[auth::ProfileInfo],
-) -> Result<LoginContext> {
-    if profiles.is_empty() {
-        eprintln!("No auth profiles found. Let's set one up.\n");
-        auth::login_interactive_oauth(base).await?;
-        return auth::login(base).await;
+async fn ensure_setup_auth(base: &mut BaseArgs) -> Result<(LoginContext, ApiClient)> {
+    let (login_ctx, is_oauth) = ensure_auth(base).await?;
+    let client = ApiClient::new(&login_ctx)?;
+    if is_oauth
+        && !matches!(
+            base.api_key_source,
+            Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
+        )
+    {
+        maybe_create_api_key_for_oauth(&client).await?;
     }
-
-    let cfg_org = config::load().ok().and_then(|cfg| cfg.org);
-    if let Some(profile_name) = choose_setup_profile(base, profiles, cfg_org.as_deref())? {
-        base.profile = Some(profile_name);
-    }
-    match auth::login(base).await {
-        Ok(ctx) => Ok(ctx),
-        Err(err) if auth::is_missing_credential_error(&err) => {
-            auth::login_interactive_oauth(base).await?;
-            auth::login(base).await
-        }
-        Err(err) => Err(err),
-    }
+    Ok((login_ctx, client))
 }
 
 /// After an OAuth login in `bt setup`, create a permanent Braintrust API key so the user
@@ -997,59 +1022,6 @@ async fn maybe_create_api_key_for_oauth(client: &ApiClient) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn choose_setup_profile(
-    base: &BaseArgs,
-    profiles: &[auth::ProfileInfo],
-    cfg_org: Option<&str>,
-) -> Result<Option<String>> {
-    if let Some(profile_name) = base.profile.as_ref().map(|value| value.trim()) {
-        if !profile_name.is_empty() {
-            return Ok(Some(profile_name.to_string()));
-        }
-    }
-
-    if let Some(org) = base.org_name.as_deref() {
-        return auth::resolve_org_to_profile(org, profiles).map(Some);
-    }
-
-    if let Some(org) = cfg_org {
-        return auth::resolve_org_to_profile(org, profiles).map(Some);
-    }
-
-    if profiles.len() == 1 {
-        return Ok(profiles.first().map(|profile| profile.name.clone()));
-    }
-
-    if ui::is_interactive() {
-        return auth::select_profile_interactive(None);
-    }
-
-    bail!("multiple auth profiles found; pass --profile <NAME> or --org <ORG>, or re-run in an interactive terminal")
-}
-
-fn ensure_instrumentation_skill_prereq(
-    agent: Agent,
-    root: &Path,
-    home: &Path,
-    no_skills: bool,
-) -> Result<()> {
-    if !no_skills {
-        return Ok(());
-    }
-
-    let skill_path = skill_config_path(agent, InstallScope::Local, Some(root), home)?;
-    if skill_path.exists() {
-        return Ok(());
-    }
-
-    bail!(
-        "--no-skills prevents automatic skill installation, but instrumentation requires a local {} skill at {}. Re-run without --no-skills, run `bt setup skills --local --agent {}` first, or add --no-instrument.",
-        agent.as_str(),
-        skill_path.display(),
-        agent.as_str(),
-    )
 }
 
 async fn select_project_for_setup(
@@ -3543,14 +3515,25 @@ fn print_mcp_human_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
-    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[derive(Parser)]
-    struct SetupArgsHarness {
-        #[command(flatten)]
-        setup: SetupArgs,
+    fn make_base_args() -> BaseArgs {
+        BaseArgs {
+            json: false,
+            verbose: false,
+            quiet: false,
+            no_color: false,
+            no_input: false,
+            profile: None,
+            org_name: None,
+            project: None,
+            api_key: None,
+            api_key_source: None,
+            prefer_profile: false,
+            api_url: None,
+            app_url: None,
+            env_file: None,
+        }
     }
 
     #[test]
@@ -3585,73 +3568,26 @@ mod tests {
         assert!(err.to_string().contains("pass --agent"));
     }
 
-    #[test]
-    fn choose_setup_profile_uses_configured_org_when_multiple_profiles_exist() {
-        let base = BaseArgs {
-            json: false,
-            verbose: false,
-            quiet: false,
-            no_color: false,
-            no_input: true,
-            profile: None,
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            env_file: None,
-        };
-        let profiles = vec![
-            auth::ProfileInfo {
-                name: "alpha".to_string(),
-                org_name: Some("alpha-org".to_string()),
-                user_name: None,
-                email: None,
-                api_key_hint: None,
-            },
-            auth::ProfileInfo {
-                name: "beta".to_string(),
-                org_name: Some("beta-org".to_string()),
-                user_name: None,
-                email: None,
-                api_key_hint: None,
-            },
-        ];
-
-        let selected = choose_setup_profile(&base, &profiles, Some("alpha-org"))
-            .expect("resolve profile from config org");
-
-        assert_eq!(selected, Some("alpha".to_string()));
+    fn should_create_api_key(is_oauth: bool, base: &BaseArgs) -> bool {
+        is_oauth
+            && !matches!(
+                base.api_key_source,
+                Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
+            )
     }
 
     #[test]
-    fn no_skills_blocks_instrumentation_when_local_skill_is_missing() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let home = tempfile::tempdir().expect("home tempdir");
-
-        let err = ensure_instrumentation_skill_prereq(Agent::Codex, root.path(), home.path(), true)
-            .expect_err("missing local skill should fail when --no-skills is set");
-
-        assert!(err
-            .to_string()
-            .contains("--no-skills prevents automatic skill installation"));
-        assert!(err
-            .to_string()
-            .contains("bt setup skills --local --agent codex"));
+    fn setup_creates_api_key_for_oauth_without_explicit_key() {
+        let base = make_base_args();
+        assert!(should_create_api_key(true, &base));
     }
 
     #[test]
-    fn no_skills_allows_instrumentation_when_local_skill_exists() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let home = tempfile::tempdir().expect("home tempdir");
-        let skill_path = root.path().join(".agents/skills/braintrust/SKILL.md");
-        fs::create_dir_all(skill_path.parent().expect("skill dir")).expect("create skill dir");
-        fs::write(&skill_path, "skill").expect("write skill");
-
-        ensure_instrumentation_skill_prereq(Agent::Codex, root.path(), home.path(), true)
-            .expect("existing local skill should satisfy --no-skills instrumentation prereq");
+    fn setup_does_not_create_api_key_when_env_key_is_present() {
+        let mut base = make_base_args();
+        base.api_key = Some("env-key".to_string());
+        base.api_key_source = Some(ArgValueSource::EnvVariable);
+        assert!(!should_create_api_key(true, &base));
     }
 
     #[test]

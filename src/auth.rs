@@ -782,9 +782,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if !ui::is_interactive() {
         bail!("oauth login requires an interactive terminal");
     }
-    if let Some(warning) = oauth_ignored_api_key_warning(base) {
-        eprintln!("{warning}");
-    }
 
     let api_url = base
         .api_url
@@ -1046,18 +1043,6 @@ fn commit_oauth_profile(
         },
     );
     save_auth_store(&store)
-}
-
-fn oauth_ignored_api_key_warning(base: &BaseArgs) -> Option<String> {
-    let api_key = base.api_key.as_deref()?.trim();
-    if api_key.is_empty() {
-        return None;
-    }
-
-    Some(
-        "warning: --api-key/BRAINTRUST_API_KEY is set; ignoring it because --oauth was requested"
-            .to_string(),
-    )
 }
 
 async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
@@ -3027,21 +3012,6 @@ mod tests {
             err.to_string().contains("did not include code or error"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn oauth_ignored_api_key_warning_is_none_without_api_key() {
-        let base = make_base();
-        assert_eq!(oauth_ignored_api_key_warning(&base), None);
-    }
-
-    #[test]
-    fn oauth_ignored_api_key_warning_is_some_with_api_key() {
-        let mut base = make_base();
-        base.api_key = Some("secret".to_string());
-        let warning = oauth_ignored_api_key_warning(&base).expect("warning");
-        assert!(warning.contains("ignoring it"));
-        assert!(warning.contains("--oauth"));
     }
 
     #[test]
