@@ -362,6 +362,8 @@ struct AgentInstallResult {
 #[derive(Debug, Clone, Serialize)]
 struct DetectionSignal {
     agent: Agent,
+    #[serde(default)]
+    on_path: bool,
     reason: String,
 }
 
@@ -646,24 +648,16 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
-        let agents = vec![resolve_default_agent_selection(
-            flag_agent,
-            &detected,
-            "Select coding agent",
-            true,
-        )?];
+        let selected_agent =
+            resolve_default_agent_selection(flag_agent, &detected, "Select coding agent", true)?;
         if verbose && flag_agent.is_some() {
-            let agent_names: Vec<String> = agents
-                .iter()
-                .map(|a| style(a.as_str()).green().to_string())
-                .collect();
             eprintln!(
-                "{} Select agents to configure · {}",
+                "{} Select agent to configure · {}",
                 style("✔").green(),
-                agent_names.join(", ")
+                style(selected_agent.as_str()).green()
             );
         }
-        Some((scope, agents, home))
+        Some((scope, selected_agent, home))
     } else {
         None
     };
@@ -672,11 +666,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if verbose {
             eprintln!("   {}", style("Skills:").bold());
         }
-        if let Some((scope, _, _)) = setup_context {
+        if let Some((scope, selected_agent, _)) = setup_context.as_ref() {
             let args = AgentsSetupArgs {
-                agent: flag_agent,
-                local: matches!(scope, InstallScope::Local),
-                global: matches!(scope, InstallScope::Global),
+                agent: Some(map_agent_to_agent_arg(*selected_agent)),
+                local: matches!(*scope, InstallScope::Local),
+                global: matches!(*scope, InstallScope::Global),
                 workflows: Vec::new(),
                 no_workflow: flag_no_workflow,
                 yes: true,
@@ -701,9 +695,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if verbose {
             eprintln!("   {}", style("MCP:").bold());
         }
-        if let Some((scope, ref agents, ref home)) = setup_context {
-            let local_root = resolve_local_root_for_scope(scope)?;
-            let outcome = execute_mcp_install(scope, local_root.as_deref(), home, agents);
+        if let Some((scope, selected_agent, home)) = setup_context.as_ref() {
+            let local_root = resolve_local_root_for_scope(*scope)?;
+            let outcome =
+                execute_mcp_install(*scope, local_root.as_deref(), home, &[*selected_agent]);
             for r in &outcome.results {
                 if verbose {
                     print_wizard_agent_result(r);
@@ -712,7 +707,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     had_failures = true;
                 }
             }
-            if outcome.installed_count == 0 && !agents.is_empty() {
+            if outcome.installed_count == 0 {
                 had_failures = true;
             }
         }
@@ -750,12 +745,17 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 .interact()?
         };
         if instrument {
-            let instrument_agent = flag_agent.map(|a| match a {
-                AgentArg::Claude => InstrumentAgentArg::Claude,
-                AgentArg::Codex => InstrumentAgentArg::Codex,
-                AgentArg::Cursor => InstrumentAgentArg::Cursor,
-                AgentArg::Opencode => InstrumentAgentArg::Opencode,
-            });
+            let instrument_agent = setup_context
+                .as_ref()
+                .map(|(_, agent, _)| map_agent_to_instrument_agent_arg(*agent))
+                .or_else(|| {
+                    flag_agent.map(|a| match a {
+                        AgentArg::Claude => InstrumentAgentArg::Claude,
+                        AgentArg::Codex => InstrumentAgentArg::Codex,
+                        AgentArg::Cursor => InstrumentAgentArg::Cursor,
+                        AgentArg::Opencode => InstrumentAgentArg::Opencode,
+                    })
+                });
             run_instrument_setup(
                 base,
                 InstrumentSetupArgs {
@@ -792,7 +792,18 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     Ok(())
 }
 
-async fn run_default_setup(base: BaseArgs, args: SetupArgs) -> Result<()> {
+async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
+    let project_flag = base.project.clone();
+    let login_ctx = ensure_auth(&mut base).await?;
+    let client = ApiClient::new(&login_ctx)?;
+    let org = client.org_name().to_string();
+    let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
+    if let Some(ref project) = project {
+        if find_git_root().is_some() {
+            let _ = maybe_init(&org, project)?;
+        }
+    }
+
     let scope = default_setup_scope(&args.agents);
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let local_root = resolve_local_root_for_scope(scope)?;
@@ -844,7 +855,7 @@ async fn run_default_setup(base: BaseArgs, args: SetupArgs) -> Result<()> {
                     agent_cmd: None,
                     workflows: args.agents.workflows,
                     skip_workflow_docs: args.agents.no_workflow,
-                    yes: true,
+                    yes: false,
                     refresh_docs: args.agents.refresh_docs,
                     workers: args.agents.workers,
                     languages: args.languages,
@@ -953,6 +964,10 @@ async fn select_project_for_setup(
     )
     .await?;
 
+    if projects.is_empty() {
+        bail!("no projects found in org '{}'", client.org_name());
+    }
+
     if projects.len() == 1 && projects[0].name == "My Project" {
         return create_or_fetch_project(client, &default_setup_project_name()).await;
     }
@@ -1005,9 +1020,15 @@ async fn create_or_fetch_project(
     }
     match crate::projects::api::create_project(client, name).await {
         Ok(project) => Ok(project),
-        Err(_) => crate::projects::api::get_project_by_name(client, name)
-            .await?
-            .ok_or_else(|| anyhow!("failed to create project '{name}'")),
+        Err(err) => match crate::projects::api::get_project_by_name(client, name).await {
+            Ok(Some(project)) => Ok(project),
+            Ok(None) => Err(err).context(format!(
+                "failed to create project '{name}' and project was not found afterwards"
+            )),
+            Err(fetch_err) => Err(fetch_err).context(format!(
+                "failed to create project '{name}' after initial create error: {err}"
+            )),
+        },
     }
 }
 
@@ -1313,7 +1334,7 @@ async fn run_instrument_setup(
     // --tui:        interactive TUI
     // --background: background, restricted to language package managers
     // --yes or non-interactive terminal: background, restricted to language package managers
-    // Otherwise: ask the user.
+    // Otherwise: default to interactive TUI.
     let (run_interactive, bypass_permissions) = if args.tui {
         (true, false)
     } else if args.yolo {
@@ -1357,14 +1378,14 @@ async fn run_instrument_setup(
 
     if run_interactive {
         eprintln!();
-        eprintln!("Claude Code is opening in interactive mode.");
+        eprintln!("{} is opening in interactive mode.", selected.as_str());
         eprintln!("The instrumentation task is pre-loaded. Press Enter to begin.");
         eprintln!("Task file: {}", task_path.display());
         eprintln!();
     }
 
-    let show_output = !base.json && !args.background;
-    let status = if args.background && !base.json {
+    let show_output = !base.json && run_interactive;
+    let status = if !run_interactive && !base.json {
         with_spinner(
             "Running agent instrumentation…",
             run_agent_invocation(&root, &invocation, false),
@@ -1771,39 +1792,56 @@ fn resolve_instrument_invocation(
     }
 
     let invocation = match agent {
-        Agent::Codex => InstrumentInvocation::Program {
-            program: "codex".to_string(),
-            args: vec!["exec".to_string(), "-".to_string()],
-            stdin_file: Some(task_path.to_path_buf()),
-            prompt_file_arg: None,
-            initial_prompt: None,
-            stream_json: false,
-            interactive,
-        },
+        Agent::Codex => {
+            let mut codex_args = vec![];
+            if bypass_permissions {
+                codex_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+            }
+            if interactive {
+                InstrumentInvocation::Program {
+                    program: "codex".to_string(),
+                    args: codex_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                codex_args.extend(["exec".to_string(), "-".to_string()]);
+                InstrumentInvocation::Program {
+                    program: "codex".to_string(),
+                    args: codex_args,
+                    stdin_file: Some(task_path.to_path_buf()),
+                    prompt_file_arg: None,
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: false,
+                }
+            }
+        }
         Agent::Claude => {
             if interactive {
-                // In interactive mode the full task goes into --append-system-prompt so
-                // Claude already knows what to do.  A short initial user message is passed
-                // as the positional arg so Claude immediately starts working — the user only
-                // needs to press Enter once on a short, clear prompt rather than a wall of
-                // raw task markdown.
-                let task_content = std::fs::read_to_string(task_path)
-                    .with_context(|| format!("failed to read task file {}", task_path.display()))?;
+                let permission_mode = if bypass_permissions {
+                    "bypassPermissions"
+                } else {
+                    "acceptEdits"
+                };
                 InstrumentInvocation::Program {
                     program: "claude".to_string(),
                     args: vec![
-                        "--append-system-prompt".to_string(),
-                        task_content,
+                        "--permission-mode".to_string(),
+                        permission_mode.to_string(),
+                        "--settings".to_string(),
+                        format!(r#"{{"defaultMode": "{permission_mode}"}}"#),
                         "--disallowedTools".to_string(),
-                        "EnterPlanMode".to_string(),
+                        "ExitPlanMode,EnterPlanMode".to_string(),
                         "--name".to_string(),
                         "Braintrust: Instrument".to_string(),
                     ],
                     stdin_file: None,
-                    prompt_file_arg: None,
-                    initial_prompt: Some(
-                        "Please begin the Braintrust instrumentation task.".to_string(),
-                    ),
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
                     stream_json: false,
                     interactive: true,
                 }
@@ -1848,21 +1886,39 @@ fn resolve_instrument_invocation(
             stream_json: false,
             interactive,
         },
-        Agent::Cursor => InstrumentInvocation::Program {
-            program: "cursor-agent".to_string(),
-            args: vec![
-                "-p".to_string(),
-                "-f".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--stream-partial-output".to_string(),
-            ],
-            stdin_file: None,
-            prompt_file_arg: Some(task_path.to_path_buf()),
-            initial_prompt: None,
-            stream_json: true,
-            interactive,
-        },
+        Agent::Cursor => {
+            let mut cursor_args = vec![];
+            if bypass_permissions {
+                cursor_args.push("--yolo".to_string());
+            }
+            if interactive {
+                InstrumentInvocation::Program {
+                    program: "cursor-agent".to_string(),
+                    args: cursor_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                cursor_args.extend([
+                    "-p".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--stream-partial-output".to_string(),
+                ]);
+                InstrumentInvocation::Program {
+                    program: "cursor-agent".to_string(),
+                    args: cursor_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
     };
     Ok(invocation)
 }
@@ -2518,14 +2574,18 @@ fn resolve_default_agent_selection(
     }
 
     let path_agents = detected_agents_on_path(detected);
-    if path_agents.len() == 1 {
-        return Ok(path_agents[0]);
-    }
-
     if allow_prompt {
         let default = pick_agent_mode_target(&path_agents).unwrap_or(Agent::Codex);
         return prompt_agent_selection(prompt, default)?
             .ok_or_else(|| anyhow!("setup cancelled by user"));
+    }
+
+    if path_agents.len() == 1 {
+        return Ok(path_agents[0]);
+    }
+
+    if path_agents.is_empty() {
+        bail!("no coding agents detected on PATH; pass --agent <AGENT> to try anyway");
     }
 
     bail!("multiple coding agents available; pass --agent <AGENT> or re-run in an interactive terminal");
@@ -2576,7 +2636,7 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
 fn detected_agents_on_path(detected: &[DetectionSignal]) -> Vec<Agent> {
     let mut agents = BTreeSet::new();
     for signal in detected {
-        if signal.reason.contains("binary found in PATH") {
+        if signal.on_path {
             agents.insert(signal.agent);
         }
     }
@@ -2598,19 +2658,30 @@ fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
 }
 
 fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal> {
-    let mut by_agent: BTreeMap<Agent, BTreeSet<String>> = BTreeMap::new();
+    let mut by_agent: BTreeMap<Agent, BTreeSet<(bool, String)>> = BTreeMap::new();
 
     if let Some(root) = local_root {
         if root.join(".claude").exists() {
-            add_signal(&mut by_agent, Agent::Claude, ".claude exists in repo root");
+            add_signal(
+                &mut by_agent,
+                Agent::Claude,
+                false,
+                ".claude exists in repo root",
+            );
         }
         if root.join(".cursor").exists() {
-            add_signal(&mut by_agent, Agent::Cursor, ".cursor exists in repo root");
+            add_signal(
+                &mut by_agent,
+                Agent::Cursor,
+                false,
+                ".cursor exists in repo root",
+            );
         }
         if root.join(".opencode").exists() {
             add_signal(
                 &mut by_agent,
                 Agent::Opencode,
+                false,
                 ".opencode exists in repo root",
             );
         }
@@ -2618,36 +2689,54 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
             add_signal(
                 &mut by_agent,
                 Agent::Codex,
+                false,
                 ".agents/skills exists in repo root",
             );
             add_signal(
                 &mut by_agent,
                 Agent::Opencode,
+                false,
                 ".agents/skills exists in repo root",
             );
         }
         if root.join("AGENTS.md").exists() {
-            add_signal(&mut by_agent, Agent::Codex, "AGENTS.md exists in repo root");
+            add_signal(
+                &mut by_agent,
+                Agent::Codex,
+                false,
+                "AGENTS.md exists in repo root",
+            );
         }
     }
 
     if home.join(".claude").exists() {
-        add_signal(&mut by_agent, Agent::Claude, "~/.claude exists");
+        add_signal(&mut by_agent, Agent::Claude, false, "~/.claude exists");
     }
     if home.join(".cursor").exists() {
-        add_signal(&mut by_agent, Agent::Cursor, "~/.cursor exists");
+        add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
     }
     if home.join(".codex").exists() {
-        add_signal(&mut by_agent, Agent::Codex, "~/.codex exists");
+        add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
     }
     if home.join(".agents/skills").exists() {
-        add_signal(&mut by_agent, Agent::Codex, "~/.agents/skills exists");
-        add_signal(&mut by_agent, Agent::Opencode, "~/.agents/skills exists");
+        add_signal(
+            &mut by_agent,
+            Agent::Codex,
+            false,
+            "~/.agents/skills exists",
+        );
+        add_signal(
+            &mut by_agent,
+            Agent::Opencode,
+            false,
+            "~/.agents/skills exists",
+        );
     }
     if home.join(".opencode").exists() || home.join(".config/opencode").exists() {
         add_signal(
             &mut by_agent,
             Agent::Opencode,
+            false,
             "opencode config directory exists",
         );
     }
@@ -2656,21 +2745,33 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
         add_signal(
             &mut by_agent,
             Agent::Claude,
+            true,
             "`claude` binary found in PATH",
         );
     }
 
     let mut out = Vec::new();
-    for (agent, reasons) in by_agent {
-        for reason in reasons {
-            out.push(DetectionSignal { agent, reason });
+    for (agent, signals) in by_agent {
+        for (on_path, reason) in signals {
+            out.push(DetectionSignal {
+                agent,
+                on_path,
+                reason,
+            });
         }
     }
     out
 }
 
-fn add_signal(map: &mut BTreeMap<Agent, BTreeSet<String>>, agent: Agent, reason: &str) {
-    map.entry(agent).or_default().insert(reason.to_string());
+fn add_signal(
+    map: &mut BTreeMap<Agent, BTreeSet<(bool, String)>>,
+    agent: Agent,
+    on_path: bool,
+    reason: &str,
+) {
+    map.entry(agent)
+        .or_default()
+        .insert((on_path, reason.to_string()));
 }
 
 fn install_claude(
@@ -3321,6 +3422,7 @@ mod tests {
     fn single_path_agent_is_selected_by_default() {
         let detected = vec![DetectionSignal {
             agent: Agent::Codex,
+            on_path: true,
             reason: "`codex` binary found in PATH".to_string(),
         }];
         let resolved =
@@ -3334,10 +3436,12 @@ mod tests {
         let detected = vec![
             DetectionSignal {
                 agent: Agent::Codex,
+                on_path: true,
                 reason: "`codex` binary found in PATH".to_string(),
             },
             DetectionSignal {
                 agent: Agent::Claude,
+                on_path: true,
                 reason: "`claude` binary found in PATH".to_string(),
             },
         ];
@@ -3612,6 +3716,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_interactive_instrument_invocation_uses_tui_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Codex, None, &task_path, true, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "codex");
+                assert!(args.is_empty());
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
     fn claude_instrument_invocation_uses_print_with_bypass_permissions() {
         let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
         let invocation =
@@ -3712,11 +3844,8 @@ mod tests {
     }
 
     #[test]
-    fn claude_interactive_instrument_invocation_uses_system_prompt_no_print_flag() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let task_path = dir.path().join("AGENT_TASK.instrument.md");
-        std::fs::write(&task_path, "## Task\nInstrument this repo.").expect("write task");
-
+    fn claude_interactive_instrument_invocation_uses_prompt_arg_no_print_flag() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
         let invocation =
             resolve_instrument_invocation(Agent::Claude, None, &task_path, true, false, &[])
                 .expect("resolve instrument invocation");
@@ -3727,30 +3856,21 @@ mod tests {
                 args,
                 stdin_file,
                 prompt_file_arg,
-                initial_prompt,
                 stream_json,
                 interactive,
+                ..
             } => {
                 assert_eq!(program, "claude");
                 assert!(
                     !args.contains(&"-p".to_string()),
                     "interactive mode must not pass -p"
                 );
-                assert!(
-                    args.contains(&"--append-system-prompt".to_string()),
-                    "task should be in system prompt"
-                );
+                assert!(args.contains(&"--permission-mode".to_string()));
+                assert!(args.contains(&"--settings".to_string()));
                 assert!(args.contains(&"--disallowedTools".to_string()));
                 assert!(args.contains(&"--name".to_string()));
                 assert_eq!(stdin_file, None);
-                assert_eq!(
-                    prompt_file_arg, None,
-                    "task is in system prompt, not prompt_file_arg"
-                );
-                assert!(
-                    initial_prompt.is_some(),
-                    "short initial message must be set to trigger Claude"
-                );
+                assert_eq!(prompt_file_arg, Some(task_path));
                 assert!(!stream_json);
                 assert!(interactive);
             }
@@ -3805,7 +3925,6 @@ mod tests {
                     args,
                     vec![
                         "-p".to_string(),
-                        "-f".to_string(),
                         "--output-format".to_string(),
                         "stream-json".to_string(),
                         "--stream-partial-output".to_string(),
@@ -3814,6 +3933,34 @@ mod tests {
                 assert_eq!(stdin_file, None);
                 assert_eq!(prompt_file_arg, Some(task_path));
                 assert!(stream_json);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn cursor_interactive_instrument_invocation_uses_tui_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Cursor, None, &task_path, true, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "cursor-agent");
+                assert!(args.is_empty());
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
