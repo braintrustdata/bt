@@ -7,6 +7,16 @@ fn bt_command() -> Command {
     Command::cargo_bin("bt").expect("bt binary")
 }
 
+fn clear_braintrust_auth_env(cmd: &mut Command) {
+    for key in [
+        "BRAINTRUST_API_KEY",
+        "BRAINTRUST_PROFILE",
+        "BRAINTRUST_ORG_NAME",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 fn write_executable(path: &Path) {
     fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
     #[cfg(unix)]
@@ -92,8 +102,9 @@ fn setup_uses_codex_detected_on_path_without_explicit_agent() {
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     write_executable(&bin_dir.path().join("codex"));
 
-    bt_command()
-        .current_dir(repo.path())
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(repo.path())
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -125,8 +136,9 @@ fn setup_no_instrument_does_not_require_auth_in_git_repo() {
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     write_executable(&bin_dir.path().join("codex"));
 
-    bt_command()
-        .current_dir(&nested)
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(&nested)
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -152,8 +164,9 @@ fn setup_requires_profile_disambiguation_when_multiple_profiles_exist() {
         &[("alpha", "alpha-org"), ("beta", "beta-org")],
     );
 
-    bt_command()
-        .current_dir(repo.path())
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(repo.path())
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
