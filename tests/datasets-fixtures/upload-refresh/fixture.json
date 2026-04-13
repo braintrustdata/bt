@@ -26,6 +26,21 @@
     {
       "command": [
         "datasets",
+        "--no-input",
+        "update",
+        "qa-fixture",
+        "--rows",
+        "[{\"input\":{\"prompt\":\"missing-id\"},\"expected\":\"nope\"}]"
+      ],
+      "expect_success": false,
+      "stderr_contains": [
+        "missing a stable id at 'id'",
+        "update`/`add`/`refresh` require explicit ids"
+      ]
+    },
+    {
+      "command": [
+        "datasets",
         "--json",
         "--no-input",
         "refresh",

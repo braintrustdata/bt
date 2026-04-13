@@ -227,10 +227,12 @@ fn prepare_records(
     require_ids: bool,
 ) -> Result<Vec<PreparedDatasetRecord>> {
     let id_path = parse_id_field_path(id_field)?;
+    let id_root = id_path.first().cloned().expect("id path must be non-empty");
     let mut records = Vec::with_capacity(raw_records.len());
     let mut seen_ids = HashSet::new();
 
     for (row_index, raw_record) in raw_records.into_iter().enumerate() {
+        validate_supported_fields(&raw_record, &id_root, row_index)?;
         let record =
             prepared_record_from_input_object(raw_record, &id_path, require_ids, row_index)?;
         if !seen_ids.insert(record.id.clone()) {
@@ -246,6 +248,37 @@ fn prepare_records(
     Ok(records)
 }
 
+fn validate_supported_fields(
+    object: &Map<String, Value>,
+    id_root: &str,
+    row_index: usize,
+) -> Result<()> {
+    const BASE_ALLOWED_FIELDS: [&str; 6] =
+        ["id", "input", "expected", "output", "metadata", "tags"];
+    let mut unsupported = object
+        .keys()
+        .filter(|field| !BASE_ALLOWED_FIELDS.contains(&field.as_str()) && field.as_str() != id_root)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    unsupported.sort();
+    let id_clause = if BASE_ALLOWED_FIELDS.contains(&id_root) {
+        String::new()
+    } else {
+        format!(", and id root '{}'", id_root)
+    };
+    bail!(
+        "dataset record {} contains unsupported top-level field(s): {}. Allowed fields are id, input, expected, output, metadata, tags{}",
+        row_index + 1,
+        unsupported.join(", "),
+        id_clause
+    );
+}
+
 fn prepared_record_from_input_object(
     object: Map<String, Value>,
     id_path: &[String],
@@ -259,7 +292,7 @@ fn prepared_record_from_input_object(
     let id = match explicit_id {
         Some(id) => id,
         None if require_id => bail!(
-            "dataset record {} is missing a stable id at '{}'; pass --id-field or include an id field",
+            "dataset record {} is missing a stable id at '{}'. `bt datasets update`/`add`/`refresh` require explicit ids; include an id field or pass --id-field",
             row_index + 1,
             id_path.join(".")
         ),
@@ -434,6 +467,9 @@ mod tests {
         let err = load_refresh_records(None, Some(r#"[{"input":{"text":"hello"}}]"#), "id")
             .expect_err("refresh should require explicit ids");
         assert!(err.to_string().contains("missing a stable id at 'id'"));
+        assert!(err
+            .to_string()
+            .contains("update`/`add`/`refresh` require explicit ids"));
     }
 
     #[test]
@@ -472,5 +508,29 @@ mod tests {
         assert!(err
             .to_string()
             .contains("duplicate dataset record id 'dup'"));
+    }
+
+    #[test]
+    fn prepare_records_rejects_unsupported_top_level_fields() {
+        let record =
+            serde_json::from_value(serde_json::json!({"id": "case-1", "foo": "bar"})).expect("map");
+        let err = prepare_records(vec![record], "id", true)
+            .expect_err("unsupported top-level field should error");
+        assert!(err
+            .to_string()
+            .contains("unsupported top-level field(s): foo"));
+    }
+
+    #[test]
+    fn prepare_records_allows_custom_id_root_field() {
+        let record = serde_json::from_value(serde_json::json!({
+            "custom": {"record_id": "case-1"},
+            "input": {"prompt": "hello"},
+            "expected": "world"
+        }))
+        .expect("map");
+        let prepared = prepare_records(vec![record], "custom.record_id", true)
+            .expect("custom id-field root should be allowed");
+        assert_eq!(prepared[0].id, "case-1");
     }
 }

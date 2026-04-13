@@ -166,11 +166,13 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt datasets create my-dataset --file records.jsonl` — create the remote dataset and seed it from a JSON/JSONL file.
 - `cat records.jsonl | bt datasets create my-dataset` — create the dataset and seed it from stdin.
 - `bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'` — create the dataset from inline JSON rows.
+- `bt datasets create my-dataset --rows '[{"input":{"text":"hi"},"expected":"hello"}]'` — create a dataset when rows do not include `id`; bt auto-generates deterministic record IDs.
 - `bt datasets update my-dataset --file records.jsonl` — deterministically upsert rows by stable record id.
 - `bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `update`.
 - `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id` — alias for `update` with explicit id path (fails if the dataset does not exist, and does not delete remote rows missing from the input).
 - `bt datasets view my-dataset` — show dataset metadata and row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust or `--all-rows` to load everything.
-- `update`/`add`/`refresh` require stable IDs (via `id` or your `--id-field` path). Accepted record fields are `id`, `input`, `expected`, `metadata`, and `tags`.
+- `update`/`add`/`refresh` require explicit stable IDs via `id` or `--id-field`.
+- Accepted top-level record fields are `id`, `input`, `expected`, `output`, `metadata`, and `tags` (plus the root field referenced by `--id-field`, if different).
 ## `bt sql`
 
 - Runs interactively on TTY by default.
