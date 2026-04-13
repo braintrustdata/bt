@@ -23,9 +23,8 @@ use crate::functions::report::{
     CommandStatus, FileStatus, HardFailureReason, PushFileReport, PushSummary, ReportError,
     SoftSkipReason,
 };
-use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
-use crate::python_runner;
+use crate::runner::{self, js, py};
 use crate::source_language::{classify_runtime_extension, SourceLanguage};
 use crate::ui::{animations_enabled, is_interactive, is_quiet};
 
@@ -980,8 +979,7 @@ fn build_js_bundle(
     })?;
     let output_bundle = build_dir.path.join("bundle.js");
 
-    let bundler_script = js_runner::materialize_runner_script_in_cwd(
-        "functions-runners",
+    let bundler_script = runner::materialize_runner_script_in_cwd(
         FUNCTIONS_JS_BUNDLER_FILE,
         FUNCTIONS_JS_BUNDLER_SOURCE,
     )
@@ -990,7 +988,7 @@ fn build_js_bundle(
         message: format!("failed to materialize JS bundler script: {err}"),
     })?;
 
-    let mut command = js_runner::build_js_runner_command(
+    let mut command = js::build_js_runner_command(
         args.runner.as_deref(),
         &bundler_script,
         &[source_path.to_path_buf(), output_bundle.clone()],
@@ -1045,17 +1043,13 @@ fn run_functions_runner(
 ) -> std::result::Result<RunnerManifest, FileFailure> {
     let mut command = match language {
         SourceLanguage::JsLike => {
-            let _common = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
-                RUNNER_COMMON_FILE,
-                RUNNER_COMMON_SOURCE,
-            )
-            .map_err(|err| FileFailure {
-                reason: HardFailureReason::RunnerSpawnFailed,
-                message: format!("failed to materialize shared runner helper: {err}"),
-            })?;
-            let runner_script = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
+            let _common =
+                runner::materialize_runner_script_in_cwd(RUNNER_COMMON_FILE, RUNNER_COMMON_SOURCE)
+                    .map_err(|err| FileFailure {
+                        reason: HardFailureReason::RunnerSpawnFailed,
+                        message: format!("failed to materialize shared runner helper: {err}"),
+                    })?;
+            let runner_script = runner::materialize_runner_script_in_cwd(
                 FUNCTIONS_JS_RUNNER_FILE,
                 FUNCTIONS_JS_RUNNER_SOURCE,
             )
@@ -1063,11 +1057,10 @@ fn run_functions_runner(
                 reason: HardFailureReason::RunnerSpawnFailed,
                 message: format!("failed to materialize functions runner: {err}"),
             })?;
-            js_runner::build_js_runner_command(args.runner.as_deref(), &runner_script, files)
+            js::build_js_runner_command(args.runner.as_deref(), &runner_script, files)
         }
         SourceLanguage::Python => {
-            let _common = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
+            let _common = runner::materialize_runner_script_in_cwd(
                 PYTHON_RUNNER_COMMON_FILE,
                 PYTHON_RUNNER_COMMON_SOURCE,
             )
@@ -1075,8 +1068,7 @@ fn run_functions_runner(
                 reason: HardFailureReason::RunnerSpawnFailed,
                 message: format!("failed to materialize shared Python runner helper: {err}"),
             })?;
-            let runner_script = js_runner::materialize_runner_script_in_cwd(
-                "functions-runners",
+            let runner_script = runner::materialize_runner_script_in_cwd(
                 FUNCTIONS_PY_RUNNER_FILE,
                 FUNCTIONS_PY_RUNNER_SOURCE,
             )
@@ -1084,7 +1076,7 @@ fn run_functions_runner(
                 reason: HardFailureReason::RunnerSpawnFailed,
                 message: format!("failed to materialize Python functions runner: {err}"),
             })?;
-            let Some(python) = python_runner::resolve_python_interpreter(
+            let Some(python) = py::resolve_python_interpreter(
                 args.runner.as_deref(),
                 PYTHON_INTERPRETER_ENV_OVERRIDES,
             ) else {
@@ -1615,8 +1607,7 @@ fn build_python_bundle_archive(
     baseline_dep_versions: &[String],
     python_version: &str,
 ) -> Result<Vec<u8>> {
-    let Some(python) =
-        python_runner::resolve_python_interpreter(runner, PYTHON_INTERPRETER_ENV_OVERRIDES)
+    let Some(python) = py::resolve_python_interpreter(runner, PYTHON_INTERPRETER_ENV_OVERRIDES)
     else {
         bail!("No Python interpreter found. Install python or pass --runner.")
     };
@@ -1847,7 +1838,7 @@ fn install_python_dependencies(
     baseline_dep_versions: &[String],
     python_version: &str,
 ) -> Result<()> {
-    let uv = python_runner::find_binary_in_path(&["uv"]).ok_or_else(|| {
+    let uv = py::find_binary_in_path(&["uv"]).ok_or_else(|| {
         anyhow!("`uv` is required to build Python code bundles; please install uv")
     })?;
 

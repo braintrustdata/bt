@@ -169,12 +169,18 @@ pub fn save_global(config: &Config) -> Result<()> {
 }
 
 pub fn find_local_config_dir() -> Option<PathBuf> {
+    let current_dir = std::env::current_dir().ok()?;
+    find_local_config_dir_from(&current_dir)
+}
+
+fn find_local_config_dir_from(start: &Path) -> Option<PathBuf> {
     let home = dirs::home_dir();
-    let mut current_dir = std::env::current_dir().ok()?;
+    let mut current_dir = start.to_path_buf();
 
     loop {
-        if current_dir.join(".bt").is_dir() {
-            return Some(current_dir.join(".bt"));
+        let bt_dir = current_dir.join(crate::bt_dir::BT_DIR);
+        if bt_dir.join(crate::bt_dir::CONFIG_FILE).is_file() {
+            return Some(bt_dir);
         }
         if current_dir.join(".git").exists() {
             return None;
@@ -189,7 +195,7 @@ pub fn find_local_config_dir() -> Option<PathBuf> {
 }
 
 pub fn local_path() -> Option<PathBuf> {
-    find_local_config_dir().map(|dir| dir.join("config.json"))
+    find_local_config_dir().map(|dir| dir.join(crate::bt_dir::CONFIG_FILE))
 }
 
 pub enum WriteTarget {
@@ -222,12 +228,10 @@ pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
     }
 }
 
-pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
-    let dir = std::env::current_dir()?.join(".bt");
-    if create_dir && !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
-    save_file(&dir.join("config.json"), config)
+pub fn save_local(config: &Config) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    crate::bt_dir::ensure_repo_layout(&cwd)?;
+    save_file(&crate::bt_dir::config_path(&cwd), config)
 }
 
 // --- CLI commands ---
@@ -459,5 +463,30 @@ mod tests {
 
         save_file(&path, &config).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn find_local_config_dir_requires_config_file() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_root.join(".bt").join("cache")).unwrap();
+        std::fs::create_dir_all(repo_root.join("nested")).unwrap();
+
+        let discovered = find_local_config_dir_from(&repo_root.join("nested"));
+        assert_eq!(discovered, None);
+    }
+
+    #[test]
+    fn find_local_config_dir_detects_config_file_in_parent_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_root.join(".bt")).unwrap();
+        std::fs::write(repo_root.join(".bt").join("config.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(repo_root.join("nested").join("pkg")).unwrap();
+
+        let discovered = find_local_config_dir_from(&repo_root.join("nested").join("pkg"));
+        assert_eq!(discovered, Some(repo_root.join(".bt")));
     }
 }

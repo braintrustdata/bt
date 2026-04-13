@@ -757,7 +757,8 @@ async fn select_project_with_skip(
 
 /// Returns `true` if config was written or already matched, `false` if user declined.
 fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool> {
-    let config_path = std::env::current_dir()?.join(".bt").join("config.json");
+    let cwd = std::env::current_dir()?;
+    let config_path = crate::bt_dir::config_path(&cwd);
 
     if config_path.exists() {
         let mut existing = config::load_file(&config_path);
@@ -770,7 +771,7 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
             existing.org = Some(org.to_string());
             existing.project = Some(project.name.clone());
             existing.project_id = Some(project.id.clone());
-            config::save_local(&existing, true)?;
+            config::save_local(&existing)?;
             return Ok(true);
         }
         let update = Confirm::new()
@@ -788,7 +789,7 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
         project_id: Some(project.id.clone()),
         ..Default::default()
     };
-    config::save_local(&cfg, true)?;
+    config::save_local(&cfg)?;
     Ok(true)
 }
 
@@ -1093,13 +1094,10 @@ async fn run_instrument_setup(
         (interactive, false)
     };
 
-    let docs_output_dir = root.join(".bt").join("skills").join("docs");
+    let docs_output_dir = crate::bt_dir::skills_docs_dir(&root);
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
 
-    let task_path = root
-        .join(".bt")
-        .join("skills")
-        .join("AGENT_TASK.instrument.md");
+    let task_path = crate::bt_dir::skills_dir(&root).join("AGENT_TASK.instrument.md");
     write_text_file(
         &task_path,
         &render_instrument_task(
@@ -2899,7 +2897,7 @@ fn setup_docs_output_dir(
     match scope {
         InstallScope::Local => {
             let root = scope_root(scope, local_root, home)?;
-            Ok(root.join(".bt").join("skills").join("docs"))
+            Ok(crate::bt_dir::skills_docs_dir(root))
         }
         InstallScope::Global => Ok(global_bt_config_dir(home).join("skills").join("docs")),
     }

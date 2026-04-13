@@ -2134,7 +2134,7 @@ fn build_js_plan(
     if let Some(explicit) = runner_override {
         let resolved_runner = resolve_js_runner_command(explicit, files);
         if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
-            let runner_script = prepare_js_runner_in_cwd()?;
+            let runner_script = prepare_js_runner_in_repo_cache()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
                 kind: RunnerKind::Deno,
@@ -2149,7 +2149,7 @@ fn build_js_plan(
 
     if let Some(auto_runner) = find_js_runner_binary(files) {
         if is_deno_runner_path(&auto_runner) {
-            let runner_script = prepare_js_runner_in_cwd()?;
+            let runner_script = prepare_js_runner_in_repo_cache()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
                 kind: RunnerKind::Deno,
@@ -2313,24 +2313,14 @@ fn is_deno_runner_path(runner: &Path) -> bool {
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
     if is_ts_node_runner(runner_command) {
-        return prepare_js_runner_in_cwd();
+        return prepare_js_runner_in_repo_cache();
     }
     Ok(default_runner.to_path_buf())
 }
 
-fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = cwd
-        .join(".bt")
-        .join("eval-runners")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&cache_dir).with_context(|| {
-        format!(
-            "failed to create eval runner cache dir {}",
-            cache_dir.display()
-        )
-    })?;
-    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+fn prepare_js_runner_in_repo_cache() -> Result<PathBuf> {
+    let root = resolve_runner_cache_root()?;
+    crate::runner::materialize_runner_script_in_root(&root, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
@@ -2461,42 +2451,31 @@ fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
     ))
 }
 
-fn eval_runner_cache_dir() -> PathBuf {
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-
-    root.join("bt")
-        .join("eval-runners")
-        .join(env!("CARGO_PKG_VERSION"))
-}
-
 fn prepare_eval_runners() -> Result<(PathBuf, PathBuf)> {
-    prepare_eval_runners_in_dir(&eval_runner_cache_dir())
+    let root = resolve_runner_cache_root()?;
+    prepare_eval_runners_in_root(&root)
 }
 
-fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
-    std::fs::create_dir_all(cache_dir).with_context(|| {
-        format!(
-            "failed to create eval runner cache dir {}",
-            cache_dir.display()
-        )
-    })?;
-
-    let js_runner = materialize_runner_script(cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
-    let py_runner = materialize_runner_script(cache_dir, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
+fn prepare_eval_runners_in_root(root: &Path) -> Result<(PathBuf, PathBuf)> {
+    crate::bt_dir::ensure_repo_layout(root)?;
+    let js_runner =
+        crate::runner::materialize_runner_script_in_root(root, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
+    let py_runner =
+        crate::runner::materialize_runner_script_in_root(root, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
     Ok((js_runner, py_runner))
 }
 
-fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
-    let path = cache_dir.join(file_name);
-    let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(source) {
-        std::fs::write(&path, source)
-            .with_context(|| format!("failed to write eval runner script {}", path.display()))?;
+fn resolve_runner_cache_root() -> Result<PathBuf> {
+    if let Some(local_bt_dir) = crate::config::find_local_config_dir() {
+        if let Some(parent) = local_bt_dir.parent() {
+            return Ok(parent.to_path_buf());
+        }
     }
-    Ok(path)
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    if let Some(repo) = crate::utils::GitRepo::discover_from(&cwd) {
+        return Ok(repo.root().to_path_buf());
+    }
+    Ok(cwd)
 }
 
 #[derive(Debug)]
@@ -3533,42 +3512,172 @@ mod tests {
 
     #[test]
     fn materialize_runner_script_writes_file() {
-        let dir = make_temp_dir("write");
+        let root = make_temp_dir("write");
 
-        let path = materialize_runner_script(&dir, "runner.ts", "console.log('ok');")
-            .expect("runner script should be materialized");
+        let path = crate::runner::materialize_runner_script_in_root(
+            &root,
+            "runner.ts",
+            "console.log('ok');",
+        )
+        .expect("runner script should be materialized");
         let contents = fs::read_to_string(path).expect("runner script should be readable");
         assert_eq!(contents, "console.log('ok');");
 
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn materialize_runner_script_overwrites_stale_content() {
-        let dir = make_temp_dir("overwrite");
-        let path = dir.join("runner.py");
+        let root = make_temp_dir("overwrite");
+        let cache_dir = crate::bt_dir::runners_cache_dir(&root);
+        fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+        let path = cache_dir.join("runner.py");
         fs::write(&path, "stale").expect("stale file should be written");
 
-        materialize_runner_script(&dir, "runner.py", "fresh")
+        crate::runner::materialize_runner_script_in_root(&root, "runner.py", "fresh")
             .expect("runner script should be updated");
         let contents = fs::read_to_string(path).expect("runner script should be readable");
         assert_eq!(contents, "fresh");
 
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn prepare_eval_runners_writes_embedded_scripts() {
-        let dir = make_temp_dir("embedded");
+        let root = make_temp_dir("embedded");
         let (js_runner, py_runner) =
-            prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
+            prepare_eval_runners_in_root(&root).expect("embedded runners should be materialized");
 
         let js = fs::read_to_string(js_runner).expect("js runner should be readable");
         let py = fs::read_to_string(py_runner).expect("python runner should be readable");
         assert_eq!(js, JS_RUNNER_SOURCE);
         assert_eq!(py, PY_RUNNER_SOURCE);
+        let gitignore = fs::read_to_string(root.join(".bt").join(".gitignore"))
+            .expect("managed .bt/.gitignore should be written");
+        assert!(gitignore.contains("# BEGIN bt-managed"));
+        assert!(gitignore.contains("!config.json"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_eval_runners_uses_repo_local_cache() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = make_temp_dir("repo-local-eval-runners");
+        let original_cwd = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(&dir).expect("set cwd");
+
+        let (js_runner, py_runner) = prepare_eval_runners().expect("prepare eval runners");
+
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        let expected_root = dir
+            .join(".bt")
+            .join("cache")
+            .join("runners")
+            .join(env!("CARGO_PKG_VERSION"))
+            .canonicalize()
+            .expect("canonicalize expected root");
+        let js_root = js_runner
+            .parent()
+            .expect("js runner parent")
+            .canonicalize()
+            .expect("canonicalize js runner parent");
+        let py_root = py_runner
+            .parent()
+            .expect("py runner parent")
+            .canonicalize()
+            .expect("canonicalize py runner parent");
+
+        assert_eq!(js_root, expected_root);
+        assert_eq!(py_root, expected_root);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_runner_cache_root_uses_git_repo_root() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = make_temp_dir("runner-root-git");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested directories");
+        fs::create_dir_all(root.join(".git")).expect("create git marker");
+
+        let original_cwd = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(&nested).expect("set cwd");
+        let resolved = resolve_runner_cache_root().expect("resolve runner cache root");
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        assert_eq!(
+            resolved.canonicalize().expect("canonicalize resolved root"),
+            root.canonicalize().expect("canonicalize root"),
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_eval_runners_uses_git_repo_root_when_nested() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = make_temp_dir("runner-cache-git-root");
+        let nested = root.join("pkg").join("evals");
+        fs::create_dir_all(&nested).expect("create nested directories");
+        fs::create_dir_all(root.join(".git")).expect("create git marker");
+
+        let original_cwd = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(&nested).expect("set cwd");
+        let (js_runner, py_runner) = prepare_eval_runners().expect("prepare eval runners");
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        let expected_root = root
+            .join(".bt")
+            .join("cache")
+            .join("runners")
+            .join(env!("CARGO_PKG_VERSION"))
+            .canonicalize()
+            .expect("canonicalize expected root");
+
+        assert_eq!(
+            js_runner
+                .parent()
+                .expect("js runner parent")
+                .canonicalize()
+                .expect("canonicalize js runner parent"),
+            expected_root
+        );
+        assert_eq!(
+            py_runner
+                .parent()
+                .expect("py runner parent")
+                .canonicalize()
+                .expect("canonicalize py runner parent"),
+            expected_root
+        );
+        assert!(!nested.join(".bt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_eval_runners_rejects_symlinked_bt_dir() {
+        use std::os::unix::fs::symlink;
+
+        let root = make_temp_dir("runner-symlink");
+        let target = make_temp_dir("runner-symlink-target");
+        symlink(&target, root.join(".bt")).expect("create symlinked .bt");
+
+        let err = prepare_eval_runners_in_root(&root).expect_err("must reject symlinked path");
+        assert!(err.to_string().contains("symlink"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&target);
     }
 
     #[test]
@@ -3605,6 +3714,62 @@ mod tests {
         assert!(result[1].ends_with("b.eval.ts"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_js_runner_entrypoint_materializes_ts_node_at_repo_cache_root() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = make_temp_dir("ts-node-entrypoint");
+        let cwd = root.join("package");
+        fs::create_dir_all(&cwd).expect("create package directory");
+        fs::create_dir_all(root.join(".git")).expect("create git marker");
+
+        let original_cwd = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        for runner in ["ts-node", "ts-node-esm"] {
+            let entrypoint =
+                select_js_runner_entrypoint(Path::new("repo-runner.ts"), Path::new(runner))
+                    .expect("select runner entrypoint");
+            let expected_root = root
+                .join(".bt")
+                .join("cache")
+                .join("runners")
+                .join(env!("CARGO_PKG_VERSION"))
+                .canonicalize()
+                .expect("canonicalize expected root");
+            assert_eq!(
+                entrypoint
+                    .parent()
+                    .expect("entrypoint parent")
+                    .canonicalize()
+                    .expect("canonicalize entrypoint parent"),
+                expected_root
+            );
+            assert_eq!(
+                entrypoint.file_name().and_then(|value| value.to_str()),
+                Some(JS_RUNNER_FILE)
+            );
+            let contents = fs::read_to_string(&entrypoint).expect("read materialized entrypoint");
+            assert_eq!(contents, JS_RUNNER_SOURCE);
+        }
+        assert!(
+            !cwd.join(".bt").exists(),
+            "ts-node runner cache should be written at repo root, not cwd"
+        );
+
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn select_js_runner_entrypoint_keeps_default_for_non_ts_node() {
+        let default = PathBuf::from("repo-root-runner.ts");
+        let entrypoint = select_js_runner_entrypoint(&default, Path::new("tsx"))
+            .expect("select runner entrypoint");
+        assert_eq!(entrypoint, default);
     }
 
     #[test]

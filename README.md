@@ -122,6 +122,13 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
 | `bt self update` | Update bt in-place                                                 |
 
+## `bt init`
+
+- Creates local project config at `.bt/config.json`.
+- Ensures `.bt/.gitignore` is present with managed rules:
+  - tracked by default: `.bt/config.json`, `.bt/skills/**`
+  - ignored by default: other `.bt/*` runtime artifacts (for example runner caches)
+
 ## `bt eval`
 
 **File selection:**
