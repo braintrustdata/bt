@@ -156,12 +156,8 @@ struct AgentsSetupArgs {
     #[arg(skip)]
     yes: bool,
 
-    /// Do not auto-fetch workflow docs during setup
-    #[arg(long)]
-    no_fetch_docs: bool,
-
     /// Refresh prefetched docs by clearing existing output before download
-    #[arg(long, conflicts_with = "no_fetch_docs")]
+    #[arg(long, conflicts_with = "no_workflow")]
     refresh_docs: bool,
 
     /// Number of concurrent workers for docs prefetch/download.
@@ -668,9 +664,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 local: matches!(*scope, InstallScope::Local),
                 global: matches!(*scope, InstallScope::Global),
                 workflows: Vec::new(),
-                no_workflow: flag_no_workflow,
+                no_workflow: true,
                 yes: true,
-                no_fetch_docs: true,
                 refresh_docs: false,
                 workers: crate::sync::default_workers(),
                 yolo: false,
@@ -821,7 +816,6 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 workflows: args.agents.workflows.clone(),
                 no_workflow: args.agents.no_workflow,
                 yes: true,
-                no_fetch_docs: args.agents.no_fetch_docs,
                 refresh_docs: args.agents.refresh_docs,
                 workers: args.agents.workers,
                 yolo: args.agents.yolo,
@@ -1169,8 +1163,6 @@ async fn execute_skills_setup(
         notes.push(
             "Skipped workflow docs prefetch (no agents configured successfully).".to_string(),
         );
-    } else if args.no_fetch_docs {
-        notes.push("Skipped workflow docs prefetch (`--no-fetch-docs`).".to_string());
     } else if selected_workflows.is_empty() {
         notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
     } else {
@@ -1303,7 +1295,6 @@ async fn run_instrument_setup(
             workflows: selected_workflows.clone(),
             no_workflow: args.skip_workflow_docs,
             yes: true,
-            no_fetch_docs: args.skip_workflow_docs,
             refresh_docs: args.refresh_docs,
             workers: args.workers,
             yolo: false,
@@ -2143,8 +2134,7 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
 fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
     let interactive = ui::is_interactive() && !args.yes;
-    let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_fetch_docs || args.no_workflow
-    {
+    let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_workflow {
         Some(Vec::new())
     } else {
         None
@@ -2161,7 +2151,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
         if scope.is_none() {
             steps.push(SetupWizardStep::Scope);
         }
-        if !args.no_fetch_docs && args.workflows.is_empty() {
+        if !args.no_workflow && args.workflows.is_empty() {
             steps.push(SetupWizardStep::Workflows);
         }
 
@@ -2219,7 +2209,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
     )?;
     let selected_agents = vec![selected_agent];
 
-    let selected_workflows = if args.no_fetch_docs {
+    let selected_workflows = if args.no_workflow {
         Vec::new()
     } else if let Some(value) = prompted_workflows {
         value
@@ -3535,25 +3525,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_setup_selection_honors_no_fetch_docs() {
-        let args = AgentsSetupArgs {
-            agent: Some(AgentArg::Codex),
-            local: false,
-            global: true,
-            workflows: vec![WorkflowArg::Evaluate],
-            no_workflow: false,
-            yes: true,
-            no_fetch_docs: true,
-            refresh_docs: false,
-            workers: crate::sync::default_workers(),
-            yolo: false,
-        };
-        let home = std::env::temp_dir();
-        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
-        assert!(selection.selected_workflows.is_empty());
-    }
-
-    #[test]
     fn resolve_setup_selection_honors_no_workflow() {
         let args = AgentsSetupArgs {
             agent: Some(AgentArg::Codex),
@@ -3562,7 +3533,6 @@ mod tests {
             workflows: vec![WorkflowArg::Evaluate],
             no_workflow: true,
             yes: true,
-            no_fetch_docs: false,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
             yolo: false,
