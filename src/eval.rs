@@ -1239,12 +1239,6 @@ fn serialize_sse_event(event: &str, data: &str) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
-fn is_eval_progress_payload(progress: &SseProgressEventData) -> bool {
-    serde_json::from_str::<EvalProgressData>(&progress.data)
-        .map(|payload| payload.kind_type == "eval_progress")
-        .unwrap_or(false)
-}
-
 fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
     match event {
         EvalEvent::Processing(payload) => serde_json::to_string(payload)
@@ -1257,7 +1251,13 @@ fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
             .ok()
             .map(|data| serialize_sse_event("summary", &data)),
         EvalEvent::Progress(progress) => {
-            if is_eval_progress_payload(progress) {
+            // Filter out internal eval_progress events (start/increment/stop)
+            // which are used for CLI progress bars but crash the UI stream
+            // parser.  Only forward external progress events (e.g. json_delta).
+            if serde_json::from_str::<EvalProgressData>(&progress.data)
+                .map(|p| p.kind_type == "eval_progress")
+                .unwrap_or(false)
+            {
                 None
             } else {
                 serde_json::to_string(progress)

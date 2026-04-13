@@ -54,12 +54,23 @@ def purge_local_modules(cwd: str, preserve_modules: set[str] | None = None) -> N
     for module_name, module in list(sys.modules.items()):
         if module_name in preserved:
             continue
+        # Never purge the braintrust SDK itself — the runner holds references
+        # to its registries (functions, prompts, _evals) and purging would
+        # cause re-imports that create new list/dict objects, breaking identity.
+        if module_name == "braintrust" or module_name.startswith("braintrust."):
+            continue
         module_file = getattr(module, "__file__", None)
         if not module_file:
             continue
         candidate = module_file[:-1] if module_file.endswith(".pyc") else module_file
         candidate_abs = os.path.abspath(candidate)
         if not os.path.isfile(candidate_abs):
+            continue
+        # Skip installed packages inside virtualenvs under cwd (e.g. .venv/lib/.../site-packages).
+        if os.sep + "site-packages" + os.sep in candidate_abs:
+            continue
+        # Skip bt runner scripts materialised under .bt/.
+        if os.sep + ".bt" + os.sep in candidate_abs:
             continue
         try:
             common = os.path.commonpath([candidate_abs, cwd_abs])
@@ -83,6 +94,12 @@ def collect_python_sources(cwd: str, input_file: str) -> list[str]:
         if not os.path.isfile(candidate_abs):
             continue
         if not candidate_abs.endswith(".py"):
+            continue
+        # Skip installed packages inside virtualenvs under cwd (e.g. .venv/lib/.../site-packages).
+        if os.sep + "site-packages" + os.sep in candidate_abs:
+            continue
+        # Skip bt runner scripts materialised under .bt/.
+        if os.sep + ".bt" + os.sep in candidate_abs:
             continue
         try:
             common = os.path.commonpath([candidate_abs, cwd])

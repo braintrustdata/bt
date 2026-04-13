@@ -35,6 +35,7 @@ pub enum FunctionTypeFilter {
     Classifier,
     Tag,
     Parameters,
+    Sandbox,
 }
 
 impl FunctionTypeFilter {
@@ -50,6 +51,7 @@ impl FunctionTypeFilter {
             Self::Classifier => "classifier",
             Self::Tag => "tag",
             Self::Parameters => "parameters",
+            Self::Sandbox => "sandbox",
         }
     }
 
@@ -73,6 +75,7 @@ impl FunctionTypeFilter {
             Self::Classifier => "classifiers",
             Self::Tag => "tags",
             Self::Parameters => "parameters",
+            Self::Sandbox => "sandboxes",
         }
     }
 }

@@ -26,7 +26,7 @@ use crate::functions::report::{
 use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
-use crate::source_language::{classify_runtime_extension, SourceLanguage};
+use crate::source_language::{classify_runtime_extension, JsExtensionProfile, SourceLanguage};
 use crate::ui::{animations_enabled, is_interactive, is_quiet};
 
 use super::api;
@@ -765,10 +765,14 @@ async fn push_file(
 
     let mut function_events: Vec<Value> = Vec::new();
 
+    let has_sandbox_entries = code_entries
+        .iter()
+        .any(|(code, _)| code.function_type.as_deref() == Some("sandbox"));
+
     if !code_entries.is_empty() {
         let (upload_bytes, content_encoding) = match selected_language {
             SourceLanguage::JsLike => {
-                let bundle_bytes = build_js_bundle(source_path, args)?;
+                let bundle_bytes = build_js_bundle(source_path, args, has_sandbox_entries)?;
                 let gzipped = gzip_bytes(&bundle_bytes).map_err(|err| FileFailure {
                     reason: HardFailureReason::BundleUploadFailed,
                     message: format!("failed to gzip {}: {err}", source_path.display()),
@@ -973,6 +977,7 @@ async fn push_file(
 fn build_js_bundle(
     source_path: &Path,
     args: &PushArgs,
+    self_contained: bool,
 ) -> std::result::Result<Vec<u8>, FileFailure> {
     let build_dir = TempBuildDir::create("bt-functions-js-bundle").map_err(|err| FileFailure {
         reason: HardFailureReason::BundleUploadFailed,
@@ -1004,6 +1009,9 @@ fn build_js_bundle(
             "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
             args.external_packages.join(","),
         );
+    }
+    if self_contained {
+        command.env("BT_FUNCTIONS_PUSH_SELF_CONTAINED", "1");
     }
 
     let output = command.output().map_err(|err| FileFailure {
@@ -1151,7 +1159,7 @@ fn parse_runner_manifest_output(
 fn classify_source_file(path: &Path) -> Option<SourceLanguage> {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .and_then(classify_runtime_extension)
+        .and_then(|ext| classify_runtime_extension(ext, JsExtensionProfile::FunctionsPush))
 }
 
 fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
@@ -1167,6 +1175,14 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     let mut explicit_supported_files = 0usize;
     let mut explicit_js_like = 0usize;
     let mut explicit_python = 0usize;
+
+    // Always include CWD so that Python files importing from sibling
+    // packages (e.g. `from src.agents import ...`) are accepted.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(canonical_cwd) = cwd.canonicalize() {
+            allowed_roots.insert(canonical_cwd);
+        }
+    }
 
     for input in inputs {
         let path = if input.is_absolute() {
@@ -3428,6 +3444,49 @@ mod tests {
                 .is_none_or(|value| value != "outside-link.txt")),
             "collector must skip symlink file entries"
         );
+    }
+
+    #[test]
+    fn code_function_data_passes_through_sandbox_location() {
+        let runtime = RuntimeContext {
+            runtime: "node".to_string(),
+            version: "20.0.0".to_string(),
+        };
+        let sandbox_location = serde_json::json!({
+            "type": "sandbox",
+            "sandbox_spec": { "provider": "lambda" },
+            "entrypoints": ["/tmp/eval.ts"],
+            "eval_name": "my-eval",
+            "evaluator_definition": {
+                "scores": [{ "name": "accuracy" }]
+            }
+        });
+        let value =
+            build_code_function_data(&runtime, sandbox_location.clone(), "bundle-sandbox-1", None);
+
+        assert_eq!(value["type"], "code");
+        assert_eq!(value["data"]["type"], "bundle");
+        assert_eq!(value["data"]["bundle_id"], "bundle-sandbox-1");
+        assert_eq!(value["data"]["location"], sandbox_location);
+        assert!(value["data"].get("preview").is_none());
+    }
+
+    #[test]
+    fn code_function_data_passes_through_experiment_location() {
+        let runtime = RuntimeContext {
+            runtime: "node".to_string(),
+            version: "20.0.0".to_string(),
+        };
+        let experiment_location = serde_json::json!({
+            "type": "experiment",
+            "eval_name": "my-eval",
+            "position": { "type": "task" }
+        });
+        let value =
+            build_code_function_data(&runtime, experiment_location.clone(), "bundle-task-1", None);
+
+        assert_eq!(value["type"], "code");
+        assert_eq!(value["data"]["location"], experiment_location);
     }
 
     fn test_base_args() -> BaseArgs {
