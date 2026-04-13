@@ -792,16 +792,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     Ok(())
 }
 
-async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
-    let login_ctx = ensure_auth(&mut base).await?;
-    let client = ApiClient::new(&login_ctx)?;
-    let org = client.org_name().to_string();
-    let project = select_project_for_setup(&client, base.project.as_deref()).await?;
-
-    if find_git_root().is_some() {
-        let _ = maybe_init(&org, &project)?;
-    }
-
+async fn run_default_setup(base: BaseArgs, args: SetupArgs) -> Result<()> {
     let scope = default_setup_scope(&args.agents);
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let local_root = resolve_local_root_for_scope(scope)?;
@@ -1622,8 +1613,9 @@ fn skill_config_path(
     let root = scope_root(scope, local_root, home)?;
     let path = match agent {
         Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
-        Agent::Codex | Agent::Opencode => root.join(".agents/skills/braintrust/SKILL.md"),
-        Agent::Cursor => root.join(".cursor/rules/braintrust.mdc"),
+        Agent::Codex | Agent::Opencode | Agent::Cursor => {
+            root.join(".agents/skills/braintrust/SKILL.md")
+        }
     };
     Ok(path)
 }
@@ -2365,32 +2357,9 @@ fn doctor_agent_status(
         .collect::<Vec<_>>();
     let detected_any = !detected_signals.is_empty();
 
-    let config_path = match (agent, scope) {
-        (Agent::Claude, InstallScope::Local) => local_root
-            .map(|root| root.join(".claude/skills/braintrust/SKILL.md"))
-            .map(|p| p.display().to_string()),
-        (Agent::Claude, InstallScope::Global) => Some(
-            home.join(".claude/skills/braintrust/SKILL.md")
-                .display()
-                .to_string(),
-        ),
-        (Agent::Codex, InstallScope::Local) | (Agent::Opencode, InstallScope::Local) => local_root
-            .map(|root| root.join(".agents/skills/braintrust/SKILL.md"))
-            .map(|p| p.display().to_string()),
-        (Agent::Codex, InstallScope::Global) | (Agent::Opencode, InstallScope::Global) => Some(
-            home.join(".agents/skills/braintrust/SKILL.md")
-                .display()
-                .to_string(),
-        ),
-        (Agent::Cursor, InstallScope::Local) => local_root
-            .map(|root| root.join(".cursor/skills/braintrust/SKILL.md"))
-            .map(|p| p.display().to_string()),
-        (Agent::Cursor, InstallScope::Global) => Some(
-            home.join(".cursor/skills/braintrust/SKILL.md")
-                .display()
-                .to_string(),
-        ),
-    };
+    let config_path = skill_config_path(agent, scope, local_root, home)
+        .ok()
+        .map(|path| path.display().to_string());
 
     let configured = config_path
         .as_deref()
@@ -3866,7 +3835,14 @@ mod tests {
         let home = std::env::temp_dir();
         let status = doctor_agent_status(Agent::Cursor, InstallScope::Global, None, &home, &[]);
         assert!(!status.configured);
-        assert!(status.config_path.is_some());
+        assert_eq!(
+            status.config_path,
+            Some(
+                home.join(".agents/skills/braintrust/SKILL.md")
+                    .display()
+                    .to_string()
+            )
+        );
         assert!(status.notes.is_empty());
     }
 
