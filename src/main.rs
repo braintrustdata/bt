@@ -392,15 +392,36 @@ fn print_error(err: &anyhow::Error, code: ExitCode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env_var(key: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
 
     #[test]
     fn apply_base_arg_sources_tracks_cli_api_key() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
+
         let matches = Cli::command()
             .try_get_matches_from(["bt", "status", "--api-key", "secret"])
             .expect("matches");
         let mut cli = Cli::from_arg_matches(&matches).expect("cli");
 
         apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
 
         assert_eq!(
             cli.command.base().api_key_source,
@@ -410,6 +431,10 @@ mod tests {
 
     #[test]
     fn apply_base_arg_sources_leaves_api_key_source_empty_when_unset() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
+
         let matches = Cli::command()
             .try_get_matches_from(["bt", "status"])
             .expect("matches");
@@ -417,6 +442,35 @@ mod tests {
 
         apply_base_arg_sources(&matches, cli.command.base_mut());
 
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
         assert_eq!(cli.command.base().api_key_source, None);
+    }
+
+    #[test]
+    fn deprecated_global_quiet_flag_still_parses_for_other_commands() {
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status", "--quiet"])
+            .expect("matches");
+        let cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        assert!(cli.command.base().quiet);
+    }
+
+    #[test]
+    fn deprecated_global_quiet_flag_still_parses_for_setup_subcommands() {
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "setup", "skills", "--quiet"])
+            .expect("matches");
+        let cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        assert!(cli.command.base().quiet);
+    }
+
+    #[test]
+    fn setup_instrument_quiet_no_longer_aliases_background() {
+        Cli::command()
+            .try_get_matches_from(["bt", "setup", "instrument", "--quiet", "--tui"])
+            .expect("matches");
     }
 }

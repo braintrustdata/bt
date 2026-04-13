@@ -111,10 +111,6 @@ pub struct SetupArgs {
     #[arg(long, short = 'v')]
     verbose: bool,
 
-    /// Deprecated: quiet is now the default; this flag is accepted as a no-op
-    #[arg(long, hide = true)]
-    quiet: bool,
-
     /// Deprecated: use --no-skills --no-mcp instead
     #[arg(long, hide = true, conflicts_with = "skills", conflicts_with = "mcp")]
     no_mcp_skill: bool,
@@ -235,7 +231,7 @@ struct InstrumentSetupArgs {
     tui: bool,
 
     /// Run the agent in background (non-interactive) mode
-    #[arg(long, conflicts_with = "tui", alias = "quiet")]
+    #[arg(long, conflicts_with = "tui")]
     background: bool,
 
     /// Grant the agent full permissions (bypass permission prompts)
@@ -3660,13 +3656,6 @@ mod tests {
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
             .expect("resolve instrument workflows");
         assert!(selected.is_empty());
-    }
-
-    #[test]
-    fn setup_accepts_deprecated_quiet_flag() {
-        let parsed = SetupArgsHarness::try_parse_from(["bt", "--quiet"]).expect("parse");
-        assert!(parsed.setup.quiet);
-        assert!(!parsed.setup.verbose);
     }
 
     #[test]

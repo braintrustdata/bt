@@ -6059,6 +6059,7 @@ mod tests {
         BaseArgs {
             json: false,
             verbose: false,
+            quiet: false,
             no_color: false,
             no_input: false,
             profile: None,
