@@ -637,8 +637,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 .ok_or_else(|| anyhow!("setup cancelled"))?
         };
         let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-        let local_root = resolve_local_root_for_scope(scope)?;
-        let detected = detect_agents(local_root.as_deref(), &home);
+        let detected = detect_agents();
         let selected_agent =
             resolve_default_agent_selection(flag_agent, &detected, "Select coding agent", true)?;
         if verbose && flag_agent.is_some() {
@@ -797,9 +796,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     }
 
     let scope = default_setup_scope(&args.agents);
-    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), &home);
+    let detected = detect_agents();
     let selected_agent = resolve_default_agent_selection(
         args.agents.agent,
         &detected,
@@ -1160,7 +1157,7 @@ async fn execute_skills_setup(
     quiet: bool,
 ) -> Result<SkillsSetupOutcome> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let selection = resolve_setup_selection(args, &home)?;
+    let selection = resolve_setup_selection(args)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
     let detected = selection.detected;
@@ -1288,11 +1285,11 @@ async fn run_instrument_setup(
             "instrument setup requires running inside a git repository (could not find .git in parent chain)"
         )
     })?;
-    let mut detected = detect_agents(Some(&root), &home);
+    let mut detected = detect_agents();
 
     let runnable_agents = detect_runnable_agents();
     let selected = if args.agent.is_none() {
-        resolve_unambiguous_instrument_agent(&runnable_agents, &detected)
+        resolve_unambiguous_instrument_agent(&runnable_agents)
     } else {
         None
     };
@@ -2162,7 +2159,7 @@ fn execute_mcp_install(
 
 fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let selection = resolve_mcp_selection(&args, &home)?;
+    let selection = resolve_mcp_selection(&args)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
     let detected = selection.detected;
@@ -2195,7 +2192,7 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupSelection> {
+fn resolve_setup_selection(args: &AgentsSetupArgs) -> Result<SetupSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
     let interactive = ui::is_interactive() && !args.yes;
     let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_workflow {
@@ -2264,7 +2261,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
         )?,
     };
     let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), home);
+    let detected = detect_agents();
     let selected_agent = resolve_default_agent_selection(
         args.agent,
         &detected,
@@ -2290,7 +2287,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
     })
 }
 
-fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSelection> {
+fn resolve_mcp_selection(args: &AgentsMcpSetupArgs) -> Result<McpSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
     let interactive = ui::is_interactive() && !args.yes;
 
@@ -2334,7 +2331,7 @@ fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSe
         )?,
     };
     let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), home);
+    let detected = detect_agents();
     let selected_agent = resolve_default_agent_selection(
         args.agent,
         &detected,
@@ -2355,7 +2352,7 @@ fn run_doctor(base: BaseArgs, args: AgentsDoctorArgs) -> Result<()> {
     let (scope, local_root) = resolve_doctor_scope(&args)?;
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let docs_output_dir = setup_docs_output_dir(scope, local_root.as_deref(), &home)?;
-    let detected = detect_agents(local_root.as_deref(), &home);
+    let detected = detect_agents();
 
     let warnings = Vec::new();
     let agents = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode]
@@ -2658,16 +2655,6 @@ fn resolve_default_agent_selection(
     bail!("multiple coding agents available; pass --agent <AGENT> or re-run in an interactive terminal");
 }
 
-#[allow(dead_code)]
-fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
-    match agent {
-        InstrumentAgentArg::Claude => Agent::Claude,
-        InstrumentAgentArg::Codex => Agent::Codex,
-        InstrumentAgentArg::Cursor => Agent::Cursor,
-        InstrumentAgentArg::Opencode => Agent::Opencode,
-    }
-}
-
 fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg {
     match agent {
         InstrumentAgentArg::Claude => AgentArg::Claude,
@@ -2741,10 +2728,10 @@ fn detect_runnable_agents() -> Vec<Agent> {
     agents
 }
 
-fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal> {
+fn detect_agents() -> Vec<DetectionSignal> {
     let mut by_agent: BTreeMap<Agent, BTreeSet<(bool, String)>> = BTreeMap::new();
 
-    if let Some(root) = local_root {
+    if let Some(root) = find_git_root() {
         if root.join(".claude").exists() {
             add_signal(
                 &mut by_agent,
@@ -2793,36 +2780,38 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
         }
     }
 
-    if home.join(".claude").exists() {
-        add_signal(&mut by_agent, Agent::Claude, false, "~/.claude exists");
-    }
-    if home.join(".cursor").exists() {
-        add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
-    }
-    if home.join(".codex").exists() {
-        add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
-    }
-    if home.join(".agents/skills").exists() {
-        add_signal(
-            &mut by_agent,
-            Agent::Codex,
-            false,
-            "~/.agents/skills exists",
-        );
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            false,
-            "~/.agents/skills exists",
-        );
-    }
-    if home.join(".opencode").exists() || home.join(".config/opencode").exists() {
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            false,
-            "opencode config directory exists",
-        );
+    if let Some(home) = home_dir() {
+        if home.join(".claude").exists() {
+            add_signal(&mut by_agent, Agent::Claude, false, "~/.claude exists");
+        }
+        if home.join(".cursor").exists() {
+            add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
+        }
+        if home.join(".codex").exists() {
+            add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
+        }
+        if home.join(".agents/skills").exists() {
+            add_signal(
+                &mut by_agent,
+                Agent::Codex,
+                false,
+                "~/.agents/skills exists",
+            );
+            add_signal(
+                &mut by_agent,
+                Agent::Opencode,
+                false,
+                "~/.agents/skills exists",
+            );
+        }
+        if home.join(".opencode").exists() || home.join(".config/opencode").exists() {
+            add_signal(
+                &mut by_agent,
+                Agent::Opencode,
+                false,
+                "opencode config directory exists",
+            );
+        }
     }
 
     if command_exists("claude") {
@@ -2882,20 +2871,10 @@ fn add_signal(
         .insert((on_path, reason.to_string()));
 }
 
-fn resolve_unambiguous_instrument_agent(
-    runnable_agents: &[Agent],
-    detected: &[DetectionSignal],
-) -> Option<Agent> {
-    let runnable_set: BTreeSet<Agent> = runnable_agents.iter().copied().collect();
-    if runnable_set.len() == 1 {
-        return runnable_set.into_iter().next();
+fn resolve_unambiguous_instrument_agent(runnable_agents: &[Agent]) -> Option<Agent> {
+    if runnable_agents.len() == 1 {
+        return Some(runnable_agents[0]);
     }
-
-    let detected_set: BTreeSet<Agent> = detected.iter().map(|signal| signal.agent).collect();
-    if detected_set.len() == 1 {
-        return detected_set.into_iter().next();
-    }
-
     None
 }
 
@@ -3747,7 +3726,7 @@ mod tests {
             yolo: false,
         };
         let home = std::env::temp_dir();
-        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
+        let selection = resolve_setup_selection(&args).expect("resolve setup selection");
         assert!(selection.selected_workflows.is_empty());
     }
 
@@ -3766,7 +3745,7 @@ mod tests {
             yolo: false,
         };
         let home = std::env::temp_dir();
-        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
+        let selection = resolve_setup_selection(&args).expect("resolve setup selection");
         assert!(selection.selected_workflows.is_empty());
     }
 
@@ -4305,39 +4284,16 @@ mod tests {
     }
 
     #[test]
-    fn instrument_agent_resolution_prefers_single_runnable_agent() {
-        let detected = vec![
-            DetectionSignal {
-                agent: Agent::Claude,
-                on_path: false,
-                reason: "config".to_string(),
-            },
-            DetectionSignal {
-                agent: Agent::Codex,
-                on_path: false,
-                reason: "binary".to_string(),
-            },
-            DetectionSignal {
-                agent: Agent::Opencode,
-                on_path: false,
-                reason: "config".to_string(),
-            },
-        ];
-
-        let resolved = resolve_unambiguous_instrument_agent(&[Agent::Codex], &detected);
+    fn instrument_agent_resolution_selects_single_runnable_agent() {
+        let resolved = resolve_unambiguous_instrument_agent(&[Agent::Codex]);
         assert_eq!(resolved, Some(Agent::Codex));
     }
 
     #[test]
-    fn instrument_agent_resolution_falls_back_to_single_detected_agent() {
-        let detected = vec![DetectionSignal {
-            agent: Agent::Codex,
-            on_path: false,
-            reason: "config".to_string(),
-        }];
-
-        let resolved = resolve_unambiguous_instrument_agent(&[], &detected);
-        assert_eq!(resolved, Some(Agent::Codex));
+    fn instrument_agent_resolution_returns_none_for_multiple_runnable_agents() {
+        let resolved =
+            resolve_unambiguous_instrument_agent(&[Agent::Codex, Agent::Claude, Agent::Opencode]);
+        assert_eq!(resolved, None);
     }
 
     #[test]
