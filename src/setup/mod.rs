@@ -784,13 +784,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 }
 
 async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
-    let project_flag = base.project.clone();
-    let login_ctx = ensure_auth(&mut base).await?;
-    let client = ApiClient::new(&login_ctx)?;
-    let org = client.org_name().to_string();
-    let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
-    if let Some(ref project) = project {
-        if find_git_root().is_some() {
+    let should_prepare_project = should_prepare_project_context(args.no_instrument);
+    if should_prepare_project {
+        let project_flag = base.project.clone();
+        let login_ctx = ensure_auth(&mut base).await?;
+        let client = ApiClient::new(&login_ctx)?;
+        let org = client.org_name().to_string();
+        let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
+        if let Some(ref project) = project {
             let _ = maybe_init(&org, project)?;
         }
     }
@@ -865,6 +866,10 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
+fn should_prepare_project_context(no_instrument: bool) -> bool {
+    !no_instrument && find_git_root().is_some()
+}
+
 async fn ensure_auth(base: &mut BaseArgs) -> Result<LoginContext> {
     if matches!(base.api_key_source, Some(ArgValueSource::CommandLine)) {
         return auth::login(base).await;
@@ -892,8 +897,9 @@ async fn login_with_existing_or_oauth(
         return auth::login(base).await;
     }
 
-    let profile_name = choose_setup_profile(base, profiles)?;
-    base.profile = Some(profile_name);
+    if let Some(profile_name) = choose_setup_profile(base, profiles)? {
+        base.profile = Some(profile_name);
+    }
     match auth::login(base).await {
         Ok(ctx) => Ok(ctx),
         Err(err) if auth::is_missing_credential_error(&err) => {
@@ -904,21 +910,26 @@ async fn login_with_existing_or_oauth(
     }
 }
 
-fn choose_setup_profile(base: &BaseArgs, profiles: &[auth::ProfileInfo]) -> Result<String> {
+fn choose_setup_profile(base: &BaseArgs, profiles: &[auth::ProfileInfo]) -> Result<Option<String>> {
     if let Some(profile_name) = base.profile.as_ref().map(|value| value.trim()) {
         if !profile_name.is_empty() {
-            return Ok(profile_name.to_string());
+            return Ok(Some(profile_name.to_string()));
         }
     }
 
     if let Some(org) = base.org_name.as_deref() {
-        return auth::resolve_org_to_profile(org, profiles);
+        return auth::resolve_org_to_profile(org, profiles).map(Some);
     }
 
-    profiles
-        .first()
-        .map(|profile| profile.name.clone())
-        .ok_or_else(|| anyhow!("no auth profiles found"))
+    if profiles.len() == 1 {
+        return Ok(profiles.first().map(|profile| profile.name.clone()));
+    }
+
+    if ui::is_interactive() {
+        return auth::select_profile_interactive(None);
+    }
+
+    bail!("multiple auth profiles found; pass --profile <NAME> or --org <ORG>, or re-run in an interactive terminal")
 }
 
 async fn select_project_for_setup(
@@ -2726,6 +2737,30 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
             Agent::Claude,
             true,
             "`claude` binary found in PATH",
+        );
+    }
+    if command_exists("codex") {
+        add_signal(
+            &mut by_agent,
+            Agent::Codex,
+            true,
+            "`codex` binary found in PATH",
+        );
+    }
+    if command_exists("cursor-agent") {
+        add_signal(
+            &mut by_agent,
+            Agent::Cursor,
+            true,
+            "`cursor-agent` binary found in PATH",
+        );
+    }
+    if command_exists("opencode") {
+        add_signal(
+            &mut by_agent,
+            Agent::Opencode,
+            true,
+            "`opencode` binary found in PATH",
         );
     }
 
