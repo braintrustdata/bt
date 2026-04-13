@@ -260,7 +260,16 @@ async fn try_main() -> Result<()> {
 }
 
 fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
-    base.api_key_source = matches.value_source("api_key").and_then(map_value_source);
+    base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
+}
+
+fn find_value_source(matches: &ArgMatches, id: &str) -> Option<ValueSource> {
+    match matches.try_contains_id(id) {
+        Ok(_) => matches.value_source(id),
+        Err(_) => matches
+            .subcommand()
+            .and_then(|(_, sub_matches)| find_value_source(sub_matches, id)),
+    }
 }
 
 fn map_value_source(source: ValueSource) -> Option<ArgValueSource> {
@@ -375,5 +384,37 @@ fn print_error(err: &anyhow::Error, code: ExitCode) {
     eprintln!("error: {err}");
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_base_arg_sources_tracks_cli_api_key() {
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status", "--api-key", "secret"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        assert_eq!(
+            cli.command.base().api_key_source,
+            Some(ArgValueSource::CommandLine)
+        );
+    }
+
+    #[test]
+    fn apply_base_arg_sources_leaves_api_key_source_empty_when_unset() {
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        assert_eq!(cli.command.base().api_key_source, None);
     }
 }
