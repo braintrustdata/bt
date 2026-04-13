@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,48 @@ pub struct AvailableOrg {
     pub id: String,
     pub name: String,
     pub api_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverableAuthErrorKind {
+    OauthProfileSelection,
+    OauthClientId,
+    OauthRefreshToken,
+    StoredCredential,
+}
+
+#[derive(Debug)]
+struct RecoverableAuthError {
+    kind: RecoverableAuthErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for RecoverableAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for RecoverableAuthError {}
+
+fn recoverable_auth_error(kind: RecoverableAuthErrorKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(RecoverableAuthError { kind, message })
+}
+
+pub fn is_missing_credential_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .downcast_ref::<RecoverableAuthError>()
+            .is_some_and(|err| {
+                matches!(
+                    err.kind,
+                    RecoverableAuthErrorKind::OauthProfileSelection
+                        | RecoverableAuthErrorKind::OauthClientId
+                        | RecoverableAuthErrorKind::OauthRefreshToken
+                        | RecoverableAuthErrorKind::StoredCredential
+                )
+            })
+    })
 }
 
 pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
@@ -494,15 +537,23 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
         .or_else(|| {
             (store.profiles.len() == 1).then(|| store.profiles.keys().next().unwrap().as_str())
         })
-        .ok_or_else(|| anyhow::anyhow!("oauth profile requested but none selected"))?
+        .ok_or_else(|| {
+            recoverable_auth_error(
+                RecoverableAuthErrorKind::OauthProfileSelection,
+                "oauth profile requested but none selected".to_string(),
+            )
+        })?
         .to_string();
     let profile = store
         .profiles
         .get(profile_name.as_str())
         .ok_or_else(|| anyhow::anyhow!("profile '{profile_name}' not found"))?;
     let client_id = profile.oauth_client_id.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
+        recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthClientId,
+            format!(
+                "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
+            ),
         )
     })?;
     let cached_expires_at = profile.oauth_access_expires_at;
@@ -519,8 +570,11 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     }
 
     let refresh_token = load_profile_oauth_refresh_token(&profile_name)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
+        recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthRefreshToken,
+            format!(
+                "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
+            ),
         )
     })?;
     let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
@@ -640,8 +694,11 @@ where
             None
         } else {
             Some(load_secret(profile_name)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no keychain credential found for profile '{profile_name}'; re-run `bt auth login --profile {profile_name}`"
+                recoverable_auth_error(
+                    RecoverableAuthErrorKind::StoredCredential,
+                    format!(
+                        "no keychain credential found for profile '{profile_name}'; re-run `bt auth login --profile {profile_name}`"
+                    ),
                 )
             })?)
         };
@@ -2716,6 +2773,34 @@ mod tests {
 
     fn assert_invalid_api_url<T>(result: Result<T>) {
         assert_err_contains(result, "invalid api_url");
+    }
+
+    #[test]
+    fn missing_credential_error_helper_detects_typed_auth_errors() {
+        let err = recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthRefreshToken,
+            "oauth refresh token missing".to_string(),
+        );
+
+        assert!(is_missing_credential_error(&err));
+    }
+
+    #[test]
+    fn missing_credential_error_helper_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("some unrelated error");
+
+        assert!(!is_missing_credential_error(&err));
+    }
+
+    #[test]
+    fn missing_credential_error_helper_detects_errors_through_context() {
+        let err = recoverable_auth_error(
+            RecoverableAuthErrorKind::StoredCredential,
+            "missing stored credential".to_string(),
+        )
+        .context("while resolving auth");
+
+        assert!(is_missing_credential_error(&err));
     }
 
     fn restore_env_var(key: &str, previous: Option<OsString>) {

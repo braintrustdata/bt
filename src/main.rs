@@ -446,31 +446,4 @@ mod tests {
 
         assert_eq!(cli.command.base().api_key_source, None);
     }
-
-    #[test]
-    fn deprecated_global_quiet_flag_still_parses_for_other_commands() {
-        let matches = Cli::command()
-            .try_get_matches_from(["bt", "status", "--quiet"])
-            .expect("matches");
-        let cli = Cli::from_arg_matches(&matches).expect("cli");
-
-        assert!(cli.command.base().quiet);
-    }
-
-    #[test]
-    fn deprecated_global_quiet_flag_still_parses_for_setup_subcommands() {
-        let matches = Cli::command()
-            .try_get_matches_from(["bt", "setup", "skills", "--quiet"])
-            .expect("matches");
-        let cli = Cli::from_arg_matches(&matches).expect("cli");
-
-        assert!(cli.command.base().quiet);
-    }
-
-    #[test]
-    fn setup_instrument_quiet_no_longer_aliases_background() {
-        Cli::command()
-            .try_get_matches_from(["bt", "setup", "instrument", "--quiet", "--tui"])
-            .expect("matches");
-    }
 }

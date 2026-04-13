@@ -902,7 +902,7 @@ async fn login_with_existing_or_oauth(
     base.profile = Some(profile_name);
     match auth::login(base).await {
         Ok(ctx) => Ok(ctx),
-        Err(err) if should_force_reauth(&err) => {
+        Err(err) if auth::is_missing_credential_error(&err) => {
             auth::login_setup_oauth(base).await?;
             auth::login(base).await
         }
@@ -925,13 +925,6 @@ fn choose_setup_profile(base: &BaseArgs, profiles: &[auth::ProfileInfo]) -> Resu
         .first()
         .map(|profile| profile.name.clone())
         .ok_or_else(|| anyhow!("no auth profiles found"))
-}
-
-fn should_force_reauth(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("oauth refresh token missing")
-        || msg.contains("oauth profile requested but none selected")
-        || msg.contains("re-run `bt auth login --oauth")
 }
 
 async fn select_project_for_setup(
