@@ -1286,6 +1286,8 @@ async fn run_instrument_setup(
     let runnable_agents = detect_runnable_agents();
     let mut selected = if let Some(agent_arg) = args.agent {
         map_instrument_agent_arg(agent_arg)
+    } else if let Some(agent) = resolve_unambiguous_instrument_agent(&runnable_agents, &detected) {
+        agent
     } else {
         let candidate_agents: Vec<Agent> = if runnable_agents.is_empty() {
             ALL_AGENTS.to_vec()
@@ -2651,15 +2653,6 @@ fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
         InstrumentAgentArg::Codex => Agent::Codex,
         InstrumentAgentArg::Cursor => Agent::Cursor,
         InstrumentAgentArg::Opencode => Agent::Opencode,
-    }
-}
-
-fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg {
-    match agent {
-        InstrumentAgentArg::Claude => AgentArg::Claude,
-        InstrumentAgentArg::Codex => AgentArg::Codex,
-        InstrumentAgentArg::Cursor => AgentArg::Cursor,
-        InstrumentAgentArg::Opencode => AgentArg::Opencode,
     }
 }
 
