@@ -82,6 +82,35 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
         .collect())
 }
 
+pub fn resolve_profile_info(profile: Option<&str>, org: Option<&str>) -> Option<ProfileInfo> {
+    let profiles = list_profiles().ok()?;
+
+    if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
+        return profiles.into_iter().find(|pi| pi.name == p);
+    }
+
+    if let Some(o) = org.map(str::trim).filter(|o| !o.is_empty()) {
+        if profiles.iter().any(|pi| pi.name == o) {
+            return profiles.into_iter().find(|pi| pi.name == o);
+        }
+        let org_matches: Vec<&ProfileInfo> = profiles
+            .iter()
+            .filter(|pi| pi.org_name.as_deref() == Some(o))
+            .collect();
+        if org_matches.len() == 1 {
+            let name = org_matches[0].name.clone();
+            return profiles.into_iter().find(|pi| pi.name == name);
+        }
+        return None;
+    }
+
+    if profiles.len() == 1 {
+        return profiles.into_iter().next();
+    }
+
+    None
+}
+
 pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Result<String> {
     if profiles.is_empty() {
         bail!("no auth profiles found. Run `bt auth login` to create one.");

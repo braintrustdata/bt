@@ -1,0 +1,57 @@
+{
+  "env": {
+    "BRAINTRUST_API_KEY": "fixture-api-key",
+    "BRAINTRUST_API_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_APP_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_ORG_NAME": "test-org",
+    "BRAINTRUST_DEFAULT_PROJECT": "fixtures-project"
+  },
+  "steps": [
+    {
+      "command": ["datasets", "--json", "--no-input", "create", "versioned-fixture"],
+      "stdout_contains": [
+        "\"name\":\"versioned-fixture\"",
+        "\"created_dataset\":true",
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "versions",
+        "create",
+        "versioned-fixture",
+        "baseline",
+        "--xact-id",
+        "1000192656880881099",
+        "--description",
+        "Initial snapshot"
+      ],
+      "stdout_contains": [
+        "\"version\":{\"id\":\"snapshot_1\"",
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\"",
+        "\"description\":\"Initial snapshot\"",
+        "\"mode\":\"version_create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "version",
+        "list",
+        "versioned-fixture"
+      ],
+      "stdout_contains": [
+        "\"versions\":[{\"id\":\"snapshot_1\"",
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\""
+      ]
+    }
+  ],
+  "expected_logs3_requests": 0
+}

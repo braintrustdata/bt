@@ -1,0 +1,58 @@
+{
+  "env": {
+    "BRAINTRUST_API_KEY": "fixture-api-key",
+    "BRAINTRUST_API_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_APP_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_ORG_NAME": "test-org",
+    "BRAINTRUST_DEFAULT_PROJECT": "fixtures-project"
+  },
+  "steps": [
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "versioned-head-fixture",
+        "--rows",
+        "[{\"id\":\"case-1\",\"input\":{\"prompt\":\"inline\"},\"expected\":\"ok\"}]"
+      ],
+      "stdout_contains": [
+        "\"name\":\"versioned-head-fixture\"",
+        "\"uploaded\":1",
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "versions",
+        "create",
+        "versioned-head-fixture",
+        "head-default"
+      ],
+      "stdout_contains": [
+        "\"name\":\"head-default\"",
+        "\"xact_id\":\"1000192656880881099\"",
+        "\"mode\":\"version_create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "versions",
+        "list",
+        "versioned-head-fixture"
+      ],
+      "stdout_contains": [
+        "\"name\":\"head-default\"",
+        "\"xact_id\":\"1000192656880881099\""
+      ]
+    }
+  ],
+  "expected_logs3_requests": 1
+}

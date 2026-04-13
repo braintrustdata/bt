@@ -118,7 +118,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt sql`         | Run SQL queries against Braintrust                                   |
 | `bt view`        | View logs, traces, and spans                                         |
 | `bt projects`    | Manage projects (list, create, view, delete)                         |
-| `bt datasets`    | Manage remote datasets (list, create, upload, refresh, view, delete) |
+| `bt datasets`    | Manage remote datasets (list, create, upload, refresh, view, delete) and dataset versions                                   |
 | `bt prompts`     | Manage prompts (list, view, delete)                                  |
 | `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files   |
 | `bt self update` | Update bt in-place                                                   |
@@ -164,6 +164,16 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt datasets upload my-dataset --file records.jsonl` — legacy-compatible alias for `add`.
 - `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id --prune` — deterministically upsert rows by stable record id and optionally prune stale remote rows.
 - `bt datasets view my-dataset` — show dataset metadata and the important row fields by default; pass `--verbose` to inspect full row payloads.
+- `bt datasets versions create my-dataset` — create a named dataset version using a generated `<user>-<timestamp>` name and the dataset's current head xact.
+- `bt datasets versions create my-dataset baseline` — create a named dataset version from the dataset's current head xact.
+- `bt datasets versions list my-dataset` — list saved dataset versions for a dataset.
+- `bt datasets versions restore my-dataset` — on a TTY, interactively pick a saved version to restore.
+- `bt datasets versions restore my-dataset --name baseline` — preview restoring a dataset to a saved version, including `rows_to_restore` / `rows_to_delete`, then confirm before applying it.
+- `bt datasets versions restore my-dataset --version 1000192656880881099 --force` — preview and immediately restore a dataset to a transaction id without prompting.
+- Applied restores return `xact_id`, `rows_restored`, and `rows_deleted`.
+- `bt datasets versions create my-dataset baseline --xact-id 1000192656880881099` — create a named dataset version from a transaction id.
+- `bt datasets versions create my-dataset baseline --xact-id 1000192656880881099 --description "Initial snapshot"` — attach an optional description to the dataset version.
+- `bt datasets versions restore ...` resolves `--name` through the dataset snapshot list endpoint; if you already know the xact id, pass it directly with `--version`.
 - Accepted row fields for create/upload/update/refresh are `id` (or your `--id-field` path), `input`, `expected`, `metadata`, and `tags`.
 
 ## `bt sql`

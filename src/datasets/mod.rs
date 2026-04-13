@@ -17,6 +17,7 @@ mod list;
 mod records;
 mod refresh;
 mod upload;
+mod versions;
 mod view;
 
 use api::{self as datasets_api, Dataset};
@@ -82,6 +83,12 @@ struct DatasetInputArgs {
   bt datasets add my-dataset --file more-records.jsonl
   bt datasets append my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'
   bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id --prune
+  bt datasets versions list my-dataset
+  bt datasets versions create my-dataset baseline
+  bt datasets versions create my-dataset baseline --xact-id 1000192656880881099
+  bt datasets versions restore my-dataset
+  bt datasets versions restore my-dataset --name baseline
+  bt datasets versions restore my-dataset --version 1000192656880881099 --force
   bt datasets view my-dataset
   bt datasets delete my-dataset
 "#)]
@@ -105,6 +112,9 @@ enum DatasetsCommands {
     View(ViewArgs),
     /// Delete a dataset
     Delete(DeleteArgs),
+    /// Manage dataset versions
+    #[command(visible_alias = "version")]
+    Versions(VersionsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -201,6 +211,162 @@ impl DeleteArgs {
     }
 }
 
+#[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt datasets versions list my-dataset
+  bt datasets versions create my-dataset
+  bt datasets versions create my-dataset baseline
+  bt datasets versions create my-dataset baseline --xact-id 1000192656880881099
+  bt datasets versions restore my-dataset
+  bt datasets versions restore my-dataset --name baseline
+  bt datasets versions restore my-dataset --version 1000192656880881099 --force
+")]
+struct VersionsArgs {
+    #[command(subcommand)]
+    command: VersionsCommands,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum VersionsCommands {
+    /// List versions for a dataset
+    List(VersionListArgs),
+    /// Create a new version for a dataset
+    Create(VersionCreateArgs),
+    /// Restore a dataset to a saved version
+    Restore(VersionRestoreArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct VersionDatasetArgs {
+    /// Dataset name (positional)
+    #[arg(value_name = "DATASET")]
+    dataset_positional: Option<String>,
+
+    /// Dataset name (flag)
+    #[arg(long = "dataset", short = 'd')]
+    dataset_flag: Option<String>,
+}
+
+impl VersionDatasetArgs {
+    fn dataset_name(&self) -> Option<&str> {
+        self.dataset_positional
+            .as_deref()
+            .or(self.dataset_flag.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+struct VersionNameArgs {
+    /// Version name (positional)
+    #[arg(value_name = "VERSION")]
+    name_positional: Option<String>,
+
+    /// Version name (flag)
+    #[arg(long = "name", short = 'n')]
+    name_flag: Option<String>,
+}
+
+impl VersionNameArgs {
+    fn name(&self) -> Option<&str> {
+        self.name_positional
+            .as_deref()
+            .or(self.name_flag.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+struct VersionListArgs {
+    #[command(flatten)]
+    dataset: VersionDatasetArgs,
+}
+
+impl VersionListArgs {
+    fn dataset_name(&self) -> Option<&str> {
+        self.dataset.dataset_name()
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+struct VersionCreateArgs {
+    #[command(flatten)]
+    dataset: VersionDatasetArgs,
+
+    #[command(flatten)]
+    version: VersionNameArgs,
+
+    /// Transaction id to snapshot. Defaults to the dataset's current head xact.
+    #[arg(
+        long = "xact-id",
+        env = "BT_DATASETS_VERSION_XACT_ID",
+        value_name = "XACT_ID"
+    )]
+    xact_id: Option<String>,
+
+    /// Optional version description
+    #[arg(long, env = "BT_DATASETS_VERSION_DESCRIPTION", value_name = "TEXT")]
+    description: Option<String>,
+}
+
+impl VersionCreateArgs {
+    fn dataset_name(&self) -> Option<&str> {
+        self.dataset.dataset_name()
+    }
+
+    fn version_name(&self) -> Option<&str> {
+        self.version.name()
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+struct VersionRestoreArgs {
+    #[command(flatten)]
+    dataset: VersionDatasetArgs,
+
+    /// Saved version name to restore
+    #[arg(
+        long,
+        short = 'n',
+        env = "BT_DATASETS_VERSION_RESTORE_NAME",
+        value_name = "NAME",
+        conflicts_with = "version"
+    )]
+    name: Option<String>,
+
+    /// Transaction id to restore
+    #[arg(
+        long = "version",
+        env = "BT_DATASETS_VERSION_RESTORE_VERSION",
+        value_name = "XACT_ID",
+        conflicts_with = "name"
+    )]
+    version: Option<String>,
+
+    /// Skip confirmation after preview and apply the restore
+    #[arg(
+        long,
+        short = 'f',
+        env = "BT_DATASETS_VERSION_RESTORE_FORCE",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    force: bool,
+}
+
+impl VersionRestoreArgs {
+    fn dataset_name(&self) -> Option<&str> {
+        self.dataset.dataset_name()
+    }
+
+    fn version_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn version_xact_id(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+}
+
 pub(crate) async fn select_dataset_interactive(
     client: &ApiClient,
     project_id: &str,
@@ -275,6 +441,9 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
         }
         Some(DatasetsCommands::Delete(delete_args)) => {
             delete::run(&ctx, delete_args.name(), delete_args.force).await
+        }
+        Some(DatasetsCommands::Versions(version_args)) => {
+            versions::run(&ctx, &base, version_args).await
         }
     }
 }
@@ -460,5 +629,143 @@ mod tests {
             panic!("expected delete command");
         };
         assert_eq!(delete.name(), Some("positional-name"));
+    }
+
+    #[test]
+    fn versions_list_parses_dataset_name() {
+        let parsed =
+            parse(&["datasets", "versions", "list", "my-dataset"]).expect("parse versions list");
+        let DatasetsCommands::Versions(versions) = parsed.command.expect("subcommand") else {
+            panic!("expected versions command");
+        };
+        let VersionsCommands::List(list) = versions.command else {
+            panic!("expected versions list command");
+        };
+        assert_eq!(list.dataset_name(), Some("my-dataset"));
+    }
+
+    #[test]
+    fn version_alias_parses_create_flags() {
+        let parsed = parse(&[
+            "datasets",
+            "version",
+            "create",
+            "--dataset",
+            "my-dataset",
+            "--name",
+            "baseline",
+            "--xact-id",
+            "1000192656880881099",
+            "--description",
+            "Initial snapshot",
+        ])
+        .expect("parse version alias create");
+        let DatasetsCommands::Versions(versions) = parsed.command.expect("subcommand") else {
+            panic!("expected versions command");
+        };
+        let VersionsCommands::Create(create) = versions.command else {
+            panic!("expected versions create command");
+        };
+        assert_eq!(create.dataset_name(), Some("my-dataset"));
+        assert_eq!(create.version_name(), Some("baseline"));
+        assert_eq!(create.xact_id.as_deref(), Some("1000192656880881099"));
+        assert_eq!(create.description.as_deref(), Some("Initial snapshot"));
+    }
+
+    #[test]
+    fn versions_create_allows_omitting_xact_id() {
+        let parsed = parse(&["datasets", "versions", "create", "my-dataset", "baseline"])
+            .expect("parse versions create without xact id");
+        let DatasetsCommands::Versions(versions) = parsed.command.expect("subcommand") else {
+            panic!("expected versions command");
+        };
+        let VersionsCommands::Create(create) = versions.command else {
+            panic!("expected versions create command");
+        };
+        assert_eq!(create.dataset_name(), Some("my-dataset"));
+        assert_eq!(create.version_name(), Some("baseline"));
+        assert!(create.xact_id.is_none());
+    }
+
+    #[test]
+    fn versions_create_allows_omitting_version_name() {
+        let parsed = parse(&["datasets", "versions", "create", "my-dataset"])
+            .expect("parse versions create without version name");
+        let DatasetsCommands::Versions(versions) = parsed.command.expect("subcommand") else {
+            panic!("expected versions command");
+        };
+        let VersionsCommands::Create(create) = versions.command else {
+            panic!("expected versions create command");
+        };
+        assert_eq!(create.dataset_name(), Some("my-dataset"));
+        assert!(create.version_name().is_none());
+    }
+
+    #[test]
+    fn versions_restore_parses_name_target() {
+        let parsed = parse(&[
+            "datasets",
+            "versions",
+            "restore",
+            "my-dataset",
+            "--name",
+            "baseline",
+        ])
+        .expect("parse versions restore --name");
+        let DatasetsCommands::Versions(versions) = parsed.command.expect("subcommand") else {
+            panic!("expected versions command");
+        };
+        let VersionsCommands::Restore(restore) = versions.command else {
+            panic!("expected versions restore command");
+        };
+        assert_eq!(restore.dataset_name(), Some("my-dataset"));
+        assert_eq!(restore.version_name(), Some("baseline"));
+        assert!(restore.version_xact_id().is_none());
+        assert!(!restore.force);
+    }
+
+    #[test]
+    fn version_alias_parses_restore_version_and_force() {
+        let parsed = parse(&[
+            "datasets",
+            "version",
+            "restore",
+            "--dataset",
+            "my-dataset",
+            "--version",
+            "1000192656880881099",
+            "--force",
+        ])
+        .expect("parse version alias restore");
+        let DatasetsCommands::Versions(versions) = parsed.command.expect("subcommand") else {
+            panic!("expected versions command");
+        };
+        let VersionsCommands::Restore(restore) = versions.command else {
+            panic!("expected versions restore command");
+        };
+        assert_eq!(restore.dataset_name(), Some("my-dataset"));
+        assert_eq!(restore.version_xact_id(), Some("1000192656880881099"));
+        assert!(restore.version_name().is_none());
+        assert!(restore.force);
+    }
+
+    #[test]
+    fn versions_restore_rejects_name_and_version_together() {
+        let err = parse(&[
+            "datasets",
+            "versions",
+            "restore",
+            "my-dataset",
+            "--name",
+            "baseline",
+            "--version",
+            "1000192656880881099",
+        ])
+        .expect_err("restore target conflict should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("--name") && message.contains("--version"),
+            "unexpected clap error: {message}"
+        );
     }
 }

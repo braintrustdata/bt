@@ -102,12 +102,24 @@ struct MockDataset {
     created: String,
 }
 
+#[derive(Debug, Clone)]
+struct MockDatasetVersion {
+    id: String,
+    dataset_id: String,
+    name: String,
+    description: Option<String>,
+    xact_id: String,
+    created: String,
+}
+
 #[derive(Debug)]
 struct MockServerState {
     requests: Mutex<Vec<String>>,
     projects: Mutex<Vec<MockProject>>,
     datasets: Mutex<Vec<MockDataset>>,
+    dataset_versions: Mutex<Vec<MockDatasetVersion>>,
     dataset_rows: Mutex<BTreeMap<String, BTreeMap<String, Map<String, Value>>>>,
+    next_xact_id: Mutex<u64>,
 }
 
 impl MockServerState {
@@ -120,7 +132,9 @@ impl MockServerState {
                 org_id: "org_mock".to_string(),
             }]),
             datasets: Mutex::new(Vec::new()),
+            dataset_versions: Mutex::new(Vec::new()),
             dataset_rows: Mutex::new(BTreeMap::new()),
+            next_xact_id: Mutex::new(1_000_192_656_880_881_099),
         }
     }
 }
@@ -144,6 +158,22 @@ impl MockServer {
                 .route("/v1/project", web::get().to(mock_list_projects))
                 .route("/v1/dataset", web::get().to(mock_list_datasets))
                 .route("/v1/dataset", web::post().to(mock_create_dataset))
+                .route(
+                    "/v1/dataset/{dataset_id}/restore/preview",
+                    web::post().to(mock_restore_dataset_preview),
+                )
+                .route(
+                    "/v1/dataset/{dataset_id}/restore",
+                    web::post().to(mock_restore_dataset),
+                )
+                .route(
+                    "/v1/dataset_snapshot",
+                    web::get().to(mock_list_dataset_versions),
+                )
+                .route(
+                    "/v1/dataset_snapshot",
+                    web::post().to(mock_create_dataset_version),
+                )
                 .route("/btql", web::post().to(mock_btql))
                 .route("/version", web::get().to(mock_version))
                 .route("/logs3", web::post().to(mock_logs3))
@@ -270,6 +300,118 @@ async fn mock_create_dataset(
     }))
 }
 
+async fn mock_list_dataset_versions(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let query = parse_query(req.query_string());
+    let requested_dataset_id = query.get("dataset_id").cloned();
+    let versions = state
+        .dataset_versions
+        .lock()
+        .expect("dataset versions lock")
+        .clone();
+    let objects = versions
+        .into_iter()
+        .filter(|version| {
+            requested_dataset_id
+                .as_deref()
+                .is_none_or(|dataset_id| version.dataset_id == dataset_id)
+        })
+        .map(|version| {
+            serde_json::json!({
+                "id": version.id,
+                "dataset_id": version.dataset_id,
+                "name": version.name,
+                "description": version.description,
+                "xact_id": version.xact_id,
+                "created": version.created
+            })
+        })
+        .collect::<Vec<_>>();
+    HttpResponse::Ok().json(serde_json::json!({ "objects": objects }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDatasetVersionRequest {
+    dataset_id: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    xact_id: String,
+}
+
+async fn mock_create_dataset_version(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    body: web::Json<CreateDatasetVersionRequest>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let mut versions = state
+        .dataset_versions
+        .lock()
+        .expect("dataset versions lock");
+    let created = MockDatasetVersion {
+        id: format!("snapshot_{}", versions.len() + 1),
+        dataset_id: body.dataset_id.clone(),
+        name: body.name.clone(),
+        description: body.description.clone(),
+        xact_id: body.xact_id.clone(),
+        created: "2026-01-02T00:00:00Z".to_string(),
+    };
+    versions.push(created.clone());
+    HttpResponse::Ok().json(serde_json::json!({
+        "id": created.id,
+        "dataset_id": created.dataset_id,
+        "name": created.name,
+        "description": created.description,
+        "xact_id": created.xact_id,
+        "created": created.created
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreDatasetRequest {
+    version: String,
+}
+
+async fn mock_restore_dataset_preview(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    dataset_id: web::Path<String>,
+    _body: web::Json<RestoreDatasetRequest>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let dataset_id = dataset_id.into_inner();
+    let current_row_count = state
+        .dataset_rows
+        .lock()
+        .expect("dataset rows lock")
+        .get(&dataset_id)
+        .map(|rows| rows.len())
+        .unwrap_or_default();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "rows_to_restore": current_row_count,
+        "rows_to_delete": 0
+    }))
+}
+
+async fn mock_restore_dataset(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    _dataset_id: web::Path<String>,
+    body: web::Json<RestoreDatasetRequest>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    HttpResponse::Ok().json(serde_json::json!({
+        "xact_id": body.version,
+        "rows_restored": 1,
+        "rows_deleted": 0
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct BtqlRequest {
     query: String,
@@ -327,6 +469,7 @@ async fn mock_logs3(
     };
 
     let mut dataset_rows = state.dataset_rows.lock().expect("dataset rows lock");
+    let mut next_xact_id = state.next_xact_id.lock().expect("next xact id lock");
     for row in rows {
         let Some(object) = row.as_object() else {
             return HttpResponse::BadRequest().body("logs3 rows must be objects");
@@ -346,7 +489,15 @@ async fn mock_logs3(
         {
             rows_for_dataset.remove(row_id);
         } else {
-            rows_for_dataset.insert(row_id.to_string(), object.clone());
+            let mut stored = object.clone();
+            if !stored.contains_key("_xact_id") {
+                stored.insert(
+                    "_xact_id".to_string(),
+                    Value::String(next_xact_id.to_string()),
+                );
+                *next_xact_id += 1;
+            }
+            rows_for_dataset.insert(row_id.to_string(), stored);
         }
     }
 

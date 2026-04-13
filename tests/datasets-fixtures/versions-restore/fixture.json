@@ -1,0 +1,82 @@
+{
+  "env": {
+    "BRAINTRUST_API_KEY": "fixture-api-key",
+    "BRAINTRUST_API_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_APP_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_ORG_NAME": "test-org",
+    "BRAINTRUST_DEFAULT_PROJECT": "fixtures-project"
+  },
+  "steps": [
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "restore-fixture",
+        "--rows",
+        "[{\"id\":\"case-1\",\"input\":{\"prompt\":\"restore me\"},\"expected\":\"ok\"}]"
+      ],
+      "stdout_contains": [
+        "\"name\":\"restore-fixture\"",
+        "\"uploaded\":1",
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "versions",
+        "create",
+        "restore-fixture",
+        "baseline"
+      ],
+      "stdout_contains": [
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\"",
+        "\"mode\":\"version_create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "versions",
+        "restore",
+        "restore-fixture",
+        "--name",
+        "baseline"
+      ],
+      "stdout_contains": [
+        "\"target\":{\"name\":\"baseline\",\"xact_id\":\"1000192656880881099\"}",
+        "\"preview\":{\"rows_to_restore\":1,\"rows_to_delete\":0}",
+        "\"restored\":false",
+        "\"mode\":\"version_restore\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "versions",
+        "restore",
+        "restore-fixture",
+        "--name",
+        "baseline",
+        "--force"
+      ],
+      "stdout_contains": [
+        "\"target\":{\"name\":\"baseline\",\"xact_id\":\"1000192656880881099\"}",
+        "\"preview\":{\"rows_to_restore\":1,\"rows_to_delete\":0}",
+        "\"result\":{\"rows_deleted\":0,\"rows_restored\":1,\"xact_id\":\"1000192656880881099\"}",
+        "\"restored\":true",
+        "\"mode\":\"version_restore\""
+      ]
+    }
+  ],
+  "expected_logs3_requests": 1
+}
