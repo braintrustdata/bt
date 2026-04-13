@@ -6,7 +6,7 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use dialoguer::console::style;
-use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
@@ -1744,11 +1744,11 @@ fn prompt_instrument_agent(default_agent: Agent) -> Result<Agent> {
         .iter()
         .position(|agent| *agent == default_agent)
         .unwrap_or(0);
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agent to instrument this repo")
-        .items(&choices)
-        .default(default_index)
-        .interact_opt()?;
+    let selection = ui::fuzzy_select_opt(
+        "Select agent to instrument this repo",
+        &choices,
+        default_index,
+    )?;
     let Some(index) = selection else {
         bail!("instrument setup cancelled by user");
     };
@@ -2559,11 +2559,7 @@ fn prompt_agent_selection(prompt: &str, default: Agent) -> Result<Option<Agent>>
         .iter()
         .position(|agent| *agent == default)
         .unwrap_or(0);
-    let selected = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt(prompt)
-        .items(&labels)
-        .default(default_index)
-        .interact_opt()?;
+    let selected = ui::fuzzy_select_opt(prompt, &labels, default_index)?;
     Ok(selected.map(|index| ALL_AGENTS[index]))
 }
 

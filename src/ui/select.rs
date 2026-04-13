@@ -33,6 +33,19 @@ fn tty_term() -> Option<Term> {
 /// Works even when stdin is piped (e.g. `echo "bt setup" | sh`) because
 /// it falls back to /dev/tty for both display and keyboard input.
 pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> Result<usize> {
+    let Some(selection) = fuzzy_select_opt(prompt, items, default)? else {
+        bail!("selection cancelled by user");
+    };
+    Ok(selection)
+}
+
+/// Fuzzy select from a list of items, returning `None` when the user cancels.
+/// Uses the same TTY fallback behavior as [`fuzzy_select`].
+pub fn fuzzy_select_opt<T: ToString>(
+    prompt: &str,
+    items: &[T],
+    default: usize,
+) -> Result<Option<usize>> {
     let Some(term) = tty_term() else {
         bail!("interactive mode requires TTY");
     };
@@ -48,7 +61,7 @@ pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> R
         .items(&labels)
         .default(default)
         .max_length(12)
-        .interact_on(&term)?;
+        .interact_on_opt(&term)?;
 
     Ok(selection)
 }
