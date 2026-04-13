@@ -59,6 +59,7 @@ pub struct ProfileInfo {
     pub user_name: Option<String>,
     pub email: Option<String>,
     pub api_key_hint: Option<String>,
+    pub is_oauth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +122,7 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
             user_name: p.user_name.clone(),
             email: p.email.clone(),
             api_key_hint: p.api_key_hint.clone(),
+            is_oauth: p.auth_kind == AuthKind::Oauth,
         })
         .collect())
 }
