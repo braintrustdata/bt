@@ -156,6 +156,7 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 
 - `bt datasets` works directly against remote Braintrust datasets — no local `bt sync` artifact flow is required.
 - `bt datasets create my-dataset` — create an empty remote dataset in the current project.
+- `bt datasets create my-dataset --description "Dataset for smoke tests"` — create a dataset with a description.
 - `bt datasets create my-dataset --file records.jsonl` — create the remote dataset and seed it from a JSON/JSONL file.
 - `cat records.jsonl | bt datasets create my-dataset` — create the dataset and seed it from stdin.
 - `bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'` — create the dataset from inline JSON rows.

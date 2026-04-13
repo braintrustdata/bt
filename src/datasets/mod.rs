@@ -77,6 +77,7 @@ struct DatasetInputArgs {
 #[command(after_help = r#"Examples:
   bt datasets list
   bt datasets create my-dataset
+  bt datasets create my-dataset --description "Dataset for smoke tests"
   bt datasets create my-dataset --file records.jsonl
   cat records.jsonl | bt datasets create my-dataset
   bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'
@@ -110,6 +111,15 @@ enum DatasetsCommands {
 struct CreateArgs {
     #[command(flatten)]
     name: DatasetNameArgs,
+
+    /// Optional dataset description.
+    #[arg(
+        long,
+        short = 'd',
+        env = "BT_DATASETS_DESCRIPTION",
+        value_name = "TEXT"
+    )]
+    description: Option<String>,
 
     #[command(flatten)]
     input: DatasetInputArgs,
@@ -229,6 +239,7 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
             create::run(
                 &ctx,
                 create_args.name(),
+                create_args.description.as_deref(),
                 create_args.input.file.as_deref(),
                 create_args.input.rows.as_deref(),
                 &create_args.input.id_field,
@@ -328,6 +339,8 @@ mod tests {
             "datasets",
             "create",
             "my-dataset",
+            "--description",
+            "Dataset for smoke tests",
             "--file",
             "records.jsonl",
             "--id-field",
@@ -338,6 +351,10 @@ mod tests {
             panic!("expected create command");
         };
         assert_eq!(create.name(), Some("my-dataset"));
+        assert_eq!(
+            create.description.as_deref(),
+            Some("Dataset for smoke tests")
+        );
         assert_eq!(create.input.file, Some(PathBuf::from("records.jsonl")));
         assert_eq!(create.input.id_field, "metadata.case_id");
         assert!(create.input.rows.is_none());
@@ -525,6 +542,7 @@ mod tests {
                     name_positional: Some("dataset".to_string()),
                     name_flag: None,
                 },
+                description: None,
                 input: DatasetInputArgs {
                     file: None,
                     rows: Some("[]".to_string()),

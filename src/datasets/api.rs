@@ -182,12 +182,20 @@ pub async fn list_dataset_rows_limited(
     Ok((rows, truncated))
 }
 
-pub async fn create_dataset(client: &ApiClient, project_id: &str, name: &str) -> Result<Dataset> {
-    let body = serde_json::json!({
+pub async fn create_dataset(
+    client: &ApiClient,
+    project_id: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Result<Dataset> {
+    let mut body = serde_json::json!({
         "name": name,
         "project_id": project_id,
         "org_name": client.org_name(),
     });
+    if let Some(description) = description.filter(|description| !description.is_empty()) {
+        body["description"] = serde_json::Value::String(description.to_string());
+    }
     client.post("/v1/dataset", &body).await
 }
 
