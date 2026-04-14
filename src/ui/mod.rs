@@ -33,6 +33,10 @@ pub fn animations_enabled() -> bool {
     ANIMATIONS_ENABLED.load(Ordering::Relaxed)
 }
 
+pub fn can_prompt() -> bool {
+    tty_term().is_some() && !NO_INPUT.load(Ordering::Relaxed)
+}
+
 pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && !NO_INPUT.load(Ordering::Relaxed)
 }

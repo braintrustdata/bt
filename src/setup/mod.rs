@@ -801,7 +801,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         args.agents.agent,
         &detected,
         "Select coding agent",
-        ui::is_interactive(),
+        ui::can_prompt(),
     )?;
 
     if args.skills || !args.no_skills {
@@ -934,7 +934,7 @@ fn choose_setup_profile(
         return Ok(profiles.first().map(|profile| profile.name.clone()));
     }
 
-    if ui::is_interactive() {
+    if ui::can_prompt() {
         return auth::select_profile_interactive(None);
     }
 
@@ -999,7 +999,7 @@ async fn select_project_for_setup(
     }
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
-    if !ui::is_interactive() {
+    if !ui::can_prompt() {
         bail!(
             "multiple project choices available; pass --project <NAME> or run `bt setup` in an interactive terminal"
         );
@@ -1300,7 +1300,7 @@ async fn run_instrument_setup(
             args.agent.map(map_instrument_agent_arg_to_agent_arg),
             &detected,
             "Select agent to instrument this repo",
-            ui::is_interactive() && !args.yes,
+            ui::can_prompt() && !args.yes,
         )?
     };
 
@@ -2194,7 +2194,7 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
 
 fn resolve_setup_selection(args: &AgentsSetupArgs) -> Result<SetupSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
-    let interactive = ui::is_interactive() && !args.yes;
+    let interactive = ui::can_prompt() && !args.yes;
     let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_workflow {
         Some(Vec::new())
     } else {
@@ -2289,7 +2289,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs) -> Result<SetupSelection> {
 
 fn resolve_mcp_selection(args: &AgentsMcpSetupArgs) -> Result<McpSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
-    let interactive = ui::is_interactive() && !args.yes;
+    let interactive = ui::can_prompt() && !args.yes;
 
     if interactive {
         #[derive(Clone, Copy)]
@@ -2611,7 +2611,7 @@ fn resolve_scope_from_flags(
         return Ok(resolve_yes_scope(yes_scope_default));
     }
 
-    if !ui::is_interactive() {
+    if !ui::can_prompt() {
         bail!("scope required in non-interactive mode: pass --local or --global");
     }
 
