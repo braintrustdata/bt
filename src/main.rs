@@ -26,6 +26,7 @@ mod status;
 mod switch;
 mod sync;
 mod tools;
+mod topics;
 mod traces;
 mod ui;
 mod util_cmd;
@@ -59,6 +60,7 @@ Core
 
 Projects & resources
   projects     Manage projects
+  topics       Inspect Topics automation status
   prompts      Manage prompts
   functions    Manage functions (tools, scorers, and more)
   tools        Manage tools
@@ -129,6 +131,8 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Inspect Topics automation status
+    Topics(CLIArgs<topics::TopicsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
@@ -166,6 +170,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
+            Commands::Topics(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
             Commands::SelfCommand(cmd) => &cmd.base,
             Commands::Tools(cmd) => &cmd.base,
@@ -220,6 +225,7 @@ async fn try_main() -> Result<()> {
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+        Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
