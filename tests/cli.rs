@@ -12,6 +12,7 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
         "BRAINTRUST_API_KEY",
         "BRAINTRUST_PROFILE",
         "BRAINTRUST_ORG_NAME",
+        "BRAINTRUST_DEFAULT_PROJECT",
     ] {
         cmd.env_remove(key);
     }
@@ -154,11 +155,20 @@ fn setup_no_instrument_does_not_require_auth_in_git_repo() {
 }
 
 #[test]
-fn setup_requires_profile_disambiguation_when_multiple_profiles_exist() {
+fn setup_accepts_no_skill_alias() {
+    bt_command()
+        .args(["setup", "--no-skill", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn setup_mcp_only_no_instrument_does_not_require_project_or_auth() {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    write_executable(&bin_dir.path().join("codex"));
     write_auth_store(
         config_home.path(),
         &[("alpha", "alpha-org"), ("beta", "beta-org")],
@@ -170,9 +180,15 @@ fn setup_requires_profile_disambiguation_when_multiple_profiles_exist() {
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .args(["setup", "--global", "--no-input"])
+        .args([
+            "setup",
+            "--global",
+            "--mcp",
+            "--no-skills",
+            "--no-instrument",
+            "--no-input",
+        ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("multiple auth profiles found"))
-        .stderr(predicate::str::contains("pass --profile"));
+        .success()
+        .stdout(predicate::str::contains("Configuring MCP for Braintrust"));
 }

@@ -276,7 +276,6 @@ mod tests {
             user_name: None,
             email: None,
             api_key_hint: None,
-            is_oauth: false,
         }
     }
 

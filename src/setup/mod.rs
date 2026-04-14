@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -59,7 +58,7 @@ pub struct SetupArgs {
     skills: bool,
 
     /// Do not set up coding-agent skills
-    #[arg(long, conflicts_with = "skills")]
+    #[arg(long, visible_alias = "no-skill", conflicts_with = "skills")]
     no_skills: bool,
 
     /// Set up MCP server
@@ -528,7 +527,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(1, "Auth");
     }
     let project_flag = base.project.clone();
-    let (_login_ctx, client) = ensure_setup_auth(&mut base).await?;
+    let client = ensure_setup_auth(&mut base, !flag_no_instrument).await?;
     let org = client.org_name().to_string();
 
     if verbose {
@@ -783,10 +782,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 }
 
 async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
-    let needs_auth = !args.no_instrument || (args.mcp && !args.no_mcp);
+    let needs_auth = !args.no_instrument;
     if needs_auth {
         let project_flag = base.project.clone();
-        let (_login_ctx, client) = ensure_setup_auth(&mut base).await?;
+        let client = ensure_setup_auth(&mut base, false).await?;
         let org = client.org_name().to_string();
         let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
@@ -866,51 +865,87 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_auth(base: &mut BaseArgs) -> Result<(LoginContext, bool)> {
+fn in_ci() -> bool {
+    std::env::var_os("CI").is_some()
+}
+
+fn resolve_profile_name_for_setup(
+    base: &BaseArgs,
+    profiles: &[auth::ProfileInfo],
+    prompt_for_choice: bool,
+) -> Result<String> {
+    if let Some(profile_name) = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(profile_name.to_string());
+    }
+
+    if let Some(org_name) = base.org_name.as_deref() {
+        if let Some(profile_name) = profiles
+            .iter()
+            .find(|profile| profile.name == org_name)
+            .map(|profile| profile.name.clone())
+        {
+            return Ok(profile_name);
+        }
+
+        let mut matches = profiles
+            .iter()
+            .filter(|profile| profile.org_name.as_deref() == Some(org_name))
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        matches.sort();
+
+        return match matches.len() {
+            0 => auth::resolve_org_to_profile(org_name, profiles),
+            1 => Ok(matches.remove(0)),
+            _ if prompt_for_choice => auth::select_profile_interactive(Some(org_name))?
+                .ok_or_else(|| anyhow!("no profile selected")),
+            _ => Ok(matches.remove(0)),
+        };
+    }
+
+    if profiles.len() == 1 {
+        return Ok(profiles[0].name.clone());
+    }
+
+    if prompt_for_choice {
+        auth::select_profile_interactive(None)?.ok_or_else(|| anyhow!("no profile selected"))
+    } else {
+        let mut names = profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(names.remove(0))
+    }
+}
+
+async fn ensure_auth(base: &mut BaseArgs, prompt_for_profile_choice: bool) -> Result<LoginContext> {
     if matches!(base.api_key_source, Some(ArgValueSource::CommandLine)) {
-        return Ok((auth::login(base).await?, false));
+        return auth::login(base).await;
     }
 
     if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) && !base.prefer_profile {
-        return Ok((auth::login(base).await?, false));
+        return auth::login(base).await;
     }
 
     let profiles = auth::list_profiles()?;
     if !profiles.is_empty() {
-        let profile_name = if let Some(profile_name) =
-            base.profile.as_ref().map(|value| value.trim())
-        {
-            if !profile_name.is_empty() {
-                profile_name.to_string()
-            } else if let Some(org) = base.org_name.as_deref() {
-                auth::resolve_org_to_profile(org, &profiles)?
-            } else if profiles.len() == 1 {
-                profiles[0].name.clone()
-            } else if !ui::is_interactive() {
-                bail!("multiple auth profiles found; pass --profile <NAME> or --org <ORG>, or re-run in an interactive terminal")
-            } else {
-                auth::select_profile_interactive(None)?
-                    .ok_or_else(|| anyhow!("no profile selected"))?
-            }
-        } else if let Some(org) = base.org_name.as_deref() {
-            auth::resolve_org_to_profile(org, &profiles)?
-        } else if profiles.len() == 1 {
-            profiles[0].name.clone()
-        } else if !ui::is_interactive() {
-            bail!("multiple auth profiles found; pass --profile <NAME> or --org <ORG>, or re-run in an interactive terminal")
-        } else {
-            auth::select_profile_interactive(None)?.ok_or_else(|| anyhow!("no profile selected"))?
-        };
+        let should_prompt_for_profile_choice = prompt_for_profile_choice
+            && !base.json
+            && !base.no_input
+            && !in_ci()
+            && ui::is_interactive();
+        let profile_name =
+            resolve_profile_name_for_setup(base, &profiles, should_prompt_for_profile_choice)?;
         base.profile = Some(profile_name.clone());
 
         match auth::login(base).await {
-            Ok(ctx) => {
-                let is_oauth = profiles
-                    .iter()
-                    .find(|p| p.name == profile_name)
-                    .is_some_and(|p| p.is_oauth);
-                return Ok((ctx, is_oauth));
-            }
+            Ok(ctx) => return Ok(ctx),
             Err(err) if auth::is_missing_credential_error(&err) => {
                 if base.verbose {
                     eprintln!(
@@ -918,9 +953,8 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<(LoginContext, bool)> {
                         profile_name, err
                     );
                 }
-                base.profile = None;
                 auth::login_interactive_oauth(base).await?;
-                return Ok((auth::login(base).await?, true));
+                return auth::login(base).await;
             }
             Err(err) => return Err(err),
         }
@@ -930,98 +964,15 @@ async fn ensure_auth(base: &mut BaseArgs) -> Result<(LoginContext, bool)> {
         eprintln!("No auth profiles found. Starting OAuth login.\n");
     }
     auth::login_interactive_oauth(base).await?;
-    Ok((auth::login(base).await?, true))
+    auth::login(base).await
 }
 
-async fn ensure_setup_auth(base: &mut BaseArgs) -> Result<(LoginContext, ApiClient)> {
-    let (login_ctx, is_oauth) = ensure_auth(base).await?;
-    let client = ApiClient::new(&login_ctx)?;
-    if is_oauth
-        && !matches!(
-            base.api_key_source,
-            Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
-        )
-    {
-        maybe_create_api_key_for_oauth(&client).await?;
-    }
-    Ok((login_ctx, client))
-}
-
-/// After an OAuth login in `bt setup`, create a permanent Braintrust API key so the user
-/// has a key they can use outside this session.
-///
-/// The key is stored in `BRAINTRUST_API_KEY` for the rest of the current process and printed
-/// once to stderr (it is never retrievable again).
-async fn maybe_create_api_key_for_oauth(client: &ApiClient) -> Result<()> {
-    let username = std::process::Command::new("whoami")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "user".to_string());
-    let base_name = format!("{username}-created-by-bt-setup");
-
-    #[derive(serde::Deserialize)]
-    struct ApiKeyEntry {
-        name: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct ApiKeyList {
-        objects: Vec<ApiKeyEntry>,
-    }
-
-    let existing: Vec<String> = client
-        .get::<ApiKeyList>("/v1/api_key")
-        .await
-        .map(|r| r.objects.into_iter().map(|k| k.name).collect())
-        .unwrap_or_default();
-
-    let name = if !existing.iter().any(|n| n == &base_name) {
-        base_name
-    } else {
-        (1u32..)
-            .map(|i| format!("{base_name}{i}"))
-            .find(|candidate| !existing.iter().any(|n| n == candidate))
-            .expect("name sequence is infinite")
-    };
-
-    #[derive(serde::Deserialize)]
-    struct CreatedKey {
-        key: String,
-    }
-
-    let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
-    let created: CreatedKey = client.post("/v1/api_key", &body).await?;
-
-    // Expose the key in the current process so later steps can use it.
-    std::env::set_var("BRAINTRUST_API_KEY", &created.key);
-
-    // Print once to stderr — the raw key is never retrievable again.
-    eprintln!();
-    eprintln!(
-        "{} New API key '{}' created — displayed only once:",
-        style("!").yellow().bold(),
-        name,
-    );
-    eprintln!();
-    eprintln!("   {}", style(&created.key).bold());
-    eprintln!();
-    eprintln!("   To export it in your shell, run:");
-    eprintln!(
-        "   {}",
-        style(format!("export BRAINTRUST_API_KEY={}", created.key)).dim()
-    );
-    eprintln!(
-        "   It is safe to cancel the setup now, export the key and restart the setup (with bt setup)."
-    );
-    eprintln!();
-    if std::io::stdin().is_terminal() {
-        eprint!("   Press Enter to continue...");
-        let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut String::new());
-    }
-
-    Ok(())
+async fn ensure_setup_auth(
+    base: &mut BaseArgs,
+    prompt_for_profile_choice: bool,
+) -> Result<ApiClient> {
+    let login_ctx = ensure_auth(base, prompt_for_profile_choice).await?;
+    ApiClient::new(&login_ctx)
 }
 
 async fn select_project_for_setup(
@@ -1050,18 +1001,10 @@ async fn select_project_for_setup(
     )
     .await?;
 
-    if projects.is_empty() {
-        bail!("no projects found in org '{}'", client.org_name());
-    }
-
-    if projects.len() == 1 && projects[0].name == "My Project" {
-        return create_or_fetch_project(client, &default_setup_project_name()).await;
-    }
-
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     if !ui::is_interactive() {
         bail!(
-            "multiple project choices available; pass --project <NAME> or run `bt setup` in an interactive terminal"
+            "project choice required in non-interactive mode; pass --project <NAME> or set BRAINTRUST_DEFAULT_PROJECT"
         );
     }
 
@@ -1362,7 +1305,16 @@ async fn run_instrument_setup(
     let mut hint_pending = print_hint && base.verbose;
     let selected_workflows = resolve_instrument_workflow_selection(&args, &mut hint_pending)?;
 
-    let selected_languages: Vec<LanguageArg> = args.languages.clone();
+    let detected_languages = if args.languages.is_empty() {
+        detect_languages_from_dir(&root)
+    } else {
+        Vec::new()
+    };
+    let selected_languages: Vec<LanguageArg> = if args.languages.is_empty() {
+        detected_languages.clone()
+    } else {
+        args.languages.clone()
+    };
 
     let show_progress = !base.json;
     let mut warnings = Vec::new();
@@ -1416,17 +1368,23 @@ async fn run_instrument_setup(
     // --yolo:       background, full bypassPermissions (no restrictions)
     // --tui:        interactive TUI
     // --background: background, restricted to language package managers
-    // --yes or non-interactive terminal: background, restricted to language package managers
-    // Otherwise: default to interactive TUI.
-    let (run_interactive, bypass_permissions) = if args.tui {
+    // Otherwise: default to interactive TUI when supported.
+    let requested_interactive = if args.tui {
         (true, false)
     } else if args.yolo {
         (false, true)
-    } else if args.background || args.yes || !ui::is_interactive() {
+    } else if args.background || !ui::is_interactive() {
         (false, false)
     } else {
         (true, false)
     };
+    let (mut run_interactive, bypass_permissions) = requested_interactive;
+    if run_interactive && matches!(selected, Agent::Opencode) {
+        run_interactive = false;
+        warnings.push(
+            "Opencode does not reliably support starting with a preloaded prompt in TUI mode; launching it in background mode instead.".to_string(),
+        );
+    }
 
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
@@ -1442,6 +1400,7 @@ async fn run_instrument_setup(
             &selected_workflows,
             &selected_languages,
             run_interactive,
+            detected_languages.is_empty(),
         ),
     )?;
 
@@ -2092,6 +2051,7 @@ fn render_instrument_task(
     workflows: &[WorkflowArg],
     languages: &[LanguageArg],
     interactive: bool,
+    needs_language_detection: bool,
 ) -> String {
     use std::collections::BTreeSet;
     let sdk_install_dir = docs_output_dir.join("sdk-install");
@@ -2099,7 +2059,15 @@ fn render_instrument_task(
     // Deduplicate languages (TypeScript and JavaScript both map to the same variant).
     let unique_langs: BTreeSet<LanguageArg> = languages.iter().copied().collect();
     let language_context = if unique_langs.is_empty() {
-        String::new()
+        if needs_language_detection {
+            "### Language Discovery\n\n\
+             No language override was provided and no supported language markers were detected \
+             in the repo root or its immediate subdirectories. Determine which language(s) to \
+             instrument before you make code changes.\n"
+                .to_string()
+        } else {
+            String::new()
+        }
     } else {
         let names: Vec<String> = unique_langs
             .iter()
@@ -2656,14 +2624,14 @@ fn resolve_default_agent_selection(
     }
 
     let path_agents = detected_agents_on_path(detected);
+    if path_agents.len() == 1 {
+        return Ok(path_agents[0]);
+    }
+
     if allow_prompt {
         let default = pick_agent_mode_target(&path_agents).unwrap_or(Agent::Codex);
         return prompt_agent_selection(prompt, default)?
             .ok_or_else(|| anyhow!("setup cancelled by user"));
-    }
-
-    if path_agents.len() == 1 {
-        return Ok(path_agents[0]);
     }
 
     if path_agents.is_empty() {
@@ -3568,26 +3536,42 @@ mod tests {
         assert!(err.to_string().contains("pass --agent"));
     }
 
-    fn should_create_api_key(is_oauth: bool, base: &BaseArgs) -> bool {
-        is_oauth
-            && !matches!(
-                base.api_key_source,
-                Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
-            )
+    #[test]
+    fn default_agent_selection_uses_single_path_agent_without_prompt() {
+        let detected = vec![DetectionSignal {
+            agent: Agent::Cursor,
+            on_path: true,
+            reason: "`cursor-agent` binary found in PATH".to_string(),
+        }];
+        let resolved =
+            resolve_default_agent_selection(None, &detected, "Select coding agent", true)
+                .expect("resolve default agent");
+        assert_eq!(resolved, Agent::Cursor);
     }
 
     #[test]
-    fn setup_creates_api_key_for_oauth_without_explicit_key() {
+    fn resolve_profile_name_for_setup_uses_first_alphabetical_profile_without_prompt() {
         let base = make_base_args();
-        assert!(should_create_api_key(true, &base));
-    }
+        let profiles = vec![
+            auth::ProfileInfo {
+                name: "zeta".to_string(),
+                org_name: Some("Zeta Org".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+            auth::ProfileInfo {
+                name: "alpha".to_string(),
+                org_name: Some("Alpha Org".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+        ];
 
-    #[test]
-    fn setup_does_not_create_api_key_when_env_key_is_present() {
-        let mut base = make_base_args();
-        base.api_key = Some("env-key".to_string());
-        base.api_key_source = Some(ArgValueSource::EnvVariable);
-        assert!(!should_create_api_key(true, &base));
+        let resolved =
+            resolve_profile_name_for_setup(&base, &profiles, false).expect("resolve profile");
+        assert_eq!(resolved, "alpha");
     }
 
     #[test]
@@ -3790,10 +3774,19 @@ mod tests {
             &[WorkflowArg::Instrument, WorkflowArg::Observe],
             &[],
             false,
+            false,
         );
         assert!(task.contains("Use the installed Braintrust agent skills"));
         assert!(task.contains("prefer local `bt` CLI commands"));
         assert!(task.contains("Do not rely on the Braintrust MCP server"));
+    }
+
+    #[test]
+    fn render_instrument_task_includes_language_discovery_guidance_when_needed() {
+        let root = PathBuf::from("/tmp/repo");
+        let task = render_instrument_task(&root, &[WorkflowArg::Instrument], &[], false, true);
+        assert!(task.contains("Language Discovery"));
+        assert!(task.contains("Determine which language"));
     }
 
     #[test]

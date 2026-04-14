@@ -59,7 +59,6 @@ pub struct ProfileInfo {
     pub user_name: Option<String>,
     pub email: Option<String>,
     pub api_key_hint: Option<String>,
-    pub is_oauth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +121,6 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
             user_name: p.user_name.clone(),
             email: p.email.clone(),
             api_key_hint: p.api_key_hint.clone(),
-            is_oauth: p.auth_kind == AuthKind::Oauth,
         })
         .collect())
 }
@@ -511,7 +509,12 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
 }
 
 fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
-    if base.prefer_profile {
+    if base.prefer_profile
+        && !matches!(
+            base.api_key_source,
+            Some(crate::args::ArgValueSource::CommandLine)
+        )
+    {
         return None;
     }
     let value = base.api_key.as_deref()?.trim();
@@ -2943,6 +2946,39 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn resolve_auth_prefers_cli_api_key_even_with_prefer_profile() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".to_string());
+        base.api_key_source = Some(crate::args::ArgValueSource::CommandLine);
+        base.prefer_profile = true;
+        base.profile = Some("work".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: None,
+                org_name: Some("Example Org".to_string()),
+                oauth_client_id: None,
+                oauth_access_expires_at: None,
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
+        assert_eq!(resolved.org_name, None);
     }
 
     #[test]

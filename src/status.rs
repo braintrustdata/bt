@@ -342,7 +342,6 @@ mod tests {
             user_name: user_name.map(Into::into),
             email: email.map(Into::into),
             api_key_hint: api_key_hint.map(Into::into),
-            is_oauth: false,
         }
     }
 
