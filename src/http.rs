@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use reqwest::header::HeaderValue;
 use reqwest::{Client, ClientBuilder};
@@ -11,39 +9,16 @@ use crate::auth::LoginContext;
 
 pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub fn build_http_client(timeout: std::time::Duration, ca_cert: Option<&Path>) -> Result<Client> {
-    build_http_client_from_builder(Client::builder().timeout(timeout), ca_cert)
+pub fn build_http_client(timeout: std::time::Duration) -> Result<Client> {
+    build_http_client_from_builder(Client::builder().timeout(timeout))
 }
 
-pub fn build_http_client_from_builder(
-    mut builder: ClientBuilder,
-    ca_cert: Option<&Path>,
-) -> Result<Client> {
+pub fn build_http_client_from_builder(mut builder: ClientBuilder) -> Result<Client> {
     // Prefer the platform/native root store so standard envs like SSL_CERT_FILE
     // are honored consistently across the CLI.
     builder = builder
         .tls_built_in_native_certs(true)
         .tls_built_in_webpki_certs(false);
-
-    if let Some(ca_cert) = ca_cert {
-        let pem = std::fs::read(ca_cert)
-            .with_context(|| format!("failed to read CA cert bundle {}", ca_cert.display()))?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem).with_context(|| {
-            format!(
-                "failed to parse PEM certificates from {}",
-                ca_cert.display()
-            )
-        })?;
-        if certs.is_empty() {
-            anyhow::bail!(
-                "CA cert bundle {} did not contain any PEM certificates",
-                ca_cert.display()
-            );
-        }
-        for cert in certs {
-            builder = builder.add_root_certificate(cert);
-        }
-    }
 
     builder.build().context("failed to build HTTP client")
 }
@@ -77,7 +52,7 @@ pub struct BtqlResponse<T> {
 
 impl ApiClient {
     pub fn new(ctx: &LoginContext) -> Result<Self> {
-        let http = build_http_client(DEFAULT_HTTP_TIMEOUT, ctx.ca_cert.as_deref())?;
+        let http = build_http_client(DEFAULT_HTTP_TIMEOUT)?;
 
         Ok(Self {
             http,
@@ -246,10 +221,9 @@ pub async fn put_signed_url(
     url: &str,
     body: Vec<u8>,
     content_encoding: Option<&str>,
-    ca_cert: Option<&Path>,
 ) -> Result<()> {
-    let client = build_http_client(UPLOAD_HTTP_TIMEOUT, ca_cert)
-        .context("failed to build signed-url HTTP client")?;
+    let client =
+        build_http_client(UPLOAD_HTTP_TIMEOUT).context("failed to build signed-url HTTP client")?;
 
     let mut request = client.put(url).body(body);
     if let Some(encoding) = content_encoding {

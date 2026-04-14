@@ -69,7 +69,7 @@ pub struct BaseArgs {
     /// Path to a PEM-encoded CA bundle used for HTTPS requests.
     #[arg(
         long = "ca-cert",
-        env = "SSL_CERT_FILE",
+        env = "BRAINTRUST_CA_CERT",
         hide_env_values = true,
         global = true
     )]
@@ -97,9 +97,5 @@ pub struct CLIArgs<T: Args> {
 impl BaseArgs {
     pub fn ca_cert(&self) -> Option<&Path> {
         self.ca_cert.as_deref()
-    }
-
-    pub fn ca_cert_path(&self) -> Option<PathBuf> {
-        self.ca_cert.clone()
     }
 }

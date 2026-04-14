@@ -77,8 +77,6 @@ impl UpdateChannel {
 }
 
 const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
-const SSL_CERT_FILE_ENV_VAR: &str = "SSL_CERT_FILE";
-
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -118,7 +116,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(channel, base.ca_cert())?;
+    run_installer(channel)?;
     Ok(())
 }
 
@@ -153,12 +151,11 @@ async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()>
     Ok(())
 }
 
-async fn fetch_release(base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
+async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
     let client = crate::http::build_http_client_from_builder(
         Client::builder()
             .user_agent("bt-self-update")
             .timeout(DEFAULT_HTTP_TIMEOUT),
-        base.ca_cert(),
     )
     .context("failed to initialize HTTP client")?;
 
@@ -188,14 +185,7 @@ async fn fetch_release(base: &BaseArgs, channel: UpdateChannel) -> Result<GitHub
         .context("failed to parse GitHub release response")
 }
 
-#[cfg(not(windows))]
-fn installer_env_vars(ca_cert: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
-    ca_cert
-        .map(|path| vec![(SSL_CERT_FILE_ENV_VAR, path.to_path_buf())])
-        .unwrap_or_default()
-}
-
-fn run_installer(channel: UpdateChannel, ca_cert: Option<&Path>) -> Result<()> {
+fn run_installer(channel: UpdateChannel) -> Result<()> {
     #[cfg(not(windows))]
     {
         let installer_url = channel.installer_url();
@@ -203,9 +193,6 @@ fn run_installer(channel: UpdateChannel, ca_cert: Option<&Path>) -> Result<()> {
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
-        for (key, value) in installer_env_vars(ca_cert) {
-            command.env(key, value);
-        }
         let status = command.status().context("failed to execute installer")?;
 
         if !status.success() {
@@ -218,7 +205,6 @@ fn run_installer(channel: UpdateChannel, ca_cert: Option<&Path>) -> Result<()> {
 
     #[cfg(windows)]
     {
-        let _ = ca_cert;
         let installer_url = match channel {
             UpdateChannel::Stable => {
                 "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1"
@@ -493,22 +479,6 @@ mod tests {
         assert_eq!(
             inferred_update_channel(Some("canary")),
             UpdateChannel::Canary
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn installer_env_vars_omit_ca_cert_when_unset() {
-        assert!(installer_env_vars(None).is_empty());
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn installer_env_vars_set_ssl_cert_file_from_cli_ca_cert() {
-        let ca_cert = Path::new("/tmp/custom-ca.pem");
-        assert_eq!(
-            installer_env_vars(Some(ca_cert)),
-            vec![(SSL_CERT_FILE_ENV_VAR, ca_cert.to_path_buf())]
         );
     }
 }

@@ -889,7 +889,6 @@ async fn execute_skills_setup(
         notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
     } else {
         prefetch_workflow_docs(
-            base,
             show_progress,
             scope,
             local_root.as_deref(),
@@ -1027,7 +1026,6 @@ async fn run_instrument_setup(
         });
         notes.push("Skipped skills setup (already configured).".to_string());
         prefetch_workflow_docs(
-            &base,
             show_progress,
             InstallScope::Local,
             Some(&root),
@@ -1390,7 +1388,6 @@ fn skill_config_path(
 
 #[allow(clippy::too_many_arguments)]
 async fn prefetch_workflow_docs(
-    base: &BaseArgs,
     show_progress: bool,
     scope: InstallScope,
     local_root: Option<&Path>,
@@ -1422,11 +1419,11 @@ async fn prefetch_workflow_docs(
     let fetch_result = if show_progress {
         with_spinner(
             "Prefetching workflow docs...",
-            docs::fetch_docs_pages_with_ca(base.ca_cert(), &docs_args, selected_workflows),
+            docs::fetch_docs_pages(&docs_args, selected_workflows),
         )
         .await
     } else {
-        docs::fetch_docs_pages_with_ca(base.ca_cert(), &docs_args, selected_workflows).await
+        docs::fetch_docs_pages(&docs_args, selected_workflows).await
     };
     match fetch_result {
         Ok(fetch_result) => {

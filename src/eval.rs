@@ -404,11 +404,8 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             allowed_org_name: args.dev_org_name.clone(),
             allowed_origins: collect_allowed_dev_origins(&args.dev_allowed_origin, &app_url),
             app_url,
-            http_client: crate::http::build_http_client(
-                crate::http::DEFAULT_HTTP_TIMEOUT,
-                base.ca_cert(),
-            )
-            .context("failed to create dev server HTTP client")?,
+            http_client: crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
+                .context("failed to create dev server HTTP client")?,
         };
         return run_dev_server(state).await;
     }
@@ -1228,12 +1225,6 @@ fn make_dev_mode_env(
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
-    if let Some(ca_cert) = state.base.ca_cert_path() {
-        env.push((
-            "SSL_CERT_FILE".to_string(),
-            ca_cert.to_string_lossy().into_owned(),
-        ));
-    }
     if let Some(request) = request {
         let serialized =
             serde_json::to_string(request).context("failed to serialize eval request payload")?;

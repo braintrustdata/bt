@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -215,9 +213,8 @@ pub async fn upload_bundle(
     url: &str,
     bundle_bytes: Vec<u8>,
     content_encoding: Option<&str>,
-    ca_cert: Option<&Path>,
 ) -> Result<()> {
-    crate::http::put_signed_url(url, bundle_bytes, content_encoding, ca_cert)
+    crate::http::put_signed_url(url, bundle_bytes, content_encoding)
         .await
         .context("failed to upload code bundle to signed URL")
 }

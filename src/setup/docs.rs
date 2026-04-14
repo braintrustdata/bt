@@ -116,7 +116,7 @@ async fn run_docs(base: BaseArgs, args: DocsArgs) -> Result<()> {
 
 async fn run_docs_fetch(base: BaseArgs, args: DocsFetchArgs) -> Result<()> {
     let selected_workflows = resolve_workflow_selection(&args.workflows);
-    let fetch_result = fetch_docs_pages_with_ca(base.ca_cert(), &args, &selected_workflows).await?;
+    let fetch_result = fetch_docs_pages(&args, &selected_workflows).await?;
 
     if base.json {
         let report = DocsFetchJsonReport {
@@ -174,8 +174,7 @@ async fn run_docs_fetch(base: BaseArgs, args: DocsFetchArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn fetch_docs_pages_with_ca(
-    ca_cert: Option<&Path>,
+pub(super) async fn fetch_docs_pages(
     args: &DocsFetchArgs,
     selected_workflows: &[WorkflowArg],
 ) -> Result<DocsFetchResult> {
@@ -194,7 +193,7 @@ pub(super) async fn fetch_docs_pages_with_ca(
         Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).context("failed to build URL regex")?;
     let llms_base = reqwest::Url::parse(&args.llms_url)
         .with_context(|| format!("invalid llms URL: {}", args.llms_url))?;
-    let client = crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT, ca_cert)
+    let client = crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
         .context("failed to build HTTP client")?;
 
     let index_response = client
