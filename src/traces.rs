@@ -882,7 +882,7 @@ pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
     let base = apply_url_hints_to_base(base, parsed_startup_url.as_ref());
 
     let ctx = login(&base).await?;
-    let client = ApiClient::new(&ctx)?;
+    let client = ApiClient::new(&base, &ctx)?;
 
     match args.command {
         None => run_logs_command(base, client, LogsArgs::default()).await,
@@ -6068,6 +6068,7 @@ mod tests {
             no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }

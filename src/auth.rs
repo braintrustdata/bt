@@ -8,18 +8,14 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use braintrust_sdk_rust::{BraintrustClient, LoginState};
+use braintrust_sdk_rust::LoginState;
 use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
-use oauth2::basic::{BasicClient, BasicTokenType};
-use oauth2::reqwest::async_http_client;
+use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EmptyExtraTokenFields, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, StandardTokenResponse, TokenResponse,
-    TokenUrl,
+    AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
 };
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -172,7 +168,7 @@ pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
         None => login(base).await?.login.api_key,
     };
 
-    let mut orgs = fetch_login_orgs(&api_key, &app_url).await?;
+    let mut orgs = fetch_login_orgs(base, &api_key, &app_url).await?;
     orgs.sort_by(|a, b| {
         a.name
             .to_ascii_lowercase()
@@ -378,42 +374,22 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         )
     })?;
 
-    let mut builder = BraintrustClient::builder()
-        .blocking_login(true)
-        .api_key(api_key.clone());
-
-    if let Some(api_url) = &auth.api_url {
-        builder = builder.api_url(api_url);
-    }
-    if let Some(app_url) = &auth.app_url {
-        builder = builder.app_url(app_url);
-    }
-    if let Some(org_name) = &auth.org_name {
-        builder = builder.org_name(org_name);
-    }
-    let project = base
-        .project
+    let configured_api_url = auth
+        .api_url
         .clone()
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
-    if let Some(project) = &project {
-        builder = builder.default_project(project);
-    }
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    reqwest::Url::parse(&configured_api_url).context("invalid api_url")?;
 
-    let login = match builder.build().await {
-        Ok(client) => client.wait_for_login().await?,
-        Err(err) if auth.is_oauth => {
-            let org_name = auth
-                .org_name
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("oauth profile is missing org_name: {err}"))?;
-            LoginState {
-                api_key: api_key.clone(),
-                org_id: String::new(),
-                org_name,
-                api_url: auth.api_url.clone(),
-            }
-        }
-        Err(err) => return Err(err.into()),
+    let app_url = auth
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let login = match fetch_login_orgs(base, &api_key, &app_url).await {
+        Ok(login_orgs) => login_state_from_orgs(&auth, api_key.clone(), login_orgs)?,
+        Err(err) => match oauth_login_state_fallback(&auth, api_key.clone()) {
+            Some(login) => login,
+            None => return Err(err),
+        },
     };
 
     let api_url = login
@@ -422,15 +398,48 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         .or(auth.api_url.clone())
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
-    let app_url = auth
-        .app_url
-        .clone()
-        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-
     Ok(LoginContext {
         login,
         api_url,
         app_url,
+    })
+}
+
+fn login_state_from_orgs(
+    auth: &ResolvedAuth,
+    api_key: String,
+    login_orgs: Vec<LoginOrgInfo>,
+) -> Result<LoginState> {
+    let org = if let Some(org_name) = auth.org_name.as_deref() {
+        login_orgs
+            .into_iter()
+            .find(|org| org.name == org_name)
+            .ok_or_else(|| anyhow::anyhow!("organization '{org_name}' not found"))?
+    } else {
+        login_orgs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no organizations found for this credential"))?
+    };
+
+    Ok(LoginState {
+        api_key,
+        org_id: org.id,
+        org_name: org.name,
+        api_url: org.api_url.clone().or(auth.api_url.clone()),
+    })
+}
+
+fn oauth_login_state_fallback(auth: &ResolvedAuth, api_key: String) -> Option<LoginState> {
+    if !auth.is_oauth {
+        return None;
+    }
+
+    Some(LoginState {
+        api_key,
+        org_id: String::new(),
+        org_name: auth.org_name.clone()?,
+        api_url: auth.api_url.clone(),
     })
 }
 
@@ -523,7 +532,7 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
             "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
         )
     })?;
-    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
+    let refreshed = refresh_oauth_access_token(base, &api_url, &refresh_token, client_id).await?;
     save_profile_oauth_access_token(&profile_name, &refreshed.access_token)?;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
         if next_refresh_token != &refresh_token {
@@ -691,7 +700,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
+    let login_orgs = fetch_login_orgs(base, &api_key, &login_app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -791,6 +800,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     }
 
     let oauth_tokens = exchange_oauth_authorization_code(
+        base,
         &api_url,
         &client_id,
         &redirect_uri,
@@ -798,7 +808,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         pkce_verifier,
     )
     .await?;
-    let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
+    let login_orgs = fetch_login_orgs(base, &oauth_tokens.access_token, &app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -849,7 +859,7 @@ async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
+    let login_orgs = fetch_login_orgs(base, &api_key, &login_app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -932,6 +942,7 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     }
 
     let oauth_tokens = exchange_oauth_authorization_code(
+        base,
         &api_url,
         &client_id,
         &redirect_uri,
@@ -940,7 +951,7 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     )
     .await?;
 
-    let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
+    let login_orgs = fetch_login_orgs(base, &oauth_tokens.access_token, &app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
@@ -1091,7 +1102,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         println!("Cached access token expiry before refresh: unknown");
     }
 
-    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &client_id).await?;
+    let refreshed = refresh_oauth_access_token(base, &api_url, &refresh_token, &client_id).await?;
     save_profile_oauth_access_token(profile_name.as_str(), &refreshed.access_token)?;
     let mut refresh_rotated = false;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
@@ -1221,7 +1232,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
         return Ok(());
     }
 
-    let verifications = verify_all_profiles_from_store(&store).await;
+    let verifications = verify_all_profiles_from_store(base, &store).await;
     let all_network_errors = verifications
         .iter()
         .all(|v| v.status == "error" && !v.error.as_deref().unwrap_or("").contains("invalid"));
@@ -1402,7 +1413,11 @@ fn build_verification(
     }
 }
 
-async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerification {
+async fn verify_profile_full(
+    base: &BaseArgs,
+    name: &str,
+    profile: &AuthProfile,
+) -> ProfileVerification {
     let app_url = profile.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
     let auth_kind = match profile.auth_kind {
         AuthKind::ApiKey => "api_key",
@@ -1431,7 +1446,7 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
         AuthKind::ApiKey => (None, profile.api_key_hint.clone()),
     };
 
-    match fetch_login_orgs(&credential, app_url).await {
+    match fetch_login_orgs(base, &credential, app_url).await {
         Ok(_) => mk(ProfileStatus::Ok, jwt_id, hint),
         Err(e) => {
             let msg = e.to_string();
@@ -1449,12 +1464,16 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
     }
 }
 
-async fn verify_all_profiles_from_store(store: &AuthStore) -> Vec<ProfileVerification> {
+async fn verify_all_profiles_from_store(
+    base: &BaseArgs,
+    store: &AuthStore,
+) -> Vec<ProfileVerification> {
     let mut set = tokio::task::JoinSet::new();
     for (name, profile) in store.profiles.iter() {
+        let base = base.clone();
         let name = name.clone();
         let profile = profile.clone();
-        set.spawn(async move { verify_profile_full(&name, &profile).await });
+        set.spawn(async move { verify_profile_full(&base, &name, &profile).await });
     }
 
     let mut results = Vec::new();
@@ -1538,10 +1557,13 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
+async fn fetch_login_orgs(
+    base: &BaseArgs,
+    api_key: &str,
+    app_url: &str,
+) -> Result<Vec<LoginOrgInfo>> {
     let login_url = format!("{}/api/apikey/login", app_url.trim_end_matches('/'));
-    let client = Client::builder()
-        .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
+    let client = crate::http::client_builder(base, crate::http::DEFAULT_HTTP_TIMEOUT)?
         .build()
         .context("failed to initialize HTTP client")?;
     let response = client
@@ -1550,7 +1572,9 @@ async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgIn
         .header("Content-Type", "application/json")
         .send()
         .await
-        .with_context(|| format!("failed to call login endpoint {login_url}"))?;
+        .map_err(|err| {
+            anyhow::Error::new(err).context(format!("failed to call login endpoint {login_url}"))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1931,47 +1955,76 @@ fn is_ssh_session() -> bool {
 }
 
 async fn exchange_oauth_authorization_code(
+    base: &BaseArgs,
     api_url: &str,
     client_id: &str,
     redirect_uri: &str,
     code: &str,
     code_verifier: PkceCodeVerifier,
 ) -> Result<OAuthTokenResponse> {
-    let oauth_client = build_oauth_client(api_url, client_id, Some(redirect_uri))?;
-    let token_response = oauth_client
-        .exchange_code(AuthorizationCode::new(code.to_string()))
-        .set_pkce_verifier(code_verifier)
-        .request_async(async_http_client)
+    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
+    let client = crate::http::client_builder(base, crate::http::DEFAULT_HTTP_TIMEOUT)?
+        .build()
+        .context("failed to initialize HTTP client")?;
+    let token_response = client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("code", code),
+            ("code_verifier", code_verifier.secret()),
+        ])
+        .send()
         .await
-        .with_context(|| {
-            format!(
-                "failed to call oauth token endpoint {}/oauth/token",
-                api_url.trim_end_matches('/')
-            )
+        .map_err(|err| {
+            anyhow::Error::new(err)
+                .context(format!("failed to call oauth token endpoint {token_url}"))
         })?;
-    Ok(to_oauth_token_response(token_response))
+    if !token_response.status().is_success() {
+        let status = token_response.status();
+        let body = token_response.text().await.unwrap_or_default();
+        return Err(crate::http::HttpError { status, body }.into());
+    }
+    token_response
+        .json()
+        .await
+        .context("failed to parse oauth token response")
 }
 
 async fn refresh_oauth_access_token(
+    base: &BaseArgs,
     api_url: &str,
     refresh_token: &str,
     client_id: &str,
 ) -> Result<OAuthTokenResponse> {
-    let oauth_client = build_oauth_client(api_url, client_id, None)?;
-    let token_response = oauth_client
-        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-        .request_async(async_http_client)
+    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
+    let client = crate::http::client_builder(base, crate::http::DEFAULT_HTTP_TIMEOUT)?
+        .build()
+        .context("failed to initialize HTTP client")?;
+    let token_response = client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
         .await
-        .with_context(|| {
-            format!(
-                "failed to call oauth token endpoint {}/oauth/token",
-                api_url.trim_end_matches('/')
-            )
+        .map_err(|err| {
+            anyhow::Error::new(err)
+                .context(format!("failed to call oauth token endpoint {token_url}"))
         })?;
-    Ok(to_oauth_token_response(token_response))
+    if !token_response.status().is_success() {
+        let status = token_response.status();
+        let body = token_response.text().await.unwrap_or_default();
+        return Err(crate::http::HttpError { status, body }.into());
+    }
+    token_response
+        .json()
+        .await
+        .context("failed to parse oauth token response")
 }
-
-type OAuth2StdTokenResponse = StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType>;
 
 fn build_oauth_client(
     api_url: &str,
@@ -1995,16 +2048,6 @@ fn build_oauth_client(
         Ok(client.set_redirect_uri(redirect_url))
     } else {
         Ok(client)
-    }
-}
-
-fn to_oauth_token_response(tokens: OAuth2StdTokenResponse) -> OAuthTokenResponse {
-    OAuthTokenResponse {
-        access_token: tokens.access_token().secret().to_string(),
-        refresh_token: tokens
-            .refresh_token()
-            .map(|token| token.secret().to_string()),
-        expires_in: tokens.expires_in().map(|duration| duration.as_secs()),
     }
 }
 
@@ -2652,6 +2695,7 @@ mod tests {
             no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }
@@ -2944,6 +2988,38 @@ mod tests {
         assert!(resolved.is_oauth);
         assert_eq!(resolved.api_key, None);
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn oauth_login_state_fallback_uses_stored_profile_context() {
+        let auth = ResolvedAuth {
+            api_key: Some("oauth-token".to_string()),
+            api_url: Some("https://api.example.com".to_string()),
+            app_url: Some("https://app.example.com".to_string()),
+            org_name: Some("Example Org".to_string()),
+            is_oauth: true,
+        };
+
+        let login = oauth_login_state_fallback(&auth, "oauth-token".to_string())
+            .expect("oauth fallback should be available");
+
+        assert_eq!(login.api_key, "oauth-token");
+        assert_eq!(login.org_id, "");
+        assert_eq!(login.org_name, "Example Org");
+        assert_eq!(login.api_url.as_deref(), Some("https://api.example.com"));
+    }
+
+    #[test]
+    fn oauth_login_state_fallback_requires_org_name() {
+        let auth = ResolvedAuth {
+            api_key: Some("oauth-token".to_string()),
+            api_url: Some("https://api.example.com".to_string()),
+            app_url: Some("https://app.example.com".to_string()),
+            org_name: None,
+            is_oauth: true,
+        };
+
+        assert!(oauth_login_state_fallback(&auth, "oauth-token".to_string()).is_none());
     }
 
     #[test]

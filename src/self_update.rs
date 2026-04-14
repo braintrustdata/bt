@@ -1,13 +1,13 @@
 use std::env;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use reqwest::Client;
 use serde::Deserialize;
 
-use crate::http::DEFAULT_HTTP_TIMEOUT;
+use crate::{args::BaseArgs, http::DEFAULT_HTTP_TIMEOUT};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -82,25 +82,25 @@ struct GitHubRelease {
     tag_name: String,
 }
 
-pub async fn run(args: SelfArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
     match args.command {
-        SelfSubcommand::Update(args) => run_update(args).await,
+        SelfSubcommand::Update(args) => run_update(&base, args).await,
     }
 }
 
-async fn run_update(args: UpdateArgs) -> Result<()> {
+async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
     ensure_installer_managed_install()?;
     let channel = args
         .channel
         .unwrap_or_else(|| inferred_update_channel(BUILD_UPDATE_CHANNEL));
 
     if args.check {
-        check_for_update(channel).await?;
+        check_for_update(base, channel).await?;
         return Ok(());
     }
 
     if channel == UpdateChannel::Stable {
-        match fetch_release(channel).await {
+        match fetch_release(base, channel).await {
             Ok(release) => {
                 let current = env!("CARGO_PKG_VERSION");
                 if stable_is_up_to_date(current, &release.tag_name) {
@@ -116,7 +116,7 @@ async fn run_update(args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(channel)?;
+    run_installer(base, channel).await?;
     Ok(())
 }
 
@@ -135,8 +135,8 @@ fn ensure_installer_managed_install() -> Result<()> {
     );
 }
 
-async fn check_for_update(channel: UpdateChannel) -> Result<()> {
-    let release = fetch_release(channel).await?;
+async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+    let release = fetch_release(base, channel).await?;
     let current = env!("CARGO_PKG_VERSION");
 
     match channel {
@@ -151,10 +151,9 @@ async fn check_for_update(channel: UpdateChannel) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
-    let client = Client::builder()
+async fn fetch_release(base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
+    let client = crate::http::client_builder(base, DEFAULT_HTTP_TIMEOUT)?
         .user_agent("bt-self-update")
-        .timeout(DEFAULT_HTTP_TIMEOUT)
         .build()
         .context("failed to initialize HTTP client")?;
 
@@ -184,17 +183,26 @@ async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
         .context("failed to parse GitHub release response")
 }
 
-fn run_installer(channel: UpdateChannel) -> Result<()> {
+async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+    let installer_url = channel.installer_url();
+    let installer_script = fetch_installer_script(base, installer_url).await?;
+
     #[cfg(not(windows))]
     {
-        let installer_url = channel.installer_url();
         println!("updating bt from {} channel...", channel.name());
-        let cmd = format!("curl -fsSL '{installer_url}' | sh");
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .status()
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .spawn()
             .context("failed to execute installer")?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(installer_script.as_bytes())
+                .context("failed to write installer script")?;
+        }
+
+        let status = child.wait().context("failed to wait for installer")?;
 
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
@@ -206,25 +214,20 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
 
     #[cfg(windows)]
     {
-        let installer_url = match channel {
-            UpdateChannel::Stable => {
-                "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1"
-            }
-            UpdateChannel::Canary => {
-                "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1"
-            }
-        };
-        let script = format!("irm {installer_url} | iex");
-        let status = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ])
-            .status()
+        println!("updating bt from {} channel...", channel.name());
+        let mut child = Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"])
+            .stdin(Stdio::piped())
+            .spawn()
             .context("failed to execute PowerShell installer")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(installer_script.as_bytes())
+                .context("failed to write PowerShell installer script")?;
+        }
+        let status = child
+            .wait()
+            .context("failed to wait for PowerShell installer")?;
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
         }
@@ -232,6 +235,27 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
         println!("update completed");
         return Ok(());
     }
+}
+
+async fn fetch_installer_script(base: &BaseArgs, installer_url: &str) -> Result<String> {
+    let client = crate::http::client_builder(base, DEFAULT_HTTP_TIMEOUT)?
+        .user_agent("bt-self-update")
+        .build()
+        .context("failed to initialize installer HTTP client")?;
+    let response = client
+        .get(installer_url)
+        .send()
+        .await
+        .with_context(|| format!("failed to download installer {installer_url}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("failed to download installer {installer_url} ({status}): {body}");
+    }
+    response
+        .text()
+        .await
+        .context("failed to read installer script")
 }
 
 fn receipt_path() -> Option<PathBuf> {

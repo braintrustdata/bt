@@ -73,7 +73,7 @@ struct DeleteArgs {
 
 pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
     let ctx = login(&base).await?;
-    let client = ApiClient::new(&ctx)?;
+    let client = ApiClient::new(&base, &ctx)?;
 
     match args.command {
         None | Some(ProjectsCommands::List) => {

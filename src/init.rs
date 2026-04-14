@@ -38,7 +38,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
             }
         }
         let ctx = login(&login_base).await?;
-        let client = ApiClient::new(&ctx)?;
+        let client = ApiClient::new(&login_base, &ctx)?;
 
         let org = client.org_name().to_string();
         let project = select_project_interactive(&client, Some("Link to project"), None).await?;

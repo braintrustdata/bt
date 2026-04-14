@@ -11,7 +11,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use backoff::future::retry_notify;
 use backoff::{Error as BackoffError, ExponentialBackoffBuilder};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use braintrust_sdk_rust::Logs3BatchUploader;
 use clap::{Args, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::de::DeserializeOwned;
@@ -24,6 +23,7 @@ use crate::args::BaseArgs;
 use crate::auth::{login, LoginContext};
 use crate::experiments::api::create_experiment;
 use crate::http::ApiClient;
+use crate::logs3_uploader::Logs3BatchUploader;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 
@@ -543,13 +543,13 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
     match args.command {
         SyncCommand::Pull(pull) => {
             let ctx = login(&base).await?;
-            let client = ApiClient::new(&ctx)?;
+            let client = ApiClient::new(&base, &ctx)?;
             run_pull(base.json, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
             let ctx = login(&base).await?;
-            let client = ApiClient::new(&ctx)?;
-            run_push(base.json, &ctx, &client, project.as_deref(), push).await
+            let client = ApiClient::new(&base, &ctx)?;
+            run_push(&base, base.json, &ctx, &client, project.as_deref(), push).await
         }
         SyncCommand::Status(status) => run_status(base.json, status),
     }
@@ -1569,6 +1569,7 @@ async fn process_trace_chunk(
 }
 
 async fn run_push(
+    base: &BaseArgs,
     json_output: bool,
     ctx: &LoginContext,
     client: &ApiClient,
@@ -1697,6 +1698,7 @@ async fn run_push(
     });
 
     let uploader_template = Logs3BatchUploader::new(
+        &base,
         ctx.api_url.clone(),
         ctx.login.api_key.clone(),
         (!ctx.login.org_name.trim().is_empty()).then_some(ctx.login.org_name.clone()),

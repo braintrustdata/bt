@@ -109,7 +109,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     };
 
     let ctx = login(&login_base).await?;
-    let client = ApiClient::new(&ctx)?;
+    let client = ApiClient::new(&login_base, &ctx)?;
     let org_name = client.org_name().to_string();
 
     let project = match resolved_project {
@@ -263,6 +263,7 @@ mod tests {
             no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }

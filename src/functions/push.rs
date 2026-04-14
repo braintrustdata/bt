@@ -599,6 +599,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
 
         let source_path = PathBuf::from(&file.source_file);
         let file_result = push_file(
+            &base,
             &auth_ctx,
             default_project_id.as_deref(),
             &manifest.runtime_context,
@@ -727,6 +728,7 @@ fn build_code_function_data(
 
 #[allow(clippy::too_many_arguments)]
 async fn push_file(
+    base: &BaseArgs,
     auth_ctx: &super::AuthContext,
     default_project_id: Option<&str>,
     runtime_context: &RuntimeContext,
@@ -810,7 +812,7 @@ async fn push_file(
             message: format!("{err:#}"),
         })?;
 
-        api::upload_bundle(&slot.url, upload_bytes, content_encoding)
+        api::upload_bundle(base, &slot.url, upload_bytes, content_encoding)
             .await
             .map_err(|err| FileFailure {
                 reason: HardFailureReason::BundleUploadFailed,
@@ -3443,6 +3445,7 @@ mod tests {
             no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }

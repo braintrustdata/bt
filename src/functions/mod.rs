@@ -464,7 +464,7 @@ pub(crate) struct ResolvedContext {
 
 pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext> {
     let ctx = login(base).await?;
-    let client = ApiClient::new(&ctx)?;
+    let client = ApiClient::new(base, &ctx)?;
     Ok(AuthContext {
         client,
         app_url: ctx.app_url,

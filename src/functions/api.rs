@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
+use crate::args::BaseArgs;
 use crate::http::ApiClient;
 
 fn escape_sql(s: &str) -> String {
@@ -210,11 +211,12 @@ pub async fn request_code_upload_slot(
 }
 
 pub async fn upload_bundle(
+    base: &BaseArgs,
     url: &str,
     bundle_bytes: Vec<u8>,
     content_encoding: Option<&str>,
 ) -> Result<()> {
-    crate::http::put_signed_url(url, bundle_bytes, content_encoding)
+    crate::http::put_signed_url(base, url, bundle_bytes, content_encoding)
         .await
         .context("failed to upload code bundle to signed URL")
 }

@@ -66,6 +66,16 @@ pub struct BaseArgs {
     )]
     pub app_url: Option<String>,
 
+    /// PEM CA bundle used for bt HTTPS requests
+    #[arg(
+        long = "ca-cert",
+        env = "BRAINTRUST_CA_CERT",
+        hide_env_values = true,
+        global = true,
+        value_name = "PATH"
+    )]
+    pub ca_cert: Option<PathBuf>,
+
     /// Path to a .env file to load before running commands.
     #[arg(
         long,

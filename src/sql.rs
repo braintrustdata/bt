@@ -80,7 +80,7 @@ struct RealtimeState {
 
 pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let ctx = login(&base).await?;
-    let client = ApiClient::new(&ctx)?;
+    let client = ApiClient::new(&base, &ctx)?;
     let interactive = !base.json && crate::ui::is_interactive() && !args.non_interactive;
     let query = read_non_interactive_query(&args.query, interactive)?;
 

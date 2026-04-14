@@ -14,6 +14,7 @@ mod functions;
 mod http;
 mod init;
 mod js_runner;
+mod logs3_uploader;
 mod projects;
 mod prompts;
 mod python_runner;
@@ -76,7 +77,8 @@ Additional
   setup        Configure Braintrust setup flows
   status       Show current org and project context
 
-Flags
+Common Flags
+Pass these after the command, for example `bt status --ca-cert /path/to/ca.pem`.
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
   -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
@@ -86,6 +88,7 @@ Flags
       --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
+      --ca-cert <PATH>       PEM CA bundle [env: BRAINTRUST_CA_CERT or SSL_CERT_FILE]
       --env-file <PATH>      Path to a .env file to load
   -h, --help                 Print help
   -V, --version              Print version
@@ -227,7 +230,7 @@ async fn try_main() -> Result<()> {
         Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
         Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
         Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
-        Commands::SelfCommand(cmd) => self_update::run(cmd.args).await?,
+        Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
         Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
         Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
     }
@@ -343,7 +346,25 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
 
 fn print_error(err: &anyhow::Error, code: ExitCode) {
     eprintln!("error: {err}");
+    let mut causes = err.chain().skip(1).peekable();
+    if causes.peek().is_some() {
+        eprintln!("caused by:");
+        for cause in causes {
+            eprintln!("  - {cause}");
+        }
+    }
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HELP_TEMPLATE;
+
+    #[test]
+    fn help_template_mentions_ca_cert_and_flag_placement() {
+        assert!(HELP_TEMPLATE.contains("--ca-cert <PATH>"));
+        assert!(HELP_TEMPLATE.contains("Pass these after the command"));
     }
 }
