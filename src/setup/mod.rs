@@ -234,11 +234,6 @@ struct InstrumentSetupArgs {
     /// Grant the agent full permissions (bypass permission prompts)
     #[arg(long)]
     yolo: bool,
-
-    /// Set up skills and write the task file but do not launch the agent.
-    #[arg(skip)]
-    #[allow(dead_code)]
-    skip_launch: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -453,7 +448,6 @@ pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             let wizard_flags = WizardFlags {
-                interactive: args.interactive,
                 yolo: args.agents.yolo,
                 skills: args.skills,
                 no_skills: args.no_skills,
@@ -481,9 +475,7 @@ pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()
 
 pub use docs::run_docs_top;
 
-#[allow(dead_code)]
 struct WizardFlags {
-    interactive: bool,
     yolo: bool,
     skills: bool,
     no_skills: bool,
@@ -503,7 +495,6 @@ struct WizardFlags {
 
 async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> {
     let WizardFlags {
-        interactive: _,
         yolo,
         skills: flag_skills,
         no_skills: flag_no_skills,
@@ -605,11 +596,12 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
         let choices = ["Skills", "MCP"];
         let defaults = [true, false];
+        let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
         let selected = MultiSelect::with_theme(&ColorfulTheme::default())
             .with_prompt("What would you like to set up?")
             .items(&choices)
             .defaults(&defaults)
-            .interact()?;
+            .interact_on(&term)?;
         (selected.contains(&0), selected.contains(&1))
     };
 
@@ -729,10 +721,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             }
             true
         } else {
+            let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
             Confirm::with_theme(&ColorfulTheme::default())
                 .with_prompt("Run instrumentation agent to set up tracing in this repo?")
                 .default(true)
-                .interact()?
+                .interact_on(&term)?
         };
         if instrument {
             let instrument_agent = setup_context
@@ -760,7 +753,6 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     tui: flag_tui,
                     background: flag_background,
                     yolo,
-                    skip_launch: false,
                 },
                 !multiselect_hint_shown,
             )
@@ -804,7 +796,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         args.agents.agent,
         &detected,
         "Select coding agent",
-        ui::is_interactive(),
+        ui::can_prompt(),
     )?;
 
     if args.skills || !args.no_skills {
@@ -853,7 +845,6 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                     tui: args.tui,
                     background: args.background,
                     yolo: args.agents.yolo,
-                    skip_launch: false,
                 },
                 false,
             )
@@ -943,7 +934,7 @@ async fn ensure_auth(
             && !base.json
             && !base.no_input
             && !in_ci()
-            && ui::is_interactive();
+            && ui::can_prompt();
         let profile_name =
             resolve_profile_name_for_setup(base, &profiles, should_prompt_for_profile_choice)?;
         base.profile = Some(profile_name.clone());
@@ -1093,7 +1084,7 @@ async fn select_project_for_setup(
     .await?;
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
-    if !ui::is_interactive() {
+    if !ui::can_prompt() {
         bail!(
             "project choice required in non-interactive mode; pass --project <NAME> or set BRAINTRUST_DEFAULT_PROJECT"
         );
@@ -1108,7 +1099,9 @@ async fn select_project_for_setup(
         let name: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Project name")
             .default(default_name)
-            .interact_text()?;
+            .interact_text_on(
+                &ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?,
+            )?;
         let trimmed = name.trim();
         if trimmed.is_empty() {
             bail!("project name cannot be empty");
@@ -1185,7 +1178,9 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
         let update = Confirm::new()
             .with_prompt(format!("Update .bt/config.json to {org}/{}?", project.name))
             .default(true)
-            .interact()?;
+            .interact_on(
+                &ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?,
+            )?;
         if !update {
             return Ok(false);
         }
@@ -1382,7 +1377,7 @@ async fn run_instrument_setup(
         args.agent.map(map_instrument_agent_arg_to_agent_arg),
         &detected,
         "Select agent to instrument this repo",
-        ui::is_interactive() && !args.yes,
+        ui::can_prompt() && !args.yes,
     )?;
 
     if args.agent.is_some() && base.verbose {
@@ -1456,19 +1451,9 @@ async fn run_instrument_setup(
     }
 
     // Determine run mode: interactive TUI vs background (autonomous).
-    // --yolo:       background, full bypassPermissions (no restrictions)
-    // --tui:        interactive TUI
-    // --background: background, restricted to language package managers
-    // Otherwise: default to interactive TUI when supported.
-    let requested_interactive = if args.tui {
-        (true, false)
-    } else if args.yolo {
-        (false, true)
-    } else if args.background || !ui::is_interactive() {
-        (false, false)
-    } else {
-        (true, false)
-    };
+    // Use prompt availability rather than stdin TTY state so `/dev/tty`
+    // fallbacks still allow TUI launch when bt is invoked via a shell script.
+    let requested_interactive = resolve_instrument_run_mode(&args, ui::can_prompt());
     let (mut run_interactive, bypass_permissions) = requested_interactive;
     if run_interactive && matches!(selected, Agent::Opencode) {
         run_interactive = false;
@@ -1595,31 +1580,6 @@ fn resolve_instrument_workflow_selection(
     Ok(resolve_workflow_selection(&[]))
 }
 
-#[allow(dead_code)]
-fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
-    let choices = ["observe", "annotate", "evaluate", "deploy"];
-    let defaults = [true, false, true, false];
-    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select additional workflow docs to prefetch (instrument is always included)")
-        .items(&choices)
-        .defaults(&defaults)
-        .interact_opt()?;
-    Ok(selected.map(|indexes| {
-        let mut workflows = vec![WorkflowArg::Instrument];
-        for index in indexes {
-            match index {
-                0 => workflows.push(WorkflowArg::Observe),
-                1 => workflows.push(WorkflowArg::Annotate),
-                2 => workflows.push(WorkflowArg::Evaluate),
-                3 => workflows.push(WorkflowArg::Deploy),
-                _ => {}
-            }
-        }
-        workflows
-    }))
-}
-
-#[allow(dead_code)]
 fn detect_languages_from_dir(dir: &std::path::Path) -> Vec<LanguageArg> {
     // (indicator filename suffix, language)
     let indicators: &[(&str, LanguageArg)] = &[
@@ -1683,61 +1643,6 @@ fn detect_languages_from_dir(dir: &std::path::Path) -> Vec<LanguageArg> {
     }
 
     found.into_iter().collect()
-}
-
-#[allow(dead_code)]
-fn prompt_instrument_language_selection(
-    detected: &[LanguageArg],
-) -> Result<Option<Vec<LanguageArg>>> {
-    // Index 0 = "All / auto-detect".  Indices 1-6 map to specific languages.
-    let choices = [
-        "All languages (auto-detect)",
-        "Python",
-        "TypeScript / JavaScript",
-        "Go",
-        "Java",
-        "Ruby",
-        "C#",
-    ];
-    // Map detected languages to their choice indices (1-based)
-    let lang_to_idx = |lang: LanguageArg| match lang {
-        LanguageArg::Python => 1usize,
-        LanguageArg::TypeScript => 2,
-        LanguageArg::Go => 3,
-        LanguageArg::Java => 4,
-        LanguageArg::Ruby => 5,
-        LanguageArg::CSharp => 6,
-    };
-    let defaults = if detected.len() != 1 {
-        // Zero or multiple detected → pre-select "All languages (auto-detect)"
-        [true, false, false, false, false, false, false]
-    } else {
-        let mut d = [false; 7];
-        d[lang_to_idx(detected[0])] = true;
-        d
-    };
-    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Which language(s) to instrument?")
-        .items(&choices)
-        .defaults(&defaults)
-        .interact_opt()?;
-    Ok(selected.map(|indices| {
-        if indices.is_empty() || indices.contains(&0) {
-            return Vec::new(); // auto-detect
-        }
-        indices
-            .iter()
-            .filter_map(|&i| match i {
-                1 => Some(LanguageArg::Python),
-                2 => Some(LanguageArg::TypeScript),
-                3 => Some(LanguageArg::Go),
-                4 => Some(LanguageArg::Java),
-                5 => Some(LanguageArg::Ruby),
-                6 => Some(LanguageArg::CSharp),
-                _ => None,
-            })
-            .collect()
-    }))
 }
 
 fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
@@ -1832,27 +1737,6 @@ async fn prefetch_workflow_docs(
     }
 
     Ok(())
-}
-
-#[allow(dead_code)]
-fn prompt_instrument_agent(default_agent: Agent) -> Result<Agent> {
-    let choices = ALL_AGENTS
-        .iter()
-        .map(|agent| agent.as_str())
-        .collect::<Vec<_>>();
-    let default_index = ALL_AGENTS
-        .iter()
-        .position(|agent| *agent == default_agent)
-        .unwrap_or(0);
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agent to instrument this repo")
-        .items(&choices)
-        .default(default_index)
-        .interact_opt()?;
-    let Some(index) = selection else {
-        bail!("instrument setup cancelled by user");
-    };
-    Ok(ALL_AGENTS[index])
 }
 
 /// Returns the package-manager command names allowed in background (non-yolo) mode.
@@ -2107,6 +1991,12 @@ async fn run_agent_invocation(
 
             if *interactive {
                 // Inherit all streams so the user can interact with the agent directly.
+                #[cfg(unix)]
+                if !ui::is_interactive() {
+                    if let Ok(tty) = fs::File::open("/dev/tty") {
+                        command.stdin(Stdio::from(tty));
+                    }
+                }
                 return command
                     .status()
                     .await
@@ -2134,6 +2024,16 @@ async fn run_agent_invocation(
                     .with_context(|| format!("failed to run agent command in {}", root.display()))
             }
         }
+    }
+}
+
+fn resolve_instrument_run_mode(args: &InstrumentSetupArgs, prompt_available: bool) -> (bool, bool) {
+    if args.tui {
+        (true, args.yolo)
+    } else if args.background || !prompt_available {
+        (false, args.yolo)
+    } else {
+        (true, args.yolo)
     }
 }
 
@@ -2295,7 +2195,7 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
 
 fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
-    let interactive = ui::is_interactive() && !args.yes;
+    let interactive = ui::can_prompt() && !args.yes;
     let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_workflow {
         Some(Vec::new())
     } else {
@@ -2390,7 +2290,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
 
 fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
-    let interactive = ui::is_interactive() && !args.yes;
+    let interactive = ui::can_prompt() && !args.yes;
 
     if interactive {
         #[derive(Clone, Copy)]
@@ -2616,11 +2516,12 @@ fn resolve_local_root_for_scope(scope: InstallScope) -> Result<Option<PathBuf>> 
 
 fn prompt_scope_selection(prompt: &str) -> Result<Option<InstallScope>> {
     let choices = ["local (current git repo)", "global (user-wide)"];
+    let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
     let idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&choices)
         .default(1)
-        .interact_opt()?;
+        .interact_on_opt(&term)?;
     Ok(idx.map(|i| {
         if i == 0 {
             InstallScope::Local
@@ -2639,11 +2540,12 @@ fn prompt_agent_selection(prompt: &str, default: Agent) -> Result<Option<Agent>>
         .iter()
         .position(|agent| *agent == default)
         .unwrap_or(0);
+    let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
     let selected = FuzzySelect::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&labels)
         .default(default_index)
-        .interact_opt()?;
+        .interact_on_opt(&term)?;
     Ok(selected.map(|index| ALL_AGENTS[index]))
 }
 
@@ -2658,13 +2560,14 @@ fn prompt_workflows_selection(defaults: &[WorkflowArg]) -> Result<Option<Vec<Wor
         .map(|workflow| default_set.contains(workflow))
         .collect::<Vec<_>>();
 
+    let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt(
             "Select the workflows you are interested in (will prefetch docs for them) (Esc: back)",
         )
         .items(&labels)
         .defaults(&default_flags)
-        .interact_opt()?;
+        .interact_on_opt(&term)?;
 
     Ok(selected.map(|indexes| {
         indexes
@@ -2691,7 +2594,7 @@ fn resolve_scope_from_flags(
         return Ok(resolve_yes_scope(yes_scope_default));
     }
 
-    if !ui::is_interactive() {
+    if !ui::can_prompt() {
         bail!("scope required in non-interactive mode: pass --local or --global");
     }
 
@@ -2730,16 +2633,6 @@ fn resolve_default_agent_selection(
     }
 
     bail!("multiple coding agents available; pass --agent <AGENT> or re-run in an interactive terminal");
-}
-
-#[allow(dead_code)]
-fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
-    match agent {
-        InstrumentAgentArg::Claude => Agent::Claude,
-        InstrumentAgentArg::Codex => Agent::Codex,
-        InstrumentAgentArg::Cursor => Agent::Cursor,
-        InstrumentAgentArg::Opencode => Agent::Opencode,
-    }
 }
 
 fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg {
@@ -3674,7 +3567,9 @@ mod tests {
     #[test]
     fn oauth_non_instrumentation_does_not_create_api_key() {
         let base = make_base_args();
-        assert!(!should_create_api_key_for_instrumentation(true, &base, false));
+        assert!(!should_create_api_key_for_instrumentation(
+            true, &base, false
+        ));
     }
 
     #[test]
@@ -3682,7 +3577,9 @@ mod tests {
         let mut base = make_base_args();
         base.api_key = Some("env-key".to_string());
         base.api_key_source = Some(ArgValueSource::EnvVariable);
-        assert!(!should_create_api_key_for_instrumentation(true, &base, true));
+        assert!(!should_create_api_key_for_instrumentation(
+            true, &base, true
+        ));
     }
 
     #[test]
@@ -3822,7 +3719,6 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
-            skip_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -3847,7 +3743,6 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
-            skip_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -3869,12 +3764,87 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
-            skip_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
             .expect("resolve instrument workflows");
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn instrument_run_mode_prefers_tui_when_prompt_is_available() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
+    }
+
+    #[test]
+    fn instrument_run_mode_falls_back_to_background_without_prompt() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, false), (false, false));
+    }
+
+    #[test]
+    fn instrument_run_mode_keeps_tui_when_yolo_and_prompt_available() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: true,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (true, true));
+    }
+
+    #[test]
+    fn instrument_run_mode_keeps_background_when_requested_with_yolo() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: true,
+            yolo: true,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (false, true));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dialoguer::console::Term;
+
 mod pager;
 pub mod prompt_render;
 mod select;
@@ -30,6 +32,33 @@ pub fn set_animations_enabled(val: bool) {
 
 pub fn animations_enabled() -> bool {
     ANIMATIONS_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn prompt_term() -> Option<Term> {
+    if NO_INPUT.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    if std::io::stderr().is_terminal() {
+        return Some(Term::stderr());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+
+        if let Ok(tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            if let Ok(tty2) = tty.try_clone() {
+                return Some(Term::read_write_pair(tty, tty2));
+            }
+        }
+    }
+
+    None
+}
+
+pub fn can_prompt() -> bool {
+    prompt_term().is_some()
 }
 
 pub fn is_interactive() -> bool {

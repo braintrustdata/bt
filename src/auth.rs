@@ -784,10 +784,6 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
 }
 
 async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
-    if !ui::is_interactive() {
-        bail!("oauth login requires an interactive terminal");
-    }
-
     let api_url = base
         .api_url
         .clone()
@@ -860,7 +856,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
-        true,
+        ui::can_prompt(),
         args.verbose,
         true,
     )?;
@@ -958,7 +954,7 @@ pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<Strin
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
-        true,
+        ui::can_prompt(),
         false,
         false,
     )?;
@@ -1633,7 +1629,7 @@ fn select_login_org(
         }
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    println!("\n\nA Braintrust organization is usually a team or a company.");
+    eprintln!("\n\nA Braintrust organization is usually a team or a company.");
     let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
     if allow_cross_org && selection == 0 {
         return Ok(None);
@@ -1710,6 +1706,29 @@ struct OAuthCallbackParams {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthCallbackMode {
+    ListenerOnly,
+    ListenerOrStdin,
+    PromptThenListener,
+}
+
+fn oauth_callback_mode(prefer_manual: bool) -> OAuthCallbackMode {
+    if prefer_manual {
+        if ui::can_prompt() {
+            OAuthCallbackMode::PromptThenListener
+        } else {
+            OAuthCallbackMode::ListenerOnly
+        }
+    } else if ui::is_interactive() {
+        OAuthCallbackMode::ListenerOrStdin
+    } else if ui::can_prompt() {
+        OAuthCallbackMode::PromptThenListener
+    } else {
+        OAuthCallbackMode::ListenerOnly
+    }
+}
+
 async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallbackParams> {
     let (mut stream, _) = tokio::time::timeout(OAUTH_CALLBACK_TIMEOUT, listener.accept())
         .await
@@ -1758,27 +1777,34 @@ async fn collect_oauth_callback(
     listener: TcpListener,
     prefer_manual: bool,
 ) -> Result<OAuthCallbackParams> {
-    if !prefer_manual {
-        return wait_for_oauth_callback_or_stdin(listener).await;
+    match oauth_callback_mode(prefer_manual) {
+        OAuthCallbackMode::ListenerOnly => {
+            eprintln!("Waiting for browser authorization...");
+            wait_for_oauth_callback(listener).await
+        }
+        OAuthCallbackMode::ListenerOrStdin => wait_for_oauth_callback_or_stdin(listener).await,
+        OAuthCallbackMode::PromptThenListener => {
+            let term = ui::prompt_term()
+                .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?;
+            println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
+            println!(
+                "After approving access, your browser may show a localhost connection error on remote hosts."
+            );
+            println!(
+                "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
+            );
+            let pasted = Input::<String>::new()
+                .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
+                .allow_empty(true)
+                .report(false)
+                .interact_text_on(&term)
+                .context("failed to read callback URL")?;
+            if pasted.trim().is_empty() {
+                return wait_for_oauth_callback(listener).await;
+            }
+            parse_oauth_callback_input(&pasted)
+        }
     }
-
-    println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
-    println!(
-        "After approving access, your browser may show a localhost connection error on remote hosts."
-    );
-    println!(
-        "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
-    );
-    let pasted = Input::<String>::new()
-        .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
-        .allow_empty(true)
-        .report(false)
-        .interact_text()
-        .context("failed to read callback URL")?;
-    if pasted.trim().is_empty() {
-        return wait_for_oauth_callback(listener).await;
-    }
-    parse_oauth_callback_input(&pasted)
 }
 
 async fn wait_for_oauth_callback_or_stdin(listener: TcpListener) -> Result<OAuthCallbackParams> {
@@ -3286,6 +3312,31 @@ mod tests {
             format_verification_line(&v),
             "bad — api_key — org: corp — invalid API key"
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_mode_uses_listener_only_when_input_is_disabled() {
+        let _guard = env_test_lock().lock().await;
+        ui::set_no_input(true);
+        assert_eq!(oauth_callback_mode(false), OAuthCallbackMode::ListenerOnly);
+        assert_eq!(oauth_callback_mode(true), OAuthCallbackMode::ListenerOnly);
+        ui::set_no_input(false);
+    }
+
+    #[test]
+    fn oauth_callback_mode_prefers_manual_prompt_when_interactive() {
+        ui::set_no_input(false);
+
+        if ui::is_interactive() {
+            assert_eq!(
+                oauth_callback_mode(true),
+                OAuthCallbackMode::PromptThenListener
+            );
+            assert_eq!(
+                oauth_callback_mode(false),
+                OAuthCallbackMode::ListenerOrStdin
+            );
+        }
     }
 
     #[tokio::test]

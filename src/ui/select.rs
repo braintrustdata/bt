@@ -5,9 +5,9 @@ use crate::{http::ApiClient, projects::api, ui::with_spinner};
 
 /// Fuzzy select from a list of items. Requires TTY.
 pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> Result<usize> {
-    if !super::is_interactive() {
+    let Some(term) = super::prompt_term() else {
         bail!("interactive mode requires TTY");
-    }
+    };
 
     if items.is_empty() {
         bail!("no items to select from");
@@ -20,7 +20,7 @@ pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> R
         .items(&labels)
         .default(default)
         .max_length(12)
-        .interact()?;
+        .interact_on(&term)?;
 
     Ok(selection)
 }
