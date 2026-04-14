@@ -5,6 +5,7 @@ use crate::{args::BaseArgs, projects::context::resolve_project_context};
 
 pub(crate) mod api;
 mod open;
+mod poke;
 mod status;
 
 pub(crate) type ResolvedContext = crate::projects::context::ProjectContext;
@@ -16,6 +17,7 @@ Examples:
   bt topics status
   bt topics status --full
   bt topics status --watch
+  bt topics poke
   bt topics open
 ")]
 pub struct TopicsArgs {
@@ -27,6 +29,8 @@ pub struct TopicsArgs {
 enum TopicsCommands {
     /// Show Topics automation status for the active project
     Status(StatusArgs),
+    /// Queue Topics to run on the next executor pass
+    Poke,
     /// Open the Topics page in the browser
     Open,
 }
@@ -43,7 +47,11 @@ struct StatusArgs {
 }
 
 pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
-    let ctx = resolve_project_context(&base, true).await?;
+    let read_only = matches!(
+        args.command.as_ref(),
+        None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open)
+    );
+    let ctx = resolve_project_context(&base, read_only).await?;
 
     match args.command {
         None => {
@@ -60,6 +68,7 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         Some(TopicsCommands::Status(status_args)) => {
             status::run(&ctx, status_args, base.json).await
         }
+        Some(TopicsCommands::Poke) => poke::run(&ctx, base.json).await,
         Some(TopicsCommands::Open) => open::run(&ctx).await,
     }
 }
@@ -114,5 +123,11 @@ mod tests {
 
         let parsed = parse(&["topics", "open"]).expect("parse");
         assert!(topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
+    fn topics_poke_uses_validated_auth() {
+        let parsed = parse(&["topics", "poke"]).expect("parse");
+        assert!(!topics_command_is_read_only(parsed.command.as_ref()));
     }
 }

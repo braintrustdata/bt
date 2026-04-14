@@ -60,7 +60,7 @@ Core
 
 Projects & resources
   projects     Manage projects
-  topics       Inspect Topics automation status
+  topics       Inspect and control Topics automation
   prompts      Manage prompts
   functions    Manage functions (tools, scorers, and more)
   tools        Manage tools
@@ -131,7 +131,7 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
-    /// Inspect Topics automation status
+    /// Inspect and control Topics automation
     Topics(CLIArgs<topics::TopicsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),

@@ -1,7 +1,7 @@
 # `bt topics` CLI Spec
 
 Status: draft
-Last updated: 2026-04-13
+Last updated: 2026-04-14
 
 ## Background
 
@@ -24,7 +24,7 @@ implementation-shaped for the public `bt` CLI.
 For `bt`, the first Topics release should be narrower:
 
 - project-scoped
-- read-only
+- mostly read-only, with a narrow "poke" action
 - state-machine-first
 - consistent with existing `bt` command patterns
 - no nested `topics automation ...` command tree
@@ -34,17 +34,18 @@ For `bt`, the first Topics release should be narrower:
 
 - Make it easy to inspect Topics status from the terminal.
 - Make the topic automation state machine a first-class view.
+- Allow users to nudge Topics to run immediately without exposing the full
+  automation/backfill control surface.
 - Reuse `bt`'s existing global project context instead of per-command
   `--project` flags.
 - Support both human-readable output and `--json`.
-- Avoid BTQL-heavy or write-path behavior in the initial version.
+- Avoid BTQL-heavy or broad write-path behavior in the initial version.
 
 ## Non-goals for v1
 
 - Full parity with `btapi topics ...`
-- Creating, editing, deleting, rewinding, poking, or running automations
+- Creating, editing, deleting, rewinding, or manually running automations
 - Topic generation or cluster exploration
-- Per-facet and per-topic detailed progress bars
 - Topic map diffing/version management
 
 ## Proposed Command Surface
@@ -52,6 +53,7 @@ For `bt`, the first Topics release should be narrower:
 ```text
 bt topics
 bt topics status [--watch] [--full]
+bt topics poke
 bt topics open
 ```
 
@@ -87,6 +89,11 @@ Rationale:
 - `bt topics open`
   Opens the Topics page in the browser for the active project.
 
+- `bt topics poke`
+  Marks Topics runnable now by updating the object cursor so it is ready on the
+  next executor pass. This is intentionally lighter-weight than a reset,
+  backfill, or "regenerate everything" command.
+
 ## CLI Conventions
 
 `bt topics` should follow normal `bt` conventions:
@@ -95,7 +102,9 @@ Rationale:
 - Org comes from normal `bt` auth/context resolution.
 - `--json` is supported globally.
 - `--app-url` remains the source of truth for browser links.
-- All v1 Topics commands use read-only auth/context resolution.
+- `status` and `open` use read-only auth/context resolution.
+- `poke` uses normal validated auth/context resolution because it updates the
+  object cursor.
 - `status` is the runtime/automation inspection verb.
 - `view` is intentionally left unused in v1 so it can later mean "show me the
   topics/topic map contents" rather than "show me automation status."
@@ -166,6 +175,24 @@ directly:
 - `pending_topic_classification_backfill`
 - `backfilling_topic_classifications`
 - `idle`
+
+### `bt topics poke`
+
+Behavior:
+
+- Resolve the active project using existing `bt` project-context logic.
+- Load all topic automations for the project.
+- For each topic automation, compute the object ID from its data scope and call
+  `/brainstore/automation/upsert-object-cursor`.
+- Render a short summary saying the automation is ready to run on the next
+  executor pass.
+
+Notes:
+
+- `poke` should mean "make it runnable now", not "force a full regeneration."
+- It should clear scheduler backoff in the same way the backend
+  `upsert-object-cursor` path does.
+- If there are no topic automations, print `No topic automations found.`
 
 ### `bt topics open`
 
@@ -303,15 +330,16 @@ Topics (auto_123)
     - topic maps: 2
 ```
 
-### State-machine mode
+### Expanded diagnostics
 
-The state-machine output should stay close to the backend semantics.
+In `bt topics status --full`, the expanded diagnostics should stay close to the
+backend semantics.
 
 Example:
 
 ```text
 Project: my-project
-Topic automation state machines:
+Topic automation diagnostics:
 
 Topics (auto_123)
   current state: idle
@@ -348,7 +376,7 @@ Topics (auto_123)
     |   backfilling_topic_classifications     |
     +-----------------------------------------+
                        |
-                       | pending_segments == 0
+                       | pending replay is newer than recompute snapshot
                        v
     +-----------------------------------------+
     | * idle                                  |
