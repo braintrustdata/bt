@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
 mod args;
@@ -79,7 +79,7 @@ Additional
 Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
-  -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
+      -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
       --json                 Output as JSON
   -q, --quiet                Reduce interactive UI output [env: BRAINTRUST_QUIET=]
       --no-color             Disable ANSI color output
@@ -232,7 +232,7 @@ async fn try_main() -> Result<()> {
 
     let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
-    apply_base_arg_sources(&argv, cli.command.base_mut());
+    apply_base_arg_sources(&matches, cli.command.base_mut());
     configure_output(cli.command.base());
 
     match cli.command {
@@ -260,30 +260,25 @@ async fn try_main() -> Result<()> {
     Ok(())
 }
 
-fn apply_base_arg_sources(argv: &[OsString], base: &mut BaseArgs) {
-    base.api_key_source = detect_api_key_source(argv, base);
+fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
+    base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
 }
 
-fn detect_api_key_source(argv: &[OsString], base: &BaseArgs) -> Option<ArgValueSource> {
-    // BaseArgs are flattened into subcommands, and querying the root ArgMatches for
-    // their value source can panic before the subcommand runs. Detect the source here
-    // from the CLI layer instead.
-    base.api_key.as_ref()?;
-
-    if argv.iter().skip(1).any(|arg| {
-        arg == "--api-key"
-            || arg
-                .to_str()
-                .is_some_and(|value| value.starts_with("--api-key="))
-    }) {
-        return Some(ArgValueSource::CommandLine);
+fn find_value_source(matches: &ArgMatches, id: &str) -> Option<ValueSource> {
+    match matches.try_contains_id(id) {
+        Ok(_) => matches.value_source(id),
+        Err(_) => matches
+            .subcommand()
+            .and_then(|(_, sub_matches)| find_value_source(sub_matches, id)),
     }
+}
 
-    if std::env::var_os("BRAINTRUST_API_KEY").is_some() {
-        return Some(ArgValueSource::EnvVariable);
+fn map_value_source(source: ValueSource) -> Option<ArgValueSource> {
+    match source {
+        ValueSource::CommandLine => Some(ArgValueSource::CommandLine),
+        ValueSource::EnvVariable => Some(ArgValueSource::EnvVariable),
+        _ => None,
     }
-
-    None
 }
 
 fn configure_output(base: &BaseArgs) {
@@ -300,9 +295,9 @@ fn configure_output(base: &BaseArgs) {
         ui::set_animations_enabled(false);
     }
 
-    ui::set_quiet(true);
+    ui::set_quiet(base.quiet);
     ui::set_no_input(base.no_input);
-    ui::set_animations_enabled(false);
+    ui::set_animations_enabled(!term_is_dumb && !base.quiet);
 
     if disable_color {
         dialoguer::console::set_colors_enabled(false);
@@ -397,58 +392,58 @@ fn print_error(err: &anyhow::Error, code: ExitCode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
 
-    fn test_base_args(api_key: Option<&str>) -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            quiet: false,
-            no_color: false,
-            no_input: false,
-            profile: None,
-            org_name: None,
-            project: None,
-            api_key: api_key.map(str::to_string),
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            env_file: None,
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env_var(key: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
         }
     }
 
     #[test]
-    fn detect_api_key_source_prefers_command_line() {
-        let base = test_base_args(Some("test-key"));
-        let argv = vec![OsString::from("bt"), OsString::from("--api-key=test-key")];
+    fn apply_base_arg_sources_tracks_cli_api_key() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
+
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status", "--api-key", "secret"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
 
         assert_eq!(
-            detect_api_key_source(&argv, &base),
+            cli.command.base().api_key_source,
             Some(ArgValueSource::CommandLine)
         );
     }
 
     #[test]
-    fn detect_api_key_source_accepts_split_flag_form() {
-        let base = test_base_args(Some("test-key"));
-        let argv = vec![
-            OsString::from("bt"),
-            OsString::from("--api-key"),
-            OsString::from("test-key"),
-            OsString::from("eval"),
-        ];
+    fn apply_base_arg_sources_leaves_api_key_source_empty_when_unset() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
 
-        assert_eq!(
-            detect_api_key_source(&argv, &base),
-            Some(ArgValueSource::CommandLine)
-        );
-    }
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
 
-    #[test]
-    fn detect_api_key_source_returns_none_without_api_key() {
-        assert_eq!(
-            detect_api_key_source(&[OsString::from("bt")], &test_base_args(None)),
-            None
-        );
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
+        assert_eq!(cli.command.base().api_key_source, None);
     }
 }

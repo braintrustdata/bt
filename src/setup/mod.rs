@@ -1670,8 +1670,9 @@ fn skill_config_path(
     let root = scope_root(scope, local_root, home)?;
     let path = match agent {
         Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
-        Agent::Codex | Agent::Opencode => root.join(".agents/skills/braintrust/SKILL.md"),
-        Agent::Cursor => root.join(".cursor/rules/braintrust.mdc"),
+        Agent::Codex | Agent::Opencode | Agent::Cursor => {
+            root.join(".agents/skills/braintrust/SKILL.md")
+        }
     };
     Ok(path)
 }
@@ -2453,32 +2454,9 @@ fn doctor_agent_status(
         .collect::<Vec<_>>();
     let detected_any = !detected_signals.is_empty();
 
-    let config_path = match (agent, scope) {
-        (Agent::Claude, InstallScope::Local) => local_root
-            .map(|root| root.join(".claude/skills/braintrust/SKILL.md"))
-            .map(|p| p.display().to_string()),
-        (Agent::Claude, InstallScope::Global) => Some(
-            home.join(".claude/skills/braintrust/SKILL.md")
-                .display()
-                .to_string(),
-        ),
-        (Agent::Codex, InstallScope::Local) | (Agent::Opencode, InstallScope::Local) => local_root
-            .map(|root| root.join(".agents/skills/braintrust/SKILL.md"))
-            .map(|p| p.display().to_string()),
-        (Agent::Codex, InstallScope::Global) | (Agent::Opencode, InstallScope::Global) => Some(
-            home.join(".agents/skills/braintrust/SKILL.md")
-                .display()
-                .to_string(),
-        ),
-        (Agent::Cursor, InstallScope::Local) => local_root
-            .map(|root| root.join(".cursor/skills/braintrust/SKILL.md"))
-            .map(|p| p.display().to_string()),
-        (Agent::Cursor, InstallScope::Global) => Some(
-            home.join(".cursor/skills/braintrust/SKILL.md")
-                .display()
-                .to_string(),
-        ),
-    };
+    let config_path = skill_config_path(agent, scope, local_root, home)
+        .ok()
+        .map(|path| path.display().to_string());
 
     let configured = config_path
         .as_deref()
@@ -3432,7 +3410,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
     #[test]
     fn single_path_agent_is_selected_by_default() {
         let detected = vec![DetectionSignal {
@@ -4038,7 +4015,14 @@ mod tests {
         let home = std::env::temp_dir();
         let status = doctor_agent_status(Agent::Cursor, InstallScope::Global, None, &home, &[]);
         assert!(!status.configured);
-        assert!(status.config_path.is_some());
+        assert_eq!(
+            status.config_path,
+            Some(
+                home.join(".agents/skills/braintrust/SKILL.md")
+                    .display()
+                    .to_string()
+            )
+        );
         assert!(status.notes.is_empty());
     }
 
