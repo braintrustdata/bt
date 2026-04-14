@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -527,7 +528,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(1, "Auth");
     }
     let project_flag = base.project.clone();
-    let client = ensure_setup_auth(&mut base, !flag_no_instrument).await?;
+    let client = ensure_setup_auth(&mut base, !flag_no_instrument, !flag_no_instrument).await?;
     let org = client.org_name().to_string();
 
     if verbose {
@@ -785,7 +786,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     let needs_auth = !args.no_instrument;
     if needs_auth {
         let project_flag = base.project.clone();
-        let client = ensure_setup_auth(&mut base, false).await?;
+        let client = ensure_setup_auth(&mut base, false, true).await?;
         let org = client.org_name().to_string();
         let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
@@ -924,13 +925,16 @@ fn resolve_profile_name_for_setup(
     }
 }
 
-async fn ensure_auth(base: &mut BaseArgs, prompt_for_profile_choice: bool) -> Result<LoginContext> {
+async fn ensure_auth(
+    base: &mut BaseArgs,
+    prompt_for_profile_choice: bool,
+) -> Result<(LoginContext, bool)> {
     if matches!(base.api_key_source, Some(ArgValueSource::CommandLine)) {
-        return auth::login(base).await;
+        return Ok((auth::login(base).await?, false));
     }
 
     if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) && !base.prefer_profile {
-        return auth::login(base).await;
+        return Ok((auth::login(base).await?, false));
     }
 
     let profiles = auth::list_profiles()?;
@@ -945,7 +949,10 @@ async fn ensure_auth(base: &mut BaseArgs, prompt_for_profile_choice: bool) -> Re
         base.profile = Some(profile_name.clone());
 
         match auth::login(base).await {
-            Ok(ctx) => return Ok(ctx),
+            Ok(ctx) => {
+                let is_oauth = auth::resolve_auth(base).await?.is_oauth;
+                return Ok((ctx, is_oauth));
+            }
             Err(err) if auth::is_missing_credential_error(&err) => {
                 if base.verbose {
                     eprintln!(
@@ -954,7 +961,7 @@ async fn ensure_auth(base: &mut BaseArgs, prompt_for_profile_choice: bool) -> Re
                     );
                 }
                 auth::login_interactive_oauth(base).await?;
-                return auth::login(base).await;
+                return Ok((auth::login(base).await?, true));
             }
             Err(err) => return Err(err),
         }
@@ -964,15 +971,99 @@ async fn ensure_auth(base: &mut BaseArgs, prompt_for_profile_choice: bool) -> Re
         eprintln!("No auth profiles found. Starting OAuth login.\n");
     }
     auth::login_interactive_oauth(base).await?;
-    auth::login(base).await
+    Ok((auth::login(base).await?, true))
 }
 
 async fn ensure_setup_auth(
     base: &mut BaseArgs,
     prompt_for_profile_choice: bool,
+    will_instrument: bool,
 ) -> Result<ApiClient> {
-    let login_ctx = ensure_auth(base, prompt_for_profile_choice).await?;
-    ApiClient::new(&login_ctx)
+    let (login_ctx, is_oauth) = ensure_auth(base, prompt_for_profile_choice).await?;
+    let client = ApiClient::new(&login_ctx)?;
+    if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
+        maybe_create_api_key_for_instrumentation(base, &client).await?;
+    }
+    Ok(client)
+}
+
+fn should_create_api_key_for_instrumentation(
+    is_oauth: bool,
+    base: &BaseArgs,
+    will_instrument: bool,
+) -> bool {
+    will_instrument
+        && is_oauth
+        && !matches!(
+            base.api_key_source,
+            Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
+        )
+}
+
+async fn maybe_create_api_key_for_instrumentation(
+    base: &BaseArgs,
+    client: &ApiClient,
+) -> Result<()> {
+    let username = std::process::Command::new("whoami")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "user".to_string());
+    let base_name = format!("{username}-created-by-bt-setup");
+
+    #[derive(serde::Deserialize)]
+    struct ApiKeyEntry {
+        name: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ApiKeyList {
+        objects: Vec<ApiKeyEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct CreatedKey {
+        key: String,
+    }
+
+    let existing: Vec<String> = client
+        .get::<ApiKeyList>("/v1/api_key")
+        .await
+        .map(|r| r.objects.into_iter().map(|k| k.name).collect())
+        .unwrap_or_default();
+
+    let name = if !existing.iter().any(|n| n == &base_name) {
+        base_name
+    } else {
+        (1u32..)
+            .map(|i| format!("{base_name}{i}"))
+            .find(|candidate| !existing.iter().any(|n| n == candidate))
+            .expect("name sequence is infinite")
+    };
+
+    let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
+    let created: CreatedKey = client.post("/v1/api_key", &body).await?;
+    std::env::set_var("BRAINTRUST_API_KEY", &created.key);
+
+    if !base.quiet && std::io::stderr().is_terminal() {
+        eprintln!();
+        eprintln!(
+            "{} Created Braintrust API key '{}' for instrumentation and exported it to this setup process:",
+            style("!").yellow().bold(),
+            name,
+        );
+        eprintln!();
+        eprintln!("   {}", style(&created.key).bold());
+        eprintln!();
+        eprintln!("   To reuse it later in your shell, run:");
+        eprintln!(
+            "   {}",
+            style(format!("export BRAINTRUST_API_KEY={}", created.key)).dim()
+        );
+        eprintln!();
+    }
+
+    Ok(())
 }
 
 async fn select_project_for_setup(
@@ -3572,6 +3663,26 @@ mod tests {
         let resolved =
             resolve_profile_name_for_setup(&base, &profiles, false).expect("resolve profile");
         assert_eq!(resolved, "alpha");
+    }
+
+    #[test]
+    fn oauth_instrumentation_creates_api_key_when_no_env_key_exists() {
+        let base = make_base_args();
+        assert!(should_create_api_key_for_instrumentation(true, &base, true));
+    }
+
+    #[test]
+    fn oauth_non_instrumentation_does_not_create_api_key() {
+        let base = make_base_args();
+        assert!(!should_create_api_key_for_instrumentation(true, &base, false));
+    }
+
+    #[test]
+    fn oauth_instrumentation_skips_api_key_creation_when_env_key_exists() {
+        let mut base = make_base_args();
+        base.api_key = Some("env-key".to_string());
+        base.api_key_source = Some(ArgValueSource::EnvVariable);
+        assert!(!should_create_api_key_for_instrumentation(true, &base, true));
     }
 
     #[test]
