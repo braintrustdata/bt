@@ -2731,89 +2731,6 @@ fn detect_runnable_agents() -> Vec<Agent> {
 fn detect_agents() -> Vec<DetectionSignal> {
     let mut by_agent: BTreeMap<Agent, BTreeSet<(bool, String)>> = BTreeMap::new();
 
-    if let Some(root) = find_git_root() {
-        if root.join(".claude").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Claude,
-                false,
-                ".claude exists in repo root",
-            );
-        }
-        if root.join(".cursor").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Cursor,
-                false,
-                ".cursor exists in repo root",
-            );
-        }
-        if root.join(".opencode").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                ".opencode exists in repo root",
-            );
-        }
-        if root.join(".agents").exists() || root.join(".agents/skills").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Codex,
-                false,
-                ".agents/skills exists in repo root",
-            );
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                ".agents/skills exists in repo root",
-            );
-        }
-        if root.join("AGENTS.md").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Codex,
-                false,
-                "AGENTS.md exists in repo root",
-            );
-        }
-    }
-
-    if let Some(home) = home_dir() {
-        if home.join(".claude").exists() {
-            add_signal(&mut by_agent, Agent::Claude, false, "~/.claude exists");
-        }
-        if home.join(".cursor").exists() {
-            add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
-        }
-        if home.join(".codex").exists() {
-            add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
-        }
-        if home.join(".agents/skills").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Codex,
-                false,
-                "~/.agents/skills exists",
-            );
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                "~/.agents/skills exists",
-            );
-        }
-        if home.join(".opencode").exists() || home.join(".config/opencode").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                "opencode config directory exists",
-            );
-        }
-    }
-
     if command_exists("claude") {
         add_signal(
             &mut by_agent,
@@ -4287,5 +4204,27 @@ mod tests {
         let resolved = resolve_default_agent_selection(None, &detected, "ignored", true)
             .expect("resolve default agent selection");
         assert_eq!(resolved, Agent::Codex);
+    }
+
+    #[test]
+    fn detect_agents_reports_only_path_signals() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-detect-agents-{unique}"));
+        fs::create_dir_all(root.join(".claude")).expect("create repo heuristic");
+        fs::create_dir_all(root.join(".agents/skills")).expect("create codex heuristic");
+        fs::write(root.join("AGENTS.md"), "# Agents\n").expect("write agents file");
+
+        let old = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("cd root");
+        let detected = detect_agents();
+        std::env::set_current_dir(old).expect("restore cwd");
+
+        assert!(
+            detected.iter().all(|signal| signal.on_path),
+            "detect_agents should only emit PATH-based signals"
+        );
     }
 }
