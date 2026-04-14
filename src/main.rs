@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
 mod args;
@@ -32,7 +32,7 @@ mod ui;
 mod util_cmd;
 mod utils;
 
-use crate::args::{BaseArgs, CLIArgs};
+use crate::args::{ArgValueSource, BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -81,11 +81,10 @@ Additional
 Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
-  -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
-  -q, --quiet                Suppress non-essential output
+      -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
       --json                 Output as JSON
+  -q, --quiet                Reduce interactive UI output [env: BRAINTRUST_QUIET=]
       --no-color             Disable ANSI color output
-      --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
       --env-file <PATH>      Path to a .env file to load
@@ -237,7 +236,9 @@ async fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
-    let cli = Cli::parse_from(argv);
+    let matches = Cli::command().get_matches_from(&argv);
+    let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
+    apply_base_arg_sources(&matches, cli.command.base_mut());
     configure_output(cli.command.base());
 
     match cli.command {
@@ -266,6 +267,27 @@ async fn try_main() -> Result<()> {
     Ok(())
 }
 
+fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
+    base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
+}
+
+fn find_value_source(matches: &ArgMatches, id: &str) -> Option<ValueSource> {
+    match matches.try_contains_id(id) {
+        Ok(_) => matches.value_source(id),
+        Err(_) => matches
+            .subcommand()
+            .and_then(|(_, sub_matches)| find_value_source(sub_matches, id)),
+    }
+}
+
+fn map_value_source(source: ValueSource) -> Option<ArgValueSource> {
+    match source {
+        ValueSource::CommandLine => Some(ArgValueSource::CommandLine),
+        ValueSource::EnvVariable => Some(ArgValueSource::EnvVariable),
+        _ => None,
+    }
+}
+
 fn configure_output(base: &BaseArgs) {
     let mut disable_color = base.no_color || std::env::var_os("NO_COLOR").is_some();
 
@@ -280,14 +302,9 @@ fn configure_output(base: &BaseArgs) {
         ui::set_animations_enabled(false);
     }
 
-    if base.quiet {
-        ui::set_quiet(true);
-        ui::set_animations_enabled(false);
-    }
-
-    if base.no_input {
-        ui::set_no_input(true);
-    }
+    ui::set_quiet(base.quiet);
+    ui::set_no_input(base.no_input);
+    ui::set_animations_enabled(!term_is_dumb && !base.quiet);
 
     if disable_color {
         dialoguer::console::set_colors_enabled(false);
@@ -376,5 +393,64 @@ fn print_error(err: &anyhow::Error, code: ExitCode) {
     eprintln!("error: {err}");
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env_var(key: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn apply_base_arg_sources_tracks_cli_api_key() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
+
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status", "--api-key", "secret"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
+        assert_eq!(
+            cli.command.base().api_key_source,
+            Some(ArgValueSource::CommandLine)
+        );
+    }
+
+    #[test]
+    fn apply_base_arg_sources_leaves_api_key_source_empty_when_unset() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
+
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
+        assert_eq!(cli.command.base().api_key_source, None);
     }
 }

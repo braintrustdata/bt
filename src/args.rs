@@ -4,19 +4,33 @@ use clap::Args;
 
 pub use braintrust_sdk_rust::{DEFAULT_API_URL, DEFAULT_APP_URL};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgValueSource {
+    CommandLine,
+    EnvVariable,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct BaseArgs {
     /// Output as JSON
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Suppress non-essential output
+    /// Verbose mode — set at runtime by subcommands that support it
+    #[arg(skip)]
+    pub verbose: bool,
+
+    /// Reduce interactive UI output
     #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub quiet: bool,
 
     /// Disable ANSI color output
     #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub no_color: bool,
+
+    /// Disable all interactive prompts
+    #[arg(long, env = "BRAINTRUST_NO_INPUT", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
+    pub no_input: bool,
 
     /// Use a saved login profile (or via BRAINTRUST_PROFILE)
     #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
@@ -40,13 +54,12 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true, hide = true)]
     pub api_key: Option<String>,
 
+    #[arg(skip)]
+    pub api_key_source: Option<ArgValueSource>,
+
     /// Prefer profile credentials even if BRAINTRUST_API_KEY/--api-key is set.
     #[arg(long, global = true)]
     pub prefer_profile: bool,
-
-    /// Disable all interactive prompts
-    #[arg(long, global = true)]
-    pub no_input: bool,
 
     /// Override API URL (or via BRAINTRUST_API_URL)
     #[arg(

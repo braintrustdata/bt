@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,6 +12,53 @@ use std::time::{Duration, Instant};
 struct SseEvent {
     event: String,
     data: String,
+}
+
+fn find_header_terminator(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn parse_content_length(headers: &str) -> usize {
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("content-length") {
+                return None;
+            }
+            value.trim().parse::<usize>().ok()
+        })
+        .unwrap_or(0)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut expected_len: Option<usize> = None;
+
+    loop {
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..n]);
+
+        if expected_len.is_none() {
+            let header_end = find_header_terminator(&request)?;
+            let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+            let content_length = parse_content_length(headers);
+            expected_len = Some(header_end + content_length);
+        }
+
+        if request.len() >= expected_len.unwrap_or(0) {
+            break;
+        }
+    }
+
+    String::from_utf8(request).ok()
 }
 
 /// Start a minimal HTTP server that always responds with a valid Braintrust
@@ -36,8 +83,7 @@ fn start_mock_auth_server() -> (u16, thread::JoinHandle<()>) {
                 Err(_) => break,
             };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
+            let _ = read_http_request(&mut stream);
             let _ = stream.write_all(http_response.as_bytes());
             let _ = stream.flush();
         }
@@ -66,12 +112,10 @@ fn start_mock_api_server() -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
                 Err(_) => break,
             };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let mut buf = vec![0u8; 262144];
-            let n = match stream.read(&mut buf) {
-                Ok(n) => n,
-                Err(_) => continue,
+            let request = match read_http_request(&mut stream) {
+                Some(request) => request,
+                None => continue,
             };
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
 
             // Extract first line to determine the method + path.
             let first_line = request.lines().next().unwrap_or("");
@@ -123,10 +167,10 @@ fn parse_sse_events(body: &str) -> Vec<SseEvent> {
     let mut current_data = Vec::<String>::new();
 
     for line in body.lines() {
-        if line.starts_with("event: ") {
-            current_event = line["event: ".len()..].to_string();
-        } else if line.starts_with("data: ") {
-            current_data.push(line["data: ".len()..].to_string());
+        if let Some(stripped) = line.strip_prefix("event: ") {
+            current_event = stripped.to_string();
+        } else if let Some(stripped) = line.strip_prefix("data: ") {
+            current_data.push(stripped.to_string());
         } else if line.is_empty() && !current_event.is_empty() {
             events.push(SseEvent {
                 event: std::mem::take(&mut current_event),
@@ -518,10 +562,10 @@ fn streaming_eval_post(
             Ok(l) => l,
             Err(_) => break,
         };
-        if line.starts_with("event: ") {
-            current_event = line["event: ".len()..].to_string();
-        } else if line.starts_with("data: ") {
-            current_data.push(line["data: ".len()..].to_string());
+        if let Some(stripped) = line.strip_prefix("event: ") {
+            current_event = stripped.to_string();
+        } else if let Some(stripped) = line.strip_prefix("data: ") {
+            current_data.push(stripped.to_string());
         } else if line.is_empty() && !current_event.is_empty() {
             let event = SseEvent {
                 event: std::mem::take(&mut current_event),
