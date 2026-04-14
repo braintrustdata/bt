@@ -21,6 +21,7 @@ Examples:
   bt topics status --watch
   bt topics config
   bt topics config set --topic-window 1h --generation-cadence 1d
+  bt topics config topic-map set Task --embedding-model brain-embedding-1
   bt topics poke
   bt topics rewind 7d
   bt topics open
@@ -69,6 +70,9 @@ struct ConfigArgs {
 enum ConfigCommands {
     /// Update editable Topics config fields
     Set(ConfigSetArgs),
+    /// Edit per-topic-map settings
+    #[command(name = "topic-map")]
+    TopicMap(TopicMapArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -115,6 +119,80 @@ struct ConfigSetArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct TopicMapArgs {
+    #[command(subcommand)]
+    command: TopicMapCommands,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TopicMapCommands {
+    /// Update a configured Topics topic map by name or function ID
+    Set(TopicMapSetArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct TopicMapSetArgs {
+    /// Specific automation ID to search within
+    #[arg(long = "automation-id")]
+    automation_id: Option<String>,
+
+    /// Topic map name or function ID
+    topic_map: String,
+
+    /// Human-friendly topic map name
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Human-friendly topic map description
+    #[arg(long)]
+    description: Option<String>,
+
+    /// Facet field this topic map clusters
+    #[arg(long = "source-facet")]
+    source_facet: Option<String>,
+
+    /// Embedding model used for clustering
+    #[arg(long = "embedding-model")]
+    embedding_model: Option<String>,
+
+    /// Maximum centroid distance before returning no_match
+    #[arg(long = "distance-threshold")]
+    distance_threshold: Option<f64>,
+
+    /// Clustering algorithm to use when generating topics
+    #[arg(long, value_parser = ["hdbscan", "kmeans"])]
+    algorithm: Option<String>,
+
+    /// Dimension reduction step to use before clustering
+    #[arg(long = "dimension-reduction", value_parser = ["umap", "pca", "none"])]
+    dimension_reduction: Option<String>,
+
+    /// Maximum number of rows sampled during topic-map generation
+    #[arg(long = "sample-size")]
+    sample_size: Option<u32>,
+
+    /// Number of clusters when using kmeans
+    #[arg(long = "n-clusters")]
+    n_clusters: Option<u32>,
+
+    /// Minimum cluster size when using hdbscan
+    #[arg(long = "min-cluster-size")]
+    min_cluster_size: Option<usize>,
+
+    /// Minimum samples when using hdbscan
+    #[arg(long = "min-samples")]
+    min_samples: Option<usize>,
+
+    /// Hierarchy threshold used when naming hierarchical clusters
+    #[arg(long = "hierarchy-threshold")]
+    hierarchy_threshold: Option<usize>,
+
+    /// LLM model used to name generated topics
+    #[arg(long = "naming-model")]
+    naming_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 struct RewindArgs {
     /// Specific automation ID to rewind
     #[arg(long = "automation-id")]
@@ -153,6 +231,11 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
             Some(ConfigCommands::Set(set_args)) => {
                 config::run_set(&ctx, &set_args, base.json).await
             }
+            Some(ConfigCommands::TopicMap(topic_map_args)) => match topic_map_args.command {
+                TopicMapCommands::Set(set_args) => {
+                    config::run_topic_map_set(&ctx, &set_args, base.json).await
+                }
+            },
         },
         Some(TopicsCommands::Poke) => poke::run(&ctx, base.json).await,
         Some(TopicsCommands::Rewind(rewind_args)) => {
@@ -241,6 +324,21 @@ mod tests {
     }
 
     #[test]
+    fn topics_config_topic_map_set_uses_validated_auth() {
+        let parsed = parse(&[
+            "topics",
+            "config",
+            "topic-map",
+            "set",
+            "Task",
+            "--embedding-model",
+            "brain-embedding-1",
+        ])
+        .expect("parse");
+        assert!(!topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
     fn topics_config_set_accepts_legacy_flag_aliases() {
         let parsed = parse(&[
             "topics",
@@ -275,5 +373,48 @@ mod tests {
             panic!("expected rewind command");
         };
         assert_eq!(rewind_args.topic_window.as_str(), "7d");
+    }
+
+    #[test]
+    fn topics_config_topic_map_set_parses_generation_settings() {
+        let parsed = parse(&[
+            "topics",
+            "config",
+            "topic-map",
+            "set",
+            "Task",
+            "--embedding-model",
+            "brain-embedding-1",
+            "--naming-model",
+            "brain-agent-1",
+            "--algorithm",
+            "hdbscan",
+            "--dimension-reduction",
+            "umap",
+            "--min-cluster-size",
+            "25",
+        ])
+        .expect("parse");
+
+        let Some(TopicsCommands::Config(ConfigArgs {
+            command:
+                Some(ConfigCommands::TopicMap(TopicMapArgs {
+                    command: TopicMapCommands::Set(set_args),
+                })),
+            ..
+        })) = parsed.command.as_ref()
+        else {
+            panic!("expected topic-map set command");
+        };
+
+        assert_eq!(set_args.topic_map, "Task");
+        assert_eq!(
+            set_args.embedding_model.as_deref(),
+            Some("brain-embedding-1")
+        );
+        assert_eq!(set_args.naming_model.as_deref(), Some("brain-agent-1"));
+        assert_eq!(set_args.algorithm.as_deref(), Some("hdbscan"));
+        assert_eq!(set_args.dimension_reduction.as_deref(), Some("umap"));
+        assert_eq!(set_args.min_cluster_size, Some(25));
     }
 }

@@ -72,10 +72,13 @@ fn render_report(report: &TopicsStatusReport, full: bool) -> String {
     let mut output = String::new();
     writeln!(
         output,
-        "Project: {} {} {}",
+        "Project: {} {} {}{}{}{}",
         console::style(report.project.org_name.as_str()).bold(),
         console::style("/").dim().bold(),
-        console::style(report.project.name.as_str()).bold()
+        console::style(report.project.name.as_str()).bold(),
+        console::style(" (").dim(),
+        console::style(report.project.id.as_str()).dim(),
+        console::style(")").dim()
     )
     .expect("write to string");
 
@@ -84,17 +87,16 @@ fn render_report(report: &TopicsStatusReport, full: bool) -> String {
         return output;
     }
 
-    writeln!(output, "Topic automations: {}", report.automations.len()).expect("write to string");
-
-    for automation in &report.automations {
-        write_automation_summary(&mut output, automation, full).expect("write to string");
+    if report.automations.len() > 1 {
+        writeln!(output, "Topic automations: {}", report.automations.len())
+            .expect("write to string");
     }
 
-    if full {
-        writeln!(output, "\nTopic automation state machines:").expect("write to string");
-        for automation in &report.automations {
-            write_automation_diagnostics(&mut output, automation).expect("write to string");
+    for (index, automation) in report.automations.iter().enumerate() {
+        if index > 0 {
+            writeln!(output, "\n---").expect("write to string");
         }
+        write_automation_summary(&mut output, automation, full).expect("write to string");
     }
 
     output
@@ -108,64 +110,61 @@ fn write_automation_summary(
     let progress_window = format_progress_window_label(automation);
 
     writeln!(output, "\n{} ({})", automation.name, automation.id)?;
-    writeln!(
-        output,
-        "  scope: {} | filter: {}",
-        automation.scope_type.as_deref().unwrap_or("n/a"),
-        automation.btql_filter.as_deref().unwrap_or("none")
-    )?;
-    writeln!(
-        output,
-        "  schedule: window {} | cadence {} | overlap {} | idle {}",
-        format_duration_compact(automation.window_seconds),
-        format_duration_compact(automation.rerun_seconds),
-        format_duration_compact(automation.relabel_overlap_seconds),
-        format_duration_compact(automation.idle_seconds)
-    )?;
-    writeln!(output, "  processing:")?;
-    for line in render_processing_status_lines(automation) {
-        writeln!(output, "{line}")?;
+    writeln!(output, "status: {}", format_overall_status(automation))?;
+    if let Some(next_event) = format_next_event_summary(automation) {
+        writeln!(output, "{next_event}")?;
     }
     writeln!(
         output,
-        "  coverage ({progress_window}): {} traces | {} with facet labels",
-        automation.total_traces, automation.facet_current_count
+        "coverage: {}",
+        format_coverage_summary(automation, &progress_window)
     )?;
-    if automation.total_traces == 0 {
-        writeln!(
-            output,
-            "    no traces currently fall within this topic window; older labeled traces are not shown here"
-        )?;
-    }
+    writeln!(output, "labels: {}", format_label_summary(automation))?;
+    writeln!(
+        output,
+        "facets: {}",
+        format_facet_processing_status(automation)
+    )?;
+
     if !automation.facets.is_empty() && automation.total_traces > 0 {
-        writeln!(
-            output,
-            "  facet progress in that window (matched / done / running / errors):"
-        )?;
-        for line in render_progress_lines(&automation.facets, "matched", "done") {
+        writeln!(output)?;
+        writeln!(output, "facet progress:")?;
+        for line in render_progress_lines(
+            &automation.facets,
+            &["considered", "matched", "running", "errors"],
+            |item| {
+                vec![
+                    item.checked_count.to_string(),
+                    item.matched_count.to_string(),
+                    item.processing_count.to_string(),
+                    item.error_count.to_string(),
+                ]
+            },
+        ) {
             writeln!(output, "{line}")?;
         }
     }
     if !automation.topics.is_empty() && automation.total_traces > 0 {
-        writeln!(
-            output,
-            "  topic progress in that window (eligible / labeled / running / errors):"
-        )?;
-        for line in render_progress_lines(&automation.topics, "eligible", "labeled") {
+        writeln!(output)?;
+        writeln!(output, "topic progress:")?;
+        for line in render_progress_lines(
+            &automation.topics,
+            &["considered", "labeled", "running", "errors"],
+            |item| {
+                vec![
+                    item.checked_count.to_string(),
+                    item.completed_count.to_string(),
+                    item.processing_count.to_string(),
+                    item.error_count.to_string(),
+                ]
+            },
+        ) {
             writeln!(output, "{line}")?;
         }
     }
     if full {
-        writeln!(
-            output,
-            "  facets: {}",
-            summarize_function_names(&automation.facet_functions)
-        )?;
-        writeln!(
-            output,
-            "  topic maps: {}",
-            summarize_function_names(&automation.topic_map_functions)
-        )?;
+        writeln!(output)?;
+        write_automation_diagnostics(output, automation)?;
     }
 
     Ok(())
@@ -175,34 +174,60 @@ fn write_automation_diagnostics(
     output: &mut String,
     automation: &TopicAutomationStatus,
 ) -> std::fmt::Result {
-    writeln!(output, "\n{} ({})", automation.name, automation.id)?;
-
     let Some(runtime) = automation.object_cursor.topic_runtime.as_ref() else {
-        writeln!(output, "  state machine: unavailable")?;
+        writeln!(output, "details:")?;
+        writeln!(output, "  runtime: unavailable")?;
         return Ok(());
     };
 
-    writeln!(output, "  current state: {}", runtime.state)?;
+    writeln!(output, "details:")?;
+    writeln!(
+        output,
+        "  scope: {}",
+        automation.scope_type.as_deref().unwrap_or("n/a")
+    )?;
+    writeln!(
+        output,
+        "  schedule: window {} | cadence {} | overlap {} | idle {}",
+        format_duration_compact(automation.window_seconds),
+        format_duration_compact(automation.rerun_seconds),
+        format_duration_compact(automation.relabel_overlap_seconds),
+        format_duration_compact(automation.idle_seconds)
+    )?;
+    writeln!(
+        output,
+        "  filter: {}",
+        automation.btql_filter.as_deref().unwrap_or("none")
+    )?;
+    writeln!(
+        output,
+        "  configured facets: {}",
+        summarize_function_names(&automation.facet_functions)
+    )?;
+    writeln!(
+        output,
+        "  configured topic maps: {}",
+        summarize_function_names(&automation.topic_map_functions)
+    )?;
     if let Some(entered_at) = runtime.entered_at.as_deref() {
         writeln!(
             output,
-            "  entered at: {}",
+            "  state since: {}",
             format_timestamp_with_relative(entered_at)
         )?;
     }
     if let Some(reason) = runtime.reason.as_deref() {
-        writeln!(output, "  reason: {reason}")?;
+        writeln!(output, "  reason: {}", format_reason(reason))?;
     }
 
-    writeln!(output, "  to transition:")?;
+    writeln!(output)?;
+    writeln!(output, "next steps:")?;
     for line in render_transition_requirements(automation, runtime) {
         writeln!(output, "{line}")?;
     }
 
-    writeln!(output, "\n  state machine:")?;
-    for line in render_state_machine(runtime.state.as_str()) {
-        writeln!(output, "{line}")?;
-    }
+    writeln!(output)?;
+    writeln!(output, "flow: {}", format_flow(runtime.state.as_str()))?;
 
     Ok(())
 }
@@ -214,16 +239,16 @@ fn render_transition_requirements(
     match runtime.state.as_str() {
         "waiting_for_facets" => {
             let mut lines = vec![
-                "    - at least one topic map must have enough facet-ready traces for its source facet"
+                "  - at least one topic map must have enough facet-ready traces for its source facet"
                     .to_string(),
-                "    - this state only exists before the first topic map has been generated".to_string(),
+                "  - this state only exists before the first topic map has been generated".to_string(),
             ];
             if let Some(readiness) = format_window_candidate_readiness(&runtime.window_candidates) {
-                lines.push(format!("    - current readiness: {readiness}"));
+                lines.push(format!("  - current readiness: {readiness}"));
             }
             if let Some(next_run_at) = automation.object_cursor.next_run_at.as_deref() {
                 lines.push(format!(
-                    "    - next check: {}",
+                    "  - next check: {}",
                     format_timestamp_with_relative(next_run_at)
                 ));
             }
@@ -231,47 +256,46 @@ fn render_transition_requirements(
         }
         "recomputing_topic_maps" => {
             let mut lines = vec![
-                "    - clustering queries are currently running for the selected ready topic maps"
+                "  - clustering queries are currently running for the selected ready topic maps"
                     .to_string(),
             ];
             if let Some(window_seconds) = runtime.selected_window_seconds {
                 lines.push(format!(
-                    "    - generation window: {}",
+                    "  - generation window: {}",
                     format_duration_compact(Some(window_seconds))
                 ));
             }
             lines.push(
-                "    - if one or more topic maps are generated, it transitions to pending_topic_classification_backfill"
+                "  - if one or more topic maps are generated, label backfill starts next"
                     .to_string(),
             );
             lines.push(
-                "    - if none are generated, it falls back to waiting_for_facets before first initialization, otherwise idle"
+                "  - if none are generated, it goes back to waiting for facets before first initialization, otherwise idle"
                     .to_string(),
             );
             lines
         }
         "pending_topic_classification_backfill" => {
             let mut lines = vec![
-                "    - segment cursors have been rewound to the generation window start"
-                    .to_string(),
+                "  - segment cursors have been rewound to the generation window start".to_string(),
             ];
             if let Some(start_xact) = runtime
                 .topic_classification_backfill_start_xact_id
                 .as_deref()
             {
-                lines.push(format!("    - rewind start xact: {start_xact}"));
+                lines.push(format!("  - rewind start xact: {start_xact}"));
             }
             lines.push(
-                "    - the next object check moves to backfilling_topic_classifications if replay still has rows before the recompute snapshot"
+                "  - the next check starts label backfill if replay still has rows before the recompute snapshot"
                     .to_string(),
             );
             lines.push(
-                "    - if replay has already caught up through the recompute snapshot, it can move directly to idle"
+                "  - if replay has already caught up through the recompute snapshot, it can move directly to idle"
                     .to_string(),
             );
             if let Some(next_run_at) = automation.object_cursor.next_run_at.as_deref() {
                 lines.push(format!(
-                    "    - next check: {}",
+                    "  - next check: {}",
                     format_timestamp_with_relative(next_run_at)
                 ));
             }
@@ -283,28 +307,41 @@ fn render_transition_requirements(
                 .iter()
                 .map(|item| item.matched_count)
                 .sum::<usize>();
+            let checked = automation
+                .topics
+                .iter()
+                .map(|item| item.checked_count)
+                .sum::<usize>();
             let labeled = automation
                 .topics
                 .iter()
                 .map(|item| item.completed_count)
                 .sum::<usize>();
             let mut lines = vec![
-                "    - segment replay must catch up through the recompute snapshot".to_string(),
-                format!("    - current label progress: {labeled}/{eligible} labeled"),
+                "  - segment replay must catch up through the recompute snapshot".to_string(),
                 format!(
-                    "    - pending segments: {}",
+                    "  - current replay progress: {}/{} checked ({} labeled)",
+                    format_count(checked),
+                    format_count(eligible),
+                    format_count(labeled)
+                ),
+                format!(
+                    "  - pending segments: {}",
                     automation.cursor.pending_segments
                 ),
             ];
             if let Some(idle_wait) = format_trace_idle_wait_summary(automation) {
-                lines.push(format!("    - {idle_wait}"));
+                lines.push(format!("  - {idle_wait}"));
             }
             if let Some(end_xact) = runtime.generation_window_end_xact_id.as_deref() {
-                lines.push(format!("    - recompute snapshot end xact: {end_xact}"));
+                lines.push(format!(
+                    "  - recompute snapshot ends at: {}",
+                    format_snapshot_end_xact(end_xact)
+                ));
             }
             if let Some(next_run_at) = automation.object_cursor.next_run_at.as_deref() {
                 lines.push(format!(
-                    "    - next check: {}",
+                    "  - next check: {}",
                     format_timestamp_with_relative(next_run_at)
                 ));
             }
@@ -312,62 +349,25 @@ fn render_transition_requirements(
         }
         "idle" => {
             let mut lines = vec![
-                "    - on the next rerun, readiness is checked again using the candidate windows"
+                "  - on the next rerun, readiness is checked again using the candidate windows"
                     .to_string(),
             ];
             if let Some(readiness) = format_window_candidate_readiness(&runtime.window_candidates) {
-                lines.push(format!("    - last observed readiness: {readiness}"));
+                lines.push(format!("  - last observed readiness: {readiness}"));
             }
             if let Some(next_run_at) = automation.object_cursor.next_run_at.as_deref() {
                 lines.push(format!(
-                    "    - next rerun: {}",
+                    "  - next rerun: {}",
                     format_timestamp_with_relative(next_run_at)
                 ));
             }
             lines.push(
-                "    - if one or more topic maps are ready at rerun time, it transitions to recomputing_topic_maps; otherwise it stays idle"
+                "  - if one or more topic maps are ready at rerun time, Topics starts recomputing them; otherwise it stays idle"
                     .to_string(),
             );
             lines
         }
-        _ => vec!["    - no transition details available".to_string()],
-    }
-}
-
-fn render_state_machine(current_state: &str) -> Vec<String> {
-    vec![
-        format!(
-            "    {}",
-            format_state_label("waiting_for_facets", current_state)
-        ),
-        "      -> recomputing_topic_maps".to_string(),
-        format!(
-            "    {}",
-            format_state_label("recomputing_topic_maps", current_state)
-        ),
-        "      -> pending_topic_classification_backfill".to_string(),
-        format!(
-            "    {}",
-            format_state_label("pending_topic_classification_backfill", current_state)
-        ),
-        "      -> backfilling_topic_classifications  if pending segments".to_string(),
-        "      -> idle                              otherwise".to_string(),
-        format!(
-            "    {}",
-            format_state_label("backfilling_topic_classifications", current_state)
-        ),
-        "      -> idle  when replay is newer than recompute snapshot".to_string(),
-        format!("    {}", format_state_label("idle", current_state)),
-        "      -> recomputing_topic_maps  if rerun finds ready topic maps".to_string(),
-        "      -> idle                    otherwise".to_string(),
-    ]
-}
-
-fn format_state_label(state: &str, current_state: &str) -> String {
-    if state == current_state {
-        format!("* {state}")
-    } else {
-        state.to_string()
+        _ => vec!["  - no transition details available".to_string()],
     }
 }
 
@@ -394,6 +394,154 @@ fn format_window_candidate_readiness(
     )
 }
 
+fn format_overall_status(automation: &TopicAutomationStatus) -> String {
+    if automation.object_cursor.error_objects > 0 {
+        if automation.object_cursor.retry_after.is_some() {
+            return "waiting to retry after an error".to_string();
+        }
+        return "blocked by an error".to_string();
+    }
+
+    let Some(runtime) = automation.object_cursor.topic_runtime.as_ref() else {
+        if automation.object_cursor.due_objects > 0 {
+            return "ready to run".to_string();
+        }
+        return "idle".to_string();
+    };
+
+    match runtime.state.as_str() {
+        "waiting_for_facets" => "waiting for facets".to_string(),
+        "recomputing_topic_maps" => "recomputing topic maps".to_string(),
+        "pending_topic_classification_backfill" => "starting label backfill".to_string(),
+        "backfilling_topic_classifications" => format_trace_idle_wait_summary(automation)
+            .unwrap_or_else(|| "backfilling labels".to_string()),
+        "idle" => {
+            if automation.object_cursor.due_objects > 0 {
+                "ready to run".to_string()
+            } else {
+                "idle".to_string()
+            }
+        }
+        other => other.replace('_', " "),
+    }
+}
+
+fn format_next_event_summary(automation: &TopicAutomationStatus) -> Option<String> {
+    if automation.object_cursor.error_objects > 0 {
+        if let Some(retry_after) = automation.object_cursor.retry_after.as_deref() {
+            return Some(format!(
+                "retry: {}",
+                format_timestamp_with_relative(retry_after)
+            ));
+        }
+    }
+
+    let runtime = automation.object_cursor.topic_runtime.as_ref();
+    let next_run_at = automation.object_cursor.next_run_at.as_deref()?;
+    let label =
+        if runtime.map(|runtime| runtime.state.as_str()) == Some("idle") || runtime.is_none() {
+            "next rerun"
+        } else {
+            "next check"
+        };
+    Some(format!(
+        "{label}: {}",
+        format_timestamp_with_relative(next_run_at)
+    ))
+}
+
+fn format_coverage_summary(automation: &TopicAutomationStatus, progress_window: &str) -> String {
+    if automation.total_traces == 0 {
+        return format!("no traces in the {progress_window}");
+    }
+
+    format!(
+        "{}/{} traces have facet labels in the {}",
+        format_count(automation.facet_current_count),
+        format_count(automation.total_traces),
+        progress_window
+    )
+}
+
+fn format_label_summary(automation: &TopicAutomationStatus) -> String {
+    if automation.total_traces == 0 {
+        return "no traces currently fall within the topic window".to_string();
+    }
+
+    let eligible = automation
+        .topics
+        .iter()
+        .map(|item| item.matched_count)
+        .sum::<usize>();
+    let checked = automation
+        .topics
+        .iter()
+        .map(|item| item.checked_count)
+        .sum::<usize>();
+    let labeled = automation
+        .topics
+        .iter()
+        .map(|item| item.completed_count)
+        .sum::<usize>();
+    let errors = automation
+        .topics
+        .iter()
+        .map(|item| item.error_count)
+        .sum::<usize>();
+
+    if eligible == 0 {
+        return "no eligible topic labels yet".to_string();
+    }
+
+    let mut parts = vec![format!(
+        "{}/{} considered | {} labeled",
+        format_count(checked),
+        format_count(eligible),
+        format_count(labeled),
+    )];
+    if errors > 0 {
+        parts.push(format!("{} errors", format_count(errors)));
+    }
+    parts.join(" | ")
+}
+
+fn format_flow(current_state: &str) -> String {
+    [
+        ("waiting_for_facets", "waiting for facets"),
+        ("recomputing_topic_maps", "recomputing topic maps"),
+        ("pending_topic_classification_backfill", "pending backfill"),
+        ("backfilling_topic_classifications", "backfilling labels"),
+        ("idle", "idle"),
+    ]
+    .iter()
+    .map(|(state, label)| {
+        if *state == current_state {
+            format!("[{label}]")
+        } else {
+            (*label).to_string()
+        }
+    })
+    .collect::<Vec<_>>()
+    .join(" -> ")
+}
+
+fn format_reason(reason: &str) -> String {
+    match reason {
+        "ready_for_next_rerun" => "waiting for the next scheduled rerun".to_string(),
+        "segment_replay_pending" => "segment replay is still behind".to_string(),
+        "topic_classification_backfill_complete" => "label backfill completed".to_string(),
+        "generated_topic_maps" => "new topic maps were generated".to_string(),
+        "generation_produced_no_topic_maps" => {
+            "generation did not produce any topic maps".to_string()
+        }
+        "no_topic_maps_configured" => "no topic maps are configured".to_string(),
+        "no_topic_maps_ready_for_generation" => "no topic maps were ready to generate".to_string(),
+        "recompute_in_progress" => "topic maps are being recomputed".to_string(),
+        "missing_backfill_snapshot" => "the backfill snapshot is missing".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
 fn format_progress_window_label(automation: &TopicAutomationStatus) -> String {
     automation
         .window_seconds
@@ -406,85 +554,6 @@ fn format_progress_window_label(automation: &TopicAutomationStatus) -> String {
         })
         .map(|seconds| format!("{} topic window", format_duration_compact(Some(seconds))))
         .unwrap_or_else(|| "current topic window".to_string())
-}
-
-fn render_processing_status_lines(automation: &TopicAutomationStatus) -> Vec<String> {
-    let runtime = automation.object_cursor.topic_runtime.as_ref();
-    let mut lines = vec![format!(
-        "    facets: {}",
-        format_facet_processing_status(automation)
-    )];
-
-    let mut topic_maps_status = format_recompute_status(automation);
-    if let Some(runtime) = runtime {
-        topic_maps_status = format!("{} ({topic_maps_status})", runtime.state);
-    }
-    lines.push(format!("    topic maps: {topic_maps_status}"));
-
-    if let Some(runtime) = runtime {
-        if runtime.state == "waiting_for_facets" {
-            if let Some(readiness) = format_topic_generation_readiness(runtime) {
-                lines.push(format!("      readiness: {readiness}"));
-            }
-        } else if let Some(window_seconds) = runtime.selected_window_seconds {
-            lines.push(format!(
-                "      window: {}",
-                format_duration_compact(Some(window_seconds))
-            ));
-        }
-    }
-
-    if automation.object_cursor.error_objects > 0 {
-        if let Some(retry_after) = automation.object_cursor.retry_after.as_deref() {
-            lines.push(format!(
-                "      retry: {}",
-                format_timestamp_with_relative(retry_after)
-            ));
-        }
-    } else if runtime.map(|runtime| runtime.state.as_str()) == Some("recomputing_topic_maps") {
-        if let Some(started_at) = runtime.and_then(|runtime| runtime.entered_at.as_deref()) {
-            lines.push(format!(
-                "      started: {}",
-                format_timestamp_with_relative(started_at)
-            ));
-        }
-    } else if let Some(next_run_at) = automation.object_cursor.next_run_at.as_deref() {
-        let next_label =
-            if runtime.map(|runtime| runtime.state.as_str()) == Some("idle") || runtime.is_none() {
-                "next"
-            } else {
-                "check"
-            };
-        lines.push(format!(
-            "      {next_label}: {}",
-            format_timestamp_with_relative(next_run_at)
-        ));
-    }
-
-    if let Some(last_run_at) = automation.object_cursor.last_run_at.as_deref() {
-        lines.push(format!(
-            "      last: {}",
-            format_timestamp_with_relative(last_run_at)
-        ));
-    }
-    if let Some(last_error) = automation.object_cursor.last_error.as_deref() {
-        let mut line = format!("      error: {last_error}");
-        if let Some(last_error_at) = automation.object_cursor.last_error_at.as_deref() {
-            line.push_str(&format!(
-                " ({})",
-                format_timestamp_with_relative(last_error_at)
-            ));
-        }
-        lines.push(line);
-    }
-
-    let mut topic_labels_status = format_topic_label_processing_status(automation);
-    if let Some(runtime) = runtime {
-        topic_labels_status = format!("{} ({topic_labels_status})", runtime.state);
-    }
-    lines.push(format!("    labels: {topic_labels_status}"));
-
-    lines
 }
 
 fn format_facet_processing_status(automation: &TopicAutomationStatus) -> String {
@@ -532,194 +601,19 @@ fn format_facet_processing_status(automation: &TopicAutomationStatus) -> String 
     }
 }
 
-fn format_topic_label_processing_status(automation: &TopicAutomationStatus) -> String {
-    if let Some(runtime) = automation.object_cursor.topic_runtime.as_ref() {
-        match runtime.state.as_str() {
-            "waiting_for_facets" => {
-                if automation
-                    .topic_map_functions
-                    .iter()
-                    .any(|function| function.version.is_some())
-                {
-                    return "waiting for more topic maps to initialize".to_string();
-                }
-                return "waiting for initial topic maps".to_string();
-            }
-            "recomputing_topic_maps" => {
-                return "waiting for topic map recompute to finish".to_string();
-            }
-            "pending_topic_classification_backfill" => {
-                return "waiting to start topic classification backfill".to_string();
-            }
-            "backfilling_topic_classifications" => {
-                let eligible = automation
-                    .topics
-                    .iter()
-                    .map(|item| item.matched_count)
-                    .sum::<usize>();
-                let labeled = automation
-                    .topics
-                    .iter()
-                    .map(|item| item.completed_count)
-                    .sum::<usize>();
-                if let Some(idle_wait) = format_trace_idle_wait_summary(automation) {
-                    return format!("{idle_wait}; {labeled}/{eligible} labeled");
-                }
-                return format!("backfilling topic classifications ({labeled}/{eligible} labeled)");
-            }
-            _ => {}
-        }
-    }
-
-    if automation.total_traces == 0 {
-        return "no traces currently fall within the topic window".to_string();
-    }
-
-    let eligible = automation
-        .topics
-        .iter()
-        .map(|item| item.matched_count)
-        .sum::<usize>();
-    let labeled = automation
-        .topics
-        .iter()
-        .map(|item| item.completed_count)
-        .sum::<usize>();
-    let running = automation
-        .topics
-        .iter()
-        .map(|item| item.processing_count)
-        .sum::<usize>();
-    let errors = automation
-        .topics
-        .iter()
-        .map(|item| item.error_count)
-        .sum::<usize>();
-
-    if eligible == 0 {
-        if is_trace_idle_buffering(automation) {
-            return "waiting for idle time before replaying labels".to_string();
-        }
-        if automation.cursor.pending_segments > 0 {
-            return "waiting for facet replay before labels become eligible".to_string();
-        }
-        return "no eligible rows in the topic window".to_string();
-    }
-
-    let progress = format!("{labeled}/{eligible} labeled");
-    let status_text = if running > 0 {
-        "replaying labels over the topic window"
-    } else if is_trace_idle_buffering(automation) && labeled < eligible {
-        "waiting for idle time before replaying labels"
-    } else if automation.cursor.pending_segments > 0 && labeled < eligible {
-        "replaying labels over the topic window"
-    } else if labeled < eligible {
-        "partially labeled in the topic window"
-    } else {
-        "up to date in the topic window"
-    };
-
-    if errors > 0 {
-        format!("{status_text} ({progress}; {errors} errors)")
-    } else {
-        format!("{status_text} ({progress})")
-    }
-}
-
-fn format_recompute_status(automation: &TopicAutomationStatus) -> String {
-    if automation.object_cursor.error_objects > 0 {
-        if automation.object_cursor.retry_after.is_some() {
-            if automation.object_cursor.error_objects == 1 {
-                return "backing off after last failure".to_string();
-            }
-            return format!(
-                "{} object cursor(s) backing off after failure",
-                automation.object_cursor.error_objects
-            );
-        }
-        return format!(
-            "{} object cursor(s) in error",
-            automation.object_cursor.error_objects
-        );
-    }
-
-    if let Some(runtime) = automation.object_cursor.topic_runtime.as_ref() {
-        match runtime.state.as_str() {
-            "waiting_for_facets" => return "waiting for more data".to_string(),
-            "recomputing_topic_maps" => return "recomputing topic maps".to_string(),
-            "pending_topic_classification_backfill" => {
-                return "topic maps are ready; starting classification backfill".to_string();
-            }
-            "backfilling_topic_classifications" => {
-                if let Some(idle_wait) = format_trace_idle_wait_summary(automation) {
-                    return idle_wait;
-                }
-                return "backfilling topic classifications".to_string();
-            }
-            "idle" => {
-                if automation.object_cursor.due_objects > 0 {
-                    if automation.object_cursor.due_objects == 1 {
-                        return "ready to run now".to_string();
-                    }
-                    return format!(
-                        "{} object cursor(s) ready to run now",
-                        automation.object_cursor.due_objects
-                    );
-                }
-                if automation.object_cursor.next_run_at.is_some() {
-                    return "scheduled".to_string();
-                }
-                if automation.object_cursor.last_run_at.is_some() {
-                    return "idle".to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if automation.object_cursor.due_objects > 0 {
-        if automation.object_cursor.due_objects == 1 {
-            return "ready to run now".to_string();
-        }
-        return format!(
-            "{} object cursor(s) ready to run now",
-            automation.object_cursor.due_objects
-        );
-    }
-    if automation.object_cursor.next_run_at.is_some() {
-        return "scheduled".to_string();
-    }
-    if automation.object_cursor.last_run_at.is_some() {
-        return "idle".to_string();
-    }
-    "not scheduled".to_string()
-}
-
-fn format_topic_generation_readiness(runtime: &TopicRuntimeSnapshot) -> Option<String> {
-    let best_candidate = runtime.window_candidates.iter().max_by(|left, right| {
-        left.ready_topic_maps
-            .cmp(&right.ready_topic_maps)
-            .then(left.window_seconds.cmp(&right.window_seconds))
-    })?;
-    if best_candidate.total_topic_maps == 0 {
-        return None;
-    }
-    Some(format!(
-        "{}/{} topic maps ready in {}",
-        best_candidate.ready_topic_maps,
-        best_candidate.total_topic_maps,
-        format_duration_compact(Some(best_candidate.window_seconds))
-    ))
-}
-
-fn render_progress_lines(
+fn render_progress_lines<F>(
     items: &[api::TopicAutomationProgressItem],
-    first_label: &str,
-    second_label: &str,
-) -> Vec<String> {
+    column_labels: &[&str],
+    row_values: F,
+) -> Vec<String>
+where
+    F: Fn(&api::TopicAutomationProgressItem) -> Vec<String>,
+{
     if items.is_empty() {
-        return vec!["    none".to_string()];
+        return vec!["  none".to_string()];
     }
+
+    let rows = items.iter().map(row_values).collect::<Vec<_>>();
 
     let name_width = items
         .iter()
@@ -727,62 +621,43 @@ fn render_progress_lines(
         .max()
         .unwrap_or(0)
         .max("name".len());
-    let first_width = items
+    let column_widths = column_labels
         .iter()
-        .map(|item| item.matched_count.to_string().len())
-        .max()
-        .unwrap_or(0)
-        .max(first_label.len());
-    let second_width = items
-        .iter()
-        .map(|item| item.completed_count.to_string().len())
-        .max()
-        .unwrap_or(0)
-        .max(second_label.len());
-    let running_width = items
-        .iter()
-        .map(|item| item.processing_count.to_string().len())
-        .max()
-        .unwrap_or(0)
-        .max("running".len());
-    let error_width = items
-        .iter()
-        .map(|item| item.error_count.to_string().len())
-        .max()
-        .unwrap_or(0)
-        .max("errors".len());
+        .enumerate()
+        .map(|(index, label)| {
+            rows.iter()
+                .filter_map(|row| row.get(index))
+                .map(|value| value.len())
+                .max()
+                .unwrap_or(0)
+                .max(label.len())
+        })
+        .collect::<Vec<_>>();
 
-    let format_row = |name: &str,
-                      first: String,
-                      second: String,
-                      running: String,
-                      errors: String| {
+    let format_row = |name: &str, values: &[String]| {
+        let formatted_values = values
+            .iter()
+            .zip(column_widths.iter())
+            .map(|(value, width)| format!("{value:>width$}", width = width))
+            .collect::<Vec<_>>()
+            .join(" | ");
         format!(
-            "    {name:<name_width$} | {first:>first_width$} | {second:>second_width$} | {running:>running_width$} | {errors:>error_width$}",
-            name_width = name_width,
-            first_width = first_width,
-            second_width = second_width,
-            running_width = running_width,
-            error_width = error_width,
+            "  {name:<name_width$} | {formatted_values}",
+            name_width = name_width
         )
     };
 
-    let mut lines = vec![format_row(
-        "name",
-        first_label.to_string(),
-        second_label.to_string(),
-        "running".to_string(),
-        "errors".to_string(),
-    )];
-    lines.extend(items.iter().map(|item| {
-        format_row(
-            item.name.as_str(),
-            item.matched_count.to_string(),
-            item.completed_count.to_string(),
-            item.processing_count.to_string(),
-            item.error_count.to_string(),
-        )
-    }));
+    let header_values = column_labels
+        .iter()
+        .map(|label| (*label).to_string())
+        .collect::<Vec<_>>();
+    let mut lines = vec![format_row("name", &header_values)];
+    lines.extend(
+        items
+            .iter()
+            .zip(rows.iter())
+            .map(|(item, values)| format_row(item.name.as_str(), values)),
+    );
     lines
 }
 
@@ -845,11 +720,28 @@ fn format_timestamp_with_relative(value: &str) -> String {
     let Ok(parsed) = DateTime::parse_from_rfc3339(value) else {
         return value.to_string();
     };
-    let utc = parsed.with_timezone(&Utc);
+    format_datetime_with_relative(parsed.with_timezone(&Utc))
+}
+
+fn format_snapshot_end_xact(xact_id: &str) -> String {
+    let Some(epoch_ms) = api::epoch_ms_from_xact_id(xact_id) else {
+        return xact_id.to_string();
+    };
+    let Some(timestamp) = DateTime::<Utc>::from_timestamp_millis(epoch_ms) else {
+        return xact_id.to_string();
+    };
+    format!(
+        "{} (xact_id {})",
+        format_datetime_with_relative(timestamp),
+        xact_id
+    )
+}
+
+fn format_datetime_with_relative(timestamp: DateTime<Utc>) -> String {
     format!(
         "{} ({})",
-        utc.to_rfc3339_opts(SecondsFormat::Secs, true),
-        relative_time(utc)
+        timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
+        relative_time(timestamp)
     )
 }
 
@@ -926,6 +818,20 @@ fn format_relative_duration_seconds(delta_seconds: i64, include_direction: bool)
     "0s".to_string()
 }
 
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+
+    out.chars().rev().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -966,6 +872,7 @@ mod tests {
                         name: "Task".to_string(),
                         matched_count: 996,
                         completed_count: 1004,
+                        checked_count: 1004,
                         processing_count: 6,
                         error_count: 0,
                     },
@@ -973,6 +880,7 @@ mod tests {
                         name: "Sentiment".to_string(),
                         matched_count: 80,
                         completed_count: 1004,
+                        checked_count: 1004,
                         processing_count: 6,
                         error_count: 0,
                     },
@@ -982,6 +890,7 @@ mod tests {
                         name: "Task".to_string(),
                         matched_count: 996,
                         completed_count: 698,
+                        checked_count: 900,
                         processing_count: 6,
                         error_count: 0,
                     },
@@ -989,6 +898,7 @@ mod tests {
                         name: "Sentiment".to_string(),
                         matched_count: 80,
                         completed_count: 0,
+                        checked_count: 20,
                         processing_count: 6,
                         error_count: 0,
                     },
@@ -999,16 +909,26 @@ mod tests {
                         ref_type: "global".to_string(),
                         function_type: Some("facet".to_string()),
                         id: None,
+                        description: None,
                         version: None,
                         btql_filter: None,
+                        source_facet: None,
+                        embedding_model: None,
+                        distance_threshold: None,
+                        generation_settings: None,
                     },
                     api::FunctionSummary {
                         name: "Sentiment".to_string(),
                         ref_type: "global".to_string(),
                         function_type: Some("facet".to_string()),
                         id: None,
+                        description: None,
                         version: None,
                         btql_filter: None,
+                        source_facet: None,
+                        embedding_model: None,
+                        distance_threshold: None,
+                        generation_settings: None,
                     },
                 ],
                 topic_map_functions: vec![api::FunctionSummary {
@@ -1016,8 +936,13 @@ mod tests {
                     ref_type: "function".to_string(),
                     function_type: Some("classifier".to_string()),
                     id: Some("func_1".to_string()),
+                    description: None,
                     version: None,
                     btql_filter: None,
+                    source_facet: None,
+                    embedding_model: None,
+                    distance_threshold: None,
+                    generation_settings: None,
                 }],
                 cursor: AutomationCursorSnapshot {
                     total_segments: 12,
@@ -1029,18 +954,18 @@ mod tests {
                 },
                 object_cursor: ObjectAutomationCursorSnapshot {
                     total_objects: 5,
-                    due_objects: 2,
-                    error_objects: 1,
+                    due_objects: 0,
+                    error_objects: 0,
                     last_compacted_xact_id: Some("9990001112223334".to_string()),
-                    next_run_at: Some("2026-03-09T12:00:00Z".to_string()),
-                    last_run_at: Some("2026-03-09T11:00:00Z".to_string()),
-                    retry_after: Some("2026-03-09T11:15:00Z".to_string()),
-                    last_error: Some("Example failure".to_string()),
-                    last_error_at: Some("2026-03-09T11:05:00Z".to_string()),
+                    next_run_at: Some("2026-04-15T12:00:00Z".to_string()),
+                    last_run_at: Some("2026-04-14T11:00:00Z".to_string()),
+                    retry_after: None,
+                    last_error: None,
+                    last_error_at: None,
                     topic_runtime: Some(TopicRuntimeSnapshot {
                         state: "idle".to_string(),
                         reason: Some("ready_for_next_rerun".to_string()),
-                        entered_at: Some("2026-03-09T11:00:00Z".to_string()),
+                        entered_at: Some("2026-04-14T11:00:00Z".to_string()),
                         selected_window_seconds: Some(3600),
                         generation_window_start_xact_id: Some("9990001112220000".to_string()),
                         generation_window_end_xact_id: Some("9990001112223334".to_string()),
@@ -1066,27 +991,34 @@ mod tests {
     fn compact_report_includes_summary_details() {
         let output = render_report(&sample_report(), false);
         assert!(output.contains("Project:"));
-        assert!(output.contains("Topic automations: 1"));
-        assert!(output.contains("scope: trace | filter: none"));
-        assert!(output.contains("processing:"));
-        assert!(output.contains("coverage (1d topic window): 1010 traces | 1004 with facet labels"));
-        assert!(
-            output.contains("facet progress in that window (matched / done / running / errors):")
-        );
+        assert!(!output.contains("Topic automations: 1"));
+        assert!(output.contains("demo-project (proj_123)"));
+        assert!(output.contains("status: idle"));
         assert!(output
-            .contains("topic progress in that window (eligible / labeled / running / errors):"));
-        assert!(!output.contains("topic maps: Task"));
+            .contains("coverage: 1,004/1,010 traces have facet labels in the 1d topic window"));
+        assert!(output.contains("labels: 920/1,076 considered | 698 labeled"));
+        assert!(output.contains("facets: "));
+        assert!(output.contains("facet progress:"));
+        assert!(output.contains("topic progress:"));
+        assert!(output.contains("considered | matched | running | errors"));
+        assert!(output.contains("considered | labeled | running | errors"));
+        assert!(!output.contains("processing:"));
+        assert!(!output.contains("state machine:"));
     }
 
     #[test]
-    fn full_report_includes_state_machine() {
+    fn full_report_includes_diagnostics_and_flow() {
         let output = render_report(&sample_report(), true);
-        assert!(output.contains("Topic automation state machines:"));
-        assert!(output.contains("current state: idle"));
-        assert!(output.contains("state machine:"));
-        assert!(output.contains("    * idle"));
-        assert!(output.contains("-> recomputing_topic_maps  if rerun finds ready topic maps"));
-        assert!(output.contains("topic maps: Task"));
+        assert!(output.contains("details:"));
+        assert!(output.contains("  scope: trace"));
+        assert!(output.contains("  state since: "));
+        assert!(output.contains("  reason: waiting for the next scheduled rerun"));
+        assert!(output.contains("next steps:"));
+        assert!(output.contains(
+            "flow: waiting for facets -> recomputing topic maps -> pending backfill -> backfilling labels -> [idle]"
+        ));
+        assert!(output.contains("configured topic maps: Task"));
+        assert!(!output.contains("state machine:"));
     }
 
     #[test]
@@ -1102,10 +1034,16 @@ mod tests {
         let runtime = runtime.clone();
 
         let lines = render_transition_requirements(automation, &runtime);
-        assert!(lines.contains(&"    - current label progress: 698/1076 labeled".to_string()));
+        assert!(lines
+            .contains(&"  - current replay progress: 920/1,076 checked (698 labeled)".to_string()));
         assert!(lines
             .iter()
             .any(|line| line.contains("waiting for trace idle window")));
+        assert!(lines.iter().any(|line| {
+            line.contains("recompute snapshot ends at: ")
+                && line.contains("(xact_id 9990001112223334)")
+                && line.contains("T")
+        }));
     }
 
     #[test]
@@ -1127,5 +1065,18 @@ mod tests {
         let report = sample_report();
         let label = format_progress_window_label(&report.automations[0]);
         assert_eq!(label, "1d topic window");
+    }
+
+    #[test]
+    fn multi_automation_report_uses_divider() {
+        let mut report = sample_report();
+        let mut second = report.automations[0].clone();
+        second.id = "auto_456".to_string();
+        second.name = "Topics copy".to_string();
+        report.automations.push(second);
+
+        let output = render_report(&report, false);
+        assert!(output.contains("Topic automations: 2"));
+        assert!(output.contains("\n---\n\nTopics copy (auto_456)"));
     }
 }

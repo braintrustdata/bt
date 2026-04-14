@@ -33,6 +33,12 @@ pub struct TopicsConfigReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TopicMapConfigUpdate {
+    pub automation: TopicAutomationConfig,
+    pub topic_map_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TopicsProjectSummary {
     pub id: String,
     pub name: String,
@@ -112,14 +118,50 @@ pub struct TopicAutomationConfigPatch {
     pub idle_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TopicMapConfigPatch {
+    pub automation_id: Option<String>,
+    pub topic_map_target: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub source_facet: Option<String>,
+    pub embedding_model: Option<String>,
+    pub distance_threshold: Option<f64>,
+    pub algorithm: Option<String>,
+    pub dimension_reduction: Option<String>,
+    pub sample_size: Option<u32>,
+    pub n_clusters: Option<u32>,
+    pub min_cluster_size: Option<usize>,
+    pub min_samples: Option<usize>,
+    pub hierarchy_threshold: Option<usize>,
+    pub naming_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicMapGenerationSettings {
+    pub algorithm: Option<String>,
+    pub dimension_reduction: Option<String>,
+    pub sample_size: Option<u32>,
+    pub n_clusters: Option<u32>,
+    pub min_cluster_size: Option<usize>,
+    pub min_samples: Option<usize>,
+    pub hierarchy_threshold: Option<usize>,
+    pub naming_model: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionSummary {
     pub name: String,
     pub ref_type: String,
     pub function_type: Option<String>,
     pub id: Option<String>,
+    pub description: Option<String>,
     pub version: Option<String>,
     pub btql_filter: Option<String>,
+    pub source_facet: Option<String>,
+    pub embedding_model: Option<String>,
+    pub distance_threshold: Option<f64>,
+    pub generation_settings: Option<TopicMapGenerationSettings>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +169,7 @@ pub struct TopicAutomationProgressItem {
     pub name: String,
     pub matched_count: usize,
     pub completed_count: usize,
+    pub checked_count: usize,
     pub processing_count: usize,
     pub error_count: usize,
 }
@@ -421,6 +464,134 @@ pub async fn update_topics_config(
     build_topic_automation_config(&ctx.client, &updated_row, &mut function_cache).await
 }
 
+pub async fn update_topic_map_config(
+    ctx: &ProjectContext,
+    patch: TopicMapConfigPatch,
+) -> Result<TopicMapConfigUpdate> {
+    let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    let mut function_cache = HashMap::new();
+    let resolved = resolve_topic_map_target(
+        &ctx.client,
+        rows,
+        patch.automation_id.as_deref(),
+        &patch.topic_map_target,
+        &mut function_cache,
+    )
+    .await?;
+
+    let function_row =
+        load_function_row(&ctx.client, &mut function_cache, &resolved.function_id).await?;
+    let mut function_data = function_row
+        .get("function_data")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if string_value(function_data.get("type")).as_deref() != Some("topic_map") {
+        bail!(
+            "topic map '{}' is backed by function '{}' with unsupported function_data.type",
+            resolved.topic_map_name,
+            resolved.function_id
+        );
+    }
+
+    let mut payload = serde_json::Map::new();
+    if let Some(name) = patch.name {
+        payload.insert("name".to_string(), Value::String(name));
+    }
+    if let Some(description) = patch.description {
+        payload.insert("description".to_string(), Value::String(description));
+    }
+
+    if let Some(source_facet) = patch.source_facet {
+        function_data.insert("source_facet".to_string(), Value::String(source_facet));
+    }
+    if let Some(embedding_model) = patch.embedding_model {
+        function_data.insert(
+            "embedding_model".to_string(),
+            Value::String(embedding_model),
+        );
+    }
+    if let Some(distance_threshold) = patch.distance_threshold {
+        function_data.insert(
+            "distance_threshold".to_string(),
+            Value::from(distance_threshold),
+        );
+    }
+
+    let mut generation_settings = function_data
+        .get("generation_settings")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut generation_settings_changed = false;
+    if let Some(algorithm) = patch.algorithm {
+        generation_settings.insert("algorithm".to_string(), Value::String(algorithm));
+        generation_settings_changed = true;
+    }
+    if let Some(dimension_reduction) = patch.dimension_reduction {
+        generation_settings.insert(
+            "dimension_reduction".to_string(),
+            Value::String(dimension_reduction),
+        );
+        generation_settings_changed = true;
+    }
+    if let Some(sample_size) = patch.sample_size {
+        generation_settings.insert("sample_size".to_string(), Value::from(sample_size));
+        generation_settings_changed = true;
+    }
+    if let Some(n_clusters) = patch.n_clusters {
+        generation_settings.insert("n_clusters".to_string(), Value::from(n_clusters));
+        generation_settings_changed = true;
+    }
+    if let Some(min_cluster_size) = patch.min_cluster_size {
+        generation_settings.insert(
+            "min_cluster_size".to_string(),
+            Value::from(min_cluster_size),
+        );
+        generation_settings_changed = true;
+    }
+    if let Some(min_samples) = patch.min_samples {
+        generation_settings.insert("min_samples".to_string(), Value::from(min_samples));
+        generation_settings_changed = true;
+    }
+    if let Some(hierarchy_threshold) = patch.hierarchy_threshold {
+        generation_settings.insert(
+            "hierarchy_threshold".to_string(),
+            Value::from(hierarchy_threshold),
+        );
+        generation_settings_changed = true;
+    }
+    if let Some(naming_model) = patch.naming_model {
+        generation_settings.insert("naming_model".to_string(), Value::String(naming_model));
+        generation_settings_changed = true;
+    }
+    if generation_settings_changed {
+        function_data.insert(
+            "generation_settings".to_string(),
+            Value::Object(generation_settings),
+        );
+    }
+
+    function_data.insert("type".to_string(), Value::String("topic_map".to_string()));
+    payload.insert("function_data".to_string(), Value::Object(function_data));
+
+    let path = format!("/v1/function/{}", encode(&resolved.function_id));
+    let _: Value = ctx.client.patch(&path, &Value::Object(payload)).await?;
+
+    let mut updated_function_cache = HashMap::new();
+    let automation = build_topic_automation_config(
+        &ctx.client,
+        &resolved.automation_row,
+        &mut updated_function_cache,
+    )
+    .await?;
+
+    Ok(TopicMapConfigUpdate {
+        automation,
+        topic_map_id: resolved.function_id,
+    })
+}
+
 pub fn topics_url(app_url: &str, org_name: &str, project_name: &str) -> String {
     format!(
         "{}/app/{}/p/{}/topics",
@@ -500,6 +671,81 @@ fn resolve_single_topic_automation_row(
         .collect::<Vec<_>>()
         .join(", ");
     bail!("project has multiple topic automations ({names}); re-run with --automation-id")
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTopicMapTarget {
+    automation_row: Value,
+    function_id: String,
+    topic_map_name: String,
+}
+
+async fn resolve_topic_map_target(
+    client: &ApiClient,
+    rows: Vec<Value>,
+    automation_id: Option<&str>,
+    topic_map_target: &str,
+    function_cache: &mut HashMap<String, Value>,
+) -> Result<ResolvedTopicMapTarget> {
+    let rows = filter_or_resolve_topic_automation_rows(rows, automation_id)?;
+    let normalized_target = topic_map_target.trim();
+    if normalized_target.is_empty() {
+        bail!("topic map target cannot be empty");
+    }
+
+    let mut matches = Vec::new();
+    for row in rows {
+        let config = row
+            .get("config")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for topic_map_ref in config
+            .get("topic_map_functions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let summary =
+                summarize_topic_map_function(client, function_cache, topic_map_ref).await?;
+            let Some(function_id) = summary.id.clone() else {
+                continue;
+            };
+            if function_id == normalized_target
+                || summary.name.eq_ignore_ascii_case(normalized_target)
+            {
+                matches.push(ResolvedTopicMapTarget {
+                    automation_row: row.clone(),
+                    function_id,
+                    topic_map_name: summary.name,
+                });
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        bail!("topic map '{normalized_target}' was not found");
+    }
+    if matches.len() == 1 {
+        return Ok(matches.into_iter().next().expect("single topic map"));
+    }
+
+    let choices = matches
+        .into_iter()
+        .map(|item| {
+            let automation_name = string_value(item.automation_row.get("name"))
+                .unwrap_or_else(|| "Topics".to_string());
+            let automation_id = stringish_value(item.automation_row.get("id")).unwrap_or_default();
+            format!(
+                "{} (topic map id: {}, automation: {} [{}])",
+                item.topic_map_name, item.function_id, automation_name, automation_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "topic map '{normalized_target}' matched multiple entries ({choices}); re-run with --automation-id or the topic map function ID"
+    )
 }
 
 async fn list_topic_automation_rows(client: &ApiClient, project_id: &str) -> Result<Vec<Value>> {
@@ -826,16 +1072,21 @@ async fn summarize_topic_map_function(
     function_cache: &mut HashMap<String, Value>,
     topic_map_ref: &Value,
 ) -> Result<FunctionSummary> {
-    let summary = summarize_function_ref(
+    let mut summary = summarize_function_ref(
         client,
         function_cache,
         topic_map_ref.get("function").unwrap_or(&Value::Null),
     )
     .await?;
-    Ok(FunctionSummary {
-        btql_filter: string_value(topic_map_ref.get("btql_filter")),
-        ..summary
-    })
+    summary.btql_filter = string_value(topic_map_ref.get("btql_filter"));
+    if let Some(function_id) = summary.id.clone() {
+        let function_row = load_function_row(client, function_cache, &function_id).await?;
+        apply_topic_map_details(
+            &mut summary,
+            function_row.get("function_data").and_then(Value::as_object),
+        );
+    }
+    Ok(summary)
 }
 
 async fn summarize_function_ref(
@@ -852,8 +1103,13 @@ async fn summarize_function_ref(
             ref_type,
             function_type: string_value(reference.get("function_type")),
             id: None,
+            description: None,
             version: None,
             btql_filter: None,
+            source_facet: None,
+            embedding_model: None,
+            distance_threshold: None,
+            generation_settings: None,
         });
     }
 
@@ -864,8 +1120,13 @@ async fn summarize_function_ref(
             ref_type,
             function_type: None,
             id: None,
+            description: None,
             version: None,
             btql_filter: None,
+            source_facet: None,
+            embedding_model: None,
+            distance_threshold: None,
+            generation_settings: None,
         });
     };
 
@@ -875,8 +1136,50 @@ async fn summarize_function_ref(
         ref_type,
         function_type: string_value(function_row.get("function_type")),
         id: Some(function_id),
+        description: string_value(function_row.get("description")),
         version: string_value(reference.get("version")),
         btql_filter: None,
+        source_facet: None,
+        embedding_model: None,
+        distance_threshold: None,
+        generation_settings: None,
+    })
+}
+
+fn apply_topic_map_details(
+    summary: &mut FunctionSummary,
+    function_data: Option<&serde_json::Map<String, Value>>,
+) {
+    let Some(function_data) = function_data else {
+        return;
+    };
+    if string_value(function_data.get("type")).as_deref() != Some("topic_map") {
+        return;
+    }
+
+    summary.source_facet = string_value(function_data.get("source_facet"));
+    summary.embedding_model = string_value(function_data.get("embedding_model"));
+    summary.distance_threshold = float_value(function_data.get("distance_threshold"));
+    summary.generation_settings =
+        topic_map_generation_settings_from_value(function_data.get("generation_settings"));
+}
+
+fn topic_map_generation_settings_from_value(
+    value: Option<&Value>,
+) -> Option<TopicMapGenerationSettings> {
+    let map = value?.as_object()?;
+    Some(TopicMapGenerationSettings {
+        algorithm: string_value(map.get("algorithm")),
+        dimension_reduction: string_value(map.get("dimension_reduction")),
+        sample_size: int_value(map.get("sample_size")).and_then(|value| u32::try_from(value).ok()),
+        n_clusters: int_value(map.get("n_clusters")).and_then(|value| u32::try_from(value).ok()),
+        min_cluster_size: int_value(map.get("min_cluster_size"))
+            .and_then(|value| usize::try_from(value).ok()),
+        min_samples: int_value(map.get("min_samples"))
+            .and_then(|value| usize::try_from(value).ok()),
+        hierarchy_threshold: int_value(map.get("hierarchy_threshold"))
+            .and_then(|value| usize::try_from(value).ok()),
+        naming_model: string_value(map.get("naming_model")),
     })
 }
 
@@ -1185,6 +1488,10 @@ async fn fetch_topic_automation_progress(
                     aggregate_row.as_ref(),
                     &format!("facet_{index}_current_completed_output_traces"),
                 ),
+                checked_count: read_btql_count_metric(
+                    aggregate_row.as_ref(),
+                    &format!("facet_{index}_current_completed_traces"),
+                ),
                 processing_count: read_btql_count_metric(
                     aggregate_row.as_ref(),
                     &format!("facet_{index}_current_inflight_traces"),
@@ -1211,6 +1518,10 @@ async fn fetch_topic_automation_progress(
                 completed_count: read_btql_count_metric(
                     aggregate_row.as_ref(),
                     &format!("topic_{index}_current_labeled_traces"),
+                ),
+                checked_count: read_btql_count_metric(
+                    aggregate_row.as_ref(),
+                    &format!("topic_{index}_current_completed_traces"),
                 ),
                 processing_count: read_btql_count_metric(
                     aggregate_row.as_ref(),
@@ -1402,7 +1713,7 @@ fn format_processing_lag_from_xact_range(
     Some(format!("{}m behind", std::cmp::max(1, minutes)))
 }
 
-fn epoch_ms_from_xact_id(xact_id: &str) -> Option<i64> {
+pub(crate) fn epoch_ms_from_xact_id(xact_id: &str) -> Option<i64> {
     let xact_value = xact_id.parse::<i64>().ok()?;
     let removed_flag = xact_value & 0x0000_FFFF_FFFF_FFFF;
     let epoch_seconds = (removed_flag >> 16) & 0x0000_FFFF_FFFF;

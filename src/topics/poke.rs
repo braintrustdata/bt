@@ -19,8 +19,8 @@ pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
 
 fn render_report(report: &api::TopicsPokeReport) -> String {
     let mut lines = vec![format!(
-        "Project: {} / {}",
-        report.project.org_name, report.project.name
+        "Project: {} / {} ({})",
+        report.project.org_name, report.project.name, report.project.id
     )];
 
     if report.queued.is_empty() {
