@@ -83,7 +83,6 @@ Flags
       --json                 Output as JSON
   -q, --quiet                Reduce interactive UI output [env: BRAINTRUST_QUIET=]
       --no-color             Disable ANSI color output
-      --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
       --env-file <PATH>      Path to a .env file to load

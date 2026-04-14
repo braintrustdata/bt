@@ -6,7 +6,7 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use dialoguer::console::style;
-use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
@@ -604,11 +604,12 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
         let choices = ["Skills", "MCP"];
         let defaults = [true, false];
+        let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
         let selected = MultiSelect::with_theme(&ColorfulTheme::default())
             .with_prompt("What would you like to set up?")
             .items(&choices)
             .defaults(&defaults)
-            .interact()?;
+            .interact_on(&term)?;
         (selected.contains(&0), selected.contains(&1))
     };
 
@@ -636,8 +637,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 .ok_or_else(|| anyhow!("setup cancelled"))?
         };
         let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-        let local_root = resolve_local_root_for_scope(scope)?;
-        let detected = detect_agents(local_root.as_deref(), &home);
+        let detected = detect_agents();
         let selected_agent =
             resolve_default_agent_selection(flag_agent, &detected, "Select coding agent", true)?;
         if verbose && flag_agent.is_some() {
@@ -728,10 +728,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             }
             true
         } else {
+            let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
             Confirm::with_theme(&ColorfulTheme::default())
                 .with_prompt("Run instrumentation agent to set up tracing in this repo?")
                 .default(true)
-                .interact()?
+                .interact_on(&term)?
         };
         if instrument {
             let instrument_agent = setup_context
@@ -795,14 +796,12 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     }
 
     let scope = default_setup_scope(&args.agents);
-    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), &home);
+    let detected = detect_agents();
     let selected_agent = resolve_default_agent_selection(
         args.agents.agent,
         &detected,
         "Select coding agent",
-        ui::is_interactive(),
+        ui::can_prompt(),
     )?;
 
     if args.skills || !args.no_skills {
@@ -935,7 +934,7 @@ fn choose_setup_profile(
         return Ok(profiles.first().map(|profile| profile.name.clone()));
     }
 
-    if ui::is_interactive() {
+    if ui::can_prompt() {
         return auth::select_profile_interactive(None);
     }
 
@@ -1000,7 +999,7 @@ async fn select_project_for_setup(
     }
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
-    if !ui::is_interactive() {
+    if !ui::can_prompt() {
         bail!(
             "multiple project choices available; pass --project <NAME> or run `bt setup` in an interactive terminal"
         );
@@ -1012,10 +1011,11 @@ async fn select_project_for_setup(
 
     if selection == labels.len() - 1 {
         let default_name = default_setup_project_name();
+        let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
         let name: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Project name")
             .default(default_name)
-            .interact_text()?;
+            .interact_text_on(&term)?;
         let trimmed = name.trim();
         if trimmed.is_empty() {
             bail!("project name cannot be empty");
@@ -1092,7 +1092,9 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
         let update = Confirm::new()
             .with_prompt(format!("Update .bt/config.json to {org}/{}?", project.name))
             .default(true)
-            .interact()?;
+            .interact_on(
+                &ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?,
+            )?;
         if !update {
             return Ok(false);
         }
@@ -1155,7 +1157,7 @@ async fn execute_skills_setup(
     quiet: bool,
 ) -> Result<SkillsSetupOutcome> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let selection = resolve_setup_selection(args, &home)?;
+    let selection = resolve_setup_selection(args)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
     let detected = selection.detected;
@@ -1283,14 +1285,24 @@ async fn run_instrument_setup(
             "instrument setup requires running inside a git repository (could not find .git in parent chain)"
         )
     })?;
-    let mut detected = detect_agents(Some(&root), &home);
+    let mut detected = detect_agents();
 
-    let selected = resolve_default_agent_selection(
-        args.agent.map(map_instrument_agent_arg_to_agent_arg),
-        &detected,
-        "Select agent to instrument this repo",
-        ui::is_interactive() && !args.yes,
-    )?;
+    let runnable_agents = detect_runnable_agents();
+    let selected = if args.agent.is_none() {
+        resolve_unambiguous_instrument_agent(&runnable_agents)
+    } else {
+        None
+    };
+    let selected = if let Some(agent) = selected {
+        agent
+    } else {
+        resolve_default_agent_selection(
+            args.agent.map(map_instrument_agent_arg_to_agent_arg),
+            &detected,
+            "Select agent to instrument this repo",
+            ui::can_prompt() && !args.yes,
+        )?
+    };
 
     if args.agent.is_some() && base.verbose {
         eprintln!(
@@ -1735,11 +1747,11 @@ fn prompt_instrument_agent(default_agent: Agent) -> Result<Agent> {
         .iter()
         .position(|agent| *agent == default_agent)
         .unwrap_or(0);
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agent to instrument this repo")
-        .items(&choices)
-        .default(default_index)
-        .interact_opt()?;
+    let selection = ui::fuzzy_select_opt(
+        "Select agent to instrument this repo",
+        &choices,
+        default_index,
+    )?;
     let Some(index) = selection else {
         bail!("instrument setup cancelled by user");
     };
@@ -1998,6 +2010,12 @@ async fn run_agent_invocation(
 
             if *interactive {
                 // Inherit all streams so the user can interact with the agent directly.
+                #[cfg(unix)]
+                if !ui::is_interactive() {
+                    if let Ok(tty) = fs::File::open("/dev/tty") {
+                        command.stdin(Stdio::from(tty));
+                    }
+                }
                 return command
                     .status()
                     .await
@@ -2142,7 +2160,7 @@ fn execute_mcp_install(
 
 fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let selection = resolve_mcp_selection(&args, &home)?;
+    let selection = resolve_mcp_selection(&args)?;
     let scope = selection.scope;
     let local_root = selection.local_root;
     let detected = selection.detected;
@@ -2175,9 +2193,9 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupSelection> {
+fn resolve_setup_selection(args: &AgentsSetupArgs) -> Result<SetupSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
-    let interactive = ui::is_interactive() && !args.yes;
+    let interactive = ui::can_prompt() && !args.yes;
     let mut prompted_workflows: Option<Vec<WorkflowArg>> = if args.no_workflow {
         Some(Vec::new())
     } else {
@@ -2244,7 +2262,7 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
         )?,
     };
     let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), home);
+    let detected = detect_agents();
     let selected_agent = resolve_default_agent_selection(
         args.agent,
         &detected,
@@ -2270,9 +2288,9 @@ fn resolve_setup_selection(args: &AgentsSetupArgs, home: &Path) -> Result<SetupS
     })
 }
 
-fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSelection> {
+fn resolve_mcp_selection(args: &AgentsMcpSetupArgs) -> Result<McpSelection> {
     let mut scope = initial_scope(args.local, args.global, args.yes, YesScopeDefault::Global);
-    let interactive = ui::is_interactive() && !args.yes;
+    let interactive = ui::can_prompt() && !args.yes;
 
     if interactive {
         #[derive(Clone, Copy)]
@@ -2314,7 +2332,7 @@ fn resolve_mcp_selection(args: &AgentsMcpSetupArgs, home: &Path) -> Result<McpSe
         )?,
     };
     let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), home);
+    let detected = detect_agents();
     let selected_agent = resolve_default_agent_selection(
         args.agent,
         &detected,
@@ -2335,7 +2353,7 @@ fn run_doctor(base: BaseArgs, args: AgentsDoctorArgs) -> Result<()> {
     let (scope, local_root) = resolve_doctor_scope(&args)?;
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let docs_output_dir = setup_docs_output_dir(scope, local_root.as_deref(), &home)?;
-    let detected = detect_agents(local_root.as_deref(), &home);
+    let detected = detect_agents();
 
     let warnings = Vec::new();
     let agents = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode]
@@ -2498,11 +2516,12 @@ fn resolve_local_root_for_scope(scope: InstallScope) -> Result<Option<PathBuf>> 
 
 fn prompt_scope_selection(prompt: &str) -> Result<Option<InstallScope>> {
     let choices = ["local (current git repo)", "global (user-wide)"];
+    let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
     let idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .items(&choices)
         .default(1)
-        .interact_opt()?;
+        .interact_on_opt(&term)?;
     Ok(idx.map(|i| {
         if i == 0 {
             InstallScope::Local
@@ -2521,11 +2540,7 @@ fn prompt_agent_selection(prompt: &str, default: Agent) -> Result<Option<Agent>>
         .iter()
         .position(|agent| *agent == default)
         .unwrap_or(0);
-    let selected = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt(prompt)
-        .items(&labels)
-        .default(default_index)
-        .interact_opt()?;
+    let selected = ui::fuzzy_select_opt(prompt, &labels, default_index)?;
     Ok(selected.map(|index| ALL_AGENTS[index]))
 }
 
@@ -2540,13 +2555,14 @@ fn prompt_workflows_selection(defaults: &[WorkflowArg]) -> Result<Option<Vec<Wor
         .map(|workflow| default_set.contains(workflow))
         .collect::<Vec<_>>();
 
+    let term = ui::tty_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
     let selected = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt(
             "Select the workflows you are interested in (will prefetch docs for them) (Esc: back)",
         )
         .items(&labels)
         .defaults(&default_flags)
-        .interact_opt()?;
+        .interact_on_opt(&term)?;
 
     Ok(selected.map(|indexes| {
         indexes
@@ -2573,7 +2589,7 @@ fn resolve_scope_from_flags(
         return Ok(resolve_yes_scope(yes_scope_default));
     }
 
-    if !ui::is_interactive() {
+    if !ui::can_prompt() {
         bail!("scope required in non-interactive mode: pass --local or --global");
     }
 
@@ -2598,6 +2614,9 @@ fn resolve_default_agent_selection(
 
     let path_agents = detected_agents_on_path(detected);
     if allow_prompt {
+        if path_agents.len() == 1 {
+            return Ok(path_agents[0]);
+        }
         let default = pick_agent_mode_target(&path_agents).unwrap_or(Agent::Codex);
         return prompt_agent_selection(prompt, default)?
             .ok_or_else(|| anyhow!("setup cancelled by user"));
@@ -2612,16 +2631,6 @@ fn resolve_default_agent_selection(
     }
 
     bail!("multiple coding agents available; pass --agent <AGENT> or re-run in an interactive terminal");
-}
-
-#[allow(dead_code)]
-fn map_instrument_agent_arg(agent: InstrumentAgentArg) -> Agent {
-    match agent {
-        InstrumentAgentArg::Claude => Agent::Claude,
-        InstrumentAgentArg::Codex => Agent::Codex,
-        InstrumentAgentArg::Cursor => Agent::Cursor,
-        InstrumentAgentArg::Opencode => Agent::Opencode,
-    }
 }
 
 fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg {
@@ -2680,89 +2689,25 @@ fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
     out.into_iter().collect()
 }
 
-fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal> {
+fn detect_runnable_agents() -> Vec<Agent> {
+    let mut agents = Vec::new();
+    if command_exists("codex") {
+        agents.push(Agent::Codex);
+    }
+    if command_exists("claude") {
+        agents.push(Agent::Claude);
+    }
+    if command_exists("cursor-agent") {
+        agents.push(Agent::Cursor);
+    }
+    if command_exists("opencode") {
+        agents.push(Agent::Opencode);
+    }
+    agents
+}
+
+fn detect_agents() -> Vec<DetectionSignal> {
     let mut by_agent: BTreeMap<Agent, BTreeSet<(bool, String)>> = BTreeMap::new();
-
-    if let Some(root) = local_root {
-        if root.join(".claude").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Claude,
-                false,
-                ".claude exists in repo root",
-            );
-        }
-        if root.join(".cursor").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Cursor,
-                false,
-                ".cursor exists in repo root",
-            );
-        }
-        if root.join(".opencode").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                ".opencode exists in repo root",
-            );
-        }
-        if root.join(".agents").exists() || root.join(".agents/skills").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Codex,
-                false,
-                ".agents/skills exists in repo root",
-            );
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                ".agents/skills exists in repo root",
-            );
-        }
-        if root.join("AGENTS.md").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Codex,
-                false,
-                "AGENTS.md exists in repo root",
-            );
-        }
-    }
-
-    if home.join(".claude").exists() {
-        add_signal(&mut by_agent, Agent::Claude, false, "~/.claude exists");
-    }
-    if home.join(".cursor").exists() {
-        add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
-    }
-    if home.join(".codex").exists() {
-        add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
-    }
-    if home.join(".agents/skills").exists() {
-        add_signal(
-            &mut by_agent,
-            Agent::Codex,
-            false,
-            "~/.agents/skills exists",
-        );
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            false,
-            "~/.agents/skills exists",
-        );
-    }
-    if home.join(".opencode").exists() || home.join(".config/opencode").exists() {
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            false,
-            "opencode config directory exists",
-        );
-    }
 
     if command_exists("claude") {
         add_signal(
@@ -2819,6 +2764,13 @@ fn add_signal(
     map.entry(agent)
         .or_default()
         .insert((on_path, reason.to_string()));
+}
+
+fn resolve_unambiguous_instrument_agent(runnable_agents: &[Agent]) -> Option<Agent> {
+    if runnable_agents.len() == 1 {
+        return Some(runnable_agents[0]);
+    }
+    None
 }
 
 fn install_claude(
@@ -3456,16 +3408,8 @@ fn print_mcp_human_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[derive(Parser)]
-    struct SetupArgsHarness {
-        #[command(flatten)]
-        setup: SetupArgs,
-    }
-
     #[test]
     fn single_path_agent_is_selected_by_default() {
         let detected = vec![DetectionSignal {
@@ -3675,8 +3619,7 @@ mod tests {
             workers: crate::sync::default_workers(),
             yolo: false,
         };
-        let home = std::env::temp_dir();
-        let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
+        let selection = resolve_setup_selection(&args).expect("resolve setup selection");
         assert!(selection.selected_workflows.is_empty());
     }
 
@@ -4219,5 +4162,40 @@ mod tests {
             &root,
             &[WorkflowArg::Evaluate]
         ));
+    }
+
+    #[test]
+    fn instrument_agent_resolution_selects_single_runnable_agent() {
+        let resolved = resolve_unambiguous_instrument_agent(&[Agent::Codex]);
+        assert_eq!(resolved, Some(Agent::Codex));
+    }
+
+    #[test]
+    fn instrument_agent_resolution_returns_none_for_multiple_runnable_agents() {
+        let resolved =
+            resolve_unambiguous_instrument_agent(&[Agent::Codex, Agent::Claude, Agent::Opencode]);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_default_agent_selection_auto_selects_single_path_agent_even_when_prompt_allowed() {
+        let detected = vec![DetectionSignal {
+            agent: Agent::Codex,
+            on_path: true,
+            reason: "binary".to_string(),
+        }];
+
+        let resolved = resolve_default_agent_selection(None, &detected, "ignored", true)
+            .expect("resolve default agent selection");
+        assert_eq!(resolved, Agent::Codex);
+    }
+
+    #[test]
+    fn detect_agents_reports_only_path_signals() {
+        let detected = detect_agents();
+        assert!(
+            detected.iter().all(|signal| signal.on_path),
+            "detect_agents should only emit PATH-based signals"
+        );
     }
 }
