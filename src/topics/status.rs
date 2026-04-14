@@ -36,9 +36,18 @@ pub async fn run(ctx: &ResolvedContext, args: StatusArgs, json: bool) -> Result<
 async fn watch(ctx: &ResolvedContext, full: bool) -> Result<()> {
     let is_tty = io::stdout().is_terminal();
     let mut first_frame = true;
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
 
     loop {
-        let report = api::fetch_topics_status(ctx).await?;
+        let report = tokio::select! {
+            _ = &mut ctrl_c => {
+                if is_tty {
+                    println!();
+                }
+                break;
+            }
+            report = api::fetch_topics_status(ctx) => report?,
+        };
         let output = render_report(&report, full);
 
         if is_tty {
@@ -55,7 +64,7 @@ async fn watch(ctx: &ResolvedContext, full: bool) -> Result<()> {
         first_frame = false;
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut ctrl_c => {
                 if is_tty {
                     println!();
                 }
