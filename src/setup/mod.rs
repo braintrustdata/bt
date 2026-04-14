@@ -1366,20 +1366,10 @@ async fn run_instrument_setup(
     }
 
     // Determine run mode: interactive TUI vs background (autonomous).
-    // --yolo:       background, full bypassPermissions (no restrictions)
-    // --tui:        interactive TUI
-    // --background: background, restricted to language package managers
-    // --yes or non-interactive terminal: background, restricted to language package managers
-    // Otherwise: default to interactive TUI.
-    let (run_interactive, bypass_permissions) = if args.tui {
-        (true, false)
-    } else if args.yolo {
-        (false, true)
-    } else if args.background || args.yes || !ui::is_interactive() {
-        (false, false)
-    } else {
-        (true, false)
-    };
+    // Use prompt availability rather than stdin TTY state so `/dev/tty`
+    // fallbacks still allow TUI launch when bt is invoked via a shell script.
+    let (run_interactive, bypass_permissions) =
+        resolve_instrument_run_mode(&args, ui::can_prompt());
 
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
@@ -1496,6 +1486,16 @@ fn resolve_instrument_workflow_selection(
     }
 
     Ok(resolve_workflow_selection(&[]))
+}
+
+fn resolve_instrument_run_mode(args: &InstrumentSetupArgs, prompt_available: bool) -> (bool, bool) {
+    if args.tui {
+        (true, args.yolo)
+    } else if args.background || args.yes || !prompt_available {
+        (false, args.yolo)
+    } else {
+        (true, args.yolo)
+    }
 }
 
 #[allow(dead_code)]
@@ -3700,6 +3700,86 @@ mod tests {
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
             .expect("resolve instrument workflows");
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn instrument_run_mode_prefers_tui_when_prompt_is_available() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: false,
+            skip_launch: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
+    }
+
+    #[test]
+    fn instrument_run_mode_falls_back_to_background_without_prompt() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: false,
+            skip_launch: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, false), (false, false));
+    }
+
+    #[test]
+    fn instrument_run_mode_keeps_tui_when_yolo_and_prompt_available() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: true,
+            skip_launch: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (true, true));
+    }
+
+    #[test]
+    fn instrument_run_mode_keeps_background_when_requested_with_yolo() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Codex),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: true,
+            yolo: true,
+            skip_launch: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (false, true));
     }
 
     #[test]
