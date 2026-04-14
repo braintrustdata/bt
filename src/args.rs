@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -66,6 +66,25 @@ pub struct BaseArgs {
     )]
     pub app_url: Option<String>,
 
+    /// Path to a PEM-encoded CA bundle used for HTTPS requests.
+    #[arg(
+        long = "ca-cert",
+        env = "BRAINTRUST_CA_CERT",
+        hide_env_values = true,
+        global = true
+    )]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Hidden compatibility fallback for standard TLS tooling.
+    #[arg(
+        long = "ssl-cert-file",
+        env = "SSL_CERT_FILE",
+        hide = true,
+        hide_env_values = true,
+        global = true
+    )]
+    pub ssl_cert_file: Option<PathBuf>,
+
     /// Path to a .env file to load before running commands.
     #[arg(
         long,
@@ -83,4 +102,14 @@ pub struct CLIArgs<T: Args> {
 
     #[command(flatten)]
     pub args: T,
+}
+
+impl BaseArgs {
+    pub fn ca_cert(&self) -> Option<&Path> {
+        self.ca_cert.as_deref().or(self.ssl_cert_file.as_deref())
+    }
+
+    pub fn ca_cert_path(&self) -> Option<PathBuf> {
+        self.ca_cert.clone().or_else(|| self.ssl_cert_file.clone())
+    }
 }

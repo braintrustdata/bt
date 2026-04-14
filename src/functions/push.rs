@@ -374,19 +374,24 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         return Ok(());
     }
 
-    let manifest =
-        match run_functions_runner(&args, &files, selected_language, auth_ctx.client.api_key()) {
-            Ok(manifest) => manifest,
-            Err(failure) => {
-                return fail_push_with_all_skipped(
-                    &base,
-                    &files,
-                    failure.reason,
-                    &failure.message,
-                    "skipped because manifest generation failed",
-                );
-            }
-        };
+    let manifest = match run_functions_runner(
+        &args,
+        &files,
+        selected_language,
+        auth_ctx.client.api_key(),
+        base.ca_cert(),
+    ) {
+        Ok(manifest) => manifest,
+        Err(failure) => {
+            return fail_push_with_all_skipped(
+                &base,
+                &files,
+                failure.reason,
+                &failure.message,
+                "skipped because manifest generation failed",
+            );
+        }
+    };
 
     if let Err(failure) = validate_manifest_paths(
         &manifest,
@@ -600,6 +605,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         let source_path = PathBuf::from(&file.source_file);
         let file_result = push_file(
             &auth_ctx,
+            base.ca_cert(),
             default_project_id.as_deref(),
             &manifest.runtime_context,
             &source_path,
@@ -728,6 +734,7 @@ fn build_code_function_data(
 #[allow(clippy::too_many_arguments)]
 async fn push_file(
     auth_ctx: &super::AuthContext,
+    ca_cert: Option<&Path>,
     default_project_id: Option<&str>,
     runtime_context: &RuntimeContext,
     source_path: &Path,
@@ -810,7 +817,7 @@ async fn push_file(
             message: format!("{err:#}"),
         })?;
 
-        api::upload_bundle(&slot.url, upload_bytes, content_encoding)
+        api::upload_bundle(&slot.url, upload_bytes, content_encoding, ca_cert)
             .await
             .map_err(|err| FileFailure {
                 reason: HardFailureReason::BundleUploadFailed,
@@ -1042,6 +1049,7 @@ fn run_functions_runner(
     files: &[PathBuf],
     language: SourceLanguage,
     api_key: &str,
+    ca_cert: Option<&Path>,
 ) -> std::result::Result<RunnerManifest, FileFailure> {
     let mut command = match language {
         SourceLanguage::JsLike => {
@@ -1104,6 +1112,11 @@ fn run_functions_runner(
     };
 
     command.env("BRAINTRUST_API_KEY", api_key);
+    if let Some(ca_cert) = ca_cert {
+        let ca_cert = ca_cert.to_string_lossy().into_owned();
+        command.env("BRAINTRUST_CA_CERT", &ca_cert);
+        command.env("SSL_CERT_FILE", ca_cert);
+    }
     if let Some(tsconfig) = &args.tsconfig {
         command.env("TS_NODE_PROJECT", tsconfig);
         command.env("TSX_TSCONFIG_PATH", tsconfig);
@@ -3443,6 +3456,8 @@ mod tests {
             no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
+            ssl_cert_file: None,
             env_file: None,
         }
     }
