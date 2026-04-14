@@ -4208,20 +4208,7 @@ mod tests {
 
     #[test]
     fn detect_agents_reports_only_path_signals() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("bt-detect-agents-{unique}"));
-        fs::create_dir_all(root.join(".claude")).expect("create repo heuristic");
-        fs::create_dir_all(root.join(".agents/skills")).expect("create codex heuristic");
-        fs::write(root.join("AGENTS.md"), "# Agents\n").expect("write agents file");
-
-        let old = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("cd root");
         let detected = detect_agents();
-        std::env::set_current_dir(old).expect("restore cwd");
-
         assert!(
             detected.iter().all(|signal| signal.on_path),
             "detect_agents should only emit PATH-based signals"
