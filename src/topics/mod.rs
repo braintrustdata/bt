@@ -7,6 +7,7 @@ pub(crate) mod api;
 mod config;
 mod open;
 mod poke;
+mod rewind;
 mod status;
 
 pub(crate) type ResolvedContext = crate::projects::context::ProjectContext;
@@ -21,6 +22,7 @@ Examples:
   bt topics config
   bt topics config set --topic-window 1h --generation-cadence 1d
   bt topics poke
+  bt topics rewind 7d
   bt topics open
 ")]
 pub struct TopicsArgs {
@@ -36,6 +38,8 @@ enum TopicsCommands {
     Config(ConfigArgs),
     /// Queue Topics to run on the next executor pass
     Poke,
+    /// Rewind recent Topics history and queue it to reprocess
+    Rewind(RewindArgs),
     /// Open the Topics page in the browser
     Open,
 }
@@ -110,6 +114,16 @@ struct ConfigSetArgs {
     clear_filter: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+struct RewindArgs {
+    /// Specific automation ID to rewind
+    #[arg(long = "automation-id")]
+    automation_id: Option<String>,
+
+    /// Topic window to reprocess, for example 1h or 7d
+    topic_window: String,
+}
+
 pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
     let read_only = matches!(
         args.command.as_ref(),
@@ -141,6 +155,9 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
             }
         },
         Some(TopicsCommands::Poke) => poke::run(&ctx, base.json).await,
+        Some(TopicsCommands::Rewind(rewind_args)) => {
+            rewind::run(&ctx, &rewind_args, base.json).await
+        }
         Some(TopicsCommands::Open) => open::run(&ctx).await,
     }
 }
@@ -206,6 +223,12 @@ mod tests {
     }
 
     #[test]
+    fn topics_rewind_uses_validated_auth() {
+        let parsed = parse(&["topics", "rewind", "7d"]).expect("parse");
+        assert!(!topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
     fn topics_config_view_uses_read_only_auth() {
         let parsed = parse(&["topics", "config"]).expect("parse");
         assert!(topics_command_is_read_only(parsed.command.as_ref()));
@@ -243,5 +266,14 @@ mod tests {
         assert_eq!(set_args.window.as_deref(), Some("1h"));
         assert_eq!(set_args.cadence.as_deref(), Some("1d"));
         assert_eq!(set_args.idle.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn topics_rewind_uses_positional_window() {
+        let parsed = parse(&["topics", "rewind", "7d"]).expect("parse");
+        let Some(TopicsCommands::Rewind(rewind_args)) = parsed.command.as_ref() else {
+            panic!("expected rewind command");
+        };
+        assert_eq!(rewind_args.topic_window.as_str(), "7d");
     }
 }

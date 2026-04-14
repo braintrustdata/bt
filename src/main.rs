@@ -183,6 +183,31 @@ impl Commands {
             Commands::Status(cmd) => &cmd.base,
         }
     }
+
+    fn base_mut(&mut self) -> &mut BaseArgs {
+        match self {
+            Commands::Init(cmd) => &mut cmd.base,
+            Commands::Setup(cmd) => &mut cmd.base,
+            Commands::Docs(cmd) => &mut cmd.base,
+            Commands::Sql(cmd) => &mut cmd.base,
+            Commands::Auth(cmd) => &mut cmd.base,
+            Commands::View(cmd) => &mut cmd.base,
+            #[cfg(unix)]
+            Commands::Eval(cmd) => &mut cmd.base,
+            Commands::Projects(cmd) => &mut cmd.base,
+            Commands::Topics(cmd) => &mut cmd.base,
+            Commands::Prompts(cmd) => &mut cmd.base,
+            Commands::SelfCommand(cmd) => &mut cmd.base,
+            Commands::Tools(cmd) => &mut cmd.base,
+            Commands::Scorers(cmd) => &mut cmd.base,
+            Commands::Functions(cmd) => &mut cmd.base,
+            Commands::Experiments(cmd) => &mut cmd.base,
+            Commands::Sync(cmd) => &mut cmd.base,
+            Commands::Util(cmd) => &mut cmd.base,
+            Commands::Switch(cmd) => &mut cmd.base,
+            Commands::Status(cmd) => &mut cmd.base,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -21,6 +21,12 @@ pub struct TopicsPokeReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TopicsRewindReport {
+    pub project: TopicsProjectSummary,
+    pub rewound: Vec<TopicAutomationRewindResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TopicsConfigReport {
     pub project: TopicsProjectSummary,
     pub automations: Vec<TopicAutomationConfig>,
@@ -66,6 +72,15 @@ pub struct TopicAutomationPokeResult {
     pub object_id: String,
     pub previous_next_run_at: Option<String>,
     pub runtime_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicAutomationRewindResult {
+    pub id: String,
+    pub name: String,
+    pub object_id: String,
+    pub window_seconds: i64,
+    pub start_xact_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,6 +241,70 @@ pub async fn poke_topic_automations(ctx: &ProjectContext) -> Result<TopicsPokeRe
             topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
         },
         queued,
+    })
+}
+
+pub async fn rewind_topic_automations(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+    window_seconds: i64,
+) -> Result<TopicsRewindReport> {
+    let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    let rows = filter_or_resolve_topic_automation_rows(rows, automation_id)?;
+    let mut rewound = Vec::with_capacity(rows.len());
+
+    for row in &rows {
+        let automation_id = stringish_value(row.get("id")).unwrap_or_default();
+        let object_id = topic_automation_object_id(
+            &ctx.project.id,
+            row.get("config")
+                .and_then(Value::as_object)
+                .and_then(|config| config.get("data_scope")),
+        )?;
+        let start_xact_id = inclusive_start_xact_id_from_epoch_ms(
+            Utc::now()
+                .timestamp_millis()
+                .saturating_sub(window_seconds.saturating_mul(1000)),
+        );
+
+        let reset_body = serde_json::json!({
+            "automation_id": automation_id,
+            "object_id": object_id,
+            "start_xact_id": start_xact_id,
+        });
+        let _: Value = ctx
+            .client
+            .post("/brainstore/automation/reset-cursors", &reset_body)
+            .await?;
+
+        let upsert_body = serde_json::json!({
+            "automation_id": automation_id,
+            "object_id": object_id,
+        });
+        let _: Value = ctx
+            .client
+            .post("/brainstore/automation/upsert-object-cursor", &upsert_body)
+            .await?;
+
+        rewound.push(TopicAutomationRewindResult {
+            id: automation_id,
+            name: string_value(row.get("name")).unwrap_or_else(|| "Topics".to_string()),
+            object_id,
+            window_seconds,
+            start_xact_id,
+        });
+    }
+
+    rewound.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+
+    Ok(TopicsRewindReport {
+        project: TopicsProjectSummary {
+            id: ctx.project.id.clone(),
+            name: ctx.project.name.clone(),
+            org_name: ctx.client.org_name().to_string(),
+            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+        },
+        rewound,
     })
 }
 
@@ -1395,6 +1474,16 @@ fn backfill_time_range_to_window_seconds(value: Option<&Value>) -> Option<i64> {
     Some(std::cmp::max(0, (to - from).num_seconds()))
 }
 
+fn inclusive_start_xact_id_from_epoch_ms(epoch_ms: i64) -> String {
+    const XACT_NAMESPACE: i64 = 0x0DE1;
+    let epoch_seconds = std::cmp::max(0, epoch_ms / 1000);
+    let transaction_id = (XACT_NAMESPACE << 48) | ((epoch_seconds & 0x0000_FFFF_FFFF) << 16);
+    if transaction_id <= 0 {
+        return "0".to_string();
+    }
+    (transaction_id - 1).to_string()
+}
+
 fn parse_duration_to_seconds(value: &str) -> Option<i64> {
     let value = value.trim();
     if value.is_empty() {
@@ -1470,6 +1559,13 @@ mod tests {
             backfill_time_range_to_window_seconds(Some(&range)),
             Some(5400)
         );
+    }
+
+    #[test]
+    fn inclusive_start_xact_id_from_epoch_ms_matches_python_formula() {
+        let inclusive = inclusive_start_xact_id_from_epoch_ms(1_744_539_200_123);
+        let exclusive = (inclusive.parse::<i64>().expect("xact id") + 1).to_string();
+        assert_eq!(epoch_ms_from_xact_id(&exclusive), Some(1_744_539_200_000));
     }
 
     #[test]
