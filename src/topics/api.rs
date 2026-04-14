@@ -21,6 +21,12 @@ pub struct TopicsPokeReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TopicsConfigReport {
+    pub project: TopicsProjectSummary,
+    pub automations: Vec<TopicAutomationConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TopicsProjectSummary {
     pub id: String,
     pub name: String,
@@ -60,6 +66,35 @@ pub struct TopicAutomationPokeResult {
     pub object_id: String,
     pub previous_next_run_at: Option<String>,
     pub runtime_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicAutomationConfig {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub scope_type: Option<String>,
+    pub btql_filter: Option<String>,
+    pub sampling_rate: Option<f64>,
+    pub window_seconds: Option<i64>,
+    pub rerun_seconds: Option<i64>,
+    pub relabel_overlap_seconds: Option<i64>,
+    pub idle_seconds: Option<i64>,
+    pub facet_functions: Vec<FunctionSummary>,
+    pub topic_map_functions: Vec<FunctionSummary>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TopicAutomationConfigPatch {
+    pub automation_id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub btql_filter: Option<Option<String>>,
+    pub sampling_rate: Option<f64>,
+    pub window_seconds: Option<i64>,
+    pub rerun_seconds: Option<i64>,
+    pub relabel_overlap_seconds: Option<i64>,
+    pub idle_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +229,119 @@ pub async fn poke_topic_automations(ctx: &ProjectContext) -> Result<TopicsPokeRe
     })
 }
 
+pub async fn fetch_topics_config(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+) -> Result<TopicsConfigReport> {
+    let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    let rows = filter_or_resolve_topic_automation_rows(rows, automation_id)?;
+    let mut function_cache = HashMap::new();
+    let mut automations = Vec::with_capacity(rows.len());
+
+    for row in &rows {
+        automations
+            .push(build_topic_automation_config(&ctx.client, row, &mut function_cache).await?);
+    }
+
+    automations.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+
+    Ok(TopicsConfigReport {
+        project: TopicsProjectSummary {
+            id: ctx.project.id.clone(),
+            name: ctx.project.name.clone(),
+            org_name: ctx.client.org_name().to_string(),
+            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+        },
+        automations,
+    })
+}
+
+pub async fn update_topics_config(
+    ctx: &ProjectContext,
+    patch: TopicAutomationConfigPatch,
+) -> Result<TopicAutomationConfig> {
+    let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    let row = resolve_single_topic_automation_row(rows, patch.automation_id.as_deref())?;
+    let current_config = row
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut next_config = current_config.clone();
+    let mut has_config_changes = false;
+
+    if let Some(sampling_rate) = patch.sampling_rate {
+        next_config.insert("sampling_rate".to_string(), Value::from(sampling_rate));
+        has_config_changes = true;
+    }
+    if let Some(window_seconds) = patch.window_seconds {
+        next_config.insert(
+            "backfill_time_range".to_string(),
+            Value::String(format_duration_seconds(window_seconds)),
+        );
+        has_config_changes = true;
+    }
+    if let Some(rerun_seconds) = patch.rerun_seconds {
+        next_config.insert("rerun_seconds".to_string(), Value::from(rerun_seconds));
+        has_config_changes = true;
+    }
+    if let Some(relabel_overlap_seconds) = patch.relabel_overlap_seconds {
+        next_config.insert(
+            "relabel_overlap_seconds".to_string(),
+            Value::from(relabel_overlap_seconds),
+        );
+        has_config_changes = true;
+    }
+    if let Some(idle_seconds) = patch.idle_seconds {
+        let mut next_scope = current_config
+            .get("scope")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        next_scope.insert("type".to_string(), Value::String("trace".to_string()));
+        next_scope.insert("idle_seconds".to_string(), Value::from(idle_seconds));
+        next_config.insert("scope".to_string(), Value::Object(next_scope));
+        has_config_changes = true;
+    }
+    if let Some(btql_filter) = patch.btql_filter {
+        match btql_filter {
+            Some(filter) => {
+                next_config.insert("btql_filter".to_string(), Value::String(filter));
+            }
+            None => {
+                next_config.remove("btql_filter");
+            }
+        }
+        has_config_changes = true;
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "id".to_string(),
+        Value::String(stringish_value(row.get("id")).unwrap_or_default()),
+    );
+    if let Some(name) = patch.name {
+        payload.insert("name".to_string(), Value::String(name));
+    }
+    if let Some(description) = patch.description {
+        payload.insert("description".to_string(), Value::String(description));
+    }
+    if has_config_changes {
+        payload.insert("config".to_string(), Value::Object(next_config));
+    }
+    if payload.len() == 1 {
+        bail!("no topic automation updates were requested");
+    }
+
+    let response: Value = ctx
+        .client
+        .post("/api/project_automation/patch_id", &Value::Object(payload))
+        .await?;
+    let updated_row = project_automation_row_from_response(&response)?;
+    let mut function_cache = HashMap::new();
+    build_topic_automation_config(&ctx.client, &updated_row, &mut function_cache).await
+}
+
 pub fn topics_url(app_url: &str, org_name: &str, project_name: &str) -> String {
     format!(
         "{}/app/{}/p/{}/topics",
@@ -219,6 +367,60 @@ fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> R
         }
         Some(other) => bail!("unsupported topic automation data scope: {other}"),
     }
+}
+
+fn project_automation_row_from_response(response: &Value) -> Result<Value> {
+    if let Some(project_automation) = response.get("project_automation") {
+        if project_automation.is_object() {
+            return Ok(project_automation.clone());
+        }
+    }
+    if response.get("id").is_some() && response.get("config").is_some() && response.is_object() {
+        return Ok(response.clone());
+    }
+    bail!("unexpected project automation response shape");
+}
+
+fn filter_or_resolve_topic_automation_rows(
+    rows: Vec<Value>,
+    automation_id: Option<&str>,
+) -> Result<Vec<Value>> {
+    match automation_id {
+        Some(automation_id) => {
+            let matching = rows
+                .into_iter()
+                .filter(|row| stringish_value(row.get("id")).as_deref() == Some(automation_id))
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                bail!("topic automation '{automation_id}' was not found");
+            }
+            Ok(matching)
+        }
+        None => Ok(rows),
+    }
+}
+
+fn resolve_single_topic_automation_row(
+    rows: Vec<Value>,
+    automation_id: Option<&str>,
+) -> Result<Value> {
+    let rows = filter_or_resolve_topic_automation_rows(rows, automation_id)?;
+    if rows.is_empty() {
+        bail!("no topic automations found");
+    }
+    if rows.len() == 1 {
+        return Ok(rows.into_iter().next().expect("single row"));
+    }
+    let names = rows
+        .iter()
+        .map(|row| {
+            let name = string_value(row.get("name")).unwrap_or_else(|| "Topics".to_string());
+            let id = stringish_value(row.get("id")).unwrap_or_default();
+            format!("{name} ({id})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("project has multiple topic automations ({names}); re-run with --automation-id")
 }
 
 async fn list_topic_automation_rows(client: &ApiClient, project_id: &str) -> Result<Vec<Value>> {
@@ -329,6 +531,48 @@ async fn build_topic_automation_status(
         topic_map_functions,
         cursor,
         object_cursor,
+    })
+}
+
+async fn build_topic_automation_config(
+    client: &ApiClient,
+    row: &Value,
+    function_cache: &mut HashMap<String, Value>,
+) -> Result<TopicAutomationConfig> {
+    let config = row
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let scope = config
+        .get("scope")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(TopicAutomationConfig {
+        id: stringish_value(row.get("id")).unwrap_or_default(),
+        name: string_value(row.get("name")).unwrap_or_else(|| "Topics".to_string()),
+        description: string_value(row.get("description")).unwrap_or_default(),
+        scope_type: string_value(scope.get("type")),
+        btql_filter: string_value(config.get("btql_filter")),
+        sampling_rate: float_value(config.get("sampling_rate")),
+        window_seconds: backfill_time_range_to_window_seconds(config.get("backfill_time_range")),
+        rerun_seconds: int_value(config.get("rerun_seconds")),
+        relabel_overlap_seconds: int_value(config.get("relabel_overlap_seconds")),
+        idle_seconds: int_value(scope.get("idle_seconds")),
+        facet_functions: summarize_function_refs(
+            client,
+            function_cache,
+            config.get("facet_functions"),
+        )
+        .await?,
+        topic_map_functions: summarize_topic_map_functions(
+            client,
+            function_cache,
+            config.get("topic_map_functions"),
+        )
+        .await?,
     })
 }
 
@@ -1116,6 +1360,14 @@ fn int_value(value: Option<&Value>) -> Option<i64> {
     }
 }
 
+fn float_value(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(value)) => value.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 fn usize_value(value: Option<&Value>) -> usize {
     int_value(value)
         .and_then(|value| usize::try_from(value).ok())
@@ -1164,6 +1416,22 @@ fn parse_duration_to_seconds(value: &str) -> Option<i64> {
         _ => return None,
     };
     Some(amount * multiplier)
+}
+
+fn format_duration_seconds(seconds: i64) -> String {
+    let units = [
+        ("w", 7 * 24 * 60 * 60),
+        ("d", 24 * 60 * 60),
+        ("h", 60 * 60),
+        ("m", 60),
+        ("s", 1),
+    ];
+    for (suffix, scale) in units {
+        if seconds >= scale && seconds % scale == 0 {
+            return format!("{}{}", seconds / scale, suffix);
+        }
+    }
+    format!("{seconds}s")
 }
 
 #[cfg(test)]
@@ -1260,5 +1528,11 @@ mod tests {
             .expect("object id"),
             "experiment:exp_123"
         );
+    }
+
+    #[test]
+    fn format_duration_seconds_prefers_compact_units() {
+        assert_eq!(format_duration_seconds(3600), "1h");
+        assert_eq!(format_duration_seconds(5400), "90m");
     }
 }

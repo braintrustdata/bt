@@ -53,6 +53,8 @@ For `bt`, the first Topics release should be narrower:
 ```text
 bt topics
 bt topics status [--watch] [--full]
+bt topics config [--automation-id <id>]
+bt topics config set [--automation-id <id>] [--name ...] [--description ...] [--topic-window ...] [--generation-cadence ...] [--relabel-overlap ...] [--idle-time ...] [--sampling-rate ...] [--filter ... | --clear-filter]
 bt topics poke
 bt topics open
 ```
@@ -89,6 +91,14 @@ Rationale:
 - `bt topics open`
   Opens the Topics page in the browser for the active project.
 
+- `bt topics config`
+  Shows normalized Topics automation configuration. The human view should be
+  annotated, with a short explanation of what each setting means.
+
+- `bt topics config set`
+  Updates the small safe set of top-level editable settings already supported
+  by the backend patch path.
+
 - `bt topics poke`
   Marks Topics runnable now by updating the object cursor so it is ready on the
   next executor pass. This is intentionally lighter-weight than a reset,
@@ -103,6 +113,8 @@ Rationale:
 - `--json` is supported globally.
 - `--app-url` remains the source of truth for browser links.
 - `status` and `open` use read-only auth/context resolution.
+- `config` view uses read-only auth/context resolution.
+- `config set` uses normal validated auth/context resolution.
 - `poke` uses normal validated auth/context resolution because it updates the
   object cursor.
 - `status` is the runtime/automation inspection verb.
@@ -193,6 +205,66 @@ Notes:
 - It should clear scheduler backoff in the same way the backend
   `upsert-object-cursor` path does.
 - If there are no topic automations, print `No topic automations found.`
+
+### `bt topics config`
+
+Behavior:
+
+- Resolve the active project using existing `bt` project-context logic.
+- Load topic automations for the project.
+- Optionally filter to a specific automation with `--automation-id`.
+- Render normalized configuration values plus concise descriptions of what each
+  field means.
+
+Fields in the human view:
+
+- name
+- description
+- scope
+- topic window
+- generation cadence
+- relabel overlap
+- idle time
+- sampling rate
+- top-level BTQL filter
+- configured facets
+- configured topic maps
+
+Notes:
+
+- The human view should optimize for quick understanding, not raw payload
+  fidelity.
+- `--json` should return normalized config data without the prose descriptions.
+
+### `bt topics config set`
+
+Behavior:
+
+- Resolve the active project using validated auth/context.
+- Resolve the target topic automation:
+  - if there is exactly one, use it
+  - if there are multiple, require `--automation-id`
+- Patch the selected automation with the requested changes.
+- Print the updated config after a successful patch.
+
+Editable fields in v1:
+
+- `--name`
+- `--description`
+- `--topic-window`
+- `--generation-cadence`
+- `--relabel-overlap`
+- `--idle-time`
+- `--sampling-rate`
+- `--filter`
+- `--clear-filter`
+
+Non-goals for `config set` in v1:
+
+- changing facet membership
+- changing topic map membership
+- creating or deleting automations
+- rewinding or resetting cursors
 
 ### `bt topics open`
 
