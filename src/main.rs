@@ -86,7 +86,7 @@ Flags
       --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
-      --ca-cert <PATH>       Path to PEM CA bundle [env: BRAINTRUST_CA_CERT, SSL_CERT_FILE]
+      --ca-cert <PATH>       Path to PEM CA bundle [env: SSL_CERT_FILE]
       --env-file <PATH>      Path to a .env file to load
   -h, --help                 Print help
   -V, --version              Print version

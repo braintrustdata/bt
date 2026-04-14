@@ -1113,9 +1113,7 @@ fn run_functions_runner(
 
     command.env("BRAINTRUST_API_KEY", api_key);
     if let Some(ca_cert) = ca_cert {
-        let ca_cert = ca_cert.to_string_lossy().into_owned();
-        command.env("BRAINTRUST_CA_CERT", &ca_cert);
-        command.env("SSL_CERT_FILE", ca_cert);
+        command.env("SSL_CERT_FILE", ca_cert.to_string_lossy().into_owned());
     }
     if let Some(tsconfig) = &args.tsconfig {
         command.env("TS_NODE_PROJECT", tsconfig);
@@ -3457,7 +3455,6 @@ mod tests {
             api_url: None,
             app_url: None,
             ca_cert: None,
-            ssl_cert_file: None,
             env_file: None,
         }
     }

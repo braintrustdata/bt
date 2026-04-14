@@ -573,9 +573,10 @@ pub async fn resolved_auth_env(base: &BaseArgs) -> Result<Vec<(String, String)>>
         envs.push(("BRAINTRUST_ORG_NAME".to_string(), org_name));
     }
     if let Some(ca_cert) = base.ca_cert_path() {
-        let ca_cert = ca_cert.to_string_lossy().into_owned();
-        envs.push(("BRAINTRUST_CA_CERT".to_string(), ca_cert.clone()));
-        envs.push(("SSL_CERT_FILE".to_string(), ca_cert));
+        envs.push((
+            "SSL_CERT_FILE".to_string(),
+            ca_cert.to_string_lossy().into_owned(),
+        ));
     }
 
     Ok(envs)
@@ -2714,7 +2715,6 @@ mod tests {
             api_url: None,
             app_url: None,
             ca_cert: None,
-            ssl_cert_file: None,
             env_file: None,
         }
     }

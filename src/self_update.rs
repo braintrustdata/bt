@@ -77,7 +77,7 @@ impl UpdateChannel {
 }
 
 const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
-const CURL_CA_BUNDLE_ENV_VAR: &str = "CURL_CA_BUNDLE";
+const SSL_CERT_FILE_ENV_VAR: &str = "SSL_CERT_FILE";
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -191,7 +191,7 @@ async fn fetch_release(base: &BaseArgs, channel: UpdateChannel) -> Result<GitHub
 #[cfg(not(windows))]
 fn installer_env_vars(ca_cert: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
     ca_cert
-        .map(|path| vec![(CURL_CA_BUNDLE_ENV_VAR, path.to_path_buf())])
+        .map(|path| vec![(SSL_CERT_FILE_ENV_VAR, path.to_path_buf())])
         .unwrap_or_default()
 }
 
@@ -504,11 +504,11 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn installer_env_vars_set_curl_ca_bundle_from_cli_ca_cert() {
+    fn installer_env_vars_set_ssl_cert_file_from_cli_ca_cert() {
         let ca_cert = Path::new("/tmp/custom-ca.pem");
         assert_eq!(
             installer_env_vars(Some(ca_cert)),
-            vec![(CURL_CA_BUNDLE_ENV_VAR, ca_cert.to_path_buf())]
+            vec![(SSL_CERT_FILE_ENV_VAR, ca_cert.to_path_buf())]
         );
     }
 }

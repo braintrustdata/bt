@@ -264,7 +264,6 @@ mod tests {
             api_url: None,
             app_url: None,
             ca_cert: None,
-            ssl_cert_file: None,
             env_file: None,
         }
     }

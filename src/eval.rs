@@ -1229,9 +1229,10 @@ fn make_dev_mode_env(
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
     if let Some(ca_cert) = state.base.ca_cert_path() {
-        let ca_cert = ca_cert.to_string_lossy().into_owned();
-        env.push(("BRAINTRUST_CA_CERT".to_string(), ca_cert.clone()));
-        env.push(("SSL_CERT_FILE".to_string(), ca_cert));
+        env.push((
+            "SSL_CERT_FILE".to_string(),
+            ca_cert.to_string_lossy().into_owned(),
+        ));
     }
     if let Some(request) = request {
         let serialized =
