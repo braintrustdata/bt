@@ -5,6 +5,7 @@ use crate::{args::BaseArgs, projects::context::resolve_project_context};
 
 pub(crate) mod api;
 mod config;
+mod formatting;
 mod open;
 mod poke;
 mod rewind;

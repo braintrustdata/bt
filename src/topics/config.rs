@@ -7,6 +7,7 @@ use super::{
         self, FunctionSummary, TopicAutomationConfig, TopicAutomationConfigPatch,
         TopicMapConfigPatch, TopicMapConfigUpdate, TopicMapGenerationSettings, TopicsConfigReport,
     },
+    formatting::{format_duration_compact, format_project_header},
     ConfigArgs, ConfigSetArgs, ResolvedContext, TopicMapSetArgs,
 };
 
@@ -41,7 +42,7 @@ pub async fn run_set(ctx: &ResolvedContext, args: &ConfigSetArgs, json: bool) ->
 
     print_command_status(CommandStatus::Success, "Updated Topics automation config");
     print_with_pager(&render_single_config(
-        &report_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
+        &format_project_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
         &updated,
     ))?;
     Ok(())
@@ -66,14 +67,14 @@ pub async fn run_topic_map_set(
 
     print_command_status(CommandStatus::Success, "Updated Topics topic map config");
     print_with_pager(&render_single_topic_map_update(
-        &report_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
+        &format_project_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
         &updated,
     ))?;
     Ok(())
 }
 
 fn render_report(report: &TopicsConfigReport) -> String {
-    let mut output = report_header(
+    let mut output = format_project_header(
         &report.project.name,
         &report.project.id,
         &report.project.org_name,
@@ -117,10 +118,6 @@ fn render_single_topic_map_update(header: &str, updated: &TopicMapConfigUpdate) 
     ));
     output.push('\n');
     output
-}
-
-fn report_header(project_name: &str, project_id: &str, org_name: &str) -> String {
-    format!("Project: {org_name} / {project_name} ({project_id})")
 }
 
 fn render_config_block(automation: &TopicAutomationConfig) -> String {
@@ -380,26 +377,6 @@ fn format_sampling_percent(value: f64) -> String {
     } else {
         format!("{percent:.2}%")
     }
-}
-
-fn format_duration_compact(seconds: Option<i64>) -> String {
-    let Some(seconds) = seconds else {
-        return "n/a".to_string();
-    };
-
-    let units = [
-        ("w", 7 * 24 * 60 * 60),
-        ("d", 24 * 60 * 60),
-        ("h", 60 * 60),
-        ("m", 60),
-        ("s", 1),
-    ];
-    for (suffix, scale) in units {
-        if seconds >= scale && seconds % scale == 0 {
-            return format!("{}{}", seconds / scale, suffix);
-        }
-    }
-    format!("{seconds}s")
 }
 
 fn format_float_compact(value: f64) -> String {

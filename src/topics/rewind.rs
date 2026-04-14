@@ -2,7 +2,11 @@ use anyhow::{bail, Result};
 
 use crate::ui::{print_with_pager, with_spinner};
 
-use super::{api, ResolvedContext, RewindArgs};
+use super::{
+    api,
+    formatting::{format_duration_compact, format_project_header},
+    ResolvedContext, RewindArgs,
+};
 
 pub async fn run(ctx: &ResolvedContext, args: &RewindArgs, json: bool) -> Result<()> {
     let window_seconds = parse_topic_window(&args.topic_window)?;
@@ -22,9 +26,10 @@ pub async fn run(ctx: &ResolvedContext, args: &RewindArgs, json: bool) -> Result
 }
 
 fn render_report(report: &api::TopicsRewindReport) -> String {
-    let mut lines = vec![format!(
-        "Project: {} / {} ({})",
-        report.project.org_name, report.project.name, report.project.id
+    let mut lines = vec![format_project_header(
+        &report.project.name,
+        &report.project.id,
+        &report.project.org_name,
     )];
 
     if report.rewound.is_empty() {
@@ -43,7 +48,7 @@ fn render_report(report: &api::TopicsRewindReport) -> String {
         lines.push(format!("  object: {}", item.object_id));
         lines.push(format!(
             "  rewind window: {}",
-            format_duration_compact(item.window_seconds)
+            format_duration_compact(Some(item.window_seconds))
         ));
         lines.push(format!("  rewind start xact: {}", item.start_xact_id));
         lines.push("  next check: now".to_string());
@@ -81,23 +86,6 @@ fn parse_topic_window(value: &str) -> Result<i64> {
     };
     Ok(amount * multiplier)
 }
-
-fn format_duration_compact(seconds: i64) -> String {
-    let units = [
-        ("w", 7 * 24 * 60 * 60),
-        ("d", 24 * 60 * 60),
-        ("h", 60 * 60),
-        ("m", 60),
-        ("s", 1),
-    ];
-    for (suffix, scale) in units {
-        if seconds >= scale && seconds % scale == 0 {
-            return format!("{}{}", seconds / scale, suffix);
-        }
-    }
-    format!("{seconds}s")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,9 +1,12 @@
 use anyhow::Result;
-use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::ui::{print_with_pager, with_spinner};
 
-use super::{api, ResolvedContext};
+use super::{
+    api,
+    formatting::{format_project_header, format_timestamp_with_relative},
+    ResolvedContext,
+};
 
 pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
     let report = with_spinner("Queueing Topics run...", api::poke_topic_automations(ctx)).await?;
@@ -18,9 +21,10 @@ pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
 }
 
 fn render_report(report: &api::TopicsPokeReport) -> String {
-    let mut lines = vec![format!(
-        "Project: {} / {} ({})",
-        report.project.org_name, report.project.name, report.project.id
+    let mut lines = vec![format_project_header(
+        &report.project.name,
+        &report.project.id,
+        &report.project.org_name,
     )];
 
     if report.queued.is_empty() {
@@ -70,58 +74,6 @@ fn render_report(report: &api::TopicsPokeReport) -> String {
     }
 
     lines.join("\n")
-}
-
-fn format_timestamp_with_relative(value: &str) -> String {
-    let Ok(parsed) = DateTime::parse_from_rfc3339(value) else {
-        return value.to_string();
-    };
-    let utc = parsed.with_timezone(&Utc);
-    format!(
-        "{} ({})",
-        utc.to_rfc3339_opts(SecondsFormat::Secs, true),
-        relative_time(utc)
-    )
-}
-
-fn relative_time(timestamp: DateTime<Utc>) -> String {
-    let delta = timestamp.signed_duration_since(Utc::now());
-    let seconds = delta.num_seconds();
-
-    if seconds.abs() < 5 {
-        return "now".to_string();
-    }
-
-    let text = human_interval(seconds.abs());
-    if seconds >= 0 {
-        format!("in {text}")
-    } else {
-        format!("{text} ago")
-    }
-}
-
-fn human_interval(seconds: i64) -> String {
-    let units = [("d", 24 * 60 * 60), ("h", 60 * 60), ("m", 60), ("s", 1)];
-    let mut remaining = seconds;
-    let mut parts = Vec::new();
-
-    for (suffix, scale) in units {
-        if remaining < scale {
-            continue;
-        }
-        let value = remaining / scale;
-        remaining %= scale;
-        parts.push(format!("{value}{suffix}"));
-        if parts.len() == 2 {
-            break;
-        }
-    }
-
-    if parts.is_empty() {
-        "0s".to_string()
-    } else {
-        parts.join(" ")
-    }
 }
 
 #[cfg(test)]
