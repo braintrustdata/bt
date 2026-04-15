@@ -8,6 +8,17 @@ use urlencoding::encode;
 
 use crate::{http::ApiClient, projects::context::ProjectContext};
 
+const DEFAULT_TOPIC_AUTOMATION_NAME: &str = "Topics";
+const DEFAULT_TOPIC_AUTOMATION_DESCRIPTION: &str =
+    "Automatically extract facets and classify logs using topic maps";
+const DEFAULT_TOPIC_FACET_NAMES: &[&str] = &["Task", "Sentiment", "Issues"];
+const DEFAULT_TOPIC_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+const DEFAULT_TOPIC_RERUN_SECONDS: i64 = 24 * 60 * 60;
+const DEFAULT_TOPIC_RELABEL_OVERLAP_SECONDS: i64 = 60 * 60;
+const DEFAULT_TOPIC_IDLE_SECONDS: i64 = 10 * 60;
+const DEFAULT_TOPIC_SAMPLING_RATE: f64 = 1.0;
+const DEFAULT_TOPIC_EMBEDDING_MODEL: &str = "brain-embedding-1";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicsStatusReport {
     pub project: TopicsProjectSummary,
@@ -119,6 +130,20 @@ pub struct TopicAutomationConfigPatch {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct TopicAutomationConfigCreate {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub btql_filter: Option<String>,
+    pub sampling_rate: Option<f64>,
+    pub window_seconds: Option<i64>,
+    pub rerun_seconds: Option<i64>,
+    pub relabel_overlap_seconds: Option<i64>,
+    pub idle_seconds: Option<i64>,
+    pub facets: Vec<String>,
+    pub embedding_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TopicMapConfigPatch {
     pub automation_id: Option<String>,
     pub topic_map_target: String,
@@ -218,6 +243,105 @@ pub struct TopicWindowCandidateSnapshot {
     pub total_topic_maps: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RegisterTopicAutomationRequest {
+    project_automation_name: String,
+    description: String,
+    project_id: String,
+    config: RegisterTopicAutomationConfig,
+    update: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RegisterTopicAutomationConfig {
+    event_type: &'static str,
+    sampling_rate: f64,
+    facet_functions: Vec<GlobalFacetFunctionRef>,
+    topic_map_functions: Vec<TopicMapFunctionRef>,
+    scope: TraceScopeConfig,
+    rerun_seconds: i64,
+    relabel_overlap_seconds: i64,
+    backfill_time_range: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    btql_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GlobalFacetFunctionRef {
+    #[serde(rename = "type")]
+    ref_type: &'static str,
+    name: String,
+    function_type: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TopicMapFunctionRef {
+    function: FunctionIdRef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FunctionIdRef {
+    #[serde(rename = "type")]
+    ref_type: &'static str,
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceScopeConfig {
+    #[serde(rename = "type")]
+    scope_type: &'static str,
+    idle_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InsertFunctionsRequest {
+    functions: Vec<CreateTopicMapFunctionRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateTopicMapFunctionRequest {
+    project_id: String,
+    name: String,
+    slug: String,
+    function_type: &'static str,
+    function_data: CreateTopicMapFunctionData,
+    if_exists: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateTopicMapFunctionData {
+    #[serde(rename = "type")]
+    data_type: &'static str,
+    source_facet: String,
+    embedding_model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutomationProjectRequest {
+    automation_id: String,
+    project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpsertObjectCursorRequest {
+    automation_id: String,
+    object_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResetObjectCursorRequest {
+    automation_id: String,
+    object_id: String,
+    start_xact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BtqlValueRequest<'a> {
+    query: &'a str,
+    fmt: &'static str,
+    brainstore_realtime: bool,
+}
+
 pub async fn fetch_topics_status(ctx: &ProjectContext) -> Result<TopicsStatusReport> {
     let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
     let mut function_cache = HashMap::new();
@@ -256,10 +380,10 @@ pub async fn poke_topic_automations(ctx: &ProjectContext) -> Result<TopicsPokeRe
                 .and_then(|config| config.get("data_scope")),
         )?;
 
-        let body = serde_json::json!({
-            "automation_id": automation_id,
-            "object_id": object_id,
-        });
+        let body = UpsertObjectCursorRequest {
+            automation_id: automation_id.clone(),
+            object_id: object_id.clone(),
+        };
         let _: Value = ctx
             .client
             .post("/brainstore/automation/upsert-object-cursor", &body)
@@ -297,44 +421,17 @@ pub async fn rewind_topic_automations(
     let mut rewound = Vec::with_capacity(rows.len());
 
     for row in &rows {
+        let seeded =
+            seed_topic_automation_cursors(&ctx.client, &ctx.project.id, row, Some(window_seconds))
+                .await?;
         let automation_id = stringish_value(row.get("id")).unwrap_or_default();
-        let object_id = topic_automation_object_id(
-            &ctx.project.id,
-            row.get("config")
-                .and_then(Value::as_object)
-                .and_then(|config| config.get("data_scope")),
-        )?;
-        let start_xact_id = inclusive_start_xact_id_from_epoch_ms(
-            Utc::now()
-                .timestamp_millis()
-                .saturating_sub(window_seconds.saturating_mul(1000)),
-        );
-
-        let reset_body = serde_json::json!({
-            "automation_id": automation_id,
-            "object_id": object_id,
-            "start_xact_id": start_xact_id,
-        });
-        let _: Value = ctx
-            .client
-            .post("/brainstore/automation/reset-cursors", &reset_body)
-            .await?;
-
-        let upsert_body = serde_json::json!({
-            "automation_id": automation_id,
-            "object_id": object_id,
-        });
-        let _: Value = ctx
-            .client
-            .post("/brainstore/automation/upsert-object-cursor", &upsert_body)
-            .await?;
 
         rewound.push(TopicAutomationRewindResult {
             id: automation_id,
             name: string_value(row.get("name")).unwrap_or_else(|| "Topics".to_string()),
-            object_id,
-            window_seconds,
-            start_xact_id,
+            object_id: seeded.object_id,
+            window_seconds: seeded.window_seconds,
+            start_xact_id: seeded.start_xact_id,
         });
     }
 
@@ -349,6 +446,91 @@ pub async fn rewind_topic_automations(
         },
         rewound,
     })
+}
+
+pub async fn enable_topics_config(
+    ctx: &ProjectContext,
+    create: TopicAutomationConfigCreate,
+) -> Result<TopicAutomationConfig> {
+    let existing = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    if !existing.is_empty() {
+        bail!(
+            "Topics is already enabled for this project; use `bt topics config set` to update it"
+        );
+    }
+
+    let facet_names = normalize_facet_names(&create.facets);
+    if facet_names.is_empty() {
+        bail!("at least one facet name is required to enable Topics");
+    }
+
+    let window_seconds = create
+        .window_seconds
+        .unwrap_or(DEFAULT_TOPIC_WINDOW_SECONDS);
+    let rerun_seconds = create.rerun_seconds.unwrap_or(DEFAULT_TOPIC_RERUN_SECONDS);
+    let relabel_overlap_seconds = create
+        .relabel_overlap_seconds
+        .unwrap_or(DEFAULT_TOPIC_RELABEL_OVERLAP_SECONDS);
+    let idle_seconds = create.idle_seconds.unwrap_or(DEFAULT_TOPIC_IDLE_SECONDS);
+    let sampling_rate = create.sampling_rate.unwrap_or(DEFAULT_TOPIC_SAMPLING_RATE);
+    let embedding_model = create
+        .embedding_model
+        .unwrap_or_else(|| DEFAULT_TOPIC_EMBEDDING_MODEL.to_string());
+
+    let topic_map_functions = create_topic_map_function_refs(
+        &ctx.client,
+        &ctx.project.id,
+        &facet_names,
+        &embedding_model,
+    )
+    .await?;
+    let request = RegisterTopicAutomationRequest {
+        project_automation_name: create
+            .name
+            .unwrap_or_else(|| DEFAULT_TOPIC_AUTOMATION_NAME.to_string()),
+        description: create
+            .description
+            .unwrap_or_else(|| DEFAULT_TOPIC_AUTOMATION_DESCRIPTION.to_string()),
+        project_id: ctx.project.id.clone(),
+        config: RegisterTopicAutomationConfig {
+            event_type: "topic",
+            sampling_rate,
+            facet_functions: facet_names
+                .iter()
+                .map(|facet_name| GlobalFacetFunctionRef {
+                    ref_type: "global",
+                    name: facet_name.clone(),
+                    function_type: "facet",
+                })
+                .collect(),
+            topic_map_functions,
+            scope: TraceScopeConfig {
+                scope_type: "trace",
+                idle_seconds,
+            },
+            rerun_seconds,
+            relabel_overlap_seconds,
+            backfill_time_range: format_duration_seconds(window_seconds),
+            btql_filter: create.btql_filter,
+        },
+        update: true,
+    };
+
+    let response: Value = ctx
+        .client
+        .post("/api/project_automation/register", &request)
+        .await?;
+    let automation_row = project_automation_row_from_response(&response)?;
+    seed_topic_automation_cursors(
+        &ctx.client,
+        &ctx.project.id,
+        &automation_row,
+        Some(window_seconds),
+    )
+    .await?;
+
+    let mut function_cache = HashMap::new();
+    build_topic_automation_config(&ctx.client, &automation_row, &mut function_cache).await
 }
 
 pub async fn fetch_topics_config(
@@ -631,6 +813,63 @@ fn project_automation_row_from_response(response: &Value) -> Result<Value> {
     bail!("unexpected project automation response shape");
 }
 
+struct SeededTopicAutomationCursors {
+    object_id: String,
+    start_xact_id: String,
+    window_seconds: i64,
+}
+
+async fn seed_topic_automation_cursors(
+    client: &ApiClient,
+    project_id: &str,
+    automation_row: &Value,
+    window_seconds_override: Option<i64>,
+) -> Result<SeededTopicAutomationCursors> {
+    let config = automation_row
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let window_seconds = window_seconds_override
+        .or_else(|| backfill_time_range_to_window_seconds(config.get("backfill_time_range")))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "topic automation {} is missing a valid backfill_time_range",
+                stringish_value(automation_row.get("id")).unwrap_or_default()
+            )
+        })?;
+    let object_id = topic_automation_object_id(project_id, config.get("data_scope"))?;
+    let automation_id = stringish_value(automation_row.get("id")).unwrap_or_default();
+    let start_xact_id = inclusive_start_xact_id_from_epoch_ms(
+        Utc::now()
+            .timestamp_millis()
+            .saturating_sub(window_seconds.saturating_mul(1000)),
+    );
+
+    let reset_body = ResetObjectCursorRequest {
+        automation_id: automation_id.clone(),
+        object_id: object_id.clone(),
+        start_xact_id: start_xact_id.clone(),
+    };
+    let _: Value = client
+        .post("/brainstore/automation/reset-cursors", &reset_body)
+        .await?;
+
+    let upsert_body = UpsertObjectCursorRequest {
+        automation_id,
+        object_id: object_id.clone(),
+    };
+    let _: Value = client
+        .post("/brainstore/automation/upsert-object-cursor", &upsert_body)
+        .await?;
+
+    Ok(SeededTopicAutomationCursors {
+        object_id,
+        start_xact_id,
+        window_seconds,
+    })
+}
+
 fn filter_or_resolve_topic_automation_rows(
     rows: Vec<Value>,
     automation_id: Option<&str>,
@@ -762,6 +1001,97 @@ async fn list_topic_automation_rows(client: &ApiClient, project_id: &str) -> Res
         })
         .cloned()
         .collect())
+}
+
+async fn create_topic_map_function_refs(
+    client: &ApiClient,
+    project_id: &str,
+    facet_names: &[String],
+    embedding_model: &str,
+) -> Result<Vec<TopicMapFunctionRef>> {
+    let request = InsertFunctionsRequest {
+        functions: facet_names
+            .iter()
+            .map(|facet_name| CreateTopicMapFunctionRequest {
+                project_id: project_id.to_string(),
+                name: facet_name.clone(),
+                slug: slugify_topic_map_name(facet_name),
+                function_type: "classifier",
+                function_data: CreateTopicMapFunctionData {
+                    data_type: "topic_map",
+                    source_facet: facet_name.clone(),
+                    embedding_model: embedding_model.to_string(),
+                },
+                if_exists: "ignore",
+            })
+            .collect(),
+    };
+    let response: Value = client.post("/insert-functions", &request).await?;
+    let created = response
+        .get("functions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("unexpected insert-functions response shape"))?;
+    if created.len() != facet_names.len() {
+        bail!("failed to create topic map functions");
+    }
+
+    created
+        .iter()
+        .map(|function_row| {
+            let function_id = stringish_value(function_row.get("id"))
+                .ok_or_else(|| anyhow::anyhow!("failed to create topic map functions"))?;
+            Ok(TopicMapFunctionRef {
+                function: FunctionIdRef {
+                    ref_type: "function",
+                    id: function_id,
+                },
+            })
+        })
+        .collect()
+}
+
+fn normalize_facet_names(facets: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for facet in facets {
+        let trimmed = facet.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if normalized.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    if normalized.is_empty() {
+        DEFAULT_TOPIC_FACET_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    } else {
+        normalized
+    }
+}
+
+fn slugify_topic_map_name(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_was_dash = false;
+    for ch in value.trim().chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            slug.push(ch);
+            previous_was_dash = false;
+            continue;
+        }
+        if !previous_was_dash {
+            slug.push('-');
+            previous_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "topic-map".to_string()
+    } else {
+        slug
+    }
 }
 
 async fn build_topic_automation_status(
@@ -906,10 +1236,10 @@ async fn fetch_cursor_snapshot(
     project_id: &str,
     automation_id: &str,
 ) -> Result<AutomationCursorSnapshot> {
-    let body = serde_json::json!({
-        "automation_id": automation_id,
-        "project_id": project_id,
-    });
+    let body = AutomationProjectRequest {
+        automation_id: automation_id.to_string(),
+        project_id: project_id.to_string(),
+    };
     let response: Value = client
         .post("/brainstore/automation/get-cursors", &body)
         .await?;
@@ -936,10 +1266,10 @@ async fn fetch_object_cursor_snapshot(
     project_id: &str,
     automation_id: &str,
 ) -> Result<ObjectAutomationCursorSnapshot> {
-    let body = serde_json::json!({
-        "automation_id": automation_id,
-        "project_id": project_id,
-    });
+    let body = AutomationProjectRequest {
+        automation_id: automation_id.to_string(),
+        project_id: project_id.to_string(),
+    };
     let response: Value = client
         .post("/brainstore/automation/get-object-cursors", &body)
         .await?;
@@ -1541,11 +1871,11 @@ async fn fetch_topic_automation_progress(
 }
 
 async fn execute_btql_value(client: &ApiClient, query: &str) -> Result<Value> {
-    let body = serde_json::json!({
-        "query": query,
-        "fmt": "json",
-        "brainstore_realtime": true,
-    });
+    let body = BtqlValueRequest {
+        query,
+        fmt: "json",
+        brainstore_realtime: true,
+    };
     let org_name = client.org_name();
     let headers = if !org_name.is_empty() {
         vec![("x-bt-org-name", org_name)]
@@ -1941,5 +2271,39 @@ mod tests {
     fn format_duration_seconds_prefers_compact_units() {
         assert_eq!(format_duration_seconds(3600), "1h");
         assert_eq!(format_duration_seconds(5400), "90m");
+    }
+
+    #[test]
+    fn normalize_facet_names_uses_defaults_when_empty() {
+        assert_eq!(
+            normalize_facet_names(&[]),
+            vec!["Task", "Sentiment", "Issues"]
+        );
+        assert_eq!(
+            normalize_facet_names(&["  ".to_string(), "".to_string()]),
+            vec!["Task", "Sentiment", "Issues"]
+        );
+    }
+
+    #[test]
+    fn normalize_facet_names_deduplicates_and_trims() {
+        assert_eq!(
+            normalize_facet_names(&[
+                " Task ".to_string(),
+                "Issues".to_string(),
+                "Task".to_string(),
+            ]),
+            vec!["Task", "Issues"]
+        );
+    }
+
+    #[test]
+    fn slugify_topic_map_name_matches_python_shape() {
+        assert_eq!(slugify_topic_map_name("Task"), "task");
+        assert_eq!(
+            slugify_topic_map_name("Emergent Issues 2026/04/14"),
+            "emergent-issues-2026-04-14"
+        );
+        assert_eq!(slugify_topic_map_name("   "), "topic-map");
     }
 }

@@ -4,11 +4,13 @@ use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandSta
 
 use super::{
     api::{
-        self, FunctionSummary, TopicAutomationConfig, TopicAutomationConfigPatch,
-        TopicMapConfigPatch, TopicMapConfigUpdate, TopicMapGenerationSettings, TopicsConfigReport,
+        self, FunctionSummary, TopicAutomationConfig, TopicAutomationConfigCreate,
+        TopicAutomationConfigPatch, TopicMapConfigPatch, TopicMapConfigUpdate,
+        TopicMapGenerationSettings, TopicsConfigReport,
     },
     formatting::{format_duration_compact, format_project_header},
-    ConfigArgs, ConfigSetArgs, ResolvedContext, TopicMapSetArgs,
+    ConfigArgs, ConfigEnableArgs, ConfigSetArgs, ResolvedContext, TopicMapSetArgs,
+    TopicsConfigFieldsArgs,
 };
 
 pub async fn run_view(ctx: &ResolvedContext, args: &ConfigArgs, json: bool) -> Result<()> {
@@ -48,6 +50,24 @@ pub async fn run_set(ctx: &ResolvedContext, args: &ConfigSetArgs, json: bool) ->
     Ok(())
 }
 
+pub async fn run_enable(ctx: &ResolvedContext, args: &ConfigEnableArgs, json: bool) -> Result<()> {
+    let create = args.to_create()?;
+    let created =
+        with_spinner("Enabling Topics...", api::enable_topics_config(ctx, create)).await?;
+
+    if json {
+        println!("{}", serde_json::to_string(&created)?);
+        return Ok(());
+    }
+
+    print_command_status(CommandStatus::Success, "Enabled Topics automation");
+    print_with_pager(&render_single_config(
+        &format_project_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
+        &created,
+    ))?;
+    Ok(())
+}
+
 pub async fn run_topic_map_set(
     ctx: &ResolvedContext,
     args: &TopicMapSetArgs,
@@ -81,7 +101,9 @@ fn render_report(report: &TopicsConfigReport) -> String {
     );
 
     if report.automations.is_empty() {
-        output.push_str("\nNo topic automations found.\n");
+        output.push_str(
+            "\nNo topic automations found. Run `bt topics config enable` to create one.\n",
+        );
         return output;
     }
 
@@ -389,22 +411,52 @@ fn format_float_compact(value: f64) -> String {
     }
 }
 
-impl ConfigSetArgs {
-    fn to_patch(&self) -> Result<TopicAutomationConfigPatch> {
-        let patch = TopicAutomationConfigPatch {
-            automation_id: self.automation_id.clone(),
+#[derive(Debug, Clone, Default)]
+struct ResolvedTopicsConfigFields {
+    name: Option<String>,
+    description: Option<String>,
+    filter: Option<String>,
+    clear_filter: bool,
+    sampling_rate: Option<f64>,
+    window_seconds: Option<i64>,
+    rerun_seconds: Option<i64>,
+    relabel_overlap_seconds: Option<i64>,
+    idle_seconds: Option<i64>,
+}
+
+impl TopicsConfigFieldsArgs {
+    fn resolve(&self) -> Result<ResolvedTopicsConfigFields> {
+        Ok(ResolvedTopicsConfigFields {
             name: self.name.clone(),
             description: self.description.clone(),
-            btql_filter: if self.clear_filter {
-                Some(None)
-            } else {
-                self.filter.clone().map(Some)
-            },
+            filter: self.filter.clone(),
+            clear_filter: self.clear_filter,
             sampling_rate: parse_sampling_rate(self.sampling_rate.as_deref())?,
             window_seconds: parse_duration_to_seconds(self.window.as_deref())?,
             rerun_seconds: parse_duration_to_seconds(self.cadence.as_deref())?,
             relabel_overlap_seconds: parse_duration_to_seconds(self.relabel_overlap.as_deref())?,
             idle_seconds: parse_duration_to_seconds(self.idle.as_deref())?,
+        })
+    }
+}
+
+impl ConfigSetArgs {
+    fn to_patch(&self) -> Result<TopicAutomationConfigPatch> {
+        let fields = self.fields.resolve()?;
+        let patch = TopicAutomationConfigPatch {
+            automation_id: self.automation_id.clone(),
+            name: fields.name,
+            description: fields.description,
+            btql_filter: if fields.clear_filter {
+                Some(None)
+            } else {
+                fields.filter.map(Some)
+            },
+            sampling_rate: fields.sampling_rate,
+            window_seconds: fields.window_seconds,
+            rerun_seconds: fields.rerun_seconds,
+            relabel_overlap_seconds: fields.relabel_overlap_seconds,
+            idle_seconds: fields.idle_seconds,
         };
 
         if patch.name.is_none()
@@ -420,6 +472,24 @@ impl ConfigSetArgs {
         }
 
         Ok(patch)
+    }
+}
+
+impl ConfigEnableArgs {
+    fn to_create(&self) -> Result<TopicAutomationConfigCreate> {
+        let fields = self.fields.resolve()?;
+        Ok(TopicAutomationConfigCreate {
+            name: fields.name,
+            description: fields.description,
+            btql_filter: fields.filter,
+            sampling_rate: fields.sampling_rate,
+            window_seconds: fields.window_seconds,
+            rerun_seconds: fields.rerun_seconds,
+            relabel_overlap_seconds: fields.relabel_overlap_seconds,
+            idle_seconds: fields.idle_seconds,
+            facets: self.facets.clone(),
+            embedding_model: trim_to_option(self.embedding_model.as_deref()),
+        })
     }
 }
 
@@ -609,15 +679,17 @@ mod tests {
     fn config_set_args_build_patch() {
         let args = ConfigSetArgs {
             automation_id: Some("auto_123".to_string()),
-            name: None,
-            description: None,
-            window: Some("1h".to_string()),
-            cadence: Some("1d".to_string()),
-            relabel_overlap: None,
-            idle: Some("30s".to_string()),
-            sampling_rate: Some("50%".to_string()),
-            filter: Some("root_span_id = 'abc'".to_string()),
-            clear_filter: false,
+            fields: TopicsConfigFieldsArgs {
+                name: None,
+                description: None,
+                window: Some("1h".to_string()),
+                cadence: Some("1d".to_string()),
+                relabel_overlap: None,
+                idle: Some("30s".to_string()),
+                sampling_rate: Some("50%".to_string()),
+                filter: Some("root_span_id = 'abc'".to_string()),
+                clear_filter: false,
+            },
         };
 
         let patch = args.to_patch().expect("patch");
@@ -635,15 +707,17 @@ mod tests {
     fn config_set_args_accepts_fractional_sampling_rate_for_compatibility() {
         let args = ConfigSetArgs {
             automation_id: None,
-            name: None,
-            description: None,
-            window: None,
-            cadence: None,
-            relabel_overlap: None,
-            idle: None,
-            sampling_rate: Some("0.25".to_string()),
-            filter: None,
-            clear_filter: false,
+            fields: TopicsConfigFieldsArgs {
+                name: None,
+                description: None,
+                window: None,
+                cadence: None,
+                relabel_overlap: None,
+                idle: None,
+                sampling_rate: Some("0.25".to_string()),
+                filter: None,
+                clear_filter: false,
+            },
         };
 
         let patch = args.to_patch().expect("patch");
@@ -654,19 +728,51 @@ mod tests {
     fn config_set_args_treats_integer_sampling_rate_as_percent() {
         let args = ConfigSetArgs {
             automation_id: None,
-            name: None,
-            description: None,
-            window: None,
-            cadence: None,
-            relabel_overlap: None,
-            idle: None,
-            sampling_rate: Some("25".to_string()),
-            filter: None,
-            clear_filter: false,
+            fields: TopicsConfigFieldsArgs {
+                name: None,
+                description: None,
+                window: None,
+                cadence: None,
+                relabel_overlap: None,
+                idle: None,
+                sampling_rate: Some("25".to_string()),
+                filter: None,
+                clear_filter: false,
+            },
         };
 
         let patch = args.to_patch().expect("patch");
         assert_eq!(patch.sampling_rate, Some(0.25));
+    }
+
+    #[test]
+    fn config_enable_args_reuse_config_fields_and_defaults_to_no_filter() {
+        let args = ConfigEnableArgs {
+            fields: TopicsConfigFieldsArgs {
+                name: Some("Topics".to_string()),
+                description: None,
+                window: Some("6h".to_string()),
+                cadence: Some("1d".to_string()),
+                relabel_overlap: Some("1h".to_string()),
+                idle: Some("10m".to_string()),
+                sampling_rate: Some("25%".to_string()),
+                filter: None,
+                clear_filter: true,
+            },
+            facets: vec!["Task".to_string(), "Issues".to_string()],
+            embedding_model: Some("brain-embedding-1".to_string()),
+        };
+
+        let create = args.to_create().expect("create");
+        assert_eq!(create.name.as_deref(), Some("Topics"));
+        assert_eq!(create.window_seconds, Some(6 * 60 * 60));
+        assert_eq!(create.rerun_seconds, Some(24 * 60 * 60));
+        assert_eq!(create.relabel_overlap_seconds, Some(60 * 60));
+        assert_eq!(create.idle_seconds, Some(10 * 60));
+        assert_eq!(create.sampling_rate, Some(0.25));
+        assert_eq!(create.btql_filter, None);
+        assert_eq!(create.facets, vec!["Task", "Issues"]);
+        assert_eq!(create.embedding_model.as_deref(), Some("brain-embedding-1"));
     }
 
     #[test]

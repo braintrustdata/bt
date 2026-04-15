@@ -21,6 +21,7 @@ Examples:
   bt topics status --full
   bt topics status --watch
   bt topics config
+  bt topics config enable
   bt topics config set --topic-window 1h --generation-cadence 1d
   bt topics config topic-map set Task --embedding-model brain-embedding-1
   bt topics poke
@@ -37,7 +38,7 @@ enum TopicsCommands {
     /// Show Topics automation status for the active project
     Status(StatusArgs),
     /// View or edit Topics automation config
-    Config(ConfigArgs),
+    Config(Box<ConfigArgs>),
     /// Queue Topics to run on the next executor pass
     Poke,
     /// Rewind recent Topics history and queue it to reprocess
@@ -69,6 +70,8 @@ struct ConfigArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum ConfigCommands {
+    /// Enable Topics for this project with the provided config
+    Enable(ConfigEnableArgs),
     /// Update editable Topics config fields
     Set(ConfigSetArgs),
     /// Edit per-topic-map settings
@@ -77,11 +80,7 @@ enum ConfigCommands {
 }
 
 #[derive(Debug, Clone, Args)]
-struct ConfigSetArgs {
-    /// Specific automation ID to update
-    #[arg(long = "automation-id")]
-    automation_id: Option<String>,
-
+struct TopicsConfigFieldsArgs {
     /// Human-friendly automation name
     #[arg(long)]
     name: Option<String>,
@@ -117,6 +116,30 @@ struct ConfigSetArgs {
     /// Clear the top-level BTQL filter
     #[arg(long, conflicts_with = "filter")]
     clear_filter: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ConfigEnableArgs {
+    #[command(flatten)]
+    fields: TopicsConfigFieldsArgs,
+
+    /// Facet labels to enable. Reuse the built-in defaults by omitting this flag.
+    #[arg(long = "facet")]
+    facets: Vec<String>,
+
+    /// Embedding model used for new topic maps
+    #[arg(long = "embedding-model")]
+    embedding_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ConfigSetArgs {
+    /// Specific automation ID to update
+    #[arg(long = "automation-id")]
+    automation_id: Option<String>,
+
+    #[command(flatten)]
+    fields: TopicsConfigFieldsArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -204,12 +227,11 @@ struct RewindArgs {
 }
 
 pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
-    let read_only = matches!(
-        args.command.as_ref(),
-        None | Some(TopicsCommands::Status(_))
-            | Some(TopicsCommands::Open)
-            | Some(TopicsCommands::Config(ConfigArgs { command: None, .. }))
-    );
+    let read_only = match args.command.as_ref() {
+        None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
+        Some(TopicsCommands::Config(config_args)) => config_args.command.is_none(),
+        Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
+    };
     let ctx = resolve_project_context(&base, read_only).await?;
 
     match args.command {
@@ -229,6 +251,9 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         }
         Some(TopicsCommands::Config(config_args)) => match config_args.command {
             None => config::run_view(&ctx, &config_args, base.json).await,
+            Some(ConfigCommands::Enable(enable_args)) => {
+                config::run_enable(&ctx, &enable_args, base.json).await
+            }
             Some(ConfigCommands::Set(set_args)) => {
                 config::run_set(&ctx, &set_args, base.json).await
             }
@@ -273,12 +298,11 @@ mod tests {
     }
 
     fn topics_command_is_read_only(command: Option<&TopicsCommands>) -> bool {
-        matches!(
-            command,
-            None | Some(TopicsCommands::Status(_))
-                | Some(TopicsCommands::Open)
-                | Some(TopicsCommands::Config(ConfigArgs { command: None, .. }))
-        )
+        match command {
+            None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
+            Some(TopicsCommands::Config(config_args)) => config_args.command.is_none(),
+            Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
+        }
     }
 
     #[test]
@@ -325,6 +349,12 @@ mod tests {
     }
 
     #[test]
+    fn topics_config_enable_uses_validated_auth() {
+        let parsed = parse(&["topics", "config", "enable"]).expect("parse");
+        assert!(!topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
     fn topics_config_topic_map_set_uses_validated_auth() {
         let parsed = parse(&[
             "topics",
@@ -354,17 +384,54 @@ mod tests {
         ])
         .expect("parse");
 
-        let Some(TopicsCommands::Config(ConfigArgs {
-            command: Some(ConfigCommands::Set(set_args)),
-            ..
-        })) = parsed.command.as_ref()
-        else {
+        let Some(TopicsCommands::Config(config_args)) = parsed.command.as_ref() else {
+            panic!("expected config set command");
+        };
+        let Some(ConfigCommands::Set(set_args)) = config_args.command.as_ref() else {
             panic!("expected config set command");
         };
 
-        assert_eq!(set_args.window.as_deref(), Some("1h"));
-        assert_eq!(set_args.cadence.as_deref(), Some("1d"));
-        assert_eq!(set_args.idle.as_deref(), Some("30s"));
+        assert_eq!(set_args.fields.window.as_deref(), Some("1h"));
+        assert_eq!(set_args.fields.cadence.as_deref(), Some("1d"));
+        assert_eq!(set_args.fields.idle.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn topics_config_enable_accepts_shared_flags() {
+        let parsed = parse(&[
+            "topics",
+            "config",
+            "enable",
+            "--topic-window",
+            "6h",
+            "--generation-cadence",
+            "1d",
+            "--sampling-rate",
+            "25%",
+            "--facet",
+            "Task",
+            "--facet",
+            "Issues",
+            "--embedding-model",
+            "brain-embedding-1",
+        ])
+        .expect("parse");
+
+        let Some(TopicsCommands::Config(config_args)) = parsed.command.as_ref() else {
+            panic!("expected config enable command");
+        };
+        let Some(ConfigCommands::Enable(enable_args)) = config_args.command.as_ref() else {
+            panic!("expected config enable command");
+        };
+
+        assert_eq!(enable_args.fields.window.as_deref(), Some("6h"));
+        assert_eq!(enable_args.fields.cadence.as_deref(), Some("1d"));
+        assert_eq!(enable_args.fields.sampling_rate.as_deref(), Some("25%"));
+        assert_eq!(enable_args.facets, vec!["Task", "Issues"]);
+        assert_eq!(
+            enable_args.embedding_model.as_deref(),
+            Some("brain-embedding-1")
+        );
     }
 
     #[test]
@@ -397,16 +464,13 @@ mod tests {
         ])
         .expect("parse");
 
-        let Some(TopicsCommands::Config(ConfigArgs {
-            command:
-                Some(ConfigCommands::TopicMap(TopicMapArgs {
-                    command: TopicMapCommands::Set(set_args),
-                })),
-            ..
-        })) = parsed.command.as_ref()
-        else {
+        let Some(TopicsCommands::Config(config_args)) = parsed.command.as_ref() else {
             panic!("expected topic-map set command");
         };
+        let Some(ConfigCommands::TopicMap(topic_map_args)) = config_args.command.as_ref() else {
+            panic!("expected topic-map set command");
+        };
+        let TopicMapCommands::Set(set_args) = &topic_map_args.command;
 
         assert_eq!(set_args.topic_map, "Task");
         assert_eq!(
