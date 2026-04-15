@@ -68,7 +68,7 @@ Compare new or changed code against `references/bt-patterns.md`. Check:
 - **Success/error status**: `print_command_status(CommandStatus::Success/Error, "Past tense message")`
 - **List output**: JSON early return → summary line → `styled_table` → `print_with_pager`
 - **Spinner usage**: `with_spinner("Present participle...", future)`, stderr-only, 300ms delay
-- **Positional + flag dual args**: positional precedence over flag, both optional, `.identifier()` accessor method
+- **Positional + flag dual args**: every positional argument MUST have a corresponding `--flag` alternative, positional precedence over flag, both optional, `.identifier()` accessor method
 - **Project resolution**: `base.project → interactive select → bail with env var hint`
 - **Color/styling**: bold for names, dim for secondary, green/red for status, cyan for template vars
 - **Import order**: std → external crates → `crate::` → `super::`
