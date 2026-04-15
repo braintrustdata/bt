@@ -6,7 +6,8 @@ use serde_json::{Map, Value};
 use urlencoding::encode;
 
 use crate::ui::{
-    is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
+    apply_column_padding, header, is_interactive, print_command_status, print_with_pager,
+    styled_table, truncate, with_spinner, CommandStatus,
 };
 
 use super::{api, ResolvedContext};
@@ -67,12 +68,6 @@ pub async fn run(
         return Ok(());
     }
 
-    let display_rows = if verbose {
-        rows.clone()
-    } else {
-        rows.iter().map(compact_row_for_display).collect()
-    };
-
     let mut output = String::new();
     writeln!(output, "Viewing {}", console::style(&dataset.name).bold())?;
 
@@ -131,7 +126,34 @@ pub async fn run(
             .dim()
         )?;
     }
-    writeln!(output, "{}", serde_json::to_string_pretty(&display_rows)?)?;
+    if verbose {
+        writeln!(output, "{}", serde_json::to_string_pretty(&rows)?)?;
+    } else {
+        let mut table = styled_table();
+        table.set_header(vec![
+            header("ID"),
+            header("Input"),
+            header("Expected"),
+            header("Output"),
+            header("Metadata"),
+            header("Tags"),
+        ]);
+        apply_column_padding(&mut table, (0, 2));
+
+        for row in &rows {
+            let compact = compact_row_for_display(row);
+            table.add_row(vec![
+                format_compact_value(compact.get("id"), 30),
+                format_compact_value(compact.get("input"), 40),
+                format_compact_value(compact.get("expected"), 40),
+                format_compact_value(compact.get("output"), 40),
+                format_compact_value(compact.get("metadata"), 40),
+                format_compact_value(compact.get("tags"), 30),
+            ]);
+        }
+
+        writeln!(output, "{table}")?;
+    }
 
     print_with_pager(&output)?;
     Ok(())
@@ -153,6 +175,18 @@ fn compact_row_for_display(row: &Map<String, Value>) -> Map<String, Value> {
     }
 
     compact
+}
+
+fn format_compact_value(value: Option<&Value>, max_len: usize) -> String {
+    let Some(value) = value else {
+        return "-".to_string();
+    };
+
+    let rendered = match value {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".to_string()),
+    };
+    truncate(&rendered, max_len)
 }
 
 #[cfg(test)]
@@ -206,5 +240,14 @@ mod tests {
             Some(&Value::String("value".to_string()))
         );
         assert!(compact.get("created").is_none());
+    }
+
+    #[test]
+    fn format_compact_value_handles_strings_and_missing_values() {
+        assert_eq!(
+            format_compact_value(Some(&Value::String("abc".into())), 10),
+            "abc"
+        );
+        assert_eq!(format_compact_value(None, 10), "-");
     }
 }

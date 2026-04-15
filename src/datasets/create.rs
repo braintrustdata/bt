@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::ui::{print_command_status, with_spinner, with_spinner_visible, CommandStatus};
 
-use super::{api, records::load_optional_upload_records, upload, ResolvedContext};
+use super::{api, records::load_optional_upload_records, utils, ResolvedContext};
 
 pub async fn run(
     ctx: &ResolvedContext,
@@ -16,7 +16,7 @@ pub async fn run(
     id_field: &str,
     json_output: bool,
 ) -> Result<()> {
-    let name = upload::resolve_dataset_name(name, "create")?;
+    let name = super::resolve_dataset_name(name, "create")?;
 
     let exists = with_spinner(
         "Checking dataset...",
@@ -48,7 +48,7 @@ pub async fn run(
     };
 
     if let Some(records) = records.as_ref() {
-        if let Err(error) = upload::submit_prepared_records(
+        if let Err(error) = utils::submit_prepared_records(
             ctx,
             &dataset.id,
             records,
@@ -79,9 +79,9 @@ pub async fn run(
     }
 
     let detail = if uploaded == 0 {
-        format!("Successfully created '{name}'")
+        format!("Created '{name}'")
     } else {
-        format!("Created '{}' and uploaded {} records.", name, uploaded)
+        format!("Created '{name}' with {uploaded} records")
     };
     print_command_status(CommandStatus::Success, &detail);
     Ok(())

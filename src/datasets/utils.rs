@@ -1,28 +1,15 @@
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use braintrust_sdk_rust::Logs3BatchUploader;
-use dialoguer::Input;
 use serde_json::{Map, Value};
 
-use crate::ui::{is_interactive, with_spinner_visible};
+use crate::ui::with_spinner_visible;
 
 use super::{
     records::{PreparedDatasetRecord, DATASET_UPLOAD_BATCH_SIZE},
     ResolvedContext,
 };
-
-pub(crate) fn resolve_dataset_name(name: Option<&str>, command: &str) -> Result<String> {
-    match name {
-        Some(name) if !name.trim().is_empty() => Ok(name.trim().to_string()),
-        _ => {
-            if !is_interactive() {
-                bail!("dataset name required. Use: bt datasets {command} <name>");
-            }
-            Ok(Input::new().with_prompt("Dataset name").interact_text()?)
-        }
-    }
-}
 
 pub(crate) async fn submit_prepared_records(
     ctx: &ResolvedContext,

@@ -48,12 +48,7 @@
         "--file",
         "refresh.jsonl"
       ],
-      "stdout_contains": [
-        "\"created\":1",
-        "\"updated\":1",
-        "\"unchanged\":0",
-        "\"mode\":\"update\""
-      ]
+      "stdout_contains": ["\"mode\":\"update\""]
     },
     {
       "command": [
@@ -65,12 +60,7 @@
         "--file",
         "refresh.jsonl"
       ],
-      "stdout_contains": [
-        "\"created\":0",
-        "\"updated\":0",
-        "\"unchanged\":2",
-        "\"mode\":\"update\""
-      ]
+      "stdout_contains": ["\"mode\":\"update\""]
     },
     {
       "command": ["datasets", "--json", "--no-input", "view", "qa-fixture"],
@@ -83,5 +73,5 @@
       "stdout_not_contains": []
     }
   ],
-  "expected_logs3_requests": 2
+  "expected_logs3_requests": 3
 }

@@ -87,11 +87,6 @@ pub async fn get_dataset_by_name(
     Ok(datasets.into_iter().find(|dataset| dataset.name == name))
 }
 
-pub async fn list_dataset_rows(client: &ApiClient, dataset_id: &str) -> Result<Vec<DatasetRow>> {
-    let (rows, _truncated) = list_dataset_rows_limited(client, dataset_id, None).await?;
-    Ok(rows)
-}
-
 pub async fn list_dataset_rows_limited(
     client: &ApiClient,
     dataset_id: &str,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     io::{self, IsTerminal, Read},
     path::Path,
@@ -9,8 +9,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-
-use super::api::DatasetRow;
 
 pub(crate) const DATASET_UPLOAD_BATCH_SIZE: usize = 1000;
 
@@ -72,21 +70,6 @@ pub(crate) fn load_refresh_records(
 ) -> Result<Vec<PreparedDatasetRecord>> {
     let raw = load_required_record_objects(input_path, inline_rows)?;
     prepare_records(raw, id_field, true)
-}
-
-pub(crate) fn remote_records_by_id(
-    rows: Vec<DatasetRow>,
-) -> Result<HashMap<String, PreparedDatasetRecord>> {
-    let mut records = HashMap::new();
-    for row in rows {
-        if let Some(record) = prepared_record_from_remote_row(&row)? {
-            let record_id = record.id.clone();
-            if records.insert(record_id.clone(), record).is_some() {
-                bail!("remote dataset contains duplicate record id '{record_id}'");
-            }
-        }
-    }
-    Ok(records)
 }
 
 fn load_required_record_objects(
@@ -311,23 +294,6 @@ fn prepared_record_from_input_object(
     })
 }
 
-fn prepared_record_from_remote_row(row: &DatasetRow) -> Result<Option<PreparedDatasetRecord>> {
-    let Some(id_value) = row.get("id").or_else(|| row.get("span_id")) else {
-        return Ok(None);
-    };
-    let id = coerce_id_value(id_value)?;
-    Ok(Some(PreparedDatasetRecord {
-        id,
-        input: row.get("input").cloned(),
-        expected: row
-            .get("expected")
-            .cloned()
-            .or_else(|| row.get("output").cloned()),
-        metadata: parse_metadata(row.get("metadata"))?,
-        tags: parse_tags(row.get("tags"))?,
-    }))
-}
-
 fn parse_id_field_path(id_field: &str) -> Result<Vec<String>> {
     let path = id_field
         .split('.')
@@ -470,34 +436,6 @@ mod tests {
         assert!(err
             .to_string()
             .contains("update`/`add`/`refresh` require explicit ids"));
-    }
-
-    #[test]
-    fn remote_record_prefers_expected_over_output() {
-        let row = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
-            "id": "case-1",
-            "expected": "expected",
-            "output": "output"
-        }))
-        .expect("map");
-        let record = prepared_record_from_remote_row(&row)
-            .expect("parse remote")
-            .expect("record");
-        assert_eq!(record.expected, Some(Value::String("expected".to_string())));
-    }
-
-    #[test]
-    fn remote_records_by_id_rejects_duplicate_ids() {
-        let rows = vec![
-            serde_json::from_value(serde_json::json!({"id": "dup", "expected": "a"}))
-                .expect("first row"),
-            serde_json::from_value(serde_json::json!({"id": "dup", "expected": "b"}))
-                .expect("second row"),
-        ];
-        let err = remote_records_by_id(rows).expect_err("duplicate remote ids");
-        assert!(err
-            .to_string()
-            .contains("remote dataset contains duplicate record id 'dup'"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{builder::BoolishValueParser, Args, Subcommand};
+use dialoguer::Input;
 
 use crate::{
     args::BaseArgs,
@@ -15,8 +16,8 @@ mod create;
 mod delete;
 mod list;
 mod records;
-mod refresh;
-mod upload;
+mod update;
+mod utils;
 mod view;
 
 use api::{self as datasets_api, Dataset};
@@ -98,7 +99,7 @@ enum DatasetsCommands {
     List,
     /// Create a new dataset, optionally seeding rows from a file, --rows, or stdin
     Create(CreateArgs),
-    /// Deterministically update remote dataset rows by record id
+    /// Upsert remote dataset rows by record id
     #[command(visible_aliases = ["add", "refresh"])]
     Update(UpdateArgs),
     /// View a dataset
@@ -206,6 +207,18 @@ impl DeleteArgs {
     }
 }
 
+pub(crate) fn resolve_dataset_name(name: Option<&str>, command: &str) -> Result<String> {
+    match name {
+        Some(name) if !name.trim().is_empty() => Ok(name.trim().to_string()),
+        _ => {
+            if !ui::is_interactive() {
+                bail!("dataset name required. Use: bt datasets {command} <name>");
+            }
+            Ok(Input::new().with_prompt("Dataset name").interact_text()?)
+        }
+    }
+}
+
 pub(crate) async fn select_dataset_interactive(
     client: &ApiClient,
     project_id: &str,
@@ -248,7 +261,7 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
             .await
         }
         Some(DatasetsCommands::Update(update_args)) => {
-            refresh::run(
+            update::run(
                 &ctx,
                 update_args.name.name(),
                 update_args.input.file.as_deref(),
