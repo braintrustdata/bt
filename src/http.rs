@@ -107,6 +107,30 @@ impl ApiClient {
         response.json().await.context("failed to parse response")
     }
 
+    pub async fn patch<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = self.url(path);
+        let response = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.api_key)
+            .json(body)
+            .send()
+            .await
+            .context("request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(HttpError { status, body }.into());
+        }
+
+        response.json().await.context("failed to parse response")
+    }
+
     pub async fn post_with_headers<T, B>(
         &self,
         path: &str,

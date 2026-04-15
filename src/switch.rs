@@ -253,14 +253,17 @@ mod tests {
     fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
         BaseArgs {
             json: false,
+            verbose: false,
             quiet: false,
             no_color: false,
+            no_input: false,
             profile: None,
+            profile_explicit: false,
             org_name: org.map(String::from),
             project: project.map(String::from),
             api_key: None,
+            api_key_source: None,
             prefer_profile: false,
-            no_input: false,
             api_url: None,
             app_url: None,
             env_file: None,

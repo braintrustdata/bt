@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,48 @@ pub struct AvailableOrg {
     pub id: String,
     pub name: String,
     pub api_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverableAuthErrorKind {
+    OauthProfileSelection,
+    OauthClientId,
+    OauthRefreshToken,
+    StoredCredential,
+}
+
+#[derive(Debug)]
+struct RecoverableAuthError {
+    kind: RecoverableAuthErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for RecoverableAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for RecoverableAuthError {}
+
+fn recoverable_auth_error(kind: RecoverableAuthErrorKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(RecoverableAuthError { kind, message })
+}
+
+pub fn is_missing_credential_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .downcast_ref::<RecoverableAuthError>()
+            .is_some_and(|err| {
+                matches!(
+                    err.kind,
+                    RecoverableAuthErrorKind::OauthProfileSelection
+                        | RecoverableAuthErrorKind::OauthClientId
+                        | RecoverableAuthErrorKind::OauthRefreshToken
+                        | RecoverableAuthErrorKind::StoredCredential
+                )
+            })
+    })
 }
 
 pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
@@ -495,8 +538,16 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
     }
 }
 
+fn has_explicit_profile_selection(base: &BaseArgs) -> bool {
+    base.profile_explicit
+        && base
+            .profile
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
-    if base.prefer_profile {
+    if base.prefer_profile || has_explicit_profile_selection(base) {
         return None;
     }
     let value = base.api_key.as_deref()?.trim();
@@ -523,15 +574,23 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
         .or_else(|| {
             (store.profiles.len() == 1).then(|| store.profiles.keys().next().unwrap().as_str())
         })
-        .ok_or_else(|| anyhow::anyhow!("oauth profile requested but none selected"))?
+        .ok_or_else(|| {
+            recoverable_auth_error(
+                RecoverableAuthErrorKind::OauthProfileSelection,
+                "oauth profile requested but none selected".to_string(),
+            )
+        })?
         .to_string();
     let profile = store
         .profiles
         .get(profile_name.as_str())
         .ok_or_else(|| anyhow::anyhow!("profile '{profile_name}' not found"))?;
     let client_id = profile.oauth_client_id.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
+        recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthClientId,
+            format!(
+                "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
+            ),
         )
     })?;
     let cached_expires_at = profile.oauth_access_expires_at;
@@ -548,8 +607,11 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     }
 
     let refresh_token = load_profile_oauth_refresh_token(&profile_name)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
+        recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthRefreshToken,
+            format!(
+                "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
+            ),
         )
     })?;
     let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
@@ -669,8 +731,11 @@ where
             None
         } else {
             Some(load_secret(profile_name)?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no keychain credential found for profile '{profile_name}'; re-run `bt auth login --profile {profile_name}`"
+                recoverable_auth_error(
+                    RecoverableAuthErrorKind::StoredCredential,
+                    format!(
+                        "no keychain credential found for profile '{profile_name}'; re-run `bt auth login --profile {profile_name}`"
+                    ),
                 )
             })?)
         };
@@ -860,6 +925,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn login_interactive(base: &mut BaseArgs) -> Result<String> {
     let methods = ["OAuth (browser)", "API key"];
     let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
@@ -871,6 +937,11 @@ pub async fn login_interactive(base: &mut BaseArgs) -> Result<String> {
     }
 }
 
+pub async fn login_setup_oauth(base: &mut BaseArgs) -> Result<String> {
+    login_interactive_oauth(base).await
+}
+
+#[allow(dead_code)]
 async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
     let api_key = prompt_api_key()?;
 
@@ -1238,12 +1309,6 @@ fn format_login_success(
 }
 
 async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
-    if resolve_api_key_override(base).is_some() {
-        println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
-        eprintln!("Tip: pass --prefer-profile or unset BRAINTRUST_API_KEY to use profiles.");
-        return Ok(());
-    }
-
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
         println!("No saved profiles. Run `bt auth login` to create one.");
@@ -2671,14 +2736,17 @@ mod tests {
     fn make_base() -> BaseArgs {
         BaseArgs {
             json: false,
+            verbose: false,
             quiet: false,
             no_color: false,
+            no_input: false,
             profile: None,
+            profile_explicit: false,
             project: None,
             org_name: None,
             api_key: None,
+            api_key_source: None,
             prefer_profile: false,
-            no_input: false,
             api_url: None,
             app_url: None,
             env_file: None,
@@ -2737,6 +2805,34 @@ mod tests {
 
     fn assert_invalid_api_url<T>(result: Result<T>) {
         assert_err_contains(result, "invalid api_url");
+    }
+
+    #[test]
+    fn missing_credential_error_helper_detects_typed_auth_errors() {
+        let err = recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthRefreshToken,
+            "oauth refresh token missing".to_string(),
+        );
+
+        assert!(is_missing_credential_error(&err));
+    }
+
+    #[test]
+    fn missing_credential_error_helper_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("some unrelated error");
+
+        assert!(!is_missing_credential_error(&err));
+    }
+
+    #[test]
+    fn missing_credential_error_helper_detects_errors_through_context() {
+        let err = recoverable_auth_error(
+            RecoverableAuthErrorKind::StoredCredential,
+            "missing stored credential".to_string(),
+        )
+        .context("while resolving auth");
+
+        assert!(is_missing_credential_error(&err));
     }
 
     fn restore_env_var(key: &str, previous: Option<OsString>) {
@@ -2941,6 +3037,69 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn resolve_auth_explicit_profile_ignores_api_key_override() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".to_string());
+        base.profile = Some("work".to_string());
+        base.profile_explicit = true;
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: None,
+                org_name: Some("Example Org".to_string()),
+                oauth_client_id: None,
+                oauth_access_expires_at: None,
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn resolve_auth_env_profile_still_prefers_api_key_override() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".to_string());
+        base.profile = Some("work".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: None,
+                org_name: Some("Example Org".to_string()),
+                oauth_client_id: None,
+                oauth_access_expires_at: None,
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
+        assert!(!resolved.is_oauth);
     }
 
     #[test]

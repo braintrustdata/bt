@@ -266,10 +266,11 @@ Local transaction-id conversion helpers:
 
 Auth resolution order for commands is:
 
-1. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
-2. `--profile` or `BRAINTRUST_PROFILE`
-3. Org-based profile match (profile whose org matches `--org`/config org)
-4. Single-profile auto-select (if only one profile exists)
+1. Explicit `--profile`
+2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
+3. `BRAINTRUST_PROFILE`
+4. Org-based profile match (profile whose org matches `--org`/config org)
+5. Single-profile auto-select (if only one profile exists)
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
 
