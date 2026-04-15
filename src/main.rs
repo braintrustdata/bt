@@ -32,7 +32,7 @@ mod ui;
 mod util_cmd;
 mod utils;
 
-use crate::args::{ArgValueSource, BaseArgs, CLIArgs};
+use crate::args::{has_explicit_profile_arg, ArgValueSource, BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -236,9 +236,10 @@ async fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
-    let matches = Cli::command().get_matches_from(&argv);
+    let matches = Cli::command().get_matches_from(argv.clone());
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
     apply_base_arg_sources(&matches, cli.command.base_mut());
+    cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     configure_output(cli.command.base());
 
     match cli.command {

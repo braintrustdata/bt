@@ -3451,6 +3451,7 @@ mod tests {
             no_color: false,
             no_input: true,
             profile: None,
+            profile_explicit: false,
             org_name: None,
             project: None,
             api_key: None,
