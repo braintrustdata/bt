@@ -181,6 +181,7 @@ struct DevServerState {
 struct DevAuthContext {
     token: String,
     org_name: String,
+    api_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1093,26 +1094,33 @@ async fn authenticate_dev_request(
 
     let payload = response.json::<Value>().await.unwrap_or(Value::Null);
     if let Some(orgs) = payload.get("org_info").and_then(|value| value.as_array()) {
-        let matched = orgs.iter().any(|org| {
+        let matched_org = orgs.iter().find(|org| {
             org.get("name")
                 .and_then(|name| name.as_str())
                 .map(|name| name == org_name)
                 .unwrap_or(false)
         });
-        if !matched {
+        let Some(matched_org) = matched_org else {
             return Err(json_error_response(
                 actix_web::http::StatusCode::UNAUTHORIZED,
                 "Unauthorized",
             ));
-        }
+        };
+        let api_url = matched_org
+            .get("api_url")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        Ok(DevAuthContext {
+            token,
+            org_name,
+            api_url,
+        })
     } else {
-        return Err(json_error_response(
+        Err(json_error_response(
             actix_web::http::StatusCode::UNAUTHORIZED,
             "Unauthorized",
-        ));
+        ))
     }
-
-    Ok(DevAuthContext { token, org_name })
 }
 
 async fn resolve_dataset_ref_for_eval_request(
@@ -1227,6 +1235,9 @@ fn make_dev_mode_env(
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
+    if let Some(api_url) = auth.api_url.as_ref() {
+        env.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
+    }
     if let Some(request) = request {
         let serialized =
             serde_json::to_string(request).context("failed to serialize eval request payload")?;
