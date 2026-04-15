@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
-use crate::args::{ArgValueSource, BaseArgs};
+use crate::args::{ArgValueSource, BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
 use crate::auth;
 use crate::auth::LoginContext;
 use crate::config;
@@ -513,40 +513,57 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     } = flags;
     let mut had_failures = false;
     let verbose = base.verbose;
+    let will_instrument = !flag_no_instrument && find_git_root().is_some();
 
     // ── Step 1: Auth ──
     if verbose {
         print_wizard_step(1, "Auth");
     }
-    let project_flag = base.project.clone();
-    let client = ensure_setup_auth(&mut base, !flag_no_instrument, !flag_no_instrument).await?;
-    let org = client.org_name().to_string();
+    let project_flag = will_instrument.then(|| base.project.clone()).flatten();
+    let setup_client = if will_instrument {
+        Some(ensure_setup_auth(&mut base, !flag_no_instrument, !flag_no_instrument).await?)
+    } else {
+        None
+    };
+    let org = setup_client
+        .as_ref()
+        .map(|client| client.org_name().to_string());
 
     if verbose {
-        eprintln!("   {} Using org '{}'", style("✓").green(), org);
+        if let Some(org) = org.as_deref() {
+            eprintln!("   {} Using org '{}'", style("✓").green(), org);
+        } else {
+            eprintln!("   {}", style("Skipped").dim());
+        }
     }
 
     // ── Step 2: Project ──
     if verbose {
         print_wizard_step(2, "Project");
     }
-    let project = select_project_with_skip(&client, project_flag.as_deref(), !verbose).await?;
+    let project = if let Some(client) = setup_client.as_ref() {
+        select_project_with_skip(client, project_flag.as_deref(), !verbose).await?
+    } else {
+        None
+    };
     if verbose {
         if let Some(ref project) = project {
-            if find_git_root().is_some() && maybe_init(&org, project)? {
-                eprintln!(
-                    "   {} Linked to {}/{}",
-                    style("✓").green(),
-                    org,
-                    project.name
-                );
+            if let Some(org) = org.as_deref() {
+                if maybe_init(org, project)? {
+                    eprintln!(
+                        "   {} Linked to {}/{}",
+                        style("✓").green(),
+                        org,
+                        project.name
+                    );
+                }
             }
         } else {
             eprintln!("   {}", style("Skipped").dim());
         }
     } else if let Some(ref project) = project {
-        if find_git_root().is_some() {
-            let _ = maybe_init(&org, project)?;
+        if let Some(org) = org.as_deref() {
+            let _ = maybe_init(org, project)?;
         }
     }
 
@@ -775,16 +792,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 }
 
 async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
-    let needs_auth = !args.no_instrument;
-    if needs_auth {
+    let will_instrument = !args.no_instrument && find_git_root().is_some();
+    if will_instrument {
         let project_flag = base.project.clone();
         let client = ensure_setup_auth(&mut base, false, true).await?;
         let org = client.org_name().to_string();
         let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
-            if find_git_root().is_some() {
-                let _ = maybe_init(&org, project)?;
-            }
+            let _ = maybe_init(&org, project)?;
         }
     }
 
@@ -830,7 +845,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     }
 
     if !args.no_instrument {
-        if find_git_root().is_some() {
+        if will_instrument {
             run_instrument_setup(
                 base,
                 InstrumentSetupArgs {
@@ -861,18 +876,55 @@ fn in_ci() -> bool {
     std::env::var_os("CI").is_some()
 }
 
+fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
+    let cfg = config::load().unwrap_or_default();
+
+    if base
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        base.org_name = cfg
+            .org
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    if base
+        .project
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        base.project = cfg
+            .project
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+}
+
+fn setup_can_prompt(base: &BaseArgs) -> bool {
+    !base.json && !base.no_input && !in_ci() && ui::can_prompt()
+}
+
 fn resolve_profile_name_for_setup(
     base: &BaseArgs,
     profiles: &[auth::ProfileInfo],
     prompt_for_choice: bool,
-) -> Result<String> {
+) -> Result<Option<String>> {
     if let Some(profile_name) = base
         .profile
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Ok(profile_name.to_string());
+        if profiles.iter().any(|profile| profile.name == profile_name) {
+            return Ok(Some(profile_name.to_string()));
+        }
+        bail!(
+            "profile '{profile_name}' not found; run `bt auth profiles` to see available profiles"
+        );
     }
 
     if let Some(org_name) = base.org_name.as_deref() {
@@ -881,7 +933,7 @@ fn resolve_profile_name_for_setup(
             .find(|profile| profile.name == org_name)
             .map(|profile| profile.name.clone())
         {
-            return Ok(profile_name);
+            return Ok(Some(profile_name));
         }
 
         let mut matches = profiles
@@ -892,56 +944,210 @@ fn resolve_profile_name_for_setup(
         matches.sort();
 
         return match matches.len() {
-            0 => auth::resolve_org_to_profile(org_name, profiles),
-            1 => Ok(matches.remove(0)),
+            0 => Ok(None),
+            1 => Ok(Some(matches.remove(0))),
             _ if prompt_for_choice => auth::select_profile_interactive(Some(org_name))?
+                .map(Some)
                 .ok_or_else(|| anyhow!("no profile selected")),
-            _ => Ok(matches.remove(0)),
+            _ => bail!(
+                "multiple profiles for org '{org_name}': {}. Use --profile to disambiguate.",
+                matches.join(", ")
+            ),
         };
     }
 
     if profiles.len() == 1 {
-        return Ok(profiles[0].name.clone());
+        return Ok(Some(profiles[0].name.clone()));
     }
 
     if prompt_for_choice {
-        auth::select_profile_interactive(None)?.ok_or_else(|| anyhow!("no profile selected"))
+        auth::select_profile_interactive(None)?
+            .map(Some)
+            .ok_or_else(|| anyhow!("no profile selected"))
     } else {
-        let mut names = profiles
-            .iter()
-            .map(|profile| profile.name.clone())
-            .collect::<Vec<_>>();
-        names.sort();
-        Ok(names.remove(0))
+        Ok(None)
     }
 }
 
-async fn ensure_auth(
+fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
+}
+
+async fn list_available_orgs_for_setup(
+    api_key: &str,
+    app_url: &str,
+) -> Result<Vec<auth::AvailableOrg>> {
+    match auth::list_available_orgs_for_api_key(api_key, app_url).await {
+        Ok(orgs) => Ok(orgs),
+        Err(err) => {
+            if let Some(http_err) = find_http_error(&err) {
+                if matches!(http_err.status.as_u16(), 401 | 403) {
+                    return Ok(Vec::new());
+                }
+            }
+            if err
+                .to_string()
+                .contains("no organizations found for this API key")
+            {
+                return Ok(Vec::new());
+            }
+            Err(err)
+        }
+    }
+}
+
+fn find_available_org<'a>(
+    orgs: &'a [auth::AvailableOrg],
+    org_name: &str,
+) -> Option<&'a auth::AvailableOrg> {
+    orgs.iter().find(|org| org.name == org_name).or_else(|| {
+        let lowered = org_name.to_ascii_lowercase();
+        orgs.iter()
+            .find(|org| org.name.to_ascii_lowercase() == lowered)
+    })
+}
+
+fn build_api_key_login_context(
+    base: &BaseArgs,
+    api_key: &str,
+    org: &auth::AvailableOrg,
+) -> LoginContext {
+    let api_url = base
+        .api_url
+        .clone()
+        .or_else(|| org.api_url.clone())
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let app_url = base
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+
+    LoginContext {
+        login: braintrust_sdk_rust::LoginState {
+            api_key: api_key.to_string(),
+            org_id: org.id.clone(),
+            org_name: org.name.clone(),
+            api_url: Some(api_url.clone()),
+        },
+        api_url,
+        app_url,
+    }
+}
+
+async fn build_api_key_client(
+    base: &BaseArgs,
+    api_key: &str,
+    org: &auth::AvailableOrg,
+) -> Result<ApiClient> {
+    ApiClient::new(&build_api_key_login_context(base, api_key, org))
+}
+
+async fn project_exists_in_org(client: &ApiClient, project_name: &str) -> Result<bool> {
+    let projects = crate::projects::api::list_projects(client).await?;
+    Ok(projects
+        .into_iter()
+        .any(|project| project.name == project_name))
+}
+
+async fn orgs_with_project(
+    base: &BaseArgs,
+    api_key: &str,
+    orgs: &[auth::AvailableOrg],
+    project_name: &str,
+) -> Result<Vec<auth::AvailableOrg>> {
+    let mut matches = Vec::new();
+    for org in orgs {
+        let client = build_api_key_client(base, api_key, org).await?;
+        if project_exists_in_org(&client, project_name).await? {
+            matches.push(org.clone());
+        }
+    }
+    Ok(matches)
+}
+
+fn prompt_for_org_choice(prompt: &str, orgs: &[auth::AvailableOrg]) -> Result<auth::AvailableOrg> {
+    let labels: Vec<&str> = orgs.iter().map(|org| org.name.as_str()).collect();
+    let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .items(&labels)
+        .default(0)
+        .interact_on(&ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?)?;
+    Ok(orgs[idx].clone())
+}
+
+fn select_api_key_org_for_setup(
+    base: &BaseArgs,
+    orgs: &[auth::AvailableOrg],
+    project_name: Option<&str>,
+    preferred_org_names: &[String],
+) -> Result<auth::AvailableOrg> {
+    let mut candidates = if preferred_org_names.is_empty() {
+        orgs.to_vec()
+    } else {
+        orgs.iter()
+            .filter(|org| preferred_org_names.iter().any(|name| name == &org.name))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    candidates.sort_by(|left, right| left.name.cmp(&right.name));
+    candidates.dedup_by(|left, right| left.name == right.name);
+
+    if candidates.len() == 1 {
+        return Ok(candidates.remove(0));
+    }
+
+    if setup_can_prompt(base) {
+        let prompt = if project_name.is_some() {
+            "Select organization for the requested project"
+        } else {
+            "Select organization"
+        };
+        return prompt_for_org_choice(prompt, &candidates);
+    }
+
+    bail!("organization choice required in non-interactive mode; pass --org <NAME>")
+}
+
+fn matching_profile_org_names(
+    profiles: &[auth::StoredProfileInfo],
+    only_oauth: Option<bool>,
+) -> Vec<String> {
+    let mut org_names = profiles
+        .iter()
+        .filter(|profile| {
+            only_oauth
+                .map(|expected| profile.is_oauth == expected)
+                .unwrap_or(true)
+        })
+        .filter_map(|profile| profile.org_name.clone())
+        .collect::<Vec<_>>();
+    org_names.sort();
+    org_names.dedup();
+    org_names
+}
+
+async fn ensure_profile_or_oauth_auth(
     base: &mut BaseArgs,
     prompt_for_profile_choice: bool,
 ) -> Result<(LoginContext, bool)> {
-    if matches!(base.api_key_source, Some(ArgValueSource::CommandLine)) {
-        return Ok((auth::login(base).await?, false));
-    }
-
-    if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) && !base.prefer_profile {
-        return Ok((auth::login(base).await?, false));
-    }
-
     let profiles = auth::list_profiles()?;
-    if !profiles.is_empty() {
-        let should_prompt_for_profile_choice = prompt_for_profile_choice
-            && !base.json
-            && !base.no_input
-            && !in_ci()
-            && ui::can_prompt();
-        let profile_name =
-            resolve_profile_name_for_setup(base, &profiles, should_prompt_for_profile_choice)?;
-        base.profile = Some(profile_name.clone());
+    let can_prompt = setup_can_prompt(base);
+    let should_prompt_for_profile_choice = prompt_for_profile_choice && can_prompt;
+    let selected_profile =
+        resolve_profile_name_for_setup(base, &profiles, should_prompt_for_profile_choice)?;
+    let mut auth_base = base.clone();
+    auth_base.api_key = None;
+    auth_base.api_key_source = None;
 
-        match auth::login(base).await {
+    if let Some(profile_name) = selected_profile {
+        auth_base.profile = Some(profile_name.clone());
+
+        match auth::login(&auth_base).await {
             Ok(ctx) => {
-                let is_oauth = auth::resolve_auth(base).await?.is_oauth;
+                base.profile = auth_base.profile.clone();
+                let is_oauth = auth::resolve_auth(&auth_base).await?.is_oauth;
                 return Ok((ctx, is_oauth));
             }
             Err(err) if auth::is_missing_credential_error(&err) => {
@@ -951,18 +1157,34 @@ async fn ensure_auth(
                         profile_name, err
                     );
                 }
-                auth::login_interactive_oauth(base).await?;
-                return Ok((auth::login(base).await?, true));
+                if !can_prompt {
+                    bail!(
+                        "setup needs interactive OAuth re-authentication; rerun without --no-input/--json or pass a working API key"
+                    );
+                }
+                auth::login_interactive_oauth(&mut auth_base).await?;
+                base.profile = auth_base.profile.clone();
+                return Ok((auth::login(&auth_base).await?, true));
             }
             Err(err) => return Err(err),
         }
     }
 
-    if base.verbose {
-        eprintln!("No auth profiles found. Starting OAuth login.\n");
+    if !can_prompt {
+        if profiles.is_empty() {
+            bail!(
+                "setup needs interactive authentication; rerun without --no-input/--json or pass a valid API key/profile"
+            );
+        }
+        bail!("profile selection required in non-interactive mode; pass --profile <NAME>");
     }
-    auth::login_interactive_oauth(base).await?;
-    Ok((auth::login(base).await?, true))
+
+    if base.verbose {
+        eprintln!("Starting OAuth login.\n");
+    }
+    auth::login_interactive_oauth(&mut auth_base).await?;
+    base.profile = auth_base.profile.clone();
+    Ok((auth::login(&auth_base).await?, true))
 }
 
 async fn ensure_setup_auth(
@@ -970,7 +1192,226 @@ async fn ensure_setup_auth(
     prompt_for_profile_choice: bool,
     will_instrument: bool,
 ) -> Result<ApiClient> {
-    let (login_ctx, is_oauth) = ensure_auth(base, prompt_for_profile_choice).await?;
+    apply_setup_config_fallbacks(base);
+
+    let explicit_api_key = base
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let stored_profiles = auth::list_stored_profiles()?;
+    let project_name = base
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let org_name = base
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let profile_name = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if let Some(api_key) = explicit_api_key.as_deref() {
+        let app_url = base
+            .app_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+        let available_orgs = list_available_orgs_for_setup(api_key, &app_url).await?;
+
+        if let Some(profile_name) = profile_name.as_deref() {
+            let profile = stored_profiles
+                .iter()
+                .find(|profile| profile.name == profile_name)
+                .ok_or_else(|| anyhow!("profile '{profile_name}' not found"))?;
+            let target_org = match org_name.as_deref() {
+                Some(org_name) => {
+                    if profile.org_name.as_deref() != Some(org_name) {
+                        bail!(
+                            "profile '{profile_name}' belongs to org '{}' but '{}' was requested",
+                            profile.org_name.as_deref().unwrap_or("(none)"),
+                            org_name
+                        );
+                    }
+                    org_name
+                }
+                None => profile.org_name.as_deref().ok_or_else(|| {
+                    anyhow!("profile '{profile_name}' does not have a default org")
+                })?,
+            };
+
+            if let Some(org) = find_available_org(&available_orgs, target_org) {
+                let client = build_api_key_client(base, api_key, org).await?;
+                if let Some(project_name) = project_name.as_deref() {
+                    if !project_exists_in_org(&client, project_name).await? {
+                        bail!("project '{project_name}' not found in org '{}'", org.name);
+                    }
+                }
+                return Ok(client);
+            }
+
+            let (login_ctx, is_oauth) =
+                ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
+            let client = ApiClient::new(&login_ctx)?;
+            if let Some(project_name) = project_name.as_deref() {
+                if !project_exists_in_org(&client, project_name).await? {
+                    bail!(
+                        "project '{project_name}' not found in org '{}'",
+                        client.org_name()
+                    );
+                }
+            }
+            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
+                maybe_create_api_key_for_instrumentation(base, &client).await?;
+            }
+            return Ok(client);
+        }
+
+        if let Some(org_name) = org_name.as_deref() {
+            let matching_profile_count = stored_profiles
+                .iter()
+                .filter(|profile| profile.org_name.as_deref() == Some(org_name))
+                .count();
+            if base.prefer_profile && matching_profile_count == 0 {
+                bail!("no profile found for org '{org_name}'");
+            }
+
+            if let Some(org) = find_available_org(&available_orgs, org_name) {
+                let client = build_api_key_client(base, api_key, org).await?;
+                if let Some(project_name) = project_name.as_deref() {
+                    if !project_exists_in_org(&client, project_name).await? {
+                        bail!("project '{project_name}' not found in org '{org_name}'");
+                    }
+                }
+                return Ok(client);
+            }
+
+            let (login_ctx, is_oauth) =
+                ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
+            let client = ApiClient::new(&login_ctx)?;
+            if let Some(project_name) = project_name.as_deref() {
+                if !project_exists_in_org(&client, project_name).await? {
+                    bail!(
+                        "project '{project_name}' not found in org '{}'",
+                        client.org_name()
+                    );
+                }
+            }
+            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
+                maybe_create_api_key_for_instrumentation(base, &client).await?;
+            }
+            return Ok(client);
+        }
+
+        if base.prefer_profile {
+            if stored_profiles.is_empty() {
+                let matched_orgs = match project_name.as_deref() {
+                    Some(project_name) => {
+                        orgs_with_project(base, api_key, &available_orgs, project_name).await?
+                    }
+                    None => available_orgs.clone(),
+                };
+                if matched_orgs.is_empty() {
+                    let (login_ctx, is_oauth) =
+                        ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
+                    let client = ApiClient::new(&login_ctx)?;
+                    if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
+                        maybe_create_api_key_for_instrumentation(base, &client).await?;
+                    }
+                    return Ok(client);
+                }
+                let org = select_api_key_org_for_setup(
+                    base,
+                    &matched_orgs,
+                    project_name.as_deref(),
+                    &[],
+                )?;
+                let client = build_api_key_client(base, api_key, &org).await?;
+                let api_url = base
+                    .api_url
+                    .clone()
+                    .or_else(|| org.api_url.clone())
+                    .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+                auth::commit_api_key_profile(
+                    &org.name,
+                    api_key,
+                    api_url,
+                    base.app_url.clone(),
+                    Some(org.name.clone()),
+                )?;
+                return Ok(client);
+            }
+
+            let preferred_org_names = matching_profile_org_names(&stored_profiles, None);
+            let matching_orgs = available_orgs
+                .iter()
+                .filter(|org| preferred_org_names.iter().any(|name| name == &org.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching_orgs.is_empty() {
+                let (login_ctx, is_oauth) =
+                    ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
+                let client = ApiClient::new(&login_ctx)?;
+                if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
+                    maybe_create_api_key_for_instrumentation(base, &client).await?;
+                }
+                return Ok(client);
+            }
+
+            let candidate_orgs = match project_name.as_deref() {
+                Some(project_name) => {
+                    orgs_with_project(base, api_key, &matching_orgs, project_name).await?
+                }
+                None => matching_orgs,
+            };
+            if candidate_orgs.is_empty() {
+                let (login_ctx, is_oauth) =
+                    ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
+                let client = ApiClient::new(&login_ctx)?;
+                if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
+                    maybe_create_api_key_for_instrumentation(base, &client).await?;
+                }
+                return Ok(client);
+            }
+            let org = select_api_key_org_for_setup(
+                base,
+                &candidate_orgs,
+                project_name.as_deref(),
+                &preferred_org_names,
+            )?;
+            return build_api_key_client(base, api_key, &org).await;
+        }
+
+        let candidate_orgs = match project_name.as_deref() {
+            Some(project_name) => {
+                orgs_with_project(base, api_key, &available_orgs, project_name).await?
+            }
+            None => available_orgs.clone(),
+        };
+        if candidate_orgs.is_empty() {
+            let (login_ctx, is_oauth) =
+                ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
+            let client = ApiClient::new(&login_ctx)?;
+            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
+                maybe_create_api_key_for_instrumentation(base, &client).await?;
+            }
+            return Ok(client);
+        }
+        let org =
+            select_api_key_org_for_setup(base, &candidate_orgs, project_name.as_deref(), &[])?;
+        return build_api_key_client(base, api_key, &org).await;
+    }
+
+    let (login_ctx, is_oauth) =
+        ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
     let client = ApiClient::new(&login_ctx)?;
     if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
         maybe_create_api_key_for_instrumentation(base, &client).await?;
@@ -1062,19 +1503,19 @@ async fn select_project_for_setup(
     project_name: Option<&str>,
 ) -> Result<crate::projects::api::Project> {
     if let Some(name) = project_name {
-        let project = with_spinner(
-            "Loading project...",
-            crate::projects::api::get_project_by_name(client, name),
+        let projects = with_spinner(
+            "Loading projects...",
+            crate::projects::api::list_projects(client),
         )
         .await?;
-        match project {
-            Some(p) => return Ok(p),
-            None => bail!(
-                "project '{}' not found in org '{}'",
-                name,
-                client.org_name()
-            ),
+        if let Some(project) = projects.into_iter().find(|project| project.name == name) {
+            return Ok(project);
         }
+        bail!(
+            "project '{}' not found in org '{}'",
+            name,
+            client.org_name()
+        )
     }
 
     let mut projects = with_spinner(
@@ -3534,7 +3975,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_profile_name_for_setup_uses_first_alphabetical_profile_without_prompt() {
+    fn resolve_profile_name_for_setup_requires_prompt_when_multiple_profiles_exist() {
         let base = make_base_args();
         let profiles = vec![
             auth::ProfileInfo {
@@ -3555,7 +3996,24 @@ mod tests {
 
         let resolved =
             resolve_profile_name_for_setup(&base, &profiles, false).expect("resolve profile");
-        assert_eq!(resolved, "alpha");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_profile_name_for_setup_errors_for_unknown_explicit_profile() {
+        let mut base = make_base_args();
+        base.profile = Some("missing".to_string());
+        let profiles = vec![auth::ProfileInfo {
+            name: "work".to_string(),
+            org_name: Some("Acme".to_string()),
+            user_name: None,
+            email: None,
+            api_key_hint: None,
+        }];
+
+        let err =
+            resolve_profile_name_for_setup(&base, &profiles, false).expect_err("missing profile");
+        assert!(err.to_string().contains("profile 'missing' not found"));
     }
 
     #[test]

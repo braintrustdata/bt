@@ -61,6 +61,13 @@ pub struct ProfileInfo {
     pub api_key_hint: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StoredProfileInfo {
+    pub name: String,
+    pub is_oauth: bool,
+    pub org_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableOrg {
     pub id: String,
@@ -121,6 +128,19 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
             user_name: p.user_name.clone(),
             email: p.email.clone(),
             api_key_hint: p.api_key_hint.clone(),
+        })
+        .collect())
+}
+
+pub(crate) fn list_stored_profiles() -> Result<Vec<StoredProfileInfo>> {
+    let store = load_auth_store()?;
+    Ok(store
+        .profiles
+        .iter()
+        .map(|(name, profile)| StoredProfileInfo {
+            name: name.clone(),
+            is_oauth: profile.auth_kind == AuthKind::Oauth,
+            org_name: profile.org_name.clone(),
         })
         .collect())
 }
@@ -216,6 +236,28 @@ pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
     };
 
     let mut orgs = fetch_login_orgs(&api_key, &app_url).await?;
+    orgs.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(orgs
+        .into_iter()
+        .map(|org| AvailableOrg {
+            id: org.id,
+            name: org.name,
+            api_url: org.api_url,
+        })
+        .collect())
+}
+
+pub(crate) async fn list_available_orgs_for_api_key(
+    api_key: &str,
+    app_url: &str,
+) -> Result<Vec<AvailableOrg>> {
+    let mut orgs = fetch_login_orgs(api_key, app_url).await?;
     orgs.sort_by(|a, b| {
         a.name
             .to_ascii_lowercase()
@@ -762,11 +804,16 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
+    let store = load_auth_store()?;
+    let (profile_name, should_confirm_overwrite) = resolve_api_key_login_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
+        &selected_api_url,
+        &store,
     )?;
-    confirm_profile_overwrite(&profile_name)?;
+    if should_confirm_overwrite {
+        confirm_profile_overwrite(&profile_name)?;
+    }
 
     commit_api_key_profile(
         &profile_name,
@@ -862,11 +909,19 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
+    let store = load_auth_store()?;
+    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
+    let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
+        &selected_api_url,
+        &app_url,
+        &jwt_id,
+        &store,
     )?;
-    confirm_profile_overwrite(&profile_name)?;
+    if should_confirm_overwrite {
+        confirm_profile_overwrite(&profile_name)?;
+    }
 
     commit_oauth_profile(
         &profile_name,
@@ -960,11 +1015,19 @@ pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<Strin
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
+    let store = load_auth_store()?;
+    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
+    let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
+        &selected_api_url,
+        &app_url,
+        &jwt_id,
+        &store,
     )?;
-    confirm_profile_overwrite(&profile_name)?;
+    if should_confirm_overwrite {
+        confirm_profile_overwrite(&profile_name)?;
+    }
 
     commit_oauth_profile(
         &profile_name,
@@ -979,7 +1042,7 @@ pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<Strin
     Ok(profile_name)
 }
 
-fn commit_api_key_profile(
+pub(crate) fn commit_api_key_profile(
     profile_name: &str,
     api_key: &str,
     api_url: String,
@@ -1170,6 +1233,102 @@ fn resolve_profile_name(
         .filter(|name| !name.is_empty())
         .unwrap_or("profile")
         .to_string())
+}
+
+fn default_profile_name(suggested_org_name: Option<&str>) -> String {
+    suggested_org_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("profile")
+        .to_string()
+}
+
+fn next_available_profile_name(base_name: &str, store: &AuthStore) -> String {
+    if !store.profiles.contains_key(base_name) {
+        return base_name.to_string();
+    }
+
+    (2u32..)
+        .map(|idx| format!("{base_name}-{idx}"))
+        .find(|candidate| !store.profiles.contains_key(candidate))
+        .expect("profile name sequence is infinite")
+}
+
+fn resolve_api_key_login_profile_name(
+    explicit_profile: Option<&str>,
+    suggested_org_name: Option<&str>,
+    selected_api_url: &str,
+    store: &AuthStore,
+) -> Result<(String, bool)> {
+    if let Some(profile_name) = explicit_profile {
+        let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
+        return Ok((
+            profile_name.clone(),
+            store.profiles.contains_key(&profile_name),
+        ));
+    }
+
+    let default_name = default_profile_name(suggested_org_name);
+    let has_matching_api_key_profile = store.profiles.values().any(|profile| {
+        profile.auth_kind == AuthKind::ApiKey
+            && profile.api_url.as_deref() == Some(selected_api_url)
+            && profile.org_name.as_deref() == suggested_org_name
+    });
+
+    if has_matching_api_key_profile {
+        return Ok((next_available_profile_name(&default_name, store), false));
+    }
+
+    Ok((
+        default_name.clone(),
+        store.profiles.contains_key(&default_name),
+    ))
+}
+
+fn resolve_oauth_login_profile_name(
+    explicit_profile: Option<&str>,
+    suggested_org_name: Option<&str>,
+    selected_api_url: &str,
+    app_url: &str,
+    jwt_id: &JwtIdentity,
+    store: &AuthStore,
+) -> Result<(String, bool)> {
+    if let Some(profile_name) = explicit_profile {
+        let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
+        return Ok((
+            profile_name.clone(),
+            store.profiles.contains_key(&profile_name),
+        ));
+    }
+
+    let matched_profile = store
+        .profiles
+        .iter()
+        .filter(|(_, profile)| {
+            profile.auth_kind == AuthKind::Oauth
+                && profile.api_url.as_deref() == Some(selected_api_url)
+                && profile.app_url.as_deref() == Some(app_url)
+                && profile.org_name.as_deref() == suggested_org_name
+                && profile.user_name == jwt_id.name
+                && profile.email == jwt_id.email
+        })
+        .max_by(|(left_name, left), (right_name, right)| {
+            left.oauth_access_expires_at
+                .unwrap_or_default()
+                .cmp(&right.oauth_access_expires_at.unwrap_or_default())
+                .then_with(|| left_name.cmp(right_name))
+        })
+        .map(|(name, _)| name.clone());
+
+    if let Some(profile_name) = matched_profile {
+        return Ok((profile_name, false));
+    }
+
+    let default_name = default_profile_name(suggested_org_name);
+    Ok((
+        default_name.clone(),
+        store.profiles.contains_key(&default_name),
+    ))
 }
 
 fn confirm_profile_overwrite(profile_name: &str) -> Result<()> {
@@ -3195,6 +3354,79 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("other-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));
+    }
+
+    #[test]
+    fn resolve_api_key_login_profile_name_creates_new_profile_for_matching_org() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "acme".into(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.acme.example".into()),
+                org_name: Some("acme".into()),
+                ..Default::default()
+            },
+        );
+
+        let (profile_name, should_confirm) = resolve_api_key_login_profile_name(
+            None,
+            Some("acme"),
+            "https://api.acme.example",
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "acme-2");
+        assert!(!should_confirm);
+    }
+
+    #[test]
+    fn resolve_oauth_login_profile_name_reuses_most_recent_matching_profile() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "older".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                api_url: Some("https://api.acme.example".into()),
+                app_url: Some("https://www.acme.example".into()),
+                org_name: Some("acme".into()),
+                oauth_access_expires_at: Some(100),
+                user_name: Some("Alice".into()),
+                email: Some("alice@example.com".into()),
+                ..Default::default()
+            },
+        );
+        store.profiles.insert(
+            "newer".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                api_url: Some("https://api.acme.example".into()),
+                app_url: Some("https://www.acme.example".into()),
+                org_name: Some("acme".into()),
+                oauth_access_expires_at: Some(200),
+                user_name: Some("Alice".into()),
+                email: Some("alice@example.com".into()),
+                ..Default::default()
+            },
+        );
+
+        let jwt_id = JwtIdentity {
+            name: Some("Alice".into()),
+            email: Some("alice@example.com".into()),
+        };
+        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
+            None,
+            Some("acme"),
+            "https://api.acme.example",
+            "https://www.acme.example",
+            &jwt_id,
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "newer");
+        assert!(!should_confirm);
     }
 
     #[test]
