@@ -248,7 +248,7 @@ fn setup_accepts_no_skill_alias() {
 }
 
 #[test]
-fn setup_mcp_only_no_instrument_does_not_require_project_or_auth() {
+fn setup_mcp_only_requires_auth_in_non_interactive_mode() {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
@@ -274,6 +274,8 @@ fn setup_mcp_only_no_instrument_does_not_require_project_or_auth() {
             "--no-input",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Configuring MCP for Braintrust").not());
+        .failure()
+        .stderr(predicate::str::contains(
+            "profile selection required in non-interactive mode",
+        ));
 }
