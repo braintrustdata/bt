@@ -255,6 +255,7 @@ mod tests {
             no_color: false,
             no_input: false,
             profile: None,
+            profile_explicit: false,
             org_name: org.map(String::from),
             project: project.map(String::from),
             api_key: None,

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::Args;
@@ -38,6 +39,9 @@ pub struct BaseArgs {
     /// Use a saved login profile (or via BRAINTRUST_PROFILE)
     #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
     pub profile: Option<String>,
+
+    #[arg(skip = false)]
+    pub profile_explicit: bool,
 
     /// Override active org (or via BRAINTRUST_ORG_NAME)
     #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
@@ -99,4 +103,65 @@ pub struct CLIArgs<T: Args> {
 
     #[command(flatten)]
     pub args: T,
+}
+
+pub fn has_explicit_profile_arg(args: &[OsString]) -> bool {
+    let mut idx = 1usize;
+    while idx < args.len() {
+        let Some(arg) = args[idx].to_str() else {
+            idx += 1;
+            continue;
+        };
+
+        if arg == "--" {
+            break;
+        }
+
+        if arg == "--profile" || arg.starts_with("--profile=") {
+            return true;
+        }
+
+        idx += 1;
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_explicit_profile_arg;
+    use std::ffi::OsString;
+
+    #[test]
+    fn has_explicit_profile_arg_detects_split_flag() {
+        let args = vec![
+            OsString::from("bt"),
+            OsString::from("status"),
+            OsString::from("--profile"),
+            OsString::from("work"),
+        ];
+        assert!(has_explicit_profile_arg(&args));
+    }
+
+    #[test]
+    fn has_explicit_profile_arg_detects_equals_flag() {
+        let args = vec![
+            OsString::from("bt"),
+            OsString::from("status"),
+            OsString::from("--profile=work"),
+        ];
+        assert!(has_explicit_profile_arg(&args));
+    }
+
+    #[test]
+    fn has_explicit_profile_arg_ignores_passthrough_args() {
+        let args = vec![
+            OsString::from("bt"),
+            OsString::from("eval"),
+            OsString::from("--"),
+            OsString::from("--profile"),
+            OsString::from("work"),
+        ];
+        assert!(!has_explicit_profile_arg(&args));
+    }
 }

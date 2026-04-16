@@ -1,10 +1,46 @@
+use std::io::IsTerminal;
+
 use anyhow::{bail, Result};
+use dialoguer::console::Term;
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
 
 use crate::{http::ApiClient, projects::api, ui::with_spinner};
 
+/// Open a Term for interactive prompts.
+///
+/// Prefers stderr and falls back to `/dev/tty` when available so prompts still
+/// work when stdin/stderr are redirected.
+pub(crate) fn tty_term() -> Option<Term> {
+    if std::io::stderr().is_terminal() {
+        return Some(Term::stderr());
+    }
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+
+        if let Ok(tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            if let Ok(tty2) = tty.try_clone() {
+                return Some(Term::read_write_pair(tty, tty2));
+            }
+        }
+    }
+    None
+}
+
 /// Fuzzy select from a list of items. Requires TTY.
 pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> Result<usize> {
+    let Some(selection) = fuzzy_select_opt(prompt, items, default)? else {
+        bail!("selection cancelled by user");
+    };
+    Ok(selection)
+}
+
+/// Fuzzy select from a list of items, returning `None` when the user cancels.
+pub fn fuzzy_select_opt<T: ToString>(
+    prompt: &str,
+    items: &[T],
+    default: usize,
+) -> Result<Option<usize>> {
     let Some(term) = super::prompt_term() else {
         bail!("interactive mode requires TTY");
     };
@@ -20,7 +56,7 @@ pub fn fuzzy_select<T: ToString>(prompt: &str, items: &[T], default: usize) -> R
         .items(&labels)
         .default(default)
         .max_length(12)
-        .interact_on(&term)?;
+        .interact_on_opt(&term)?;
 
     Ok(selection)
 }

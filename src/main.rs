@@ -26,12 +26,13 @@ mod status;
 mod switch;
 mod sync;
 mod tools;
+mod topics;
 mod traces;
 mod ui;
 mod util_cmd;
 mod utils;
 
-use crate::args::{ArgValueSource, BaseArgs, CLIArgs};
+use crate::args::{has_explicit_profile_arg, ArgValueSource, BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -59,6 +60,7 @@ Core
 
 Projects & resources
   projects     Manage projects
+  topics       Inspect and control Topics automation
   prompts      Manage prompts
   functions    Manage functions (tools, scorers, and more)
   tools        Manage tools
@@ -130,6 +132,8 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Inspect and control Topics automation
+    Topics(CLIArgs<topics::TopicsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
@@ -167,6 +171,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
+            Commands::Topics(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
             Commands::SelfCommand(cmd) => &cmd.base,
             Commands::Tools(cmd) => &cmd.base,
@@ -191,6 +196,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
+            Commands::Topics(cmd) => &mut cmd.base,
             Commands::Prompts(cmd) => &mut cmd.base,
             Commands::SelfCommand(cmd) => &mut cmd.base,
             Commands::Tools(cmd) => &mut cmd.base,
@@ -239,6 +245,7 @@ async fn try_main() -> Result<()> {
     let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
     apply_base_arg_sources(&matches, cli.command.base_mut());
+    cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     apply_base_output_defaults(&mut cli.command);
     configure_output(cli.command.base());
 
@@ -252,6 +259,7 @@ async fn try_main() -> Result<()> {
         #[cfg(unix)]
         Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
         Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+        Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
         Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
         Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
         Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,

@@ -39,22 +39,7 @@ pub fn prompt_term() -> Option<Term> {
         return None;
     }
 
-    if std::io::stderr().is_terminal() {
-        return Some(Term::stderr());
-    }
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-
-        if let Ok(tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") {
-            if let Ok(tty2) = tty.try_clone() {
-                return Some(Term::read_write_pair(tty, tty2));
-            }
-        }
-    }
-
-    None
+    select::tty_term()
 }
 
 pub fn can_prompt() -> bool {
