@@ -3496,8 +3496,6 @@ fn install_mcp_for_agent(
 }
 
 fn install_mcp_for_codex(mcp_url: &str, api_key: &str) -> Result<AgentInstallResult> {
-    std::env::set_var("BRAINTRUST_API_KEY", api_key);
-
     let _ = std::process::Command::new("codex")
         .args(["mcp", "remove", "braintrust"])
         .env("BRAINTRUST_API_KEY", api_key)
