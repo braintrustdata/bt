@@ -1461,8 +1461,11 @@ async fn maybe_create_api_key_for_instrumentation(
     let existing: Vec<String> = client
         .get::<ApiKeyList>("/v1/api_key")
         .await
-        .map(|r| r.objects.into_iter().map(|k| k.name).collect())
-        .unwrap_or_default();
+        .context("failed to list existing Braintrust API keys before creating one")?
+        .objects
+        .into_iter()
+        .map(|k| k.name)
+        .collect();
 
     let name = if !existing.iter().any(|n| n == &base_name) {
         base_name
