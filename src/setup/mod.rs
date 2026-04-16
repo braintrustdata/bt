@@ -3904,7 +3904,13 @@ fn print_mcp_human_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn cwd_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn make_base_args() -> BaseArgs {
         BaseArgs {
@@ -4646,6 +4652,7 @@ mod tests {
 
     #[test]
     fn resolve_scope_from_flags_yes_defaults_to_local_in_git_repo() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -4668,6 +4675,7 @@ mod tests {
 
     #[test]
     fn resolve_scope_from_flags_yes_falls_back_to_global_outside_git_repo() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")

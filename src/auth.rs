@@ -176,7 +176,7 @@ pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Res
         }
         1 => Ok(matches[0].name.clone()),
         _ => {
-            if !ui::is_interactive() {
+            if !ui::can_prompt() {
                 bail!(
                     "multiple profiles for org '{identifier}': {}. Use --profile to disambiguate.",
                     matches
@@ -784,18 +784,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if args.oauth {
         return run_login_oauth(base, args).await;
     }
-
-    let has_explicit_api_key = base.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
-
-    if !has_explicit_api_key && ui::is_interactive() {
-        let methods = ["OAuth (browser)", "API key"];
-        let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
-        if selected == 0 {
-            return run_login_oauth(base, args).await;
-        }
-    }
-
-    let interactive = ui::is_interactive();
+    let interactive = ui::can_prompt();
 
     let api_key = match base.api_key.clone() {
         Some(value) if !value.trim().is_empty() => value,
@@ -1246,7 +1235,7 @@ fn resolve_selected_profile_name_for_debug(
         return Ok((name, "only profile"));
     }
 
-    if store.profiles.len() > 1 && ui::is_interactive() {
+    if store.profiles.len() > 1 && ui::can_prompt() {
         if let Some(name) = select_profile_interactive(None)? {
             return Ok((name, "interactive selection"));
         }
@@ -1375,15 +1364,15 @@ fn confirm_profile_overwrite(profile_name: &str) -> Result<()> {
     if !store.profiles.contains_key(profile_name) {
         return Ok(());
     }
-    if !ui::is_interactive() {
+    let Some(term) = ui::prompt_term() else {
         return Ok(());
-    }
+    };
     let confirmed = Confirm::new()
         .with_prompt(format!(
             "Profile '{profile_name}' already exists. Overwrite?"
         ))
         .default(false)
-        .interact()?;
+        .interact_on(&term)?;
     if !confirmed {
         bail!("login cancelled");
     }
@@ -1405,12 +1394,6 @@ fn format_login_success(
 }
 
 async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
-    if resolve_api_key_override(base).is_some() {
-        println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
-        eprintln!("Tip: pass --prefer-profile or unset BRAINTRUST_API_KEY to use profiles.");
-        return Ok(());
-    }
-
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
         println!("No saved profiles. Run `bt auth login` to create one.");
@@ -1463,14 +1446,16 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
         );
     }
 
-    if !force && ui::is_interactive() {
-        let confirmed = Confirm::new()
-            .with_prompt(format!("Delete profile '{profile_name}'?"))
-            .default(false)
-            .interact()?;
-        if !confirmed {
-            eprintln!("Cancelled");
-            return Ok(());
+    if !force {
+        if let Some(term) = ui::prompt_term() {
+            let confirmed = Confirm::new()
+                .with_prompt(format!("Delete profile '{profile_name}'?"))
+                .default(false)
+                .interact_on(&term)?;
+            if !confirmed {
+                eprintln!("Cancelled");
+                return Ok(());
+            }
         }
     }
 
@@ -1508,7 +1493,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         p
     } else if store.profiles.len() == 1 {
         store.profiles.keys().next().unwrap().clone()
-    } else if ui::is_interactive() {
+    } else if ui::can_prompt() {
         let names: Vec<&str> = store.profiles.keys().map(|k| k.as_str()).collect();
         let idx = crate::ui::fuzzy_select("Select profile to log out", &names, 0)?;
         names[idx].to_string()
@@ -2327,14 +2312,12 @@ fn to_oauth_token_response(tokens: OAuth2StdTokenResponse) -> OAuthTokenResponse
 }
 
 fn prompt_api_key() -> Result<String> {
-    if !ui::is_interactive() {
-        bail!("--api-key is required in non-interactive mode");
-    }
-
+    let term = ui::prompt_term()
+        .ok_or_else(|| anyhow::anyhow!("--api-key is required in non-interactive mode"))?;
     let api_key = Password::new()
         .with_prompt("Braintrust API key")
         .allow_empty_password(false)
-        .interact()
+        .interact_on(&term)
         .context("failed to read API key")?;
 
     if api_key.trim().is_empty() {
