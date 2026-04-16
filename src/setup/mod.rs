@@ -1556,39 +1556,19 @@ async fn select_project_for_setup(
         )
     }
 
-    let mut projects = with_spinner(
-        "Loading projects...",
-        crate::projects::api::list_projects(client),
-    )
-    .await?;
-
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
     if !ui::can_prompt() {
         bail!(
             "project choice required in non-interactive mode; pass --project <NAME> or set BRAINTRUST_DEFAULT_PROJECT"
         );
     }
 
-    let mut labels: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
-    labels.push("Create new project".to_string());
-    let selection = ui::fuzzy_select("Select project", &labels, 0)?;
-
-    if selection == labels.len() - 1 {
-        let default_name = default_setup_project_name();
-        let name: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Project name")
-            .default(default_name)
-            .interact_text_on(
-                &ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?,
-            )?;
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            bail!("project name cannot be empty");
-        }
-        return create_or_fetch_project(client, trimmed).await;
-    }
-
-    Ok(projects[selection].clone())
+    ui::select_project(
+        client,
+        None,
+        Some("Select project"),
+        ui::ProjectSelectMode::AllowCreate,
+    )
+    .await
 }
 
 async fn select_project_with_skip(
@@ -1601,39 +1581,6 @@ async fn select_project_with_skip(
         eprintln!("{} Select project · {}", style("✔").green(), project.name);
     }
     Ok(Some(project))
-}
-
-async fn create_or_fetch_project(
-    client: &ApiClient,
-    name: &str,
-) -> Result<crate::projects::api::Project> {
-    if let Some(project) = crate::projects::api::get_project_by_name(client, name).await? {
-        return Ok(project);
-    }
-    match crate::projects::api::create_project(client, name).await {
-        Ok(project) => Ok(project),
-        Err(err) => match crate::projects::api::get_project_by_name(client, name).await {
-            Ok(Some(project)) => Ok(project),
-            Ok(None) => Err(err).context(format!(
-                "failed to create project '{name}' and project was not found afterwards"
-            )),
-            Err(fetch_err) => Err(fetch_err).context(format!(
-                "failed to create project '{name}' after initial create error: {err}"
-            )),
-        },
-    }
-}
-
-fn default_setup_project_name() -> String {
-    let output = std::process::Command::new("whoami").output();
-    let user = output
-        .ok()
-        .filter(|result| result.status.success())
-        .and_then(|result| String::from_utf8(result.stdout).ok())
-        .map(|stdout| stdout.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "braintrust".to_string());
-    format!("{user}-test")
 }
 
 /// Returns `true` if config was written or already matched, `false` if user declined.

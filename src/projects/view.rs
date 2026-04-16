@@ -4,6 +4,7 @@ use urlencoding::encode;
 use crate::http::ApiClient;
 use crate::ui::{
     is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
+    ProjectSelectMode,
 };
 
 use super::api;
@@ -25,7 +26,9 @@ pub async fn run(
             if !is_interactive() {
                 bail!("project name required. Use: bt projects view <name>")
             }
-            select_project(client, None, None).await?.name
+            select_project(client, None, None, ProjectSelectMode::ExistingOnly)
+                .await?
+                .name
         }
     };
 

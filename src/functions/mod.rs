@@ -518,9 +518,16 @@ pub(crate) async fn resolve_project_context_optional(
     let config_project = config::load().ok().and_then(|c| c.project);
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(p) => Some(p.to_string()),
-        None if allow_interactive_selection && is_interactive() => {
-            Some(select_project(&auth_ctx.client, None, None).await?.name)
-        }
+        None if allow_interactive_selection && is_interactive() => Some(
+            select_project(
+                &auth_ctx.client,
+                None,
+                None,
+                crate::ui::ProjectSelectMode::ExistingOnly,
+            )
+            .await?
+            .name,
+        ),
         None => None,
     };
 

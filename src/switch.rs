@@ -116,7 +116,13 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
-            select_project(&client, None, None).await?
+            select_project(
+                &client,
+                None,
+                None,
+                crate::ui::ProjectSelectMode::ExistingOnly,
+            )
+            .await?
         }
     };
 
