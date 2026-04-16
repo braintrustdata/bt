@@ -6060,6 +6060,7 @@ mod tests {
             json: false,
             verbose: false,
             quiet: false,
+            quiet_source: None,
             no_color: false,
             no_input: false,
             profile: None,

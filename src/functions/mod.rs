@@ -398,10 +398,6 @@ pub(crate) struct PullArgs {
         value_parser = BoolishValueParser::new()
     )]
     pub force: bool,
-
-    /// Show skipped files in output.
-    #[arg(long, default_value_t = false)]
-    pub verbose: bool,
 }
 
 impl PullArgs {
@@ -424,9 +420,6 @@ pub struct ViewArgs {
     /// Open in browser
     #[arg(long)]
     web: bool,
-    /// Show all configuration details
-    #[arg(long)]
-    verbose: bool,
 }
 
 impl ViewArgs {
@@ -590,7 +583,7 @@ pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFil
     match args.command {
         None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
         Some(FunctionCommands::View(v)) => {
-            view::run(&ctx, v.slug(), base.json, v.web, v.verbose, ft).await
+            view::run(&ctx, v.slug(), base.json, v.web, base.verbose, ft).await
         }
         Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
         Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
@@ -615,7 +608,7 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
                         v.inner.slug(),
                         base.json,
                         v.inner.web,
-                        v.inner.verbose,
+                        base.verbose,
                         v.function_type.or(function_type),
                     )
                     .await

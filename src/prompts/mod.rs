@@ -48,10 +48,6 @@ pub struct ViewArgs {
     /// Open in browser instead of showing in terminal
     #[arg(long)]
     web: bool,
-
-    /// Show all model parameters and configuration
-    #[arg(long)]
-    verbose: bool,
 }
 
 impl ViewArgs {
@@ -93,7 +89,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         }
         Some(PromptsCommands::View(p)) => {
             let ctx = resolve_project_context(&base, true).await?;
-            view::run(&ctx, p.slug(), base.json, p.web, p.verbose).await
+            view::run(&ctx, p.slug(), base.json, p.web, base.verbose).await
         }
         Some(PromptsCommands::Delete(p)) => {
             let ctx = resolve_project_context(&base, false).await?;
@@ -122,7 +118,6 @@ mod tests {
                 slug_positional: Some("my-prompt".to_string()),
                 slug_flag: None,
                 web: false,
-                verbose: false,
             }
         ))));
     }

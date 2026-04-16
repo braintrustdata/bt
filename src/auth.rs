@@ -13,8 +13,8 @@ use braintrust_sdk_rust::{BraintrustClient, LoginState};
 use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
-use oauth2::basic::{BasicClient, BasicTokenType};
-use oauth2::reqwest::async_http_client;
+use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicRequestTokenError, BasicTokenType};
+use oauth2::reqwest::{async_http_client, AsyncHttpClientError};
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, EmptyExtraTokenFields, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, StandardTokenResponse, TokenResponse,
@@ -59,6 +59,13 @@ pub struct ProfileInfo {
     pub user_name: Option<String>,
     pub email: Option<String>,
     pub api_key_hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoredProfileInfo {
+    pub name: String,
+    pub is_oauth: bool,
+    pub org_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +132,19 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
         .collect())
 }
 
+pub(crate) fn list_stored_profiles() -> Result<Vec<StoredProfileInfo>> {
+    let store = load_auth_store()?;
+    Ok(store
+        .profiles
+        .iter()
+        .map(|(name, profile)| StoredProfileInfo {
+            name: name.clone(),
+            is_oauth: profile.auth_kind == AuthKind::Oauth,
+            org_name: profile.org_name.clone(),
+        })
+        .collect())
+}
+
 pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Result<String> {
     if profiles.is_empty() {
         bail!("no auth profiles found. Run `bt auth login` to create one.");
@@ -156,7 +176,7 @@ pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Res
         }
         1 => Ok(matches[0].name.clone()),
         _ => {
-            if !ui::is_interactive() {
+            if !ui::can_prompt() {
                 bail!(
                     "multiple profiles for org '{identifier}': {}. Use --profile to disambiguate.",
                     matches
@@ -233,6 +253,28 @@ pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
         .collect())
 }
 
+pub(crate) async fn list_available_orgs_for_api_key(
+    api_key: &str,
+    app_url: &str,
+) -> Result<Vec<AvailableOrg>> {
+    let mut orgs = fetch_login_orgs(api_key, app_url).await?;
+    orgs.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(orgs
+        .into_iter()
+        .map(|org| AvailableOrg {
+            id: org.id,
+            name: org.name,
+            api_url: org.api_url,
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthStore {
     #[serde(default)]
@@ -288,6 +330,20 @@ struct LoginOrgInfo {
     api_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyOrgMismatchAction {
+    UseApiKey,
+    UseOauth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedOrgResolution {
+    NoRequestedOrg,
+    UseRequestedOrg,
+    IgnoreRequestedOrg,
+    SwitchToOauth,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
@@ -323,10 +379,7 @@ enum AuthCommand {
 }
 
 #[derive(Debug, Clone, Args)]
-struct AuthProfilesArgs {
-    #[arg(long)]
-    verbose: bool,
-}
+struct AuthProfilesArgs {}
 
 #[derive(Debug, Clone, Args)]
 struct AuthLoginArgs {
@@ -341,10 +394,6 @@ struct AuthLoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
-
-    /// Show org IDs and API URLs in org selector
-    #[arg(long, short = 'v')]
-    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -500,11 +549,7 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
 
     if let Some(profile_name) = ignored_profile {
         eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY.",
-        );
-    } else {
-        eprintln!(
-            "Warning: using --api-key/BRAINTRUST_API_KEY credentials for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY."
+            "Info: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY to use a profile with OAuth login.",
         );
     }
 }
@@ -518,7 +563,12 @@ fn has_explicit_profile_selection(base: &BaseArgs) -> bool {
 }
 
 fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
-    if base.prefer_profile || has_explicit_profile_selection(base) {
+    if (base.prefer_profile || has_explicit_profile_selection(base))
+        && !matches!(
+            base.api_key_source,
+            Some(crate::args::ArgValueSource::CommandLine)
+        )
+    {
         return None;
     }
     let value = base.api_key.as_deref()?.trim();
@@ -585,7 +635,8 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
             ),
         )
     })?;
-    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
+    let refreshed =
+        refresh_oauth_access_token(&api_url, &refresh_token, client_id, &profile_name).await?;
     save_profile_oauth_access_token(&profile_name, &refreshed.access_token)?;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
         if next_refresh_token != &refresh_token {
@@ -733,18 +784,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if args.oauth {
         return run_login_oauth(base, args).await;
     }
-
-    let has_explicit_api_key = base.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
-
-    if !has_explicit_api_key && ui::is_interactive() {
-        let methods = ["OAuth (browser)", "API key"];
-        let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
-        if selected == 0 {
-            return run_login_oauth(base, args).await;
-        }
-    }
-
-    let interactive = ui::is_interactive();
+    let interactive = ui::can_prompt();
 
     let api_key = match base.api_key.clone() {
         Some(value) if !value.trim().is_empty() => value,
@@ -757,20 +797,41 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
+    let requested_org_resolution = resolve_requested_org_for_api_key_login(
+        &login_orgs,
+        base.org_name.as_deref(),
+        ui::can_prompt(),
+        prompt_for_auth_method_for_missing_requested_org,
+    )?;
+    if requested_org_resolution == RequestedOrgResolution::SwitchToOauth {
+        return run_login_oauth(base, args).await;
+    }
     let selected_org = select_login_org(
         login_orgs.clone(),
-        base.org_name.as_deref(),
+        match requested_org_resolution {
+            RequestedOrgResolution::UseRequestedOrg => base.org_name.as_deref(),
+            RequestedOrgResolution::NoRequestedOrg | RequestedOrgResolution::IgnoreRequestedOrg => {
+                None
+            }
+            RequestedOrgResolution::SwitchToOauth => unreachable!("handled above"),
+        },
         interactive,
-        args.verbose,
+        base.verbose,
         true,
+        explicitly_quiet(base),
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
+    let store = load_auth_store()?;
+    let (profile_name, should_confirm_overwrite) = resolve_api_key_login_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
+        &selected_api_url,
+        &store,
     )?;
-    confirm_profile_overwrite(&profile_name)?;
+    if should_confirm_overwrite {
+        confirm_profile_overwrite(&profile_name)?;
+    }
 
     commit_api_key_profile(
         &profile_name,
@@ -788,13 +849,6 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
 }
 
 async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
-    if !ui::is_interactive() {
-        bail!("oauth login requires an interactive terminal");
-    }
-    if let Some(warning) = oauth_ignored_api_key_warning(base) {
-        eprintln!("{warning}");
-    }
-
     let api_url = base
         .api_url
         .clone()
@@ -841,7 +895,12 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         }
     }
 
-    let callback = collect_oauth_callback(listener, args.no_browser || is_ssh_session()).await?;
+    let callback = collect_oauth_callback(
+        listener,
+        args.no_browser || is_ssh_session(),
+        explicitly_quiet(base),
+    )
+    .await?;
     if let Some(error) = callback.error {
         bail!("oauth authorization failed: {error}");
     }
@@ -867,17 +926,26 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
+        ui::can_prompt(),
+        base.verbose,
         true,
-        args.verbose,
-        true,
+        explicitly_quiet(base),
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
+    let store = load_auth_store()?;
+    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
+    let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
+        &selected_api_url,
+        &app_url,
+        &jwt_id,
+        &store,
     )?;
-    confirm_profile_overwrite(&profile_name)?;
+    if should_confirm_overwrite {
+        confirm_profile_overwrite(&profile_name)?;
+    }
 
     commit_oauth_profile(
         &profile_name,
@@ -896,59 +964,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn login_interactive(base: &mut BaseArgs) -> Result<String> {
-    let methods = ["OAuth (browser)", "API key"];
-    let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
-
-    if selected == 0 {
-        login_interactive_oauth(base).await
-    } else {
-        login_interactive_api_key(base).await
-    }
-}
-
-pub async fn login_setup_oauth(base: &mut BaseArgs) -> Result<String> {
-    login_interactive_oauth(base).await
-}
-
-#[allow(dead_code)]
-async fn login_interactive_api_key(base: &mut BaseArgs) -> Result<String> {
-    let api_key = prompt_api_key()?;
-
-    let login_app_url = base
-        .app_url
-        .clone()
-        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
-    let selected_org = select_login_org(
-        login_orgs.clone(),
-        base.org_name.as_deref(),
-        true,
-        false,
-        false,
-    )?;
-    let selected_api_url =
-        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
-        base.profile.as_deref(),
-        selected_org.as_ref().map(|org| org.name.as_str()),
-    )?;
-    confirm_profile_overwrite(&profile_name)?;
-
-    commit_api_key_profile(
-        &profile_name,
-        &api_key,
-        selected_api_url,
-        base.app_url.clone(),
-        selected_org.as_ref().map(|org| org.name.clone()),
-    )?;
-
-    base.profile = Some(profile_name.clone());
-    Ok(profile_name)
-}
-
-async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
+pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     let api_url = base
         .api_url
         .clone()
@@ -986,9 +1002,12 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
 
     let _ = open::that(&authorize_url);
     eprintln!("Complete authorization in your browser.");
+    eprintln!();
     eprintln!("{}", dialoguer::console::style(&authorize_url).dim());
+    eprintln!();
 
-    let callback = collect_oauth_callback(listener, is_ssh_session()).await?;
+    let callback =
+        collect_oauth_callback(listener, is_ssh_session(), explicitly_quiet(base)).await?;
     if let Some(error) = callback.error {
         bail!("oauth authorization failed: {error}");
     }
@@ -1015,17 +1034,26 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
-        true,
+        ui::can_prompt(),
         false,
         false,
+        explicitly_quiet(base),
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let profile_name = resolve_profile_name(
+    let store = load_auth_store()?;
+    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
+    let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
+        &selected_api_url,
+        &app_url,
+        &jwt_id,
+        &store,
     )?;
-    confirm_profile_overwrite(&profile_name)?;
+    if should_confirm_overwrite {
+        confirm_profile_overwrite(&profile_name)?;
+    }
 
     commit_oauth_profile(
         &profile_name,
@@ -1040,7 +1068,7 @@ async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<String> {
     Ok(profile_name)
 }
 
-fn commit_api_key_profile(
+pub(crate) fn commit_api_key_profile(
     profile_name: &str,
     api_key: &str,
     api_url: String,
@@ -1107,18 +1135,6 @@ fn commit_oauth_profile(
     save_auth_store(&store)
 }
 
-fn oauth_ignored_api_key_warning(base: &BaseArgs) -> Option<String> {
-    let api_key = base.api_key.as_deref()?.trim();
-    if api_key.is_empty() {
-        return None;
-    }
-
-    Some(
-        "warning: --api-key/BRAINTRUST_API_KEY is set; ignoring it because --oauth was requested"
-            .to_string(),
-    )
-}
-
 async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     let mut store = load_auth_store()?;
     let (profile_name, source) = resolve_selected_profile_name_for_debug(base, &store)?;
@@ -1162,7 +1178,9 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         println!("Cached access token expiry before refresh: unknown");
     }
 
-    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &client_id).await?;
+    let refreshed =
+        refresh_oauth_access_token(&api_url, &refresh_token, &client_id, profile_name.as_str())
+            .await?;
     save_profile_oauth_access_token(profile_name.as_str(), &refreshed.access_token)?;
     let mut refresh_rotated = false;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
@@ -1217,7 +1235,7 @@ fn resolve_selected_profile_name_for_debug(
         return Ok((name, "only profile"));
     }
 
-    if store.profiles.len() > 1 && ui::is_interactive() {
+    if store.profiles.len() > 1 && ui::can_prompt() {
         if let Some(name) = select_profile_interactive(None)? {
             return Ok((name, "interactive selection"));
         }
@@ -1245,20 +1263,116 @@ fn resolve_profile_name(
         .to_string())
 }
 
+fn default_profile_name(suggested_org_name: Option<&str>) -> String {
+    suggested_org_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("profile")
+        .to_string()
+}
+
+fn next_available_profile_name(base_name: &str, store: &AuthStore) -> String {
+    if !store.profiles.contains_key(base_name) {
+        return base_name.to_string();
+    }
+
+    (2u32..)
+        .map(|idx| format!("{base_name}-{idx}"))
+        .find(|candidate| !store.profiles.contains_key(candidate))
+        .expect("profile name sequence is infinite")
+}
+
+fn resolve_api_key_login_profile_name(
+    explicit_profile: Option<&str>,
+    suggested_org_name: Option<&str>,
+    selected_api_url: &str,
+    store: &AuthStore,
+) -> Result<(String, bool)> {
+    if let Some(profile_name) = explicit_profile {
+        let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
+        return Ok((
+            profile_name.clone(),
+            store.profiles.contains_key(&profile_name),
+        ));
+    }
+
+    let default_name = default_profile_name(suggested_org_name);
+    let has_matching_api_key_profile = store.profiles.values().any(|profile| {
+        profile.auth_kind == AuthKind::ApiKey
+            && profile.api_url.as_deref() == Some(selected_api_url)
+            && profile.org_name.as_deref() == suggested_org_name
+    });
+
+    if has_matching_api_key_profile {
+        return Ok((next_available_profile_name(&default_name, store), false));
+    }
+
+    Ok((
+        default_name.clone(),
+        store.profiles.contains_key(&default_name),
+    ))
+}
+
+fn resolve_oauth_login_profile_name(
+    explicit_profile: Option<&str>,
+    suggested_org_name: Option<&str>,
+    selected_api_url: &str,
+    app_url: &str,
+    jwt_id: &JwtIdentity,
+    store: &AuthStore,
+) -> Result<(String, bool)> {
+    if let Some(profile_name) = explicit_profile {
+        let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
+        return Ok((
+            profile_name.clone(),
+            store.profiles.contains_key(&profile_name),
+        ));
+    }
+
+    let matched_profile = store
+        .profiles
+        .iter()
+        .filter(|(_, profile)| {
+            profile.auth_kind == AuthKind::Oauth
+                && profile.api_url.as_deref() == Some(selected_api_url)
+                && profile.app_url.as_deref() == Some(app_url)
+                && profile.org_name.as_deref() == suggested_org_name
+                && profile.user_name == jwt_id.name
+                && profile.email == jwt_id.email
+        })
+        .max_by(|(left_name, left), (right_name, right)| {
+            left.oauth_access_expires_at
+                .unwrap_or_default()
+                .cmp(&right.oauth_access_expires_at.unwrap_or_default())
+                .then_with(|| left_name.cmp(right_name))
+        })
+        .map(|(name, _)| name.clone());
+
+    if let Some(profile_name) = matched_profile {
+        return Ok((profile_name, false));
+    }
+
+    let default_name = default_profile_name(suggested_org_name);
+    Ok((
+        default_name.clone(),
+        store.profiles.contains_key(&default_name),
+    ))
+}
+
 fn confirm_profile_overwrite(profile_name: &str) -> Result<()> {
     let store = load_auth_store()?;
     if !store.profiles.contains_key(profile_name) {
         return Ok(());
     }
-    if !ui::is_interactive() {
+    let Some(term) = ui::prompt_term() else {
         return Ok(());
-    }
+    };
     let confirmed = Confirm::new()
         .with_prompt(format!(
             "Profile '{profile_name}' already exists. Overwrite?"
         ))
         .default(false)
-        .interact()?;
+        .interact_on(&term)?;
     if !confirmed {
         bail!("login cancelled");
     }
@@ -1279,7 +1393,7 @@ fn format_login_success(
     }
 }
 
-async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
+async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
         println!("No saved profiles. Run `bt auth login` to create one.");
@@ -1310,7 +1424,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
         crate::ui::print_command_status(cmd_status, &format_verification_line(v));
     }
 
-    if args.verbose {
+    if base.verbose {
         if let Ok(path) = auth_store_path() {
             eprintln!("\nCredentials: {}", path.display());
         }
@@ -1332,14 +1446,16 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
         );
     }
 
-    if !force && ui::is_interactive() {
-        let confirmed = Confirm::new()
-            .with_prompt(format!("Delete profile '{profile_name}'?"))
-            .default(false)
-            .interact()?;
-        if !confirmed {
-            eprintln!("Cancelled");
-            return Ok(());
+    if !force {
+        if let Some(term) = ui::prompt_term() {
+            let confirmed = Confirm::new()
+                .with_prompt(format!("Delete profile '{profile_name}'?"))
+                .default(false)
+                .interact_on(&term)?;
+            if !confirmed {
+                eprintln!("Cancelled");
+                return Ok(());
+            }
         }
     }
 
@@ -1377,7 +1493,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         p
     } else if store.profiles.len() == 1 {
         store.profiles.keys().next().unwrap().clone()
-    } else if ui::is_interactive() {
+    } else if ui::can_prompt() {
         let names: Vec<&str> = store.profiles.keys().map(|k| k.as_str()).collect();
         let idx = crate::ui::fuzzy_select("Select profile to log out", &names, 0)?;
         names[idx].to_string()
@@ -1640,6 +1756,7 @@ fn select_login_org(
     interactive: bool,
     verbose: bool,
     allow_cross_org: bool,
+    quiet_requested: bool,
 ) -> Result<Option<LoginOrgInfo>> {
     if orgs.is_empty() {
         bail!("no organizations found for this credential");
@@ -1652,23 +1769,10 @@ fn select_login_org(
     });
 
     if let Some(name) = requested_org_name {
-        let selected = orgs
-            .iter()
-            .find(|org| org.name == name)
-            .or_else(|| {
-                let lowered = name.to_ascii_lowercase();
-                orgs.iter()
-                    .find(|org| org.name.to_ascii_lowercase() == lowered)
-            })
-            .cloned();
-        return selected.map(Some).ok_or_else(|| {
-            let available = orgs
-                .iter()
-                .map(|org| org.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::anyhow!("org '{name}' not found. Available: {available}")
-        });
+        return find_login_org(&orgs, name)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| missing_requested_org_error(&orgs, name));
     }
 
     if orgs.len() == 1 {
@@ -1696,6 +1800,9 @@ fn select_login_org(
         }
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    if !quiet_requested {
+        eprintln!("\n\nA Braintrust organization is usually a team or a company.");
+    }
     let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
     if allow_cross_org && selection == 0 {
         return Ok(None);
@@ -1706,6 +1813,78 @@ fn select_login_org(
             .nth(selection - offset)
             .expect("selected index should be in range"),
     ))
+}
+
+fn find_login_org<'a>(
+    orgs: &'a [LoginOrgInfo],
+    requested_org_name: &str,
+) -> Option<&'a LoginOrgInfo> {
+    orgs.iter()
+        .find(|org| org.name == requested_org_name)
+        .or_else(|| {
+            let lowered = requested_org_name.to_ascii_lowercase();
+            orgs.iter()
+                .find(|org| org.name.to_ascii_lowercase() == lowered)
+        })
+}
+
+fn missing_requested_org_error(orgs: &[LoginOrgInfo], requested_org_name: &str) -> anyhow::Error {
+    let available = orgs
+        .iter()
+        .map(|org| org.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::anyhow!("org '{requested_org_name}' not found. Available: {available}")
+}
+
+fn resolve_requested_org_for_api_key_login<F>(
+    orgs: &[LoginOrgInfo],
+    requested_org_name: Option<&str>,
+    can_prompt: bool,
+    choose_auth_method: F,
+) -> Result<RequestedOrgResolution>
+where
+    F: FnOnce(&str, &[LoginOrgInfo]) -> Result<ApiKeyOrgMismatchAction>,
+{
+    let Some(requested_org_name) = requested_org_name else {
+        return Ok(RequestedOrgResolution::NoRequestedOrg);
+    };
+
+    if find_login_org(orgs, requested_org_name).is_some() {
+        return Ok(RequestedOrgResolution::UseRequestedOrg);
+    }
+
+    if !can_prompt {
+        return Err(missing_requested_org_error(orgs, requested_org_name));
+    }
+
+    match choose_auth_method(requested_org_name, orgs)? {
+        ApiKeyOrgMismatchAction::UseApiKey => Ok(RequestedOrgResolution::IgnoreRequestedOrg),
+        ApiKeyOrgMismatchAction::UseOauth => Ok(RequestedOrgResolution::SwitchToOauth),
+    }
+}
+
+fn prompt_for_auth_method_for_missing_requested_org(
+    requested_org_name: &str,
+    orgs: &[LoginOrgInfo],
+) -> Result<ApiKeyOrgMismatchAction> {
+    let api_key_label = if orgs.len() == 1 {
+        format!("API key ({})", orgs[0].name)
+    } else {
+        "API key (use available org)".to_string()
+    };
+    let methods = ["OAuth (browser)".to_string(), api_key_label];
+    let method_refs: Vec<&str> = methods.iter().map(String::as_str).collect();
+    let selection = ui::fuzzy_select(
+        &format!("Org '{requested_org_name}' is not available for this API key. Continue with"),
+        &method_refs,
+        0,
+    )?;
+    Ok(match selection {
+        0 => ApiKeyOrgMismatchAction::UseOauth,
+        1 => ApiKeyOrgMismatchAction::UseApiKey,
+        _ => unreachable!("fuzzy_select returned out-of-range index"),
+    })
 }
 
 fn resolve_profile_api_url(
@@ -1772,6 +1951,29 @@ struct OAuthCallbackParams {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthCallbackMode {
+    ListenerOnly,
+    ListenerOrStdin,
+    PromptThenListener,
+}
+
+fn oauth_callback_mode(prefer_manual: bool) -> OAuthCallbackMode {
+    if prefer_manual {
+        if ui::can_prompt() {
+            OAuthCallbackMode::PromptThenListener
+        } else {
+            OAuthCallbackMode::ListenerOnly
+        }
+    } else if ui::is_interactive() {
+        OAuthCallbackMode::ListenerOrStdin
+    } else if ui::can_prompt() {
+        OAuthCallbackMode::PromptThenListener
+    } else {
+        OAuthCallbackMode::ListenerOnly
+    }
+}
+
 async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallbackParams> {
     let (mut stream, _) = tokio::time::timeout(OAUTH_CALLBACK_TIMEOUT, listener.accept())
         .await
@@ -1819,27 +2021,42 @@ async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallbackP
 async fn collect_oauth_callback(
     listener: TcpListener,
     prefer_manual: bool,
+    quiet_requested: bool,
 ) -> Result<OAuthCallbackParams> {
-    if !prefer_manual {
-        return wait_for_oauth_callback_or_stdin(listener).await;
+    match oauth_callback_mode(prefer_manual) {
+        OAuthCallbackMode::ListenerOnly => {
+            eprintln!("Waiting for browser authorization...");
+            wait_for_oauth_callback(listener).await
+        }
+        OAuthCallbackMode::ListenerOrStdin => wait_for_oauth_callback_or_stdin(listener).await,
+        OAuthCallbackMode::PromptThenListener => {
+            let term = ui::prompt_term()
+                .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?;
+            if !quiet_requested {
+                println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
+                println!(
+                    "After approving access, your browser may show a localhost connection error on remote hosts."
+                );
+                println!(
+                    "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
+                );
+            }
+            let pasted = Input::<String>::new()
+                .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
+                .allow_empty(true)
+                .report(false)
+                .interact_text_on(&term)
+                .context("failed to read callback URL")?;
+            if pasted.trim().is_empty() {
+                return wait_for_oauth_callback(listener).await;
+            }
+            parse_oauth_callback_input(&pasted)
+        }
     }
+}
 
-    println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
-    println!(
-        "After approving access, your browser may show a localhost connection error on remote hosts."
-    );
-    println!(
-        "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
-    );
-    let pasted = Input::<String>::new()
-        .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
-        .allow_empty(true)
-        .interact_text()
-        .context("failed to read callback URL")?;
-    if pasted.trim().is_empty() {
-        return wait_for_oauth_callback(listener).await;
-    }
-    parse_oauth_callback_input(&pasted)
+fn explicitly_quiet(base: &BaseArgs) -> bool {
+    base.quiet && base.quiet_source.is_some()
 }
 
 async fn wait_for_oauth_callback_or_stdin(listener: TcpListener) -> Result<OAuthCallbackParams> {
@@ -2017,22 +2234,43 @@ async fn exchange_oauth_authorization_code(
     Ok(to_oauth_token_response(token_response))
 }
 
+fn map_refresh_oauth_error(
+    api_url: &str,
+    profile_name: &str,
+    err: BasicRequestTokenError<AsyncHttpClientError>,
+) -> anyhow::Error {
+    if let BasicRequestTokenError::ServerResponse(server_err) = &err {
+        if matches!(server_err.error(), BasicErrorResponseType::InvalidGrant) {
+            let mut message =
+                format!("oauth refresh token expired or was rejected for profile '{profile_name}'");
+            if let Some(description) = server_err.error_description() {
+                message.push_str(&format!(" ({description})"));
+            }
+            message.push_str(&format!(
+                "; re-run `bt auth login --oauth --profile {profile_name}`"
+            ));
+            return recoverable_auth_error(RecoverableAuthErrorKind::OauthRefreshToken, message);
+        }
+    }
+
+    anyhow::Error::new(err).context(format!(
+        "failed to call oauth token endpoint {}/oauth/token",
+        api_url.trim_end_matches('/')
+    ))
+}
+
 async fn refresh_oauth_access_token(
     api_url: &str,
     refresh_token: &str,
     client_id: &str,
+    profile_name: &str,
 ) -> Result<OAuthTokenResponse> {
     let oauth_client = build_oauth_client(api_url, client_id, None)?;
     let token_response = oauth_client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
         .request_async(async_http_client)
         .await
-        .with_context(|| {
-            format!(
-                "failed to call oauth token endpoint {}/oauth/token",
-                api_url.trim_end_matches('/')
-            )
-        })?;
+        .map_err(|err| map_refresh_oauth_error(api_url, profile_name, err))?;
     Ok(to_oauth_token_response(token_response))
 }
 
@@ -2074,14 +2312,12 @@ fn to_oauth_token_response(tokens: OAuth2StdTokenResponse) -> OAuthTokenResponse
 }
 
 fn prompt_api_key() -> Result<String> {
-    if !ui::is_interactive() {
-        bail!("--api-key is required in non-interactive mode");
-    }
-
+    let term = ui::prompt_term()
+        .ok_or_else(|| anyhow::anyhow!("--api-key is required in non-interactive mode"))?;
     let api_key = Password::new()
         .with_prompt("Braintrust API key")
         .allow_empty_password(false)
-        .interact()
+        .interact_on(&term)
         .context("failed to read API key")?;
 
     if api_key.trim().is_empty() {
@@ -2709,6 +2945,7 @@ mod tests {
             json: false,
             verbose: false,
             quiet: false,
+            quiet_source: None,
             no_color: false,
             no_input: false,
             profile: None,
@@ -2804,6 +3041,36 @@ mod tests {
         .context("while resolving auth");
 
         assert!(is_missing_credential_error(&err));
+    }
+
+    #[test]
+    fn invalid_grant_refresh_error_is_treated_as_recoverable() {
+        let err = map_refresh_oauth_error(
+            "https://api.example.com",
+            "work",
+            BasicRequestTokenError::ServerResponse(oauth2::basic::BasicErrorResponse::new(
+                BasicErrorResponseType::InvalidGrant,
+                Some("refresh token expired".to_string()),
+                None,
+            )),
+        );
+
+        assert!(is_missing_credential_error(&err));
+        assert!(err.to_string().contains("refresh token expired"));
+    }
+
+    #[test]
+    fn nonrecoverable_refresh_errors_remain_nonrecoverable() {
+        let err = map_refresh_oauth_error(
+            "https://api.example.com",
+            "work",
+            BasicRequestTokenError::Other("unexpected response".to_string()),
+        );
+
+        assert!(!is_missing_credential_error(&err));
+        assert!(err
+            .to_string()
+            .contains("failed to call oauth token endpoint"));
     }
 
     fn restore_env_var(key: &str, previous: Option<OsString>) {
@@ -3011,7 +3278,40 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_explicit_profile_ignores_api_key_override() {
+    fn resolve_auth_prefers_cli_api_key_even_with_prefer_profile() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".to_string());
+        base.api_key_source = Some(crate::args::ArgValueSource::CommandLine);
+        base.prefer_profile = true;
+        base.profile = Some("work".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.example.com".to_string()),
+                app_url: None,
+                org_name: Some("Example Org".to_string()),
+                oauth_client_id: None,
+                oauth_access_expires_at: None,
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".to_string())),
+            &None,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
+        assert_eq!(resolved.org_name, None);
+    }
+
+    #[test]
+    fn resolve_auth_explicit_profile_ignores_env_api_key_override() {
         let mut base = make_base();
         base.api_key = Some("explicit-key".to_string());
         base.profile = Some("work".to_string());
@@ -3040,37 +3340,6 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
-    }
-
-    #[test]
-    fn resolve_auth_env_profile_still_prefers_api_key_override() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".to_string());
-        base.profile = Some("work".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
-                app_url: None,
-                org_name: Some("Example Org".to_string()),
-                oauth_client_id: None,
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".to_string())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
-        assert!(!resolved.is_oauth);
     }
 
     #[test]
@@ -3142,21 +3411,6 @@ mod tests {
             err.to_string().contains("did not include code or error"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn oauth_ignored_api_key_warning_is_none_without_api_key() {
-        let base = make_base();
-        assert_eq!(oauth_ignored_api_key_warning(&base), None);
-    }
-
-    #[test]
-    fn oauth_ignored_api_key_warning_is_some_with_api_key() {
-        let mut base = make_base();
-        base.api_key = Some("secret".to_string());
-        let warning = oauth_ignored_api_key_warning(&base).expect("warning");
-        assert!(warning.contains("ignoring it"));
-        assert!(warning.contains("--oauth"));
     }
 
     #[test]
@@ -3279,6 +3533,153 @@ mod tests {
     }
 
     #[test]
+    fn resolve_api_key_login_profile_name_creates_new_profile_for_matching_org() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "acme".into(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.acme.example".into()),
+                org_name: Some("acme".into()),
+                ..Default::default()
+            },
+        );
+
+        let (profile_name, should_confirm) = resolve_api_key_login_profile_name(
+            None,
+            Some("acme"),
+            "https://api.acme.example",
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "acme-2");
+        assert!(!should_confirm);
+    }
+
+    #[test]
+    fn resolve_oauth_login_profile_name_reuses_most_recent_matching_profile() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "older".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                api_url: Some("https://api.acme.example".into()),
+                app_url: Some("https://www.acme.example".into()),
+                org_name: Some("acme".into()),
+                oauth_access_expires_at: Some(100),
+                user_name: Some("Alice".into()),
+                email: Some("alice@example.com".into()),
+                ..Default::default()
+            },
+        );
+        store.profiles.insert(
+            "newer".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                api_url: Some("https://api.acme.example".into()),
+                app_url: Some("https://www.acme.example".into()),
+                org_name: Some("acme".into()),
+                oauth_access_expires_at: Some(200),
+                user_name: Some("Alice".into()),
+                email: Some("alice@example.com".into()),
+                ..Default::default()
+            },
+        );
+
+        let jwt_id = JwtIdentity {
+            name: Some("Alice".into()),
+            email: Some("alice@example.com".into()),
+        };
+        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
+            None,
+            Some("acme"),
+            "https://api.acme.example",
+            "https://www.acme.example",
+            &jwt_id,
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "newer");
+        assert!(!should_confirm);
+    }
+
+    fn login_org(id: &str, name: &str) -> LoginOrgInfo {
+        LoginOrgInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            api_url: None,
+        }
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_keeps_matching_requested_org() {
+        let orgs = vec![login_org("org_1", "acme")];
+
+        let resolution =
+            resolve_requested_org_for_api_key_login(&orgs, Some("acme"), false, |_, _| {
+                panic!("prompt should not be called")
+            })
+            .expect("resolve");
+
+        assert_eq!(resolution, RequestedOrgResolution::UseRequestedOrg);
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_errors_without_prompt() {
+        let orgs = vec![login_org("org_1", "braintrustdata.com")];
+
+        let err =
+            resolve_requested_org_for_api_key_login(&orgs, Some("ced-test-1"), false, |_, _| {
+                panic!("prompt should not be called")
+            })
+            .expect_err("should fail");
+
+        assert!(err
+            .to_string()
+            .contains("org 'ced-test-1' not found. Available: braintrustdata.com"));
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_can_switch_to_oauth() {
+        let orgs = vec![login_org("org_1", "braintrustdata.com")];
+
+        let resolution = resolve_requested_org_for_api_key_login(
+            &orgs,
+            Some("ced-test-1"),
+            true,
+            |requested_org_name, available_orgs| {
+                assert_eq!(requested_org_name, "ced-test-1");
+                assert_eq!(available_orgs.len(), 1);
+                Ok(ApiKeyOrgMismatchAction::UseOauth)
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(resolution, RequestedOrgResolution::SwitchToOauth);
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_can_continue_with_api_key() {
+        let orgs = vec![login_org("org_1", "braintrustdata.com")];
+
+        let resolution = resolve_requested_org_for_api_key_login(
+            &orgs,
+            Some("ced-test-1"),
+            true,
+            |requested_org_name, available_orgs| {
+                assert_eq!(requested_org_name, "ced-test-1");
+                assert_eq!(available_orgs.len(), 1);
+                Ok(ApiKeyOrgMismatchAction::UseApiKey)
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(resolution, RequestedOrgResolution::IgnoreRequestedOrg);
+    }
+
+    #[test]
     fn obscure_api_key_standard() {
         assert_eq!(obscure_api_key("sk-LumEdp0BbLRzhJwO"), "sk-****zhJwO");
     }
@@ -3393,6 +3794,31 @@ mod tests {
             format_verification_line(&v),
             "bad — api_key — org: corp — invalid API key"
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_mode_uses_listener_only_when_input_is_disabled() {
+        let _guard = env_test_lock().lock().await;
+        ui::set_no_input(true);
+        assert_eq!(oauth_callback_mode(false), OAuthCallbackMode::ListenerOnly);
+        assert_eq!(oauth_callback_mode(true), OAuthCallbackMode::ListenerOnly);
+        ui::set_no_input(false);
+    }
+
+    #[test]
+    fn oauth_callback_mode_prefers_manual_prompt_when_interactive() {
+        ui::set_no_input(false);
+
+        if ui::is_interactive() {
+            assert_eq!(
+                oauth_callback_mode(true),
+                OAuthCallbackMode::PromptThenListener
+            );
+            assert_eq!(
+                oauth_callback_mode(false),
+                OAuthCallbackMode::ListenerOrStdin
+            );
+        }
     }
 
     #[tokio::test]

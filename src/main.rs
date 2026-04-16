@@ -83,8 +83,10 @@ Flags
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
       -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
       --json                 Output as JSON
+  -v, --verbose              Increase output verbosity [env: BRAINTRUST_VERBOSE=]
   -q, --quiet                Reduce interactive UI output [env: BRAINTRUST_QUIET=]
       --no-color             Disable ANSI color output
+      --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
       --env-file <PATH>      Path to a .env file to load
@@ -207,6 +209,10 @@ impl Commands {
             Commands::Status(cmd) => &mut cmd.base,
         }
     }
+
+    fn verbose_by_default(&self) -> bool {
+        !matches!(self, Commands::Setup(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,10 +242,11 @@ async fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
-    let matches = Cli::command().get_matches_from(argv.clone());
+    let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
     apply_base_arg_sources(&matches, cli.command.base_mut());
     cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
+    apply_base_output_defaults(&mut cli.command);
     configure_output(cli.command.base());
 
     match cli.command {
@@ -269,7 +276,21 @@ async fn try_main() -> Result<()> {
 }
 
 fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
+    base.quiet_source = find_value_source(matches, "quiet").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
+}
+
+fn apply_base_output_defaults(command: &mut Commands) {
+    let verbose_by_default = command.verbose_by_default();
+    let base = command.base_mut();
+
+    if base.quiet {
+        base.verbose = false;
+        return;
+    }
+
+    base.verbose = base.verbose || verbose_by_default;
+    base.quiet = !base.verbose;
 }
 
 fn find_value_source(matches: &ArgMatches, id: &str) -> Option<ValueSource> {
@@ -453,5 +474,59 @@ mod tests {
         restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
 
         assert_eq!(cli.command.base().api_key_source, None);
+    }
+
+    #[test]
+    fn apply_base_output_defaults_keeps_setup_quiet_by_default() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "bt",
+                "setup",
+                "--no-instrument",
+                "--global",
+                "--agent",
+                "codex",
+            ])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_output_defaults(&mut cli.command);
+
+        assert!(cli.command.base().quiet);
+        assert!(!cli.command.base().verbose);
+    }
+
+    #[test]
+    fn apply_base_output_defaults_keeps_status_verbose_by_default() {
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "status"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_output_defaults(&mut cli.command);
+
+        assert!(!cli.command.base().quiet);
+        assert!(cli.command.base().verbose);
+    }
+
+    #[test]
+    fn apply_base_output_defaults_honors_explicit_verbose_for_setup() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "bt",
+                "setup",
+                "--verbose",
+                "--no-instrument",
+                "--global",
+                "--agent",
+                "codex",
+            ])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_output_defaults(&mut cli.command);
+
+        assert!(!cli.command.base().quiet);
+        assert!(cli.command.base().verbose);
     }
 }

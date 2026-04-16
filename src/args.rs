@@ -17,13 +17,16 @@ pub struct BaseArgs {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Verbose mode — set at runtime by subcommands that support it
-    #[arg(skip)]
+    /// Increase output verbosity
+    #[arg(long, short = 'v', env = "BRAINTRUST_VERBOSE", global = true, conflicts_with = "quiet", value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub verbose: bool,
 
     /// Reduce interactive UI output
     #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub quiet: bool,
+
+    #[arg(skip)]
+    pub quiet_source: Option<ArgValueSource>,
 
     /// Disable ANSI color output
     #[arg(long, env = "BRAINTRUST_NO_COLOR", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
