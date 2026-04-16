@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -510,10 +511,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         no_workflow: flag_no_workflow,
         languages: flag_languages,
     } = flags;
-    const LOGO: &str = include_str!("../../ascii-logo-small.txt");
-    eprintln!("{LOGO}");
-    eprintln!("\x1b[34mBraintrust");
-    eprintln!("Eval everything\x1b[0m\n");
+    print_setup_banner(&base);
 
     let mut had_failures = false;
     let verbose = base.verbose;
@@ -808,6 +806,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 }
 
 async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
+    if !base.json {
+        print_setup_banner(&base);
+    }
+
     let will_instrument = !args.no_instrument && find_git_root().is_some();
     if will_instrument {
         let project_flag = base.project.clone();
@@ -891,6 +893,33 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
 
 fn in_ci() -> bool {
     std::env::var_os("CI").is_some()
+}
+
+fn setup_banner_color_enabled(base: &BaseArgs) -> bool {
+    if base.no_color || std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+
+    !matches!(std::env::var_os("TERM"), Some(term) if term == OsStr::new("dumb"))
+}
+
+fn print_setup_banner(base: &BaseArgs) {
+    let color_enabled = setup_banner_color_enabled(base);
+    eprintln!(
+        "{}",
+        style(crate::BANNER)
+            .for_stderr()
+            .blue()
+            .force_styling(color_enabled)
+    );
+    eprintln!(
+        "{}",
+        style("Braintrust")
+            .for_stderr()
+            .blue()
+            .force_styling(color_enabled)
+    );
+    eprintln!();
 }
 
 fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
@@ -1903,14 +1932,8 @@ async fn run_instrument_setup(
     // Determine run mode: interactive TUI vs background (autonomous).
     // Use prompt availability rather than stdin TTY state so `/dev/tty`
     // fallbacks still allow TUI launch when bt is invoked via a shell script.
-    let requested_interactive = resolve_instrument_run_mode(&args, ui::can_prompt());
-    let (mut run_interactive, bypass_permissions) = requested_interactive;
-    if run_interactive && matches!(selected, Agent::Opencode) {
-        run_interactive = false;
-        warnings.push(
-            "Opencode does not reliably support starting with a preloaded prompt in TUI mode; launching it in background mode instead.".to_string(),
-        );
-    }
+    let (run_interactive, bypass_permissions) =
+        resolve_instrument_run_mode(&args, ui::can_prompt());
 
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
@@ -4592,6 +4615,44 @@ mod tests {
     }
 
     #[test]
+    fn instrument_run_mode_prefers_tui_for_opencode_when_prompt_is_available() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Opencode),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
+    }
+
+    #[test]
+    fn instrument_run_mode_keeps_opencode_background_when_requested() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Opencode),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: true,
+            yolo: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (false, false));
+    }
+
+    #[test]
     fn render_instrument_task_includes_local_cli_and_no_mcp_guidance() {
         let root = PathBuf::from("/tmp/repo");
         let task = render_instrument_task(
@@ -4830,6 +4891,34 @@ mod tests {
                 assert_eq!(stdin_file, None);
                 assert_eq!(prompt_file_arg, Some(task_path));
                 assert!(!stream_json);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn opencode_interactive_instrument_invocation_stays_interactive() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Opencode, None, &task_path, true, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "opencode");
+                assert_eq!(args, vec!["run".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
