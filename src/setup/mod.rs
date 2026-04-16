@@ -1006,7 +1006,7 @@ fn resolve_profile_name_for_setup(
         return Ok(Some(profiles[0].name.clone()));
     }
 
-    if prompt_for_choice {
+    if prompt_for_choice && !profiles.is_empty() {
         auth::select_profile_interactive(None)?
             .map(Some)
             .ok_or_else(|| anyhow!("no profile selected"))
@@ -4245,6 +4245,16 @@ mod tests {
 
         let resolved =
             resolve_profile_name_for_setup(&base, &profiles, false).expect("resolve profile");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_profile_name_for_setup_allows_oauth_fallback_when_no_profiles_exist() {
+        let base = make_base_args();
+        let profiles = Vec::new();
+
+        let resolved =
+            resolve_profile_name_for_setup(&base, &profiles, true).expect("resolve profile");
         assert_eq!(resolved, None);
     }
 
