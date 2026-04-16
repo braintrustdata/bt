@@ -733,6 +733,10 @@ mod tests {
         TopicsProjectSummary,
     };
 
+    fn strip_ansi(s: &str) -> String {
+        console::strip_ansi_codes(s).to_string()
+    }
+
     fn sample_report() -> TopicsStatusReport {
         TopicsStatusReport {
             project: TopicsProjectSummary {
@@ -880,7 +884,7 @@ mod tests {
 
     #[test]
     fn compact_report_includes_summary_details() {
-        let output = render_report(&sample_report(), false);
+        let output = strip_ansi(&render_report(&sample_report(), false));
         assert!(output.contains("Project:"));
         assert!(!output.contains("Topic automations: 1"));
         assert!(output.contains("demo-project (proj_123)"));
@@ -899,7 +903,7 @@ mod tests {
 
     #[test]
     fn full_report_includes_diagnostics_and_flow() {
-        let output = render_report(&sample_report(), true);
+        let output = strip_ansi(&render_report(&sample_report(), true));
         assert!(output.contains("details:"));
         assert!(output.contains("  scope: trace"));
         assert!(output.contains("  state since: "));
@@ -966,7 +970,7 @@ mod tests {
         second.name = "Topics copy".to_string();
         report.automations.push(second);
 
-        let output = render_report(&report, false);
+        let output = strip_ansi(&render_report(&report, false));
         assert!(output.contains("Topic automations: 2"));
         assert!(output.contains("\n---\n\nTopics copy (auto_456)"));
     }
