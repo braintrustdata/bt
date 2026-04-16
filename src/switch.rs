@@ -25,9 +25,6 @@ pub struct SwitchArgs {
     /// Force set local config value
     #[arg(long, short = 'l')]
     local: bool,
-    /// Output verbose response
-    #[arg(long)]
-    verbose: bool,
     /// Target: project name or org/project
     #[arg(value_name = "TARGET")]
     target: Option<String>,
@@ -151,7 +148,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let display = format!("{org_name}/{}", project.name);
     print_command_status(CommandStatus::Success, &format!("Switched to {display}"));
-    if args.verbose {
+    if base.verbose {
         eprintln!("Wrote to {}", path.display());
     }
 
@@ -245,7 +242,6 @@ mod tests {
         SwitchArgs {
             global: false,
             local: false,
-            verbose: false,
             target: target.map(String::from),
         }
     }
@@ -255,6 +251,7 @@ mod tests {
             json: false,
             verbose: false,
             quiet: false,
+            quiet_source: None,
             no_color: false,
             no_input: false,
             profile: None,

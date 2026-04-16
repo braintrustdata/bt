@@ -108,10 +108,6 @@ pub struct SetupArgs {
     #[arg(long, short = 'i')]
     interactive: bool,
 
-    /// Show additional setup output
-    #[arg(long, short = 'v', global = true)]
-    verbose: bool,
-
     /// Deprecated: use --no-skills --no-mcp instead
     #[arg(long, hide = true, conflicts_with = "skills", conflicts_with = "mcp")]
     no_mcp_skill: bool,
@@ -419,10 +415,7 @@ struct SkillsAliasResult {
     path: PathBuf,
 }
 
-pub async fn run_setup_top(mut base: BaseArgs, mut args: SetupArgs) -> Result<()> {
-    base.verbose = args.verbose;
-    crate::ui::set_quiet(!args.verbose);
-    crate::ui::set_animations_enabled(args.verbose);
+pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
     // Deprecated flag: --no-mcp-skill is equivalent to --no-skills --no-mcp
     if args.no_mcp_skill {
         args.no_skills = true;
@@ -1663,7 +1656,7 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
         );
-    } else {
+    } else if base.verbose {
         print_human_report(
             false,
             outcome.scope,
@@ -1696,7 +1689,7 @@ async fn execute_skills_setup(
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut results = Vec::new();
-    let show_progress = !base.json && !quiet;
+    let show_progress = !base.json && !quiet && base.verbose;
 
     if show_progress {
         println!("Configuring coding agents for Braintrust");
@@ -1938,7 +1931,7 @@ async fn run_instrument_setup(
         &selected_languages,
     )?;
 
-    if run_interactive {
+    if run_interactive && base.verbose {
         eprintln!();
         eprintln!("{} is opening in interactive mode.", selected.as_str());
         eprintln!("The instrumentation task is pre-loaded. Press Enter to begin.");
@@ -1985,7 +1978,7 @@ async fn run_instrument_setup(
             "{}",
             serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
         );
-    } else {
+    } else if base.verbose {
         eprintln!();
         for result in &results {
             print_wizard_agent_result(result);
@@ -2626,7 +2619,7 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
             serde_json::to_string_pretty(&report)
                 .context("failed to serialize MCP setup report")?
         );
-    } else {
+    } else if base.verbose {
         print_mcp_human_report(scope, &selected_agents, &outcome.results, &outcome.warnings);
     }
 
@@ -3918,6 +3911,7 @@ mod tests {
             json: false,
             verbose: false,
             quiet: false,
+            quiet_source: None,
             no_color: false,
             no_input: false,
             profile: None,

@@ -294,15 +294,6 @@ pub struct EvalArgs {
     )]
     pub filter: Vec<String>,
 
-    /// Show verbose evaluator errors and stderr output.
-    #[arg(
-        long,
-        env = "BT_EVAL_VERBOSE",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        default_value_t = false
-    )]
-    pub verbose: bool,
-
     /// Re-run evals when input files change.
     #[arg(
         long,
@@ -385,7 +376,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         num_workers: args.num_workers,
         list: args.list,
         filter: args.filter,
-        verbose: args.verbose,
+        verbose: base.verbose,
         extra_args: args.extra_args,
     };
 
@@ -4273,7 +4264,6 @@ mod tests {
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
-            "BT_EVAL_VERBOSE",
             "BT_EVAL_WATCH",
             "BT_EVAL_DEV",
             "BT_EVAL_DEV_HOST",
@@ -4287,7 +4277,6 @@ mod tests {
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
-        set_env_var("BT_EVAL_VERBOSE", "1");
         set_env_var("BT_EVAL_WATCH", "on");
         set_env_var("BT_EVAL_DEV", "true");
         set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
@@ -4307,7 +4296,6 @@ mod tests {
                 "metadata.kind=fast".to_string()
             ]
         );
-        assert!(parsed.eval.verbose);
         assert!(parsed.eval.watch);
         assert!(parsed.eval.dev);
         assert_eq!(parsed.eval.dev_host, "127.0.0.1");

@@ -80,6 +80,32 @@ fn setup_verbose_is_accepted_after_subcommand() {
 }
 
 #[test]
+fn status_quiet_and_verbose_conflict() {
+    bt_command()
+        .args(["status", "--quiet", "--verbose"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn setup_quiet_and_verbose_conflict() {
+    bt_command()
+        .args([
+            "setup",
+            "--quiet",
+            "--verbose",
+            "--no-instrument",
+            "--global",
+            "--agent",
+            "codex",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
 fn setup_instrument_accepts_no_workflow_flag() {
     bt_command()
         .args(["setup", "instrument", "--no-workflow", "--help"])
@@ -118,12 +144,39 @@ fn setup_uses_codex_detected_on_path_without_explicit_agent() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Selected agents: codex"));
+        .stdout(predicate::str::contains("Selected agents: codex").not());
 
     assert!(home
         .path()
         .join(".agents/skills/braintrust/SKILL.md")
         .exists());
+}
+
+#[test]
+fn setup_verbose_prints_agent_summary() {
+    let repo = make_git_repo();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    write_executable(&bin_dir.path().join("codex"));
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("PATH", bin_dir.path())
+        .args([
+            "setup",
+            "--verbose",
+            "--global",
+            "--no-instrument",
+            "--no-workflow",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Selected agents: codex"));
 }
 
 #[test]
@@ -222,5 +275,5 @@ fn setup_mcp_only_no_instrument_does_not_require_project_or_auth() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Configuring MCP for Braintrust"));
+        .stdout(predicate::str::contains("Configuring MCP for Braintrust").not());
 }

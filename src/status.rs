@@ -13,11 +13,7 @@ Examples:
   bt status --json
   bt status --verbose
 ")]
-pub struct StatusArgs {
-    /// Output verbose status
-    #[arg(long)]
-    pub verbose: bool,
-}
+pub struct StatusArgs {}
 
 #[derive(Serialize)]
 struct StatusOutput {
@@ -44,7 +40,7 @@ fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
     }
 }
 
-pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     let global_path = config::global_path().ok();
     let global_cfg = config::load_global().unwrap_or_default();
     let local_path = config::local_path();
@@ -79,7 +75,7 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
-    if args.verbose {
+    if base.verbose {
         println!("org: {}", org.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
         if let Some(ref p) = profile_info {

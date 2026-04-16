@@ -330,6 +330,20 @@ struct LoginOrgInfo {
     api_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyOrgMismatchAction {
+    UseApiKey,
+    UseOauth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedOrgResolution {
+    NoRequestedOrg,
+    UseRequestedOrg,
+    IgnoreRequestedOrg,
+    SwitchToOauth,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
@@ -365,10 +379,7 @@ enum AuthCommand {
 }
 
 #[derive(Debug, Clone, Args)]
-struct AuthProfilesArgs {
-    #[arg(long)]
-    verbose: bool,
-}
+struct AuthProfilesArgs {}
 
 #[derive(Debug, Clone, Args)]
 struct AuthLoginArgs {
@@ -383,10 +394,6 @@ struct AuthLoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
-
-    /// Show org IDs and API URLs in org selector
-    #[arg(long, short = 'v')]
-    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -401,9 +408,6 @@ struct AuthLogoutArgs {
 }
 
 pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
-    if !base.json {
-        crate::ui::set_quiet(false);
-    }
     match args.command {
         AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
@@ -796,12 +800,28 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
+    let requested_org_resolution = resolve_requested_org_for_api_key_login(
+        &login_orgs,
+        base.org_name.as_deref(),
+        ui::can_prompt(),
+        prompt_for_auth_method_for_missing_requested_org,
+    )?;
+    if requested_org_resolution == RequestedOrgResolution::SwitchToOauth {
+        return run_login_oauth(base, args).await;
+    }
     let selected_org = select_login_org(
         login_orgs.clone(),
-        base.org_name.as_deref(),
+        match requested_org_resolution {
+            RequestedOrgResolution::UseRequestedOrg => base.org_name.as_deref(),
+            RequestedOrgResolution::NoRequestedOrg | RequestedOrgResolution::IgnoreRequestedOrg => {
+                None
+            }
+            RequestedOrgResolution::SwitchToOauth => unreachable!("handled above"),
+        },
         interactive,
-        args.verbose,
+        base.verbose,
         true,
+        explicitly_quiet(base),
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
@@ -878,7 +898,12 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         }
     }
 
-    let callback = collect_oauth_callback(listener, args.no_browser || is_ssh_session()).await?;
+    let callback = collect_oauth_callback(
+        listener,
+        args.no_browser || is_ssh_session(),
+        explicitly_quiet(base),
+    )
+    .await?;
     if let Some(error) = callback.error {
         bail!("oauth authorization failed: {error}");
     }
@@ -905,8 +930,9 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         login_orgs.clone(),
         base.org_name.as_deref(),
         ui::can_prompt(),
-        args.verbose,
+        base.verbose,
         true,
+        explicitly_quiet(base),
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
@@ -983,7 +1009,8 @@ pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<Strin
     eprintln!("{}", dialoguer::console::style(&authorize_url).dim());
     eprintln!();
 
-    let callback = collect_oauth_callback(listener, is_ssh_session()).await?;
+    let callback =
+        collect_oauth_callback(listener, is_ssh_session(), explicitly_quiet(base)).await?;
     if let Some(error) = callback.error {
         bail!("oauth authorization failed: {error}");
     }
@@ -1013,6 +1040,7 @@ pub(crate) async fn login_interactive_oauth(base: &mut BaseArgs) -> Result<Strin
         ui::can_prompt(),
         false,
         false,
+        explicitly_quiet(base),
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
@@ -1368,7 +1396,7 @@ fn format_login_success(
     }
 }
 
-async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
+async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
     if resolve_api_key_override(base).is_some() {
         println!("Auth source: --api-key/BRAINTRUST_API_KEY override");
         eprintln!("Tip: pass --prefer-profile or unset BRAINTRUST_API_KEY to use profiles.");
@@ -1405,7 +1433,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
         crate::ui::print_command_status(cmd_status, &format_verification_line(v));
     }
 
-    if args.verbose {
+    if base.verbose {
         if let Ok(path) = auth_store_path() {
             eprintln!("\nCredentials: {}", path.display());
         }
@@ -1735,6 +1763,7 @@ fn select_login_org(
     interactive: bool,
     verbose: bool,
     allow_cross_org: bool,
+    quiet_requested: bool,
 ) -> Result<Option<LoginOrgInfo>> {
     if orgs.is_empty() {
         bail!("no organizations found for this credential");
@@ -1747,23 +1776,10 @@ fn select_login_org(
     });
 
     if let Some(name) = requested_org_name {
-        let selected = orgs
-            .iter()
-            .find(|org| org.name == name)
-            .or_else(|| {
-                let lowered = name.to_ascii_lowercase();
-                orgs.iter()
-                    .find(|org| org.name.to_ascii_lowercase() == lowered)
-            })
-            .cloned();
-        return selected.map(Some).ok_or_else(|| {
-            let available = orgs
-                .iter()
-                .map(|org| org.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::anyhow!("org '{name}' not found. Available: {available}")
-        });
+        return find_login_org(&orgs, name)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| missing_requested_org_error(&orgs, name));
     }
 
     if orgs.len() == 1 {
@@ -1791,7 +1807,9 @@ fn select_login_org(
         }
     }));
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-    eprintln!("\n\nA Braintrust organization is usually a team or a company.");
+    if !quiet_requested {
+        eprintln!("\n\nA Braintrust organization is usually a team or a company.");
+    }
     let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
     if allow_cross_org && selection == 0 {
         return Ok(None);
@@ -1802,6 +1820,78 @@ fn select_login_org(
             .nth(selection - offset)
             .expect("selected index should be in range"),
     ))
+}
+
+fn find_login_org<'a>(
+    orgs: &'a [LoginOrgInfo],
+    requested_org_name: &str,
+) -> Option<&'a LoginOrgInfo> {
+    orgs.iter()
+        .find(|org| org.name == requested_org_name)
+        .or_else(|| {
+            let lowered = requested_org_name.to_ascii_lowercase();
+            orgs.iter()
+                .find(|org| org.name.to_ascii_lowercase() == lowered)
+        })
+}
+
+fn missing_requested_org_error(orgs: &[LoginOrgInfo], requested_org_name: &str) -> anyhow::Error {
+    let available = orgs
+        .iter()
+        .map(|org| org.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::anyhow!("org '{requested_org_name}' not found. Available: {available}")
+}
+
+fn resolve_requested_org_for_api_key_login<F>(
+    orgs: &[LoginOrgInfo],
+    requested_org_name: Option<&str>,
+    can_prompt: bool,
+    choose_auth_method: F,
+) -> Result<RequestedOrgResolution>
+where
+    F: FnOnce(&str, &[LoginOrgInfo]) -> Result<ApiKeyOrgMismatchAction>,
+{
+    let Some(requested_org_name) = requested_org_name else {
+        return Ok(RequestedOrgResolution::NoRequestedOrg);
+    };
+
+    if find_login_org(orgs, requested_org_name).is_some() {
+        return Ok(RequestedOrgResolution::UseRequestedOrg);
+    }
+
+    if !can_prompt {
+        return Err(missing_requested_org_error(orgs, requested_org_name));
+    }
+
+    match choose_auth_method(requested_org_name, orgs)? {
+        ApiKeyOrgMismatchAction::UseApiKey => Ok(RequestedOrgResolution::IgnoreRequestedOrg),
+        ApiKeyOrgMismatchAction::UseOauth => Ok(RequestedOrgResolution::SwitchToOauth),
+    }
+}
+
+fn prompt_for_auth_method_for_missing_requested_org(
+    requested_org_name: &str,
+    orgs: &[LoginOrgInfo],
+) -> Result<ApiKeyOrgMismatchAction> {
+    let api_key_label = if orgs.len() == 1 {
+        format!("API key ({})", orgs[0].name)
+    } else {
+        "API key (use available org)".to_string()
+    };
+    let methods = ["OAuth (browser)".to_string(), api_key_label];
+    let method_refs: Vec<&str> = methods.iter().map(String::as_str).collect();
+    let selection = ui::fuzzy_select(
+        &format!("Org '{requested_org_name}' is not available for this API key. Continue with"),
+        &method_refs,
+        0,
+    )?;
+    Ok(match selection {
+        0 => ApiKeyOrgMismatchAction::UseOauth,
+        1 => ApiKeyOrgMismatchAction::UseApiKey,
+        _ => unreachable!("fuzzy_select returned out-of-range index"),
+    })
 }
 
 fn resolve_profile_api_url(
@@ -1938,6 +2028,7 @@ async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallbackP
 async fn collect_oauth_callback(
     listener: TcpListener,
     prefer_manual: bool,
+    quiet_requested: bool,
 ) -> Result<OAuthCallbackParams> {
     match oauth_callback_mode(prefer_manual) {
         OAuthCallbackMode::ListenerOnly => {
@@ -1948,13 +2039,15 @@ async fn collect_oauth_callback(
         OAuthCallbackMode::PromptThenListener => {
             let term = ui::prompt_term()
                 .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?;
-            println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
-            println!(
-                "After approving access, your browser may show a localhost connection error on remote hosts."
-            );
-            println!(
-                "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
-            );
+            if !quiet_requested {
+                println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
+                println!(
+                    "After approving access, your browser may show a localhost connection error on remote hosts."
+                );
+                println!(
+                    "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
+                );
+            }
             let pasted = Input::<String>::new()
                 .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
                 .allow_empty(true)
@@ -1967,6 +2060,10 @@ async fn collect_oauth_callback(
             parse_oauth_callback_input(&pasted)
         }
     }
+}
+
+fn explicitly_quiet(base: &BaseArgs) -> bool {
+    base.quiet && base.quiet_source.is_some()
 }
 
 async fn wait_for_oauth_callback_or_stdin(listener: TcpListener) -> Result<OAuthCallbackParams> {
@@ -2857,6 +2954,7 @@ mod tests {
             json: false,
             verbose: false,
             quiet: false,
+            quiet_source: None,
             no_color: false,
             no_input: false,
             profile: None,
@@ -3481,6 +3579,80 @@ mod tests {
 
         assert_eq!(profile_name, "newer");
         assert!(!should_confirm);
+    }
+
+    fn login_org(id: &str, name: &str) -> LoginOrgInfo {
+        LoginOrgInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            api_url: None,
+        }
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_keeps_matching_requested_org() {
+        let orgs = vec![login_org("org_1", "acme")];
+
+        let resolution =
+            resolve_requested_org_for_api_key_login(&orgs, Some("acme"), false, |_, _| {
+                panic!("prompt should not be called")
+            })
+            .expect("resolve");
+
+        assert_eq!(resolution, RequestedOrgResolution::UseRequestedOrg);
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_errors_without_prompt() {
+        let orgs = vec![login_org("org_1", "braintrustdata.com")];
+
+        let err =
+            resolve_requested_org_for_api_key_login(&orgs, Some("ced-test-1"), false, |_, _| {
+                panic!("prompt should not be called")
+            })
+            .expect_err("should fail");
+
+        assert!(err
+            .to_string()
+            .contains("org 'ced-test-1' not found. Available: braintrustdata.com"));
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_can_switch_to_oauth() {
+        let orgs = vec![login_org("org_1", "braintrustdata.com")];
+
+        let resolution = resolve_requested_org_for_api_key_login(
+            &orgs,
+            Some("ced-test-1"),
+            true,
+            |requested_org_name, available_orgs| {
+                assert_eq!(requested_org_name, "ced-test-1");
+                assert_eq!(available_orgs.len(), 1);
+                Ok(ApiKeyOrgMismatchAction::UseOauth)
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(resolution, RequestedOrgResolution::SwitchToOauth);
+    }
+
+    #[test]
+    fn resolve_requested_org_for_api_key_login_can_continue_with_api_key() {
+        let orgs = vec![login_org("org_1", "braintrustdata.com")];
+
+        let resolution = resolve_requested_org_for_api_key_login(
+            &orgs,
+            Some("ced-test-1"),
+            true,
+            |requested_org_name, available_orgs| {
+                assert_eq!(requested_org_name, "ced-test-1");
+                assert_eq!(available_orgs.len(), 1);
+                Ok(ApiKeyOrgMismatchAction::UseApiKey)
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(resolution, RequestedOrgResolution::IgnoreRequestedOrg);
     }
 
     #[test]
