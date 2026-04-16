@@ -13,8 +13,8 @@ use braintrust_sdk_rust::{BraintrustClient, LoginState};
 use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
-use oauth2::basic::{BasicClient, BasicTokenType};
-use oauth2::reqwest::async_http_client;
+use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicRequestTokenError, BasicTokenType};
+use oauth2::reqwest::{async_http_client, AsyncHttpClientError};
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, EmptyExtraTokenFields, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, StandardTokenResponse, TokenResponse,
@@ -623,7 +623,8 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
             ),
         )
     })?;
-    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, client_id).await?;
+    let refreshed =
+        refresh_oauth_access_token(&api_url, &refresh_token, client_id, &profile_name).await?;
     save_profile_oauth_access_token(&profile_name, &refreshed.access_token)?;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
         if next_refresh_token != &refresh_token {
@@ -1152,7 +1153,9 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         println!("Cached access token expiry before refresh: unknown");
     }
 
-    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &client_id).await?;
+    let refreshed =
+        refresh_oauth_access_token(&api_url, &refresh_token, &client_id, profile_name.as_str())
+            .await?;
     save_profile_oauth_access_token(profile_name.as_str(), &refreshed.access_token)?;
     let mut refresh_rotated = false;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
@@ -2141,22 +2144,43 @@ async fn exchange_oauth_authorization_code(
     Ok(to_oauth_token_response(token_response))
 }
 
+fn map_refresh_oauth_error(
+    api_url: &str,
+    profile_name: &str,
+    err: BasicRequestTokenError<AsyncHttpClientError>,
+) -> anyhow::Error {
+    if let BasicRequestTokenError::ServerResponse(server_err) = &err {
+        if matches!(server_err.error(), BasicErrorResponseType::InvalidGrant) {
+            let mut message =
+                format!("oauth refresh token expired or was rejected for profile '{profile_name}'");
+            if let Some(description) = server_err.error_description() {
+                message.push_str(&format!(" ({description})"));
+            }
+            message.push_str(&format!(
+                "; re-run `bt auth login --oauth --profile {profile_name}`"
+            ));
+            return recoverable_auth_error(RecoverableAuthErrorKind::OauthRefreshToken, message);
+        }
+    }
+
+    anyhow::Error::new(err).context(format!(
+        "failed to call oauth token endpoint {}/oauth/token",
+        api_url.trim_end_matches('/')
+    ))
+}
+
 async fn refresh_oauth_access_token(
     api_url: &str,
     refresh_token: &str,
     client_id: &str,
+    profile_name: &str,
 ) -> Result<OAuthTokenResponse> {
     let oauth_client = build_oauth_client(api_url, client_id, None)?;
     let token_response = oauth_client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
         .request_async(async_http_client)
         .await
-        .with_context(|| {
-            format!(
-                "failed to call oauth token endpoint {}/oauth/token",
-                api_url.trim_end_matches('/')
-            )
-        })?;
+        .map_err(|err| map_refresh_oauth_error(api_url, profile_name, err))?;
     Ok(to_oauth_token_response(token_response))
 }
 
@@ -2927,6 +2951,36 @@ mod tests {
         .context("while resolving auth");
 
         assert!(is_missing_credential_error(&err));
+    }
+
+    #[test]
+    fn invalid_grant_refresh_error_is_treated_as_recoverable() {
+        let err = map_refresh_oauth_error(
+            "https://api.example.com",
+            "work",
+            BasicRequestTokenError::ServerResponse(oauth2::basic::BasicErrorResponse::new(
+                BasicErrorResponseType::InvalidGrant,
+                Some("refresh token expired".to_string()),
+                None,
+            )),
+        );
+
+        assert!(is_missing_credential_error(&err));
+        assert!(err.to_string().contains("refresh token expired"));
+    }
+
+    #[test]
+    fn nonrecoverable_refresh_errors_remain_nonrecoverable() {
+        let err = map_refresh_oauth_error(
+            "https://api.example.com",
+            "work",
+            BasicRequestTokenError::Other("unexpected response".to_string()),
+        );
+
+        assert!(!is_missing_credential_error(&err));
+        assert!(err
+            .to_string()
+            .contains("failed to call oauth token endpoint"));
     }
 
     fn restore_env_var(key: &str, previous: Option<OsString>) {
