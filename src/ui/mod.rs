@@ -13,7 +13,6 @@ mod table;
 static NO_INPUT: AtomicBool = AtomicBool::new(false);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static ANIMATIONS_ENABLED: AtomicBool = AtomicBool::new(true);
-static NO_INPUT: AtomicBool = AtomicBool::new(false);
 
 pub fn set_no_input(val: bool) {
     NO_INPUT.store(val, Ordering::Relaxed);
@@ -33,10 +32,6 @@ pub fn set_animations_enabled(val: bool) {
 
 pub fn animations_enabled() -> bool {
     ANIMATIONS_ENABLED.load(Ordering::Relaxed)
-}
-
-pub fn set_no_input(val: bool) {
-    NO_INPUT.store(val, Ordering::Relaxed);
 }
 
 pub fn prompt_term() -> Option<Term> {
