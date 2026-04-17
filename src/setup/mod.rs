@@ -2705,8 +2705,7 @@ fn render_instrument_task(
         };
         format!(
             "### 2. Language\n\n\
-             The target language has been specified: {}. \
-             Proceed directly to Step 3.",
+             The target language has been specified: {}.",
             list
         )
     };
