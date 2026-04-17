@@ -163,6 +163,12 @@ struct AgentsSetupArgs {
     #[arg(long, default_value_t = crate::sync::default_workers())]
     workers: usize,
 
+    #[command(flatten)]
+    permissions: InstrumentPermissionArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct InstrumentPermissionArgs {
     /// Grant the agent full permissions (bypass permission prompts)
     #[arg(long)]
     yolo: bool,
@@ -229,9 +235,8 @@ struct InstrumentSetupArgs {
     #[arg(long, conflicts_with = "tui")]
     background: bool,
 
-    /// Grant the agent full permissions (bypass permission prompts)
-    #[arg(long)]
-    yolo: bool,
+    #[command(flatten)]
+    permissions: InstrumentPermissionArgs,
 
     #[arg(skip)]
     prompt_for_missing_options: bool,
@@ -452,7 +457,7 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             let wizard_flags = WizardFlags {
-                yolo: args.agents.yolo,
+                yolo: args.agents.permissions.yolo,
                 skills: args.skills,
                 no_skills: args.no_skills,
                 mcp: args.mcp,
@@ -697,7 +702,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 yes: true,
                 refresh_docs: false,
                 workers: crate::sync::default_workers(),
-                yolo: false,
+                permissions: InstrumentPermissionArgs { yolo: false },
             };
             let outcome = execute_skills_setup(&base, &args, true).await?;
             for r in &outcome.results {
@@ -838,7 +843,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                         languages: selected_languages.clone(),
                         tui: false,
                         background: false,
-                        yolo,
+                        permissions: InstrumentPermissionArgs { yolo },
                         prompt_for_missing_options: false,
                     },
                     ui::can_prompt(),
@@ -858,7 +863,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     languages: selected_languages,
                     tui: run_tui,
                     background: !run_tui,
-                    yolo: yolo_mode,
+                    permissions: InstrumentPermissionArgs { yolo: yolo_mode },
                     prompt_for_missing_options: false,
                 },
                 !multiselect_hint_shown,
@@ -930,7 +935,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 yes: true,
                 refresh_docs: args.agents.refresh_docs,
                 workers: args.agents.workers,
-                yolo: args.agents.yolo,
+                permissions: args.agents.permissions.clone(),
             },
         )
         .await?;
@@ -963,7 +968,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 languages: args.languages,
                 tui: args.tui,
                 background: args.background,
-                yolo: args.agents.yolo,
+                permissions: args.agents.permissions,
                 prompt_for_missing_options: false,
             },
             false,
@@ -1946,7 +1951,7 @@ async fn run_instrument_setup(
             yes: true,
             refresh_docs: args.refresh_docs,
             workers: args.workers,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
         };
         let outcome = execute_skills_setup(&base, &setup_args, false).await?;
         detected = outcome.detected_agents;
@@ -2559,11 +2564,11 @@ async fn run_agent_invocation(
 
 fn resolve_instrument_run_mode(args: &InstrumentSetupArgs, prompt_available: bool) -> (bool, bool) {
     if args.tui {
-        (true, args.yolo)
+        (true, args.permissions.yolo)
     } else if args.background || !prompt_available {
-        (false, args.yolo)
+        (false, args.permissions.yolo)
     } else {
-        (true, args.yolo)
+        (true, args.permissions.yolo)
     }
 }
 
@@ -2581,7 +2586,7 @@ fn prompt_instrument_run_mode(args: &InstrumentSetupArgs) -> Result<(bool, bool)
             .interact_on(&term)?
             == 0
     };
-    let bypass_permissions = if args.yolo {
+    let bypass_permissions = if args.permissions.yolo {
         true
     } else {
         Confirm::with_theme(&ColorfulTheme::default())
@@ -4732,7 +4737,7 @@ mod tests {
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
         };
         let home = std::env::temp_dir();
         let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
@@ -4762,7 +4767,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
         };
 
@@ -4787,7 +4792,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
         };
 
@@ -4809,7 +4814,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
         };
 
@@ -4831,7 +4836,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
         };
 
@@ -4851,7 +4856,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
         };
 
@@ -4871,7 +4876,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: true,
+            permissions: InstrumentPermissionArgs { yolo: true },
             prompt_for_missing_options: false,
         };
 
@@ -4891,7 +4896,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: true,
-            yolo: true,
+            permissions: InstrumentPermissionArgs { yolo: true },
             prompt_for_missing_options: false,
         };
 
@@ -4911,7 +4916,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
         };
 
@@ -4931,7 +4936,7 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: true,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
         };
 
