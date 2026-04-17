@@ -40,7 +40,7 @@ const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
     None => DEFAULT_CANARY_VERSION,
 };
 
-const BANNER: &str = r#"
+pub(crate) const BANNER: &str = r#"
 
   ███  ███
 ███      ███

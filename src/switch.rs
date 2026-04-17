@@ -8,7 +8,7 @@ use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
 use crate::ui::{
-    is_interactive, print_command_status, select_project_interactive, with_spinner, CommandStatus,
+    is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
 };
 
 #[derive(Debug, Clone, Args)]
@@ -116,14 +116,13 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
                 bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
             }
             interactive = true;
-            let selected_name =
-                select_project_interactive(&client, None, current_cfg.project.as_deref()).await?;
-            with_spinner(
-                "Loading project...",
-                api::get_project_by_name(&client, &selected_name),
+            select_project(
+                &client,
+                None,
+                None,
+                crate::ui::ProjectSelectMode::ExistingOnly,
             )
             .await?
-            .ok_or_else(|| anyhow::anyhow!("project '{selected_name}' not found"))?
         }
     };
 

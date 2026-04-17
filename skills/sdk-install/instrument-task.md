@@ -28,8 +28,6 @@ Before writing any code:
 
 ## Steps
 
-{LANGUAGE_CONTEXT}
-
 ### 1. Verify API Key (Install Precondition)
 
 Check if `BRAINTRUST_API_KEY` is exported:
@@ -42,46 +40,11 @@ If not set, **abort installation immediately**.
 
 ---
 
-### 2. Detect Language
-
-Determine the project language using concrete signals:
-
-- `package.json` → TypeScript
-- `requirements.txt` or `pyproject.toml` → Python
-- `pom.xml` or `build.gradle` → Java
-- `go.mod` → Go
-- `Gemfile` → Ruby
-- `.csproj` → C#
-
-If the language is not obvious from standard build/dependency files:
-
-- infer it from concrete repo evidence (e.g., entrypoint file extensions, build scripts, framework config)
-- State the single strongest piece of evidence you used
-- If still ambiguous (polyglot/monorepo), ask the user which service/app to instrument and wait for the response before proceeding
-- If the inferred language is not in the supported list, **abort the install**.
-
-If none match, **abort installation**.
+{LANGUAGE_CONTEXT}
 
 ---
 
-### 3. Install SDK (Language-Specific)
-
-Read the install guide for the detected language from the local docs:
-
-| Language   | Local doc                         |
-| ---------- | --------------------------------- |
-| Java       | `{SDK_INSTALL_DIR}/java.md`       |
-| TypeScript | `{SDK_INSTALL_DIR}/typescript.md` |
-| Python     | `{SDK_INSTALL_DIR}/python.md`     |
-| Go         | `{SDK_INSTALL_DIR}/go.md`         |
-| Ruby       | `{SDK_INSTALL_DIR}/ruby.md`       |
-| C#         | `{SDK_INSTALL_DIR}/csharp.md`     |
-
-Requirements:
-
-- Pin an exact SDK version (resolve via package manager).
-- Modify only dependency files and a minimal application entry point (e.g., main/bootstrap).
-- Do not change unrelated code.
+{INSTALL_SDK_CONTEXT}
 
 ---
 
@@ -108,14 +71,6 @@ Most language SDKs print a direct URL to the emitted trace after the app runs. C
 
 If the SDK does not print a URL, construct one manually using the URL format documented in `{SDK_INSTALL_DIR}/braintrust-url-formats.md`:
 
-```
-https://www.braintrust.dev/app/{org}/p/{project_name}/logs?r={root_span_id}
-```
-
-- `org`: your Braintrust organization slug
-- `project_name`: the project name set in code
-- `root_span_id`: the trace/span ID returned or logged by the SDK
-
 ---
 
 ### 6. Final Summary
@@ -126,5 +81,15 @@ Summarize:
 - Where code was modified
 - What logs/traces were emitted
 - The Braintrust permalink (required)
+
+---
+
+### 7. Next Steps
+
+Tell the user:
+
+- Braintrust agent skills have been installed and are available to your coding agent to help you integrate Braintrust into your product.
+- The Braintrust MCP server can be added to make your coding agent even more helpful when working with Braintrust — run `bt setup mcp` to install it. More information at https://www.braintrust.dev/docs/integrations/developer-tools/mcp
+- For more information on Braintrust, visit https://www.braintrust.dev/docs
 
 {WORKFLOW_CONTEXT}

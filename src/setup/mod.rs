@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect, Select}
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
+use toml::Value as TomlValue;
 
 use crate::args::{ArgValueSource, BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
 use crate::auth;
@@ -399,6 +401,11 @@ struct McpSelection {
     selected_agents: Vec<Agent>,
 }
 
+struct SetupAuthContext {
+    client: ApiClient,
+    api_key: String,
+}
+
 struct SkillsSetupOutcome {
     scope: InstallScope,
     selected_agents: Vec<Agent>,
@@ -437,7 +444,7 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Instrument(instrument)) => {
             run_instrument_setup(base, instrument, false).await
         }
-        Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp),
+        Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp).await,
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             let wizard_flags = WizardFlags {
@@ -504,6 +511,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         no_workflow: flag_no_workflow,
         languages: flag_languages,
     } = flags;
+    print_setup_banner(&base);
+
     let mut had_failures = false;
     let verbose = base.verbose;
     let will_instrument = !flag_no_instrument && find_git_root().is_some();
@@ -513,14 +522,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(1, "Auth");
     }
     let project_flag = will_instrument.then(|| base.project.clone()).flatten();
-    let setup_client = if will_instrument {
+    let mut setup_auth = if will_instrument {
         Some(ensure_setup_auth(&mut base, !flag_no_instrument, !flag_no_instrument).await?)
     } else {
         None
     };
-    let org = setup_client
+    let org = setup_auth
         .as_ref()
-        .map(|client| client.org_name().to_string());
+        .map(|auth| auth.client.org_name().to_string());
 
     if verbose {
         if let Some(org) = org.as_deref() {
@@ -534,8 +543,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(2, "Project");
     }
-    let project = if let Some(client) = setup_client.as_ref() {
-        select_project_with_skip(client, project_flag.as_deref(), !verbose).await?
+    let project = if let Some(auth) = setup_auth.as_ref() {
+        select_project_with_skip(&auth.client, project_flag.as_deref(), !verbose).await?
     } else {
         None
     };
@@ -687,10 +696,22 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         if verbose {
             eprintln!("   {}", style("MCP:").bold());
         }
-        if let Some((scope, selected_agent, home)) = setup_context.as_ref() {
+        if setup_auth.is_none() {
+            setup_auth = Some(ensure_setup_auth(&mut base, false, true).await?);
+        }
+        if let (Some((scope, selected_agent, home)), Some(auth)) =
+            (setup_context.as_ref(), setup_auth.as_ref())
+        {
             let local_root = resolve_local_root_for_scope(*scope)?;
-            let outcome =
-                execute_mcp_install(*scope, local_root.as_deref(), home, &[*selected_agent]);
+            let api_url = auth.client.url("");
+            let outcome = execute_mcp_install(
+                *scope,
+                local_root.as_deref(),
+                home,
+                &[*selected_agent],
+                &auth.api_key,
+                &mcp_url_from_api_url(&api_url),
+            );
             for r in &outcome.results {
                 if verbose {
                     print_wizard_agent_result(r);
@@ -785,12 +806,16 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
 }
 
 async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
+    if !base.json {
+        print_setup_banner(&base);
+    }
+
     let will_instrument = !args.no_instrument && find_git_root().is_some();
     if will_instrument {
         let project_flag = base.project.clone();
-        let client = ensure_setup_auth(&mut base, false, true).await?;
-        let org = client.org_name().to_string();
-        let project = select_project_with_skip(&client, project_flag.as_deref(), true).await?;
+        let auth = ensure_setup_auth(&mut base, false, true).await?;
+        let org = auth.client.org_name().to_string();
+        let project = select_project_with_skip(&auth.client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
             let _ = maybe_init(&org, project)?;
         }
@@ -834,7 +859,8 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 global: matches!(scope, InstallScope::Global),
                 yes: true,
             },
-        )?;
+        )
+        .await?;
     }
 
     if !args.no_instrument {
@@ -867,6 +893,33 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
 
 fn in_ci() -> bool {
     std::env::var_os("CI").is_some()
+}
+
+fn setup_banner_color_enabled(base: &BaseArgs) -> bool {
+    if base.no_color || std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+
+    !matches!(std::env::var_os("TERM"), Some(term) if term == OsStr::new("dumb"))
+}
+
+fn print_setup_banner(base: &BaseArgs) {
+    let color_enabled = setup_banner_color_enabled(base);
+    eprintln!(
+        "{}",
+        style(crate::BANNER)
+            .for_stderr()
+            .blue()
+            .force_styling(color_enabled)
+    );
+    eprintln!(
+        "{}",
+        style("Braintrust")
+            .for_stderr()
+            .blue()
+            .force_styling(color_enabled)
+    );
+    eprintln!();
 }
 
 fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
@@ -953,7 +1006,7 @@ fn resolve_profile_name_for_setup(
         return Ok(Some(profiles[0].name.clone()));
     }
 
-    if prompt_for_choice {
+    if prompt_for_choice && !profiles.is_empty() {
         auth::select_profile_interactive(None)?
             .map(Some)
             .ok_or_else(|| anyhow!("no profile selected"))
@@ -1183,8 +1236,8 @@ async fn ensure_profile_or_oauth_auth(
 async fn ensure_setup_auth(
     base: &mut BaseArgs,
     prompt_for_profile_choice: bool,
-    will_instrument: bool,
-) -> Result<ApiClient> {
+    needs_api_key: bool,
+) -> Result<SetupAuthContext> {
     apply_setup_config_fallbacks(base);
 
     let explicit_api_key = base
@@ -1248,7 +1301,7 @@ async fn ensure_setup_auth(
                         bail!("project '{project_name}' not found in org '{}'", org.name);
                     }
                 }
-                return Ok(client);
+                return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let (login_ctx, is_oauth) =
@@ -1262,10 +1315,7 @@ async fn ensure_setup_auth(
                     );
                 }
             }
-            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                maybe_create_api_key_for_instrumentation(base, &client).await?;
-            }
-            return Ok(client);
+            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
 
         if let Some(org_name) = org_name.as_deref() {
@@ -1284,7 +1334,7 @@ async fn ensure_setup_auth(
                         bail!("project '{project_name}' not found in org '{org_name}'");
                     }
                 }
-                return Ok(client);
+                return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let (login_ctx, is_oauth) =
@@ -1298,10 +1348,7 @@ async fn ensure_setup_auth(
                     );
                 }
             }
-            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                maybe_create_api_key_for_instrumentation(base, &client).await?;
-            }
-            return Ok(client);
+            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
 
         if base.prefer_profile {
@@ -1316,10 +1363,7 @@ async fn ensure_setup_auth(
                     let (login_ctx, is_oauth) =
                         ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
                     let client = ApiClient::new(&login_ctx)?;
-                    if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                        maybe_create_api_key_for_instrumentation(base, &client).await?;
-                    }
-                    return Ok(client);
+                    return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
                 }
                 let org = select_api_key_org_for_setup(
                     base,
@@ -1340,7 +1384,7 @@ async fn ensure_setup_auth(
                     base.app_url.clone(),
                     Some(org.name.clone()),
                 )?;
-                return Ok(client);
+                return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let preferred_org_names = matching_profile_org_names(&stored_profiles, None);
@@ -1353,10 +1397,7 @@ async fn ensure_setup_auth(
                 let (login_ctx, is_oauth) =
                     ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
                 let client = ApiClient::new(&login_ctx)?;
-                if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                    maybe_create_api_key_for_instrumentation(base, &client).await?;
-                }
-                return Ok(client);
+                return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
             }
 
             let candidate_orgs = match project_name.as_deref() {
@@ -1369,10 +1410,7 @@ async fn ensure_setup_auth(
                 let (login_ctx, is_oauth) =
                     ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
                 let client = ApiClient::new(&login_ctx)?;
-                if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                    maybe_create_api_key_for_instrumentation(base, &client).await?;
-                }
-                return Ok(client);
+                return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
             }
             let org = select_api_key_org_for_setup(
                 base,
@@ -1380,7 +1418,8 @@ async fn ensure_setup_auth(
                 project_name.as_deref(),
                 &preferred_org_names,
             )?;
-            return build_api_key_client(base, api_key, &org).await;
+            let client = build_api_key_client(base, api_key, &org).await?;
+            return build_setup_auth_context(base, client, false, needs_api_key).await;
         }
 
         let candidate_orgs = match project_name.as_deref() {
@@ -1393,31 +1432,37 @@ async fn ensure_setup_auth(
             let (login_ctx, is_oauth) =
                 ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
             let client = ApiClient::new(&login_ctx)?;
-            if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-                maybe_create_api_key_for_instrumentation(base, &client).await?;
-            }
-            return Ok(client);
+            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
         let org =
             select_api_key_org_for_setup(base, &candidate_orgs, project_name.as_deref(), &[])?;
-        return build_api_key_client(base, api_key, &org).await;
+        let client = build_api_key_client(base, api_key, &org).await?;
+        return build_setup_auth_context(base, client, false, needs_api_key).await;
     }
 
     let (login_ctx, is_oauth) =
         ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
     let client = ApiClient::new(&login_ctx)?;
-    if should_create_api_key_for_instrumentation(is_oauth, base, will_instrument) {
-        maybe_create_api_key_for_instrumentation(base, &client).await?;
-    }
-    Ok(client)
+    build_setup_auth_context(base, client, is_oauth, needs_api_key).await
 }
 
-fn should_create_api_key_for_instrumentation(
-    is_oauth: bool,
+async fn build_setup_auth_context(
     base: &BaseArgs,
-    will_instrument: bool,
-) -> bool {
-    will_instrument
+    client: ApiClient,
+    is_oauth: bool,
+    needs_api_key: bool,
+) -> Result<SetupAuthContext> {
+    let api_key = if should_create_api_key_for_setup(is_oauth, base, needs_api_key) {
+        maybe_create_api_key_for_oauth(base, &client).await?
+    } else {
+        client.api_key().to_string()
+    };
+
+    Ok(SetupAuthContext { client, api_key })
+}
+
+fn should_create_api_key_for_setup(is_oauth: bool, base: &BaseArgs, needs_api_key: bool) -> bool {
+    needs_api_key
         && is_oauth
         && !matches!(
             base.api_key_source,
@@ -1425,10 +1470,7 @@ fn should_create_api_key_for_instrumentation(
         )
 }
 
-async fn maybe_create_api_key_for_instrumentation(
-    base: &BaseArgs,
-    client: &ApiClient,
-) -> Result<()> {
+async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> Result<String> {
     let username = std::process::Command::new("whoami")
         .output()
         .ok()
@@ -1491,7 +1533,7 @@ async fn maybe_create_api_key_for_instrumentation(
         eprintln!();
     }
 
-    Ok(())
+    Ok(created.key)
 }
 
 async fn select_project_for_setup(
@@ -1514,39 +1556,19 @@ async fn select_project_for_setup(
         )
     }
 
-    let mut projects = with_spinner(
-        "Loading projects...",
-        crate::projects::api::list_projects(client),
-    )
-    .await?;
-
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
     if !ui::can_prompt() {
         bail!(
             "project choice required in non-interactive mode; pass --project <NAME> or set BRAINTRUST_DEFAULT_PROJECT"
         );
     }
 
-    let mut labels: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
-    labels.push("Create new project".to_string());
-    let selection = ui::fuzzy_select("Select project", &labels, 0)?;
-
-    if selection == labels.len() - 1 {
-        let default_name = default_setup_project_name();
-        let name: String = dialoguer::Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Project name")
-            .default(default_name)
-            .interact_text_on(
-                &ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?,
-            )?;
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            bail!("project name cannot be empty");
-        }
-        return create_or_fetch_project(client, trimmed).await;
-    }
-
-    Ok(projects[selection].clone())
+    ui::select_project(
+        client,
+        None,
+        Some("Select project"),
+        ui::ProjectSelectMode::AllowCreate,
+    )
+    .await
 }
 
 async fn select_project_with_skip(
@@ -1559,39 +1581,6 @@ async fn select_project_with_skip(
         eprintln!("{} Select project · {}", style("✔").green(), project.name);
     }
     Ok(Some(project))
-}
-
-async fn create_or_fetch_project(
-    client: &ApiClient,
-    name: &str,
-) -> Result<crate::projects::api::Project> {
-    if let Some(project) = crate::projects::api::get_project_by_name(client, name).await? {
-        return Ok(project);
-    }
-    match crate::projects::api::create_project(client, name).await {
-        Ok(project) => Ok(project),
-        Err(err) => match crate::projects::api::get_project_by_name(client, name).await {
-            Ok(Some(project)) => Ok(project),
-            Ok(None) => Err(err).context(format!(
-                "failed to create project '{name}' and project was not found afterwards"
-            )),
-            Err(fetch_err) => Err(fetch_err).context(format!(
-                "failed to create project '{name}' after initial create error: {err}"
-            )),
-        },
-    }
-}
-
-fn default_setup_project_name() -> String {
-    let output = std::process::Command::new("whoami").output();
-    let user = output
-        .ok()
-        .filter(|result| result.status.success())
-        .and_then(|result| String::from_utf8(result.stdout).ok())
-        .map(|stdout| stdout.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "braintrust".to_string());
-    format!("{user}-test")
 }
 
 /// Returns `true` if config was written or already matched, `false` if user declined.
@@ -1890,14 +1879,8 @@ async fn run_instrument_setup(
     // Determine run mode: interactive TUI vs background (autonomous).
     // Use prompt availability rather than stdin TTY state so `/dev/tty`
     // fallbacks still allow TUI launch when bt is invoked via a shell script.
-    let requested_interactive = resolve_instrument_run_mode(&args, ui::can_prompt());
-    let (mut run_interactive, bypass_permissions) = requested_interactive;
-    if run_interactive && matches!(selected, Agent::Opencode) {
-        run_interactive = false;
-        warnings.push(
-            "Opencode does not reliably support starting with a preloaded prompt in TUI mode; launching it in background mode instead.".to_string(),
-        );
-    }
+    let (run_interactive, bypass_permissions) =
+        resolve_instrument_run_mode(&args, ui::can_prompt());
 
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
@@ -2557,12 +2540,14 @@ fn execute_mcp_install(
     local_root: Option<&Path>,
     home: &Path,
     agents: &[Agent],
+    api_key: &str,
+    mcp_url: &str,
 ) -> McpSetupOutcome {
     let mut warnings = Vec::new();
     let mut results = Vec::new();
 
     for agent in agents.iter().copied() {
-        let result = install_mcp_for_agent(agent, scope, local_root, home);
+        let result = install_mcp_for_agent(agent, scope, local_root, home, api_key, mcp_url);
         match result {
             Ok(r) => {
                 if matches!(r.status, InstallStatus::Skipped)
@@ -2595,7 +2580,7 @@ fn execute_mcp_install(
     }
 }
 
-fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
+async fn run_mcp_setup(mut base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let selection = resolve_mcp_selection(&args, &home)?;
     let scope = selection.scope;
@@ -2603,7 +2588,16 @@ fn run_mcp_setup(base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<()> {
     let detected = selection.detected;
     let selected_agents = selection.selected_agents;
 
-    let outcome = execute_mcp_install(scope, local_root.as_deref(), &home, &selected_agents);
+    let auth = ensure_setup_auth(&mut base, false, true).await?;
+    let api_url = auth.client.url("");
+    let outcome = execute_mcp_install(
+        scope,
+        local_root.as_deref(),
+        &home,
+        &selected_agents,
+        &auth.api_key,
+        &mcp_url_from_api_url(&api_url),
+    );
 
     if base.json {
         let report = SetupJsonReport {
@@ -3487,41 +3481,190 @@ fn install_mcp_for_agent(
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
+    api_key: &str,
+    mcp_url: &str,
 ) -> Result<AgentInstallResult> {
-    let path = match agent {
-        Agent::Cursor => {
-            if matches!(scope, InstallScope::Global) {
-                return Ok(AgentInstallResult {
-                    agent,
-                    status: InstallStatus::Skipped,
-                    message: "warning: cursor currently supports only --local in bt setup mcp"
-                        .to_string(),
-                    paths: Vec::new(),
-                });
-            }
-            let root = scope_root(scope, local_root, home)?;
-            root.join(".cursor/mcp.json")
-        }
-        Agent::Claude | Agent::Codex | Agent::Opencode => {
-            let root = scope_root(scope, local_root, home)?;
-            match scope {
-                InstallScope::Local => root.join(".mcp.json"),
-                InstallScope::Global => home.join(".mcp.json"),
-            }
-        }
-    };
+    match agent {
+        Agent::Claude => install_mcp_for_claude(scope, local_root, home, mcp_url, api_key),
+        Agent::Codex => match scope {
+            InstallScope::Local => install_mcp_for_codex_local(local_root, home, api_key, mcp_url),
+            InstallScope::Global => install_mcp_for_codex(mcp_url, api_key),
+        },
+        Agent::Cursor => install_mcp_for_cursor(scope, local_root, home, api_key, mcp_url),
+        Agent::Opencode => install_mcp_for_opencode(scope, local_root, home, api_key, mcp_url),
+    }
+}
 
-    merge_mcp_config(&path)?;
+fn install_mcp_for_codex(mcp_url: &str, api_key: &str) -> Result<AgentInstallResult> {
+    let _ = std::process::Command::new("codex")
+        .args(["mcp", "remove", "braintrust"])
+        .env("BRAINTRUST_API_KEY", api_key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let status = std::process::Command::new("codex")
+        .args([
+            "mcp",
+            "add",
+            "braintrust",
+            "--url",
+            mcp_url,
+            "--bearer-token-env-var",
+            "BRAINTRUST_API_KEY",
+        ])
+        .env("BRAINTRUST_API_KEY", api_key)
+        .stdout(Stdio::null())
+        .status()
+        .context("failed to run `codex mcp add`")?;
+
+    if !status.success() {
+        bail!("`codex mcp add` exited with status {status}");
+    }
 
     Ok(AgentInstallResult {
-        agent,
+        agent: Agent::Codex,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec!["codex:braintrust".to_string()],
+    })
+}
+
+fn install_mcp_for_codex_local(
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    let root = scope_root(InstallScope::Local, local_root, home)?;
+    let path = root.join(".codex/config.toml");
+    merge_codex_config(&path, api_key, mcp_url)?;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Codex,
         status: InstallStatus::Installed,
         message: "installed MCP config".to_string(),
         paths: vec![path.display().to_string()],
     })
 }
 
-fn merge_mcp_config(path: &Path) -> Result<()> {
+fn install_mcp_for_cursor(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    let path = match scope {
+        InstallScope::Local => scope_root(scope, local_root, home)?.join(".cursor/mcp.json"),
+        InstallScope::Global => home.join(".cursor/mcp.json"),
+    };
+    merge_mcp_config(&path, api_key, mcp_url)?;
+    enable_cursor_mcp(local_root)?;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Cursor,
+        status: InstallStatus::Installed,
+        message: "installed MCP config and enabled server".to_string(),
+        paths: vec![path.display().to_string()],
+    })
+}
+
+fn enable_cursor_mcp(local_root: Option<&Path>) -> Result<()> {
+    let binary = if command_exists("cursor-agent") {
+        "cursor-agent"
+    } else {
+        "cursor"
+    };
+    let cwd = match local_root {
+        Some(root) => root.to_path_buf(),
+        None => std::env::current_dir().context("failed to resolve current directory")?,
+    };
+    let status = std::process::Command::new(binary)
+        .args(["mcp", "enable", "braintrust"])
+        .current_dir(cwd)
+        .stdout(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to run `{binary} mcp enable braintrust`"))?;
+
+    if !status.success() {
+        bail!("`{binary} mcp enable braintrust` exited with status {status}");
+    }
+    Ok(())
+}
+
+fn install_mcp_for_claude(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    mcp_url: &str,
+    api_key: &str,
+) -> Result<AgentInstallResult> {
+    let (scope_name, cwd, path_label) = match scope {
+        InstallScope::Local => (
+            "project",
+            Some(scope_root(scope, local_root, home)?.to_path_buf()),
+            "claude:project".to_string(),
+        ),
+        InstallScope::Global => ("user", None, "claude:user".to_string()),
+    };
+
+    let status = std::process::Command::new("claude")
+        .args([
+            "mcp",
+            "add",
+            "-s",
+            scope_name,
+            "--transport",
+            "http",
+            "braintrust",
+            mcp_url,
+            "--header",
+            &format!("Authorization: Bearer {api_key}"),
+        ])
+        .current_dir(cwd.unwrap_or_else(|| home.to_path_buf()))
+        .stdout(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to run `claude mcp add -s {scope_name}`"))?;
+
+    if !status.success() {
+        bail!("`claude mcp add -s {scope_name}` exited with status {status}");
+    }
+
+    Ok(AgentInstallResult {
+        agent: Agent::Claude,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec![path_label],
+    })
+}
+
+fn mcp_url_from_api_url(api_url: &str) -> String {
+    format!("{}/mcp", api_url.trim_end_matches('/'))
+}
+
+fn install_mcp_for_opencode(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    let path = match scope {
+        InstallScope::Local => scope_root(scope, local_root, home)?.join("opencode.json"),
+        InstallScope::Global => home.join(".config/opencode/opencode.json"),
+    };
+    merge_opencode_config(&path, api_key, mcp_url)?;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Opencode,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec![path.display().to_string()],
+    })
+}
+
+fn merge_mcp_config(path: &Path, api_key: &str, mcp_url: &str) -> Result<()> {
     let mut root = load_json_object_or_default(path)?;
     let servers_value = root
         .entry("mcpServers".to_string())
@@ -3537,14 +3680,71 @@ fn merge_mcp_config(path: &Path) -> Result<()> {
         "braintrust".to_string(),
         serde_json::json!({
             "type": "http",
-            "url": "https://api.braintrust.dev/mcp",
+            "url": mcp_url,
             "headers": {
-                "Authorization": "Bearer ${BRAINTRUST_API_KEY}"
+                "Authorization": format!("Bearer {api_key}")
             }
         }),
     );
 
     write_json_object(path, &root)
+}
+
+fn merge_opencode_config(path: &Path, api_key: &str, mcp_url: &str) -> Result<()> {
+    let mut root = load_json_object_or_default(path)?;
+    root.entry("$schema".to_string())
+        .or_insert_with(|| Value::String("https://opencode.ai/config.json".to_string()));
+
+    let mcp_value = root
+        .entry("mcp".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let mcp = mcp_value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("field 'mcp' in {} must be a JSON object", path.display()))?;
+
+    mcp.insert(
+        "braintrust".to_string(),
+        serde_json::json!({
+            "type": "remote",
+            "url": mcp_url,
+            "headers": {
+                "Authorization": format!("Bearer {api_key}")
+            }
+        }),
+    );
+
+    write_json_object(path, &root)
+}
+
+fn merge_codex_config(path: &Path, _api_key: &str, mcp_url: &str) -> Result<()> {
+    let mut root = load_toml_table_or_default(path)?;
+    let mcp_servers = root
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+    let mcp_servers = mcp_servers.as_table_mut().ok_or_else(|| {
+        anyhow!(
+            "field 'mcp_servers' in {} must be a TOML table",
+            path.display()
+        )
+    })?;
+
+    let braintrust = mcp_servers
+        .entry("braintrust".to_string())
+        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+    let braintrust = braintrust.as_table_mut().ok_or_else(|| {
+        anyhow!(
+            "field 'mcp_servers.braintrust' in {} must be a TOML table",
+            path.display()
+        )
+    })?;
+
+    braintrust.insert("url".to_string(), TomlValue::String(mcp_url.to_string()));
+    braintrust.insert(
+        "bearer_token_env_var".to_string(),
+        TomlValue::String("BRAINTRUST_API_KEY".to_string()),
+    );
+
+    write_toml_table(path, &root)
 }
 
 fn load_json_object_or_default(path: &Path) -> Result<Map<String, Value>> {
@@ -3563,6 +3763,23 @@ fn load_json_object_or_default(path: &Path) -> Result<Map<String, Value>> {
         .ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))
 }
 
+fn load_toml_table_or_default(path: &Path) -> Result<toml::map::Map<String, TomlValue>> {
+    if !path.exists() {
+        return Ok(toml::map::Map::new());
+    }
+
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("failed to read TOML file {}", path.display()))?;
+    let value: TomlValue = data
+        .parse()
+        .with_context(|| format!("failed to parse TOML file {}", path.display()))?;
+
+    value
+        .as_table()
+        .cloned()
+        .ok_or_else(|| anyhow!("{} must contain a TOML table", path.display()))
+}
+
 fn write_json_object(path: &Path, object: &Map<String, Value>) -> Result<()> {
     let data = serde_json::to_string_pretty(&Value::Object(object.clone()))
         .with_context(|| format!("failed to serialize JSON for {}", path.display()))?;
@@ -3575,6 +3792,23 @@ fn write_json_object(path: &Path, object: &Map<String, Value>) -> Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, format!("{data}\n"))
         .with_context(|| format!("failed to finalize temp JSON file {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
+
+    Ok(())
+}
+
+fn write_toml_table(path: &Path, table: &toml::map::Map<String, TomlValue>) -> Result<()> {
+    let data = toml::to_string_pretty(&TomlValue::Table(table.clone()))
+        .with_context(|| format!("failed to serialize TOML for {}", path.display()))?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, format!("{data}\n"))
+        .with_context(|| format!("failed to finalize temp TOML file {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
 
     Ok(())
@@ -3904,12 +4138,23 @@ fn print_mcp_human_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cwd_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, content).expect("write executable");
+        let mut perms = fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod");
     }
 
     fn make_base_args() -> BaseArgs {
@@ -4004,6 +4249,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_profile_name_for_setup_allows_oauth_fallback_when_no_profiles_exist() {
+        let base = make_base_args();
+        let profiles = Vec::new();
+
+        let resolved =
+            resolve_profile_name_for_setup(&base, &profiles, true).expect("resolve profile");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
     fn resolve_profile_name_for_setup_errors_for_unknown_explicit_profile() {
         let mut base = make_base_args();
         base.profile = Some("missing".to_string());
@@ -4023,15 +4278,13 @@ mod tests {
     #[test]
     fn oauth_instrumentation_creates_api_key_when_no_env_key_exists() {
         let base = make_base_args();
-        assert!(should_create_api_key_for_instrumentation(true, &base, true));
+        assert!(should_create_api_key_for_setup(true, &base, true));
     }
 
     #[test]
     fn oauth_non_instrumentation_does_not_create_api_key() {
         let base = make_base_args();
-        assert!(!should_create_api_key_for_instrumentation(
-            true, &base, false
-        ));
+        assert!(!should_create_api_key_for_setup(true, &base, false));
     }
 
     #[test]
@@ -4039,9 +4292,7 @@ mod tests {
         let mut base = make_base_args();
         base.api_key = Some("env-key".to_string());
         base.api_key_source = Some(ArgValueSource::EnvVariable);
-        assert!(!should_create_api_key_for_instrumentation(
-            true, &base, true
-        ));
+        assert!(!should_create_api_key_for_setup(true, &base, true));
     }
 
     #[test]
@@ -4060,7 +4311,8 @@ mod tests {
         )
         .expect("seed mcp");
 
-        merge_mcp_config(&path).expect("merge mcp");
+        merge_mcp_config(&path, "test-api-key", "https://api.braintrust.dev/mcp")
+            .expect("merge mcp");
 
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(&path).expect("read mcp")).expect("json");
@@ -4070,6 +4322,14 @@ mod tests {
             .expect("servers object");
         assert!(servers.contains_key("existing"));
         assert!(servers.contains_key("braintrust"));
+        assert_eq!(
+            servers["braintrust"]["url"].as_str(),
+            Some("https://api.braintrust.dev/mcp")
+        );
+        assert_eq!(
+            servers["braintrust"]["headers"]["Authorization"].as_str(),
+            Some("Bearer test-api-key")
+        );
     }
 
     #[test]
@@ -4307,6 +4567,44 @@ mod tests {
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (false, true));
+    }
+
+    #[test]
+    fn instrument_run_mode_prefers_tui_for_opencode_when_prompt_is_available() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Opencode),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: false,
+            yolo: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
+    }
+
+    #[test]
+    fn instrument_run_mode_keeps_opencode_background_when_requested() {
+        let args = InstrumentSetupArgs {
+            agent: Some(InstrumentAgentArg::Opencode),
+            agent_cmd: None,
+            workflows: Vec::new(),
+            no_workflow: false,
+            yes: false,
+            refresh_docs: false,
+            workers: crate::sync::default_workers(),
+            languages: Vec::new(),
+            tui: false,
+            background: true,
+            yolo: false,
+        };
+
+        assert_eq!(resolve_instrument_run_mode(&args, true), (false, false));
     }
 
     #[test]
@@ -4554,6 +4852,34 @@ mod tests {
     }
 
     #[test]
+    fn opencode_interactive_instrument_invocation_stays_interactive() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Opencode, None, &task_path, true, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "opencode");
+                assert_eq!(args, vec!["run".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
     fn cursor_instrument_invocation_uses_print_with_prompt_arg() {
         let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
         let invocation =
@@ -4694,21 +5020,241 @@ mod tests {
     }
 
     #[test]
-    fn install_mcp_for_agent_writes_local_mcp_file() {
+    fn install_mcp_for_agent_writes_opencode_local_config_file() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("bt-agents-mcp-local-{unique}"));
+        let root = std::env::temp_dir().join(format!("bt-agents-opencode-mcp-local-{unique}"));
         fs::create_dir_all(&root).expect("create temp root");
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result = install_mcp_for_agent(Agent::Codex, InstallScope::Local, Some(&root), &home)
-            .expect("install local mcp");
+        let result = install_mcp_for_agent(
+            Agent::Opencode,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "embedded-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install local mcp");
         assert!(matches!(result.status, InstallStatus::Installed));
 
-        let mcp_path = root.join(".mcp.json");
+        let mcp_path = root.join("opencode.json");
+        assert!(mcp_path.exists());
+        let parsed: Value =
+            serde_json::from_str(&fs::read_to_string(&mcp_path).expect("read mcp")).expect("json");
+        assert_eq!(
+            parsed.get("$schema").and_then(|v| v.as_str()),
+            Some("https://opencode.ai/config.json")
+        );
+        let servers = parsed
+            .get("mcp")
+            .and_then(|v| v.as_object())
+            .expect("servers object");
+        assert!(servers.contains_key("braintrust"));
+        assert_eq!(
+            servers["braintrust"]["url"].as_str(),
+            Some("https://api.example.com/mcp")
+        );
+        assert_eq!(
+            servers["braintrust"]["headers"]["Authorization"].as_str(),
+            Some("Bearer embedded-api-key")
+        );
+        assert_eq!(servers["braintrust"]["type"].as_str(), Some("remote"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_mcp_for_agent_writes_codex_local_config_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-codex-mcp-local-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let result = install_mcp_for_agent(
+            Agent::Codex,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "embedded-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install local codex mcp");
+        assert!(matches!(result.status, InstallStatus::Installed));
+
+        let config_path = root.join(".codex/config.toml");
+        assert!(config_path.exists());
+        let parsed: TomlValue = fs::read_to_string(&config_path)
+            .expect("read codex config")
+            .parse()
+            .expect("parse codex config");
+        let servers = parsed
+            .get("mcp_servers")
+            .and_then(|v| v.as_table())
+            .expect("mcp_servers table");
+        let braintrust = servers
+            .get("braintrust")
+            .and_then(|v| v.as_table())
+            .expect("braintrust table");
+        assert_eq!(
+            braintrust.get("url").and_then(|v| v.as_str()),
+            Some("https://api.example.com/mcp")
+        );
+        assert_eq!(
+            braintrust
+                .get("bearer_token_env_var")
+                .and_then(|v| v.as_str()),
+            Some("BRAINTRUST_API_KEY")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_mcp_for_agent_updates_existing_codex_local_config() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-codex-mcp-update-{unique}"));
+        let codex_dir = root.join(".codex");
+        fs::create_dir_all(&codex_dir).expect("create codex dir");
+        fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.braintrust]\nurl = \"https://old.example/mcp\"\nbearer_token_env_var = \"OLD_KEY\"\n",
+        )
+        .expect("seed codex config");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        install_mcp_for_agent(
+            Agent::Codex,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "embedded-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("update local codex mcp");
+
+        let parsed: TomlValue = fs::read_to_string(codex_dir.join("config.toml"))
+            .expect("read codex config")
+            .parse()
+            .expect("parse codex config");
+        let braintrust = parsed
+            .get("mcp_servers")
+            .and_then(|v| v.get("braintrust"))
+            .and_then(|v| v.as_table())
+            .expect("braintrust table");
+        assert_eq!(
+            braintrust.get("url").and_then(|v| v.as_str()),
+            Some("https://api.example.com/mcp")
+        );
+        assert_eq!(
+            braintrust
+                .get("bearer_token_env_var")
+                .and_then(|v| v.as_str()),
+            Some("BRAINTRUST_API_KEY")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_mcp_for_agent_invokes_codex_native_mcp_add_for_global() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-codex-mcp-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("codex.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        write_executable(
+            &bin_dir.join("codex"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Codex,
+            InstallScope::Global,
+            None,
+            &home,
+            "embedded-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install codex mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        let log = fs::read_to_string(&log_path).expect("read codex log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("remove"));
+        assert!(log.contains("add"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("--url"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains("--bearer-token-env-var"));
+        assert!(log.contains("BRAINTRUST_API_KEY"));
+        assert!(log.contains("ENV=embedded-api-key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_mcp_for_agent_writes_cursor_global_config_and_enables_server() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-cursor-mcp-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("cursor.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        write_executable(
+            &bin_dir.join("cursor-agent"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Cursor,
+            InstallScope::Global,
+            None,
+            &home,
+            "cursor-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install cursor mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        let mcp_path = home.join(".cursor/mcp.json");
         assert!(mcp_path.exists());
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(&mcp_path).expect("read mcp")).expect("json");
@@ -4716,7 +5262,70 @@ mod tests {
             .get("mcpServers")
             .and_then(|v| v.as_object())
             .expect("servers object");
-        assert!(servers.contains_key("braintrust"));
+        assert_eq!(
+            servers["braintrust"]["headers"]["Authorization"].as_str(),
+            Some("Bearer cursor-api-key")
+        );
+
+        let log = fs::read_to_string(&log_path).expect("read cursor log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("enable"));
+        assert!(log.contains("braintrust"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_mcp_for_agent_invokes_claude_project_scope_for_local() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-claude-mcp-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("claude.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("claude"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Claude,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "claude-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install claude local mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["claude:project".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read claude log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("add"));
+        assert!(log.contains("-s"));
+        assert!(log.contains("project"));
+        assert!(log.contains("--transport"));
+        assert!(log.contains("http"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains("Authorization: Bearer claude-api-key"));
+        assert!(log.contains(&root.display().to_string()));
     }
 
     #[test]
