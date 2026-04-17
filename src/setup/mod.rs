@@ -1598,7 +1598,7 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     let created: CreatedKey = client.post("/v1/api_key", &body).await?;
     std::env::set_var("BRAINTRUST_API_KEY", &created.key);
 
-    if !base.quiet && std::io::stderr().is_terminal() {
+    if std::io::stderr().is_terminal() && (!base.quiet || base.quiet_source.is_none()) {
         eprintln!();
         eprintln!(
             "{} Created Braintrust API key '{}' for instrumentation and exported it to this setup process:",
