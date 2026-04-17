@@ -1870,7 +1870,7 @@ impl LanguageArg {
 }
 
 async fn run_instrument_setup(
-    base: BaseArgs,
+    mut base: BaseArgs,
     args: InstrumentSetupArgs,
     print_hint: bool,
 ) -> Result<()> {
@@ -2002,6 +2002,7 @@ async fn run_instrument_setup(
         bypass_permissions,
         &selected_languages,
     )?;
+    let launch_env = resolve_agent_launch_env(&mut base, selected, &root, &home).await?;
 
     if run_interactive && base.verbose {
         eprintln!();
@@ -2015,11 +2016,11 @@ async fn run_instrument_setup(
     let status = if !run_interactive && !base.json {
         with_spinner(
             "Running agent instrumentation…",
-            run_agent_invocation(&root, &invocation, false),
+            run_agent_invocation(&root, &invocation, false, &launch_env),
         )
         .await?
     } else {
-        run_agent_invocation(&root, &invocation, show_output).await?
+        run_agent_invocation(&root, &invocation, show_output, &launch_env).await?
     };
     if status.success() {
         results.push(AgentInstallResult {
@@ -2187,6 +2188,66 @@ fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
         Agent::Cursor => AgentArg::Cursor,
         Agent::Opencode => AgentArg::Opencode,
     }
+}
+
+fn configured_api_key(base: &BaseArgs) -> Option<String> {
+    base.api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn current_api_key_env() -> Option<String> {
+    std::env::var("BRAINTRUST_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn codex_has_braintrust_mcp_config(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(parsed) = contents.parse::<TomlValue>() else {
+        return false;
+    };
+    parsed
+        .get("mcp_servers")
+        .and_then(|value| value.get("braintrust"))
+        .is_some()
+}
+
+fn codex_braintrust_mcp_configured(root: &Path, home: &Path) -> bool {
+    codex_has_braintrust_mcp_config(&root.join(".codex/config.toml"))
+        || codex_has_braintrust_mcp_config(&home.join(".codex/config.toml"))
+}
+
+async fn resolve_agent_launch_env(
+    base: &mut BaseArgs,
+    agent: Agent,
+    root: &Path,
+    home: &Path,
+) -> Result<Vec<(String, String)>> {
+    let api_key = match agent {
+        Agent::Codex => {
+            if let Some(api_key) = current_api_key_env() {
+                Some(api_key)
+            } else if let Some(api_key) = configured_api_key(base) {
+                Some(api_key)
+            } else if codex_braintrust_mcp_configured(root, home) {
+                Some(ensure_setup_auth(base, false, true).await?.api_key)
+            } else {
+                None
+            }
+        }
+        Agent::Claude | Agent::Cursor | Agent::Opencode => None,
+    };
+
+    Ok(api_key
+        .into_iter()
+        .map(|value| ("BRAINTRUST_API_KEY".to_string(), value))
+        .collect())
 }
 
 fn map_agent_to_instrument_agent_arg(agent: Agent) -> InstrumentAgentArg {
@@ -2479,12 +2540,16 @@ async fn run_agent_invocation(
     root: &Path,
     invocation: &InstrumentInvocation,
     show_output: bool,
+    extra_env: &[(String, String)],
 ) -> Result<std::process::ExitStatus> {
     match invocation {
         InstrumentInvocation::Shell(command_text) => {
             let mut command = Command::new("bash");
             command.arg("-lc").arg(command_text);
             command.current_dir(root);
+            for (key, value) in extra_env {
+                command.env(key, value);
+            }
             if !show_output {
                 command.stdout(Stdio::null()).stderr(Stdio::null());
             }
@@ -2504,6 +2569,9 @@ async fn run_agent_invocation(
         } => {
             let mut command = Command::new(program);
             command.args(args).current_dir(root);
+            for (key, value) in extra_env {
+                command.env(key, value);
+            }
             if let Some(path) = prompt_file_arg {
                 let prompt = fs::read_to_string(path).with_context(|| {
                     format!("failed to read task prompt file {}", path.display())
@@ -4466,10 +4534,16 @@ fn print_mcp_human_report(
 mod tests {
     use super::*;
     use std::env;
+    use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cwd_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -4502,6 +4576,13 @@ mod tests {
             api_url: None,
             app_url: None,
             env_file: None,
+        }
+    }
+
+    fn restore_env_var(key: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
         }
     }
 
@@ -5297,6 +5378,87 @@ mod tests {
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
         }
+    }
+
+    #[test]
+    fn resolve_agent_launch_env_uses_base_api_key_for_codex() {
+        let _guard = env_test_lock().lock().expect("lock env test");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
+
+        let mut base = make_base_args();
+        base.api_key = Some("cli-key".to_string());
+        base.api_key_source = Some(ArgValueSource::CommandLine);
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let env_vars = runtime
+            .block_on(resolve_agent_launch_env(
+                &mut base,
+                Agent::Codex,
+                Path::new("/tmp/project"),
+                Path::new("/tmp/home"),
+            ))
+            .expect("resolve launch env");
+
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
+        assert_eq!(
+            env_vars,
+            vec![("BRAINTRUST_API_KEY".to_string(), "cli-key".to_string())]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_agent_invocation_sets_extra_env_for_program_launches() {
+        let _guard = env_test_lock().lock().expect("lock env test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-run-agent-env-{unique}"));
+        let bin_dir = root.join("bin");
+        let task_path = root.join("AGENT_TASK.instrument.md");
+        let log_path = root.join("codex.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::write(&task_path, "instrument this repo").expect("write task");
+        write_executable(
+            &bin_dir.join("codex"),
+            &format!(
+                "#!/bin/sh\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" > \"{}\"\ncat >/dev/null\nexit 0\n",
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+        env::remove_var("BRAINTRUST_API_KEY");
+
+        let invocation = InstrumentInvocation::Program {
+            program: "codex".to_string(),
+            args: vec!["exec".to_string(), "-".to_string()],
+            stdin_file: Some(task_path),
+            prompt_file_arg: None,
+            initial_prompt: None,
+            stream_json: false,
+            interactive: false,
+        };
+        let status = run_agent_invocation(
+            &root,
+            &invocation,
+            false,
+            &[("BRAINTRUST_API_KEY".to_string(), "launch-key".to_string())],
+        )
+        .await
+        .expect("run agent invocation");
+
+        env::set_var("PATH", old_path);
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
+        assert!(status.success());
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert!(log.contains("ENV=launch-key"));
     }
 
     #[test]
