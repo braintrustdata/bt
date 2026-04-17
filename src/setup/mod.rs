@@ -565,8 +565,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(2, "Project");
     }
     if project_flag.is_none() && ui::can_prompt() {
-        println!("First, select a project, or create a new one.");
-        println!("Projects organize AI features in your application. Each project contains logs, experiments, datasets, prompts, and other functions.");
+        eprintln!("First, select a project, or create a new one.");
+        eprintln!("Projects organize AI features in your application. Each project contains logs, experiments, datasets, prompts, and other functions.");
     }
     let project = if let Some(auth) = setup_auth.as_ref() {
         select_project_with_skip(&auth.client, project_flag.as_deref(), !verbose).await?
@@ -576,21 +576,20 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         if let Some(ref project) = project {
             if let Some(org) = org.as_deref() {
-                if maybe_init(org, project)? {
-                    eprintln!(
-                        "   {} Linked to {}/{}",
-                        style("✓").green(),
-                        org,
-                        project.name
-                    );
-                }
+                maybe_init(org, project)?;
+                eprintln!(
+                    "   {} Linked to {}/{}",
+                    style("✓").green(),
+                    org,
+                    project.name
+                );
             }
         } else {
             eprintln!("   {}", style("Skipped").dim());
         }
     } else if let Some(ref project) = project {
         if let Some(org) = org.as_deref() {
-            let _ = maybe_init(org, project)?;
+            maybe_init(org, project)?;
         }
     }
 
@@ -803,10 +802,12 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             };
             let selected_languages = if !flag_languages.is_empty() {
                 flag_languages.clone()
-            } else {
+            } else if ui::can_prompt() {
                 let defaults = detect_languages_from_dir(&std::env::current_dir()?);
                 prompt_instrument_language_selection(&defaults)?
                     .ok_or_else(|| anyhow!("setup cancelled"))?
+            } else {
+                Vec::new()
             };
             let (run_tui, yolo_mode) = if flag_tui {
                 (true, yolo)
@@ -904,7 +905,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         let org = auth.client.org_name().to_string();
         let project = select_project_with_skip(&auth.client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
-            let _ = maybe_init(&org, project)?;
+            maybe_init(&org, project)?;
         }
     }
 
@@ -1603,7 +1604,7 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     let created: CreatedKey = client.post("/v1/api_key", &body).await?;
     std::env::set_var("BRAINTRUST_API_KEY", &created.key);
 
-    if std::io::stderr().is_terminal() && (!base.quiet || base.quiet_source.is_none()) {
+    if std::io::stderr().is_terminal() && base.verbose {
         eprintln!();
         eprintln!(
             "{} Created Braintrust API key '{}' for instrumentation and exported it to this setup process:",
@@ -1671,8 +1672,7 @@ async fn select_project_with_skip(
     Ok(Some(project))
 }
 
-/// Returns `true` if config was written or already matched, `false` if user declined.
-fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool> {
+fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> {
     let config_path = std::env::current_dir()?.join(".bt").join("config.json");
 
     if config_path.exists() {
@@ -1680,7 +1680,7 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
         let matches = existing.org.as_deref() == Some(org)
             && existing.project.as_deref() == Some(project.name.as_str());
         if matches && existing.project_id.as_deref() == Some(project.id.as_str()) {
-            return Ok(true);
+            return Ok(());
         }
     }
 
@@ -1691,7 +1691,7 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool
         ..Default::default()
     };
     config::save_local(&cfg, true)?;
-    Ok(true)
+    Ok(())
 }
 
 fn default_setup_scope(args: &AgentsSetupArgs) -> InstallScope {
