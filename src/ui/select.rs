@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Result};
 use dialoguer::console::Term;
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 
@@ -77,17 +77,6 @@ pub async fn select_project(
     current: Option<&str>,
     select_label: Option<&str>,
     mode: ProjectSelectMode,
-) -> Result<api::Project> {
-    select_project_with_create_default(client, current, select_label, None).await
-}
-
-/// Interactive selector for project data with a custom default name for the
-/// create-project path.
-pub async fn select_project_with_create_default(
-    client: &ApiClient,
-    current: Option<&str>,
-    select_label: Option<&str>,
-    create_default_name: Option<&str>,
 ) -> Result<api::Project> {
     let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
 
@@ -258,24 +247,5 @@ mod tests {
             selected_project_index(1, ProjectSelectMode::ExistingOnly),
             1
         );
-    }
-}
-
-async fn create_or_fetch_project(client: &ApiClient, name: &str) -> Result<api::Project> {
-    if let Some(project) = api::get_project_by_name(client, name).await? {
-        return Ok(project);
-    }
-
-    match api::create_project(client, name).await {
-        Ok(project) => Ok(project),
-        Err(err) => match api::get_project_by_name(client, name).await {
-            Ok(Some(project)) => Ok(project),
-            Ok(None) => Err(err).context(format!(
-                "failed to create project '{name}' and project was not found afterwards"
-            )),
-            Err(fetch_err) => Err(fetch_err).context(format!(
-                "failed to create project '{name}' after initial create error: {err}"
-            )),
-        },
     }
 }

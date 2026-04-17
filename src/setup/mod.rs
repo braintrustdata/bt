@@ -232,6 +232,9 @@ struct InstrumentSetupArgs {
     /// Grant the agent full permissions (bypass permission prompts)
     #[arg(long)]
     yolo: bool,
+
+    #[arg(skip)]
+    prompt_for_missing_options: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -441,7 +444,8 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
     }
     match args.command {
         Some(SetupSubcommand::Skills(setup)) => run_setup(base, setup).await,
-        Some(SetupSubcommand::Instrument(instrument)) => {
+        Some(SetupSubcommand::Instrument(mut instrument)) => {
+            instrument.prompt_for_missing_options = true;
             run_instrument_setup(base, instrument, false).await
         }
         Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp).await,
@@ -640,7 +644,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         (selected.contains(&0), selected.contains(&1))
     };
 
-    let setup_context = if wants_skills || wants_mcp {
+    let setup_context = if wants_skills || wants_mcp || !flag_no_instrument {
         let scope = if flag_local {
             if verbose {
                 eprintln!(
@@ -774,26 +778,15 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 .interact_on(&term)?
         };
         if instrument {
-            let instrument_detected = detect_agents(git_root.as_deref(), &home);
-            let instrument_agent = if let Some(agent) =
-                determine_wizard_instrument_agent(flag_agent, git_root.as_deref(), &home)
-            {
-                Some(agent)
-            } else if ui::can_prompt() {
-                let runnable = detect_runnable_agents();
-                let candidates = promptable_instrument_agents(&runnable, &instrument_detected);
-                let default = pick_agent_mode_target(&candidates).unwrap_or(Agent::Codex);
-                Some(map_agent_to_instrument_agent_arg(
-                    prompt_agent_selection(
-                        "Select agent to instrument this repo",
-                        &candidates,
-                        default,
-                    )?
-                    .ok_or_else(|| anyhow!("setup cancelled"))?,
-                ))
-            } else {
-                None
-            };
+            let instrument_agent = setup_context
+                .as_ref()
+                .map(|(_, agent, _)| map_agent_to_instrument_agent_arg(*agent))
+                .or_else(|| {
+                    flag_agent.map(|arg| map_agent_to_instrument_agent_arg(map_agent_arg(arg)))
+                })
+                .or_else(|| {
+                    determine_wizard_instrument_agent(flag_agent, git_root.as_deref(), &home)
+                });
             let selected_workflows = if flag_no_workflow {
                 Vec::new()
             } else if !flag_workflows.is_empty() {
@@ -846,6 +839,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                         tui: false,
                         background: false,
                         yolo,
+                        prompt_for_missing_options: false,
                     },
                     ui::can_prompt(),
                 );
@@ -865,6 +859,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     tui: run_tui,
                     background: !run_tui,
                     yolo: yolo_mode,
+                    prompt_for_missing_options: false,
                 },
                 !multiselect_hint_shown,
             )
@@ -889,7 +884,13 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         print_setup_banner(&base);
     }
 
-    let will_instrument = !args.no_instrument && find_git_root().is_some();
+    let will_instrument = !args.no_instrument;
+    if will_instrument && find_git_root().is_none() && !base.json {
+        eprintln!(
+            "{} Not inside a git repository — the agent may edit files in the current directory.",
+            style("!").yellow()
+        );
+    }
     let wants_skills = args.skills || !args.no_skills;
     let wants_mcp = args.mcp && !args.no_mcp;
     if will_instrument {
@@ -963,6 +964,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 tui: args.tui,
                 background: args.background,
                 yolo: args.agents.yolo,
+                prompt_for_missing_options: false,
             },
             false,
         )
@@ -1868,9 +1870,8 @@ async fn run_instrument_setup(
     print_hint: bool,
 ) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let root = find_git_root()
-        .map(Ok)
-        .unwrap_or_else(|| std::env::current_dir().context("failed to get current directory"))?;
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let root = find_git_root().unwrap_or_else(|| cwd.clone());
     let mut detected = detect_agents(Some(&root), &home);
 
     let selected = resolve_default_agent_selection(
@@ -1893,20 +1894,20 @@ async fn run_instrument_setup(
 
     let selected_languages: Vec<LanguageArg> = if !args.languages.is_empty() {
         args.languages.clone()
-    } else if ui::is_interactive() && !args.yes && !base.json {
+    } else if args.prompt_for_missing_options && ui::can_prompt() && !args.yes && !base.json {
         if hint_pending {
             eprintln!(
                 "   {}",
                 style("(Un)select option with Space, confirm selection with Enter.").dim()
             );
         }
-        let detected_langs = detect_languages_from_dir(&std::env::current_dir()?);
+        let detected_langs = detect_languages_from_dir(&cwd);
         let Some(langs) = prompt_instrument_language_selection(&detected_langs)? else {
             bail!("instrument setup cancelled by user");
         };
         langs
     } else {
-        Vec::new()
+        detect_languages_from_dir(&cwd)
     };
 
     let show_progress = !base.json;
@@ -1960,8 +1961,11 @@ async fn run_instrument_setup(
     // Determine run mode: interactive TUI vs background (autonomous).
     // Use prompt availability rather than stdin TTY state so `/dev/tty`
     // fallbacks still allow TUI launch when bt is invoked via a shell script.
-    let (run_interactive, bypass_permissions) =
-        resolve_instrument_run_mode(&args, ui::can_prompt());
+    let (run_interactive, bypass_permissions) = if args.prompt_for_missing_options {
+        prompt_instrument_run_mode(&args)?
+    } else {
+        resolve_instrument_run_mode(&args, ui::can_prompt())
+    };
 
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
@@ -2077,7 +2081,7 @@ fn resolve_instrument_workflow_selection(
         return Ok(selected);
     }
 
-    if ui::is_interactive() && !args.yes {
+    if args.prompt_for_missing_options && ui::can_prompt() && !args.yes {
         if *hint_pending {
             eprintln!(
                 "   {}",
@@ -2091,7 +2095,7 @@ fn resolve_instrument_workflow_selection(
         return Ok(selected);
     }
 
-    Ok(vec![WorkflowArg::Instrument])
+    Ok(resolve_workflow_selection(&[]))
 }
 
 fn detect_languages_from_dir(dir: &std::path::Path) -> Vec<LanguageArg> {
@@ -2561,6 +2565,31 @@ fn resolve_instrument_run_mode(args: &InstrumentSetupArgs, prompt_available: boo
     } else {
         (true, args.yolo)
     }
+}
+
+fn prompt_instrument_run_mode(args: &InstrumentSetupArgs) -> Result<(bool, bool)> {
+    let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+    let run_interactive = if args.tui {
+        true
+    } else if args.background {
+        false
+    } else {
+        Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("How do you want to run the agent?")
+            .items(&["Interactive (TUI)", "Background"])
+            .default(0)
+            .interact_on(&term)?
+            == 0
+    };
+    let bypass_permissions = if args.yolo {
+        true
+    } else {
+        Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Grant agent full permissions? (bypass permission prompts)")
+            .default(false)
+            .interact_on(&term)?
+    };
+    Ok((run_interactive, bypass_permissions))
 }
 
 fn render_instrument_task(
@@ -3344,33 +3373,17 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
 
 fn determine_wizard_instrument_agent(
     flag_agent: Option<AgentArg>,
-    local_root: Option<&Path>,
-    home: &Path,
+    _local_root: Option<&Path>,
+    _home: &Path,
 ) -> Option<InstrumentAgentArg> {
     if let Some(arg) = flag_agent {
         return Some(map_agent_to_instrument_agent_arg(map_agent_arg(arg)));
     }
 
     let runnable_agents = detect_runnable_agents();
-    let detected = detect_agents(local_root, home);
-    resolve_unambiguous_instrument_agent(&runnable_agents, &detected)
-        .map(map_agent_to_instrument_agent_arg)
-}
-
-fn resolve_unambiguous_instrument_agent(
-    runnable_agents: &[Agent],
-    detected: &[DetectionSignal],
-) -> Option<Agent> {
-    let runnable_set: BTreeSet<Agent> = runnable_agents.iter().copied().collect();
-    if runnable_set.len() == 1 {
-        return runnable_set.into_iter().next();
+    if runnable_agents.len() == 1 {
+        return Some(map_agent_to_instrument_agent_arg(runnable_agents[0]));
     }
-
-    let detected_set: BTreeSet<Agent> = detected.iter().map(|signal| signal.agent).collect();
-    if detected_set.len() == 1 {
-        return detected_set.into_iter().next();
-    }
-
     None
 }
 
@@ -4750,6 +4763,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            prompt_for_missing_options: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -4761,7 +4775,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_instrument_workflows_default_to_instrument() {
+    fn resolve_instrument_workflows_default_to_all() {
         let args = InstrumentSetupArgs {
             agent: Some(InstrumentAgentArg::Codex),
             agent_cmd: None,
@@ -4774,11 +4788,12 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            prompt_for_missing_options: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
             .expect("resolve instrument workflows");
-        assert_eq!(selected, vec![WorkflowArg::Instrument]);
+        assert_eq!(selected, resolve_workflow_selection(&[]));
     }
 
     #[test]
@@ -4795,6 +4810,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            prompt_for_missing_options: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -4816,6 +4832,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
@@ -4835,6 +4852,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, false), (false, false));
@@ -4854,6 +4872,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: true,
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, true));
@@ -4873,6 +4892,7 @@ mod tests {
             tui: false,
             background: true,
             yolo: true,
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (false, true));
@@ -4892,6 +4912,7 @@ mod tests {
             tui: false,
             background: false,
             yolo: false,
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
@@ -4911,6 +4932,7 @@ mod tests {
             tui: false,
             background: true,
             yolo: false,
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (false, false));
