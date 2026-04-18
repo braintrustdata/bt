@@ -788,9 +788,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 .or_else(|| {
                     flag_agent.map(|arg| map_agent_to_instrument_agent_arg(map_agent_arg(arg)))
                 })
-                .or_else(|| {
-                    determine_wizard_instrument_agent(flag_agent, git_root.as_deref(), &home)
-                });
+                .or_else(|| determine_wizard_instrument_agent(flag_agent));
             let selected_workflows = if flag_no_workflow {
                 Vec::new()
             } else if !flag_workflows.is_empty() {
@@ -955,7 +953,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         .await?;
     }
 
-    if !args.no_instrument && will_instrument {
+    if will_instrument {
         run_instrument_setup(
             base,
             InstrumentSetupArgs {
@@ -1674,22 +1672,21 @@ async fn select_project_with_skip(
 
 fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> {
     let config_path = std::env::current_dir()?.join(".bt").join("config.json");
-
-    if config_path.exists() {
+    let mut cfg = if config_path.exists() {
         let existing = config::load_file(&config_path);
         let matches = existing.org.as_deref() == Some(org)
             && existing.project.as_deref() == Some(project.name.as_str());
         if matches && existing.project_id.as_deref() == Some(project.id.as_str()) {
             return Ok(());
         }
-    }
-
-    let cfg = config::Config {
-        org: Some(org.to_string()),
-        project: Some(project.name.clone()),
-        project_id: Some(project.id.clone()),
-        ..Default::default()
+        existing
+    } else {
+        config::Config::default()
     };
+
+    cfg.org = Some(org.to_string());
+    cfg.project = Some(project.name.clone());
+    cfg.project_id = Some(project.id.clone());
     config::save_local(&cfg, true)?;
     Ok(())
 }
@@ -2231,9 +2228,9 @@ async fn resolve_agent_launch_env(
 ) -> Result<Vec<(String, String)>> {
     let api_key = match agent {
         Agent::Codex => {
-            if let Some(api_key) = current_api_key_env() {
+            if let Some(api_key) = configured_api_key(base) {
                 Some(api_key)
-            } else if let Some(api_key) = configured_api_key(base) {
+            } else if let Some(api_key) = current_api_key_env() {
                 Some(api_key)
             } else if codex_braintrust_mcp_configured(root, home) {
                 Some(ensure_setup_auth(base, false, true).await?.api_key)
@@ -3443,11 +3440,7 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
     candidates.first().copied()
 }
 
-fn determine_wizard_instrument_agent(
-    flag_agent: Option<AgentArg>,
-    _local_root: Option<&Path>,
-    _home: &Path,
-) -> Option<InstrumentAgentArg> {
+fn determine_wizard_instrument_agent(flag_agent: Option<AgentArg>) -> Option<InstrumentAgentArg> {
     if let Some(arg) = flag_agent {
         return Some(map_agent_to_instrument_agent_arg(map_agent_arg(arg)));
     }
@@ -5536,6 +5529,58 @@ mod tests {
         std::env::set_current_dir(old).expect("restore cwd");
 
         assert!(matches!(scope, InstallScope::Global));
+    }
+
+    #[test]
+    fn maybe_init_preserves_existing_extra_config_fields() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-maybe-init-extra-{unique}"));
+        let bt_dir = root.join(".bt");
+        fs::create_dir_all(&bt_dir).expect("create .bt dir");
+        fs::write(
+            bt_dir.join("config.json"),
+            r#"{
+  "org": "old-org",
+  "project": "old-project",
+  "project_id": "old-project-id",
+  "custom_flag": true,
+  "nested": {
+    "keep": "me"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let old = env::current_dir().expect("cwd");
+        env::set_current_dir(&root).expect("cd root");
+
+        let project = crate::projects::api::Project {
+            id: "project-id".to_string(),
+            name: "new-project".to_string(),
+            org_id: "org-id".to_string(),
+            description: None,
+        };
+        maybe_init("new-org", &project).expect("maybe init");
+
+        env::set_current_dir(old).expect("restore cwd");
+
+        let saved = config::load_file(&bt_dir.join("config.json"));
+        assert_eq!(saved.org.as_deref(), Some("new-org"));
+        assert_eq!(saved.project.as_deref(), Some("new-project"));
+        assert_eq!(saved.project_id.as_deref(), Some("project-id"));
+        assert_eq!(
+            saved.extra.get("custom_flag"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            saved.extra.get("nested"),
+            Some(&serde_json::json!({ "keep": "me" }))
+        );
     }
 
     #[test]
