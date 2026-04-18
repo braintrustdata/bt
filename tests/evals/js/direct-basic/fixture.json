@@ -1,3 +1,4 @@
 {
-  "files": ["direct.eval.ts"]
+  "files": ["direct.eval.ts"],
+  "args": ["--sample", "1", "--sample-seed", "4294967297"]
 }

@@ -151,6 +151,12 @@ Use `--` to forward extra arguments to the eval file via `process.argv`:
 bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 ```
 
+**Sampling modes:**
+
+- `bt eval --first 20 qa.eval.ts` — run the first 20 examples and clearly label the summary as a non-final smoke run.
+- `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
+- If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
+
 ## `bt sql`
 
 - Runs interactively on TTY by default.
