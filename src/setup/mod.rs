@@ -1873,7 +1873,8 @@ async fn run_instrument_setup(
 ) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let cwd = std::env::current_dir().context("failed to get current directory")?;
-    let root = find_git_root().unwrap_or_else(|| cwd.clone());
+    let git_root = find_git_root();
+    let root = git_root.clone().unwrap_or_else(|| cwd.clone());
     let mut detected = detect_agents(Some(&root), &home);
 
     let selected = resolve_default_agent_selection(
@@ -1939,24 +1940,57 @@ async fn run_instrument_setup(
         )
         .await?;
     } else {
-        let setup_args = AgentsSetupArgs {
-            agent: Some(map_agent_to_agent_arg(selected)),
-            local: true,
-            global: false,
-            workflows: selected_workflows.clone(),
-            no_workflow: args.no_workflow,
-            yes: true,
-            refresh_docs: args.refresh_docs,
-            workers: args.workers,
-            permissions: InstrumentPermissionArgs { yolo: false },
+        if show_progress && base.verbose {
+            println!("Configuring coding agents for Braintrust");
+        }
+        let result = match selected {
+            Agent::Claude => install_claude(InstallScope::Local, Some(&root), &home),
+            Agent::Codex => install_codex(InstallScope::Local, Some(&root), &home),
+            Agent::Cursor => install_cursor(InstallScope::Local, Some(&root), &home),
+            Agent::Opencode => install_opencode(InstallScope::Local, Some(&root), &home),
         };
-        let outcome = execute_skills_setup(&base, &setup_args, false).await?;
-        detected = outcome.detected_agents;
-        results.extend(outcome.results);
-        warnings.extend(outcome.warnings);
-        notes.extend(outcome.notes);
-        if outcome.successful_count == 0 {
-            bail!("failed to configure skills for instrumentation");
+        match result {
+            Ok(r) => results.push(r),
+            Err(err) => results.push(AgentInstallResult {
+                agent: selected,
+                status: InstallStatus::Failed,
+                message: format!(
+                    "failed to install instrumentation skills in {}: {err}",
+                    root.display()
+                ),
+                paths: Vec::new(),
+            }),
+        }
+        detected = detect_agents(Some(&root), &home);
+        let successful_count = results
+            .iter()
+            .filter(|r| !matches!(r.status, InstallStatus::Failed))
+            .count();
+        if successful_count == 0 {
+            notes.push(
+                "Skipped workflow docs prefetch (no agents configured successfully).".to_string(),
+            );
+            let install_target = if git_root.is_some() {
+                format!("repo root {}", root.display())
+            } else {
+                format!("current directory {}", root.display())
+            };
+            bail!("failed to install instrumentation skills in {install_target}");
+        } else if selected_workflows.is_empty() {
+            notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
+        } else {
+            prefetch_workflow_docs(
+                show_progress,
+                InstallScope::Local,
+                Some(&root),
+                &home,
+                &selected_workflows,
+                args.refresh_docs,
+                args.workers,
+                &mut notes,
+                &mut warnings,
+            )
+            .await?;
         }
     }
 
