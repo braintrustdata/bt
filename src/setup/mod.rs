@@ -3835,7 +3835,9 @@ fn install_gemini(
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_content = render_braintrust_skill();
-    let (changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let alias = ensure_agent_skills_alias(root, ".gemini", &skill_content)?;
+    let changed = skill_changed || alias.changed;
 
     Ok(AgentInstallResult {
         agent: Agent::Gemini,
@@ -3849,7 +3851,10 @@ fn install_gemini(
         } else {
             "already configured".to_string()
         },
-        paths: vec![skill_path.display().to_string()],
+        paths: vec![
+            skill_path.display().to_string(),
+            alias.path.display().to_string(),
+        ],
     })
 }
 
@@ -6276,6 +6281,7 @@ mod tests {
             install_gemini(InstallScope::Local, Some(&root), &home).expect("install gemini");
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
+        assert!(root.join(".gemini/skills").exists());
     }
 
     #[test]

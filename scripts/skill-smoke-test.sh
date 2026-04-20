@@ -173,7 +173,7 @@ find_skill_path() {
       echo ".cursor/rules/braintrust.mdc"
       ;;
     gemini)
-      echo "GEMINI.md"
+      echo ".gemini/skills/braintrust/SKILL.md"
       ;;
   esac
 }
