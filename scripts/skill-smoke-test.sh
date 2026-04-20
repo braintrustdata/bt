@@ -16,7 +16,7 @@ Usage:
   scripts/skill-smoke-test.sh [options]
 
 Options:
-  --agent <name>         Agent to install (claude|codex|cursor|opencode). Default: codex
+  --agent <name>         Agent to install (claude|codex|cursor|gemini|opencode). Default: codex
   --bt-bin <path>        bt binary path. Default: bt
   --demo-dir <path>      Demo repo directory. Default: create temp dir
   --agent-cmd <command>  Command to run the agent after scaffold (optional)
@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-  claude|codex|cursor|opencode) ;;
+  claude|codex|cursor|gemini|opencode) ;;
   *)
     echo "Unsupported --agent value: $AGENT" >&2
     exit 2
@@ -171,6 +171,9 @@ find_skill_path() {
       ;;
     cursor)
       echo ".cursor/rules/braintrust.mdc"
+      ;;
+    gemini)
+      echo "GEMINI.md"
       ;;
   esac
 }
