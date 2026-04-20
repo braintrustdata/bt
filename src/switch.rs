@@ -54,6 +54,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let current_cfg = config::load().unwrap_or_default();
     let (resolved_org, resolved_project) = args.resolve_target(&base);
     let mut interactive = false;
+    let has_api_key_override = base
+        .api_key
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty());
 
     let profile_name = match &resolved_org {
         Some(org_or_profile) => {
@@ -64,14 +68,13 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
                 Some(auth::resolve_org_to_profile(org_or_profile, &profiles)?)
             }
         }
-        None => {
-            if resolved_project.is_none() && is_interactive() {
-                interactive = true;
-                auth::select_profile_interactive(current_cfg.org.as_deref())?
-            } else {
-                None
-            }
-        }
+        None => resolve_profile_for_switch(
+            has_api_key_override,
+            resolved_project.is_none(),
+            is_interactive(),
+            || auth::select_profile_interactive(current_cfg.org.as_deref()),
+            &mut interactive,
+        )?,
     };
 
     // When we resolved a profile from an org identifier, clear org_name — the raw identifier
@@ -88,10 +91,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         },
         _ => {
             let mut b = base.clone();
-            if b.org_name.is_none() && b.profile.is_none() {
+            if !has_api_key_override && b.org_name.is_none() && b.profile.is_none() {
                 b.org_name = current_cfg.org.clone();
             }
-            if b.org_name.is_none() && b.profile.is_none() {
+            if !has_api_key_override && b.org_name.is_none() && b.profile.is_none() {
                 let profiles = auth::list_profiles()?;
                 if profiles.len() > 1 {
                     let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
@@ -230,6 +233,31 @@ fn apply_switch_config(cfg: &mut config::Config, org_name: &str, project: &api::
     cfg.org = Some(org_name.to_string());
     cfg.project = Some(project.name.clone());
     cfg.project_id = Some(project.id.clone());
+}
+
+fn resolve_profile_for_switch<F>(
+    has_api_key_override: bool,
+    prompting_for_project_only: bool,
+    is_interactive: bool,
+    select_profile_interactive: F,
+    interactive: &mut bool,
+) -> Result<Option<String>>
+where
+    F: FnOnce() -> Result<Option<String>>,
+{
+    if has_api_key_override {
+        if prompting_for_project_only && is_interactive {
+            *interactive = true;
+        }
+        return Ok(None);
+    }
+
+    if prompting_for_project_only && is_interactive {
+        *interactive = true;
+        select_profile_interactive()
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -478,5 +506,53 @@ mod tests {
         assert_eq!(cfg.org.as_deref(), Some("acme-org"));
         assert_eq!(cfg.project.as_deref(), Some("my-project"));
         assert_eq!(cfg.project_id.as_deref(), Some("proj_123"));
+    }
+
+    #[test]
+    fn resolve_profile_for_switch_skips_org_prompt_when_api_key_infers_profile() {
+        let mut interactive = false;
+        let profile = resolve_profile_for_switch(
+            true,
+            true,
+            true,
+            || panic!("org picker should not be called"),
+            &mut interactive,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile, None);
+        assert!(interactive);
+    }
+
+    #[test]
+    fn resolve_profile_for_switch_prompts_when_no_inferred_profile() {
+        let mut interactive = false;
+        let profile = resolve_profile_for_switch(
+            false,
+            true,
+            true,
+            || Ok(Some("picked-profile".to_string())),
+            &mut interactive,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile.as_deref(), Some("picked-profile"));
+        assert!(interactive);
+    }
+
+    #[test]
+    fn resolve_profile_for_switch_skips_org_prompt_when_api_key_override_has_no_profile_match() {
+        let mut interactive = false;
+        let profile = resolve_profile_for_switch(
+            true,
+            true,
+            true,
+            || panic!("org picker should not be called"),
+            &mut interactive,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile, None);
+        assert!(interactive);
     }
 }

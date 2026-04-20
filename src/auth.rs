@@ -784,6 +784,16 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if args.oauth {
         return run_login_oauth(base, args).await;
     }
+
+    let has_explicit_api_key = base.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
+    if !has_explicit_api_key && ui::can_prompt() {
+        let methods = ["OAuth (browser)", "API key"];
+        let selected = ui::fuzzy_select("Select login method", &methods, 0)?;
+        if selected == 0 {
+            return run_login_oauth(base, args).await;
+        }
+    }
+
     let interactive = ui::can_prompt();
 
     let api_key = match base.api_key.clone() {
