@@ -63,7 +63,7 @@ If you do not know how to run the app, ask the user and wait for the response be
 
 The permalink must be included in the final output. This confirms the full installation succeeded.
 
-The project must be set in code during installation — do not guess the project name from context.
+The project name is the project field of `bt status --json`. The project must be set in code during installation — do not guess the project name from context.
 
 **How to obtain the permalink:**
 

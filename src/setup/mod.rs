@@ -163,6 +163,12 @@ struct AgentsSetupArgs {
     #[arg(long, default_value_t = crate::sync::default_workers())]
     workers: usize,
 
+    #[command(flatten)]
+    permissions: InstrumentPermissionArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct InstrumentPermissionArgs {
     /// Grant the agent full permissions (bypass permission prompts)
     #[arg(long)]
     yolo: bool,
@@ -229,9 +235,11 @@ struct InstrumentSetupArgs {
     #[arg(long, conflicts_with = "tui")]
     background: bool,
 
-    /// Grant the agent full permissions (bypass permission prompts)
-    #[arg(long)]
-    yolo: bool,
+    #[command(flatten)]
+    permissions: InstrumentPermissionArgs,
+
+    #[arg(skip)]
+    prompt_for_missing_options: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -441,14 +449,15 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
     }
     match args.command {
         Some(SetupSubcommand::Skills(setup)) => run_setup(base, setup).await,
-        Some(SetupSubcommand::Instrument(instrument)) => {
+        Some(SetupSubcommand::Instrument(mut instrument)) => {
+            instrument.prompt_for_missing_options = true;
             run_instrument_setup(base, instrument, false).await
         }
         Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp).await,
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
             let wizard_flags = WizardFlags {
-                yolo: args.agents.yolo,
+                yolo: args.agents.permissions.yolo,
                 skills: args.skills,
                 no_skills: args.no_skills,
                 mcp: args.mcp,
@@ -512,10 +521,22 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         languages: flag_languages,
     } = flags;
     print_setup_banner(&base);
+    eprintln!("Welcome to the Braintrust SDK setup wizard");
+    eprintln!(
+        "This wizard will automatically instrument your application with Braintrust SDK tracing with a coding agent of your choice.\n"
+    );
 
     let mut had_failures = false;
     let verbose = base.verbose;
-    let will_instrument = !flag_no_instrument && find_git_root().is_some();
+    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let git_root = find_git_root();
+    let will_instrument = !flag_no_instrument;
+    if git_root.is_none() && !base.json {
+        eprintln!(
+            "{} Not inside a git repository — the agent may edit files in the current directory.",
+            style("!").yellow()
+        );
+    }
 
     // ── Step 1: Auth ──
     if verbose {
@@ -543,6 +564,10 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(2, "Project");
     }
+    if project_flag.is_none() && ui::can_prompt() {
+        eprintln!("First, select a project, or create a new one.");
+        eprintln!("Projects organize AI features in your application. Each project contains logs, experiments, datasets, prompts, and other functions.");
+    }
     let project = if let Some(auth) = setup_auth.as_ref() {
         select_project_with_skip(&auth.client, project_flag.as_deref(), !verbose).await?
     } else {
@@ -551,21 +576,20 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         if let Some(ref project) = project {
             if let Some(org) = org.as_deref() {
-                if maybe_init(org, project)? {
-                    eprintln!(
-                        "   {} Linked to {}/{}",
-                        style("✓").green(),
-                        org,
-                        project.name
-                    );
-                }
+                maybe_init(org, project)?;
+                eprintln!(
+                    "   {} Linked to {}/{}",
+                    style("✓").green(),
+                    org,
+                    project.name
+                );
             }
         } else {
             eprintln!("   {}", style("Skipped").dim());
         }
     } else if let Some(ref project) = project {
         if let Some(org) = org.as_deref() {
-            let _ = maybe_init(org, project)?;
+            maybe_init(org, project)?;
         }
     }
 
@@ -624,7 +648,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         (selected.contains(&0), selected.contains(&1))
     };
 
-    let setup_context = if wants_skills || wants_mcp {
+    let setup_context = if wants_skills || wants_mcp || !flag_no_instrument {
         let scope = if flag_local {
             if verbose {
                 eprintln!(
@@ -647,7 +671,6 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             prompt_scope_selection("Select install scope")?
                 .ok_or_else(|| anyhow!("setup cancelled"))?
         };
-        let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
         let selected_agent =
@@ -659,7 +682,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 style(selected_agent.as_str()).green()
             );
         }
-        Some((scope, selected_agent, home))
+        Some((scope, selected_agent, home.clone()))
     } else {
         None
     };
@@ -678,7 +701,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 yes: true,
                 refresh_docs: false,
                 workers: crate::sync::default_workers(),
-                yolo: false,
+                permissions: InstrumentPermissionArgs { yolo: false },
             };
             let outcome = execute_skills_setup(&base, &args, true).await?;
             for r in &outcome.results {
@@ -734,7 +757,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(4, "Instrument");
     }
-    if find_git_root().is_some() {
+    {
         let instrument = if flag_no_instrument {
             if verbose {
                 eprintln!(
@@ -763,27 +786,84 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 .as_ref()
                 .map(|(_, agent, _)| map_agent_to_instrument_agent_arg(*agent))
                 .or_else(|| {
-                    flag_agent.map(|a| match a {
-                        AgentArg::Claude => InstrumentAgentArg::Claude,
-                        AgentArg::Codex => InstrumentAgentArg::Codex,
-                        AgentArg::Cursor => InstrumentAgentArg::Cursor,
-                        AgentArg::Opencode => InstrumentAgentArg::Opencode,
-                    })
-                });
+                    flag_agent.map(|arg| map_agent_to_instrument_agent_arg(map_agent_arg(arg)))
+                })
+                .or_else(|| determine_wizard_instrument_agent(flag_agent));
+            let selected_workflows = if flag_no_workflow {
+                Vec::new()
+            } else if !flag_workflows.is_empty() {
+                resolve_prompted_instrument_workflows(flag_workflows.clone())
+            } else if ui::can_prompt() {
+                prompt_instrument_workflow_selection()?.ok_or_else(|| anyhow!("setup cancelled"))?
+            } else {
+                vec![WorkflowArg::Instrument, WorkflowArg::Observe]
+            };
+            let selected_languages = if !flag_languages.is_empty() {
+                flag_languages.clone()
+            } else if ui::can_prompt() {
+                let defaults = detect_languages_from_dir(&std::env::current_dir()?);
+                prompt_instrument_language_selection(&defaults)?
+                    .ok_or_else(|| anyhow!("setup cancelled"))?
+            } else {
+                Vec::new()
+            };
+            let (run_tui, yolo_mode) = if flag_tui {
+                (true, yolo)
+            } else if flag_background {
+                (false, yolo)
+            } else if ui::can_prompt() {
+                let term =
+                    ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+                let run_tui = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("How do you want to run the agent?")
+                    .items(&["Interactive (TUI)", "Background"])
+                    .default(0)
+                    .interact_on(&term)?
+                    == 0;
+                let yolo_mode = if yolo {
+                    true
+                } else {
+                    Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Grant agent full permissions? (bypass permission prompts)")
+                        .default(false)
+                        .interact_on(&term)?
+                };
+                (run_tui, yolo_mode)
+            } else {
+                let (run_interactive, bypass_permissions) = resolve_instrument_run_mode(
+                    &InstrumentSetupArgs {
+                        agent: instrument_agent,
+                        agent_cmd: None,
+                        workflows: selected_workflows.clone(),
+                        no_workflow: flag_no_workflow,
+                        yes: false,
+                        refresh_docs: false,
+                        workers: crate::sync::default_workers(),
+                        languages: selected_languages.clone(),
+                        tui: false,
+                        background: false,
+                        permissions: InstrumentPermissionArgs { yolo },
+                        prompt_for_missing_options: false,
+                    },
+                    ui::can_prompt(),
+                );
+                (run_interactive, bypass_permissions)
+            };
             run_instrument_setup(
                 base,
                 InstrumentSetupArgs {
                     agent: instrument_agent,
                     agent_cmd: None,
-                    workflows: flag_workflows,
+                    workflows: selected_workflows,
                     no_workflow: flag_no_workflow,
                     yes: false,
                     refresh_docs: false,
                     workers: crate::sync::default_workers(),
-                    languages: flag_languages,
-                    tui: flag_tui,
-                    background: flag_background,
-                    yolo,
+                    languages: selected_languages,
+                    tui: run_tui,
+                    background: !run_tui,
+                    permissions: InstrumentPermissionArgs { yolo: yolo_mode },
+                    prompt_for_missing_options: false,
                 },
                 !multiselect_hint_shown,
             )
@@ -791,8 +871,6 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         } else if verbose {
             eprintln!("   {}", style("Skipped").dim());
         }
-    } else if verbose {
-        eprintln!("   {}", style("Skipped").dim());
     }
 
     // ── Done ──
@@ -810,15 +888,27 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         print_setup_banner(&base);
     }
 
-    let will_instrument = !args.no_instrument && find_git_root().is_some();
+    let will_instrument = !args.no_instrument;
+    if will_instrument && find_git_root().is_none() && !base.json {
+        eprintln!(
+            "{} Not inside a git repository — the agent may edit files in the current directory.",
+            style("!").yellow()
+        );
+    }
+    let wants_skills = args.skills || !args.no_skills;
+    let wants_mcp = args.mcp && !args.no_mcp;
     if will_instrument {
         let project_flag = base.project.clone();
         let auth = ensure_setup_auth(&mut base, false, true).await?;
         let org = auth.client.org_name().to_string();
         let project = select_project_with_skip(&auth.client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
-            let _ = maybe_init(&org, project)?;
+            maybe_init(&org, project)?;
         }
+    }
+
+    if !wants_skills && !wants_mcp && !will_instrument {
+        return Ok(());
     }
 
     let scope = default_setup_scope(&args.agents);
@@ -832,7 +922,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         ui::can_prompt(),
     )?;
 
-    if args.skills || !args.no_skills {
+    if wants_skills {
         run_setup(
             base.clone(),
             AgentsSetupArgs {
@@ -844,13 +934,13 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 yes: true,
                 refresh_docs: args.agents.refresh_docs,
                 workers: args.agents.workers,
-                yolo: args.agents.yolo,
+                permissions: args.agents.permissions.clone(),
             },
         )
         .await?;
     }
 
-    if args.mcp && !args.no_mcp {
+    if wants_mcp {
         run_mcp_setup(
             base.clone(),
             AgentsMcpSetupArgs {
@@ -863,29 +953,26 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         .await?;
     }
 
-    if !args.no_instrument {
-        if will_instrument {
-            run_instrument_setup(
-                base,
-                InstrumentSetupArgs {
-                    agent: Some(map_agent_to_instrument_agent_arg(selected_agent)),
-                    agent_cmd: None,
-                    workflows: args.agents.workflows,
-                    no_workflow: args.agents.no_workflow,
-                    yes: false,
-                    refresh_docs: args.agents.refresh_docs,
-                    workers: args.agents.workers,
-                    languages: args.languages,
-                    tui: args.tui,
-                    background: args.background,
-                    yolo: args.agents.yolo,
-                },
-                false,
-            )
-            .await?;
-        } else if !base.json {
-            eprintln!("Skipping instrumentation: not inside a git repository.");
-        }
+    if will_instrument {
+        run_instrument_setup(
+            base,
+            InstrumentSetupArgs {
+                agent: Some(map_agent_to_instrument_agent_arg(selected_agent)),
+                agent_cmd: None,
+                workflows: args.agents.workflows,
+                no_workflow: args.agents.no_workflow,
+                yes: false,
+                refresh_docs: args.agents.refresh_docs,
+                workers: args.agents.workers,
+                languages: args.languages,
+                tui: args.tui,
+                background: args.background,
+                permissions: args.agents.permissions,
+                prompt_for_missing_options: false,
+            },
+            false,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1446,8 +1533,18 @@ async fn ensure_setup_auth(
     build_setup_auth_context(base, client, is_oauth, needs_api_key).await
 }
 
+fn sync_setup_api_key(base: &mut BaseArgs, api_key: &str) {
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    base.api_key = Some(trimmed.to_string());
+    std::env::set_var("BRAINTRUST_API_KEY", trimmed);
+}
+
 async fn build_setup_auth_context(
-    base: &BaseArgs,
+    base: &mut BaseArgs,
     client: ApiClient,
     is_oauth: bool,
     needs_api_key: bool,
@@ -1457,6 +1554,10 @@ async fn build_setup_auth_context(
     } else {
         client.api_key().to_string()
     };
+
+    if needs_api_key {
+        sync_setup_api_key(base, &api_key);
+    }
 
     Ok(SetupAuthContext { client, api_key })
 }
@@ -1513,9 +1614,8 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
 
     let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
     let created: CreatedKey = client.post("/v1/api_key", &body).await?;
-    std::env::set_var("BRAINTRUST_API_KEY", &created.key);
 
-    if !base.quiet && std::io::stderr().is_terminal() {
+    if std::io::stderr().is_terminal() && base.verbose {
         eprintln!();
         eprintln!(
             "{} Created Braintrust API key '{}' for instrumentation and exported it to this setup process:",
@@ -1583,43 +1683,25 @@ async fn select_project_with_skip(
     Ok(Some(project))
 }
 
-/// Returns `true` if config was written or already matched, `false` if user declined.
-fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<bool> {
+fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> {
     let config_path = std::env::current_dir()?.join(".bt").join("config.json");
-
-    if config_path.exists() {
-        let mut existing = config::load_file(&config_path);
+    let mut cfg = if config_path.exists() {
+        let existing = config::load_file(&config_path);
         let matches = existing.org.as_deref() == Some(org)
             && existing.project.as_deref() == Some(project.name.as_str());
         if matches && existing.project_id.as_deref() == Some(project.id.as_str()) {
-            return Ok(true);
+            return Ok(());
         }
-        if matches {
-            existing.org = Some(org.to_string());
-            existing.project = Some(project.name.clone());
-            existing.project_id = Some(project.id.clone());
-            config::save_local(&existing, true)?;
-            return Ok(true);
-        }
-        let update = Confirm::new()
-            .with_prompt(format!("Update .bt/config.json to {org}/{}?", project.name))
-            .default(true)
-            .interact_on(
-                &ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?,
-            )?;
-        if !update {
-            return Ok(false);
-        }
-    }
-
-    let cfg = config::Config {
-        org: Some(org.to_string()),
-        project: Some(project.name.clone()),
-        project_id: Some(project.id.clone()),
-        ..Default::default()
+        existing
+    } else {
+        config::Config::default()
     };
+
+    cfg.org = Some(org.to_string());
+    cfg.project = Some(project.name.clone());
+    cfg.project_id = Some(project.id.clone());
     config::save_local(&cfg, true)?;
-    Ok(true)
+    Ok(())
 }
 
 fn default_setup_scope(args: &AgentsSetupArgs) -> InstallScope {
@@ -1784,6 +1866,17 @@ impl LanguageArg {
             LanguageArg::Ruby => "Ruby",
         }
     }
+
+    fn doc_filename(self) -> &'static str {
+        match self {
+            LanguageArg::Python => "python.md",
+            LanguageArg::TypeScript => "typescript.md",
+            LanguageArg::Go => "go.md",
+            LanguageArg::CSharp => "csharp.md",
+            LanguageArg::Java => "java.md",
+            LanguageArg::Ruby => "ruby.md",
+        }
+    }
 }
 
 async fn run_instrument_setup(
@@ -1792,11 +1885,9 @@ async fn run_instrument_setup(
     print_hint: bool,
 ) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let root = find_git_root().ok_or_else(|| {
-        anyhow!(
-            "instrument setup requires running inside a git repository (could not find .git in parent chain)"
-        )
-    })?;
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let git_root = find_git_root();
+    let root = git_root.clone().unwrap_or_else(|| cwd.clone());
     let mut detected = detect_agents(Some(&root), &home);
 
     let selected = resolve_default_agent_selection(
@@ -1817,15 +1908,22 @@ async fn run_instrument_setup(
     let mut hint_pending = print_hint && base.verbose;
     let selected_workflows = resolve_instrument_workflow_selection(&args, &mut hint_pending)?;
 
-    let detected_languages = if args.languages.is_empty() {
-        detect_languages_from_dir(&root)
-    } else {
-        Vec::new()
-    };
-    let selected_languages: Vec<LanguageArg> = if args.languages.is_empty() {
-        detected_languages.clone()
-    } else {
+    let selected_languages: Vec<LanguageArg> = if !args.languages.is_empty() {
         args.languages.clone()
+    } else if args.prompt_for_missing_options && ui::can_prompt() && !args.yes && !base.json {
+        if hint_pending {
+            eprintln!(
+                "   {}",
+                style("(Un)select option with Space, confirm selection with Enter.").dim()
+            );
+        }
+        let detected_langs = detect_languages_from_dir(&cwd);
+        let Some(langs) = prompt_instrument_language_selection(&detected_langs)? else {
+            bail!("instrument setup cancelled by user");
+        };
+        langs
+    } else {
+        detect_languages_from_dir(&cwd)
     };
 
     let show_progress = !base.json;
@@ -1855,32 +1953,68 @@ async fn run_instrument_setup(
         )
         .await?;
     } else {
-        let setup_args = AgentsSetupArgs {
-            agent: Some(map_agent_to_agent_arg(selected)),
-            local: true,
-            global: false,
-            workflows: selected_workflows.clone(),
-            no_workflow: args.no_workflow,
-            yes: true,
-            refresh_docs: args.refresh_docs,
-            workers: args.workers,
-            yolo: false,
+        if show_progress && base.verbose {
+            println!("Configuring coding agents for Braintrust");
+        }
+        let result = match selected {
+            Agent::Claude => install_claude(InstallScope::Local, Some(&root), &home),
+            Agent::Codex => install_codex(InstallScope::Local, Some(&root), &home),
+            Agent::Cursor => install_cursor(InstallScope::Local, Some(&root), &home),
+            Agent::Opencode => install_opencode(InstallScope::Local, Some(&root), &home),
         };
-        let outcome = execute_skills_setup(&base, &setup_args, false).await?;
-        detected = outcome.detected_agents;
-        results.extend(outcome.results);
-        warnings.extend(outcome.warnings);
-        notes.extend(outcome.notes);
-        if outcome.successful_count == 0 {
-            bail!("failed to configure skills for instrumentation");
+        match result {
+            Ok(r) => results.push(r),
+            Err(err) => results.push(AgentInstallResult {
+                agent: selected,
+                status: InstallStatus::Failed,
+                message: format!(
+                    "failed to install instrumentation skills in {}: {err}",
+                    root.display()
+                ),
+                paths: Vec::new(),
+            }),
+        }
+        detected = detect_agents(Some(&root), &home);
+        let successful_count = results
+            .iter()
+            .filter(|r| !matches!(r.status, InstallStatus::Failed))
+            .count();
+        if successful_count == 0 {
+            notes.push(
+                "Skipped workflow docs prefetch (no agents configured successfully).".to_string(),
+            );
+            let install_target = if git_root.is_some() {
+                format!("repo root {}", root.display())
+            } else {
+                format!("current directory {}", root.display())
+            };
+            bail!("failed to install instrumentation skills in {install_target}");
+        } else if selected_workflows.is_empty() {
+            notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
+        } else {
+            prefetch_workflow_docs(
+                show_progress,
+                InstallScope::Local,
+                Some(&root),
+                &home,
+                &selected_workflows,
+                args.refresh_docs,
+                args.workers,
+                &mut notes,
+                &mut warnings,
+            )
+            .await?;
         }
     }
 
     // Determine run mode: interactive TUI vs background (autonomous).
     // Use prompt availability rather than stdin TTY state so `/dev/tty`
     // fallbacks still allow TUI launch when bt is invoked via a shell script.
-    let (run_interactive, bypass_permissions) =
-        resolve_instrument_run_mode(&args, ui::can_prompt());
+    let (run_interactive, bypass_permissions) = if args.prompt_for_missing_options {
+        prompt_instrument_run_mode(&args)?
+    } else {
+        resolve_instrument_run_mode(&args, ui::can_prompt())
+    };
 
     let docs_output_dir = root.join(".bt").join("skills").join("docs");
     sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
@@ -1896,7 +2030,6 @@ async fn run_instrument_setup(
             &selected_workflows,
             &selected_languages,
             run_interactive,
-            detected_languages.is_empty(),
         ),
     )?;
 
@@ -1913,7 +2046,6 @@ async fn run_instrument_setup(
         bypass_permissions,
         &selected_languages,
     )?;
-
     if run_interactive && base.verbose {
         eprintln!();
         eprintln!("{} is opening in interactive mode.", selected.as_str());
@@ -1926,11 +2058,11 @@ async fn run_instrument_setup(
     let status = if !run_interactive && !base.json {
         with_spinner(
             "Running agent instrumentation…",
-            run_agent_invocation(&root, &invocation, false),
+            run_agent_invocation(&root, &invocation, false, &[]),
         )
         .await?
     } else {
-        run_agent_invocation(&root, &invocation, show_output).await?
+        run_agent_invocation(&root, &invocation, show_output, &[]).await?
     };
     if status.success() {
         results.push(AgentInstallResult {
@@ -1981,7 +2113,7 @@ async fn run_instrument_setup(
 
 fn resolve_instrument_workflow_selection(
     args: &InstrumentSetupArgs,
-    _hint_pending: &mut bool,
+    hint_pending: &mut bool,
 ) -> Result<Vec<WorkflowArg>> {
     if args.no_workflow {
         return Ok(Vec::new());
@@ -1994,6 +2126,20 @@ fn resolve_instrument_workflow_selection(
             selected.sort();
             selected.dedup();
         }
+        return Ok(selected);
+    }
+
+    if args.prompt_for_missing_options && ui::can_prompt() && !args.yes {
+        if *hint_pending {
+            eprintln!(
+                "   {}",
+                style("(Un)select option with Space, confirm selection with Enter.").dim()
+            );
+            *hint_pending = false;
+        }
+        let Some(selected) = prompt_instrument_workflow_selection()? else {
+            bail!("instrument setup cancelled by user");
+        };
         return Ok(selected);
     }
 
@@ -2063,6 +2209,18 @@ fn detect_languages_from_dir(dir: &std::path::Path) -> Vec<LanguageArg> {
     }
 
     found.into_iter().collect()
+}
+
+fn resolve_prompted_instrument_workflows(mut workflows: Vec<WorkflowArg>) -> Vec<WorkflowArg> {
+    if workflows.is_empty() {
+        return workflows;
+    }
+    if !workflows.contains(&WorkflowArg::Instrument) {
+        workflows.push(WorkflowArg::Instrument);
+    }
+    workflows.sort();
+    workflows.dedup();
+    workflows
 }
 
 fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
@@ -2364,12 +2522,16 @@ async fn run_agent_invocation(
     root: &Path,
     invocation: &InstrumentInvocation,
     show_output: bool,
+    extra_env: &[(String, String)],
 ) -> Result<std::process::ExitStatus> {
     match invocation {
         InstrumentInvocation::Shell(command_text) => {
             let mut command = Command::new("bash");
             command.arg("-lc").arg(command_text);
             command.current_dir(root);
+            for (key, value) in extra_env {
+                command.env(key, value);
+            }
             if !show_output {
                 command.stdout(Stdio::null()).stderr(Stdio::null());
             }
@@ -2389,6 +2551,9 @@ async fn run_agent_invocation(
         } => {
             let mut command = Command::new(program);
             command.args(args).current_dir(root);
+            for (key, value) in extra_env {
+                command.env(key, value);
+            }
             if let Some(path) = prompt_file_arg {
                 let prompt = fs::read_to_string(path).with_context(|| {
                     format!("failed to read task prompt file {}", path.display())
@@ -2449,12 +2614,37 @@ async fn run_agent_invocation(
 
 fn resolve_instrument_run_mode(args: &InstrumentSetupArgs, prompt_available: bool) -> (bool, bool) {
     if args.tui {
-        (true, args.yolo)
+        (true, args.permissions.yolo)
     } else if args.background || !prompt_available {
-        (false, args.yolo)
+        (false, args.permissions.yolo)
     } else {
-        (true, args.yolo)
+        (true, args.permissions.yolo)
     }
+}
+
+fn prompt_instrument_run_mode(args: &InstrumentSetupArgs) -> Result<(bool, bool)> {
+    let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+    let run_interactive = if args.tui {
+        true
+    } else if args.background {
+        false
+    } else {
+        Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("How do you want to run the agent?")
+            .items(&["Interactive (TUI)", "Background"])
+            .default(0)
+            .interact_on(&term)?
+            == 0
+    };
+    let bypass_permissions = if args.permissions.yolo {
+        true
+    } else {
+        Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Grant agent full permissions? (bypass permission prompts)")
+            .default(false)
+            .interact_on(&term)?
+    };
+    Ok((run_interactive, bypass_permissions))
 }
 
 fn render_instrument_task(
@@ -2462,7 +2652,6 @@ fn render_instrument_task(
     workflows: &[WorkflowArg],
     languages: &[LanguageArg],
     interactive: bool,
-    needs_language_detection: bool,
 ) -> String {
     use std::collections::BTreeSet;
     let sdk_install_dir = docs_output_dir.join("sdk-install");
@@ -2470,15 +2659,21 @@ fn render_instrument_task(
     // Deduplicate languages (TypeScript and JavaScript both map to the same variant).
     let unique_langs: BTreeSet<LanguageArg> = languages.iter().copied().collect();
     let language_context = if unique_langs.is_empty() {
-        if needs_language_detection {
-            "### Language Discovery\n\n\
-             No language override was provided and no supported language markers were detected \
-             in the repo root or its immediate subdirectories. Determine which language(s) to \
-             instrument before you make code changes.\n"
-                .to_string()
-        } else {
-            String::new()
-        }
+        "### 2. Detect Language\n\n\
+         Determine the project language using concrete signals:\n\n\
+         - `package.json` -> TypeScript\n\
+         - `requirements.txt`, `setup.py` or `pyproject.toml` -> Python\n\
+         - `pom.xml` or `build.gradle` -> Java\n\
+         - `go.mod` -> Go\n\
+         - `Gemfile` -> Ruby\n\
+         - `.csproj` -> C#\n\n\
+         If the language is not obvious from standard build/dependency files:\n\n\
+         - infer it from concrete repo evidence (e.g., entrypoint file extensions, build scripts, framework config)\n\
+         - State the single strongest piece of evidence you used\n\
+         - If still ambiguous (polyglot/monorepo), ask the user which service/app to instrument and wait for the response before proceeding\n\
+         - If the inferred language is not in the supported list, **abort the install**.\n\n\
+         If none match, **abort installation**."
+            .to_string()
     } else {
         let names: Vec<String> = unique_langs
             .iter()
@@ -2491,11 +2686,58 @@ fn render_instrument_task(
             format!("{} and {}", rest.join(", "), last)
         };
         format!(
-            "### Language Override\n\n\
-             Instrument {}. \
-             Skip Step 2 (language auto-detection) and proceed directly to Step 3 \
-             for the specified language(s).\n",
+            "### 2. Language\n\n\
+             The target language has been specified: {}.",
             list
+        )
+    };
+    let install_sdk_requirements = "- Pin an exact SDK version (resolve via package manager).\n\
+         - Modify only dependency files and a minimal application entry point (e.g., main/bootstrap). \
+         Auto-instrument the app (except for Java and C# which don't support auto-instrumentation).\n\
+         - Do not change unrelated code.";
+    let install_sdk_context = if unique_langs.is_empty() {
+        format!(
+            "### 3. Install SDK (Language-Specific)\n\n\
+             Read the install guide for the detected language from the local docs:\n\n\
+             | Language   | Local doc                         |\n\
+             | ---------- | --------------------------------- |\n\
+             | Java       | `{{SDK_INSTALL_DIR}}/java.md`       |\n\
+             | TypeScript | `{{SDK_INSTALL_DIR}}/typescript.md` |\n\
+             | Python     | `{{SDK_INSTALL_DIR}}/python.md`     |\n\
+             | Go         | `{{SDK_INSTALL_DIR}}/go.md`         |\n\
+             | Ruby       | `{{SDK_INSTALL_DIR}}/ruby.md`       |\n\
+             | C#         | `{{SDK_INSTALL_DIR}}/csharp.md`     |\n\n\
+             Requirements:\n\n\
+             {install_sdk_requirements}"
+        )
+    } else if unique_langs.len() == 1 {
+        let lang = *unique_langs.iter().next().unwrap();
+        format!(
+            "### 3. Install SDK\n\n\
+             Read the install guide from the local docs: `{{SDK_INSTALL_DIR}}/{}`\n\n\
+             Requirements:\n\n\
+             {install_sdk_requirements}",
+            lang.doc_filename()
+        )
+    } else {
+        let rows: String = unique_langs
+            .iter()
+            .map(|l| {
+                format!(
+                    "| {} | `{{SDK_INSTALL_DIR}}/{}` |\n",
+                    l.display_name(),
+                    l.doc_filename()
+                )
+            })
+            .collect();
+        format!(
+            "### 3. Install SDK\n\n\
+             Read the install guide for each language from the local docs:\n\n\
+             | Language | Local doc |\n\
+             | -------- | --------- |\n\
+             {rows}\n\
+             Requirements:\n\n\
+             {install_sdk_requirements}"
         )
     };
 
@@ -2523,10 +2765,11 @@ fn render_instrument_task(
     };
 
     INSTRUMENT_TASK_TEMPLATE
-        .replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
         .replace("{LANGUAGE_CONTEXT}", &language_context)
+        .replace("{INSTALL_SDK_CONTEXT}", &install_sdk_context)
         .replace("{WORKFLOW_CONTEXT}", &workflow_context)
         .replace("{RUN_MODE_CONTEXT}", run_mode_context)
+        .replace("{SDK_INSTALL_DIR}", &sdk_install_dir.display().to_string())
 }
 
 struct McpSetupOutcome {
@@ -2962,12 +3205,16 @@ fn prompt_scope_selection(prompt: &str) -> Result<Option<InstallScope>> {
     }))
 }
 
-fn prompt_agent_selection(prompt: &str, default: Agent) -> Result<Option<Agent>> {
-    let labels = ALL_AGENTS
+fn prompt_agent_selection(
+    prompt: &str,
+    candidates: &[Agent],
+    default: Agent,
+) -> Result<Option<Agent>> {
+    let labels = candidates
         .iter()
         .map(|agent| agent.as_str())
         .collect::<Vec<_>>();
-    let default_index = ALL_AGENTS
+    let default_index = candidates
         .iter()
         .position(|agent| *agent == default)
         .unwrap_or(0);
@@ -2977,7 +3224,7 @@ fn prompt_agent_selection(prompt: &str, default: Agent) -> Result<Option<Agent>>
         .items(&labels)
         .default(default_index)
         .interact_on_opt(&term)?;
-    Ok(selected.map(|index| ALL_AGENTS[index]))
+    Ok(selected.map(|index| candidates[index]))
 }
 
 fn prompt_workflows_selection(defaults: &[WorkflowArg]) -> Result<Option<Vec<WorkflowArg>>> {
@@ -3004,6 +3251,85 @@ fn prompt_workflows_selection(defaults: &[WorkflowArg]) -> Result<Option<Vec<Wor
         indexes
             .into_iter()
             .map(|index| ALL_WORKFLOWS[index])
+            .collect::<Vec<_>>()
+    }))
+}
+
+fn prompt_instrument_workflow_selection() -> Result<Option<Vec<WorkflowArg>>> {
+    let choices = ["observe", "annotate", "evaluate", "deploy"];
+    let defaults = [true, false, true, false];
+    let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select additional workflow docs to prefetch (instrument is always included)")
+        .items(&choices)
+        .defaults(&defaults)
+        .interact_on_opt(&term)?;
+
+    Ok(selected.map(|indexes| {
+        let mut workflows = vec![WorkflowArg::Instrument];
+        for index in indexes {
+            match index {
+                0 => workflows.push(WorkflowArg::Observe),
+                1 => workflows.push(WorkflowArg::Annotate),
+                2 => workflows.push(WorkflowArg::Evaluate),
+                3 => workflows.push(WorkflowArg::Deploy),
+                _ => {}
+            }
+        }
+        workflows
+    }))
+}
+
+fn prompt_instrument_language_selection(
+    defaults: &[LanguageArg],
+) -> Result<Option<Vec<LanguageArg>>> {
+    let choices = [
+        "All languages (auto-detect)",
+        "Python",
+        "TypeScript / JavaScript",
+        "Go",
+        "Java",
+        "Ruby",
+        "C#",
+    ];
+    let lang_to_idx = |lang: LanguageArg| match lang {
+        LanguageArg::Python => 1usize,
+        LanguageArg::TypeScript => 2,
+        LanguageArg::Go => 3,
+        LanguageArg::Java => 4,
+        LanguageArg::Ruby => 5,
+        LanguageArg::CSharp => 6,
+    };
+    let defaults = if defaults.len() != 1 {
+        [true, false, false, false, false, false, false]
+    } else {
+        let mut d = [false; 7];
+        d[lang_to_idx(defaults[0])] = true;
+        d
+    };
+
+    let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Which language(s) to instrument?")
+        .items(&choices)
+        .defaults(&defaults)
+        .interact_on_opt(&term)?;
+
+    Ok(selected.map(|indexes| {
+        if indexes.is_empty() || indexes.contains(&0) {
+            return Vec::new();
+        }
+        indexes
+            .into_iter()
+            .filter_map(|index| match index {
+                1 => Some(LanguageArg::Python),
+                2 => Some(LanguageArg::TypeScript),
+                3 => Some(LanguageArg::Go),
+                4 => Some(LanguageArg::Java),
+                5 => Some(LanguageArg::Ruby),
+                6 => Some(LanguageArg::CSharp),
+                _ => None,
+            })
             .collect::<Vec<_>>()
     }))
 }
@@ -3054,8 +3380,9 @@ fn resolve_default_agent_selection(
     }
 
     if allow_prompt {
-        let default = pick_agent_mode_target(&path_agents).unwrap_or(Agent::Codex);
-        return prompt_agent_selection(prompt, default)?
+        let candidates = promptable_instrument_agents(&path_agents, detected);
+        let default = pick_agent_mode_target(&candidates).unwrap_or(Agent::Codex);
+        return prompt_agent_selection(prompt, &candidates, default)?
             .ok_or_else(|| anyhow!("setup cancelled by user"));
     }
 
@@ -3098,6 +3425,34 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
     candidates.first().copied()
 }
 
+fn determine_wizard_instrument_agent(flag_agent: Option<AgentArg>) -> Option<InstrumentAgentArg> {
+    if let Some(arg) = flag_agent {
+        return Some(map_agent_to_instrument_agent_arg(map_agent_arg(arg)));
+    }
+
+    let runnable_agents = detect_runnable_agents();
+    if runnable_agents.len() == 1 {
+        return Some(map_agent_to_instrument_agent_arg(runnable_agents[0]));
+    }
+    None
+}
+
+fn promptable_instrument_agents(
+    runnable_agents: &[Agent],
+    detected: &[DetectionSignal],
+) -> Vec<Agent> {
+    if !runnable_agents.is_empty() {
+        return runnable_agents.to_vec();
+    }
+
+    let detected_set: BTreeSet<Agent> = detected.iter().map(|signal| signal.agent).collect();
+    if detected_set.is_empty() {
+        return ALL_AGENTS.to_vec();
+    }
+
+    detected_set.into_iter().collect()
+}
+
 fn detected_agents_on_path(detected: &[DetectionSignal]) -> Vec<Agent> {
     let mut agents = BTreeSet::new();
     for signal in detected {
@@ -3106,6 +3461,23 @@ fn detected_agents_on_path(detected: &[DetectionSignal]) -> Vec<Agent> {
         }
     }
     agents.into_iter().collect()
+}
+
+fn detect_runnable_agents() -> Vec<Agent> {
+    let mut agents = Vec::new();
+    if command_exists("claude") {
+        agents.push(Agent::Claude);
+    }
+    if command_exists("codex") {
+        agents.push(Agent::Codex);
+    }
+    if command_exists("cursor-agent") {
+        agents.push(Agent::Cursor);
+    }
+    if command_exists("opencode") {
+        agents.push(Agent::Opencode);
+    }
+    agents
 }
 
 fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
@@ -4139,10 +4511,16 @@ fn print_mcp_human_report(
 mod tests {
     use super::*;
     use std::env;
+    use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cwd_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -4175,6 +4553,13 @@ mod tests {
             api_url: None,
             app_url: None,
             env_file: None,
+        }
+    }
+
+    fn restore_env_var(key: &str, previous: Option<OsString>) {
+        match previous {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
         }
     }
 
@@ -4410,7 +4795,7 @@ mod tests {
             yes: true,
             refresh_docs: false,
             workers: crate::sync::default_workers(),
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
         };
         let home = std::env::temp_dir();
         let selection = resolve_setup_selection(&args, &home).expect("resolve setup selection");
@@ -4440,7 +4825,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
+            prompt_for_missing_options: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -4464,7 +4850,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
+            prompt_for_missing_options: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -4485,7 +4872,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
+            prompt_for_missing_options: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -4506,7 +4894,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
@@ -4525,7 +4914,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, false), (false, false));
@@ -4544,7 +4934,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: true,
+            permissions: InstrumentPermissionArgs { yolo: true },
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, true));
@@ -4563,7 +4954,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: true,
-            yolo: true,
+            permissions: InstrumentPermissionArgs { yolo: true },
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (false, true));
@@ -4582,7 +4974,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: false,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
@@ -4601,7 +4994,8 @@ mod tests {
             languages: Vec::new(),
             tui: false,
             background: true,
-            yolo: false,
+            permissions: InstrumentPermissionArgs { yolo: false },
+            prompt_for_missing_options: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (false, false));
@@ -4615,7 +5009,6 @@ mod tests {
             &[WorkflowArg::Instrument, WorkflowArg::Observe],
             &[],
             false,
-            false,
         );
         assert!(task.contains("Use the installed Braintrust agent skills"));
         assert!(task.contains("prefer local `bt` CLI commands"));
@@ -4623,11 +5016,34 @@ mod tests {
     }
 
     #[test]
-    fn render_instrument_task_includes_language_discovery_guidance_when_needed() {
+    fn render_instrument_task_includes_language_detection_guidance() {
         let root = PathBuf::from("/tmp/repo");
-        let task = render_instrument_task(&root, &[WorkflowArg::Instrument], &[], false, true);
-        assert!(task.contains("Language Discovery"));
-        assert!(task.contains("Determine which language"));
+        let task = render_instrument_task(&root, &[WorkflowArg::Instrument], &[], false);
+        assert!(task.contains("### 2. Detect Language"));
+        assert!(task.contains("`package.json` -> TypeScript"));
+    }
+
+    #[test]
+    fn render_instrument_task_includes_sdk_doc_paths_for_selected_languages() {
+        let root = PathBuf::from("/tmp/repo");
+        let task = render_instrument_task(
+            &root,
+            &[WorkflowArg::Instrument],
+            &[LanguageArg::Python, LanguageArg::TypeScript],
+            false,
+        );
+        assert!(task.contains("/tmp/repo/sdk-install/python.md"));
+        assert!(task.contains("/tmp/repo/sdk-install/typescript.md"));
+        assert!(!task.contains("{INSTALL_SDK_CONTEXT}"));
+    }
+
+    #[test]
+    fn prompted_instrument_workflows_always_include_instrument_when_non_empty() {
+        let resolved = resolve_prompted_instrument_workflows(vec![WorkflowArg::Evaluate]);
+        assert_eq!(
+            resolved,
+            vec![WorkflowArg::Instrument, WorkflowArg::Evaluate]
+        );
     }
 
     #[test]
@@ -4942,6 +5358,125 @@ mod tests {
     }
 
     #[test]
+    fn sync_setup_api_key_sets_base_and_process_env() {
+        let _guard = env_test_lock().lock().expect("lock env test");
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::remove_var("BRAINTRUST_API_KEY");
+
+        let mut base = make_base_args();
+        sync_setup_api_key(&mut base, "cli-key");
+
+        assert_eq!(base.api_key.as_deref(), Some("cli-key"));
+        assert_eq!(
+            env::var("BRAINTRUST_API_KEY").ok().as_deref(),
+            Some("cli-key")
+        );
+
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_agent_invocation_sets_extra_env_for_program_launches() {
+        let _guard = env_test_lock().lock().expect("lock env test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-run-agent-env-{unique}"));
+        let bin_dir = root.join("bin");
+        let task_path = root.join("AGENT_TASK.instrument.md");
+        let log_path = root.join("codex.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::write(&task_path, "instrument this repo").expect("write task");
+        write_executable(
+            &bin_dir.join("codex"),
+            &format!(
+                "#!/bin/sh\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" > \"{}\"\ncat >/dev/null\nexit 0\n",
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+        env::remove_var("BRAINTRUST_API_KEY");
+
+        let invocation = InstrumentInvocation::Program {
+            program: "codex".to_string(),
+            args: vec!["exec".to_string(), "-".to_string()],
+            stdin_file: Some(task_path),
+            prompt_file_arg: None,
+            initial_prompt: None,
+            stream_json: false,
+            interactive: false,
+        };
+        let status = run_agent_invocation(
+            &root,
+            &invocation,
+            false,
+            &[("BRAINTRUST_API_KEY".to_string(), "launch-key".to_string())],
+        )
+        .await
+        .expect("run agent invocation");
+
+        env::set_var("PATH", old_path);
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
+        assert!(status.success());
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert!(log.contains("ENV=launch-key"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_agent_invocation_inherits_process_api_key_env() {
+        let _guard = env_test_lock().lock().expect("lock env test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-run-agent-inherit-env-{unique}"));
+        let bin_dir = root.join("bin");
+        let task_path = root.join("AGENT_TASK.instrument.md");
+        let log_path = root.join("claude.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::write(&task_path, "instrument this repo").expect("write task");
+        write_executable(
+            &bin_dir.join("claude"),
+            &format!(
+                "#!/bin/sh\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" > \"{}\"\ncat >/dev/null\nexit 0\n",
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+        env::set_var("BRAINTRUST_API_KEY", "inherited-key");
+
+        let invocation = InstrumentInvocation::Program {
+            program: "claude".to_string(),
+            args: vec!["-p".to_string()],
+            stdin_file: Some(task_path),
+            prompt_file_arg: None,
+            initial_prompt: None,
+            stream_json: false,
+            interactive: false,
+        };
+        let status = run_agent_invocation(&root, &invocation, false, &[])
+            .await
+            .expect("run agent invocation");
+
+        env::set_var("PATH", old_path);
+        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
+
+        assert!(status.success());
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert!(log.contains("ENV=inherited-key"));
+    }
+
+    #[test]
     fn resolve_doctor_scope_respects_global_flag() {
         let args = AgentsDoctorArgs {
             local: false,
@@ -5017,6 +5552,58 @@ mod tests {
         std::env::set_current_dir(old).expect("restore cwd");
 
         assert!(matches!(scope, InstallScope::Global));
+    }
+
+    #[test]
+    fn maybe_init_preserves_existing_extra_config_fields() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-maybe-init-extra-{unique}"));
+        let bt_dir = root.join(".bt");
+        fs::create_dir_all(&bt_dir).expect("create .bt dir");
+        fs::write(
+            bt_dir.join("config.json"),
+            r#"{
+  "org": "old-org",
+  "project": "old-project",
+  "project_id": "old-project-id",
+  "custom_flag": true,
+  "nested": {
+    "keep": "me"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let old = env::current_dir().expect("cwd");
+        env::set_current_dir(&root).expect("cd root");
+
+        let project = crate::projects::api::Project {
+            id: "project-id".to_string(),
+            name: "new-project".to_string(),
+            org_id: "org-id".to_string(),
+            description: None,
+        };
+        maybe_init("new-org", &project).expect("maybe init");
+
+        env::set_current_dir(old).expect("restore cwd");
+
+        let saved = config::load_file(&bt_dir.join("config.json"));
+        assert_eq!(saved.org.as_deref(), Some("new-org"));
+        assert_eq!(saved.project.as_deref(), Some("new-project"));
+        assert_eq!(saved.project_id.as_deref(), Some("project-id"));
+        assert_eq!(
+            saved.extra.get("custom_flag"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            saved.extra.get("nested"),
+            Some(&serde_json::json!({ "keep": "me" }))
+        );
     }
 
     #[test]
