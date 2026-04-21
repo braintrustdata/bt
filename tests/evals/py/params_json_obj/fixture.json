@@ -1,0 +1,5 @@
+{
+  "runtime": "python",
+  "files": ["eval_params_json_obj.py"],
+  "args": ["--param", "{\"model\":\"gpt-4o\",\"count\":5}"]
+}

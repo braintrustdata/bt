@@ -65,6 +65,7 @@ class RunnerConfig:
     sample_seed: int | None
     dev_mode: str | None
     dev_request_json: str | None
+    params: dict[str, Any] | None
 
 
 @dataclass
@@ -163,6 +164,18 @@ def parse_int_env(name: str) -> int | None:
     return int(value)
 
 
+def parse_params_json(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"BT_EVAL_PARAMS_JSON is not valid JSON: {raw}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("BT_EVAL_PARAMS_JSON must be a JSON object.")
+    return parsed
+
+
 def read_runner_config() -> RunnerConfig:
     num_workers_value = os.getenv("BT_EVAL_NUM_WORKERS")
     num_workers = int(num_workers_value) if num_workers_value else None
@@ -177,6 +190,7 @@ def read_runner_config() -> RunnerConfig:
         sample_seed=parse_int_env("BT_EVAL_SAMPLE_SEED"),
         dev_mode=parse_dev_mode(os.getenv("BT_EVAL_DEV_MODE")),
         dev_request_json=os.getenv("BT_EVAL_DEV_REQUEST_JSON"),
+        params=parse_params_json(os.getenv("BT_EVAL_PARAMS_JSON")),
     )
 
 
@@ -1016,6 +1030,9 @@ async def run_once(
             return evaluator_instance, None, None, err
 
         progress_cb = create_progress_reporter(sse, evaluator_instance.evaluator.eval_name)
+        if config.params is not None and evaluator_instance.evaluator.parameters is not None:
+            evaluator = evaluator_instance.evaluator
+            evaluator.parameters = validate_parameters(config.params, evaluator.parameters)
         try:
             result = await run_evaluator_task(
                 evaluator_instance.evaluator,

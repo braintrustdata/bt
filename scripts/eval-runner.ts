@@ -121,6 +121,7 @@ type RunnerConfig = {
   sampleSeed: number | null;
   devMode: "list" | "eval" | null;
   devRequestJson: string | null;
+  params: Record<string, unknown> | null;
 };
 
 type EvalRunner = {
@@ -286,6 +287,22 @@ function parseIntegerEnv(name: string): number | null {
   return parsed;
 }
 
+function parseParamsJson(raw: string | undefined): Record<string, unknown> | null {
+  if (!raw) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`BT_EVAL_PARAMS_JSON is not valid JSON: ${raw}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("BT_EVAL_PARAMS_JSON must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
@@ -297,6 +314,7 @@ function readRunnerConfig(): RunnerConfig {
     sampleSeed: parseIntegerEnv("BT_EVAL_SAMPLE_SEED"),
     devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
     devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
+    params: parseParamsJson(process.env.BT_EVAL_PARAMS_JSON),
   };
 }
 
@@ -2159,7 +2177,12 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   ) => {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
-    const opts = makeEvalOptions(evaluatorName, options);
+    // Only inject CLI params when the evaluator declares a parameters schema.
+    const effectiveOptions =
+      config.params != null && evaluator.parameters != null
+        ? mergeEvalOptions({ parameters: config.params }, options)
+        : options;
+    const opts = makeEvalOptions(evaluatorName, effectiveOptions);
     const sampledData = await applySamplingToData(evaluator.data, config, {
       initialCallReceiver: evaluator,
     });
