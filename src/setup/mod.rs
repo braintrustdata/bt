@@ -96,7 +96,7 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with = "background", conflicts_with = "no_instrument")]
     tui: bool,
 
-    /// Run the agent in background (non-interactive) mode
+    /// Run the agent in background (non-interactive) mode. Use --verbose to see the agent output
     #[arg(long, conflicts_with = "tui", conflicts_with = "no_instrument")]
     background: bool,
 
@@ -237,7 +237,7 @@ struct InstrumentSetupArgs {
     #[arg(long, conflicts_with = "background", alias = "interactive")]
     tui: bool,
 
-    /// Run the agent in background (non-interactive) mode
+    /// Run the agent in background (non-interactive) mode. Use --verbose to see the agent output
     #[arg(long, conflicts_with = "tui")]
     background: bool,
 
@@ -2514,14 +2514,15 @@ fn resolve_instrument_invocation(
             } else {
                 gemini_args.extend([
                     "-p".to_string(),
+                    String::new(),
                     "--output-format".to_string(),
                     "stream-json".to_string(),
                 ]);
                 InstrumentInvocation::Program {
                     program: "gemini".to_string(),
                     args: gemini_args,
-                    stdin_file: None,
-                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    stdin_file: Some(task_path.to_path_buf()),
+                    prompt_file_arg: None,
                     initial_prompt: None,
                     stream_json: true,
                     interactive: false,
@@ -5470,12 +5471,13 @@ mod tests {
                     args,
                     vec![
                         "-p".to_string(),
+                        String::new(),
                         "--output-format".to_string(),
                         "stream-json".to_string(),
                     ]
                 );
-                assert_eq!(stdin_file, None);
-                assert_eq!(prompt_file_arg, Some(task_path));
+                assert_eq!(stdin_file, Some(task_path));
+                assert_eq!(prompt_file_arg, None);
                 assert!(stream_json);
                 assert!(!interactive);
             }
