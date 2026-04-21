@@ -60,6 +60,7 @@ const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
 const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
 const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
 const DEFAULT_EVAL_SAMPLE_SEED: u64 = 0;
+const EVAL_SPINNER_TICK_STRINGS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
 
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
@@ -2838,7 +2839,10 @@ impl EvalUi {
         let bar_style =
             ProgressStyle::with_template("{bar:10.blue} {msg} {percent}% {pos}/{len} {eta}")
                 .unwrap();
-        let spinner_style = ProgressStyle::with_template("{spinner} {msg}").unwrap();
+        let spinner_style = ProgressStyle::default_spinner()
+            .tick_strings(EVAL_SPINNER_TICK_STRINGS)
+            .template("{spinner:.cyan} {msg}")
+            .unwrap();
         Self {
             progress,
             bars: HashMap::new(),
@@ -2943,11 +2947,17 @@ impl EvalUi {
                     } else {
                         let bar = self.progress.add(ProgressBar::new_spinner());
                         bar.set_style(self.spinner_style.clone());
+                        if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                            bar.enable_steady_tick(Duration::from_millis(80));
+                        }
                         bar
                     }
                 } else {
                     let bar = self.progress.add(ProgressBar::new_spinner());
                     bar.set_style(self.spinner_style.clone());
+                    if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                        bar.enable_steady_tick(Duration::from_millis(80));
+                    }
                     bar
                 };
                 bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
@@ -2955,13 +2965,16 @@ impl EvalUi {
             }
             "increment" => {
                 if let Some(bar) = self.bars.get(&progress.name) {
-                    bar.inc(1);
+                    if bar.length().is_some() {
+                        bar.inc(1);
+                    }
                     bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
                 }
             }
             "set_total" => {
                 if let Some(bar) = self.bars.get(&progress.name) {
                     if let Some(total) = payload.total {
+                        bar.disable_steady_tick();
                         bar.set_length(total);
                         bar.set_style(self.bar_style.clone());
                     }
