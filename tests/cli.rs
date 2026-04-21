@@ -153,6 +153,37 @@ fn setup_uses_codex_detected_on_path_without_explicit_agent() {
 }
 
 #[test]
+fn setup_uses_gemini_detected_on_path_without_explicit_agent() {
+    let repo = make_git_repo();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    write_executable(&bin_dir.path().join("gemini"));
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("PATH", bin_dir.path())
+        .args([
+            "setup",
+            "--global",
+            "--no-instrument",
+            "--no-workflow",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Selected agents: gemini").not());
+
+    assert!(home
+        .path()
+        .join(".agents/skills/braintrust/SKILL.md")
+        .exists());
+}
+
+#[test]
 fn setup_verbose_prints_agent_summary() {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");

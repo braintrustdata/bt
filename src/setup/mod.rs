@@ -36,7 +36,13 @@ const BT_README: &str = include_str!("../../README.md");
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
     "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
 ];
-const ALL_AGENTS: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode];
+const ALL_AGENTS: [Agent; 5] = [
+    Agent::Claude,
+    Agent::Codex,
+    Agent::Cursor,
+    Agent::Gemini,
+    Agent::Opencode,
+];
 const ALL_WORKFLOWS: [WorkflowArg; 5] = [
     WorkflowArg::Instrument,
     WorkflowArg::Observe,
@@ -90,7 +96,7 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with = "background", conflicts_with = "no_instrument")]
     tui: bool,
 
-    /// Run the agent in background (non-interactive) mode
+    /// Run the agent in background (non-interactive) mode. Use --verbose to see the agent output
     #[arg(long, conflicts_with = "tui", conflicts_with = "no_instrument")]
     background: bool,
 
@@ -231,7 +237,7 @@ struct InstrumentSetupArgs {
     #[arg(long, conflicts_with = "background", alias = "interactive")]
     tui: bool,
 
-    /// Run the agent in background (non-interactive) mode
+    /// Run the agent in background (non-interactive) mode. Use --verbose to see the agent output
     #[arg(long, conflicts_with = "tui")]
     background: bool,
 
@@ -259,6 +265,7 @@ enum AgentArg {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Opencode,
 }
 
@@ -268,6 +275,7 @@ enum Agent {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Opencode,
 }
 
@@ -277,6 +285,7 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Cursor => "cursor",
+            Agent::Gemini => "gemini",
             Agent::Opencode => "opencode",
         }
     }
@@ -286,6 +295,7 @@ impl Agent {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",
             Agent::Cursor => "Cursor",
+            Agent::Gemini => "Gemini",
             Agent::Opencode => "Opencode",
         }
     }
@@ -1771,6 +1781,7 @@ async fn execute_skills_setup(
             Agent::Claude => install_claude(scope, local_root.as_deref(), &home),
             Agent::Codex => install_codex(scope, local_root.as_deref(), &home),
             Agent::Cursor => install_cursor(scope, local_root.as_deref(), &home),
+            Agent::Gemini => install_gemini(scope, local_root.as_deref(), &home),
             Agent::Opencode => install_opencode(scope, local_root.as_deref(), &home),
         };
 
@@ -1836,6 +1847,7 @@ enum InstrumentAgentArg {
     Claude,
     Codex,
     Cursor,
+    Gemini,
     Opencode,
 }
 
@@ -1960,6 +1972,7 @@ async fn run_instrument_setup(
             Agent::Claude => install_claude(InstallScope::Local, Some(&root), &home),
             Agent::Codex => install_codex(InstallScope::Local, Some(&root), &home),
             Agent::Cursor => install_cursor(InstallScope::Local, Some(&root), &home),
+            Agent::Gemini => install_gemini(InstallScope::Local, Some(&root), &home),
             Agent::Opencode => install_opencode(InstallScope::Local, Some(&root), &home),
         };
         match result {
@@ -2228,6 +2241,7 @@ fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
         Agent::Claude => AgentArg::Claude,
         Agent::Codex => AgentArg::Codex,
         Agent::Cursor => AgentArg::Cursor,
+        Agent::Gemini => AgentArg::Gemini,
         Agent::Opencode => AgentArg::Opencode,
     }
 }
@@ -2237,6 +2251,7 @@ fn map_agent_to_instrument_agent_arg(agent: Agent) -> InstrumentAgentArg {
         Agent::Claude => InstrumentAgentArg::Claude,
         Agent::Codex => InstrumentAgentArg::Codex,
         Agent::Cursor => InstrumentAgentArg::Cursor,
+        Agent::Gemini => InstrumentAgentArg::Gemini,
         Agent::Opencode => InstrumentAgentArg::Opencode,
     }
 }
@@ -2250,7 +2265,7 @@ fn skill_config_path(
     let root = scope_root(scope, local_root, home)?;
     let path = match agent {
         Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
-        Agent::Codex | Agent::Opencode | Agent::Cursor => {
+        Agent::Codex | Agent::Opencode | Agent::Cursor | Agent::Gemini => {
             root.join(".agents/skills/braintrust/SKILL.md")
         }
     };
@@ -2481,6 +2496,39 @@ fn resolve_instrument_invocation(
             stream_json: false,
             interactive,
         },
+        Agent::Gemini => {
+            let mut gemini_args = vec![];
+            if bypass_permissions {
+                gemini_args.push("--yolo".to_string());
+            }
+            if interactive {
+                InstrumentInvocation::Program {
+                    program: "gemini".to_string(),
+                    args: gemini_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                gemini_args.extend([
+                    "-p".to_string(),
+                    String::new(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                ]);
+                InstrumentInvocation::Program {
+                    program: "gemini".to_string(),
+                    args: gemini_args,
+                    stdin_file: Some(task_path.to_path_buf()),
+                    prompt_file_arg: None,
+                    initial_prompt: None,
+                    stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
         Agent::Cursor => {
             let mut cursor_args = vec![];
             if bypass_permissions {
@@ -3030,10 +3078,16 @@ fn run_doctor(base: BaseArgs, args: AgentsDoctorArgs) -> Result<()> {
     let detected = detect_agents(local_root.as_deref(), &home);
 
     let warnings = Vec::new();
-    let agents = [Agent::Claude, Agent::Codex, Agent::Cursor, Agent::Opencode]
-        .iter()
-        .map(|agent| doctor_agent_status(*agent, scope, local_root.as_deref(), &home, &detected))
-        .collect::<Vec<_>>();
+    let agents = [
+        Agent::Claude,
+        Agent::Codex,
+        Agent::Cursor,
+        Agent::Gemini,
+        Agent::Opencode,
+    ]
+    .iter()
+    .map(|agent| doctor_agent_status(*agent, scope, local_root.as_deref(), &home, &detected))
+    .collect::<Vec<_>>();
 
     if base.json {
         let report = DoctorJsonReport {
@@ -3398,6 +3452,7 @@ fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg 
         InstrumentAgentArg::Claude => AgentArg::Claude,
         InstrumentAgentArg::Codex => AgentArg::Codex,
         InstrumentAgentArg::Cursor => AgentArg::Cursor,
+        InstrumentAgentArg::Gemini => AgentArg::Gemini,
         InstrumentAgentArg::Opencode => AgentArg::Opencode,
     }
 }
@@ -3407,6 +3462,7 @@ fn map_agent_arg(agent: AgentArg) -> Agent {
         AgentArg::Claude => Agent::Claude,
         AgentArg::Codex => Agent::Codex,
         AgentArg::Cursor => Agent::Cursor,
+        AgentArg::Gemini => Agent::Gemini,
         AgentArg::Opencode => Agent::Opencode,
     }
 }
@@ -3416,7 +3472,13 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
         return None;
     }
     // Prefer Codex for instrumentation defaults when multiple agents are detected.
-    let priority = [Agent::Codex, Agent::Claude, Agent::Cursor, Agent::Opencode];
+    let priority = [
+        Agent::Codex,
+        Agent::Claude,
+        Agent::Gemini,
+        Agent::Cursor,
+        Agent::Opencode,
+    ];
     for preferred in priority {
         if candidates.contains(&preferred) {
             return Some(preferred);
@@ -3474,6 +3536,9 @@ fn detect_runnable_agents() -> Vec<Agent> {
     if command_exists("cursor-agent") {
         agents.push(Agent::Cursor);
     }
+    if command_exists("gemini") {
+        agents.push(Agent::Gemini);
+    }
     if command_exists("opencode") {
         agents.push(Agent::Opencode);
     }
@@ -3514,6 +3579,14 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
                 ".cursor exists in repo root",
             );
         }
+        if root.join(".gemini").exists() {
+            add_signal(
+                &mut by_agent,
+                Agent::Gemini,
+                false,
+                ".gemini exists in repo root",
+            );
+        }
         if root.join(".opencode").exists() {
             add_signal(
                 &mut by_agent,
@@ -3551,6 +3624,9 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
     }
     if home.join(".cursor").exists() {
         add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
+    }
+    if home.join(".gemini").exists() {
+        add_signal(&mut by_agent, Agent::Gemini, false, "~/.gemini exists");
     }
     if home.join(".codex").exists() {
         add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
@@ -3600,6 +3676,14 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
             Agent::Cursor,
             true,
             "`cursor-agent` binary found in PATH",
+        );
+    }
+    if command_exists("gemini") {
+        add_signal(
+            &mut by_agent,
+            Agent::Gemini,
+            true,
+            "`gemini` binary found in PATH",
         );
     }
     if command_exists("opencode") {
@@ -3745,6 +3829,36 @@ fn install_cursor(
     })
 }
 
+fn install_gemini(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Result<AgentInstallResult> {
+    let root = scope_root(scope, local_root, home)?;
+    let skill_content = render_braintrust_skill();
+    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let alias = ensure_agent_skills_alias(root, ".gemini", &skill_content)?;
+    let changed = skill_changed || alias.changed;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Gemini,
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
+        paths: vec![
+            skill_path.display().to_string(),
+            alias.path.display().to_string(),
+        ],
+    })
+}
+
 fn install_canonical_skill(root: &Path, skill_content: &str) -> Result<(bool, PathBuf)> {
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
     let changed = write_text_file_if_changed(&skill_path, skill_content)?;
@@ -3863,18 +3977,12 @@ fn install_mcp_for_agent(
             InstallScope::Global => install_mcp_for_codex(mcp_url, api_key),
         },
         Agent::Cursor => install_mcp_for_cursor(scope, local_root, home, api_key, mcp_url),
+        Agent::Gemini => install_mcp_for_gemini(scope, local_root, home, api_key, mcp_url),
         Agent::Opencode => install_mcp_for_opencode(scope, local_root, home, api_key, mcp_url),
     }
 }
 
 fn install_mcp_for_codex(mcp_url: &str, api_key: &str) -> Result<AgentInstallResult> {
-    let _ = std::process::Command::new("codex")
-        .args(["mcp", "remove", "braintrust"])
-        .env("BRAINTRUST_API_KEY", api_key)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
     let status = std::process::Command::new("codex")
         .args([
             "mcp",
@@ -4005,6 +4113,52 @@ fn install_mcp_for_claude(
 
     Ok(AgentInstallResult {
         agent: Agent::Claude,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec![path_label],
+    })
+}
+
+fn install_mcp_for_gemini(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    let (scope_name, cwd, path_label) = match scope {
+        InstallScope::Local => (
+            "project",
+            scope_root(scope, local_root, home)?.to_path_buf(),
+            "gemini:project".to_string(),
+        ),
+        InstallScope::Global => ("user", home.to_path_buf(), "gemini:user".to_string()),
+    };
+
+    let status = std::process::Command::new("gemini")
+        .args([
+            "mcp",
+            "add",
+            "-s",
+            scope_name,
+            "--transport",
+            "http",
+            "braintrust",
+            mcp_url,
+            "-H",
+            &format!("Authorization: Bearer {api_key}"),
+        ])
+        .current_dir(&cwd)
+        .stdout(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to run `gemini mcp add -s {scope_name}`"))?;
+
+    if !status.success() {
+        bail!("`gemini mcp add -s {scope_name}` exited with status {status}");
+    }
+
+    Ok(AgentInstallResult {
+        agent: Agent::Gemini,
         status: InstallStatus::Installed,
         message: "installed MCP config".to_string(),
         paths: vec![path_label],
@@ -5296,6 +5450,70 @@ mod tests {
     }
 
     #[test]
+    fn gemini_instrument_invocation_uses_headless_stream_json() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Gemini, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "gemini");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-p".to_string(),
+                        String::new(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                    ]
+                );
+                assert_eq!(stdin_file, Some(task_path));
+                assert_eq!(prompt_file_arg, None);
+                assert!(stream_json);
+                assert!(!interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn gemini_interactive_instrument_invocation_uses_positional_prompt() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Gemini, None, &task_path, true, true, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "gemini");
+                assert_eq!(args, vec!["--yolo".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
     fn cursor_instrument_invocation_uses_print_with_prompt_arg() {
         let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
         let invocation =
@@ -5491,6 +5709,22 @@ mod tests {
     fn doctor_agent_status_reports_cursor_global_skill_path() {
         let home = std::env::temp_dir();
         let status = doctor_agent_status(Agent::Cursor, InstallScope::Global, None, &home, &[]);
+        assert!(!status.configured);
+        assert_eq!(
+            status.config_path,
+            Some(
+                home.join(".agents/skills/braintrust/SKILL.md")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(status.notes.is_empty());
+    }
+
+    #[test]
+    fn doctor_agent_status_reports_gemini_global_skill_path() {
+        let home = std::env::temp_dir();
+        let status = doctor_agent_status(Agent::Gemini, InstallScope::Global, None, &home, &[]);
         assert!(!status.configured);
         assert_eq!(
             status.config_path,
@@ -5792,7 +6026,6 @@ mod tests {
         assert!(matches!(result.status, InstallStatus::Installed));
         let log = fs::read_to_string(&log_path).expect("read codex log");
         assert!(log.contains("mcp"));
-        assert!(log.contains("remove"));
         assert!(log.contains("add"));
         assert!(log.contains("braintrust"));
         assert!(log.contains("--url"));
@@ -5916,6 +6149,106 @@ mod tests {
     }
 
     #[test]
+    fn install_mcp_for_agent_invokes_gemini_project_scope_for_local() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-gemini-mcp-local-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("gemini.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("gemini"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Gemini,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "gemini-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install gemini local mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["gemini:project".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read gemini log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("add"));
+        assert!(log.contains("-s"));
+        assert!(log.contains("project"));
+        assert!(log.contains("--transport"));
+        assert!(log.contains("http"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains("Authorization: Bearer gemini-api-key"));
+        assert!(log.contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn install_mcp_for_agent_invokes_gemini_user_scope_for_global() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-gemini-mcp-global-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("gemini-global.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("gemini"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Gemini,
+            InstallScope::Global,
+            None,
+            &home,
+            "gemini-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install gemini global mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["gemini:user".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read gemini log");
+        assert!(log.contains("user"));
+        assert!(log.contains(&home.display().to_string()));
+    }
+
+    #[test]
     fn install_codex_is_idempotent_when_skill_is_unchanged() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5933,6 +6266,24 @@ mod tests {
             install_codex(InstallScope::Local, Some(&root), &home).expect("second install");
         assert!(matches!(second.status, InstallStatus::Skipped));
         assert!(second.message.contains("already configured"));
+    }
+
+    #[test]
+    fn install_gemini_uses_canonical_agents_skill_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-gemini-skill-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let result =
+            install_gemini(InstallScope::Local, Some(&root), &home).expect("install gemini");
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
+        assert!(root.join(".gemini/skills").exists());
     }
 
     #[test]
