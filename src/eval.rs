@@ -1790,17 +1790,13 @@ fn resolve_watch_paths(files: &[String]) -> Result<Vec<PathBuf>> {
     normalize_watch_paths(files.iter().map(PathBuf::from))
 }
 
-fn parse_eval_params(
-    params: &[String],
-) -> Result<serde_json::Map<String, serde_json::Value>> {
+fn parse_eval_params(params: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
     let mut result = serde_json::Map::new();
     for param in params {
         let trimmed = param.trim();
         if trimmed.starts_with('{') {
-            let parsed: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(trimmed).with_context(|| {
-                    format!("--param value is not a valid JSON object: {param}")
-                })?;
+            let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(trimmed)
+                .with_context(|| format!("--param value is not a valid JSON object: {param}"))?;
             result.extend(parsed);
         } else {
             let eq_pos = trimmed.find('=').ok_or_else(|| {

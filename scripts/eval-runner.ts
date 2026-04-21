@@ -287,7 +287,9 @@ function parseIntegerEnv(name: string): number | null {
   return parsed;
 }
 
-function parseParamsJson(raw: string | undefined): Record<string, unknown> | null {
+function parseParamsJson(
+  raw: string | undefined,
+): Record<string, unknown> | null {
   if (!raw) {
     return null;
   }
