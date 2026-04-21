@@ -15,6 +15,19 @@ use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 const WORKFLOWS: &[&str] = &["instrument", "observe", "annotate", "evaluate", "deploy"];
+const BRAINTRUST_CLI_ENVS: &[&str] = &[
+    "BRAINTRUST_VERBOSE",
+    "BRAINTRUST_QUIET",
+    "BRAINTRUST_NO_COLOR",
+    "BRAINTRUST_NO_INPUT",
+    "BRAINTRUST_PROFILE",
+    "BRAINTRUST_ORG_NAME",
+    "BRAINTRUST_DEFAULT_PROJECT",
+    "BRAINTRUST_API_KEY",
+    "BRAINTRUST_API_URL",
+    "BRAINTRUST_APP_URL",
+    "BRAINTRUST_ENV_FILE",
+];
 
 #[test]
 fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
@@ -218,12 +231,7 @@ impl PtyProcess {
         for (key, value) in envs {
             cmd.env(key, value);
         }
-        for key in [
-            "BRAINTRUST_API_KEY",
-            "BRAINTRUST_PROFILE",
-            "BRAINTRUST_ORG_NAME",
-            "BRAINTRUST_DEFAULT_PROJECT",
-        ] {
+        for key in BRAINTRUST_CLI_ENVS {
             cmd.env_remove(key);
         }
         cmd.env("TERM", "xterm-256color");
