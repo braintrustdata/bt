@@ -48,14 +48,6 @@ lto = "thin"
 [workspace]
 members = ["."]
 
-[workspace.metadata.dist]
-cargo-dist-version = "0.30.3"
-ci = "github"
-create-release = true
-pr-run-mode = "plan"
-allow-dirty = ["ci"]
-ssldotcom-windows-sign = "test"
-
 [package.metadata.dist]
 installers = ["shell", "powershell"]
 targets = [
