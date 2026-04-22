@@ -54,7 +54,7 @@ ci = "github"
 create-release = true
 pr-run-mode = "plan"
 allow-dirty = ["ci"]
-ssldotcom-windows-sign = "prod"
+ssldotcom-windows-sign = "test"
 
 [package.metadata.dist]
 installers = ["shell", "powershell"]
