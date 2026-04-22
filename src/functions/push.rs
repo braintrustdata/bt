@@ -1633,6 +1633,8 @@ fn build_python_bundle_archive(
         baseline_dep_versions,
         python_version,
     )?;
+    ensure_python_package_staged(&pkg_dir, &python, "braintrust")
+        .context("failed to stage required Python package 'braintrust'")?;
 
     let stage_dir = build_dir.path.join("stage");
     std::fs::create_dir_all(&stage_dir)
@@ -1865,6 +1867,100 @@ fn install_python_dependencies(
     }
 
     Ok(())
+}
+
+fn ensure_python_package_staged(pkg_dir: &Path, python: &Path, package_name: &str) -> Result<()> {
+    if python_package_staged(pkg_dir, package_name) {
+        return Ok(());
+    }
+
+    vendor_python_package_from_interpreter(pkg_dir, python, package_name)?;
+
+    if python_package_staged(pkg_dir, package_name) {
+        return Ok(());
+    }
+
+    bail!(
+        "python bundle staging is missing required package '{}' under {}",
+        package_name,
+        pkg_dir.display()
+    );
+}
+
+fn python_package_staged(pkg_dir: &Path, package_name: &str) -> bool {
+    pkg_dir.join(package_name).is_dir() || pkg_dir.join(format!("{package_name}.py")).is_file()
+}
+
+fn vendor_python_package_from_interpreter(
+    pkg_dir: &Path,
+    python: &Path,
+    package_name: &str,
+) -> Result<()> {
+    const VENDOR_PACKAGE_SCRIPT: &str = r#"import importlib
+import pathlib
+import shutil
+import sys
+
+target_root = pathlib.Path(sys.argv[1])
+package_name = sys.argv[2]
+module = importlib.import_module(package_name)
+module_file = getattr(module, "__file__", None)
+if not module_file:
+    raise RuntimeError(f"package {package_name!r} has no __file__")
+source = pathlib.Path(module_file).resolve()
+
+if source.name == "__init__.py":
+    src_dir = source.parent
+    dest = target_root / package_name
+    if dest.exists():
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    shutil.copytree(src_dir, dest)
+else:
+    dest = target_root / f"{package_name}.py"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
+"#;
+
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(VENDOR_PACKAGE_SCRIPT)
+        .arg(pkg_dir)
+        .arg(package_name)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to spawn Python package vendor helper for '{}'",
+                package_name
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let excerpt = stderr
+        .lines()
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if excerpt.is_empty() {
+        bail!(
+            "Python package vendor helper failed with status {} for '{}'",
+            output.status,
+            package_name
+        );
+    }
+    bail!(
+        "Python package vendor helper failed with status {} for '{}': {}",
+        output.status,
+        package_name,
+        excerpt
+    );
 }
 
 fn run_uv_command(uv: &Path, args: &[OsString], stage: &str) -> Result<()> {
@@ -3331,6 +3427,32 @@ mod tests {
 
         assert_eq!(value["type"], "code");
         assert!(value["data"].get("preview").is_none());
+    }
+
+    #[test]
+    fn python_package_staged_detects_module_files_and_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = dir.path();
+
+        assert!(
+            !python_package_staged(pkg_dir, "braintrust"),
+            "package should be missing initially"
+        );
+
+        let package_dir = pkg_dir.join("braintrust");
+        std::fs::create_dir_all(&package_dir).expect("create package dir");
+        std::fs::write(package_dir.join("__init__.py"), "").expect("write __init__");
+        assert!(
+            python_package_staged(pkg_dir, "braintrust"),
+            "package directory should be detected"
+        );
+
+        std::fs::remove_dir_all(&package_dir).expect("remove package dir");
+        std::fs::write(pkg_dir.join("braintrust.py"), "VALUE = 1\n").expect("write module file");
+        assert!(
+            python_package_staged(pkg_dir, "braintrust"),
+            "single-file module should be detected"
+        );
     }
 
     #[test]
