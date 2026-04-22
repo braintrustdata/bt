@@ -1625,7 +1625,8 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
     let created: CreatedKey = client.post("/v1/api_key", &body).await?;
 
-    if std::io::stderr().is_terminal() && base.verbose {
+    let explicitly_quiet = base.quiet && base.quiet_source.is_some();
+    if std::io::stderr().is_terminal() && !explicitly_quiet {
         eprintln!();
         eprintln!(
             "{} Created Braintrust API key '{}' for instrumentation and exported it to this setup process:",
