@@ -3334,6 +3334,16 @@ mod tests {
     }
 
     #[test]
+    fn js_bundler_defaults_do_not_externalize_braintrust_sdk() {
+        assert!(
+            !FUNCTIONS_JS_BUNDLER_SOURCE.contains("\"braintrust\"")
+                && !FUNCTIONS_JS_BUNDLER_SOURCE.contains("\"autoevals\"")
+                && !FUNCTIONS_JS_BUNDLER_SOURCE.contains("\"@braintrust/\""),
+            "default JS bundler externals must not include Braintrust SDK packages"
+        );
+    }
+
+    #[test]
     fn uv_install_args_include_selected_python() {
         let pkg_dir = PathBuf::from("/tmp/pkg");
         let python = PathBuf::from("/tmp/custom-python");
