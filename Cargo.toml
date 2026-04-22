@@ -8,6 +8,12 @@ description = "The Braintrust command line interface"
 license = "Apache-2.0"
 repository = "https://github.com/braintrustdata/bt"
 
+[package.metadata.wix]
+upgrade-guid = "5B558F98-EEBD-4F5E-A0C8-E7A039445139"
+path-guid = "7CD3044D-A62A-469C-8552-0E5C3A00FFF1"
+license = false
+eula = false
+
 [dependencies]
 actix-web = "4.11.0"
 anyhow = "1.0.89"
