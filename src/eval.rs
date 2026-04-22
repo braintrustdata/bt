@@ -344,6 +344,17 @@ pub struct EvalArgs {
     )]
     pub watch: bool,
 
+    /// Override one or more evaluator parameters for this run.
+    /// Accepts key=value pairs where the value is JSON (e.g. --param model='"gpt-4o"' --param enabled=true),
+    /// or a single JSON object (e.g. --param '{"model":"gpt-4o"}').
+    /// Repeat the flag to set multiple parameters.
+    #[arg(
+        long,
+        value_name = "KEY=JSON_VALUE | JSON_OBJECT",
+        allow_hyphen_values = true
+    )]
+    pub param: Vec<String>,
+
     /// Arguments forwarded to the eval file via process.argv (everything after `--`).
     /// Example: bt eval foo.eval.ts -- --description "Prod" --shard=1/4
     #[arg(last = true, value_name = "ARG")]
@@ -398,6 +409,7 @@ struct EvalRunOptions {
     sampling: EvalSamplingMode,
     verbose: bool,
     extra_args: Vec<String>,
+    params: Vec<String>,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
@@ -438,6 +450,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         verbose: base.verbose,
         sampling,
         extra_args: args.extra_args,
+        params: args.param,
     };
 
     if args.dev {
@@ -824,6 +837,12 @@ async fn spawn_eval_runner(
         let serialized =
             serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
         cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
+    }
+    if !options.params.is_empty() {
+        let parsed = parse_eval_params(&options.params)?;
+        let serialized =
+            serde_json::to_string(&parsed).context("failed to serialize eval params")?;
+        cmd.env("BT_EVAL_PARAMS_JSON", serialized);
     }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
@@ -1769,6 +1788,33 @@ type WatchState = HashMap<PathBuf, Option<WatchEntry>>;
 
 fn resolve_watch_paths(files: &[String]) -> Result<Vec<PathBuf>> {
     normalize_watch_paths(files.iter().map(PathBuf::from))
+}
+
+fn parse_eval_params(params: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut result = serde_json::Map::new();
+    for param in params {
+        let trimmed = param.trim();
+        if trimmed.starts_with('{') {
+            let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(trimmed)
+                .with_context(|| format!("--param value is not a valid JSON object: {param}"))?;
+            result.extend(parsed);
+        } else {
+            let eq_pos = trimmed.find('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--param value must be in key=JSON_VALUE format or a JSON object: {param}"
+                )
+            })?;
+            let key = &trimmed[..eq_pos];
+            if key.is_empty() {
+                anyhow::bail!("--param key must not be empty: {param}");
+            }
+            let value_str = &trimmed[eq_pos + 1..];
+            let value: serde_json::Value = serde_json::from_str(value_str)
+                .unwrap_or_else(|_| serde_json::Value::String(value_str.to_string()));
+            result.insert(key.to_string(), value);
+        }
+    }
+    Ok(result)
 }
 
 fn parse_eval_filter_expression(expression: &str) -> Result<RunnerFilter> {
@@ -4375,6 +4421,64 @@ mod tests {
 
         let rendered = format_experiment_summary(&summary);
         assert!(rendered.contains("Run mode: first 20 examples (non-final smoke run)"));
+    }
+
+    #[test]
+    fn parse_eval_params_handles_key_value_pairs() {
+        let params = vec![
+            r#"myModel="gpt-4o""#.to_string(),
+            "enabled=true".to_string(),
+            "count=42".to_string(),
+        ];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["myModel"], serde_json::json!("gpt-4o"));
+        assert_eq!(result["enabled"], serde_json::json!(true));
+        assert_eq!(result["count"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn parse_eval_params_handles_json_object() {
+        let params = vec![r#"{"myModel":"gpt-4o","enabled":true}"#.to_string()];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["myModel"], serde_json::json!("gpt-4o"));
+        assert_eq!(result["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn parse_eval_params_last_key_value_wins() {
+        let params = vec![
+            r#"model="first""#.to_string(),
+            r#"model="second""#.to_string(),
+        ];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["model"], serde_json::json!("second"));
+    }
+
+    #[test]
+    fn parse_eval_params_treats_non_json_value_as_string() {
+        let params = vec!["model=gpt-4o".to_string()];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["model"], serde_json::json!("gpt-4o"));
+    }
+
+    #[test]
+    fn parse_eval_params_rejects_missing_equals() {
+        let params = vec!["modelonly".to_string()];
+        let err = parse_eval_params(&params).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key=JSON_VALUE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_eval_params_rejects_empty_key() {
+        let params = vec![r#"="value""#.to_string()];
+        let err = parse_eval_params(&params).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key must not be empty"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
