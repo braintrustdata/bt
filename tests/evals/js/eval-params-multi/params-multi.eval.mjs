@@ -10,13 +10,19 @@ Eval("test-params-multi-a", {
   task: (input, hooks) => {
     const params = hooks.parameters;
     if (params.model !== "gpt-4o") {
-      throw new Error(`A: expected model "gpt-4o", got ${JSON.stringify(params.model)}`);
+      throw new Error(
+        `A: expected model "gpt-4o", got ${JSON.stringify(params.model)}`,
+      );
     }
     if (params.count !== 5) {
-      throw new Error(`A: expected count 5, got ${JSON.stringify(params.count)}`);
+      throw new Error(
+        `A: expected count 5, got ${JSON.stringify(params.count)}`,
+      );
     }
     if ("enabled" in params) {
-      throw new Error(`A: unexpected param 'enabled' leaked in: ${JSON.stringify(params)}`);
+      throw new Error(
+        `A: unexpected param 'enabled' leaked in: ${JSON.stringify(params)}`,
+      );
     }
     return input;
   },
@@ -31,10 +37,14 @@ Eval("test-params-multi-b", {
   task: (input, hooks) => {
     const params = hooks.parameters;
     if (params.enabled !== true) {
-      throw new Error(`B: expected enabled true, got ${JSON.stringify(params.enabled)}`);
+      throw new Error(
+        `B: expected enabled true, got ${JSON.stringify(params.enabled)}`,
+      );
     }
     if ("model" in params || "count" in params) {
-      throw new Error(`B: unexpected params leaked in: ${JSON.stringify(params)}`);
+      throw new Error(
+        `B: unexpected params leaked in: ${JSON.stringify(params)}`,
+      );
     }
     return input;
   },
