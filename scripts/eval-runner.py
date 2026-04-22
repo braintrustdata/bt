@@ -759,17 +759,29 @@ def wrap_data_with_adaptive_total(
     if progress_cb is None:
         return data
     if state is None:
-        state = {"rows_seen": 0, "last_total": 0}
+        state = {"rows_seen": 0, "last_emitted_total": 0}
 
     def report_rows_seen() -> None:
         rows_seen = state["rows_seen"]
         if rows_seen <= 0:
             return
         total = rows_seen * trial_count
-        if total <= state["last_total"]:
+        if total <= state["last_emitted_total"]:
             return
-        state["last_total"] = total
+        state["last_emitted_total"] = total
         progress_cb("set_total", total)
+
+    def maybe_report_empty_total(exhausted: bool) -> None:
+        # Unknown-total evaluators that exhaust without yielding should still
+        # emit an explicit total of 0. The renderer decides whether that
+        # threshold is shown as spinner or determinate progress.
+        if not exhausted:
+            return
+        if state["rows_seen"] != 0:
+            return
+        if state["last_emitted_total"] != 0:
+            return
+        progress_cb("set_total", 0)
 
     if inspect.isclass(data):
         return data
@@ -804,21 +816,31 @@ def wrap_data_with_adaptive_total(
 
     if inspect.isasyncgen(data) or hasattr(data, "__aiter__"):
         async def wrapped_async_iter():
-            async for item in data:
-                state["rows_seen"] += 1
-                report_rows_seen()
-                yield item
+            exhausted = False
+            try:
+                async for item in data:
+                    state["rows_seen"] += 1
+                    report_rows_seen()
+                    yield item
+                exhausted = True
+            finally:
+                maybe_report_empty_total(exhausted)
 
         return wrapped_async_iter()
 
     if inspect.isgenerator(data):
         async def wrapped_iter():
-            for item in data:
-                state["rows_seen"] += 1
-                report_rows_seen()
-                yield item
-                # Let scheduled eval tasks make progress while we keep ingesting rows.
-                await asyncio.sleep(0)
+            exhausted = False
+            try:
+                for item in data:
+                    state["rows_seen"] += 1
+                    report_rows_seen()
+                    yield item
+                    # Let scheduled eval tasks make progress while we keep ingesting rows.
+                    await asyncio.sleep(0)
+                exhausted = True
+            finally:
+                maybe_report_empty_total(exhausted)
 
         return wrapped_iter()
 
@@ -831,12 +853,17 @@ def wrap_data_with_adaptive_total(
         return data
 
     async def wrapped_iterable():
-        for item in iterator:
-            state["rows_seen"] += 1
-            report_rows_seen()
-            yield item
-            # Avoid starving task execution while iterating synchronous data sources.
-            await asyncio.sleep(0)
+        exhausted = False
+        try:
+            for item in iterator:
+                state["rows_seen"] += 1
+                report_rows_seen()
+                yield item
+                # Avoid starving task execution while iterating synchronous data sources.
+                await asyncio.sleep(0)
+            exhausted = True
+        finally:
+            maybe_report_empty_total(exhausted)
 
     return wrapped_iterable()
 

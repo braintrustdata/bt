@@ -61,6 +61,16 @@ const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
 const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
 const DEFAULT_EVAL_SAMPLE_SEED: u64 = 0;
 const EVAL_SPINNER_TICK_STRINGS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
+// UI-only smoothing knobs for adaptive totals.
+// We intentionally smooth in the CLI renderer (not the runner protocol) so
+// non-CLI consumers still receive truthful progress events.
+// `EVAL_TOTAL_SMOOTH_INTERVAL` roughly matches perceptible terminal updates.
+// `EVAL_TOTAL_SMOOTH_DELTA_DIVISOR` + `EVAL_TOTAL_SMOOTH_MIN_STEP` avoid redrawing
+// for tiny len changes while still applying meaningful jumps immediately.
+const EVAL_TOTAL_SMOOTH_INTERVAL: Duration = Duration::from_millis(100);
+const EVAL_TOTAL_SMOOTH_DELTA_DIVISOR: u64 = 50;
+const EVAL_TOTAL_SMOOTH_MIN_STEP: u64 = 2;
+const EVAL_MIN_DETERMINATE_TOTAL: u64 = 2;
 
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
@@ -2816,7 +2826,7 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
 
 struct EvalUi {
     progress: MultiProgress,
-    bars: HashMap<String, ProgressBar>,
+    bars: HashMap<String, EvalBarState>,
     bar_style: ProgressStyle,
     spinner_style: ProgressStyle,
     jsonl: bool,
@@ -2825,6 +2835,12 @@ struct EvalUi {
     deferred_errors: Vec<String>,
     suppressed_stderr_lines: usize,
     finished: bool,
+}
+
+struct EvalBarState {
+    bar: ProgressBar,
+    pending_total: Option<u64>,
+    last_total_update: Option<std::time::Instant>,
 }
 
 impl EvalUi {
@@ -2861,8 +2877,8 @@ impl EvalUi {
         if self.finished {
             return;
         }
-        for (_, bar) in self.bars.drain() {
-            bar.finish_and_clear();
+        for (_, state) in self.bars.drain() {
+            state.bar.finish_and_clear();
         }
         let _ = self.progress.clear();
         self.progress.set_draw_target(ProgressDrawTarget::hidden());
@@ -2940,7 +2956,7 @@ impl EvalUi {
         match payload.kind.as_str() {
             "start" => {
                 let bar = if let Some(total) = payload.total {
-                    if total > 0 {
+                    if total >= EVAL_MIN_DETERMINATE_TOTAL {
                         let bar = self.progress.add(ProgressBar::new(total));
                         bar.set_style(self.bar_style.clone());
                         bar
@@ -2961,31 +2977,112 @@ impl EvalUi {
                     bar
                 };
                 bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
-                self.bars.insert(progress.name.clone(), bar);
+                let last_total_update = if bar.length().is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                self.bars.insert(
+                    progress.name.clone(),
+                    EvalBarState {
+                        bar,
+                        pending_total: None,
+                        last_total_update,
+                    },
+                );
             }
             "increment" => {
-                if let Some(bar) = self.bars.get(&progress.name) {
-                    if bar.length().is_some() {
-                        bar.inc(1);
-                    }
-                    bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
+                if let Some(state) = self.bars.get_mut(&progress.name) {
+                    state.bar.inc(1);
+                    state
+                        .bar
+                        .set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
+                    Self::ensure_total_not_below_position(state, &self.bar_style);
+                    Self::maybe_apply_pending_total(state, &self.bar_style, false);
                 }
             }
             "set_total" => {
-                if let Some(bar) = self.bars.get(&progress.name) {
+                if let Some(state) = self.bars.get_mut(&progress.name) {
                     if let Some(total) = payload.total {
-                        bar.disable_steady_tick();
-                        bar.set_length(total);
-                        bar.set_style(self.bar_style.clone());
+                        let target = total.max(state.bar.position());
+                        state.pending_total = Some(
+                            state
+                                .pending_total
+                                .map_or(target, |pending| pending.max(target)),
+                        );
+                        let force_apply = state.bar.length().is_none();
+                        Self::maybe_apply_pending_total(state, &self.bar_style, force_apply);
                     }
                 }
             }
             "stop" => {
-                if let Some(bar) = self.bars.remove(&progress.name) {
-                    bar.finish_and_clear();
+                if let Some(mut state) = self.bars.remove(&progress.name) {
+                    Self::maybe_apply_pending_total(&mut state, &self.bar_style, true);
+                    state.bar.finish_and_clear();
                 }
             }
             _ => {}
+        }
+    }
+
+    fn min_total_update_step(current_total: u64) -> u64 {
+        EVAL_TOTAL_SMOOTH_MIN_STEP.max(current_total / EVAL_TOTAL_SMOOTH_DELTA_DIVISOR)
+    }
+
+    fn should_apply_total_update(state: &EvalBarState, target_total: u64) -> bool {
+        let current_total = state.bar.length().unwrap_or(0);
+        if current_total == 0 {
+            return true;
+        }
+        let delta = target_total.saturating_sub(current_total);
+        if delta >= Self::min_total_update_step(current_total) {
+            return true;
+        }
+        state
+            .last_total_update
+            .map(|instant| instant.elapsed() >= EVAL_TOTAL_SMOOTH_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    fn apply_total_update(state: &mut EvalBarState, style: &ProgressStyle, total: u64) {
+        let clamped = total.max(state.bar.position());
+        state.bar.disable_steady_tick();
+        state.bar.set_length(clamped);
+        state.bar.set_style(style.clone());
+        state.last_total_update = Some(std::time::Instant::now());
+    }
+
+    fn maybe_apply_pending_total(state: &mut EvalBarState, style: &ProgressStyle, force: bool) {
+        let mut target_total = match state.pending_total {
+            Some(total) => total,
+            None => return,
+        };
+
+        target_total = target_total.max(state.bar.position());
+        if state.bar.length().is_none() && target_total < EVAL_MIN_DETERMINATE_TOTAL {
+            return;
+        }
+        let current_total = state.bar.length().unwrap_or(0);
+        if target_total <= current_total {
+            state.pending_total = None;
+            return;
+        }
+
+        if force || Self::should_apply_total_update(state, target_total) {
+            Self::apply_total_update(state, style, target_total);
+            state.pending_total = None;
+        }
+    }
+
+    fn ensure_total_not_below_position(state: &mut EvalBarState, style: &ProgressStyle) {
+        if let Some(total) = state.bar.length() {
+            let position = state.bar.position();
+            if position > total {
+                Self::apply_total_update(state, style, position);
+                if let Some(pending_total) = state.pending_total {
+                    state.pending_total = Some(pending_total.max(position));
+                }
+            }
         }
     }
 
@@ -3600,6 +3697,24 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn eval_progress_event(name: &str, kind: &str, total: Option<u64>) -> SseProgressEventData {
+        SseProgressEventData {
+            id: format!("id-{kind}"),
+            object_type: "task".to_string(),
+            origin: None,
+            format: "global".to_string(),
+            output_type: "any".to_string(),
+            name: name.to_string(),
+            event: "progress".to_string(),
+            data: serde_json::json!({
+                "type": "eval_progress",
+                "kind": kind,
+                "total": total,
+            })
+            .to_string(),
+        }
     }
 
     #[test]
@@ -4235,6 +4350,78 @@ mod tests {
         let encoded = encode_eval_event_for_http(&event).expect("progress should be forwarded");
         assert!(encoded.contains("event: progress"));
         assert!(encoded.contains("json_delta"));
+    }
+
+    #[test]
+    fn eval_ui_preserves_spinner_increments_before_set_total() {
+        let mut ui = EvalUi::new(false, false, false);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(10)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(bar.bar.position(), 2);
+        assert_eq!(bar.bar.length(), Some(10));
+
+        ui.finish();
+    }
+
+    #[test]
+    fn eval_ui_never_sets_total_below_position() {
+        let mut ui = EvalUi::new(false, false, false);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", Some(1)));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(1)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert!(
+            bar.bar
+                .length()
+                .expect("determinate bar should have a total")
+                >= bar.bar.position()
+        );
+
+        ui.finish();
+    }
+
+    #[test]
+    fn eval_ui_keeps_spinner_until_total_exceeds_one() {
+        let mut ui = EvalUi::new(false, false, false);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(1)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(bar.bar.length(), None, "total=1 should remain spinner mode");
+
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(2)));
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(
+            bar.bar.length(),
+            Some(2),
+            "total>1 should become determinate"
+        );
+
+        ui.finish();
     }
 
     #[test]
