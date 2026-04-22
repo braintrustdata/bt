@@ -48,23 +48,6 @@ lto = "thin"
 [workspace]
 members = ["."]
 
-[package.metadata.dist]
-installers = ["shell", "powershell"]
-targets = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-musl",
-  "x86_64-pc-windows-msvc",
-]
-unix-archive = ".tar.gz"
-windows-archive = ".zip"
-install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
-install-updater = true
-install-success-msg = ""
-
 [dev-dependencies]
 tempfile = "3"
 
