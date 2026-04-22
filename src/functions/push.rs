@@ -3456,6 +3456,25 @@ mod tests {
     }
 
     #[test]
+    fn ensure_python_package_staged_can_vendor_stdlib_package() {
+        let Some(python) = crate::python_runner::resolve_python_interpreter(None, &[]) else {
+            eprintln!(
+                "Skipping ensure_python_package_staged_can_vendor_stdlib_package (python not installed)."
+            );
+            return;
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = dir.path();
+        ensure_python_package_staged(pkg_dir, &python, "json")
+            .expect("should vendor stdlib package from interpreter");
+        assert!(
+            python_package_staged(pkg_dir, "json"),
+            "json package should be staged after vendor fallback"
+        );
+    }
+
+    #[test]
     fn js_bundler_defaults_do_not_externalize_braintrust_sdk() {
         assert!(
             !FUNCTIONS_JS_BUNDLER_SOURCE.contains("\"braintrust\"")
