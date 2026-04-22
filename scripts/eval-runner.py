@@ -176,6 +176,28 @@ def parse_params_json(raw: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+def get_declared_parameter_keys(parameters: Any) -> set[str] | None:
+    if parameters is None:
+        return None
+    schema = getattr(parameters, "schema", None)
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return set(properties.keys())
+    if isinstance(parameters, dict):
+        return set(parameters.keys())
+    return None
+
+
+def filter_params_for_evaluator(
+    params: dict[str, Any], evaluator_parameters: Any
+) -> dict[str, Any]:
+    declared = get_declared_parameter_keys(evaluator_parameters)
+    if declared is None:
+        return params
+    return {k: v for k, v in params.items() if k in declared}
+
+
 def read_runner_config() -> RunnerConfig:
     num_workers_value = os.getenv("BT_EVAL_NUM_WORKERS")
     num_workers = int(num_workers_value) if num_workers_value else None
@@ -1032,7 +1054,10 @@ async def run_once(
         progress_cb = create_progress_reporter(sse, evaluator_instance.evaluator.eval_name)
         if config.params is not None and evaluator_instance.evaluator.parameters is not None:
             evaluator = evaluator_instance.evaluator
-            evaluator.parameters = validate_parameters(config.params, evaluator.parameters)
+            # Drop any --param keys the evaluator doesn't declare so a single
+            # command running multiple evaluators doesn't fail on unrelated params.
+            filtered_params = filter_params_for_evaluator(config.params, evaluator.parameters)
+            evaluator.parameters = validate_parameters(filtered_params, evaluator.parameters)
         try:
             result = await run_evaluator_task(
                 evaluator_instance.evaluator,

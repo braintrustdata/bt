@@ -305,6 +305,47 @@ function parseParamsJson(
   return parsed as Record<string, unknown>;
 }
 
+function getDeclaredParameterKeys(parameters: unknown): Set<string> | null {
+  if (!isObject(parameters)) {
+    return null;
+  }
+  if (Reflect.get(parameters, "__braintrust_parameters_marker") === true) {
+    const schema = Reflect.get(parameters, "schema");
+    if (isObject(schema)) {
+      const properties = Reflect.get(schema, "properties");
+      if (isObject(properties)) {
+        return new Set(Object.keys(properties));
+      }
+    }
+    return null;
+  }
+  if (isObject(Reflect.get(parameters, "schema"))) {
+    const schema = Reflect.get(parameters, "schema") as Record<string, unknown>;
+    const properties = Reflect.get(schema, "properties");
+    if (isObject(properties)) {
+      return new Set(Object.keys(properties));
+    }
+  }
+  return new Set(Object.keys(parameters));
+}
+
+function filterParamsForEvaluator(
+  params: Record<string, unknown>,
+  evaluatorParameters: unknown,
+): Record<string, unknown> {
+  const declared = getDeclaredParameterKeys(evaluatorParameters);
+  if (declared === null) {
+    return params;
+  }
+  const filtered: Record<string, unknown> = {};
+  for (const key of Object.keys(params)) {
+    if (declared.has(key)) {
+      filtered[key] = params[key];
+    }
+  }
+  return filtered;
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
@@ -2180,9 +2221,15 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     // Only inject CLI params when the evaluator declares a parameters schema.
-    const effectiveOptions =
+    // Drop any --param keys the evaluator doesn't declare so a single command
+    // running multiple evaluators doesn't fail on unrelated params.
+    const filteredParams =
       config.params != null && evaluator.parameters != null
-        ? mergeEvalOptions({ parameters: config.params }, options)
+        ? filterParamsForEvaluator(config.params, evaluator.parameters)
+        : null;
+    const effectiveOptions =
+      filteredParams != null
+        ? mergeEvalOptions({ parameters: filteredParams }, options)
         : options;
     const opts = makeEvalOptions(evaluatorName, effectiveOptions);
     const sampledData = await applySamplingToData(evaluator.data, config, {
