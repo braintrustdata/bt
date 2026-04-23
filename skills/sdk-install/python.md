@@ -34,23 +34,17 @@ poetry add braintrust==<VERSION>
 uv add braintrust==<VERSION>
 ```
 
-## Initialize the SDK
+## Instrument the application
 
-```python
-import braintrust
+**You must read https://www.braintrust.dev/docs/instrument/trace-llm-calls before instrumenting anything.** That page is the source of truth for supported libraries, extras, and setup, and may have changed since this guide was written.
 
-braintrust.init_logger(project="my-project")
-```
+### Prefer automatic instrumentation
 
-`init_logger` is the main entry point for tracing. It reads `BRAINTRUST_API_KEY` from the environment automatically.
+**Automatic instrumentation (`auto_instrument()`) is the recommended path and should be used whenever possible.** It patches every supported library that is installed at startup with no call-site changes, so new code and third-party code are traced automatically. See the docs page above for the current list of covered libraries -- do not rely on a hard-coded list here, since coverage changes over time.
 
-## Install instrumentation
+Manual `wrap_openai` / `wrap_anthropic` / `wrap_litellm` / etc. call-site wrappers should only be used as a **last resort** -- e.g. when instrumenting a library that `auto_instrument()` doesn't yet cover, or when you need per-client isolation. Don't reach for manual wrappers before confirming auto-instrumentation can't do the job.
 
-The Python SDK supports two approaches: **auto-instrumentation** (recommended) and **manual wrapping**.
-
-### Auto-instrumentation (recommended)
-
-`auto_instrument()` automatically patches all supported libraries that are installed. Call it once at startup, before creating any clients. This is the simplest approach.
+### Quick start
 
 ```python
 import braintrust
@@ -59,121 +53,9 @@ braintrust.init_logger(project="my-project")
 braintrust.auto_instrument()
 ```
 
-After calling `auto_instrument()`, any supported client created afterwards is automatically traced -- no wrapping needed:
+`init_logger` is the main entry point for tracing and reads `BRAINTRUST_API_KEY` from the environment automatically. `auto_instrument()` must be called **before** creating any LLM clients.
 
-```python
-import openai
-
-client = openai.OpenAI()
-
-import anthropic
-
-client = anthropic.Anthropic()
-```
-
-Supported libraries: OpenAI, Anthropic, LiteLLM, Pydantic AI, Google GenAI, Agno, Claude Agent SDK (Anthropic), DSPy.
-
-You can selectively disable specific integrations:
-
-```python
-braintrust.auto_instrument(litellm=False, dspy=False)
-```
-
-### Manual wrapping
-
-If you prefer explicit control, wrap individual clients instead.
-
-#### OpenAI (`openai`)
-
-```python
-from braintrust import wrap_openai
-from openai import OpenAI
-
-client = wrap_openai(OpenAI())
-```
-
-#### Anthropic (`anthropic`)
-
-```python
-import anthropic
-from braintrust import wrap_anthropic
-
-client = wrap_anthropic(anthropic.Anthropic())
-```
-
-#### LiteLLM (`litellm`)
-
-```python
-import litellm
-from braintrust import wrap_litellm
-
-litellm = wrap_litellm(litellm)
-```
-
-### OpenAI Agents SDK (`openai-agents`)
-
-Install with the extra and register the trace processor:
-
-```bash
-pip install "braintrust[openai-agents]"
-```
-
-```python
-from agents import Agent, Runner, set_trace_processors
-from braintrust import init_logger
-from braintrust.wrappers.openai import BraintrustTracingProcessor
-
-set_trace_processors([BraintrustTracingProcessor(init_logger("my-project"))])
-
-agent = Agent(name="Assistant", instructions="You are a helpful assistant.")
-result = await Runner.run(agent, "Hello!")
-```
-
-### LangChain (`langchain`)
-
-Install the callback handler package:
-
-```bash
-pip install braintrust-langchain
-```
-
-```python
-from braintrust import init_logger
-from braintrust_langchain import BraintrustCallbackHandler, set_global_handler
-from langchain_openai import ChatOpenAI
-
-init_logger(project="my-project")
-
-handler = BraintrustCallbackHandler()
-set_global_handler(handler)
-
-model = ChatOpenAI()
-response = await model.ainvoke("What is the capital of France?")
-```
-
-### LlamaIndex (`llama-index`)
-
-LlamaIndex traces via OpenTelemetry. Install with the otel extra:
-
-```bash
-pip install "braintrust[otel]" llama-index
-```
-
-Set environment variables:
-
-```bash
-export BRAINTRUST_API_KEY=your-api-key
-export BRAINTRUST_PARENT=project_name:my-project
-```
-
-```python
-import os
-
-import llama_index.core
-
-braintrust_api_url = os.environ.get("BRAINTRUST_API_URL", "https://api.braintrust.dev")
-llama_index.core.set_global_handler("arize_phoenix", endpoint=f"{braintrust_api_url}/otel/v1/traces")
-```
+To selectively enable or disable integrations, or to see which libraries require extras (e.g. `braintrust[openai-agents]`, `braintrust[otel]`) or a companion package (e.g. `braintrust-langchain`), follow the docs page -- it lists the current extras, packages, and per-integration setup.
 
 ## Run the application
 

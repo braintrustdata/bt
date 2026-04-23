@@ -12,7 +12,17 @@ Reference guide for installing the Braintrust Go SDK.
 go get github.com/braintrustdata/braintrust-sdk-go
 ```
 
-## Initialize the SDK
+## Instrument the application
+
+**You must read https://www.braintrust.dev/docs/instrument/trace-llm-calls before instrumenting anything.** That page is the source of truth for supported providers and setup, and may have changed since this guide was written.
+
+### Prefer automatic instrumentation (Orchestrion)
+
+**Automatic instrumentation via [Orchestrion](https://github.com/DataDog/orchestrion) is the recommended path and should be used whenever possible.** It injects tracing at compile time with no wrapper code in the application, so LLM client calls are traced automatically across your codebase and third-party code.
+
+Manual span/wrapper code should only be used as a **last resort** -- e.g. for bespoke business-logic spans, or when a provider isn't yet supported by the Orchestrion contrib packages. Don't reach for manual tracing before confirming Orchestrion can do the job.
+
+### Quick start
 
 Every Go project needs OpenTelemetry setup and a Braintrust client.
 
@@ -44,9 +54,9 @@ func main() {
 
 `braintrust.New` reads `BRAINTRUST_API_KEY` from the environment automatically.
 
-## Install instrumentation
+### Requirement: build with Orchestrion
 
-The Go SDK uses [Orchestrion](https://github.com/DataDog/orchestrion) to automatically inject tracing at compile time -- no wrapper code needed in the application.
+Auto-instrumentation requires building the project with Orchestrion -- without this step, nothing will be traced.
 
 **1. Install orchestrion:**
 
@@ -103,16 +113,7 @@ After this, LLM client calls are automatically traced with no code changes.
 
 ### Supported providers
 
-Orchestrion supports these providers (import the corresponding `trace/contrib/` package in `orchestrion.tool.go`):
-
-| Provider               | Import path                                                                                   |
-| ---------------------- | --------------------------------------------------------------------------------------------- |
-| OpenAI (`openai-go`)   | `github.com/braintrustdata/braintrust-sdk-go/trace/contrib/openai`                            |
-| Anthropic              | `github.com/braintrustdata/braintrust-sdk-go/trace/contrib/anthropic`                         |
-| Google GenAI / Gemini  | `github.com/braintrustdata/braintrust-sdk-go/trace/contrib/genai`                             |
-| LangChainGo            | `github.com/braintrustdata/braintrust-sdk-go/trace/contrib/langchaingo`                       |
-| sashabaranov/go-openai | `github.com/braintrustdata/braintrust-sdk-go/trace/contrib/github.com/sashabaranov/go-openai` |
-| All of the above       | `github.com/braintrustdata/braintrust-sdk-go/trace/contrib/all`                               |
+For the current list of supported providers and their `trace/contrib/` import paths, see https://www.braintrust.dev/docs/instrument/trace-llm-calls.
 
 ## Run the application
 
