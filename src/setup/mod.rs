@@ -466,7 +466,10 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp).await,
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
         None => {
-            let wizard_flags = WizardFlags {
+            if should_print_setup_wizard_intro(&base) {
+                print_setup_wizard_intro();
+            }
+            let flow_flags = SetupFlowFlags {
                 yolo: args.agents.permissions.yolo,
                 skills: args.skills,
                 no_skills: args.no_skills,
@@ -482,19 +485,32 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
                 workflows: args.agents.workflows.clone(),
                 no_workflow: args.agents.no_workflow,
                 languages: args.languages.clone(),
+                refresh_docs: args.agents.refresh_docs,
+                workers: args.agents.workers,
             };
-            if args.interactive {
-                run_setup_wizard(base, wizard_flags).await
-            } else {
-                run_default_setup(base, args).await
-            }
+            run_setup_flow(
+                base,
+                flow_flags,
+                if args.interactive {
+                    SetupFlowMode::Wizard
+                } else {
+                    SetupFlowMode::Defaults
+                },
+            )
+            .await
         }
     }
 }
 
 pub use docs::run_docs_top;
 
-struct WizardFlags {
+#[derive(Clone, Copy)]
+enum SetupFlowMode {
+    Wizard,
+    Defaults,
+}
+
+struct SetupFlowFlags {
     yolo: bool,
     skills: bool,
     no_skills: bool,
@@ -510,10 +526,16 @@ struct WizardFlags {
     workflows: Vec<WorkflowArg>,
     no_workflow: bool,
     languages: Vec<LanguageArg>,
+    refresh_docs: bool,
+    workers: usize,
 }
 
-async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> {
-    let WizardFlags {
+async fn run_setup_flow(
+    mut base: BaseArgs,
+    flags: SetupFlowFlags,
+    mode: SetupFlowMode,
+) -> Result<()> {
+    let SetupFlowFlags {
         yolo,
         skills: flag_skills,
         no_skills: flag_no_skills,
@@ -529,19 +551,27 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         workflows: flag_workflows,
         no_workflow: flag_no_workflow,
         languages: flag_languages,
+        refresh_docs: flag_refresh_docs,
+        workers: flag_workers,
     } = flags;
-    print_setup_banner(&base);
-    eprintln!("Welcome to the Braintrust SDK setup wizard");
-    eprintln!(
-        "This wizard will automatically instrument your application with Braintrust SDK tracing with a coding agent of your choice.\n"
-    );
+    let json_output = base.json;
+    if !json_output {
+        print_setup_banner(&base);
+    }
 
     let mut had_failures = false;
     let verbose = base.verbose;
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let git_root = find_git_root();
+    let can_prompt = setup_can_prompt(&base);
+    let mut json_scope: Option<InstallScope> = None;
+    let mut json_selected_agents = Vec::new();
+    let mut json_detected_agents = Vec::new();
+    let mut json_results = Vec::new();
+    let mut json_warnings = Vec::new();
+    let mut json_notes = Vec::new();
     let will_instrument = !flag_no_instrument;
-    if git_root.is_none() && !base.json {
+    if git_root.is_none() && !json_output {
         eprintln!(
             "{} Not inside a git repository — the agent may edit files in the current directory.",
             style("!").yellow()
@@ -574,7 +604,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(2, "Project");
     }
-    if project_flag.is_none() && ui::can_prompt() {
+    if project_flag.is_none() && can_prompt {
         eprintln!("First, select a project, or create a new one.");
         eprintln!("Projects organize AI features in your application. Each project contains logs, experiments, datasets, prompts, and other functions.");
     }
@@ -602,6 +632,20 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             maybe_init(org, project)?;
         }
     }
+
+    let instrument = if flag_no_instrument {
+        false
+    } else if flag_instrument {
+        true
+    } else if can_prompt {
+        let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+        Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Use coding agent to instrument the code?")
+            .default(true)
+            .interact_on(&term)?
+    } else {
+        true
+    };
 
     // ── Step 3: Agent tools (skills + MCP) ──
     if verbose {
@@ -639,7 +683,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             );
         }
         (flag_skills, flag_mcp)
-    } else {
+    } else if matches!(mode, SetupFlowMode::Wizard) {
         if verbose {
             eprintln!(
                 "   {}",
@@ -656,9 +700,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             .defaults(&defaults)
             .interact_on(&term)?;
         (selected.contains(&0), selected.contains(&1))
+    } else {
+        (true, false)
     };
 
-    let setup_context = if wants_skills || wants_mcp || !flag_no_instrument {
+    let setup_context = if wants_skills || wants_mcp || instrument {
         let scope = if flag_local {
             if verbose {
                 eprintln!(
@@ -677,14 +723,25 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 );
             }
             InstallScope::Global
+        } else if matches!(mode, SetupFlowMode::Defaults) {
+            default_setup_scope(flag_local, flag_global)
         } else {
             prompt_scope_selection("Select install scope")?
                 .ok_or_else(|| anyhow!("setup cancelled"))?
         };
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
-        let selected_agent =
-            resolve_default_agent_selection(flag_agent, &detected, "Select coding agent", true)?;
+        let selected_agent = resolve_default_agent_selection(
+            flag_agent,
+            &detected,
+            "Select coding agent",
+            can_prompt,
+        )?;
+        if json_output {
+            json_scope = Some(scope);
+            json_selected_agents = vec![selected_agent];
+            json_detected_agents = detected.clone();
+        }
         if verbose && flag_agent.is_some() {
             eprintln!(
                 "{} Select agent to configure · {}",
@@ -706,14 +763,35 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 agent: Some(map_agent_to_agent_arg(*selected_agent)),
                 local: matches!(*scope, InstallScope::Local),
                 global: matches!(*scope, InstallScope::Global),
-                workflows: Vec::new(),
-                no_workflow: true,
+                workflows: if matches!(mode, SetupFlowMode::Wizard) {
+                    Vec::new()
+                } else {
+                    flag_workflows.clone()
+                },
+                no_workflow: if matches!(mode, SetupFlowMode::Wizard) {
+                    true
+                } else {
+                    flag_no_workflow
+                },
                 yes: true,
-                refresh_docs: false,
-                workers: crate::sync::default_workers(),
+                refresh_docs: if matches!(mode, SetupFlowMode::Wizard) {
+                    false
+                } else {
+                    flag_refresh_docs
+                },
+                workers: flag_workers,
                 permissions: InstrumentPermissionArgs { yolo: false },
             };
-            let outcome = execute_skills_setup(&base, &args, true).await?;
+            let outcome =
+                execute_skills_setup(&base, &args, matches!(mode, SetupFlowMode::Wizard)).await?;
+            if json_output {
+                json_scope = Some(outcome.scope);
+                json_selected_agents = outcome.selected_agents.clone();
+                json_detected_agents = outcome.detected_agents.clone();
+                json_results.extend(outcome.results.clone());
+                json_warnings.extend(outcome.warnings.clone());
+                json_notes.extend(outcome.notes.clone());
+            }
             for r in &outcome.results {
                 if verbose {
                     print_wizard_agent_result(r);
@@ -745,6 +823,17 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 &auth.api_key,
                 &mcp_url_from_api_url(&api_url),
             );
+            if json_output {
+                json_scope.get_or_insert(*scope);
+                if json_selected_agents.is_empty() {
+                    json_selected_agents = vec![*selected_agent];
+                }
+                if json_detected_agents.is_empty() {
+                    json_detected_agents = detect_agents(local_root.as_deref(), home);
+                }
+                json_results.extend(outcome.results.clone());
+                json_warnings.extend(outcome.warnings.clone());
+            }
             for r in &outcome.results {
                 if verbose {
                     print_wizard_agent_result(r);
@@ -768,29 +857,16 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         print_wizard_step(4, "Instrument");
     }
     {
-        let instrument = if flag_no_instrument {
-            if verbose {
-                eprintln!(
-                    "Run instrumentation agent to set up tracing in this repo? {}",
-                    style("no").dim()
-                );
-            }
-            false
-        } else if flag_instrument {
-            if verbose {
-                eprintln!(
-                    "Run instrumentation agent to set up tracing in this repo? {}",
-                    style("yes").green()
-                );
-            }
-            true
-        } else {
-            let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
-            Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt("Run instrumentation agent to set up tracing in this repo?")
-                .default(true)
-                .interact_on(&term)?
-        };
+        if verbose {
+            eprintln!(
+                "Use coding agent to instrument the code? {}",
+                if instrument {
+                    style("yes").green().to_string()
+                } else {
+                    style("no").dim().to_string()
+                }
+            );
+        }
         if instrument {
             let instrument_agent = setup_context
                 .as_ref()
@@ -803,14 +879,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 Vec::new()
             } else if !flag_workflows.is_empty() {
                 resolve_prompted_instrument_workflows(flag_workflows.clone())
-            } else if ui::can_prompt() {
+            } else if matches!(mode, SetupFlowMode::Wizard) && can_prompt {
                 prompt_instrument_workflow_selection()?.ok_or_else(|| anyhow!("setup cancelled"))?
             } else {
                 vec![WorkflowArg::Instrument, WorkflowArg::Observe]
             };
             let selected_languages = if !flag_languages.is_empty() {
                 flag_languages.clone()
-            } else if ui::can_prompt() {
+            } else if matches!(mode, SetupFlowMode::Wizard) && can_prompt {
                 let defaults = detect_languages_from_dir(&std::env::current_dir()?);
                 prompt_instrument_language_selection(&defaults)?
                     .ok_or_else(|| anyhow!("setup cancelled"))?
@@ -821,7 +897,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                 (true, yolo)
             } else if flag_background {
                 (false, yolo)
-            } else if ui::can_prompt() {
+            } else if matches!(mode, SetupFlowMode::Wizard) && can_prompt {
                 let term =
                     ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
                 let run_tui = Select::with_theme(&ColorfulTheme::default())
@@ -847,8 +923,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                         workflows: selected_workflows.clone(),
                         no_workflow: flag_no_workflow,
                         yes: false,
-                        refresh_docs: false,
-                        workers: crate::sync::default_workers(),
+                        refresh_docs: flag_refresh_docs,
+                        workers: flag_workers,
                         languages: selected_languages.clone(),
                         tui: false,
                         background: false,
@@ -867,8 +943,8 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     workflows: selected_workflows,
                     no_workflow: flag_no_workflow,
                     yes: false,
-                    refresh_docs: false,
-                    workers: crate::sync::default_workers(),
+                    refresh_docs: flag_refresh_docs,
+                    workers: flag_workers,
                     languages: selected_languages,
                     tui: run_tui,
                     background: !run_tui,
@@ -887,105 +963,38 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_done(had_failures);
     }
+    if json_output {
+        let report = SetupJsonReport {
+            scope: json_scope
+                .unwrap_or(InstallScope::Global)
+                .as_str()
+                .to_string(),
+            selected_agents: json_selected_agents,
+            detected_agents: json_detected_agents,
+            results: json_results,
+            warnings: json_warnings,
+            notes: json_notes,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("failed to serialize setup report")?
+        );
+    }
     if had_failures {
         bail!("setup completed with failures");
     }
     Ok(())
 }
 
-async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
-    if !base.json {
-        print_setup_banner(&base);
-    }
+fn print_setup_wizard_intro() {
+    eprintln!("Welcome to the Braintrust SDK setup wizard");
+    eprintln!(
+        "This wizard will automatically instrument your application with Braintrust SDK tracing with a coding agent of your choice.\n"
+    );
+}
 
-    let will_instrument = !args.no_instrument;
-    if will_instrument && find_git_root().is_none() && !base.json {
-        eprintln!(
-            "{} Not inside a git repository — the agent may edit files in the current directory.",
-            style("!").yellow()
-        );
-    }
-    let wants_skills = args.skills || !args.no_skills;
-    let wants_mcp = args.mcp && !args.no_mcp;
-    if will_instrument {
-        let project_flag = base.project.clone();
-        let auth = ensure_setup_auth(&mut base, false, true).await?;
-        let org = auth.client.org_name().to_string();
-        let project = select_project_with_skip(&auth.client, project_flag.as_deref(), true).await?;
-        if let Some(ref project) = project {
-            maybe_init(&org, project)?;
-        }
-    }
-
-    if !wants_skills && !wants_mcp && !will_instrument {
-        return Ok(());
-    }
-
-    let scope = default_setup_scope(&args.agents);
-    let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let local_root = resolve_local_root_for_scope(scope)?;
-    let detected = detect_agents(local_root.as_deref(), &home);
-    let selected_agent = resolve_default_agent_selection(
-        args.agents.agent,
-        &detected,
-        "Select coding agent",
-        ui::can_prompt(),
-    )?;
-
-    if wants_skills {
-        run_setup(
-            base.clone(),
-            AgentsSetupArgs {
-                agent: Some(map_agent_to_agent_arg(selected_agent)),
-                local: matches!(scope, InstallScope::Local),
-                global: matches!(scope, InstallScope::Global),
-                workflows: args.agents.workflows.clone(),
-                no_workflow: args.agents.no_workflow,
-                yes: true,
-                refresh_docs: args.agents.refresh_docs,
-                workers: args.agents.workers,
-                permissions: args.agents.permissions.clone(),
-            },
-        )
-        .await?;
-    }
-
-    if wants_mcp {
-        run_mcp_setup(
-            base.clone(),
-            AgentsMcpSetupArgs {
-                agent: Some(map_agent_to_agent_arg(selected_agent)),
-                local: matches!(scope, InstallScope::Local),
-                global: matches!(scope, InstallScope::Global),
-                yes: true,
-            },
-        )
-        .await?;
-    }
-
-    if will_instrument {
-        run_instrument_setup(
-            base,
-            InstrumentSetupArgs {
-                agent: Some(map_agent_to_instrument_agent_arg(selected_agent)),
-                agent_cmd: None,
-                workflows: args.agents.workflows,
-                no_workflow: args.agents.no_workflow,
-                yes: false,
-                refresh_docs: args.agents.refresh_docs,
-                workers: args.agents.workers,
-                languages: args.languages,
-                tui: args.tui,
-                background: args.background,
-                permissions: args.agents.permissions,
-                prompt_for_missing_options: false,
-            },
-            false,
-        )
-        .await?;
-    }
-
-    Ok(())
+fn should_print_setup_wizard_intro(base: &BaseArgs) -> bool {
+    !(base.json || base.quiet && base.quiet_source.is_some())
 }
 
 fn in_ci() -> bool {
@@ -1714,8 +1723,8 @@ fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> 
     Ok(())
 }
 
-fn default_setup_scope(args: &AgentsSetupArgs) -> InstallScope {
-    if args.local {
+fn default_setup_scope(local: bool, _global: bool) -> InstallScope {
+    if local {
         InstallScope::Local
     } else {
         InstallScope::Global
@@ -4718,6 +4727,21 @@ mod tests {
     }
 
     #[test]
+    fn setup_intro_prints_for_default_setup_quiet_mode() {
+        let mut base = make_base_args();
+        base.quiet = true;
+        assert!(should_print_setup_wizard_intro(&base));
+    }
+
+    #[test]
+    fn setup_intro_hides_for_explicit_quiet_mode() {
+        let mut base = make_base_args();
+        base.quiet = true;
+        base.quiet_source = Some(ArgValueSource::CommandLine);
+        assert!(!should_print_setup_wizard_intro(&base));
+    }
+
+    #[test]
     fn single_path_agent_is_selected_by_default() {
         let detected = vec![DetectionSignal {
             agent: Agent::Codex,
@@ -5594,6 +5618,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)] // Serializes process env mutation for this test across the awaited subprocess run.
     #[tokio::test]
     async fn run_agent_invocation_sets_extra_env_for_program_launches() {
         let _guard = env_test_lock().lock().expect("lock env test");
@@ -5647,6 +5672,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)] // Serializes process env mutation for this test across the awaited subprocess run.
     #[tokio::test]
     async fn run_agent_invocation_inherits_process_api_key_env() {
         let _guard = env_test_lock().lock().expect("lock env test");

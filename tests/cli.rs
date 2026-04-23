@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
@@ -208,6 +209,32 @@ fn setup_verbose_prints_agent_summary() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Selected agents: codex"));
+}
+
+#[test]
+fn setup_json_emits_structured_report() {
+    let repo = make_git_repo();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    write_executable(&bin_dir.path().join("codex"));
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    let assert = cmd
+        .current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("PATH", bin_dir.path())
+        .args(["setup", "--json", "--global", "--no-workflow", "--no-input"])
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse setup JSON");
+    assert_eq!(report["scope"], "global");
+    assert_eq!(report["selected_agents"], serde_json::json!(["codex"]));
+    assert!(report["results"].is_array());
 }
 
 #[test]
