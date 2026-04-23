@@ -4098,7 +4098,7 @@ fn install_mcp_for_claude(
         InstallScope::Global => ("user", None, "claude:user".to_string()),
     };
 
-    let status = std::process::Command::new("claude")
+    let output = std::process::Command::new("claude")
         .args([
             "mcp",
             "add",
@@ -4112,12 +4112,30 @@ fn install_mcp_for_claude(
             &format!("Authorization: Bearer {api_key}"),
         ])
         .current_dir(cwd.unwrap_or_else(|| home.to_path_buf()))
-        .stdout(Stdio::null())
-        .status()
+        .output()
         .with_context(|| format!("failed to run `claude mcp add -s {scope_name}`"))?;
 
-    if !status.success() {
-        bail!("`claude mcp add -s {scope_name}` exited with status {status}");
+    if !output.status.success() {
+        let combined_output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if combined_output
+            .to_ascii_lowercase()
+            .contains("already exists")
+        {
+            return Ok(AgentInstallResult {
+                agent: Agent::Claude,
+                status: InstallStatus::Skipped,
+                message: "already configured".to_string(),
+                paths: vec![path_label],
+            });
+        }
+        bail!(
+            "`claude mcp add -s {scope_name}` exited with status {}",
+            output.status
+        );
     }
 
     Ok(AgentInstallResult {
