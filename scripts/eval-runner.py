@@ -766,20 +766,142 @@ def infer_data_total(data: Any) -> int | None:
     return None
 
 
+def normalize_trial_count(value: Any) -> int:
+    try:
+        trial_count = int(value)
+    except Exception:
+        trial_count = 1
+    if trial_count < 1:
+        trial_count = 1
+    return trial_count
+
+
 def infer_evaluator_total(evaluator: Any) -> int | None:
     data_total = infer_data_total(getattr(evaluator, "data", None))
     if data_total is None:
         return None
 
-    trial_count = getattr(evaluator, "trial_count", 1)
-    try:
-        trial_count = int(trial_count)
-    except Exception:
-        trial_count = 1
-    if trial_count < 1:
-        trial_count = 1
+    trial_count = normalize_trial_count(getattr(evaluator, "trial_count", 1))
 
     return data_total * trial_count
+
+
+def wrap_data_with_adaptive_total(
+    data: Any,
+    progress_cb: Callable[[str, int | None], None] | None,
+    trial_count: int,
+    state: dict[str, int] | None = None,
+) -> Any:
+    if progress_cb is None:
+        return data
+    if state is None:
+        state = {"rows_seen": 0, "last_emitted_total": 0}
+
+    def report_rows_seen() -> None:
+        rows_seen = state["rows_seen"]
+        if rows_seen <= 0:
+            return
+        total = rows_seen * trial_count
+        if total <= state["last_emitted_total"]:
+            return
+        state["last_emitted_total"] = total
+        progress_cb("set_total", total)
+
+    def maybe_report_empty_total(exhausted: bool) -> None:
+        # Unknown-total evaluators that exhaust without yielding should still
+        # emit an explicit total of 0. The renderer decides whether that
+        # threshold is shown as spinner or determinate progress.
+        if not exhausted:
+            return
+        if state["rows_seen"] != 0:
+            return
+        if state["last_emitted_total"] != 0:
+            return
+        progress_cb("set_total", 0)
+
+    if inspect.isclass(data):
+        return data
+
+    if inspect.isroutine(data):
+        def wrapped_data(*args, **kwargs):
+            resolved = data(*args, **kwargs)
+            return wrap_data_with_adaptive_total(
+                resolved,
+                progress_cb,
+                trial_count,
+                state,
+            )
+
+        if hasattr(data, "__name__"):
+            setattr(wrapped_data, "__name__", getattr(data, "__name__"))
+        if hasattr(data, "__qualname__"):
+            setattr(wrapped_data, "__qualname__", getattr(data, "__qualname__"))
+        return wrapped_data
+
+    if inspect.isawaitable(data):
+        async def wrapped_awaitable():
+            resolved = await data
+            return wrap_data_with_adaptive_total(
+                resolved,
+                progress_cb,
+                trial_count,
+                state,
+            )
+
+        return wrapped_awaitable()
+
+    if inspect.isasyncgen(data) or hasattr(data, "__aiter__"):
+        async def wrapped_async_iter():
+            exhausted = False
+            try:
+                async for item in data:
+                    state["rows_seen"] += 1
+                    report_rows_seen()
+                    yield item
+                exhausted = True
+            finally:
+                maybe_report_empty_total(exhausted)
+
+        return wrapped_async_iter()
+
+    if inspect.isgenerator(data):
+        async def wrapped_iter():
+            exhausted = False
+            try:
+                for item in data:
+                    state["rows_seen"] += 1
+                    report_rows_seen()
+                    yield item
+                    # Let scheduled eval tasks make progress while we keep ingesting rows.
+                    await asyncio.sleep(0)
+                exhausted = True
+            finally:
+                maybe_report_empty_total(exhausted)
+
+        return wrapped_iter()
+
+    if isinstance(data, (str, bytes, dict)):
+        return data
+
+    try:
+        iterator = iter(data)
+    except Exception:
+        return data
+
+    async def wrapped_iterable():
+        exhausted = False
+        try:
+            for item in iterator:
+                state["rows_seen"] += 1
+                report_rows_seen()
+                yield item
+                # Avoid starving task execution while iterating synchronous data sources.
+                await asyncio.sleep(0)
+            exhausted = True
+        finally:
+            maybe_report_empty_total(exhausted)
+
+    return wrapped_iterable()
 
 
 def wrap_task(
@@ -862,7 +984,15 @@ async def run_evaluator_task(
     supports_stream = run_evaluator_supports_stream()
 
     if fallback_progress:
-        progress_cb("start", infer_evaluator_total(evaluator))
+        inferred_total = infer_evaluator_total(evaluator)
+        progress_cb("start", inferred_total)
+        if inferred_total is None:
+            trial_count = normalize_trial_count(getattr(evaluator, "trial_count", 1))
+            evaluator.data = wrap_data_with_adaptive_total(
+                evaluator.data,
+                progress_cb,
+                trial_count,
+            )
 
     evaluator.task = wrap_task(
         original_task,
