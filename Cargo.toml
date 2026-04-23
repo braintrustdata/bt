@@ -8,6 +8,12 @@ description = "The Braintrust command line interface"
 license = "Apache-2.0"
 repository = "https://github.com/braintrustdata/bt"
 
+[package.metadata.wix]
+upgrade-guid = "5B558F98-EEBD-4F5E-A0C8-E7A039445139"
+path-guid = "7CD3044D-A62A-469C-8552-0E5C3A00FFF1"
+license = false
+eula = false
+
 [dependencies]
 actix-web = "4.11.0"
 anyhow = "1.0.89"
@@ -48,30 +54,6 @@ lto = "thin"
 
 [workspace]
 members = ["."]
-
-[workspace.metadata.dist]
-cargo-dist-version = "0.30.3"
-ci = "github"
-create-release = true
-pr-run-mode = "plan"
-allow-dirty = ["ci"]
-
-[package.metadata.dist]
-installers = ["shell", "powershell"]
-targets = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-musl",
-  "x86_64-pc-windows-msvc",
-]
-unix-archive = ".tar.gz"
-windows-archive = ".zip"
-install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
-install-updater = true
-install-success-msg = ""
 
 [dev-dependencies]
 tempfile = "3"
