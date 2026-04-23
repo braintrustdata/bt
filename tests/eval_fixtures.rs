@@ -435,6 +435,195 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
     );
 }
 
+#[test]
+fn eval_matrix_param_single_runs_all_combinations() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but unavailable for matrix-param test");
+        }
+        eprintln!(
+            "Skipping eval_matrix_param_single_runs_all_combinations (node not installed)."
+        );
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-matrix-param-single");
+    ensure_dependencies(&fixture_dir);
+
+    let bt_path = bt_binary_path(&root);
+    let out_file = fixture_dir.join(format!(
+        ".matrix-out-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ));
+    let _ = fs::remove_file(&out_file);
+
+    let output = Command::new(&bt_path)
+        .arg("eval")
+        .arg("matrix-single.eval.mjs")
+        .arg("--matrix-param")
+        .arg("model=a,b")
+        .arg("--matrix-param")
+        .arg("enableBashTool=true,false")
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_MATRIX_TEST_OUT", &out_file)
+        .env(
+            "BRAINTRUST_API_KEY",
+            std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+        )
+        .output()
+        .expect("run bt eval --matrix-param");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "bt eval --matrix-param should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let contents = fs::read_to_string(&out_file).unwrap_or_default();
+    let _ = fs::remove_file(&out_file);
+    let mut lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec!["a|false", "a|true", "b|false", "b|true"],
+        "expected all 4 matrix combinations to run.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn eval_matrix_param_rejects_multiple_evals() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but unavailable for matrix-param multi-eval test");
+        }
+        eprintln!(
+            "Skipping eval_matrix_param_rejects_multiple_evals (node not installed)."
+        );
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-matrix-param-multi-error");
+    ensure_dependencies(&fixture_dir);
+
+    let bt_path = bt_binary_path(&root);
+
+    let output = Command::new(&bt_path)
+        .arg("eval")
+        .arg("matrix-multi.eval.mjs")
+        .arg("--matrix-param")
+        .arg("model=a,b")
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env(
+            "BRAINTRUST_API_KEY",
+            std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+        )
+        .output()
+        .expect("run bt eval --matrix-param on multi-eval file");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "bt eval --matrix-param against multiple evals should fail.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not supported when running multiple evals"),
+        "expected guidance message in stderr, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("matrix-multi-alpha") && stderr.contains("matrix-multi-beta"),
+        "expected both eval names in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn eval_matrix_param_terminate_on_failure_stops_early() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!(
+                "node runtime is required but unavailable for matrix-param terminate test"
+            );
+        }
+        eprintln!(
+            "Skipping eval_matrix_param_terminate_on_failure_stops_early (node not installed)."
+        );
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-matrix-param-terminate");
+    ensure_dependencies(&fixture_dir);
+
+    let bt_path = bt_binary_path(&root);
+    let out_file = fixture_dir.join(format!(
+        ".matrix-out-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ));
+    let _ = fs::remove_file(&out_file);
+
+    let output = Command::new(&bt_path)
+        .arg("eval")
+        .arg("matrix-terminate.eval.mjs")
+        .arg("--matrix-param")
+        .arg("model=fail,ok,ok2")
+        .arg("--terminate-on-failure")
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_MATRIX_TEST_OUT", &out_file)
+        .env(
+            "BRAINTRUST_API_KEY",
+            std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+        )
+        .output()
+        .expect("run bt eval --matrix-param --terminate-on-failure");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "failing matrix run should exit non-zero.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let contents = fs::read_to_string(&out_file).unwrap_or_default();
+    let _ = fs::remove_file(&out_file);
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    assert_eq!(
+        lines,
+        vec!["fail"],
+        "with --terminate-on-failure, only the first (failing) combo should execute.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 fn read_fixture_config(path: &Path) -> FixtureConfig {
     let raw = fs::read_to_string(path).expect("read fixture.json");
     serde_json::from_str(&raw).expect("parse fixture.json")

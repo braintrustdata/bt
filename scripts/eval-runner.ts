@@ -8,6 +8,12 @@ type EvaluatorEntry = {
     projectName: string;
   } & Record<string, unknown>;
   reporter?: unknown;
+  paramsOverride?: Record<string, unknown>;
+};
+
+type MatrixAxis = {
+  key: string;
+  values: unknown[];
 };
 
 type EvalResult = {
@@ -122,6 +128,7 @@ type RunnerConfig = {
   devMode: "list" | "eval" | null;
   devRequestJson: string | null;
   params: Record<string, unknown> | null;
+  matrix: MatrixAxis[] | null;
 };
 
 type EvalRunner = {
@@ -134,6 +141,7 @@ type EvalRunner = {
     projectName: string,
     evaluator: Record<string, unknown>,
     options?: EvalOptions,
+    paramsOverride?: Record<string, unknown>,
   ) => Promise<EvalResult>;
   runRegisteredEvals: (evaluators: EvaluatorEntry[]) => Promise<boolean>;
   makeEvalOptions: (
@@ -346,6 +354,59 @@ function filterParamsForEvaluator(
   return filtered;
 }
 
+function parseMatrixJson(raw: string | undefined): MatrixAxis[] | null {
+  if (!raw) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`BT_EVAL_MATRIX_JSON is not valid JSON: ${raw}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("BT_EVAL_MATRIX_JSON must be a JSON array of {key, values}.");
+  }
+  const axes: MatrixAxis[] = [];
+  for (const entry of parsed) {
+    if (!isObject(entry)) {
+      throw new Error("BT_EVAL_MATRIX_JSON entries must be objects with key and values.");
+    }
+    const key = Reflect.get(entry, "key");
+    const values = Reflect.get(entry, "values");
+    if (typeof key !== "string" || key.length === 0) {
+      throw new Error("BT_EVAL_MATRIX_JSON entry missing string key.");
+    }
+    if (!Array.isArray(values) || values.length === 0) {
+      throw new Error(
+        `BT_EVAL_MATRIX_JSON axis "${key}" must have a non-empty values array.`,
+      );
+    }
+    axes.push({ key, values });
+  }
+  return axes.length > 0 ? axes : null;
+}
+
+function matrixCombinations(axes: MatrixAxis[]): Array<Array<[string, unknown]>> {
+  let combos: Array<Array<[string, unknown]>> = [[]];
+  for (const axis of axes) {
+    const next: Array<Array<[string, unknown]>> = [];
+    for (const existing of combos) {
+      for (const value of axis.values) {
+        next.push([...existing, [axis.key, value]]);
+      }
+    }
+    combos = next;
+  }
+  return combos;
+}
+
+function formatMatrixLabel(combo: Array<[string, unknown]>): string {
+  return combo
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(", ");
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
@@ -358,6 +419,7 @@ function readRunnerConfig(): RunnerConfig {
     devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
     devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
     params: parseParamsJson(process.env.BT_EVAL_PARAMS_JSON),
+    matrix: parseMatrixJson(process.env.BT_EVAL_MATRIX_JSON),
   };
 }
 
@@ -2217,15 +2279,20 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     projectName: string,
     evaluator: Record<string, unknown>,
     options?: EvalOptions,
+    paramsOverride?: Record<string, unknown>,
   ) => {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     // Only inject CLI params when the evaluator declares a parameters schema.
     // Drop any --param keys the evaluator doesn't declare so a single command
     // running multiple evaluators doesn't fail on unrelated params.
+    const effectiveParams =
+      paramsOverride != null
+        ? { ...(config.params ?? {}), ...paramsOverride }
+        : config.params;
     const filteredParams =
-      config.params != null && evaluator.parameters != null
-        ? filterParamsForEvaluator(config.params, evaluator.parameters)
+      effectiveParams != null && evaluator.parameters != null
+        ? filterParamsForEvaluator(effectiveParams, evaluator.parameters)
         : null;
     const effectiveOptions =
       filteredParams != null
@@ -2274,6 +2341,7 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
           entry.evaluator.projectName,
           entry.evaluator,
           options,
+          entry.paramsOverride,
         );
         const failingResults = result.results.filter(
           (r: { error?: unknown }) => r.error !== undefined,
@@ -2398,7 +2466,7 @@ async function main() {
   let ok = true;
   try {
     const discoveredEvaluators = getEvaluators();
-    const filteredEvaluators = filterEvaluators(
+    let filteredEvaluators = filterEvaluators(
       discoveredEvaluators,
       config.filters,
     );
@@ -2419,6 +2487,50 @@ async function main() {
         console.log(entry.evaluator.evalName);
       }
       return;
+    }
+
+    if (config.matrix && config.matrix.length > 0) {
+      if (filteredEvaluators.length !== 1) {
+        const names = filteredEvaluators.map((e) => e.evaluator.evalName);
+        const listed =
+          names.length === 0
+            ? "  (none matched)"
+            : names.map((n) => `  - ${n}`).join("\n");
+        const message = `--matrix-param is not supported when running multiple evals.\nMatched evals:\n${listed}\nUse --filter to select exactly one eval.`;
+        if (runner.sse) {
+          runner.sse.send("error", serializeError(new Error(message)));
+        } else {
+          console.error(message);
+        }
+        ok = false;
+        return;
+      }
+      const [sourceEntry] = filteredEvaluators;
+      const combos = matrixCombinations(config.matrix);
+      filteredEvaluators = combos.map((combo) => {
+        const label = formatMatrixLabel(combo);
+        const paramsOverride: Record<string, unknown> = {};
+        for (const [key, value] of combo) {
+          paramsOverride[key] = value;
+        }
+        const origExperimentName = sourceEntry.evaluator.experimentName;
+        const newExperimentName =
+          typeof origExperimentName === "string" && origExperimentName.length > 0
+            ? `${origExperimentName} [${label}]`
+            : `[${label}]`;
+        // Disambiguate the progress-bar / tracking key too — the runner emits progress
+        // events keyed by evalName, so combos must have distinct evalNames or bars collapse.
+        const newEvalName = `${sourceEntry.evaluator.evalName} [${label}]`;
+        return {
+          evaluator: {
+            ...sourceEntry.evaluator,
+            evalName: newEvalName,
+            experimentName: newExperimentName,
+          },
+          reporter: sourceEntry.reporter,
+          paramsOverride,
+        } satisfies EvaluatorEntry;
+      });
     }
 
     if (btEvalMains.length > 0) {
