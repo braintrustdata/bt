@@ -442,9 +442,7 @@ fn eval_matrix_param_single_runs_all_combinations() {
         if required_runtimes().contains("node") {
             panic!("node runtime is required but unavailable for matrix-param test");
         }
-        eprintln!(
-            "Skipping eval_matrix_param_single_runs_all_combinations (node not installed)."
-        );
+        eprintln!("Skipping eval_matrix_param_single_runs_all_combinations (node not installed).");
         return;
     }
 
@@ -509,9 +507,7 @@ fn eval_matrix_param_rejects_multiple_evals() {
         if required_runtimes().contains("node") {
             panic!("node runtime is required but unavailable for matrix-param multi-eval test");
         }
-        eprintln!(
-            "Skipping eval_matrix_param_rejects_multiple_evals (node not installed)."
-        );
+        eprintln!("Skipping eval_matrix_param_rejects_multiple_evals (node not installed).");
         return;
     }
 
@@ -561,9 +557,7 @@ fn eval_matrix_param_terminate_on_failure_stops_early() {
     let _guard = test_lock();
     if !command_exists("node") {
         if required_runtimes().contains("node") {
-            panic!(
-                "node runtime is required but unavailable for matrix-param terminate test"
-            );
+            panic!("node runtime is required but unavailable for matrix-param terminate test");
         }
         eprintln!(
             "Skipping eval_matrix_param_terminate_on_failure_stops_early (node not installed)."

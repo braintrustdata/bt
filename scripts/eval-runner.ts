@@ -365,12 +365,16 @@ function parseMatrixJson(raw: string | undefined): MatrixAxis[] | null {
     throw new Error(`BT_EVAL_MATRIX_JSON is not valid JSON: ${raw}`);
   }
   if (!Array.isArray(parsed)) {
-    throw new Error("BT_EVAL_MATRIX_JSON must be a JSON array of {key, values}.");
+    throw new Error(
+      "BT_EVAL_MATRIX_JSON must be a JSON array of {key, values}.",
+    );
   }
   const axes: MatrixAxis[] = [];
   for (const entry of parsed) {
     if (!isObject(entry)) {
-      throw new Error("BT_EVAL_MATRIX_JSON entries must be objects with key and values.");
+      throw new Error(
+        "BT_EVAL_MATRIX_JSON entries must be objects with key and values.",
+      );
     }
     const key = Reflect.get(entry, "key");
     const values = Reflect.get(entry, "values");
@@ -387,7 +391,9 @@ function parseMatrixJson(raw: string | undefined): MatrixAxis[] | null {
   return axes.length > 0 ? axes : null;
 }
 
-function matrixCombinations(axes: MatrixAxis[]): Array<Array<[string, unknown]>> {
+function matrixCombinations(
+  axes: MatrixAxis[],
+): Array<Array<[string, unknown]>> {
   let combos: Array<Array<[string, unknown]>> = [[]];
   for (const axis of axes) {
     const next: Array<Array<[string, unknown]>> = [];
@@ -2515,7 +2521,8 @@ async function main() {
         }
         const origExperimentName = sourceEntry.evaluator.experimentName;
         const newExperimentName =
-          typeof origExperimentName === "string" && origExperimentName.length > 0
+          typeof origExperimentName === "string" &&
+          origExperimentName.length > 0
             ? `${origExperimentName} [${label}]`
             : `[${label}]`;
         // Disambiguate the progress-bar / tracking key too — the runner emits progress

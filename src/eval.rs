@@ -460,9 +460,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         Vec::new()
     } else {
         if args.watch || args.dev || args.list {
-            anyhow::bail!(
-                "--matrix-param cannot be combined with --watch, --dev, or --list"
-            );
+            anyhow::bail!("--matrix-param cannot be combined with --watch, --dev, or --list");
         }
         parse_matrix_params(&args.matrix_param)?
     };
@@ -1876,9 +1874,10 @@ fn parse_matrix_params(raw: &[String]) -> Result<Vec<(String, Vec<serde_json::Va
         let rest = &trimmed[eq_pos + 1..];
         let rest_trimmed = rest.trim();
         let values: Vec<serde_json::Value> = if rest_trimmed.starts_with('[') {
-            let arr: Vec<serde_json::Value> = serde_json::from_str(rest_trimmed).with_context(
-                || format!("--matrix-param value is not a valid JSON array: {entry}"),
-            )?;
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_str(rest_trimmed).with_context(|| {
+                    format!("--matrix-param value is not a valid JSON array: {entry}")
+                })?;
             if arr.is_empty() {
                 anyhow::bail!("--matrix-param must have at least one value: {entry}");
             }
@@ -4573,10 +4572,7 @@ mod tests {
         assert_eq!(axes[0].0, "model");
         assert_eq!(
             axes[0].1,
-            vec![
-                serde_json::json!("gpt-4"),
-                serde_json::json!("gpt-5"),
-            ]
+            vec![serde_json::json!("gpt-4"), serde_json::json!("gpt-5"),]
         );
     }
 
@@ -4586,10 +4582,7 @@ mod tests {
         let axes = parse_matrix_params(&raw).expect("should parse");
         assert_eq!(
             axes[0].1,
-            vec![
-                serde_json::json!("gpt-4"),
-                serde_json::json!("gpt-5"),
-            ]
+            vec![serde_json::json!("gpt-4"), serde_json::json!("gpt-5"),]
         );
     }
 
