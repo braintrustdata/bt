@@ -183,6 +183,10 @@ struct TopicMapSetArgs {
     #[arg(long = "distance-threshold")]
     distance_threshold: Option<f64>,
 
+    /// Whether to disable reconciliation against the previous saved report
+    #[arg(long = "disable-reconciliation")]
+    disable_reconciliation: Option<bool>,
+
     /// Clustering algorithm to use when generating topics
     #[arg(long, value_parser = ["hdbscan", "kmeans"])]
     algorithm: Option<String>,
@@ -453,6 +457,8 @@ mod tests {
             "Task",
             "--embedding-model",
             "brain-embedding-1",
+            "--disable-reconciliation",
+            "true",
             "--naming-model",
             "brain-agent-1",
             "--algorithm",
@@ -477,6 +483,7 @@ mod tests {
             set_args.embedding_model.as_deref(),
             Some("brain-embedding-1")
         );
+        assert_eq!(set_args.disable_reconciliation, Some(true));
         assert_eq!(set_args.naming_model.as_deref(), Some("brain-agent-1"));
         assert_eq!(set_args.algorithm.as_deref(), Some("hdbscan"));
         assert_eq!(set_args.dimension_reduction.as_deref(), Some("umap"));
