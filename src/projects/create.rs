@@ -177,13 +177,16 @@ mod tests {
             create_behavior,
         });
         let server = MockServer::start(state).await;
+        let login = LoginState::new();
+        login.set(
+            "test-key".to_string(),
+            "org-1".to_string(),
+            "test-org".to_string(),
+            server.base_url.clone(),
+            "https://app.example.com".to_string(),
+        );
         let client = ApiClient::new(&LoginContext {
-            login: LoginState {
-                api_key: "test-key".to_string(),
-                org_id: "org-1".to_string(),
-                org_name: "test-org".to_string(),
-                api_url: Some(server.base_url.clone()),
-            },
+            login,
             api_url: server.base_url.clone(),
             app_url: "https://app.example.com".to_string(),
         })
