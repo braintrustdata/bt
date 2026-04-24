@@ -479,9 +479,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             allowed_org_name: args.dev_org_name.clone(),
             allowed_origins: collect_allowed_dev_origins(&args.dev_allowed_origin, &app_url),
             app_url,
-            http_client: Client::builder()
-                .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-                .build()
+            http_client: crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
                 .context("failed to create dev server HTTP client")?,
         };
         return run_dev_server(state).await;

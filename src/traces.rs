@@ -6072,6 +6072,7 @@ mod tests {
             prefer_profile: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }

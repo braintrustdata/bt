@@ -13,20 +13,17 @@ use braintrust_sdk_rust::{BraintrustClient, LoginState};
 use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
-use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicRequestTokenError, BasicTokenType};
-use oauth2::reqwest::{async_http_client, AsyncHttpClientError};
+use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EmptyExtraTokenFields, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, StandardTokenResponse, TokenResponse,
-    TokenUrl,
+    AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
 };
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
+    http::{build_http_client, build_http_client_from_builder},
     ui,
 };
 
@@ -232,7 +229,11 @@ pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let api_key = match resolved.api_key {
         Some(api_key) => api_key,
-        None => login(base).await?.login.api_key,
+        None => login(base)
+            .await?
+            .login
+            .api_key()
+            .context("login state missing API key")?,
     };
 
     let mut orgs = fetch_login_orgs(&api_key, &app_url).await?;
@@ -353,6 +354,14 @@ struct OAuthTokenResponse {
     expires_in: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct OAuthErrorResponse {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
@@ -422,7 +431,7 @@ pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
     }
 
     let ctx = fast_login(base).await?;
-    if ctx.login.org_name.trim().is_empty() {
+    if ctx.login.org_name().unwrap_or_default().trim().is_empty() {
         login(base).await
     } else {
         Ok(ctx)
@@ -449,13 +458,17 @@ pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
 
+    let login = LoginState::new();
+    login.set(
+        api_key,
+        String::new(),
+        org_name,
+        api_url.clone(),
+        app_url.clone(),
+    );
+
     Ok(LoginContext {
-        login: LoginState {
-            api_key,
-            org_id: String::new(),
-            org_name,
-            api_url: Some(api_url.clone()),
-        },
+        login,
         api_url,
         app_url,
     })
@@ -490,7 +503,6 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     if let Some(project) = &project {
         builder = builder.default_project(project);
     }
-
     let login = match builder.build().await {
         Ok(client) => client.wait_for_login().await?,
         Err(err) if auth.is_oauth => {
@@ -498,19 +510,25 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
                 .org_name
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("oauth profile is missing org_name: {err}"))?;
-            LoginState {
-                api_key: api_key.clone(),
-                org_id: String::new(),
+            let login = LoginState::new();
+            login.set(
+                api_key.clone(),
+                String::new(),
                 org_name,
-                api_url: auth.api_url.clone(),
-            }
+                auth.api_url
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
+                auth.app_url
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_APP_URL.to_string()),
+            );
+            login
         }
         Err(err) => return Err(err.into()),
     };
 
     let api_url = login
-        .api_url
-        .clone()
+        .api_url()
         .or(auth.api_url.clone())
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
@@ -667,7 +685,6 @@ pub async fn resolved_auth_env(base: &BaseArgs) -> Result<Vec<(String, String)>>
     if let Some(org_name) = auth.org_name {
         envs.push(("BRAINTRUST_ORG_NAME".to_string(), org_name));
     }
-
     Ok(envs)
 }
 
@@ -1731,9 +1748,7 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
 
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
     let login_url = format!("{}/api/apikey/login", app_url.trim_end_matches('/'));
-    let client = Client::builder()
-        .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-        .build()
+    let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
         .context("failed to initialize HTTP client")?;
     let response = client
         .post(&login_url)
@@ -2229,31 +2244,37 @@ async fn exchange_oauth_authorization_code(
     code: &str,
     code_verifier: PkceCodeVerifier,
 ) -> Result<OAuthTokenResponse> {
-    let oauth_client = build_oauth_client(api_url, client_id, Some(redirect_uri))?;
-    let token_response = oauth_client
-        .exchange_code(AuthorizationCode::new(code.to_string()))
-        .set_pkce_verifier(code_verifier)
-        .request_async(async_http_client)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to call oauth token endpoint {}/oauth/token",
-                api_url.trim_end_matches('/')
-            )
-        })?;
-    Ok(to_oauth_token_response(token_response))
+    let http_client = build_http_client_from_builder(
+        reqwest::Client::builder()
+            .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none()),
+    )
+    .context("failed to initialize oauth HTTP client")?;
+    request_oauth_token(
+        &http_client,
+        api_url,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", code_verifier.secret()),
+        ],
+    )
+    .await
 }
 
 fn map_refresh_oauth_error(
     api_url: &str,
     profile_name: &str,
-    err: BasicRequestTokenError<AsyncHttpClientError>,
+    status: reqwest::StatusCode,
+    body: &str,
 ) -> anyhow::Error {
-    if let BasicRequestTokenError::ServerResponse(server_err) = &err {
-        if matches!(server_err.error(), BasicErrorResponseType::InvalidGrant) {
+    if let Ok(server_err) = serde_json::from_str::<OAuthErrorResponse>(body) {
+        if matches!(server_err.error.as_deref(), Some("invalid_grant")) {
             let mut message =
                 format!("oauth refresh token expired or was rejected for profile '{profile_name}'");
-            if let Some(description) = server_err.error_description() {
+            if let Some(description) = server_err.error_description.as_deref() {
                 message.push_str(&format!(" ({description})"));
             }
             message.push_str(&format!(
@@ -2263,7 +2284,7 @@ fn map_refresh_oauth_error(
         }
     }
 
-    anyhow::Error::new(err).context(format!(
+    anyhow::anyhow!("oauth token request failed ({status}): {body}").context(format!(
         "failed to call oauth token endpoint {}/oauth/token",
         api_url.trim_end_matches('/')
     ))
@@ -2275,16 +2296,63 @@ async fn refresh_oauth_access_token(
     client_id: &str,
     profile_name: &str,
 ) -> Result<OAuthTokenResponse> {
-    let oauth_client = build_oauth_client(api_url, client_id, None)?;
-    let token_response = oauth_client
-        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-        .request_async(async_http_client)
+    let http_client = build_http_client_from_builder(
+        reqwest::Client::builder()
+            .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none()),
+    )
+    .context("failed to initialize oauth HTTP client")?;
+    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
+    let response = http_client
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
         .await
-        .map_err(|err| map_refresh_oauth_error(api_url, profile_name, err))?;
-    Ok(to_oauth_token_response(token_response))
+        .with_context(|| format!("failed to call oauth token endpoint {token_url}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(map_refresh_oauth_error(
+            api_url,
+            profile_name,
+            status,
+            &body,
+        ));
+    }
+
+    response
+        .json()
+        .await
+        .context("failed to parse oauth token response")
 }
 
-type OAuth2StdTokenResponse = StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType>;
+async fn request_oauth_token(
+    http_client: &reqwest::Client,
+    api_url: &str,
+    params: &[(&str, &str)],
+) -> Result<OAuthTokenResponse> {
+    let token_url = format!("{}/oauth/token", api_url.trim_end_matches('/'));
+    let response = http_client
+        .post(&token_url)
+        .form(params)
+        .send()
+        .await
+        .with_context(|| format!("failed to call oauth token endpoint {token_url}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("oauth token request failed ({status}): {body}");
+    }
+
+    response
+        .json()
+        .await
+        .context("failed to parse oauth token response")
+}
 
 fn build_oauth_client(
     api_url: &str,
@@ -2308,16 +2376,6 @@ fn build_oauth_client(
         Ok(client.set_redirect_uri(redirect_url))
     } else {
         Ok(client)
-    }
-}
-
-fn to_oauth_token_response(tokens: OAuth2StdTokenResponse) -> OAuthTokenResponse {
-    OAuthTokenResponse {
-        access_token: tokens.access_token().secret().to_string(),
-        refresh_token: tokens
-            .refresh_token()
-            .map(|token| token.secret().to_string()),
-        expires_in: tokens.expires_in().map(|duration| duration.as_secs()),
     }
 }
 
@@ -2967,6 +3025,7 @@ mod tests {
             prefer_profile: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }
@@ -3058,11 +3117,8 @@ mod tests {
         let err = map_refresh_oauth_error(
             "https://api.example.com",
             "work",
-            BasicRequestTokenError::ServerResponse(oauth2::basic::BasicErrorResponse::new(
-                BasicErrorResponseType::InvalidGrant,
-                Some("refresh token expired".to_string()),
-                None,
-            )),
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"refresh token expired"}"#,
         );
 
         assert!(is_missing_credential_error(&err));
@@ -3074,7 +3130,8 @@ mod tests {
         let err = map_refresh_oauth_error(
             "https://api.example.com",
             "work",
-            BasicRequestTokenError::Other("unexpected response".to_string()),
+            reqwest::StatusCode::BAD_REQUEST,
+            "unexpected response",
         );
 
         assert!(!is_missing_credential_error(&err));
@@ -3845,8 +3902,8 @@ mod tests {
             .await
             .expect("fast path should succeed");
 
-        assert_eq!(ctx.login.org_name, "acme");
-        assert_eq!(ctx.login.org_id, "");
+        assert_eq!(ctx.login.org_name().as_deref(), Some("acme"));
+        assert_eq!(ctx.login.org_id().as_deref(), Some(""));
         assert_eq!(ctx.api_url, "not-a-valid-url");
     }
 
@@ -3893,8 +3950,8 @@ mod tests {
             .await
             .expect("fast path should succeed with cfg org");
 
-        assert_eq!(ctx.login.api_key, "acme-secret");
-        assert_eq!(ctx.login.org_name, "acme-org");
+        assert_eq!(ctx.login.api_key().as_deref(), Some("acme-secret"));
+        assert_eq!(ctx.login.org_name().as_deref(), Some("acme-org"));
         assert_eq!(ctx.api_url, "https://api.acme.example");
         assert_eq!(ctx.app_url, "https://www.acme.example");
     }
@@ -3911,7 +3968,7 @@ mod tests {
             .await
             .expect("fast path should succeed");
 
-        assert_eq!(ctx.login.org_name, "acme");
+        assert_eq!(ctx.login.org_name().as_deref(), Some("acme"));
         assert_eq!(ctx.api_url, DEFAULT_API_URL);
         assert_eq!(ctx.app_url, DEFAULT_APP_URL);
     }

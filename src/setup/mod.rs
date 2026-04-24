@@ -1165,14 +1165,17 @@ fn build_api_key_login_context(
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let login = braintrust_sdk_rust::LoginState::new();
+    let _ = login.set(
+        api_key.to_string(),
+        org.id.clone(),
+        org.name.clone(),
+        api_url.clone(),
+        app_url.clone(),
+    );
 
     LoginContext {
-        login: braintrust_sdk_rust::LoginState {
-            api_key: api_key.to_string(),
-            org_id: org.id.clone(),
-            org_name: org.name.clone(),
-            api_url: Some(api_url.clone()),
-        },
+        login,
         api_url,
         app_url,
     }
@@ -4707,6 +4710,7 @@ mod tests {
             prefer_profile: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }

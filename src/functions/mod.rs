@@ -461,7 +461,7 @@ pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext>
     Ok(AuthContext {
         client,
         app_url: ctx.app_url,
-        org_id: ctx.login.org_id,
+        org_id: ctx.login.org_id().unwrap_or_default(),
     })
 }
 
