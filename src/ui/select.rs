@@ -6,7 +6,10 @@ use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 
 use crate::{
     http::ApiClient,
-    projects::{api, create::create_project_checked},
+    projects::{
+        api,
+        create::{create_project_checked, CreateProjectOutcome},
+    },
     ui::with_spinner,
 };
 
@@ -100,7 +103,11 @@ pub async fn select_project(
         if trimmed.is_empty() {
             bail!("project name cannot be empty");
         }
-        return create_project_checked(client, trimmed).await;
+        return match create_project_checked(client, trimmed).await? {
+            CreateProjectOutcome::Created(project) | CreateProjectOutcome::Existing(project) => {
+                Ok(project)
+            }
+        };
     }
 
     let project_index = selected_project_index(selection, mode);
