@@ -1335,6 +1335,11 @@ async fn ensure_setup_auth(
     prompt_for_profile_choice: bool,
     needs_api_key: bool,
 ) -> Result<SetupAuthContext> {
+    let project_was_explicit = base
+        .project
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
     apply_setup_config_fallbacks(base);
 
     let explicit_api_key = base
@@ -1344,7 +1349,7 @@ async fn ensure_setup_auth(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let stored_profiles = auth::list_stored_profiles()?;
-    let project_name = base
+    let mut project_name = base
         .project
         .as_deref()
         .map(str::trim)
@@ -1369,6 +1374,15 @@ async fn ensure_setup_auth(
             .clone()
             .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
         let available_orgs = list_available_orgs_for_setup(api_key, &app_url).await?;
+        if let Some(name) = project_name.as_deref() {
+            let matched_orgs = orgs_with_project(base, api_key, &available_orgs, name).await?;
+            clear_missing_fallback_setup_project(
+                base,
+                &mut project_name,
+                project_was_explicit,
+                &matched_orgs,
+            );
+        }
 
         if let Some(profile_name) = profile_name.as_deref() {
             let profile = stored_profiles
@@ -1541,6 +1555,20 @@ async fn ensure_setup_auth(
         ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
     let client = ApiClient::new(&login_ctx)?;
     build_setup_auth_context(base, client, is_oauth, needs_api_key).await
+}
+
+fn clear_missing_fallback_setup_project(
+    base: &mut BaseArgs,
+    project_name: &mut Option<String>,
+    project_was_explicit: bool,
+    matched_orgs: &[auth::AvailableOrg],
+) {
+    if project_was_explicit || project_name.is_none() || !matched_orgs.is_empty() {
+        return;
+    }
+
+    base.project = None;
+    *project_name = None;
 }
 
 fn sync_setup_api_key(base: &mut BaseArgs, api_key: &str) {
@@ -4833,6 +4861,30 @@ mod tests {
         base.api_key = Some("env-key".to_string());
         base.api_key_source = Some(ArgValueSource::EnvVariable);
         assert!(!should_create_api_key_for_setup(true, &base, true));
+    }
+
+    #[test]
+    fn clear_missing_fallback_setup_project_clears_config_project_without_matches() {
+        let mut base = make_base_args();
+        base.project = Some("stale-project".to_string());
+        let mut project_name = Some("stale-project".to_string());
+
+        clear_missing_fallback_setup_project(&mut base, &mut project_name, false, &[]);
+
+        assert_eq!(base.project, None);
+        assert_eq!(project_name, None);
+    }
+
+    #[test]
+    fn clear_missing_fallback_setup_project_keeps_explicit_project_without_matches() {
+        let mut base = make_base_args();
+        base.project = Some("explicit-project".to_string());
+        let mut project_name = Some("explicit-project".to_string());
+
+        clear_missing_fallback_setup_project(&mut base, &mut project_name, true, &[]);
+
+        assert_eq!(base.project.as_deref(), Some("explicit-project"));
+        assert_eq!(project_name.as_deref(), Some("explicit-project"));
     }
 
     #[test]
