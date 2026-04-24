@@ -2,14 +2,16 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use dialoguer::Input;
+use reqwest::StatusCode;
 
-use crate::http::ApiClient;
+use crate::http::{ApiClient, HttpError};
 use crate::ui::{
     is_interactive, print_command_status, with_spinner, with_spinner_visible, CommandStatus,
 };
 
 use super::api;
 
+#[derive(Debug)]
 pub(crate) enum CreateProjectOutcome {
     Created(api::Project),
     Existing(api::Project),
@@ -37,18 +39,30 @@ pub(crate) async fn create_project_checked(
     {
         Ok(project) => Ok(CreateProjectOutcome::Created(project)),
         Err(err) => {
+            if !is_conflict_error(&err) {
+                return Err(err);
+            }
+
             if let Some(project) = with_spinner(
                 "Checking project...",
                 api::get_project_by_name(client, name),
             )
             .await?
             {
-                Ok(CreateProjectOutcome::Existing(project))
-            } else {
-                Err(err)
+                return Ok(CreateProjectOutcome::Existing(project));
             }
+
+            Err(err)
         }
     }
+}
+
+fn is_conflict_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .downcast_ref::<HttpError>()
+            .is_some_and(|http_err| http_err.status == StatusCode::CONFLICT)
+    })
 }
 
 pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
