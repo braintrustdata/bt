@@ -810,6 +810,7 @@ mod tests {
                         source_facet: None,
                         embedding_model: None,
                         distance_threshold: None,
+                        disable_reconciliation: None,
                         generation_settings: None,
                     },
                     api::FunctionSummary {
@@ -823,6 +824,7 @@ mod tests {
                         source_facet: None,
                         embedding_model: None,
                         distance_threshold: None,
+                        disable_reconciliation: None,
                         generation_settings: None,
                     },
                 ],
@@ -837,6 +839,7 @@ mod tests {
                     source_facet: None,
                     embedding_model: None,
                     distance_threshold: None,
+                    disable_reconciliation: None,
                     generation_settings: None,
                 }],
                 cursor: AutomationCursorSnapshot {
