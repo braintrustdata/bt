@@ -319,6 +319,7 @@ pub(crate) struct PushArgs {
     pub tsconfig: Option<PathBuf>,
 
     /// Additional packages to mark external during JS bundling.
+    /// SDK dependencies (for example `braintrust`) are bundled by default.
     #[arg(
         long = "external-packages",
         env = "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
