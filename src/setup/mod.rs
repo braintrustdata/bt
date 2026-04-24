@@ -2069,7 +2069,7 @@ async fn run_instrument_setup(
     if run_interactive && base.verbose {
         eprintln!();
         eprintln!("{} is opening in interactive mode.", selected.as_str());
-        eprintln!("The instrumentation task is pre-loaded. Press Enter to begin.");
+        eprintln!("The instrumentation task is pre-loaded.");
         eprintln!("Task file: {}", task_path.display());
         eprintln!();
     }
