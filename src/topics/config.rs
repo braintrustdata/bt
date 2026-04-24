@@ -12,14 +12,17 @@ use super::{
         TopicMapGenerationSettings, TopicsConfigReport, TopicsDeleteReport,
     },
     formatting::{format_duration_compact, format_project_header},
-    ConfigArgs, ConfigDeleteArgs, ConfigEnableArgs, ConfigSetArgs, ResolvedContext,
-    TopicMapSetArgs, TopicsConfigFieldsArgs,
+    ConfigEnableArgs, ConfigSetArgs, ResolvedContext, TopicMapSetArgs, TopicsConfigFieldsArgs,
 };
 
-pub async fn run_view(ctx: &ResolvedContext, args: &ConfigArgs, json: bool) -> Result<()> {
+pub async fn run_view(
+    ctx: &ResolvedContext,
+    automation_id: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let report = with_spinner(
         "Loading Topics config...",
-        api::fetch_topics_config(ctx, args.automation_id.as_deref()),
+        api::fetch_topics_config(ctx, automation_id),
     )
     .await?;
 
@@ -71,11 +74,16 @@ pub async fn run_enable(ctx: &ResolvedContext, args: &ConfigEnableArgs, json: bo
     Ok(())
 }
 
-pub async fn run_delete(ctx: &ResolvedContext, args: &ConfigDeleteArgs, json: bool) -> Result<()> {
-    if !args.force && is_interactive() {
+pub async fn run_delete(
+    ctx: &ResolvedContext,
+    automation_id: Option<&str>,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    if !force && is_interactive() {
         let preview = with_spinner(
             "Loading Topics config...",
-            api::fetch_topics_config(ctx, args.automation_id.as_deref()),
+            api::fetch_topics_config(ctx, automation_id),
         )
         .await?;
         let automation = resolve_single_automation_for_action(&preview)?;
@@ -94,7 +102,7 @@ pub async fn run_delete(ctx: &ResolvedContext, args: &ConfigDeleteArgs, json: bo
 
     let report = with_spinner(
         "Deleting Topics...",
-        api::delete_topics_config(ctx, args.automation_id.as_deref()),
+        api::delete_topics_config(ctx, automation_id),
     )
     .await?;
 

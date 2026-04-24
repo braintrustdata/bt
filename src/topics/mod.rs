@@ -267,23 +267,37 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         Some(TopicsCommands::Status(status_args)) => {
             status::run(&ctx, status_args, base.json).await
         }
-        Some(TopicsCommands::Config(config_args)) => match config_args.command {
-            None => config::run_view(&ctx, &config_args, base.json).await,
-            Some(ConfigCommands::Enable(enable_args)) => {
-                config::run_enable(&ctx, &enable_args, base.json).await
-            }
-            Some(ConfigCommands::Delete(delete_args)) => {
-                config::run_delete(&ctx, &delete_args, base.json).await
-            }
-            Some(ConfigCommands::Set(set_args)) => {
-                config::run_set(&ctx, &set_args, base.json).await
-            }
-            Some(ConfigCommands::TopicMap(topic_map_args)) => match topic_map_args.command {
-                TopicMapCommands::Set(set_args) => {
-                    config::run_topic_map_set(&ctx, &set_args, base.json).await
+        Some(TopicsCommands::Config(config_args)) => {
+            let parent_automation_id = config_args.automation_id;
+            match config_args.command {
+                None => config::run_view(&ctx, parent_automation_id.as_deref(), base.json).await,
+                Some(ConfigCommands::Enable(enable_args)) => {
+                    config::run_enable(&ctx, &enable_args, base.json).await
                 }
-            },
-        },
+                Some(ConfigCommands::Delete(delete_args)) => {
+                    config::run_delete(
+                        &ctx,
+                        delete_args
+                            .automation_id
+                            .or(parent_automation_id)
+                            .as_deref(),
+                        delete_args.force,
+                        base.json,
+                    )
+                    .await
+                }
+                Some(ConfigCommands::Set(mut set_args)) => {
+                    set_args.automation_id = set_args.automation_id.or(parent_automation_id);
+                    config::run_set(&ctx, &set_args, base.json).await
+                }
+                Some(ConfigCommands::TopicMap(topic_map_args)) => match topic_map_args.command {
+                    TopicMapCommands::Set(mut set_args) => {
+                        set_args.automation_id = set_args.automation_id.or(parent_automation_id);
+                        config::run_topic_map_set(&ctx, &set_args, base.json).await
+                    }
+                },
+            }
+        }
         Some(TopicsCommands::Poke) => poke::run(&ctx, base.json).await,
         Some(TopicsCommands::Rewind(rewind_args)) => {
             rewind::run(&ctx, &rewind_args, base.json).await
@@ -534,5 +548,47 @@ mod tests {
         assert_eq!(set_args.algorithm.as_deref(), Some("hdbscan"));
         assert_eq!(set_args.dimension_reduction.as_deref(), Some("umap"));
         assert_eq!(set_args.min_cluster_size, Some(25));
+    }
+
+    #[test]
+    fn parent_automation_id_parsed_separately_from_delete_child() {
+        // `config --automation-id X delete` puts X on the parent, not the child.
+        // The dispatch merges them with child.or(parent).
+        let parsed =
+            parse(&["topics", "config", "--automation-id", "parent_id", "delete"]).expect("parse");
+
+        let Some(TopicsCommands::Config(config_args)) = &parsed.command else {
+            panic!("expected config command");
+        };
+        assert_eq!(config_args.automation_id.as_deref(), Some("parent_id"));
+
+        let Some(ConfigCommands::Delete(delete_args)) = &config_args.command else {
+            panic!("expected delete subcommand");
+        };
+        assert_eq!(delete_args.automation_id, None);
+    }
+
+    #[test]
+    fn parent_automation_id_parsed_separately_from_set_child() {
+        let parsed = parse(&[
+            "topics",
+            "config",
+            "--automation-id",
+            "parent_id",
+            "set",
+            "--topic-window",
+            "1h",
+        ])
+        .expect("parse");
+
+        let Some(TopicsCommands::Config(config_args)) = &parsed.command else {
+            panic!("expected config command");
+        };
+        assert_eq!(config_args.automation_id.as_deref(), Some("parent_id"));
+
+        let Some(ConfigCommands::Set(set_args)) = &config_args.command else {
+            panic!("expected set subcommand");
+        };
+        assert_eq!(set_args.automation_id, None);
     }
 }
