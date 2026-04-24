@@ -22,6 +22,7 @@ Examples:
   bt topics status --watch
   bt topics config
   bt topics config enable
+  bt topics config delete
   bt topics config set --topic-window 1h --generation-cadence 1d
   bt topics config topic-map set Task --embedding-model brain-embedding-1
   bt topics poke
@@ -72,6 +73,8 @@ struct ConfigArgs {
 enum ConfigCommands {
     /// Enable Topics for this project with the provided config
     Enable(ConfigEnableArgs),
+    /// Delete the Topics automation from this project
+    Delete(ConfigDeleteArgs),
     /// Update editable Topics config fields
     Set(ConfigSetArgs),
     /// Edit per-topic-map settings
@@ -140,6 +143,17 @@ struct ConfigSetArgs {
 
     #[command(flatten)]
     fields: TopicsConfigFieldsArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ConfigDeleteArgs {
+    /// Specific automation ID to delete
+    #[arg(long = "automation-id")]
+    automation_id: Option<String>,
+
+    /// Skip confirmation prompt
+    #[arg(long, short = 'f')]
+    force: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -258,6 +272,9 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
             Some(ConfigCommands::Enable(enable_args)) => {
                 config::run_enable(&ctx, &enable_args, base.json).await
             }
+            Some(ConfigCommands::Delete(delete_args)) => {
+                config::run_delete(&ctx, &delete_args, base.json).await
+            }
             Some(ConfigCommands::Set(set_args)) => {
                 config::run_set(&ctx, &set_args, base.json).await
             }
@@ -359,6 +376,12 @@ mod tests {
     }
 
     #[test]
+    fn topics_config_delete_uses_validated_auth() {
+        let parsed = parse(&["topics", "config", "delete"]).expect("parse");
+        assert!(!topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
     fn topics_config_topic_map_set_uses_validated_auth() {
         let parsed = parse(&[
             "topics",
@@ -436,6 +459,29 @@ mod tests {
             enable_args.embedding_model.as_deref(),
             Some("brain-embedding-1")
         );
+    }
+
+    #[test]
+    fn topics_config_delete_accepts_automation_id_and_force() {
+        let parsed = parse(&[
+            "topics",
+            "config",
+            "delete",
+            "--automation-id",
+            "auto_123",
+            "--force",
+        ])
+        .expect("parse");
+
+        let Some(TopicsCommands::Config(config_args)) = parsed.command.as_ref() else {
+            panic!("expected config delete command");
+        };
+        let Some(ConfigCommands::Delete(delete_args)) = config_args.command.as_ref() else {
+            panic!("expected config delete command");
+        };
+
+        assert_eq!(delete_args.automation_id.as_deref(), Some("auto_123"));
+        assert!(delete_args.force);
     }
 
     #[test]
