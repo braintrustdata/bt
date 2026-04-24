@@ -4864,7 +4864,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_missing_fallback_setup_project_clears_config_project_without_matches() {
+    fn clear_missing_fallback_setup_project_clears_non_explicit_only() {
         let mut base = make_base_args();
         base.project = Some("stale-project".to_string());
         let mut project_name = Some("stale-project".to_string());
@@ -4873,18 +4873,15 @@ mod tests {
 
         assert_eq!(base.project, None);
         assert_eq!(project_name, None);
-    }
 
-    #[test]
-    fn clear_missing_fallback_setup_project_keeps_explicit_project_without_matches() {
         let mut base = make_base_args();
         base.project = Some("explicit-project".to_string());
         let mut project_name = Some("explicit-project".to_string());
 
         clear_missing_fallback_setup_project(&mut base, &mut project_name, true, &[]);
 
-        assert_eq!(base.project.as_deref(), Some("explicit-project"));
-        assert_eq!(project_name.as_deref(), Some("explicit-project"));
+        assert_eq!(base.project, Some("explicit-project".to_string()));
+        assert_eq!(project_name, Some("explicit-project".to_string()));
     }
 
     #[test]

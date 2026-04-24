@@ -86,7 +86,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+    use actix_web::{web, App, HttpResponse, HttpServer};
     use braintrust_sdk_rust::LoginState;
     use serde::Deserialize;
 
@@ -98,6 +98,16 @@ mod tests {
         id: String,
         name: String,
         org_id: String,
+    }
+
+    impl MockProject {
+        fn new(id: &str, name: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                name: name.to_string(),
+                org_id: "test-org".to_string(),
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -144,62 +154,50 @@ mod tests {
         }
     }
 
-    fn make_client(base_url: &str) -> ApiClient {
-        ApiClient::new(&LoginContext {
+    async fn setup_test(
+        projects: Vec<MockProject>,
+        create_behavior: CreateBehavior,
+    ) -> (MockServer, ApiClient) {
+        let state = Arc::new(MockState {
+            projects: Mutex::new(projects),
+            create_behavior,
+        });
+        let server = MockServer::start(state).await;
+        let client = ApiClient::new(&LoginContext {
             login: LoginState {
                 api_key: "test-key".to_string(),
                 org_id: "org-1".to_string(),
                 org_name: "test-org".to_string(),
-                api_url: Some(base_url.to_string()),
+                api_url: Some(server.base_url.clone()),
             },
-            api_url: base_url.to_string(),
+            api_url: server.base_url.clone(),
             app_url: "https://app.example.com".to_string(),
         })
-        .expect("build client")
+        .expect("build client");
+        (server, client)
     }
 
-    fn parse_query(req: &HttpRequest) -> std::collections::HashMap<String, String> {
-        req.query_string()
-            .split('&')
-            .filter(|part| !part.is_empty())
-            .filter_map(|part| {
-                let (key, value) = part.split_once('=').unwrap_or((part, ""));
-                let key = urlencoding::decode(key).ok()?.into_owned();
-                let value = urlencoding::decode(value).ok()?.into_owned();
-                Some((key, value))
-            })
-            .collect()
+    #[derive(Deserialize)]
+    struct ListProjectsQuery {
+        project_name: Option<String>,
     }
 
     async fn mock_list_projects(
         state: web::Data<Arc<MockState>>,
-        req: HttpRequest,
+        query: web::Query<ListProjectsQuery>,
     ) -> HttpResponse {
-        let query = parse_query(&req);
-        let requested_name = query.get("project_name").cloned();
         let projects = state.projects.lock().expect("projects lock").clone();
-        let objects = projects
+        let objects: Vec<_> = projects
             .into_iter()
-            .filter(|project| {
-                requested_name
-                    .as_deref()
-                    .is_none_or(|name| project.name == name)
-            })
-            .map(|project| {
-                serde_json::json!({
-                    "id": project.id,
-                    "name": project.name,
-                    "org_id": project.org_id,
-                })
-            })
-            .collect::<Vec<_>>();
+            .filter(|p| query.project_name.as_deref().is_none_or(|n| p.name == n))
+            .map(|p| serde_json::json!({ "id": p.id, "name": p.name, "org_id": p.org_id }))
+            .collect();
         HttpResponse::Ok().json(serde_json::json!({ "objects": objects }))
     }
 
     #[derive(Deserialize)]
     struct CreateProjectRequest {
         name: String,
-        org_name: String,
     }
 
     async fn mock_create_project(
@@ -209,27 +207,19 @@ mod tests {
         match state.create_behavior {
             CreateBehavior::Create => {
                 let mut projects = state.projects.lock().expect("projects lock");
-                let created = MockProject {
-                    id: format!("proj-created-{}", projects.len() + 1),
-                    name: body.name.clone(),
-                    org_id: body.org_name.clone(),
-                };
+                let id = format!("proj-created-{}", projects.len() + 1);
+                let created = MockProject::new(&id, &body.name);
                 projects.push(created.clone());
-                HttpResponse::Ok().json(serde_json::json!({
-                    "id": created.id,
-                    "name": created.name,
-                    "org_id": created.org_id,
-                }))
+                HttpResponse::Ok().json(
+                    serde_json::json!({ "id": created.id, "name": created.name, "org_id": created.org_id }),
+                )
             }
             CreateBehavior::ConflictThenReveal => {
-                let mut projects = state.projects.lock().expect("projects lock");
-                if !projects.iter().any(|project| project.name == body.name) {
-                    projects.push(MockProject {
-                        id: "proj-race".to_string(),
-                        name: body.name.clone(),
-                        org_id: body.org_name.clone(),
-                    });
-                }
+                state
+                    .projects
+                    .lock()
+                    .expect("projects lock")
+                    .push(MockProject::new("proj-race", &body.name));
                 HttpResponse::Conflict()
                     .json(serde_json::json!({ "error": "project already exists" }))
             }
@@ -238,82 +228,55 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_project_checked_returns_existing_project() {
-        let state = Arc::new(MockState {
-            projects: Mutex::new(vec![MockProject {
-                id: "proj-1".to_string(),
-                name: "existing-project".to_string(),
-                org_id: "test-org".to_string(),
-            }]),
-            create_behavior: CreateBehavior::Create,
-        });
-        let server = MockServer::start(state).await;
-        let client = make_client(&server.base_url);
+        let (server, client) = setup_test(
+            vec![MockProject::new("proj-1", "existing-project")],
+            CreateBehavior::Create,
+        )
+        .await;
 
         let outcome = create_project_checked(&client, "existing-project")
             .await
             .expect("reuse existing project");
 
-        match outcome {
-            CreateProjectOutcome::Existing(project) => {
-                assert_eq!(project.id, "proj-1");
-                assert_eq!(project.name, "existing-project");
-            }
-            CreateProjectOutcome::Created(_) => panic!("expected existing project outcome"),
-        }
+        let CreateProjectOutcome::Existing(project) = outcome else {
+            panic!("expected existing project outcome");
+        };
+        assert_eq!(project.id, "proj-1");
+        assert_eq!(project.name, "existing-project");
 
         server.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_project_checked_falls_back_to_lookup_after_create_conflict() {
-        let state = Arc::new(MockState {
-            projects: Mutex::new(vec![MockProject {
-                id: "proj-2".to_string(),
-                name: "unrelated-project".to_string(),
-                org_id: "test-org".to_string(),
-            }]),
-            create_behavior: CreateBehavior::ConflictThenReveal,
-        });
-        let server = MockServer::start(state).await;
-        let client = make_client(&server.base_url);
+        let (server, client) = setup_test(vec![], CreateBehavior::ConflictThenReveal).await;
 
         let outcome = create_project_checked(&client, "race-project")
             .await
             .expect("resolve project after create conflict");
 
-        match outcome {
-            CreateProjectOutcome::Existing(project) => {
-                assert_eq!(project.id, "proj-race");
-                assert_eq!(project.name, "race-project");
-            }
-            CreateProjectOutcome::Created(_) => {
-                panic!("expected existing project outcome after create conflict")
-            }
-        }
+        let CreateProjectOutcome::Existing(project) = outcome else {
+            panic!("expected existing project outcome after create conflict");
+        };
+        assert_eq!(project.id, "proj-race");
+        assert_eq!(project.name, "race-project");
 
         server.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_project_checked_returns_created_project() {
-        let state = Arc::new(MockState {
-            projects: Mutex::new(vec![]),
-            create_behavior: CreateBehavior::Create,
-        });
-        let server = MockServer::start(state).await;
-        let client = make_client(&server.base_url);
+        let (server, client) = setup_test(vec![], CreateBehavior::Create).await;
 
         let outcome = create_project_checked(&client, "new-project")
             .await
             .expect("create new project");
 
-        match outcome {
-            CreateProjectOutcome::Created(project) => {
-                assert_eq!(project.id, "proj-created-1");
-                assert_eq!(project.name, "new-project");
-            }
-            CreateProjectOutcome::Existing(_) => panic!("expected created project outcome"),
-        }
+        let CreateProjectOutcome::Created(project) = outcome else {
+            panic!("expected created project outcome");
+        };
+        assert_eq!(project.id, "proj-created-1");
+        assert_eq!(project.name, "new-project");
 
         server.stop().await;
     }
