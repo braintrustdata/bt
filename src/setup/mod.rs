@@ -785,6 +785,16 @@ async fn run_setup_flow(
             };
             let outcome =
                 execute_skills_setup(&base, &args, matches!(mode, SetupFlowMode::Wizard)).await?;
+            if verbose && matches!(mode, SetupFlowMode::Defaults) && !json_output {
+                print_human_report(
+                    false,
+                    outcome.scope,
+                    &outcome.selected_agents,
+                    &outcome.results,
+                    &outcome.warnings,
+                    &outcome.notes,
+                );
+            }
             if json_output {
                 json_scope = Some(outcome.scope);
                 json_selected_agents = outcome.selected_agents.clone();
@@ -824,6 +834,14 @@ async fn run_setup_flow(
                 &auth.api_key,
                 &mcp_url_from_api_url(&api_url),
             );
+            if verbose && matches!(mode, SetupFlowMode::Defaults) && !json_output {
+                print_mcp_human_report(
+                    *scope,
+                    &[*selected_agent],
+                    &outcome.results,
+                    &outcome.warnings,
+                );
+            }
             if json_output {
                 json_scope.get_or_insert(*scope);
                 if json_selected_agents.is_empty() {
