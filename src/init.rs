@@ -6,7 +6,7 @@ use crate::{
     auth::{self, login},
     config,
     http::ApiClient,
-    ui::{is_interactive, print_command_status, select_project_interactive, CommandStatus},
+    ui::{is_interactive, print_command_status, select_project, CommandStatus, ProjectSelectMode},
 };
 
 #[derive(Debug, Clone, Args)]
@@ -41,7 +41,14 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         let client = ApiClient::new(&ctx)?;
 
         let org = client.org_name().to_string();
-        let project = select_project_interactive(&client, Some("Link to project"), None).await?;
+        let project = select_project(
+            &client,
+            None,
+            Some("Link to project"),
+            ProjectSelectMode::ExistingOnly,
+        )
+        .await?
+        .name;
 
         (org, project)
     };

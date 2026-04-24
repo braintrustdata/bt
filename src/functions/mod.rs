@@ -9,7 +9,7 @@ use crate::{
     config,
     http::ApiClient,
     projects::api::{get_project_by_name, Project},
-    ui::{self, is_interactive, select_project_interactive, with_spinner},
+    ui::{self, is_interactive, select_project, with_spinner},
 };
 
 pub(crate) mod api;
@@ -398,10 +398,6 @@ pub(crate) struct PullArgs {
         value_parser = BoolishValueParser::new()
     )]
     pub force: bool,
-
-    /// Show skipped files in output.
-    #[arg(long, default_value_t = false)]
-    pub verbose: bool,
 }
 
 impl PullArgs {
@@ -424,9 +420,6 @@ pub struct ViewArgs {
     /// Open in browser
     #[arg(long)]
     web: bool,
-    /// Show all configuration details
-    #[arg(long)]
-    verbose: bool,
 }
 
 impl ViewArgs {
@@ -525,9 +518,16 @@ pub(crate) async fn resolve_project_context_optional(
     let config_project = config::load().ok().and_then(|c| c.project);
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(p) => Some(p.to_string()),
-        None if allow_interactive_selection && is_interactive() => {
-            Some(select_project_interactive(&auth_ctx.client, None, None).await?)
-        }
+        None if allow_interactive_selection && is_interactive() => Some(
+            select_project(
+                &auth_ctx.client,
+                None,
+                None,
+                crate::ui::ProjectSelectMode::ExistingOnly,
+            )
+            .await?
+            .name,
+        ),
         None => None,
     };
 
@@ -550,6 +550,22 @@ async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
     })
 }
 
+fn function_selection_label(function: &Function, ft: Option<FunctionTypeFilter>) -> String {
+    let slug_suffix = if function.slug == function.name {
+        String::new()
+    } else {
+        format!(" [slug: {}]", function.slug)
+    };
+
+    match ft {
+        Some(_) => format!("{}{}", function.name, slug_suffix),
+        None => {
+            let t = function.function_type.as_deref().unwrap_or("?");
+            format!("{}{} ({})", function.name, slug_suffix, t)
+        }
+    }
+}
+
 pub(crate) async fn select_function_interactive(
     client: &ApiClient,
     project_id: &str,
@@ -568,17 +584,10 @@ pub(crate) async fn select_function_interactive(
 
     functions.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let names: Vec<String> = if ft.is_none() {
-        functions
-            .iter()
-            .map(|f| {
-                let t = f.function_type.as_deref().unwrap_or("?");
-                format!("{} ({})", f.name, t)
-            })
-            .collect()
-    } else {
-        functions.iter().map(|f| f.name.clone()).collect()
-    };
+    let names: Vec<String> = functions
+        .iter()
+        .map(|f| function_selection_label(f, ft))
+        .collect();
 
     let selection = ui::fuzzy_select(&format!("Select {}", label(ft)), &names, 0)?;
     Ok(functions[selection].clone())
@@ -590,7 +599,7 @@ pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFil
     match args.command {
         None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
         Some(FunctionCommands::View(v)) => {
-            view::run(&ctx, v.slug(), base.json, v.web, v.verbose, ft).await
+            view::run(&ctx, v.slug(), base.json, v.web, base.verbose, ft).await
         }
         Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
         Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
@@ -615,7 +624,7 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
                         v.inner.slug(),
                         base.json,
                         v.inner.web,
-                        v.inner.verbose,
+                        base.verbose,
                         v.function_type.or(function_type),
                     )
                     .await
@@ -954,6 +963,57 @@ mod tests {
             panic!("expected pull command");
         };
         assert_eq!(pull.slug_flag, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn function_selection_label_includes_slug_when_name_differs() {
+        let function = Function {
+            id: "id".to_string(),
+            name: "Display name".to_string(),
+            slug: "display-name".to_string(),
+            project_id: "project".to_string(),
+            description: None,
+            function_type: Some("classifier".to_string()),
+            prompt_data: None,
+            function_data: None,
+            tags: None,
+            metadata: None,
+            created: None,
+            _xact_id: None,
+        };
+
+        assert_eq!(
+            function_selection_label(&function, None),
+            "Display name [slug: display-name] (classifier)"
+        );
+        assert_eq!(
+            function_selection_label(&function, Some(FunctionTypeFilter::Classifier)),
+            "Display name [slug: display-name]"
+        );
+    }
+
+    #[test]
+    fn function_selection_label_avoids_duplicate_slug_when_equal_to_name() {
+        let function = Function {
+            id: "id".to_string(),
+            name: "same".to_string(),
+            slug: "same".to_string(),
+            project_id: "project".to_string(),
+            description: None,
+            function_type: Some("tool".to_string()),
+            prompt_data: None,
+            function_data: None,
+            tags: None,
+            metadata: None,
+            created: None,
+            _xact_id: None,
+        };
+
+        assert_eq!(function_selection_label(&function, None), "same (tool)");
+        assert_eq!(
+            function_selection_label(&function, Some(FunctionTypeFilter::Tool)),
+            "same"
+        );
     }
 
     #[derive(Debug, Parser)]

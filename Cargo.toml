@@ -1,12 +1,18 @@
 [package]
 name = "bt"
-version = "0.4.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.86.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
 description = "The Braintrust command line interface"
 license = "Apache-2.0"
 repository = "https://github.com/braintrustdata/bt"
+
+[package.metadata.wix]
+upgrade-guid = "5B558F98-EEBD-4F5E-A0C8-E7A039445139"
+path-guid = "7CD3044D-A62A-469C-8552-0E5C3A00FFF1"
+license = false
+eula = false
 
 [dependencies]
 actix-web = "4.11.0"
@@ -21,6 +27,7 @@ ratatui = "0.29.0"
 reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
+toml = "0.8"
 sha2 = "0.10.8"
 strip-ansi-escapes = "0.2.0"
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "process", "net", "signal"] }
@@ -47,30 +54,6 @@ lto = "thin"
 
 [workspace]
 members = ["."]
-
-[workspace.metadata.dist]
-cargo-dist-version = "0.30.3"
-ci = "github"
-create-release = true
-pr-run-mode = "plan"
-allow-dirty = ["ci"]
-
-[package.metadata.dist]
-installers = ["shell", "powershell"]
-targets = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-musl",
-  "x86_64-pc-windows-msvc",
-]
-unix-archive = ".tar.gz"
-windows-archive = ".zip"
-install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
-install-updater = true
-install-success-msg = ""
 
 [dev-dependencies]
 tempfile = "3"

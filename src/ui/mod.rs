@@ -1,6 +1,8 @@
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dialoguer::console::Term;
+
 mod pager;
 pub mod prompt_render;
 mod select;
@@ -32,12 +34,24 @@ pub fn animations_enabled() -> bool {
     ANIMATIONS_ENABLED.load(Ordering::Relaxed)
 }
 
+pub fn prompt_term() -> Option<Term> {
+    if NO_INPUT.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    select::tty_term()
+}
+
+pub fn can_prompt() -> bool {
+    prompt_term().is_some()
+}
+
 pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && !NO_INPUT.load(Ordering::Relaxed)
 }
 
 pub use pager::print_with_pager;
-pub use select::{fuzzy_select, select_project_interactive};
+pub use select::{fuzzy_select, select_project, ProjectSelectMode};
 
 pub use spinner::{with_spinner, with_spinner_visible};
 pub use status::{print_command_status, CommandStatus};

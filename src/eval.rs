@@ -59,6 +59,28 @@ const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-ne
 const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
 const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
 const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
+const DEFAULT_EVAL_SAMPLE_SEED: u64 = 0;
+const EVAL_SPINNER_TICK_STRINGS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
+// UI-only smoothing knobs for adaptive totals.
+// We intentionally smooth in the CLI renderer (not the runner protocol) so
+// non-CLI consumers still receive truthful progress events.
+// `EVAL_TOTAL_SMOOTH_INTERVAL` roughly matches perceptible terminal updates.
+// `EVAL_TOTAL_SMOOTH_DELTA_DIVISOR` + `EVAL_TOTAL_SMOOTH_MIN_STEP` avoid redrawing
+// for tiny len changes while still applying meaningful jumps immediately.
+const EVAL_TOTAL_SMOOTH_INTERVAL: Duration = Duration::from_millis(100);
+const EVAL_TOTAL_SMOOTH_DELTA_DIVISOR: u64 = 50;
+const EVAL_TOTAL_SMOOTH_MIN_STEP: u64 = 2;
+const EVAL_MIN_DETERMINATE_TOTAL: u64 = 2;
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer '{value}'"))?;
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(parsed)
+}
 static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct EvalRunOutput {
@@ -181,6 +203,7 @@ struct DevServerState {
 struct DevAuthContext {
     token: String,
     org_name: String,
+    api_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,15 +317,34 @@ pub struct EvalArgs {
     )]
     pub filter: Vec<String>,
 
-    /// Show verbose evaluator errors and stderr output.
+    /// Run only the first N dataset records. Marks the run as non-final.
     #[arg(
         long,
-        env = "BT_EVAL_VERBOSE",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        default_value_t = false
+        env = "BT_EVAL_FIRST",
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        conflicts_with = "sample"
     )]
-    pub verbose: bool,
+    pub first: Option<usize>,
 
+    /// Run a deterministic random sample of N dataset records. Marks the run as non-final.
+    #[arg(
+        long,
+        env = "BT_EVAL_SAMPLE",
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        conflicts_with = "first"
+    )]
+    pub sample: Option<usize>,
+
+    /// Seed used with --sample.
+    #[arg(
+        long = "sample-seed",
+        env = "BT_EVAL_SAMPLE_SEED",
+        value_name = "SEED",
+        requires = "sample"
+    )]
+    pub sample_seed: Option<u64>,
     /// Re-run evals when input files change.
     #[arg(
         long,
@@ -312,6 +354,17 @@ pub struct EvalArgs {
         default_value_t = false
     )]
     pub watch: bool,
+
+    /// Override one or more evaluator parameters for this run.
+    /// Accepts key=value pairs where the value is JSON (e.g. --param model='"gpt-4o"' --param enabled=true),
+    /// or a single JSON object (e.g. --param '{"model":"gpt-4o"}').
+    /// Repeat the flag to set multiple parameters.
+    #[arg(
+        long,
+        value_name = "KEY=JSON_VALUE | JSON_OBJECT",
+        allow_hyphen_values = true
+    )]
+    pub param: Vec<String>,
 
     /// Arguments forwarded to the eval file via process.argv (everything after `--`).
     /// Example: bt eval foo.eval.ts -- --description "Prod" --shard=1/4
@@ -350,6 +403,13 @@ pub struct EvalArgs {
     pub dev_allowed_origin: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalSamplingMode {
+    Full,
+    First { count: usize },
+    Sample { count: usize, seed: u64 },
+}
+
 #[derive(Debug, Clone)]
 struct EvalRunOptions {
     jsonl: bool,
@@ -357,8 +417,10 @@ struct EvalRunOptions {
     num_workers: Option<usize>,
     list: bool,
     filter: Vec<String>,
+    sampling: EvalSamplingMode,
     verbose: bool,
     extra_args: Vec<String>,
+    params: Vec<String>,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
@@ -379,14 +441,27 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     }
     validate_eval_input_files(&files)?;
 
+    let sampling = if let Some(first) = args.first {
+        EvalSamplingMode::First { count: first }
+    } else if let Some(sample) = args.sample {
+        EvalSamplingMode::Sample {
+            count: sample,
+            seed: args.sample_seed.unwrap_or(DEFAULT_EVAL_SAMPLE_SEED),
+        }
+    } else {
+        EvalSamplingMode::Full
+    };
+
     let options = EvalRunOptions {
         jsonl: args.jsonl,
         terminate_on_failure: args.terminate_on_failure,
         num_workers: args.num_workers,
         list: args.list,
         filter: args.filter,
-        verbose: args.verbose,
+        verbose: base.verbose,
+        sampling,
         extra_args: args.extra_args,
+        params: args.param,
     };
 
     if args.dev {
@@ -744,6 +819,16 @@ async fn spawn_eval_runner(
             serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
         cmd.env("BT_EVAL_FILTER_PARSED", serialized);
     }
+    match options.sampling {
+        EvalSamplingMode::Full => {}
+        EvalSamplingMode::First { count } => {
+            cmd.env("BT_EVAL_FIRST", count.to_string());
+        }
+        EvalSamplingMode::Sample { count, seed } => {
+            cmd.env("BT_EVAL_SAMPLE", count.to_string());
+            cmd.env("BT_EVAL_SAMPLE_SEED", seed.to_string());
+        }
+    }
     if language == EvalLanguage::JavaScript && force_esm {
         cmd.env("BT_EVAL_FORCE_ESM", "1");
     }
@@ -761,6 +846,12 @@ async fn spawn_eval_runner(
         let serialized =
             serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
         cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
+    }
+    if !options.params.is_empty() {
+        let parsed = parse_eval_params(&options.params)?;
+        let serialized =
+            serde_json::to_string(&parsed).context("failed to serialize eval params")?;
+        cmd.env("BT_EVAL_PARAMS_JSON", serialized);
     }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
@@ -1091,26 +1182,33 @@ async fn authenticate_dev_request(
 
     let payload = response.json::<Value>().await.unwrap_or(Value::Null);
     if let Some(orgs) = payload.get("org_info").and_then(|value| value.as_array()) {
-        let matched = orgs.iter().any(|org| {
+        let matched_org = orgs.iter().find(|org| {
             org.get("name")
                 .and_then(|name| name.as_str())
                 .map(|name| name == org_name)
                 .unwrap_or(false)
         });
-        if !matched {
+        let Some(matched_org) = matched_org else {
             return Err(json_error_response(
                 actix_web::http::StatusCode::UNAUTHORIZED,
                 "Unauthorized",
             ));
-        }
+        };
+        let api_url = matched_org
+            .get("api_url")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        Ok(DevAuthContext {
+            token,
+            org_name,
+            api_url,
+        })
     } else {
-        return Err(json_error_response(
+        Err(json_error_response(
             actix_web::http::StatusCode::UNAUTHORIZED,
             "Unauthorized",
-        ));
+        ))
     }
-
-    Ok(DevAuthContext { token, org_name })
 }
 
 async fn resolve_dataset_ref_for_eval_request(
@@ -1225,6 +1323,9 @@ fn make_dev_mode_env(
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
+    if let Some(api_url) = auth.api_url.as_ref() {
+        env.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
+    }
     if let Some(request) = request {
         let serialized =
             serde_json::to_string(request).context("failed to serialize eval request payload")?;
@@ -1696,6 +1797,33 @@ type WatchState = HashMap<PathBuf, Option<WatchEntry>>;
 
 fn resolve_watch_paths(files: &[String]) -> Result<Vec<PathBuf>> {
     normalize_watch_paths(files.iter().map(PathBuf::from))
+}
+
+fn parse_eval_params(params: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut result = serde_json::Map::new();
+    for param in params {
+        let trimmed = param.trim();
+        if trimmed.starts_with('{') {
+            let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(trimmed)
+                .with_context(|| format!("--param value is not a valid JSON object: {param}"))?;
+            result.extend(parsed);
+        } else {
+            let eq_pos = trimmed.find('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--param value must be in key=JSON_VALUE format or a JSON object: {param}"
+                )
+            })?;
+            let key = &trimmed[..eq_pos];
+            if key.is_empty() {
+                anyhow::bail!("--param key must not be empty: {param}");
+            }
+            let value_str = &trimmed[eq_pos + 1..];
+            let value: serde_json::Value = serde_json::from_str(value_str)
+                .unwrap_or_else(|_| serde_json::Value::String(value_str.to_string()));
+            result.insert(key.to_string(), value);
+        }
+    }
+    Ok(result)
 }
 
 fn parse_eval_filter_expression(expression: &str) -> Result<RunnerFilter> {
@@ -2554,6 +2682,16 @@ struct ExperimentSummary {
     comparison_experiment_name: Option<String>,
     scores: HashMap<String, ScoreSummary>,
     metrics: Option<HashMap<String, MetricSummary>>,
+    #[serde(default)]
+    run_mode: Option<String>,
+    #[serde(default)]
+    is_final: Option<bool>,
+    #[serde(default)]
+    run_label: Option<String>,
+    #[serde(default)]
+    sample_count: Option<u64>,
+    #[serde(default)]
+    sample_seed: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2732,7 +2870,7 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
 
 struct EvalUi {
     progress: MultiProgress,
-    bars: HashMap<String, ProgressBar>,
+    bars: HashMap<String, EvalBarState>,
     bar_style: ProgressStyle,
     spinner_style: ProgressStyle,
     jsonl: bool,
@@ -2741,6 +2879,12 @@ struct EvalUi {
     deferred_errors: Vec<String>,
     suppressed_stderr_lines: usize,
     finished: bool,
+}
+
+struct EvalBarState {
+    bar: ProgressBar,
+    pending_total: Option<u64>,
+    last_total_update: Option<std::time::Instant>,
 }
 
 impl EvalUi {
@@ -2755,7 +2899,10 @@ impl EvalUi {
         let bar_style =
             ProgressStyle::with_template("{bar:10.blue} {msg} {percent}% {pos}/{len} {eta}")
                 .unwrap();
-        let spinner_style = ProgressStyle::with_template("{spinner} {msg}").unwrap();
+        let spinner_style = ProgressStyle::default_spinner()
+            .tick_strings(EVAL_SPINNER_TICK_STRINGS)
+            .template("{spinner:.cyan} {msg}")
+            .unwrap();
         Self {
             progress,
             bars: HashMap::new(),
@@ -2774,8 +2921,8 @@ impl EvalUi {
         if self.finished {
             return;
         }
-        for (_, bar) in self.bars.drain() {
-            bar.finish_and_clear();
+        for (_, state) in self.bars.drain() {
+            state.bar.finish_and_clear();
         }
         let _ = self.progress.clear();
         self.progress.set_draw_target(ProgressDrawTarget::hidden());
@@ -2853,43 +3000,133 @@ impl EvalUi {
         match payload.kind.as_str() {
             "start" => {
                 let bar = if let Some(total) = payload.total {
-                    if total > 0 {
+                    if total >= EVAL_MIN_DETERMINATE_TOTAL {
                         let bar = self.progress.add(ProgressBar::new(total));
                         bar.set_style(self.bar_style.clone());
                         bar
                     } else {
                         let bar = self.progress.add(ProgressBar::new_spinner());
                         bar.set_style(self.spinner_style.clone());
+                        if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                            bar.enable_steady_tick(Duration::from_millis(80));
+                        }
                         bar
                     }
                 } else {
                     let bar = self.progress.add(ProgressBar::new_spinner());
                     bar.set_style(self.spinner_style.clone());
+                    if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                        bar.enable_steady_tick(Duration::from_millis(80));
+                    }
                     bar
                 };
                 bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
-                self.bars.insert(progress.name.clone(), bar);
+                let last_total_update = if bar.length().is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                self.bars.insert(
+                    progress.name.clone(),
+                    EvalBarState {
+                        bar,
+                        pending_total: None,
+                        last_total_update,
+                    },
+                );
             }
             "increment" => {
-                if let Some(bar) = self.bars.get(&progress.name) {
-                    bar.inc(1);
-                    bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
+                if let Some(state) = self.bars.get_mut(&progress.name) {
+                    state.bar.inc(1);
+                    state
+                        .bar
+                        .set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
+                    Self::ensure_total_not_below_position(state, &self.bar_style);
+                    Self::maybe_apply_pending_total(state, &self.bar_style, false);
                 }
             }
             "set_total" => {
-                if let Some(bar) = self.bars.get(&progress.name) {
+                if let Some(state) = self.bars.get_mut(&progress.name) {
                     if let Some(total) = payload.total {
-                        bar.set_length(total);
-                        bar.set_style(self.bar_style.clone());
+                        let target = total.max(state.bar.position());
+                        state.pending_total = Some(
+                            state
+                                .pending_total
+                                .map_or(target, |pending| pending.max(target)),
+                        );
+                        let force_apply = state.bar.length().is_none();
+                        Self::maybe_apply_pending_total(state, &self.bar_style, force_apply);
                     }
                 }
             }
             "stop" => {
-                if let Some(bar) = self.bars.remove(&progress.name) {
-                    bar.finish_and_clear();
+                if let Some(mut state) = self.bars.remove(&progress.name) {
+                    Self::maybe_apply_pending_total(&mut state, &self.bar_style, true);
+                    state.bar.finish_and_clear();
                 }
             }
             _ => {}
+        }
+    }
+
+    fn min_total_update_step(current_total: u64) -> u64 {
+        EVAL_TOTAL_SMOOTH_MIN_STEP.max(current_total / EVAL_TOTAL_SMOOTH_DELTA_DIVISOR)
+    }
+
+    fn should_apply_total_update(state: &EvalBarState, target_total: u64) -> bool {
+        let current_total = state.bar.length().unwrap_or(0);
+        if current_total == 0 {
+            return true;
+        }
+        let delta = target_total.saturating_sub(current_total);
+        if delta >= Self::min_total_update_step(current_total) {
+            return true;
+        }
+        state
+            .last_total_update
+            .map(|instant| instant.elapsed() >= EVAL_TOTAL_SMOOTH_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    fn apply_total_update(state: &mut EvalBarState, style: &ProgressStyle, total: u64) {
+        let clamped = total.max(state.bar.position());
+        state.bar.disable_steady_tick();
+        state.bar.set_length(clamped);
+        state.bar.set_style(style.clone());
+        state.last_total_update = Some(std::time::Instant::now());
+    }
+
+    fn maybe_apply_pending_total(state: &mut EvalBarState, style: &ProgressStyle, force: bool) {
+        let mut target_total = match state.pending_total {
+            Some(total) => total,
+            None => return,
+        };
+
+        target_total = target_total.max(state.bar.position());
+        if state.bar.length().is_none() && target_total < EVAL_MIN_DETERMINATE_TOTAL {
+            return;
+        }
+        let current_total = state.bar.length().unwrap_or(0);
+        if target_total <= current_total {
+            state.pending_total = None;
+            return;
+        }
+
+        if force || Self::should_apply_total_update(state, target_total) {
+            Self::apply_total_update(state, style, target_total);
+            state.pending_total = None;
+        }
+    }
+
+    fn ensure_total_not_below_position(state: &mut EvalBarState, style: &ProgressStyle) {
+        if let Some(total) = state.bar.length() {
+            let position = state.bar.position();
+            if position > total {
+                Self::apply_total_update(state, style, position);
+                if let Some(pending_total) = state.pending_total {
+                    state.pending_total = Some(pending_total.max(position));
+                }
+            }
         }
     }
 
@@ -3034,6 +3271,15 @@ fn format_start_line(start: &ExperimentStart) -> Option<String> {
 
 fn format_experiment_summary(summary: &ExperimentSummary) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    if let Some(run_label) = summary.run_label.as_deref() {
+        let line = if summary.is_final == Some(false) {
+            run_label.yellow().to_string()
+        } else {
+            run_label.to_string()
+        };
+        parts.push(line);
+    }
 
     if let Some(comparison) = summary.comparison_experiment_name.as_deref() {
         let line = format!(
@@ -3495,6 +3741,24 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    fn eval_progress_event(name: &str, kind: &str, total: Option<u64>) -> SseProgressEventData {
+        SseProgressEventData {
+            id: format!("id-{kind}"),
+            object_type: "task".to_string(),
+            origin: None,
+            format: "global".to_string(),
+            output_type: "any".to_string(),
+            name: name.to_string(),
+            event: "progress".to_string(),
+            data: serde_json::json!({
+                "type": "eval_progress",
+                "kind": kind,
+                "total": total,
+            })
+            .to_string(),
+        }
     }
 
     #[test]
@@ -4133,6 +4397,78 @@ mod tests {
     }
 
     #[test]
+    fn eval_ui_preserves_spinner_increments_before_set_total() {
+        let mut ui = EvalUi::new(false, false, false);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(10)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(bar.bar.position(), 2);
+        assert_eq!(bar.bar.length(), Some(10));
+
+        ui.finish();
+    }
+
+    #[test]
+    fn eval_ui_never_sets_total_below_position() {
+        let mut ui = EvalUi::new(false, false, false);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", Some(1)));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(1)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert!(
+            bar.bar
+                .length()
+                .expect("determinate bar should have a total")
+                >= bar.bar.position()
+        );
+
+        ui.finish();
+    }
+
+    #[test]
+    fn eval_ui_keeps_spinner_until_total_exceeds_one() {
+        let mut ui = EvalUi::new(false, false, false);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(1)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(bar.bar.length(), None, "total=1 should remain spinner mode");
+
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(2)));
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(
+            bar.bar.length(),
+            Some(2),
+            "total>1 should become determinate"
+        );
+
+        ui.finish();
+    }
+
+    #[test]
     fn format_processing_line_handles_pluralization() {
         assert_eq!(format_processing_line(1), "Processing 1 evaluator...");
         assert_eq!(format_processing_line(2), "Processing 2 evaluators...");
@@ -4229,6 +4565,121 @@ mod tests {
     }
 
     #[test]
+    fn handle_sse_event_parses_summary_run_metadata() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(
+            Some("summary".to_string()),
+            r#"{
+              "projectName":"Topics",
+              "experimentName":"sample-run",
+              "scores":{},
+              "runMode":"sample",
+              "isFinal":false,
+              "runLabel":"Run mode: random sample of 20 examples (seed 7, non-final smoke run)",
+              "sampleCount":20,
+              "sampleSeed":7
+            }"#
+            .to_string(),
+            &tx,
+        );
+
+        match rx.try_recv().expect("summary event should be emitted") {
+            EvalEvent::Summary(summary) => {
+                assert_eq!(summary.run_mode.as_deref(), Some("sample"));
+                assert_eq!(summary.is_final, Some(false));
+                assert_eq!(
+                    summary.run_label.as_deref(),
+                    Some("Run mode: random sample of 20 examples (seed 7, non-final smoke run)")
+                );
+                assert_eq!(summary.sample_count, Some(20));
+                assert_eq!(summary.sample_seed, Some(7));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_experiment_summary_includes_run_label() {
+        let summary = ExperimentSummary {
+            project_name: "Demo".to_string(),
+            experiment_name: "sample-run".to_string(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: None,
+            scores: HashMap::new(),
+            metrics: None,
+            run_mode: Some("first".to_string()),
+            is_final: Some(false),
+            run_label: Some("Run mode: first 20 examples (non-final smoke run)".to_string()),
+            sample_count: Some(20),
+            sample_seed: None,
+        };
+
+        let rendered = format_experiment_summary(&summary);
+        assert!(rendered.contains("Run mode: first 20 examples (non-final smoke run)"));
+    }
+
+    #[test]
+    fn parse_eval_params_handles_key_value_pairs() {
+        let params = vec![
+            r#"myModel="gpt-4o""#.to_string(),
+            "enabled=true".to_string(),
+            "count=42".to_string(),
+        ];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["myModel"], serde_json::json!("gpt-4o"));
+        assert_eq!(result["enabled"], serde_json::json!(true));
+        assert_eq!(result["count"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn parse_eval_params_handles_json_object() {
+        let params = vec![r#"{"myModel":"gpt-4o","enabled":true}"#.to_string()];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["myModel"], serde_json::json!("gpt-4o"));
+        assert_eq!(result["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn parse_eval_params_last_key_value_wins() {
+        let params = vec![
+            r#"model="first""#.to_string(),
+            r#"model="second""#.to_string(),
+        ];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["model"], serde_json::json!("second"));
+    }
+
+    #[test]
+    fn parse_eval_params_treats_non_json_value_as_string() {
+        let params = vec!["model=gpt-4o".to_string()];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["model"], serde_json::json!("gpt-4o"));
+    }
+
+    #[test]
+    fn parse_eval_params_rejects_missing_equals() {
+        let params = vec!["modelonly".to_string()];
+        let err = parse_eval_params(&params).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key=JSON_VALUE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_eval_params_rejects_empty_key() {
+        let params = vec![r#"="value""#.to_string()];
+        let err = parse_eval_params(&params).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn parse_eval_filter_expression_splits_path_and_pattern() {
         let parsed =
             parse_eval_filter_expression("metadata.case=smoke.*").expect("parse should succeed");
@@ -4261,6 +4712,52 @@ mod tests {
     }
 
     #[test]
+    fn eval_args_parse_first_sampling_flag() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+
+        let parsed = EvalArgsHarness::try_parse_from(["bt", "--first", "20", "sample.eval.ts"])
+            .expect("first flag should parse");
+        assert_eq!(parsed.eval.first, Some(20));
+        assert_eq!(parsed.eval.sample, None);
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
+    fn eval_args_parse_sample_and_seed_flags() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+
+        let parsed = EvalArgsHarness::try_parse_from([
+            "bt",
+            "--sample",
+            "20",
+            "--sample-seed",
+            "7",
+            "sample.eval.ts",
+        ])
+        .expect("sample flags should parse");
+        assert_eq!(parsed.eval.sample, Some(20));
+        assert_eq!(parsed.eval.sample_seed, Some(7));
+        assert_eq!(parsed.eval.first, None);
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
     fn eval_args_from_env_populates_supported_fields() {
         let _guard = env_test_lock()
             .lock()
@@ -4271,7 +4768,9 @@ mod tests {
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
-            "BT_EVAL_VERBOSE",
+            "BT_EVAL_FIRST",
+            "BT_EVAL_SAMPLE",
+            "BT_EVAL_SAMPLE_SEED",
             "BT_EVAL_WATCH",
             "BT_EVAL_DEV",
             "BT_EVAL_DEV_HOST",
@@ -4285,7 +4784,6 @@ mod tests {
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
-        set_env_var("BT_EVAL_VERBOSE", "1");
         set_env_var("BT_EVAL_WATCH", "on");
         set_env_var("BT_EVAL_DEV", "true");
         set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
@@ -4305,7 +4803,6 @@ mod tests {
                 "metadata.kind=fast".to_string()
             ]
         );
-        assert!(parsed.eval.verbose);
         assert!(parsed.eval.watch);
         assert!(parsed.eval.dev);
         assert_eq!(parsed.eval.dev_host, "127.0.0.1");

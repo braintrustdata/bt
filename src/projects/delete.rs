@@ -3,7 +3,8 @@ use dialoguer::Confirm;
 
 use crate::http::ApiClient;
 use crate::ui::{
-    is_interactive, print_command_status, select_project_interactive, with_spinner, CommandStatus,
+    is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
+    ProjectSelectMode,
 };
 
 use super::api;
@@ -21,13 +22,7 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<
             if !is_interactive() {
                 bail!("project name required. Use: bt projects delete <name>");
             }
-            let name = select_project_interactive(client, None, None).await?;
-            with_spinner(
-                "Loading project...",
-                api::get_project_by_name(client, &name),
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("project '{name}' not found"))?
+            select_project(client, None, None, ProjectSelectMode::ExistingOnly).await?
         }
     };
 

@@ -7,7 +7,7 @@ use crate::http::ApiClient;
 
 pub(crate) mod api;
 pub(crate) mod context;
-mod create;
+pub(crate) mod create;
 mod delete;
 mod list;
 mod view;

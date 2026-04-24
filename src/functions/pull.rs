@@ -238,7 +238,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             materializable.push(row);
         } else {
             summary.unsupported_records_skipped += 1;
-            if args.verbose {
+            if base.verbose {
                 eprintln!(
                     "{} skipping '{}' because it is not a prompt",
                     style("warning:").yellow(),
@@ -415,7 +415,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             }
         }
     }
-    emit_summary(&base, &summary, args.verbose)?;
+    emit_summary(&base, &summary, base.verbose)?;
     if failure {
         bail!("functions pull failed; see summary for details");
     }
@@ -1612,7 +1612,6 @@ mod tests {
             id: Some("missing".to_string()),
             version: None,
             force: false,
-            verbose: false,
         };
 
         let err = apply_selector_narrowing(vec![row], &args).expect_err("should fail");
@@ -1668,7 +1667,6 @@ mod tests {
             id: None,
             version: None,
             force: false,
-            verbose: false,
         };
 
         let narrowed = apply_selector_narrowing(rows, &args).expect("should narrow");

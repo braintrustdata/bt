@@ -151,6 +151,12 @@ Use `--` to forward extra arguments to the eval file via `process.argv`:
 bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 ```
 
+**Sampling modes:**
+
+- `bt eval --first 20 qa.eval.ts` — run the first 20 examples and clearly label the summary as a non-final smoke run.
+- `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
+- If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
+
 ## `bt sql`
 
 - Runs interactively on TTY by default.
@@ -239,10 +245,11 @@ Local transaction-id conversion helpers:
 
 Auth resolution order for commands is:
 
-1. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
-2. `--profile` or `BRAINTRUST_PROFILE`
-3. Org-based profile match (profile whose org matches `--org`/config org)
-4. Single-profile auto-select (if only one profile exists)
+1. Explicit `--profile`
+2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
+3. `BRAINTRUST_PROFILE`
+4. Org-based profile match (profile whose org matches `--org`/config org)
+5. Single-profile auto-select (if only one profile exists)
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
 
@@ -299,7 +306,7 @@ Use setup/docs commands to configure coding-agent skills and workflow docs for B
 
 Current behavior:
 
-- Supported agents: `claude`, `codex`, `cursor`, `opencode`.
+- Supported agents: `claude`, `codex`, `cursor`, `gemini`, `opencode`.
 - If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
 - In interactive TTY mode, skills setup shows a checklist so you can select/deselect agents before install.
 - In interactive TTY mode, setup also shows a workflow checklist and prefetches those docs automatically.
@@ -312,6 +319,7 @@ Current behavior:
 - Use `--refresh-docs` in setup (or `bt docs fetch --refresh`) to clear old docs before re-fetching.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
+- Gemini integration symlinks `.gemini/skills` to `.agents/skills/braintrust/SKILL.md`.
 - Cursor integration installs `.cursor/rules/braintrust.mdc` with the same shared Braintrust guidance plus an auto-generated command-reference excerpt from this README.
 - Setup-time docs prefetch writes to `.bt/skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `.bt/skills/docs/README.md` and per-section `.bt/skills/docs/<section>/_index.md` (or the global equivalents under `~/.config/bt/skills/docs`).

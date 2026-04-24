@@ -1,0 +1,4 @@
+{
+  "files": ["params-json-obj.eval.mjs"],
+  "args": ["--param", "{\"model\":\"gpt-4o\",\"count\":5}"]
+}

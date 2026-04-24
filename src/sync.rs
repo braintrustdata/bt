@@ -115,10 +115,6 @@ struct PullArgs {
     /// Include stored vectors in pulled rows so a subsequent push can re-ingest them.
     #[arg(long)]
     include_vectors: bool,
-
-    /// Print each BTQL query and timing information.
-    #[arg(long, env = "BT_SYNC_VERBOSE")]
-    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -544,7 +540,15 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
         SyncCommand::Pull(pull) => {
             let ctx = login(&base).await?;
             let client = ApiClient::new(&ctx)?;
-            run_pull(base.json, &ctx, &client, project.as_deref(), pull).await
+            run_pull(
+                base.json,
+                base.verbose,
+                &ctx,
+                &client,
+                project.as_deref(),
+                pull,
+            )
+            .await
         }
         SyncCommand::Push(push) => {
             let ctx = login(&base).await?;
@@ -557,6 +561,7 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
 
 async fn run_pull(
     json_output: bool,
+    verbose: bool,
     ctx: &LoginContext,
     client: &ApiClient,
     project_selector: Option<&str>,
@@ -705,7 +710,6 @@ async fn run_pull(
         Some(RunStatus::Running),
     )?;
     let btql_retry_tracker = Arc::new(BtqlRetryTracker::default());
-    let verbose = args.verbose;
 
     match scope {
         ScopeArg::Spans => {

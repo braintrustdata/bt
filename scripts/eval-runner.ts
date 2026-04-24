@@ -116,8 +116,12 @@ type RunnerConfig = {
   list: boolean;
   terminateOnFailure: boolean;
   filters: EvalFilter[];
+  first: number | null;
+  sample: number | null;
+  sampleSeed: number | null;
   devMode: "list" | "eval" | null;
   devRequestJson: string | null;
+  params: Record<string, unknown> | null;
 };
 
 type EvalRunner = {
@@ -253,14 +257,107 @@ function parseDevMode(value: string | undefined): "list" | "eval" | null {
   throw new Error(`Invalid BT_EVAL_DEV_MODE value: ${value}`);
 }
 
+function parsePositiveIntegerEnv(name: string): number | null {
+  const value = process.env[name];
+  if (!value) {
+    return null;
+  }
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function parseIntegerEnv(name: string): number | null {
+  const value = process.env[name];
+  if (!value) {
+    return null;
+  }
+  if (!/^-?[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be an integer.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be an integer.`);
+  }
+  return parsed;
+}
+
+function parseParamsJson(
+  raw: string | undefined,
+): Record<string, unknown> | null {
+  if (!raw) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`BT_EVAL_PARAMS_JSON is not valid JSON: ${raw}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("BT_EVAL_PARAMS_JSON must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function getDeclaredParameterKeys(parameters: unknown): Set<string> | null {
+  if (!isObject(parameters)) {
+    return null;
+  }
+  if (Reflect.get(parameters, "__braintrust_parameters_marker") === true) {
+    const schema = Reflect.get(parameters, "schema");
+    if (isObject(schema)) {
+      const properties = Reflect.get(schema, "properties");
+      if (isObject(properties)) {
+        return new Set(Object.keys(properties));
+      }
+    }
+    return null;
+  }
+  if (isObject(Reflect.get(parameters, "schema"))) {
+    const schema = Reflect.get(parameters, "schema") as Record<string, unknown>;
+    const properties = Reflect.get(schema, "properties");
+    if (isObject(properties)) {
+      return new Set(Object.keys(properties));
+    }
+  }
+  return new Set(Object.keys(parameters));
+}
+
+function filterParamsForEvaluator(
+  params: Record<string, unknown>,
+  evaluatorParameters: unknown,
+): Record<string, unknown> {
+  const declared = getDeclaredParameterKeys(evaluatorParameters);
+  if (declared === null) {
+    return params;
+  }
+  const filtered: Record<string, unknown> = {};
+  for (const key of Object.keys(params)) {
+    if (declared.has(key)) {
+      filtered[key] = params[key];
+    }
+  }
+  return filtered;
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
+    first: parsePositiveIntegerEnv("BT_EVAL_FIRST"),
+    sample: parsePositiveIntegerEnv("BT_EVAL_SAMPLE"),
+    sampleSeed: parseIntegerEnv("BT_EVAL_SAMPLE_SEED"),
     devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
     devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
+    params: parseParamsJson(process.env.BT_EVAL_PARAMS_JSON),
   };
 }
 
@@ -1487,6 +1584,244 @@ function resolveEvalData(
   throw new Error("Invalid eval data payload.");
 }
 
+type SamplingMetadata = {
+  runMode: "full" | "first" | "sample";
+  isFinal: boolean;
+  runLabel: string;
+  sampleCount?: number;
+  sampleSeed?: number;
+};
+
+function samplingMetadata(config: RunnerConfig): SamplingMetadata {
+  if (config.first !== null) {
+    return {
+      runMode: "first",
+      isFinal: false,
+      runLabel: `Run mode: first ${config.first} examples (non-final smoke run)`,
+      sampleCount: config.first,
+    };
+  }
+  if (config.sample !== null) {
+    const seed = config.sampleSeed ?? 0;
+    return {
+      runMode: "sample",
+      isFinal: false,
+      runLabel: `Run mode: random sample of ${config.sample} examples (seed ${seed}, non-final smoke run)`,
+      sampleCount: config.sample,
+      sampleSeed: seed,
+    };
+  }
+  return {
+    runMode: "full",
+    isFinal: true,
+    runLabel: "Run mode: full dataset",
+  };
+}
+
+function attachSamplingSummary(
+  summary: unknown,
+  config: RunnerConfig,
+): unknown {
+  const metadata = samplingMetadata(config);
+  if (isObject(summary)) {
+    return {
+      ...summary,
+      runMode: metadata.runMode,
+      isFinal: metadata.isFinal,
+      runLabel: metadata.runLabel,
+      ...(metadata.sampleCount !== undefined
+        ? { sampleCount: metadata.sampleCount }
+        : {}),
+      ...(metadata.sampleSeed !== undefined
+        ? { sampleSeed: metadata.sampleSeed }
+        : {}),
+    };
+  }
+  return {
+    summary,
+    runMode: metadata.runMode,
+    isFinal: metadata.isFinal,
+    runLabel: metadata.runLabel,
+    ...(metadata.sampleCount !== undefined
+      ? { sampleCount: metadata.sampleCount }
+      : {}),
+    ...(metadata.sampleSeed !== undefined
+      ? { sampleSeed: metadata.sampleSeed }
+      : {}),
+  };
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, "then") === "function"
+  );
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, Symbol.asyncIterator) === "function"
+  );
+}
+
+function isIterable(value: unknown): value is Iterable<unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, Symbol.iterator) === "function"
+  );
+}
+
+function isDatasetLike(value: unknown): value is {
+  fetch: (options?: { batchSize?: number }) => AsyncIterable<unknown>;
+} {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, "fetch") === "function" &&
+    typeof Reflect.get(value, "summarize") === "function"
+  );
+}
+
+function createSeededRandom(seed: number): () => number {
+  // SplitMix64 keeps seed entropy beyond 32 bits so distinct seeds stay distinct.
+  let state = BigInt.asUintN(64, BigInt(seed));
+  return () => {
+    state = BigInt.asUintN(64, state + 0x9e3779b97f4a7c15n);
+    let z = state;
+    z = BigInt.asUintN(64, (z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n);
+    z = BigInt.asUintN(64, (z ^ (z >> 27n)) * 0x94d049bb133111ebn);
+    z = BigInt.asUintN(64, z ^ (z >> 31n));
+    return Number(z & 0x1fffffffffffffn) / 9007199254740992;
+  };
+}
+
+type SamplingSourceOptions = {
+  initialCallReceiver?: unknown;
+};
+
+async function resolveSamplingSource(
+  source: unknown,
+  options?: SamplingSourceOptions,
+): Promise<unknown> {
+  let current: unknown = source;
+  let firstCall = true;
+  while (true) {
+    current = isPromiseLike(current) ? await current : current;
+    if (typeof current !== "function") {
+      return current;
+    }
+    if (firstCall && options?.initialCallReceiver !== undefined) {
+      current = Reflect.apply(
+        current as (...args: unknown[]) => unknown,
+        options.initialCallReceiver,
+        [],
+      );
+      firstCall = false;
+      continue;
+    }
+    current = (current as () => unknown)();
+    firstCall = false;
+  }
+}
+
+async function* iterateDataSource(
+  source: unknown,
+  batchSizeHint?: number,
+  options?: SamplingSourceOptions,
+): AsyncGenerator<unknown> {
+  const resolved = await resolveSamplingSource(source, options);
+  if (Array.isArray(resolved)) {
+    for (const item of resolved) {
+      yield item;
+    }
+    return;
+  }
+  if (isDatasetLike(resolved)) {
+    const options =
+      batchSizeHint !== undefined ? { batchSize: batchSizeHint } : undefined;
+    for await (const item of resolved.fetch(options)) {
+      yield item;
+    }
+    return;
+  }
+  if (isAsyncIterable(resolved)) {
+    for await (const item of resolved) {
+      yield item;
+    }
+    return;
+  }
+  if (typeof resolved !== "string" && isIterable(resolved)) {
+    for (const item of resolved) {
+      yield item;
+    }
+    return;
+  }
+  throw new Error(
+    "Sampling is only supported for arrays, iterables, async iterables, and Braintrust datasets.",
+  );
+}
+
+async function collectFirstRecords(
+  source: unknown,
+  count: number,
+  options?: SamplingSourceOptions,
+): Promise<unknown[]> {
+  const items: unknown[] = [];
+  for await (const item of iterateDataSource(source, count, options)) {
+    items.push(item);
+    if (items.length >= count) {
+      break;
+    }
+  }
+  return items;
+}
+
+async function reservoirSampleRecords(
+  source: unknown,
+  count: number,
+  seed: number,
+  options?: SamplingSourceOptions,
+): Promise<unknown[]> {
+  const random = createSeededRandom(seed);
+  const sample: unknown[] = [];
+  let seen = 0;
+  for await (const item of iterateDataSource(source, undefined, options)) {
+    seen += 1;
+    if (sample.length < count) {
+      sample.push(item);
+      continue;
+    }
+    const index = Math.floor(random() * seen);
+    if (index < count) {
+      sample[index] = item;
+    }
+  }
+  return sample;
+}
+
+async function applySamplingToData(
+  data: unknown,
+  config: RunnerConfig,
+  options?: SamplingSourceOptions,
+): Promise<unknown> {
+  if (config.first !== null) {
+    return await collectFirstRecords(data, config.first, options);
+  }
+  if (config.sample !== null) {
+    return await reservoirSampleRecords(
+      data,
+      config.sample,
+      config.sampleSeed ?? 0,
+      options,
+    );
+  }
+  return data;
+}
+
 function convertFunctionId(
   functionId: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -1885,9 +2220,27 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   ) => {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
-    const opts = makeEvalOptions(evaluatorName, options);
-    const wrappedEvaluator = wrapTaskForStreamingProgress(evaluator);
+    // Only inject CLI params when the evaluator declares a parameters schema.
+    // Drop any --param keys the evaluator doesn't declare so a single command
+    // running multiple evaluators doesn't fail on unrelated params.
+    const filteredParams =
+      config.params != null && evaluator.parameters != null
+        ? filterParamsForEvaluator(config.params, evaluator.parameters)
+        : null;
+    const effectiveOptions =
+      filteredParams != null
+        ? mergeEvalOptions({ parameters: filteredParams }, options)
+        : options;
+    const opts = makeEvalOptions(evaluatorName, effectiveOptions);
+    const sampledData = await applySamplingToData(evaluator.data, config, {
+      initialCallReceiver: evaluator,
+    });
+    const wrappedEvaluator = wrapTaskForStreamingProgress({
+      ...evaluator,
+      data: sampledData,
+    });
     const result = await Eval(projectName, wrappedEvaluator, opts);
+    const summary = attachSamplingSummary(result.summary, config);
     const failingResults = result.results.filter(
       (r: { error?: unknown }) => r.error !== undefined,
     );
@@ -1898,9 +2251,9 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
       );
     }
     if (sse) {
-      sse.send("summary", result.summary);
+      sse.send("summary", summary);
     } else if (config.jsonl) {
-      console.log(JSON.stringify(result.summary));
+      console.log(JSON.stringify(summary));
     }
     return result;
   };
