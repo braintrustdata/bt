@@ -71,11 +71,8 @@ pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
             Ok(())
         }
         Ok(CreateProjectOutcome::Existing(_)) => {
-            print_command_status(
-                CommandStatus::Success,
-                &format!("Project '{name}' already exists"),
-            );
-            Ok(())
+            print_command_status(CommandStatus::Error, &format!("Failed to create '{name}'"));
+            bail!("project '{name}' already exists")
         }
         Err(e) => {
             print_command_status(CommandStatus::Error, &format!("Failed to create '{name}'"));
