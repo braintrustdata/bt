@@ -183,7 +183,7 @@ struct TopicMapSetArgs {
     #[arg(long = "distance-threshold")]
     distance_threshold: Option<f64>,
 
-    /// Whether to disable reconciliation against the previous saved report
+    /// Whether to disable reconciliation against the previously saved report
     #[arg(long = "disable-reconciliation")]
     disable_reconciliation: Option<bool>,
 
