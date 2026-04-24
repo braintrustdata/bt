@@ -4745,17 +4745,16 @@ mod tests {
     }
 
     #[test]
-    fn setup_intro_prints_for_default_setup_quiet_mode() {
-        let mut base = make_base_args();
-        base.quiet = true;
-        assert!(should_print_setup_wizard_intro(&base));
-    }
+    fn should_print_setup_wizard_intro_logic() {
+        assert!(should_print_setup_wizard_intro(&make_base_args()));
 
-    #[test]
-    fn setup_intro_hides_for_explicit_quiet_mode() {
         let mut base = make_base_args();
         base.quiet = true;
         base.quiet_source = Some(ArgValueSource::CommandLine);
+        assert!(!should_print_setup_wizard_intro(&base));
+
+        let mut base = make_base_args();
+        base.json = true;
         assert!(!should_print_setup_wizard_intro(&base));
     }
 

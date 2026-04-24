@@ -215,7 +215,6 @@ fn setup_verbose_prints_agent_summary() {
 fn setup_json_emits_structured_report() {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");
-    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     write_executable(&bin_dir.path().join("codex"));
 
@@ -224,7 +223,6 @@ fn setup_json_emits_structured_report() {
     let assert = cmd
         .current_dir(repo.path())
         .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
         .args(["setup", "--json", "--global", "--no-workflow", "--no-input"])
         .assert()
@@ -234,7 +232,10 @@ fn setup_json_emits_structured_report() {
     let report: Value = serde_json::from_slice(&output.stdout).expect("parse setup JSON");
     assert_eq!(report["scope"], "global");
     assert_eq!(report["selected_agents"], serde_json::json!(["codex"]));
-    assert!(report["results"].is_array());
+    assert!(!report["results"]
+        .as_array()
+        .expect("results array")
+        .is_empty());
 }
 
 #[test]
