@@ -373,7 +373,8 @@ struct DetectionSignal {
 
 #[derive(Debug, Serialize)]
 struct SetupJsonReport {
-    scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
     selected_agents: Vec<Agent>,
     detected_agents: Vec<DetectionSignal>,
     results: Vec<AgentInstallResult>,
@@ -965,10 +966,7 @@ async fn run_setup_flow(
     }
     if json_output {
         let report = SetupJsonReport {
-            scope: json_scope
-                .unwrap_or(InstallScope::Global)
-                .as_str()
-                .to_string(),
+            scope: json_scope.map(|scope| scope.as_str().to_string()),
             selected_agents: json_selected_agents,
             detected_agents: json_detected_agents,
             results: json_results,
@@ -1735,7 +1733,7 @@ async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
     let outcome = execute_skills_setup(&base, &args, false).await?;
     if base.json {
         let report = SetupJsonReport {
-            scope: outcome.scope.as_str().to_string(),
+            scope: Some(outcome.scope.as_str().to_string()),
             selected_agents: outcome.selected_agents,
             detected_agents: outcome.detected_agents,
             results: outcome.results,
@@ -2104,7 +2102,7 @@ async fn run_instrument_setup(
 
     if base.json {
         let report = SetupJsonReport {
-            scope: InstallScope::Local.as_str().to_string(),
+            scope: Some(InstallScope::Local.as_str().to_string()),
             selected_agents: vec![selected],
             detected_agents: detected,
             results: results.clone(),
@@ -2901,7 +2899,7 @@ async fn run_mcp_setup(mut base: BaseArgs, args: AgentsMcpSetupArgs) -> Result<(
 
     if base.json {
         let report = SetupJsonReport {
-            scope: scope.as_str().to_string(),
+            scope: Some(scope.as_str().to_string()),
             selected_agents,
             detected_agents: detected,
             results: outcome.results,

@@ -239,6 +239,39 @@ fn setup_json_emits_structured_report() {
 }
 
 #[test]
+fn setup_json_omits_scope_for_no_op_run() {
+    let repo = make_git_repo();
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    let assert = cmd
+        .current_dir(repo.path())
+        .args([
+            "setup",
+            "--json",
+            "--no-skills",
+            "--no-mcp",
+            "--no-instrument",
+            "--no-input",
+        ])
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse setup JSON");
+    let report = report.as_object().expect("setup JSON object");
+    assert!(!report.contains_key("scope"));
+    assert_eq!(
+        report
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("results array")
+            .len(),
+        0
+    );
+}
+
+#[test]
 fn setup_no_instrument_does_not_require_auth_in_git_repo() {
     let repo = make_git_repo();
     let nested = repo.path().join("nested");
