@@ -270,6 +270,15 @@ pub(crate) struct PushArgs {
     )]
     pub file_flag: Vec<PathBuf>,
 
+    /// Push raw JSON function definitions, skipping the SDK runner.
+    #[arg(
+        long = "manifest",
+        env = "BT_FUNCTIONS_PUSH_MANIFEST",
+        value_name = "PATH",
+        conflicts_with_all = ["files", "file_flag"]
+    )]
+    pub manifest: Option<PathBuf>,
+
     /// Behavior when a function with the same slug already exists.
     #[arg(
         long = "if-exists",
@@ -685,6 +694,35 @@ mod tests {
         let err = parse(&["functions", "push", "--type", "tool"]).expect_err("should fail");
         let msg = err.to_string();
         assert!(msg.contains("--type"));
+    }
+
+    #[test]
+    fn push_manifest_flag_parses() {
+        let _guard = test_lock();
+        let parsed =
+            parse(&["functions", "push", "--manifest", "fn.json"]).expect("parse push manifest");
+        let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
+            panic!("expected push command");
+        };
+        assert_eq!(
+            push.manifest,
+            Some(std::path::PathBuf::from("fn.json")),
+            "manifest path should be parsed"
+        );
+        assert!(push.files.is_empty());
+        assert!(push.file_flag.is_empty());
+    }
+
+    #[test]
+    fn push_manifest_conflicts_with_file_path() {
+        let _guard = test_lock();
+        let err = parse(&["functions", "push", "--manifest", "fn.json", "extra.ts"])
+            .expect_err("manifest+file path should conflict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manifest") || msg.contains("--manifest") || msg.contains("conflict"),
+            "expected conflict-related error, got: {msg}"
+        );
     }
 
     #[test]
