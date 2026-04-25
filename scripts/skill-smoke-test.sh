@@ -16,7 +16,7 @@ Usage:
   scripts/skill-smoke-test.sh [options]
 
 Options:
-  --agent <name>         Agent to install (claude|codex|cursor|gemini|opencode). Default: codex
+  --agent <name>         Agent to install (claude|codex|cursor|gemini|opencode|qwen). Default: codex
   --bt-bin <path>        bt binary path. Default: bt
   --demo-dir <path>      Demo repo directory. Default: create temp dir
   --agent-cmd <command>  Command to run the agent after scaffold (optional)
@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-  claude|codex|cursor|gemini|opencode) ;;
+  claude|codex|cursor|gemini|opencode|qwen) ;;
   *)
     echo "Unsupported --agent value: $AGENT" >&2
     exit 2
@@ -175,6 +175,9 @@ find_skill_path() {
     gemini)
       echo ".gemini/skills/braintrust/SKILL.md"
       ;;
+    qwen)
+      echo ".qwen/skills/braintrust/SKILL.md"
+      ;;
   esac
 }
 
@@ -211,7 +214,7 @@ verify_demo() {
       [[ -n "$line" ]] && changed_user_files+=("$line")
     done < <(
       printf '%s\n' "${changed_files[@]}" \
-        | rg -v '^(\.claude/|\.agents/|\.cursor/|skills/docs/|AGENT_TASK\.md$)' || true
+        | rg -v '^(\.claude/|\.agents/|\.cursor/|\.qwen/|skills/docs/|AGENT_TASK\.md$)' || true
     )
   fi
 

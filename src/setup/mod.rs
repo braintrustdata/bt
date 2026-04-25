@@ -36,12 +36,13 @@ const BT_README: &str = include_str!("../../README.md");
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
     "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
 ];
-const ALL_AGENTS: [Agent; 5] = [
+const ALL_AGENTS: [Agent; 6] = [
     Agent::Claude,
     Agent::Codex,
     Agent::Cursor,
     Agent::Gemini,
     Agent::Opencode,
+    Agent::Qwen,
 ];
 const ALL_WORKFLOWS: [WorkflowArg; 5] = [
     WorkflowArg::Instrument,
@@ -267,6 +268,7 @@ enum AgentArg {
     Cursor,
     Gemini,
     Opencode,
+    Qwen,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize)]
@@ -277,6 +279,7 @@ enum Agent {
     Cursor,
     Gemini,
     Opencode,
+    Qwen,
 }
 
 impl Agent {
@@ -287,6 +290,7 @@ impl Agent {
             Agent::Cursor => "cursor",
             Agent::Gemini => "gemini",
             Agent::Opencode => "opencode",
+            Agent::Qwen => "qwen",
         }
     }
 
@@ -297,6 +301,7 @@ impl Agent {
             Agent::Cursor => "Cursor",
             Agent::Gemini => "Gemini",
             Agent::Opencode => "Opencode",
+            Agent::Qwen => "Qwen",
         }
     }
 }
@@ -1845,6 +1850,7 @@ async fn execute_skills_setup(
             Agent::Cursor => install_cursor(scope, local_root.as_deref(), &home),
             Agent::Gemini => install_gemini(scope, local_root.as_deref(), &home),
             Agent::Opencode => install_opencode(scope, local_root.as_deref(), &home),
+            Agent::Qwen => install_qwen(scope, local_root.as_deref(), &home),
         };
 
         match result {
@@ -1911,6 +1917,7 @@ enum InstrumentAgentArg {
     Cursor,
     Gemini,
     Opencode,
+    Qwen,
 }
 
 /// Languages supported by `--language`.  Variants map to canonical display
@@ -2036,6 +2043,7 @@ async fn run_instrument_setup(
             Agent::Cursor => install_cursor(InstallScope::Local, Some(&root), &home),
             Agent::Gemini => install_gemini(InstallScope::Local, Some(&root), &home),
             Agent::Opencode => install_opencode(InstallScope::Local, Some(&root), &home),
+            Agent::Qwen => install_qwen(InstallScope::Local, Some(&root), &home),
         };
         match result {
             Ok(r) => results.push(r),
@@ -2305,6 +2313,7 @@ fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
         Agent::Cursor => AgentArg::Cursor,
         Agent::Gemini => AgentArg::Gemini,
         Agent::Opencode => AgentArg::Opencode,
+        Agent::Qwen => AgentArg::Qwen,
     }
 }
 
@@ -2315,6 +2324,7 @@ fn map_agent_to_instrument_agent_arg(agent: Agent) -> InstrumentAgentArg {
         Agent::Cursor => InstrumentAgentArg::Cursor,
         Agent::Gemini => InstrumentAgentArg::Gemini,
         Agent::Opencode => InstrumentAgentArg::Opencode,
+        Agent::Qwen => InstrumentAgentArg::Qwen,
     }
 }
 
@@ -2327,7 +2337,7 @@ fn skill_config_path(
     let root = scope_root(scope, local_root, home)?;
     let path = match agent {
         Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
-        Agent::Codex | Agent::Opencode | Agent::Cursor | Agent::Gemini => {
+        Agent::Codex | Agent::Opencode | Agent::Cursor | Agent::Gemini | Agent::Qwen => {
             root.join(".agents/skills/braintrust/SKILL.md")
         }
     };
@@ -2616,6 +2626,40 @@ fn resolve_instrument_invocation(
                 InstrumentInvocation::Program {
                     program: "cursor-agent".to_string(),
                     args: cursor_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
+        Agent::Qwen => {
+            let mut qwen_args = vec![];
+            if bypass_permissions {
+                qwen_args.push("--yolo".to_string());
+            }
+            if interactive {
+                qwen_args.push("-i".to_string());
+                InstrumentInvocation::Program {
+                    program: "qwen".to_string(),
+                    args: qwen_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                qwen_args.extend([
+                    "-p".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--include-partial-messages".to_string(),
+                ]);
+                InstrumentInvocation::Program {
+                    program: "qwen".to_string(),
+                    args: qwen_args,
                     stdin_file: None,
                     prompt_file_arg: Some(task_path.to_path_buf()),
                     initial_prompt: None,
@@ -3146,6 +3190,7 @@ fn run_doctor(base: BaseArgs, args: AgentsDoctorArgs) -> Result<()> {
         Agent::Cursor,
         Agent::Gemini,
         Agent::Opencode,
+        Agent::Qwen,
     ]
     .iter()
     .map(|agent| doctor_agent_status(*agent, scope, local_root.as_deref(), &home, &detected))
@@ -3516,6 +3561,7 @@ fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg 
         InstrumentAgentArg::Cursor => AgentArg::Cursor,
         InstrumentAgentArg::Gemini => AgentArg::Gemini,
         InstrumentAgentArg::Opencode => AgentArg::Opencode,
+        InstrumentAgentArg::Qwen => AgentArg::Qwen,
     }
 }
 
@@ -3526,6 +3572,7 @@ fn map_agent_arg(agent: AgentArg) -> Agent {
         AgentArg::Cursor => Agent::Cursor,
         AgentArg::Gemini => Agent::Gemini,
         AgentArg::Opencode => Agent::Opencode,
+        AgentArg::Qwen => Agent::Qwen,
     }
 }
 
@@ -3538,6 +3585,7 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
         Agent::Codex,
         Agent::Claude,
         Agent::Gemini,
+        Agent::Qwen,
         Agent::Cursor,
         Agent::Opencode,
     ];
@@ -3604,6 +3652,9 @@ fn detect_runnable_agents() -> Vec<Agent> {
     if command_exists("opencode") {
         agents.push(Agent::Opencode);
     }
+    if command_exists("qwen") {
+        agents.push(Agent::Qwen);
+    }
     agents
 }
 
@@ -3655,6 +3706,14 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
                 Agent::Opencode,
                 false,
                 ".opencode exists in repo root",
+            );
+        }
+        if root.join(".qwen").exists() {
+            add_signal(
+                &mut by_agent,
+                Agent::Qwen,
+                false,
+                ".qwen exists in repo root",
             );
         }
         if root.join(".agents").exists() || root.join(".agents/skills").exists() {
@@ -3715,6 +3774,9 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
             "opencode config directory exists",
         );
     }
+    if home.join(".qwen").exists() {
+        add_signal(&mut by_agent, Agent::Qwen, false, "~/.qwen exists");
+    }
 
     if command_exists("claude") {
         add_signal(
@@ -3754,6 +3816,14 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
             Agent::Opencode,
             true,
             "`opencode` binary found in PATH",
+        );
+    }
+    if command_exists("qwen") {
+        add_signal(
+            &mut by_agent,
+            Agent::Qwen,
+            true,
+            "`qwen` binary found in PATH",
         );
     }
 
@@ -3921,6 +3991,36 @@ fn install_gemini(
     })
 }
 
+fn install_qwen(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+) -> Result<AgentInstallResult> {
+    let root = scope_root(scope, local_root, home)?;
+    let skill_content = render_braintrust_skill();
+    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let alias = ensure_agent_skills_alias(root, ".qwen", &skill_content)?;
+    let changed = skill_changed || alias.changed;
+
+    Ok(AgentInstallResult {
+        agent: Agent::Qwen,
+        status: if changed {
+            InstallStatus::Installed
+        } else {
+            InstallStatus::Skipped
+        },
+        message: if changed {
+            "installed skill".to_string()
+        } else {
+            "already configured".to_string()
+        },
+        paths: vec![
+            skill_path.display().to_string(),
+            alias.path.display().to_string(),
+        ],
+    })
+}
+
 fn install_canonical_skill(root: &Path, skill_content: &str) -> Result<(bool, PathBuf)> {
     let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
     let changed = write_text_file_if_changed(&skill_path, skill_content)?;
@@ -4041,6 +4141,7 @@ fn install_mcp_for_agent(
         Agent::Cursor => install_mcp_for_cursor(scope, local_root, home, api_key, mcp_url),
         Agent::Gemini => install_mcp_for_gemini(scope, local_root, home, api_key, mcp_url),
         Agent::Opencode => install_mcp_for_opencode(scope, local_root, home, api_key, mcp_url),
+        Agent::Qwen => install_mcp_for_qwen(scope, local_root, home, api_key, mcp_url),
     }
 }
 
@@ -4080,13 +4181,8 @@ fn install_mcp_for_codex_local(
 ) -> Result<AgentInstallResult> {
     let root = scope_root(InstallScope::Local, local_root, home)?;
     let path = root.join(".codex/config.toml");
-    merge_codex_config(&path, api_key, mcp_url)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Codex,
-        status: InstallStatus::Installed,
-        message: "installed MCP config".to_string(),
-        paths: vec![path.display().to_string()],
+    install_mcp_config_file(Agent::Codex, path, "installed MCP config", |path| {
+        merge_codex_config(path, api_key, mcp_url)
     })
 }
 
@@ -4101,13 +4197,32 @@ fn install_mcp_for_cursor(
         InstallScope::Local => scope_root(scope, local_root, home)?.join(".cursor/mcp.json"),
         InstallScope::Global => home.join(".cursor/mcp.json"),
     };
-    merge_mcp_config(&path, api_key, mcp_url)?;
-    enable_cursor_mcp(local_root)?;
+    install_mcp_config_file(
+        Agent::Cursor,
+        path,
+        "installed MCP config and enabled server",
+        |path| {
+            merge_mcp_config(path, api_key, mcp_url)?;
+            enable_cursor_mcp(local_root)
+        },
+    )
+}
+
+fn install_mcp_config_file<F>(
+    agent: Agent,
+    path: PathBuf,
+    message: &str,
+    install: F,
+) -> Result<AgentInstallResult>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    install(&path)?;
 
     Ok(AgentInstallResult {
-        agent: Agent::Cursor,
+        agent,
         status: InstallStatus::Installed,
-        message: "installed MCP config and enabled server".to_string(),
+        message: message.to_string(),
         paths: vec![path.display().to_string()],
     })
 }
@@ -4142,43 +4257,18 @@ fn install_mcp_for_claude(
     mcp_url: &str,
     api_key: &str,
 ) -> Result<AgentInstallResult> {
-    let (scope_name, cwd, path_label) = match scope {
-        InstallScope::Local => (
-            "project",
-            Some(scope_root(scope, local_root, home)?.to_path_buf()),
-            "claude:project".to_string(),
-        ),
-        InstallScope::Global => ("user", None, "claude:user".to_string()),
-    };
-
-    let status = std::process::Command::new("claude")
-        .args([
-            "mcp",
-            "add",
-            "-s",
-            scope_name,
-            "--transport",
-            "http",
-            "braintrust",
-            mcp_url,
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-        ])
-        .current_dir(cwd.unwrap_or_else(|| home.to_path_buf()))
-        .stdout(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to run `claude mcp add -s {scope_name}`"))?;
-
-    if !status.success() {
-        bail!("`claude mcp add -s {scope_name}` exited with status {status}");
-    }
-
-    Ok(AgentInstallResult {
-        agent: Agent::Claude,
-        status: InstallStatus::Installed,
-        message: "installed MCP config".to_string(),
-        paths: vec![path_label],
-    })
+    install_mcp_for_http_cli_agent(
+        McpHttpCliAgentConfig {
+            agent: Agent::Claude,
+            binary: "claude",
+            header_flag: "--header",
+        },
+        scope,
+        local_root,
+        home,
+        api_key,
+        mcp_url,
+    )
 }
 
 fn install_mcp_for_gemini(
@@ -4188,16 +4278,64 @@ fn install_mcp_for_gemini(
     api_key: &str,
     mcp_url: &str,
 ) -> Result<AgentInstallResult> {
-    let (scope_name, cwd, path_label) = match scope {
+    install_mcp_for_http_cli_agent(
+        McpHttpCliAgentConfig {
+            agent: Agent::Gemini,
+            binary: "gemini",
+            header_flag: "-H",
+        },
+        scope,
+        local_root,
+        home,
+        api_key,
+        mcp_url,
+    )
+}
+
+fn install_mcp_for_qwen(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    install_mcp_for_http_cli_agent(
+        McpHttpCliAgentConfig {
+            agent: Agent::Qwen,
+            binary: "qwen",
+            header_flag: "-H",
+        },
+        scope,
+        local_root,
+        home,
+        api_key,
+        mcp_url,
+    )
+}
+
+struct McpHttpCliAgentConfig {
+    agent: Agent,
+    binary: &'static str,
+    header_flag: &'static str,
+}
+
+fn install_mcp_for_http_cli_agent(
+    config: McpHttpCliAgentConfig,
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    let (scope_name, cwd) = match scope {
         InstallScope::Local => (
             "project",
             scope_root(scope, local_root, home)?.to_path_buf(),
-            "gemini:project".to_string(),
         ),
-        InstallScope::Global => ("user", home.to_path_buf(), "gemini:user".to_string()),
+        InstallScope::Global => ("user", home.to_path_buf()),
     };
 
-    let status = std::process::Command::new("gemini")
+    let status = std::process::Command::new(config.binary)
         .args([
             "mcp",
             "add",
@@ -4207,23 +4345,26 @@ fn install_mcp_for_gemini(
             "http",
             "braintrust",
             mcp_url,
-            "-H",
+            config.header_flag,
             &format!("Authorization: Bearer {api_key}"),
         ])
         .current_dir(&cwd)
         .stdout(Stdio::null())
         .status()
-        .with_context(|| format!("failed to run `gemini mcp add -s {scope_name}`"))?;
+        .with_context(|| format!("failed to run `{}` mcp add -s {scope_name}`", config.binary))?;
 
     if !status.success() {
-        bail!("`gemini mcp add -s {scope_name}` exited with status {status}");
+        bail!(
+            "`{} mcp add -s {scope_name}` exited with status {status}",
+            config.binary
+        );
     }
 
     Ok(AgentInstallResult {
-        agent: Agent::Gemini,
+        agent: config.agent,
         status: InstallStatus::Installed,
         message: "installed MCP config".to_string(),
-        paths: vec![path_label],
+        paths: vec![format!("{}:{scope_name}", config.agent.as_str())],
     })
 }
 
@@ -4242,13 +4383,8 @@ fn install_mcp_for_opencode(
         InstallScope::Local => scope_root(scope, local_root, home)?.join("opencode.json"),
         InstallScope::Global => home.join(".config/opencode/opencode.json"),
     };
-    merge_opencode_config(&path, api_key, mcp_url)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Opencode,
-        status: InstallStatus::Installed,
-        message: "installed MCP config".to_string(),
-        paths: vec![path.display().to_string()],
+    install_mcp_config_file(Agent::Opencode, path, "installed MCP config", |path| {
+        merge_opencode_config(path, api_key, mcp_url)
     })
 }
 
@@ -4730,6 +4866,7 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Mutex as AsyncMutex;
 
     fn cwd_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4739,6 +4876,11 @@ mod tests {
     fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn async_env_test_lock() -> &'static AsyncMutex<()> {
+        static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 
     #[cfg(unix)]
@@ -5660,6 +5802,70 @@ mod tests {
     }
 
     #[test]
+    fn qwen_instrument_invocation_uses_stream_json_with_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Qwen, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "qwen");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-p".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--include-partial-messages".to_string(),
+                    ]
+                );
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(stream_json);
+                assert!(!interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn qwen_interactive_instrument_invocation_uses_prompt_interactive() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Qwen, None, &task_path, true, true, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "qwen");
+                assert_eq!(args, vec!["--yolo".to_string(), "-i".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
     fn sync_setup_api_key_sets_base_and_process_env() {
         let _guard = env_test_lock().lock().expect("lock env test");
         let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
@@ -5680,7 +5886,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_agent_invocation_sets_extra_env_for_program_launches() {
-        let _guard = env_test_lock().lock().expect("lock env test");
+        let _guard = async_env_test_lock().lock().await;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -5733,7 +5939,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_agent_invocation_inherits_process_api_key_env() {
-        let _guard = env_test_lock().lock().expect("lock env test");
+        let _guard = async_env_test_lock().lock().await;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -5809,6 +6015,22 @@ mod tests {
     fn doctor_agent_status_reports_gemini_global_skill_path() {
         let home = std::env::temp_dir();
         let status = doctor_agent_status(Agent::Gemini, InstallScope::Global, None, &home, &[]);
+        assert!(!status.configured);
+        assert_eq!(
+            status.config_path,
+            Some(
+                home.join(".agents/skills/braintrust/SKILL.md")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(status.notes.is_empty());
+    }
+
+    #[test]
+    fn doctor_agent_status_reports_qwen_global_skill_path() {
+        let home = std::env::temp_dir();
+        let status = doctor_agent_status(Agent::Qwen, InstallScope::Global, None, &home, &[]);
         assert!(!status.configured);
         assert_eq!(
             status.config_path,
@@ -6333,6 +6555,106 @@ mod tests {
     }
 
     #[test]
+    fn install_mcp_for_agent_invokes_qwen_project_scope_for_local() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-qwen-mcp-local-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("qwen.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("qwen"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Qwen,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "qwen-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install qwen local mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["qwen:project".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read qwen log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("add"));
+        assert!(log.contains("-s"));
+        assert!(log.contains("project"));
+        assert!(log.contains("--transport"));
+        assert!(log.contains("http"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains("Authorization: Bearer qwen-api-key"));
+        assert!(log.contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn install_mcp_for_agent_invokes_qwen_user_scope_for_global() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-qwen-mcp-global-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("qwen-global.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("qwen"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Qwen,
+            InstallScope::Global,
+            None,
+            &home,
+            "qwen-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install qwen global mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["qwen:user".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read qwen log");
+        assert!(log.contains("user"));
+        assert!(log.contains(&home.display().to_string()));
+    }
+
+    #[test]
     fn install_codex_is_idempotent_when_skill_is_unchanged() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6368,6 +6690,23 @@ mod tests {
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
         assert!(root.join(".gemini/skills").exists());
+    }
+
+    #[test]
+    fn install_qwen_uses_canonical_agents_skill_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-qwen-skill-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let result = install_qwen(InstallScope::Local, Some(&root), &home).expect("install qwen");
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
+        assert!(root.join(".qwen/skills").exists());
     }
 
     #[test]
