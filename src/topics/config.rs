@@ -1,22 +1,28 @@
 use anyhow::{bail, Result};
+use dialoguer::Confirm;
 
-use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
+use crate::ui::{
+    is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
+};
 
 use super::{
     api::{
         self, FunctionSummary, TopicAutomationConfig, TopicAutomationConfigCreate,
         TopicAutomationConfigPatch, TopicMapConfigPatch, TopicMapConfigUpdate,
-        TopicMapGenerationSettings, TopicsConfigReport,
+        TopicMapGenerationSettings, TopicsConfigReport, TopicsDeleteReport,
     },
     formatting::{format_duration_compact, format_project_header},
-    ConfigArgs, ConfigEnableArgs, ConfigSetArgs, ResolvedContext, TopicMapSetArgs,
-    TopicsConfigFieldsArgs,
+    ConfigEnableArgs, ConfigSetArgs, ResolvedContext, TopicMapSetArgs, TopicsConfigFieldsArgs,
 };
 
-pub async fn run_view(ctx: &ResolvedContext, args: &ConfigArgs, json: bool) -> Result<()> {
+pub async fn run_view(
+    ctx: &ResolvedContext,
+    automation_id: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let report = with_spinner(
         "Loading Topics config...",
-        api::fetch_topics_config(ctx, args.automation_id.as_deref()),
+        api::fetch_topics_config(ctx, automation_id),
     )
     .await?;
 
@@ -65,6 +71,48 @@ pub async fn run_enable(ctx: &ResolvedContext, args: &ConfigEnableArgs, json: bo
         &format_project_header(&ctx.project.name, &ctx.project.id, ctx.client.org_name()),
         &created,
     ))?;
+    Ok(())
+}
+
+pub async fn run_delete(
+    ctx: &ResolvedContext,
+    automation_id: Option<&str>,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    if !force && is_interactive() {
+        let preview = with_spinner(
+            "Loading Topics config...",
+            api::fetch_topics_config(ctx, automation_id),
+        )
+        .await?;
+        let automation = resolve_single_automation_for_action(&preview)?;
+
+        let confirm = Confirm::new()
+            .with_prompt(format!(
+                "Delete Topics automation '{}' from {}? Existing topic labels and topic maps will be left in place.",
+                automation.name, ctx.project.name
+            ))
+            .default(false)
+            .interact()?;
+        if !confirm {
+            return Ok(());
+        }
+    }
+
+    let report = with_spinner(
+        "Deleting Topics...",
+        api::delete_topics_config(ctx, automation_id),
+    )
+    .await?;
+
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
+
+    print_command_status(CommandStatus::Success, "Deleted Topics automation");
+    print_with_pager(&render_delete_report(&report))?;
     Ok(())
 }
 
@@ -139,6 +187,30 @@ fn render_single_topic_map_update(header: &str, updated: &TopicMapConfigUpdate) 
         &updated.topic_map_id,
     ));
     output.push('\n');
+    output
+}
+
+fn render_delete_report(report: &TopicsDeleteReport) -> String {
+    let mut output = format_project_header(
+        &report.project.name,
+        &report.project.id,
+        &report.project.org_name,
+    );
+    output.push_str("\n\nDeleted Topics automation:\n");
+    output.push_str(&format!(
+        "  {} ({})\n",
+        report.automation.name, report.automation.id
+    ));
+    output.push('\n');
+    if report.automation.topic_map_functions.is_empty() {
+        output.push_str("No topic maps were attached to this automation.\n");
+    } else {
+        output.push_str("Preserved topic maps:\n");
+        push_topic_map_list(&mut output, &report.automation.topic_map_functions);
+    }
+    output.push('\n');
+    output.push_str("Existing topic labels already written to traces are unchanged.\n");
+    output.push_str("Run `bt topics config enable` to create a fresh Topics automation.\n");
     output
 }
 
@@ -252,6 +324,34 @@ fn render_topic_map_update_block(automation: &TopicAutomationConfig, topic_map_i
     ));
     push_topic_map_details(&mut lines, topic_map, "    ");
     lines.join("\n")
+}
+
+fn resolve_single_automation_for_action(
+    report: &TopicsConfigReport,
+) -> Result<&TopicAutomationConfig> {
+    if report.automations.is_empty() {
+        bail!("no topic automations found");
+    }
+    if report.automations.len() == 1 {
+        return Ok(&report.automations[0]);
+    }
+
+    let names = report
+        .automations
+        .iter()
+        .map(|automation| format!("{} ({})", automation.name, automation.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("project has multiple topic automations ({names}); re-run with --automation-id")
+}
+
+fn push_topic_map_list(output: &mut String, topic_maps: &[FunctionSummary]) {
+    for topic_map in topic_maps {
+        match topic_map.id.as_deref() {
+            Some(id) => output.push_str(&format!("  - {} (id: {})\n", topic_map.name, id)),
+            None => output.push_str(&format!("  - {}\n", topic_map.name)),
+        }
+    }
 }
 
 struct ConfigField<'a> {
@@ -612,6 +712,7 @@ fn parse_sampling_rate(value: Option<&str>) -> Result<Option<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topics::api::{TopicsDeleteReport, TopicsProjectSummary};
 
     fn sample_config() -> TopicAutomationConfig {
         TopicAutomationConfig {
@@ -687,6 +788,26 @@ mod tests {
             "generation: algorithm hdbscan | reduction umap | min cluster size 25 | min samples 10"
         ));
         assert!(output.contains("distance threshold: 0.35"));
+    }
+
+    #[test]
+    fn render_delete_report_mentions_preserved_topic_maps() {
+        let report = TopicsDeleteReport {
+            project: TopicsProjectSummary {
+                id: "proj_123".to_string(),
+                name: "demo-project".to_string(),
+                org_name: "demo-org".to_string(),
+                topics_url: "https://app.example.com/app/demo-org/p/demo-project/topics"
+                    .to_string(),
+            },
+            automation: sample_config(),
+        };
+
+        let output = render_delete_report(&report);
+        assert!(output.contains("Deleted Topics automation:"));
+        assert!(output.contains("Preserved topic maps:"));
+        assert!(output.contains("Task (id: func_1)"));
+        assert!(output.contains("Existing topic labels already written to traces are unchanged."));
     }
 
     #[test]

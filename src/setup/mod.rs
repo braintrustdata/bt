@@ -63,11 +63,11 @@ pub struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupSubcommand>,
 
-    /// Set up coding-agent skills [default]
+    /// Also install reusable coding-agent skills (persistent, opt-in)
     #[arg(long, conflicts_with = "no_skills")]
     skills: bool,
 
-    /// Do not set up coding-agent skills
+    /// Do not set up reusable coding-agent skills
     #[arg(long, visible_alias = "no-skill", conflicts_with = "skills")]
     no_skills: bool,
 
@@ -209,7 +209,7 @@ struct InstrumentSetupArgs {
     #[arg(long)]
     agent_cmd: Option<String>,
 
-    /// Workflow docs to prefetch alongside instrument (repeatable; always includes instrument) [default: all]
+    /// Latest workflow docs to provide to the instrumentation agent (repeatable; always includes instrument) [default: all]
     #[arg(long = "workflow", value_enum)]
     workflows: Vec<WorkflowArg>,
 
@@ -219,7 +219,7 @@ struct InstrumentSetupArgs {
     #[arg(skip)]
     yes: bool,
 
-    /// Refresh prefetched docs by clearing existing output before download
+    /// Deprecated: setup docs are always fetched fresh and are not cached
     #[arg(long)]
     refresh_docs: bool,
 
@@ -524,7 +524,7 @@ pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
         Some(SetupSubcommand::Skills(setup)) => run_setup(base, setup).await,
         Some(SetupSubcommand::Instrument(mut instrument)) => {
             instrument.prompt_for_missing_options = true;
-            run_instrument_setup(base, instrument, false).await
+            run_instrument_setup(base, instrument, false, true).await
         }
         Some(SetupSubcommand::Mcp(mcp)) => run_mcp_setup(base, mcp).await,
         Some(SetupSubcommand::Doctor(doctor)) => run_doctor(base, doctor),
@@ -594,9 +594,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         languages: flag_languages,
     } = flags;
     print_setup_banner(&base);
-    eprintln!("Welcome to the Braintrust SDK setup wizard");
+    eprintln!("Set up Braintrust SDK tracing");
     eprintln!(
-        "This wizard will automatically instrument your application with Braintrust SDK tracing with a coding agent of your choice.\n"
+        "Braintrust will use the coding agent you choose to add SDK tracing to this app and verify it works.\n"
     );
 
     let mut had_failures = false;
@@ -670,7 +670,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(3, "Agents");
     }
-    let mut multiselect_hint_shown = false;
+    let multiselect_hint_shown = false;
     let (wants_skills, wants_mcp) = if flag_no_skills && flag_no_mcp {
         if verbose {
             eprintln!(
@@ -681,9 +681,9 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
         (false, false)
     } else if flag_no_skills {
-        (false, flag_mcp || !flag_no_mcp)
+        (false, flag_mcp && !flag_no_mcp)
     } else if flag_no_mcp {
-        (flag_skills || !flag_no_skills, false)
+        (flag_skills && !flag_no_skills, false)
     } else if flag_skills || flag_mcp {
         if verbose {
             let chosen: Vec<&str> = [("Skills", flag_skills), ("MCP", flag_mcp)]
@@ -703,25 +703,13 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         }
         (flag_skills, flag_mcp)
     } else {
-        if verbose {
-            eprintln!(
-                "   {}",
-                style("(Un)select option with Space, confirm selection with Enter.").dim()
-            );
-            multiselect_hint_shown = true;
-        }
-        let choices = ["Skills", "MCP"];
-        let defaults = [true, false];
-        let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
-        let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-            .with_prompt("What would you like to set up?")
-            .items(&choices)
-            .defaults(&defaults)
-            .interact_on(&term)?;
-        (selected.contains(&0), selected.contains(&1))
+        // Default setup is intentionally ephemeral: persistent skills/MCP are only
+        // installed when the user asks for them explicitly (or accepts the
+        // post-success skills prompt).
+        (false, false)
     };
 
-    let setup_context = if wants_skills || wants_mcp || !flag_no_instrument {
+    let setup_context = if wants_skills || wants_mcp {
         let scope = if flag_local {
             if verbose {
                 eprintln!(
@@ -746,6 +734,11 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         };
         let local_root = resolve_local_root_for_scope(scope)?;
         let detected = detect_agents(local_root.as_deref(), &home);
+        if !flag_no_instrument
+            && should_print_agent_selection_intro(&base, flag_agent.is_some(), false)
+        {
+            print_coding_agent_selection_intro();
+        }
         let selected_agent =
             resolve_default_agent_selection(flag_agent, &detected, "Select coding agent", true)?;
         if verbose && flag_agent.is_some() {
@@ -756,6 +749,24 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
             );
         }
         Some((scope, selected_agent, home.clone()))
+    } else if !flag_no_instrument {
+        let root = git_root
+            .clone()
+            .unwrap_or(std::env::current_dir().context("failed to get current directory")?);
+        let detected = detect_agents(Some(&root), &home);
+        if should_print_agent_selection_intro(&base, flag_agent.is_some(), false) {
+            print_coding_agent_selection_intro();
+        }
+        let selected_agent =
+            resolve_default_agent_selection(flag_agent, &detected, "Select coding agent", true)?;
+        if verbose && flag_agent.is_some() {
+            eprintln!(
+                "{} Select coding agent · {}",
+                style("✔").green(),
+                style(selected_agent.as_str()).green()
+            );
+        }
+        Some((InstallScope::Local, selected_agent, home.clone()))
     } else {
         None
     };
@@ -939,6 +950,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
                     prompt_for_missing_options: false,
                 },
                 !multiselect_hint_shown,
+                !wants_skills,
             )
             .await?;
         } else if verbose {
@@ -968,7 +980,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
             style("!").yellow()
         );
     }
-    let wants_skills = args.skills || !args.no_skills;
+    let wants_skills = args.skills && !args.no_skills;
     let wants_mcp = args.mcp && !args.no_mcp;
     if will_instrument {
         let project_flag = base.project.clone();
@@ -988,6 +1000,11 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let local_root = resolve_local_root_for_scope(scope)?;
     let detected = detect_agents(local_root.as_deref(), &home);
+    if will_instrument
+        && should_print_agent_selection_intro(&base, args.agents.agent.is_some(), false)
+    {
+        print_coding_agent_selection_intro();
+    }
     let selected_agent = resolve_default_agent_selection(
         args.agents.agent,
         &detected,
@@ -1044,6 +1061,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
                 prompt_for_missing_options: false,
             },
             false,
+            !wants_skills,
         )
         .await?;
     }
@@ -1080,6 +1098,21 @@ fn print_setup_banner(base: &BaseArgs) {
             .force_styling(color_enabled)
     );
     eprintln!();
+}
+
+fn print_coding_agent_selection_intro() {
+    eprintln!(
+        "Braintrust will ask a coding agent to add SDK tracing, run your app, and verify data reaches Braintrust."
+    );
+    eprintln!("Choose which agent to use for this one-time setup run.");
+}
+
+fn should_print_agent_selection_intro(
+    base: &BaseArgs,
+    agent_is_specified: bool,
+    yes: bool,
+) -> bool {
+    !base.json && !agent_is_specified && !yes && ui::can_prompt()
 }
 
 fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
@@ -2015,12 +2048,17 @@ async fn run_instrument_setup(
     base: BaseArgs,
     args: InstrumentSetupArgs,
     print_hint: bool,
+    offer_skills_after_success: bool,
 ) -> Result<()> {
     let home = home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let git_root = find_git_root();
     let root = git_root.clone().unwrap_or_else(|| cwd.clone());
-    let mut detected = detect_agents(Some(&root), &home);
+    let detected = detect_agents(Some(&root), &home);
+
+    if should_print_agent_selection_intro(&base, args.agent.is_some(), args.yes) {
+        print_coding_agent_selection_intro();
+    }
 
     let selected = resolve_default_agent_selection(
         args.agent.map(map_instrument_agent_arg_to_agent_arg),
@@ -2062,77 +2100,67 @@ async fn run_instrument_setup(
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     let mut results = Vec::new();
-    let skill_path = skill_config_path(selected, InstallScope::Local, Some(&root), &home)?;
 
-    if skill_path.exists() {
-        results.push(AgentInstallResult {
-            agent: selected,
-            status: InstallStatus::Skipped,
-            message: "already configured".to_string(),
-            paths: vec![skill_path.display().to_string()],
-        });
-        notes.push("Skipped skills setup (already configured).".to_string());
-        prefetch_workflow_docs(
-            show_progress,
-            InstallScope::Local,
-            Some(&root),
-            &home,
-            &selected_workflows,
-            args.refresh_docs,
-            args.workers,
-            &mut notes,
-            &mut warnings,
-        )
-        .await?;
-    } else {
-        if show_progress && base.verbose {
-            println!("Configuring coding agents for Braintrust");
-        }
-        let result = selected.install_skill(InstallScope::Local, Some(&root), &home);
-        match result {
-            Ok(r) => results.push(r),
-            Err(err) => results.push(AgentInstallResult {
-                agent: selected,
-                status: InstallStatus::Failed,
-                message: format!(
-                    "failed to install instrumentation skills in {}: {err}",
-                    root.display()
-                ),
-                paths: Vec::new(),
-            }),
-        }
-        detected = detect_agents(Some(&root), &home);
-        let successful_count = results
-            .iter()
-            .filter(|r| !matches!(r.status, InstallStatus::Failed))
-            .count();
-        if successful_count == 0 {
-            notes.push(
-                "Skipped workflow docs prefetch (no agents configured successfully).".to_string(),
-            );
-            let install_target = if git_root.is_some() {
-                format!("repo root {}", root.display())
-            } else {
-                format!("current directory {}", root.display())
-            };
-            bail!("failed to install instrumentation skills in {install_target}");
-        } else if selected_workflows.is_empty() {
-            notes.push("Skipped workflow docs prefetch (no workflows selected).".to_string());
-        } else {
-            prefetch_workflow_docs(
-                show_progress,
-                InstallScope::Local,
-                Some(&root),
-                &home,
-                &selected_workflows,
-                args.refresh_docs,
-                args.workers,
-                &mut notes,
-                &mut warnings,
-            )
-            .await?;
-        }
+    if show_progress {
+        eprintln!(
+            "Braintrust will fetch the latest setup instructions and run your coding agent to install and validate the SDK."
+        );
+        eprintln!("No reusable Braintrust agent skills will be installed unless you ask for them.");
+        eprintln!();
     }
+
+    let setup_tempdir = tempfile::Builder::new()
+        .prefix("bt-setup-")
+        .tempdir()
+        .context("failed to create temporary setup directory")?;
+    let docs_output_dir = setup_tempdir.path().join("docs");
+    let task_path = setup_tempdir.path().join("AGENT_TASK.instrument.md");
+    let docs_workflows = if selected_workflows.is_empty() {
+        vec![WorkflowArg::Instrument]
+    } else {
+        selected_workflows.clone()
+    };
+
+    let docs_args = docs::DocsFetchArgs {
+        llms_url: docs::DEFAULT_DOCS_LLMS_URL.to_string(),
+        output_dir: docs_output_dir.clone(),
+        workflows: docs_workflows.clone(),
+        dry_run: false,
+        strict: true,
+        refresh: true,
+        workers: args.workers,
+    };
+    let docs_fetch_result = if show_progress {
+        with_spinner(
+            "Fetching latest Braintrust setup docs…",
+            docs::fetch_docs_pages(&docs_args, &docs_workflows),
+        )
+        .await
+    } else {
+        docs::fetch_docs_pages(&docs_args, &docs_workflows).await
+    }
+    .map_err(|err| {
+        anyhow!(
+            "Couldn’t fetch the latest Braintrust setup docs. Check your network connection and try again.\n\n{err:#}"
+        )
+    })?;
+    if docs_fetch_result.failed > 0 {
+        bail!(
+            "Couldn’t fetch the latest Braintrust setup docs. Check your network connection and try again."
+        );
+    }
+    notes.push(format!(
+        "Fetched latest Braintrust setup docs ({} page{}).",
+        docs_fetch_result.written,
+        if docs_fetch_result.written == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ));
+    warnings.extend(docs_fetch_result.warnings);
+
+    sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
 
     // Determine run mode: interactive TUI vs background (autonomous).
     // Use prompt availability rather than stdin TTY state so `/dev/tty`
@@ -2143,13 +2171,6 @@ async fn run_instrument_setup(
         resolve_instrument_run_mode(&args, ui::can_prompt())
     };
 
-    let docs_output_dir = root.join(".bt").join("skills").join("docs");
-    sdk_install_docs::write_sdk_install_docs(&docs_output_dir)?;
-
-    let task_path = root
-        .join(".bt")
-        .join("skills")
-        .join("AGENT_TASK.instrument.md");
     write_text_file(
         &task_path,
         &render_instrument_task(
@@ -2160,10 +2181,7 @@ async fn run_instrument_setup(
         ),
     )?;
 
-    notes.push(format!(
-        "Instrumentation task prompt written to {}.",
-        task_path.display()
-    ));
+    notes.push("Instrumentation task prompt prepared in a temporary directory.".to_string());
 
     let invocation = resolve_instrument_invocation(
         selected,
@@ -2177,12 +2195,12 @@ async fn run_instrument_setup(
         eprintln!();
         eprintln!("{} is opening in interactive mode.", selected.as_str());
         eprintln!("The instrumentation task is pre-loaded. Press Enter to begin.");
-        eprintln!("Task file: {}", task_path.display());
+        eprintln!("Setup context is temporary and will be removed after the run.");
         eprintln!();
     }
 
-    let show_output = !base.json && run_interactive;
-    let status = if !run_interactive && !base.json {
+    let show_output = !base.json && (run_interactive || base.verbose);
+    let status = if !run_interactive && !base.json && !base.verbose {
         with_spinner(
             "Running agent instrumentation…",
             run_agent_invocation(&root, &invocation, false, &[]),
@@ -2196,14 +2214,14 @@ async fn run_instrument_setup(
             agent: selected,
             status: InstallStatus::Installed,
             message: "agent instrumentation command completed".to_string(),
-            paths: vec![task_path.display().to_string()],
+            paths: Vec::new(),
         });
     } else {
         results.push(AgentInstallResult {
             agent: selected,
             status: InstallStatus::Failed,
             message: format!("agent command exited with status {status}"),
-            paths: vec![task_path.display().to_string()],
+            paths: Vec::new(),
         });
     }
 
@@ -2232,8 +2250,68 @@ async fn run_instrument_setup(
     }
 
     if !status.success() {
-        let _ = fs::remove_file(&task_path);
+        if !base.json {
+            eprintln!();
+            eprintln!("Setup stopped during validation.");
+            eprintln!("No Braintrust setup files were left in your repo.");
+            eprintln!("Please fix the issue above and rerun `bt setup`.");
+        }
         bail!("agent instrumentation command failed");
+    }
+
+    if !base.json {
+        eprintln!();
+        eprintln!("{} Braintrust SDK setup completed.", style("✓").green());
+        if offer_skills_after_success && setup_can_prompt(&base) && !args.yes {
+            let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+            let install_skills = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(
+                    "Install reusable Braintrust coding-agent skills for future Braintrust work?",
+                )
+                .default(false)
+                .interact_on(&term)?;
+            if install_skills {
+                install_reusable_skills_after_setup(&base, selected).await?;
+            } else {
+                eprintln!("You can install them later with `bt setup skills`.");
+            }
+        } else if offer_skills_after_success {
+            eprintln!("Want reusable Braintrust coding-agent skills for future work? Run `bt setup skills`.");
+        }
+    }
+    Ok(())
+}
+
+async fn install_reusable_skills_after_setup(base: &BaseArgs, selected: Agent) -> Result<()> {
+    let args = AgentsSetupArgs {
+        agent: Some(map_agent_to_agent_arg(selected)),
+        local: false,
+        global: true,
+        workflows: Vec::new(),
+        no_workflow: false,
+        yes: true,
+        refresh_docs: false,
+        workers: crate::sync::default_workers(),
+        permissions: InstrumentPermissionArgs { yolo: false },
+    };
+    let outcome = execute_skills_setup(base, &args, false).await?;
+    if base.verbose {
+        print_human_report(
+            false,
+            outcome.scope,
+            &outcome.selected_agents,
+            &outcome.results,
+            &outcome.warnings,
+            &outcome.notes,
+        );
+    }
+    if outcome.successful_count == 0 {
+        eprintln!(
+            "{} Could not install reusable skills. You can retry with `bt setup skills`.",
+            style("!").yellow()
+        );
+    } else if !base.verbose {
+        eprintln!("Installed reusable Braintrust coding-agent skills.");
     }
     Ok(())
 }
@@ -2939,19 +3017,25 @@ fn render_instrument_task(
         )
     };
 
-    // When non-instrument workflows are selected the agent should use local
-    // bt CLI skills rather than the MCP server.
     let workflow_context = if workflows
         .iter()
         .any(|w| !matches!(w, WorkflowArg::Instrument))
     {
-        "## Agent Skills\n\n\
-             Use the installed Braintrust agent skills from `.agents/skills/braintrust/`. \
+        format!(
+            "## Latest Braintrust Setup Docs\n\n\
+             Latest Braintrust setup and workflow docs were fetched into `{}` for this one setup run. \
+             Use those docs for Braintrust SDK, observe, annotate, evaluate, or deploy guidance. \
              When verifying data in Braintrust, prefer local `bt` CLI commands over direct \
-             API calls. Do not rely on the Braintrust MCP server for data queries.\n"
-            .to_string()
+             API calls. Do not rely on the Braintrust MCP server for data queries.\n",
+            docs_output_dir.display()
+        )
     } else {
-        String::new()
+        format!(
+            "## Latest Braintrust Setup Docs\n\n\
+             Latest Braintrust setup docs were fetched into `{}` for this one setup run. \
+             Use them as the source of truth for Braintrust setup behavior.\n",
+            docs_output_dir.display()
+        )
     };
 
     let run_mode_context = if interactive {
@@ -5211,9 +5295,10 @@ mod tests {
             &[],
             false,
         );
-        assert!(task.contains("Use the installed Braintrust agent skills"));
+        assert!(task.contains("Latest Braintrust setup and workflow docs were fetched"));
         assert!(task.contains("prefer local `bt` CLI commands"));
         assert!(task.contains("Do not rely on the Braintrust MCP server"));
+        assert!(!task.contains("Use the installed Braintrust agent skills"));
     }
 
     #[test]
@@ -5222,6 +5307,7 @@ mod tests {
         let task = render_instrument_task(&root, &[WorkflowArg::Instrument], &[], false);
         assert!(task.contains("### 2. Detect Language"));
         assert!(task.contains("`package.json` -> TypeScript"));
+        assert!(task.contains("Latest Braintrust setup docs were fetched"));
     }
 
     #[test]
