@@ -282,6 +282,13 @@ enum Agent {
     Qwen,
 }
 
+struct AgentMetadata {
+    binary: &'static str,
+    repo_marker: Option<&'static str>,
+    home_markers: &'static [&'static str],
+    skill_alias_dir: Option<&'static str>,
+}
+
 impl Agent {
     fn as_str(self) -> &'static str {
         match self {
@@ -303,6 +310,57 @@ impl Agent {
             Agent::Opencode => "Opencode",
             Agent::Qwen => "Qwen",
         }
+    }
+
+    fn metadata(self) -> AgentMetadata {
+        match self {
+            Agent::Claude => AgentMetadata {
+                binary: "claude",
+                repo_marker: Some(".claude"),
+                home_markers: &[".claude"],
+                skill_alias_dir: Some(".claude"),
+            },
+            Agent::Codex => AgentMetadata {
+                binary: "codex",
+                repo_marker: None,
+                home_markers: &[".codex"],
+                skill_alias_dir: None,
+            },
+            Agent::Cursor => AgentMetadata {
+                binary: "cursor-agent",
+                repo_marker: Some(".cursor"),
+                home_markers: &[".cursor"],
+                skill_alias_dir: Some(".cursor"),
+            },
+            Agent::Gemini => AgentMetadata {
+                binary: "gemini",
+                repo_marker: Some(".gemini"),
+                home_markers: &[".gemini"],
+                skill_alias_dir: Some(".gemini"),
+            },
+            Agent::Opencode => AgentMetadata {
+                binary: "opencode",
+                repo_marker: Some(".opencode"),
+                home_markers: &[".opencode", ".config/opencode"],
+                skill_alias_dir: None,
+            },
+            Agent::Qwen => AgentMetadata {
+                binary: "qwen",
+                repo_marker: Some(".qwen"),
+                home_markers: &[".qwen"],
+                skill_alias_dir: Some(".qwen"),
+            },
+        }
+    }
+
+    fn install_skill(
+        self,
+        scope: InstallScope,
+        local_root: Option<&Path>,
+        home: &Path,
+    ) -> Result<AgentInstallResult> {
+        let alias_dir = self.metadata().skill_alias_dir;
+        install_agent_skill(self, scope, local_root, home, alias_dir)
     }
 }
 
@@ -1844,14 +1902,7 @@ async fn execute_skills_setup(
     }
 
     for agent in selected_agents.iter().copied() {
-        let result = match agent {
-            Agent::Claude => install_claude(scope, local_root.as_deref(), &home),
-            Agent::Codex => install_codex(scope, local_root.as_deref(), &home),
-            Agent::Cursor => install_cursor(scope, local_root.as_deref(), &home),
-            Agent::Gemini => install_gemini(scope, local_root.as_deref(), &home),
-            Agent::Opencode => install_opencode(scope, local_root.as_deref(), &home),
-            Agent::Qwen => install_qwen(scope, local_root.as_deref(), &home),
-        };
+        let result = agent.install_skill(scope, local_root.as_deref(), &home);
 
         match result {
             Ok(r) => {
@@ -2037,14 +2088,7 @@ async fn run_instrument_setup(
         if show_progress && base.verbose {
             println!("Configuring coding agents for Braintrust");
         }
-        let result = match selected {
-            Agent::Claude => install_claude(InstallScope::Local, Some(&root), &home),
-            Agent::Codex => install_codex(InstallScope::Local, Some(&root), &home),
-            Agent::Cursor => install_cursor(InstallScope::Local, Some(&root), &home),
-            Agent::Gemini => install_gemini(InstallScope::Local, Some(&root), &home),
-            Agent::Opencode => install_opencode(InstallScope::Local, Some(&root), &home),
-            Agent::Qwen => install_qwen(InstallScope::Local, Some(&root), &home),
-        };
+        let result = selected.install_skill(InstallScope::Local, Some(&root), &home);
         match result {
             Ok(r) => results.push(r),
             Err(err) => results.push(AgentInstallResult {
@@ -3636,26 +3680,11 @@ fn detected_agents_on_path(detected: &[DetectionSignal]) -> Vec<Agent> {
 }
 
 fn detect_runnable_agents() -> Vec<Agent> {
-    let mut agents = Vec::new();
-    if command_exists("claude") {
-        agents.push(Agent::Claude);
-    }
-    if command_exists("codex") {
-        agents.push(Agent::Codex);
-    }
-    if command_exists("cursor-agent") {
-        agents.push(Agent::Cursor);
-    }
-    if command_exists("gemini") {
-        agents.push(Agent::Gemini);
-    }
-    if command_exists("opencode") {
-        agents.push(Agent::Opencode);
-    }
-    if command_exists("qwen") {
-        agents.push(Agent::Qwen);
-    }
-    agents
+    ALL_AGENTS
+        .iter()
+        .copied()
+        .filter(|agent| command_exists(agent.metadata().binary))
+        .collect()
 }
 
 fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
@@ -3676,45 +3705,17 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
     let mut by_agent: BTreeMap<Agent, BTreeSet<(bool, String)>> = BTreeMap::new();
 
     if let Some(root) = local_root {
-        if root.join(".claude").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Claude,
-                false,
-                ".claude exists in repo root",
-            );
-        }
-        if root.join(".cursor").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Cursor,
-                false,
-                ".cursor exists in repo root",
-            );
-        }
-        if root.join(".gemini").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Gemini,
-                false,
-                ".gemini exists in repo root",
-            );
-        }
-        if root.join(".opencode").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                ".opencode exists in repo root",
-            );
-        }
-        if root.join(".qwen").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Qwen,
-                false,
-                ".qwen exists in repo root",
-            );
+        for agent in ALL_AGENTS {
+            if let Some(marker) = agent.metadata().repo_marker {
+                if root.join(marker).exists() {
+                    add_signal(
+                        &mut by_agent,
+                        agent,
+                        false,
+                        &format!("{marker} exists in repo root"),
+                    );
+                }
+            }
         }
         if root.join(".agents").exists() || root.join(".agents/skills").exists() {
             add_signal(
@@ -3740,17 +3741,12 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
         }
     }
 
-    if home.join(".claude").exists() {
-        add_signal(&mut by_agent, Agent::Claude, false, "~/.claude exists");
-    }
-    if home.join(".cursor").exists() {
-        add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
-    }
-    if home.join(".gemini").exists() {
-        add_signal(&mut by_agent, Agent::Gemini, false, "~/.gemini exists");
-    }
-    if home.join(".codex").exists() {
-        add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
+    for agent in ALL_AGENTS {
+        for marker in agent.metadata().home_markers {
+            if home.join(marker).exists() {
+                add_signal(&mut by_agent, agent, false, &format!("~/{} exists", marker));
+            }
+        }
     }
     if home.join(".agents/skills").exists() {
         add_signal(
@@ -3774,57 +3770,17 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
             "opencode config directory exists",
         );
     }
-    if home.join(".qwen").exists() {
-        add_signal(&mut by_agent, Agent::Qwen, false, "~/.qwen exists");
-    }
 
-    if command_exists("claude") {
-        add_signal(
-            &mut by_agent,
-            Agent::Claude,
-            true,
-            "`claude` binary found in PATH",
-        );
-    }
-    if command_exists("codex") {
-        add_signal(
-            &mut by_agent,
-            Agent::Codex,
-            true,
-            "`codex` binary found in PATH",
-        );
-    }
-    if command_exists("cursor-agent") {
-        add_signal(
-            &mut by_agent,
-            Agent::Cursor,
-            true,
-            "`cursor-agent` binary found in PATH",
-        );
-    }
-    if command_exists("gemini") {
-        add_signal(
-            &mut by_agent,
-            Agent::Gemini,
-            true,
-            "`gemini` binary found in PATH",
-        );
-    }
-    if command_exists("opencode") {
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            true,
-            "`opencode` binary found in PATH",
-        );
-    }
-    if command_exists("qwen") {
-        add_signal(
-            &mut by_agent,
-            Agent::Qwen,
-            true,
-            "`qwen` binary found in PATH",
-        );
+    for agent in ALL_AGENTS {
+        let binary = agent.metadata().binary;
+        if command_exists(binary) {
+            add_signal(
+                &mut by_agent,
+                agent,
+                true,
+                &format!("`{binary}` binary found in PATH"),
+            );
+        }
     }
 
     let mut out = Vec::new();
@@ -3851,19 +3807,27 @@ fn add_signal(
         .insert((on_path, reason.to_string()));
 }
 
-fn install_claude(
+fn install_agent_skill(
+    agent: Agent,
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
+    alias_dir: Option<&str>,
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_content = render_braintrust_skill();
-    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-    let alias = ensure_agent_skills_alias(root, ".claude", &skill_content)?;
-    let changed = skill_changed || alias.changed;
+    let (canonical_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let mut changed = canonical_changed;
+    let mut paths = vec![skill_path.display().to_string()];
+
+    if let Some(alias_dir) = alias_dir {
+        let alias = ensure_agent_skills_alias(root, alias_dir, &skill_content)?;
+        changed |= alias.changed;
+        paths.push(alias.path.display().to_string());
+    }
 
     Ok(AgentInstallResult {
-        agent: Agent::Claude,
+        agent,
         status: if changed {
             InstallStatus::Installed
         } else {
@@ -3874,150 +3838,7 @@ fn install_claude(
         } else {
             "already configured".to_string()
         },
-        paths: vec![
-            skill_path.display().to_string(),
-            alias.path.display().to_string(),
-        ],
-    })
-}
-
-fn install_codex(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Codex,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![skill_path.display().to_string()],
-    })
-}
-
-fn install_opencode(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Opencode,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![skill_path.display().to_string()],
-    })
-}
-
-fn install_cursor(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-    let alias = ensure_agent_skills_alias(root, ".cursor", &skill_content)?;
-    let changed = skill_changed || alias.changed;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Cursor,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![
-            skill_path.display().to_string(),
-            alias.path.display().to_string(),
-        ],
-    })
-}
-
-fn install_gemini(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-    let alias = ensure_agent_skills_alias(root, ".gemini", &skill_content)?;
-    let changed = skill_changed || alias.changed;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Gemini,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![
-            skill_path.display().to_string(),
-            alias.path.display().to_string(),
-        ],
-    })
-}
-
-fn install_qwen(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-    let alias = ensure_agent_skills_alias(root, ".qwen", &skill_content)?;
-    let changed = skill_changed || alias.changed;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Qwen,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![
-            skill_path.display().to_string(),
-            alias.path.display().to_string(),
-        ],
+        paths,
     })
 }
 
@@ -6665,11 +6486,14 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let first = install_codex(InstallScope::Local, Some(&root), &home).expect("first install");
+        let first = Agent::Codex
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("first install");
         assert!(matches!(first.status, InstallStatus::Installed));
 
-        let second =
-            install_codex(InstallScope::Local, Some(&root), &home).expect("second install");
+        let second = Agent::Codex
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("second install");
         assert!(matches!(second.status, InstallStatus::Skipped));
         assert!(second.message.contains("already configured"));
     }
@@ -6685,8 +6509,9 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result =
-            install_gemini(InstallScope::Local, Some(&root), &home).expect("install gemini");
+        let result = Agent::Gemini
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("install gemini");
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
         assert!(root.join(".gemini/skills").exists());
@@ -6703,7 +6528,9 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result = install_qwen(InstallScope::Local, Some(&root), &home).expect("install qwen");
+        let result = Agent::Qwen
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("install qwen");
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
         assert!(root.join(".qwen/skills").exists());
@@ -6720,8 +6547,9 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result =
-            install_cursor(InstallScope::Local, Some(&root), &home).expect("install cursor");
+        let result = Agent::Cursor
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("install cursor");
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
         assert!(root.join(".cursor/skills").exists());
