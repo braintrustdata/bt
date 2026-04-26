@@ -127,6 +127,9 @@ fn write_automation_summary(
     if let Some(next_event) = format_next_event_summary(automation) {
         writeln!(output, "{next_event}")?;
     }
+    if let Some(error) = format_last_error_summary(automation) {
+        writeln!(output, "{error}")?;
+    }
     writeln!(
         output,
         "coverage: {}",
@@ -461,6 +464,23 @@ fn format_next_event_summary(automation: &TopicAutomationStatus) -> Option<Strin
         "{label}: {}",
         format_timestamp_with_relative(next_run_at)
     ))
+}
+
+fn format_last_error_summary(automation: &TopicAutomationStatus) -> Option<String> {
+    if automation.object_cursor.error_objects == 0 {
+        return None;
+    }
+
+    let last_error = automation.object_cursor.last_error.as_deref()?;
+    if let Some(last_error_at) = automation.object_cursor.last_error_at.as_deref() {
+        return Some(format!(
+            "last error: {} ({})",
+            last_error,
+            format_timestamp_with_relative(last_error_at)
+        ));
+    }
+
+    Some(format!("last error: {last_error}"))
 }
 
 fn format_coverage_summary(automation: &TopicAutomationStatus, progress_window: &str) -> String {
@@ -964,10 +984,16 @@ mod tests {
         let automation = report.automations.first_mut().expect("automation");
         automation.object_cursor.error_objects = 1;
         automation.object_cursor.retry_after = Some("2026-04-26T20:37:29Z".to_string());
+        automation.object_cursor.last_error =
+            Some("Internal error: 'Cluster naming error: cluster_id=Some(13)'".to_string());
+        automation.object_cursor.last_error_at = Some("2026-04-26T20:36:29Z".to_string());
 
         let output = strip_ansi(&render_report(&report, false));
         assert!(output.contains("status: waiting to retry after an error"));
         assert!(output.contains("retry after: 2026-04-26T20:37:29Z"));
+        assert!(output
+            .contains("last error: Internal error: 'Cluster naming error: cluster_id=Some(13)'"));
+        assert!(output.contains("2026-04-26T20:36:29Z"));
     }
 
     #[test]
