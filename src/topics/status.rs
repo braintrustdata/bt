@@ -443,7 +443,7 @@ fn format_next_event_summary(automation: &TopicAutomationStatus) -> Option<Strin
     if automation.object_cursor.error_objects > 0 {
         if let Some(retry_after) = automation.object_cursor.retry_after.as_deref() {
             return Some(format!(
-                "retry: {}",
+                "retry after: {}",
                 format_timestamp_with_relative(retry_after)
             ));
         }
@@ -956,6 +956,18 @@ mod tests {
             readiness.as_deref(),
             Some("1h window: 2/3 topic maps have enough facet-ready traces")
         );
+    }
+
+    #[test]
+    fn error_retry_summary_labels_retry_after_timestamp() {
+        let mut report = sample_report();
+        let automation = report.automations.first_mut().expect("automation");
+        automation.object_cursor.error_objects = 1;
+        automation.object_cursor.retry_after = Some("2026-04-26T20:37:29Z".to_string());
+
+        let output = strip_ansi(&render_report(&report, false));
+        assert!(output.contains("status: waiting to retry after an error"));
+        assert!(output.contains("retry after: 2026-04-26T20:37:29Z"));
     }
 
     #[test]
