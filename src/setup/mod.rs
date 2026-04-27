@@ -2842,6 +2842,7 @@ fn render_instrument_task(
     let unique_langs: BTreeSet<LanguageArg> = languages.iter().copied().collect();
     let language_context = if unique_langs.is_empty() {
         "### 2. Detect Language\n\n\
+         **Instrument exactly one language/service per install run.** Do not install Braintrust for multiple languages or multiple services in the same run, even if the repo contains more than one. If more than one candidate exists, stop and ask the user which single service to instrument before doing anything else.\n\n\
          Determine the project language using concrete signals:\n\n\
          - `package.json` -> TypeScript\n\
          - `requirements.txt`, `setup.py` or `pyproject.toml` -> Python\n\
@@ -2849,12 +2850,15 @@ fn render_instrument_task(
          - `go.mod` -> Go\n\
          - `Gemfile` -> Ruby\n\
          - `.csproj` -> C#\n\n\
-         If the language is not obvious from standard build/dependency files:\n\n\
-         - infer it from concrete repo evidence (e.g., entrypoint file extensions, build scripts, framework config)\n\
-         - State the single strongest piece of evidence you used\n\
-         - If still ambiguous (polyglot/monorepo), ask the user which service/app to instrument and wait for the response before proceeding\n\
-         - If the inferred language is not in the supported list, **abort the install**.\n\n\
-         If none match, **abort installation**."
+         **If exactly one of these matches at the repo root and there is no ambiguity, proceed with that language.**\n\n\
+         In every other case, **stop and ask the user** before continuing. Do not guess, do not pick the \"most likely\" language, and do not instrument more than one. Cases that require asking the user:\n\n\
+         - **No standard build/dependency file is present.** Do not infer from loose hints (file extensions, a stray script, a README mention). Ask the user which language/service to instrument.\n\
+         - **More than one of the above files is present** (polyglot repo, monorepo, or a mixed service). Ask the user which single service to instrument, and where it lives in the repo.\n\
+         - **A workspace/monorepo with multiple sub-projects of the same language** (e.g., several `package.json` or several `go.mod` files). Ask the user which sub-project to instrument.\n\
+         - **The inferred language is not in the supported list above.** Do not fall back to a different language or a generic OpenTelemetry setup -- **abort the install** and tell the user which languages are supported.\n\
+         - **Any other ambiguity** about which app/service the user wants traced. Ask.\n\n\
+         When you ask, be specific: list the candidate services/paths/languages you found and have the user pick exactly one. Then state the single strongest piece of evidence (the file they pointed at) before moving on.\n\n\
+         Do not proceed to Step 3 until exactly one language and one service have been confirmed."
             .to_string()
     } else {
         let names: Vec<String> = unique_langs
@@ -2873,8 +2877,8 @@ fn render_instrument_task(
             list
         )
     };
-    let install_sdk_requirements = "- Pin an exact SDK version (resolve via package manager).\n\
-         - Modify only dependency files and a minimal application entry point (e.g., main/bootstrap). \
+    let install_sdk_requirements = "- Install the latest Braintrust SDK via the language's package manager. Do not hard-pin the SDK version unless the user asks. Build-time dependencies called out by the language-specific resource (e.g. Orchestrion for Go) must still be pinned to an exact version.\n\
+         - Modify only dependency files, a minimal application entry point (e.g., main/bootstrap), and any existing build/run scripts or checked-in env/config that must change to keep auto-instrumentation active in normal use. \
          Auto-instrument the app (except for Java and C# which don't support auto-instrumentation).\n\
          - Do not change unrelated code.";
     let install_sdk_context = if unique_langs.is_empty() {
