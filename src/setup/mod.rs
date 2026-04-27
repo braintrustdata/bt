@@ -246,6 +246,9 @@ struct InstrumentSetupArgs {
 
     #[arg(skip)]
     prompt_for_missing_options: bool,
+
+    #[arg(skip)]
+    prompt_for_launch: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -634,19 +637,7 @@ async fn run_setup_flow(
         }
     }
 
-    let instrument = if flag_no_instrument {
-        false
-    } else if flag_instrument {
-        true
-    } else if can_prompt {
-        let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
-        Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Use coding agent to instrument the code?")
-            .default(true)
-            .interact_on(&term)?
-    } else {
-        true
-    };
+    let instrument = !flag_no_instrument;
 
     // ── Step 3: Agent tools (skills + MCP) ──
     if verbose {
@@ -876,16 +867,6 @@ async fn run_setup_flow(
         print_wizard_step(4, "Instrument");
     }
     {
-        if verbose {
-            eprintln!(
-                "Use coding agent to instrument the code? {}",
-                if instrument {
-                    style("yes").green().to_string()
-                } else {
-                    style("no").dim().to_string()
-                }
-            );
-        }
         if instrument {
             let instrument_agent = setup_context
                 .as_ref()
@@ -949,6 +930,7 @@ async fn run_setup_flow(
                         background: false,
                         permissions: InstrumentPermissionArgs { yolo },
                         prompt_for_missing_options: false,
+                        prompt_for_launch: false,
                     },
                     ui::can_prompt(),
                 );
@@ -969,6 +951,7 @@ async fn run_setup_flow(
                     background: !run_tui,
                     permissions: InstrumentPermissionArgs { yolo: yolo_mode },
                     prompt_for_missing_options: false,
+                    prompt_for_launch: !flag_instrument && can_prompt,
                 },
                 !multiselect_hint_shown,
             )
@@ -2076,6 +2059,26 @@ async fn run_instrument_setup(
         task_path.display()
     ));
 
+    if base.verbose || args.prompt_for_launch {
+        eprintln!();
+        eprintln!("Task file: {}", task_path.display());
+        eprintln!();
+    }
+
+    let launch_agent = if args.prompt_for_launch && ui::can_prompt() && !args.yes && !base.json {
+        let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+        Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Launch the coding agent now?")
+            .default(true)
+            .interact_on(&term)?
+    } else {
+        true
+    };
+
+    if !launch_agent {
+        return Ok(());
+    }
+
     let invocation = resolve_instrument_invocation(
         selected,
         args.agent_cmd.as_deref(),
@@ -2085,10 +2088,8 @@ async fn run_instrument_setup(
         &selected_languages,
     )?;
     if run_interactive && base.verbose {
-        eprintln!();
         eprintln!("{} is opening in interactive mode.", selected.as_str());
         eprintln!("The instrumentation task is pre-loaded.");
-        eprintln!("Task file: {}", task_path.display());
         eprintln!();
     }
 
@@ -5038,6 +5039,7 @@ mod tests {
             background: false,
             permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -5063,6 +5065,7 @@ mod tests {
             background: false,
             permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -5085,6 +5088,7 @@ mod tests {
             background: false,
             permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         let selected = resolve_instrument_workflow_selection(&args, &mut false)
@@ -5107,6 +5111,7 @@ mod tests {
             background: false,
             permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
@@ -5127,6 +5132,7 @@ mod tests {
             background: false,
             permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, false), (false, false));
@@ -5147,6 +5153,7 @@ mod tests {
             background: false,
             permissions: InstrumentPermissionArgs { yolo: true },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, true));
@@ -5167,6 +5174,7 @@ mod tests {
             background: true,
             permissions: InstrumentPermissionArgs { yolo: true },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (false, true));
@@ -5187,6 +5195,7 @@ mod tests {
             background: false,
             permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (true, false));
@@ -5207,6 +5216,7 @@ mod tests {
             background: true,
             permissions: InstrumentPermissionArgs { yolo: false },
             prompt_for_missing_options: false,
+            prompt_for_launch: false,
         };
 
         assert_eq!(resolve_instrument_run_mode(&args, true), (false, false));
