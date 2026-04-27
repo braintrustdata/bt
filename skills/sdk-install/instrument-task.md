@@ -5,13 +5,15 @@
 {RUN_MODE_CONTEXT}
 
 - **Only add Braintrust code.** Do not refactor or modify unrelated code.
-- **Pin exact versions.** Never use `latest`.
+- **One language, one service per install run.** If the repo has more than one candidate, ask the user which one to instrument before starting. Do not instrument multiple languages or services in the same run.
+- **If the language is unclear, ask the user.** Do not guess. See Step 2.
+- **Install the latest Braintrust SDK.** Do not hard-pin the Braintrust SDK version unless the user asks for it -- use the package manager's normal install (which may produce an exact or a ranged version, whichever is idiomatic for that ecosystem). Build-time dependencies (e.g. Orchestrion for Go) must still be pinned to an exact version -- see the language-specific resource.
 - **Set the project name in code.** Do NOT configure project name via env vars.
 - **App must run without Braintrust.** If `BRAINTRUST_API_KEY` is missing at runtime, do not crash.
 - **Abort install if API key is not set.** (Do not modify runtime behavior.)
 - **Do not guess APIs.** Use official documentation/examples only.
 - **Do not add eval code** unless explicitly requested.
-- **Do not add manual flush/shutdown logic.**
+- **Do not add manual flush/shutdown logic** unless the app is a short-lived script, serverless function, Lambda, or CLI that exits immediately after LLM calls -- in which case a single `flush()` (or language equivalent) right before exit is correct, since otherwise traces get dropped. Do not add flush/shutdown for long-running processes (servers, daemons, workers).
 - **If SDK is already installed/configured, do not duplicate work.**
 - **Do not create setup-only files or directories in the repo.** Do not write `.bt/setup/`, `.bt/skills/docs/`, agent skill directories, or setup task files unless explicitly asked by the user.
 
@@ -51,6 +53,7 @@ If not set, **abort installation immediately**.
 
 ### 4. Verify Installation (MANDATORY)
 
+- If the SDK relies on build-time or launch-time auto-instrumentation, make sure the project's normal build/run path now uses it. A one-off verification command is not sufficient.
 - Run the application.
 - Confirm at least one log/trace is emitted to Braintrust.
 - Confirm no runtime errors.
@@ -67,6 +70,8 @@ The permalink must be included in the final output. This confirms the full insta
 The project name is the project field of `bt status --json`. The project must be set in code during installation — do not guess the project name from context.
 
 **How to obtain the permalink:**
+
+Use the project name you configured in code during Step 3 — do not re-derive it, do not guess, and do not read it from the Braintrust UI.
 
 Most language SDKs print a direct URL to the emitted trace after the app runs. Capture that URL and print it.
 

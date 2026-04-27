@@ -6,37 +6,9 @@ Reference guide for installing the Braintrust TypeScript SDK.
 - npm: https://www.npmjs.com/package/braintrust
 - Requires Node.js 18.19.0+ or 20.6.0+ (or Bun 1.0+, Deno with Node compat)
 
-## Find the latest version of the SDK
-
-Look up the latest version from npm. Do not guess -- use the package manager to find the actual latest version.
-
-### npm
-
-```bash
-npm view braintrust version
-```
-
-### yarn
-
-```bash
-yarn info braintrust version
-```
-
-### pnpm
-
-```bash
-pnpm view braintrust version
-```
-
-### bun
-
-```bash
-bun pm view braintrust version
-```
-
 ## Install the SDK
 
-Install with exact versions.
+Install the latest published version of `braintrust`. Do not hard-pin the version unless the user asks -- let the package manager record whatever it normally records (a caret range or an exact version, whichever is idiomatic).
 
 Match the package manager the repo already uses. Check lockfiles to decide:
 
@@ -48,25 +20,25 @@ Match the package manager the repo already uses. Check lockfiles to decide:
 ### npm
 
 ```bash
-npm install --save-exact braintrust@<version> --no-audit --no-fund
+npm install braintrust --no-audit --no-fund
 ```
 
 ### yarn
 
 ```bash
-yarn add --exact braintrust@<version>
+yarn add braintrust
 ```
 
 ### pnpm
 
 ```bash
-pnpm add --save-exact braintrust@<version>
+pnpm add braintrust
 ```
 
 ### bun
 
 ```bash
-bun add --exact braintrust@<version>
+bun add braintrust
 ```
 
 ## Instrument the application
@@ -121,12 +93,6 @@ node --import braintrust/hook.mjs ./dist/index.js
 npx tsx --import braintrust/hook.mjs ./src/index.ts
 ```
 
-Or via the environment:
-
-```bash
-export NODE_OPTIONS="--import braintrust/hook.mjs"
-```
-
 **Any runtime with a bundler (Next.js, webpack, Vite, esbuild, etc.)**
 
 Use the appropriate Braintrust bundler plugin / framework integration -- see https://www.braintrust.dev/docs/instrument/trace-llm-calls for the supported plugins and framework setup (e.g. Next.js `instrumentation.ts`, webpack/Vite/esbuild plugins). This is the preferred option whenever a bundler is in play and works under Node, Bun, Deno, and Cloudflare Workers alike.
@@ -137,25 +103,48 @@ There is no automatic instrumentation path for these runtimes without a bundler.
 
 If none of the above is configured, automatic instrumentation will silently do nothing.
 
-## Run the application
+### Requirement: persist the launch hook into the normal run path
 
-Try to figure out how to run the application from the project structure:
+Auto-instrumentation requires the application to be started with the hook on every run. A one-off `node --import braintrust/hook.mjs ...` or a shell-local `export NODE_OPTIONS=...` during verification is **not enough** if the next developer, CI job, or deploy will go back to plain `node`, `tsx`, or `npm start`.
 
-- **npm scripts**: check `package.json` for `start`, `dev`, or similar scripts and add `--import braintrust/hook.mjs` to the run command, for example:
+Persist the hook into whichever launch path the project actually uses:
+
+- **`package.json` scripts**: update `start`, `dev`, `serve`, etc. to include `--import braintrust/hook.mjs`, for example:
   ```json
-  "start": "node --import braintrust/hook.mjs dist/index.js"
+  "start": "node --import braintrust/hook.mjs dist/index.js",
   "dev": "tsx --import braintrust/hook.mjs src/index.ts"
   ```
-- **Next.js**: `npm run dev` or `npx next dev`
-- **ts-node**: ts-node does not support `--import`; migrate to `tsx` instead (`npm install --save-dev tsx`)
-- **tsx**: `npx tsx --import braintrust/hook.mjs src/index.ts`
-- **Node with TypeScript**: `npx tsc && node --import braintrust/hook.mjs dist/index.js`
+- **`Dockerfile` / container entrypoint**: update the `CMD` / `ENTRYPOINT` or a checked-in start script so containers launch with the hook.
+- **Process managers / deploy config**: update `Procfile`, systemd units, PM2 config, ECS task definitions, Kubernetes manifests, etc. that define the real start command.
+- **Checked-in env/config**: if the project already uses a checked-in mechanism for env vars, set `NODE_OPTIONS="--import braintrust/hook.mjs"` there. Do **not** rely on a shell-local `export NODE_OPTIONS=...` -- it will not help the next user or CI run.
+- **Bundler / framework config**: if a bundler plugin is used, register it in the project's real bundler/framework config file, not in an ad-hoc script.
+
+If you add `initLogger` but do **not** modify any persisted launch path, treat the installation as incomplete.
+
+Verify using the same persisted command the project will actually use (e.g. `npm start`, `npm run dev`, `docker run ...`), not a custom one-off invocation.
+
+## Run the application
+
+Prefer the project's existing launch entrypoint, and make sure that entrypoint now loads the Braintrust hook (or bundler plugin) automatically.
+
+Try to figure out how the project is normally run from the project structure:
+
+- **npm scripts**: prefer `npm start` / `npm run dev` / `pnpm dev` / `yarn start` / `bun run start` -- update the script in `package.json` so it includes `--import braintrust/hook.mjs`, for example:
+  ```json
+  "start": "node --import braintrust/hook.mjs dist/index.js",
+  "dev": "tsx --import braintrust/hook.mjs src/index.ts"
+  ```
+- **Next.js**: `npm run dev` or `npx next dev` -- wire the Braintrust bundler/framework integration in the project's real Next.js config (e.g. `instrumentation.ts`), not a one-off command
+- **ts-node**: ts-node does not support `--import`; migrate to `tsx` instead (`npm install --save-dev tsx`) and update the persisted script
+- **tsx**: update the persisted script to `tsx --import braintrust/hook.mjs src/index.ts`
+- **Node with TypeScript**: update the persisted build + start scripts to `tsc && node --import braintrust/hook.mjs dist/index.js`
 - **Bun**: `bun run <script>` or `bun ./src/index.ts` (without a bundler, use manual wrappers -- `--import` is Node-only and does not apply here)
 - **Deno**: `deno run <script>` (without a bundler, use manual wrappers)
-- **Cloudflare Workers**: `wrangler dev` / `wrangler deploy` (without a bundler, use manual wrappers; with a bundler, use the Braintrust bundler plugin)
+- **Cloudflare Workers**: `wrangler dev` / `wrangler deploy` (without a bundler, use manual wrappers; with a bundler, register the Braintrust bundler plugin in the project's real bundler config)
+- **Docker / container**: update the `Dockerfile`'s `CMD`/`ENTRYPOINT` or the checked-in start script
 
-If you can't determine how to run the app, ask the user.
+If you can't determine how the app is supposed to be built or run in normal use, ask the user before proceeding.
 
 ## Generate a permalink (required)
 
-Follow the permalink generation steps in the agent task (Step 5). Search the project for the `initLogger` call to find the `projectName` — it may be in a separate bootstrap or entry file, not the file currently being edited.
+Follow the permalink generation steps in the agent task (Step 5). Use the project name you configured in code above.
