@@ -306,7 +306,7 @@ Use setup/docs commands to configure coding-agent skills and workflow docs for B
 
 Current behavior:
 
-- Supported agents: `claude`, `codex`, `cursor`, `gemini`, `opencode`, `qwen`.
+- Supported agents: `claude`, `codex`, `copilot`, `cursor`, `gemini`, `opencode`, `qwen`.
 - If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
 - In interactive TTY mode, skills setup shows a checklist so you can select/deselect agents before install.
 - In interactive TTY mode, setup also shows a workflow checklist and prefetches those docs automatically.
@@ -320,6 +320,7 @@ Current behavior:
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
 - Gemini and Qwen integration symlink `.gemini/skills`/`.qwen/skills` to `.agents/skills/braintrust/SKILL.md`.
+- Copilot integration installs the Braintrust skill file at `.agents/skills/braintrust/SKILL.md`. MCP config is written to `.mcp.json` (local) or `~/.copilot/mcp-config.json` (global).
 - Cursor integration installs `.cursor/rules/braintrust.mdc` with the same shared Braintrust guidance plus an auto-generated command-reference excerpt from this README.
 - Setup-time docs prefetch writes to `.bt/skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `.bt/skills/docs/README.md` and per-section `.bt/skills/docs/<section>/_index.md` (or the global equivalents under `~/.config/bt/skills/docs`).
