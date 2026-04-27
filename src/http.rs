@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::header::HeaderValue;
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8,6 +8,20 @@ use serde_json::json;
 use crate::auth::LoginContext;
 
 pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub fn build_http_client(timeout: std::time::Duration) -> Result<Client> {
+    build_http_client_from_builder(Client::builder().timeout(timeout))
+}
+
+pub fn build_http_client_from_builder(mut builder: ClientBuilder) -> Result<Client> {
+    // Prefer the platform/native root store so standard envs like SSL_CERT_FILE
+    // are honored consistently across the CLI.
+    builder = builder
+        .tls_built_in_native_certs(true)
+        .tls_built_in_webpki_certs(false);
+
+    builder.build().context("failed to build HTTP client")
+}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -38,16 +52,13 @@ pub struct BtqlResponse<T> {
 
 impl ApiClient {
     pub fn new(ctx: &LoginContext) -> Result<Self> {
-        let http = Client::builder()
-            .timeout(DEFAULT_HTTP_TIMEOUT)
-            .build()
-            .context("failed to build HTTP client")?;
+        let http = build_http_client(DEFAULT_HTTP_TIMEOUT)?;
 
         Ok(Self {
             http,
             base_url: ctx.api_url.trim_end_matches('/').to_string(),
-            api_key: ctx.login.api_key.clone(),
-            org_name: ctx.login.org_name.clone(),
+            api_key: ctx.login.api_key().context("login state missing API key")?,
+            org_name: ctx.login.org_name().unwrap_or_default(),
         })
     }
 
@@ -235,10 +246,8 @@ pub async fn put_signed_url(
     body: Vec<u8>,
     content_encoding: Option<&str>,
 ) -> Result<()> {
-    let client = Client::builder()
-        .timeout(UPLOAD_HTTP_TIMEOUT)
-        .build()
-        .context("failed to build signed-url HTTP client")?;
+    let client =
+        build_http_client(UPLOAD_HTTP_TIMEOUT).context("failed to build signed-url HTTP client")?;
 
     let mut request = client.put(url).body(body);
     if let Some(encoding) = content_encoding {

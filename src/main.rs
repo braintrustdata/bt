@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
@@ -89,6 +89,7 @@ Flags
       --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
+      --ca-cert <PATH>       Path to PEM CA bundle [env: BRAINTRUST_CA_CERT; overrides SSL_CERT_FILE]
       --env-file <PATH>      Path to a .env file to load
   -h, --help                 Print help
   -V, --version              Print version
@@ -225,9 +226,8 @@ enum ExitCode {
     User = 4,
 }
 
-#[tokio::main]
-async fn main() {
-    let exit_code = match try_main().await {
+fn main() {
+    let exit_code = match try_main() {
         Ok(()) => ExitCode::Success,
         Err(err) => {
             let code = classify_error(&err);
@@ -238,7 +238,16 @@ async fn main() {
     std::process::exit(exit_code as i32);
 }
 
-async fn try_main() -> Result<()> {
+fn apply_runtime_env_overrides(base: &BaseArgs) {
+    // Apply the CLI-owned override once so reqwest and inherited child
+    // commands consistently observe BRAINTRUST_CA_CERT/--ca-cert precedence
+    // over any ambient SSL_CERT_FILE.
+    if let Some(ca_cert) = base.ca_cert() {
+        std::env::set_var("SSL_CERT_FILE", ca_cert);
+    }
+}
+
+fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
@@ -248,31 +257,40 @@ async fn try_main() -> Result<()> {
     cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     apply_base_output_defaults(&mut cli.command);
     configure_output(cli.command.base());
+    apply_runtime_env_overrides(cli.command.base());
 
-    match cli.command {
-        Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
-        Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
-        Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
-        Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
-        Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
-        Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
-        #[cfg(unix)]
-        Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
-        Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
-        Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
-        Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
-        Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
-        Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
-        Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
-        Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
-        Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
-        Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
-        Commands::SelfCommand(cmd) => self_update::run(cmd.args).await?,
-        Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
-        Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
-    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build async runtime")?;
 
-    Ok(())
+    let command_result: Result<()> = runtime.block_on(async move {
+        match cli.command {
+            Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
+            Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
+            Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
+            Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
+            Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
+            Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
+            #[cfg(unix)]
+            Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
+            Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+            Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
+            Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
+            Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
+            Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
+            Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
+            Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
+            Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
+            Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
+            Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
+            Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
+            Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
+        }
+        Ok(())
+    });
+
+    command_result
 }
 
 fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {

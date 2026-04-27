@@ -123,3 +123,14 @@ Notes:
 
 - The workflow publishes an immutable tag: `canary-<branch-slug>-<short-sha>`.
 - It also updates a moving branch tag: `canary-<branch-slug>` when the run is for the latest commit on that branch.
+
+## Windows Release Signing
+
+Release and canary workflows can Authenticode-sign Windows artifacts when these GitHub Actions repository secrets are configured:
+
+- `SSLDOTCOM_USERNAME`
+- `SSLDOTCOM_PASSWORD`
+- `SSLDOTCOM_CREDENTIAL_ID`
+- `SSLDOTCOM_TOTP_SECRET`
+
+If those secrets are absent, `cargo-dist` skips Windows signing and the published `bt.exe` remains unsigned.

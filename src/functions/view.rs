@@ -63,6 +63,12 @@ pub async fn run(
 
     let mut output = String::new();
     writeln!(output, "Viewing {}", console::style(&function.name).bold())?;
+    writeln!(
+        output,
+        "{} {}",
+        console::style("Slug:").dim(),
+        function.slug
+    )?;
 
     if let Some(ft) = &function.function_type {
         writeln!(output, "{} {}", console::style("Type:").dim(), ft)?;

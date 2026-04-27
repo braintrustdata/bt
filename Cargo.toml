@@ -1,6 +1,6 @@
 [package]
 name = "bt"
-version = "0.6.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.86.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
@@ -8,17 +8,23 @@ description = "The Braintrust command line interface"
 license = "Apache-2.0"
 repository = "https://github.com/braintrustdata/bt"
 
+[package.metadata.wix]
+upgrade-guid = "5B558F98-EEBD-4F5E-A0C8-E7A039445139"
+path-guid = "7CD3044D-A62A-469C-8552-0E5C3A00FFF1"
+license = false
+eula = false
+
 [dependencies]
 actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "c8c7c7a8d9189164584adef71449a26d4ae8be2b" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "43ba73edbf5220b57090e049feb094b60a92fcd4" }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 futures-util = "0.3.31"
 indicatif = "0.17.8"
 ratatui = "0.29.0"
-reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
 toml = "0.8"
@@ -34,7 +40,7 @@ urlencoding = "2"
 lingua = { git = "https://github.com/braintrustdata/lingua", rev = "3c79f2c427d12d3e2fe104910ef3c0768ad83770" }
 comfy-table = "7.2.2"
 base64 = "0.22"
-oauth2 = { version = "4.4", default-features = false, features = ["reqwest", "rustls-tls"] }
+oauth2 = { version = "4.4", default-features = false }
 getrandom = "0.3"
 chrono = { version = "0.4.40", features = ["clock"] }
 dirs = "5"
@@ -48,30 +54,6 @@ lto = "thin"
 
 [workspace]
 members = ["."]
-
-[workspace.metadata.dist]
-cargo-dist-version = "0.30.3"
-ci = "github"
-create-release = true
-pr-run-mode = "plan"
-allow-dirty = ["ci"]
-
-[package.metadata.dist]
-installers = ["shell", "powershell"]
-targets = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "x86_64-unknown-linux-musl",
-  "x86_64-pc-windows-msvc",
-]
-unix-archive = ".tar.gz"
-windows-archive = ".zip"
-install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
-install-updater = true
-install-success-msg = ""
 
 [dev-dependencies]
 tempfile = "3"

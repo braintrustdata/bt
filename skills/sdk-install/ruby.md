@@ -87,18 +87,19 @@ Options for `Braintrust.init`:
 | `auto_instrument` | `true`                              | `true`, `false`, or Hash with `:only`/`:except` keys to filter integrations |
 | `api_key`         | `ENV['BRAINTRUST_API_KEY']`         | API key                                                                     |
 
-## Install instrumentation
+## Instrument the application
 
-By default, all three setup approaches auto-instrument every supported library that is installed. No wrapping code is needed.
+**You must read https://www.braintrust.dev/docs/instrument/trace-llm-calls before instrumenting anything.** That page is the source of truth for supported providers and setup, and may have changed since this guide was written.
+
+### Prefer automatic instrumentation
+
+**Automatic instrumentation is the recommended path and should be used whenever possible.** All three setup approaches above (`braintrust/setup`, `braintrust exec`, `Braintrust.init`) auto-instrument every supported library that is installed -- no wrapping code needed.
+
+Manual span / wrapper code should only be used as a **last resort**, e.g. for custom business-logic spans or to cover a library that auto-instrumentation doesn't yet support. Don't reach for manual tracing before confirming auto-instrumentation can do the job.
 
 ### Supported providers (auto-instrumented)
 
-| Provider  | Gem           | Integration name |
-| --------- | ------------- | ---------------- |
-| OpenAI    | `openai`      | `:openai`        |
-|           | `ruby-openai` | `:ruby_openai`   |
-| Anthropic | `anthropic`   | `:anthropic`     |
-| Multiple  | `ruby_llm`    | `:ruby_llm`      |
+For the current list of auto-instrumented gems and their integration names, see https://www.braintrust.dev/docs/instrument/trace-llm-calls.
 
 ### Selectively enabling integrations
 

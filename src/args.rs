@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -86,6 +86,15 @@ pub struct BaseArgs {
     )]
     pub app_url: Option<String>,
 
+    /// Path to a PEM-encoded CA bundle used for HTTPS requests.
+    #[arg(
+        long = "ca-cert",
+        env = "BRAINTRUST_CA_CERT",
+        hide_env_values = true,
+        global = true
+    )]
+    pub ca_cert: Option<PathBuf>,
+
     /// Path to a .env file to load before running commands.
     #[arg(
         long,
@@ -103,6 +112,12 @@ pub struct CLIArgs<T: Args> {
 
     #[command(flatten)]
     pub args: T,
+}
+
+impl BaseArgs {
+    pub fn ca_cert(&self) -> Option<&Path> {
+        self.ca_cert.as_deref()
+    }
 }
 
 pub fn has_explicit_profile_arg(args: &[OsString]) -> bool {

@@ -1,0 +1,12 @@
+{
+  "runtime": "python",
+  "files": ["eval_params_kv.py"],
+  "args": [
+    "--param",
+    "model=\"gpt-4o\"",
+    "--param",
+    "count=5",
+    "--param",
+    "enabled=true"
+  ]
+}

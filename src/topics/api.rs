@@ -152,6 +152,7 @@ pub struct TopicMapConfigPatch {
     pub source_facet: Option<String>,
     pub embedding_model: Option<String>,
     pub distance_threshold: Option<f64>,
+    pub disable_reconciliation: Option<bool>,
     pub algorithm: Option<String>,
     pub dimension_reduction: Option<String>,
     pub sample_size: Option<u32>,
@@ -186,6 +187,7 @@ pub struct FunctionSummary {
     pub source_facet: Option<String>,
     pub embedding_model: Option<String>,
     pub distance_threshold: Option<f64>,
+    pub disable_reconciliation: Option<bool>,
     pub generation_settings: Option<TopicMapGenerationSettings>,
 }
 
@@ -698,6 +700,13 @@ pub async fn update_topic_map_config(
             "distance_threshold".to_string(),
             Value::from(distance_threshold),
         );
+    }
+    if let Some(disable_reconciliation) = patch.disable_reconciliation {
+        if disable_reconciliation {
+            function_data.insert("disable_reconciliation".to_string(), Value::Bool(true));
+        } else {
+            function_data.remove("disable_reconciliation");
+        }
     }
 
     let mut generation_settings = function_data
@@ -1439,6 +1448,7 @@ async fn summarize_function_ref(
             source_facet: None,
             embedding_model: None,
             distance_threshold: None,
+            disable_reconciliation: None,
             generation_settings: None,
         });
     }
@@ -1456,6 +1466,7 @@ async fn summarize_function_ref(
             source_facet: None,
             embedding_model: None,
             distance_threshold: None,
+            disable_reconciliation: None,
             generation_settings: None,
         });
     };
@@ -1472,6 +1483,7 @@ async fn summarize_function_ref(
         source_facet: None,
         embedding_model: None,
         distance_threshold: None,
+        disable_reconciliation: None,
         generation_settings: None,
     })
 }
@@ -1490,6 +1502,12 @@ fn apply_topic_map_details(
     summary.source_facet = string_value(function_data.get("source_facet"));
     summary.embedding_model = string_value(function_data.get("embedding_model"));
     summary.distance_threshold = float_value(function_data.get("distance_threshold"));
+    summary.disable_reconciliation = Some(
+        function_data
+            .get("disable_reconciliation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
     summary.generation_settings =
         topic_map_generation_settings_from_value(function_data.get("generation_settings"));
 }

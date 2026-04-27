@@ -74,14 +74,13 @@ struct DeleteArgs {
 pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
+    let org_name = ctx.login.org_name().unwrap_or_default();
 
     match args.command {
-        None | Some(ProjectsCommands::List) => {
-            list::run(&client, &ctx.login.org_name, base.json).await
-        }
+        None | Some(ProjectsCommands::List) => list::run(&client, &org_name, base.json).await,
         Some(ProjectsCommands::Create(a)) => create::run(&client, a.name.as_deref()).await,
         Some(ProjectsCommands::View(a)) => {
-            view::run(&client, &ctx.app_url, &ctx.login.org_name, a.name()).await
+            view::run(&client, &ctx.app_url, &org_name, a.name()).await
         }
         Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref(), a.force).await,
     }

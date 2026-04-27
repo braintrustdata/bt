@@ -319,6 +319,7 @@ pub(crate) struct PushArgs {
     pub tsconfig: Option<PathBuf>,
 
     /// Additional packages to mark external during JS bundling.
+    /// SDK dependencies (for example `braintrust`) are bundled by default.
     #[arg(
         long = "external-packages",
         env = "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
@@ -461,7 +462,7 @@ pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext>
     Ok(AuthContext {
         client,
         app_url: ctx.app_url,
-        org_id: ctx.login.org_id,
+        org_id: ctx.login.org_id().unwrap_or_default(),
     })
 }
 
@@ -550,6 +551,22 @@ async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
     })
 }
 
+fn function_selection_label(function: &Function, ft: Option<FunctionTypeFilter>) -> String {
+    let slug_suffix = if function.slug == function.name {
+        String::new()
+    } else {
+        format!(" [slug: {}]", function.slug)
+    };
+
+    match ft {
+        Some(_) => format!("{}{}", function.name, slug_suffix),
+        None => {
+            let t = function.function_type.as_deref().unwrap_or("?");
+            format!("{}{} ({})", function.name, slug_suffix, t)
+        }
+    }
+}
+
 pub(crate) async fn select_function_interactive(
     client: &ApiClient,
     project_id: &str,
@@ -568,17 +585,10 @@ pub(crate) async fn select_function_interactive(
 
     functions.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let names: Vec<String> = if ft.is_none() {
-        functions
-            .iter()
-            .map(|f| {
-                let t = f.function_type.as_deref().unwrap_or("?");
-                format!("{} ({})", f.name, t)
-            })
-            .collect()
-    } else {
-        functions.iter().map(|f| f.name.clone()).collect()
-    };
+    let names: Vec<String> = functions
+        .iter()
+        .map(|f| function_selection_label(f, ft))
+        .collect();
 
     let selection = ui::fuzzy_select(&format!("Select {}", label(ft)), &names, 0)?;
     Ok(functions[selection].clone())
@@ -954,6 +964,57 @@ mod tests {
             panic!("expected pull command");
         };
         assert_eq!(pull.slug_flag, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn function_selection_label_includes_slug_when_name_differs() {
+        let function = Function {
+            id: "id".to_string(),
+            name: "Display name".to_string(),
+            slug: "display-name".to_string(),
+            project_id: "project".to_string(),
+            description: None,
+            function_type: Some("classifier".to_string()),
+            prompt_data: None,
+            function_data: None,
+            tags: None,
+            metadata: None,
+            created: None,
+            _xact_id: None,
+        };
+
+        assert_eq!(
+            function_selection_label(&function, None),
+            "Display name [slug: display-name] (classifier)"
+        );
+        assert_eq!(
+            function_selection_label(&function, Some(FunctionTypeFilter::Classifier)),
+            "Display name [slug: display-name]"
+        );
+    }
+
+    #[test]
+    fn function_selection_label_avoids_duplicate_slug_when_equal_to_name() {
+        let function = Function {
+            id: "id".to_string(),
+            name: "same".to_string(),
+            slug: "same".to_string(),
+            project_id: "project".to_string(),
+            description: None,
+            function_type: Some("tool".to_string()),
+            prompt_data: None,
+            function_data: None,
+            tags: None,
+            metadata: None,
+            created: None,
+            _xact_id: None,
+        };
+
+        assert_eq!(function_selection_label(&function, None), "same (tool)");
+        assert_eq!(
+            function_selection_label(&function, Some(FunctionTypeFilter::Tool)),
+            "same"
+        );
     }
 
     #[derive(Debug, Parser)]

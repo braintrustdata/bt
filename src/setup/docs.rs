@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use regex::Regex;
-use reqwest::Client;
 use serde::Serialize;
 
 use crate::args::BaseArgs;
@@ -194,9 +193,7 @@ pub(super) async fn fetch_docs_pages(
         Regex::new(r#"(?m)\b(https?://[^\s<>"')]+)"#).context("failed to build URL regex")?;
     let llms_base = reqwest::Url::parse(&args.llms_url)
         .with_context(|| format!("invalid llms URL: {}", args.llms_url))?;
-    let client = Client::builder()
-        .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-        .build()
+    let client = crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
         .context("failed to build HTTP client")?;
 
     let index_response = client

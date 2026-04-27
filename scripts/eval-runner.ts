@@ -121,6 +121,7 @@ type RunnerConfig = {
   sampleSeed: number | null;
   devMode: "list" | "eval" | null;
   devRequestJson: string | null;
+  params: Record<string, unknown> | null;
 };
 
 type EvalRunner = {
@@ -286,6 +287,65 @@ function parseIntegerEnv(name: string): number | null {
   return parsed;
 }
 
+function parseParamsJson(
+  raw: string | undefined,
+): Record<string, unknown> | null {
+  if (!raw) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`BT_EVAL_PARAMS_JSON is not valid JSON: ${raw}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("BT_EVAL_PARAMS_JSON must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function getDeclaredParameterKeys(parameters: unknown): Set<string> | null {
+  if (!isObject(parameters)) {
+    return null;
+  }
+  if (Reflect.get(parameters, "__braintrust_parameters_marker") === true) {
+    const schema = Reflect.get(parameters, "schema");
+    if (isObject(schema)) {
+      const properties = Reflect.get(schema, "properties");
+      if (isObject(properties)) {
+        return new Set(Object.keys(properties));
+      }
+    }
+    return null;
+  }
+  if (isObject(Reflect.get(parameters, "schema"))) {
+    const schema = Reflect.get(parameters, "schema") as Record<string, unknown>;
+    const properties = Reflect.get(schema, "properties");
+    if (isObject(properties)) {
+      return new Set(Object.keys(properties));
+    }
+  }
+  return new Set(Object.keys(parameters));
+}
+
+function filterParamsForEvaluator(
+  params: Record<string, unknown>,
+  evaluatorParameters: unknown,
+): Record<string, unknown> {
+  const declared = getDeclaredParameterKeys(evaluatorParameters);
+  if (declared === null) {
+    return params;
+  }
+  const filtered: Record<string, unknown> = {};
+  for (const key of Object.keys(params)) {
+    if (declared.has(key)) {
+      filtered[key] = params[key];
+    }
+  }
+  return filtered;
+}
+
 function readRunnerConfig(): RunnerConfig {
   return {
     jsonl: envFlag("BT_EVAL_JSONL"),
@@ -297,6 +357,7 @@ function readRunnerConfig(): RunnerConfig {
     sampleSeed: parseIntegerEnv("BT_EVAL_SAMPLE_SEED"),
     devMode: parseDevMode(process.env.BT_EVAL_DEV_MODE),
     devRequestJson: process.env.BT_EVAL_DEV_REQUEST_JSON ?? null,
+    params: parseParamsJson(process.env.BT_EVAL_PARAMS_JSON),
   };
 }
 
@@ -2159,7 +2220,18 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   ) => {
     globalThis._lazy_load = false;
     const evaluatorName = getEvaluatorName(evaluator, projectName);
-    const opts = makeEvalOptions(evaluatorName, options);
+    // Only inject CLI params when the evaluator declares a parameters schema.
+    // Drop any --param keys the evaluator doesn't declare so a single command
+    // running multiple evaluators doesn't fail on unrelated params.
+    const filteredParams =
+      config.params != null && evaluator.parameters != null
+        ? filterParamsForEvaluator(config.params, evaluator.parameters)
+        : null;
+    const effectiveOptions =
+      filteredParams != null
+        ? mergeEvalOptions({ parameters: filteredParams }, options)
+        : options;
+    const opts = makeEvalOptions(evaluatorName, effectiveOptions);
     const sampledData = await applySamplingToData(evaluator.data, config, {
       initialCallReceiver: evaluator,
     });

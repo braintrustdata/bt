@@ -1173,14 +1173,17 @@ fn build_api_key_login_context(
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let login = braintrust_sdk_rust::LoginState::new();
+    let _ = login.set(
+        api_key.to_string(),
+        org.id.clone(),
+        org.name.clone(),
+        api_url.clone(),
+        app_url.clone(),
+    );
 
     LoginContext {
-        login: braintrust_sdk_rust::LoginState {
-            api_key: api_key.to_string(),
-            org_id: org.id.clone(),
-            org_name: org.name.clone(),
-            api_url: Some(api_url.clone()),
-        },
+        login,
         api_url,
         app_url,
     }
@@ -1343,6 +1346,11 @@ async fn ensure_setup_auth(
     prompt_for_profile_choice: bool,
     needs_api_key: bool,
 ) -> Result<SetupAuthContext> {
+    let project_was_explicit = base
+        .project
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
     apply_setup_config_fallbacks(base);
 
     let explicit_api_key = base
@@ -1352,7 +1360,7 @@ async fn ensure_setup_auth(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let stored_profiles = auth::list_stored_profiles()?;
-    let project_name = base
+    let mut project_name = base
         .project
         .as_deref()
         .map(str::trim)
@@ -1377,6 +1385,15 @@ async fn ensure_setup_auth(
             .clone()
             .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
         let available_orgs = list_available_orgs_for_setup(api_key, &app_url).await?;
+        if project_name.is_some() && org_name.is_none() && profile_name.is_none() {
+            let name = project_name
+                .as_deref()
+                .expect("project name exists when probing all orgs");
+            let matched_orgs = orgs_with_project(base, api_key, &available_orgs, name).await?;
+            if matched_orgs.is_empty() {
+                clear_missing_fallback_setup_project(base, &mut project_name, project_was_explicit);
+            }
+        }
 
         if let Some(profile_name) = profile_name.as_deref() {
             let profile = stored_profiles
@@ -1401,25 +1418,29 @@ async fn ensure_setup_auth(
 
             if let Some(org) = find_available_org(&available_orgs, target_org) {
                 let client = build_api_key_client(base, api_key, org).await?;
-                if let Some(project_name) = project_name.as_deref() {
-                    if !project_exists_in_org(&client, project_name).await? {
-                        bail!("project '{project_name}' not found in org '{}'", org.name);
-                    }
-                }
+                ensure_selected_setup_project(
+                    base,
+                    &client,
+                    &mut project_name,
+                    project_was_explicit,
+                    &org.name,
+                )
+                .await?;
                 return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let (login_ctx, is_oauth) =
                 ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
             let client = ApiClient::new(&login_ctx)?;
-            if let Some(project_name) = project_name.as_deref() {
-                if !project_exists_in_org(&client, project_name).await? {
-                    bail!(
-                        "project '{project_name}' not found in org '{}'",
-                        client.org_name()
-                    );
-                }
-            }
+            let resolved_org = client.org_name().to_string();
+            ensure_selected_setup_project(
+                base,
+                &client,
+                &mut project_name,
+                project_was_explicit,
+                &resolved_org,
+            )
+            .await?;
             return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
 
@@ -1434,25 +1455,29 @@ async fn ensure_setup_auth(
 
             if let Some(org) = find_available_org(&available_orgs, org_name) {
                 let client = build_api_key_client(base, api_key, org).await?;
-                if let Some(project_name) = project_name.as_deref() {
-                    if !project_exists_in_org(&client, project_name).await? {
-                        bail!("project '{project_name}' not found in org '{org_name}'");
-                    }
-                }
+                ensure_selected_setup_project(
+                    base,
+                    &client,
+                    &mut project_name,
+                    project_was_explicit,
+                    org_name,
+                )
+                .await?;
                 return build_setup_auth_context(base, client, false, needs_api_key).await;
             }
 
             let (login_ctx, is_oauth) =
                 ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
             let client = ApiClient::new(&login_ctx)?;
-            if let Some(project_name) = project_name.as_deref() {
-                if !project_exists_in_org(&client, project_name).await? {
-                    bail!(
-                        "project '{project_name}' not found in org '{}'",
-                        client.org_name()
-                    );
-                }
-            }
+            let resolved_org = client.org_name().to_string();
+            ensure_selected_setup_project(
+                base,
+                &client,
+                &mut project_name,
+                project_was_explicit,
+                &resolved_org,
+            )
+            .await?;
             return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
         }
 
@@ -1551,6 +1576,42 @@ async fn ensure_setup_auth(
     build_setup_auth_context(base, client, is_oauth, needs_api_key).await
 }
 
+async fn ensure_selected_setup_project(
+    base: &mut BaseArgs,
+    client: &ApiClient,
+    project_name: &mut Option<String>,
+    project_was_explicit: bool,
+    org_name: &str,
+) -> Result<()> {
+    let Some(requested_project) = project_name.as_deref() else {
+        return Ok(());
+    };
+
+    if project_exists_in_org(client, requested_project).await? {
+        return Ok(());
+    }
+
+    if project_was_explicit {
+        bail!("project '{requested_project}' not found in org '{org_name}'");
+    }
+
+    clear_missing_fallback_setup_project(base, project_name, false);
+    Ok(())
+}
+
+fn clear_missing_fallback_setup_project(
+    base: &mut BaseArgs,
+    project_name: &mut Option<String>,
+    project_was_explicit: bool,
+) {
+    if project_was_explicit || project_name.is_none() {
+        return;
+    }
+
+    base.project = None;
+    *project_name = None;
+}
+
 fn sync_setup_api_key(base: &mut BaseArgs, api_key: &str) {
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
@@ -1633,7 +1694,8 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
     let created: CreatedKey = client.post("/v1/api_key", &body).await?;
 
-    if std::io::stderr().is_terminal() && base.verbose {
+    let explicitly_quiet = base.quiet && base.quiet_source.is_some();
+    if std::io::stderr().is_terminal() && !explicitly_quiet {
         eprintln!();
         eprintln!(
             "{} Created Braintrust API key '{}' for instrumentation and exported it to this setup process:",
@@ -4750,6 +4812,7 @@ mod tests {
             prefer_profile: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }
@@ -4890,6 +4953,27 @@ mod tests {
         base.api_key = Some("env-key".to_string());
         base.api_key_source = Some(ArgValueSource::EnvVariable);
         assert!(!should_create_api_key_for_setup(true, &base, true));
+    }
+
+    #[test]
+    fn clear_missing_fallback_setup_project_clears_non_explicit_only() {
+        let mut base = make_base_args();
+        base.project = Some("stale-project".to_string());
+        let mut project_name = Some("stale-project".to_string());
+
+        clear_missing_fallback_setup_project(&mut base, &mut project_name, false);
+
+        assert_eq!(base.project, None);
+        assert_eq!(project_name, None);
+
+        let mut base = make_base_args();
+        base.project = Some("explicit-project".to_string());
+        let mut project_name = Some("explicit-project".to_string());
+
+        clear_missing_fallback_setup_project(&mut base, &mut project_name, true);
+
+        assert_eq!(base.project, Some("explicit-project".to_string()));
+        assert_eq!(project_name, Some("explicit-project".to_string()));
     }
 
     #[test]

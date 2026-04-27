@@ -342,6 +342,16 @@ fn push_topic_map_details(lines: &mut Vec<String>, function: &FunctionSummary, i
             format_float_compact(distance_threshold)
         ));
     }
+    if let Some(disable_reconciliation) = function.disable_reconciliation {
+        lines.push(format!(
+            "{indent}reconciliation: {}",
+            if disable_reconciliation {
+                "disabled (new runs ignore the previous report)"
+            } else {
+                "enabled (new runs can use the previous report)"
+            }
+        ));
+    }
     if let Some(btql_filter) = function.btql_filter.as_deref() {
         lines.push(format!(
             "{indent}filter: {btql_filter} (extra BTQL filter for this topic map)"
@@ -503,6 +513,7 @@ impl TopicMapSetArgs {
             source_facet: trim_to_option(self.source_facet.as_deref()),
             embedding_model: trim_to_option(self.embedding_model.as_deref()),
             distance_threshold: self.distance_threshold,
+            disable_reconciliation: self.disable_reconciliation,
             algorithm: self.algorithm.clone(),
             dimension_reduction: self.dimension_reduction.clone(),
             sample_size: self.sample_size,
@@ -521,6 +532,7 @@ impl TopicMapSetArgs {
             && patch.source_facet.is_none()
             && patch.embedding_model.is_none()
             && patch.distance_threshold.is_none()
+            && patch.disable_reconciliation.is_none()
             && patch.algorithm.is_none()
             && patch.dimension_reduction.is_none()
             && patch.sample_size.is_none()
@@ -625,6 +637,7 @@ mod tests {
                 source_facet: None,
                 embedding_model: None,
                 distance_threshold: None,
+                disable_reconciliation: None,
                 generation_settings: None,
             }],
             topic_map_functions: vec![api::FunctionSummary {
@@ -638,6 +651,7 @@ mod tests {
                 source_facet: Some("Task".to_string()),
                 embedding_model: Some("brain-embedding-1".to_string()),
                 distance_threshold: Some(0.35),
+                disable_reconciliation: Some(true),
                 generation_settings: Some(api::TopicMapGenerationSettings {
                     algorithm: Some("hdbscan".to_string()),
                     dimension_reduction: Some("umap".to_string()),
@@ -785,6 +799,7 @@ mod tests {
             source_facet: Some("Task".to_string()),
             embedding_model: Some("brain-embedding-1".to_string()),
             distance_threshold: Some(0.4),
+            disable_reconciliation: Some(true),
             algorithm: Some("hdbscan".to_string()),
             dimension_reduction: Some("umap".to_string()),
             sample_size: None,
@@ -800,6 +815,7 @@ mod tests {
         assert_eq!(patch.topic_map_target, "Task");
         assert_eq!(patch.embedding_model.as_deref(), Some("brain-embedding-1"));
         assert_eq!(patch.distance_threshold, Some(0.4));
+        assert_eq!(patch.disable_reconciliation, Some(true));
         assert_eq!(patch.algorithm.as_deref(), Some("hdbscan"));
         assert_eq!(patch.dimension_reduction.as_deref(), Some("umap"));
         assert_eq!(patch.min_cluster_size, Some(20));

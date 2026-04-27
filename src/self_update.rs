@@ -7,6 +7,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::args::BaseArgs;
 use crate::http::DEFAULT_HTTP_TIMEOUT;
 
 #[derive(Debug, Clone, Args)]
@@ -76,31 +77,30 @@ impl UpdateChannel {
 }
 
 const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
-
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
 }
 
-pub async fn run(args: SelfArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
     match args.command {
-        SelfSubcommand::Update(args) => run_update(args).await,
+        SelfSubcommand::Update(args) => run_update(&base, args).await,
     }
 }
 
-async fn run_update(args: UpdateArgs) -> Result<()> {
+async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
     ensure_installer_managed_install()?;
     let channel = args
         .channel
         .unwrap_or_else(|| inferred_update_channel(BUILD_UPDATE_CHANNEL));
 
     if args.check {
-        check_for_update(channel).await?;
+        check_for_update(base, channel).await?;
         return Ok(());
     }
 
     if channel == UpdateChannel::Stable {
-        match fetch_release(channel).await {
+        match fetch_release(base, channel).await {
             Ok(release) => {
                 let current = env!("CARGO_PKG_VERSION");
                 if stable_is_up_to_date(current, &release.tag_name) {
@@ -135,8 +135,8 @@ fn ensure_installer_managed_install() -> Result<()> {
     );
 }
 
-async fn check_for_update(channel: UpdateChannel) -> Result<()> {
-    let release = fetch_release(channel).await?;
+async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+    let release = fetch_release(base, channel).await?;
     let current = env!("CARGO_PKG_VERSION");
 
     match channel {
@@ -151,12 +151,13 @@ async fn check_for_update(channel: UpdateChannel) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_release(channel: UpdateChannel) -> Result<GitHubRelease> {
-    let client = Client::builder()
-        .user_agent("bt-self-update")
-        .timeout(DEFAULT_HTTP_TIMEOUT)
-        .build()
-        .context("failed to initialize HTTP client")?;
+async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
+    let client = crate::http::build_http_client_from_builder(
+        Client::builder()
+            .user_agent("bt-self-update")
+            .timeout(DEFAULT_HTTP_TIMEOUT),
+    )
+    .context("failed to initialize HTTP client")?;
 
     let mut request = client
         .get(channel.github_release_api_url())
@@ -190,11 +191,9 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
         let installer_url = channel.installer_url();
         println!("updating bt from {} channel...", channel.name());
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .status()
-            .context("failed to execute installer")?;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(cmd);
+        let status = command.status().context("failed to execute installer")?;
 
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
