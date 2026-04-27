@@ -140,6 +140,14 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
 
+      - name: Install sha256sum (macOS ARM64)
+        if: ${{ runner.os == 'macOS' && runner.arch == 'ARM64' }}
+        shell: bash
+        run: |
+          printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > /tmp/sha256sum
+          chmod +x /tmp/sha256sum
+          echo /tmp >> "$GITHUB_PATH"
+
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
 
