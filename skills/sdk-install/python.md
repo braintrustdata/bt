@@ -6,32 +6,26 @@ Reference guide for installing the Braintrust Python SDK.
 - PyPI: https://pypi.org/project/braintrust/
 - Requires Python 3.9+
 
-## Find the latest version of the SDK
+## Install the SDK
 
-Look up the latest version from PyPI **without installing anything**. Do not guess -- use a read-only query so the environment stays unchanged until you pin the exact version.
-
-```bash
-pip index versions braintrust
-```
-
-Then install that exact version with the project's package manager:
+Install the latest published version of `braintrust`. Do not hard-pin the version unless the user asks -- let the package manager record whatever it normally records.
 
 ### pip
 
 ```bash
-pip install braintrust==<VERSION>
+pip install braintrust
 ```
 
 ### poetry
 
 ```bash
-poetry add braintrust==<VERSION>
+poetry add braintrust
 ```
 
 ### uv
 
 ```bash
-uv add braintrust==<VERSION>
+uv add braintrust
 ```
 
 ## Instrument the application
@@ -72,4 +66,4 @@ If you can't determine how to run the app, ask the user.
 
 ## Generate a permalink (required)
 
-Follow the permalink generation steps in the agent task (Step 5). Use the `project=` argument passed to `init_logger` as the project name.
+Follow the permalink generation steps in the agent task (Step 5). Use the project name you configured in code above.

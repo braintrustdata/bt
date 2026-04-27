@@ -8,9 +8,19 @@ Reference guide for installing the Braintrust Go SDK.
 
 ## Install the SDK
 
+Install the latest Braintrust SDK. Do not hard-pin the SDK version unless the user asks -- `go get` without a version suffix is fine and will record whatever version `go mod tidy` resolves.
+
 ```bash
 go get github.com/braintrustdata/braintrust-sdk-go
 ```
+
+If you need to know what the latest version is:
+
+```bash
+go list -m -versions github.com/braintrustdata/braintrust-sdk-go
+```
+
+**Note:** Orchestrion, the build-time instrumentation tool described below, **must** be pinned to an exact version. That requirement is separate from the SDK itself.
 
 ## Instrument the application
 
@@ -30,7 +40,6 @@ Every Go project needs OpenTelemetry setup and a Braintrust client.
 package main
 
 import (
-	"context"
 	"log"
 
 	"github.com/braintrustdata/braintrust-sdk-go"
@@ -39,10 +48,7 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
-
 	tp := trace.NewTracerProvider()
-	defer tp.Shutdown(ctx)
 	otel.SetTracerProvider(tp)
 
 	_, err := braintrust.New(tp, braintrust.WithProject("my-project"))
@@ -54,17 +60,24 @@ func main() {
 
 `braintrust.New` reads `BRAINTRUST_API_KEY` from the environment automatically.
 
-### Requirement: build with Orchestrion
+### Requirement: persist Orchestrion into the normal build/run path
 
-Auto-instrumentation requires building the project with Orchestrion -- without this step, nothing will be traced.
+Auto-instrumentation requires the project to be built and run with Orchestrion. A one-off `orchestrion go build` during verification is **not enough** if the next developer, CI job, or deploy will go back to plain `go build` / `go run`.
 
-**1. Install orchestrion:**
+**1. Resolve and pin an exact Orchestrion version:**
+
+Orchestrion is a build-time dependency that modifies the Go toolchain, so it **must** be pinned to an exact version for reproducible builds -- this is different from the Braintrust SDK itself.
 
 ```bash
-go install github.com/DataDog/orchestrion@v1.6.1
+go list -m -versions github.com/DataDog/orchestrion
+go install github.com/DataDog/orchestrion@vX.Y.Z
 ```
 
-**2. Create `orchestrion.tool.go` in the project root:**
+Do not use `@latest`. Prefer the newest version that is compatible with the project's existing `go` / `toolchain` version. If Orchestrion would require bumping the project's Go version or toolchain, ask the user before making that change.
+
+**2. Create `orchestrion.tool.go` in the module root (the same directory as `go.mod`):**
+
+Prefer importing only the integrations the project actually uses. Use `trace/contrib/all` only if provider detection is genuinely unclear or the project uses many supported integrations.
 
 To instrument all supported providers:
 
@@ -96,20 +109,26 @@ import (
 )
 ```
 
-**3. Build with orchestrion:**
+Then run `go mod tidy` so the exact Orchestrion and contrib versions are recorded in `go.mod` / `go.sum`.
 
-```bash
-orchestrion go build ./...
-```
+**3. Persist Orchestrion into the project's actual workflow:**
 
-Or set GOFLAGS to use orchestrion automatically:
+Update the command the project already expects developers or CI to use:
 
-```bash
-export GOFLAGS="-toolexec='orchestrion toolexec'"
-go build ./...
-```
+- `Makefile` / `justfile` / shell scripts: change `go build`, `go run`, and `go test` invocations to `orchestrion go ...` where appropriate.
+- `Dockerfile`: change build steps to use Orchestrion.
+- Bootstrap / CI / devcontainer setup: if the repo already has a checked-in way to install required tooling, add Orchestrion there too so future users do not hit `orchestrion: command not found`.
+- Repo-local env/config files: if the project already uses a checked-in mechanism for env vars, set `GOFLAGS="-toolexec=orchestrion toolexec"` there.
 
-After this, LLM client calls are automatically traced with no code changes.
+A shell-local `export GOFLAGS=...` in the current terminal does **not** satisfy this requirement by itself, because it will not help the next user or CI run.
+
+If you add `orchestrion.tool.go` but do **not** modify any persisted build/run path, treat the installation as incomplete.
+
+**4. Verify using the same persisted command:**
+
+After wiring Orchestrion into the normal workflow, run that exact command and confirm traces are emitted. Do not verify with a custom one-off command that the project will not use later.
+
+After this, LLM client calls are automatically traced with no application wrapper code.
 
 ### Supported providers
 
@@ -117,15 +136,16 @@ For the current list of supported providers and their `trace/contrib/` import pa
 
 ## Run the application
 
-Try to figure out how to run the application from the project structure:
+Prefer the project's existing build/run entrypoint, and make sure that entrypoint now goes through Orchestrion.
 
-- **go run**: `go run .` or `go run ./cmd/myapp`
-- **Orchestrion**: `orchestrion go run .`
-- **Makefile**: check for `run`, `serve`, or similar targets
-- **Docker**: check for a `Dockerfile`
+Try to figure out how the project is normally run from the project structure:
 
-If you can't determine how to run the app, ask the user.
+- **Makefile / justfile / scripts**: prefer `make run`, `just run`, or the existing repo script if present
+- **go run**: if the project is normally run directly, update that path to `orchestrion go run .` or `orchestrion go run ./cmd/myapp`
+- **Docker**: check for a `Dockerfile` or container build script
+
+If you can't determine how the app is supposed to be built or run in normal use, ask the user before proceeding.
 
 ## Generate a permalink (required)
 
-Follow the permalink generation steps in the agent task (Step 5). Use the value passed to `braintrust.WithProject(...)` as the project name.
+Follow the permalink generation steps in the agent task (Step 5). Use the project name you configured in code above.
