@@ -177,6 +177,7 @@ fn sanitized_env_keys() -> &'static [&'static str] {
         "BT_FUNCTIONS_PUSH_REQUIREMENTS",
         "BT_FUNCTIONS_PUSH_TSCONFIG",
         "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+        "BT_FUNCTIONS_PUSH_MANIFEST",
         "BT_FUNCTIONS_PULL_OUTPUT_DIR",
         "BT_FUNCTIONS_PULL_PROJECT_ID",
         "BT_FUNCTIONS_PULL_PROJECT_NAME",
@@ -1772,6 +1773,538 @@ exit 24
     assert!(
         decompressed.contains("globalThis._evals"),
         "uploaded bundle should contain original source"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_manifest_works_against_mock_api() {
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let manifest_path = tmp.path().join("facet.json");
+    let manifest_body = serde_json::json!({
+        "name": "mock-facet",
+        "slug": "mock-facet-v1",
+        "function_type": "facet",
+        "function_data": {
+            "type": "facet",
+            "prompt": "score the trace",
+            "no_match_pattern": "^NONE",
+            "preprocessor": { "id": "preproc-id", "type": "function" }
+        }
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string(&manifest_body).expect("serialize manifest"),
+    )
+    .expect("write manifest file");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--manifest",
+            manifest_path
+                .to_str()
+                .expect("manifest path should be valid UTF-8 for test"),
+            "-p",
+            "mock-project",
+            "--if-exists",
+            "replace",
+            "--yes",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt functions push --manifest");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("manifest push failed:\n{stderr}");
+    }
+
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("parse push summary");
+    assert_eq!(summary["status"].as_str(), Some("success"));
+    assert_eq!(summary["uploaded_files"].as_u64(), Some(1));
+
+    let inserted = state
+        .inserted_functions
+        .lock()
+        .expect("inserted functions lock")
+        .clone();
+    assert_eq!(inserted.len(), 1);
+    let first = inserted[0].as_object().expect("inserted function object");
+    assert_eq!(
+        first.get("project_id").and_then(Value::as_str),
+        Some("proj_mock")
+    );
+    assert_eq!(
+        first.get("function_type").and_then(Value::as_str),
+        Some("facet")
+    );
+    assert_eq!(
+        first.get("if_exists").and_then(Value::as_str),
+        Some("replace")
+    );
+    // The point of the patch: facet-shaped function_data passes through verbatim,
+    // including fields the SDK has no builder for (preprocessor reference).
+    assert_eq!(
+        first.get("function_data").and_then(|v| v.get("type")),
+        manifest_body
+            .get("function_data")
+            .and_then(|v| v.get("type"))
+    );
+    assert_eq!(
+        first
+            .get("function_data")
+            .and_then(|v| v.get("preprocessor")),
+        manifest_body
+            .get("function_data")
+            .and_then(|v| v.get("preprocessor"))
+    );
+
+    let uploaded = state
+        .uploaded_bundles
+        .lock()
+        .expect("uploaded bundles lock")
+        .clone();
+    assert!(
+        uploaded.is_empty(),
+        "manifest push must not upload a bundle"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_manifest_inline_quickjs_preprocessor_array() {
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let manifest_path = tmp.path().join("lens.json");
+    let manifest_body = serde_json::json!([
+        {
+            "name": "lens-preprocessor",
+            "slug": "lens-preprocessor-v1",
+            "function_type": "preprocessor",
+            "function_data": {
+                "type": "code",
+                "data": {
+                    "type": "inline",
+                    "code": "function handler({ span_attributes }) { return null; }",
+                    "runtime_context": { "runtime": "quickjs", "version": "ES2023" }
+                }
+            }
+        },
+        {
+            "name": "lens-facet",
+            "slug": "lens-facet-v1",
+            "function_type": "facet",
+            "function_data": {
+                "type": "facet",
+                "prompt": "score the trace",
+                "no_match_pattern": "^NONE",
+                "preprocessor": { "id": "preproc-id", "type": "function" }
+            }
+        }
+    ]);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string(&manifest_body).expect("serialize"),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--manifest",
+            manifest_path.to_str().expect("path utf8"),
+            "-p",
+            "mock-project",
+            "--yes",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        panic!(
+            "manifest push failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let inserted = state.inserted_functions.lock().expect("lock").clone();
+    assert_eq!(inserted.len(), 2);
+
+    // Inline-quickjs preprocessor data shape passes through verbatim.
+    let preproc = &inserted[0];
+    assert_eq!(
+        preproc.get("function_type").and_then(Value::as_str),
+        Some("preprocessor")
+    );
+    let pdata = preproc
+        .get("function_data")
+        .and_then(|v| v.get("data"))
+        .expect("data");
+    assert_eq!(pdata.get("type").and_then(Value::as_str), Some("inline"));
+    assert_eq!(
+        pdata
+            .get("runtime_context")
+            .and_then(|v| v.get("runtime"))
+            .and_then(Value::as_str),
+        Some("quickjs")
+    );
+
+    // Facet preserves preprocessor reference.
+    let facet = &inserted[1];
+    assert_eq!(
+        facet.get("function_type").and_then(Value::as_str),
+        Some("facet")
+    );
+    assert_eq!(
+        facet
+            .get("function_data")
+            .and_then(|v| v.get("preprocessor")),
+        manifest_body[1]
+            .get("function_data")
+            .and_then(|v| v.get("preprocessor"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_manifest_accepts_wrapped_shape() {
+    // The exact /insert-functions wire body: {"functions": [...]}.
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let manifest_path = tmp.path().join("wrapped.json");
+    let body = serde_json::json!({
+        "functions": [
+            {"name":"a","slug":"a-v1","function_type":"facet","function_data":{"type":"facet"}},
+            {"name":"b","slug":"b-v1","function_type":"facet","function_data":{"type":"facet"}}
+        ]
+    });
+    std::fs::write(&manifest_path, serde_json::to_string(&body).expect("ser")).expect("write");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--manifest",
+            manifest_path.to_str().expect("path utf8"),
+            "-p",
+            "mock-project",
+            "--yes",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        panic!(
+            "wrapped manifest push failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(state.inserted_functions.lock().expect("lock").len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_manifest_ignores_runner_env_vars() {
+    // Regression: --manifest used to conflict with env-backed runner options
+    // (BT_FUNCTIONS_PUSH_RUNNER, BT_FUNCTIONS_PUSH_LANGUAGE, etc.), so a user
+    // with those exported in their shell could not push a manifest at all.
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let manifest_path = tmp.path().join("simple.json");
+    let body = serde_json::json!({
+        "name": "x",
+        "slug": "x-v1",
+        "function_type": "facet",
+        "function_data": {"type": "facet"}
+    });
+    std::fs::write(&manifest_path, serde_json::to_string(&body).expect("ser")).expect("write");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--manifest",
+            manifest_path.to_str().expect("path utf8"),
+            "-p",
+            "mock-project",
+            "--yes",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env("BT_FUNCTIONS_PUSH_RUNNER", "tsx")
+        .env("BT_FUNCTIONS_PUSH_LANGUAGE", "javascript")
+        .env("BT_FUNCTIONS_PUSH_TSCONFIG", "/tmp/tsconfig.json")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        panic!(
+            "manifest push must ignore runner env vars:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(state.inserted_functions.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_manifest_duplicate_slugs_dont_create_fresh_project() {
+    // Regression: duplicate-slug detection used to run after resolve_named_projects,
+    // so a manifest with duplicate slugs and -p new-project would create the project
+    // on the server even though no functions were inserted. Covers two alias shapes:
+    // both entries fall back to -p, and one falls back while the other names -p.
+    for entries_body in [
+        serde_json::json!([
+            {"name":"a","slug":"same-slug","function_type":"facet","function_data":{"type":"facet"}},
+            {"name":"b","slug":"same-slug","function_type":"facet","function_data":{"type":"facet"}}
+        ]),
+        serde_json::json!([
+            {"name":"a","slug":"same-slug","function_type":"facet","function_data":{"type":"facet"}},
+            {"name":"b","slug":"same-slug","project_name":"fresh-project","function_type":"facet","function_data":{"type":"facet"}}
+        ]),
+    ] {
+        let state = Arc::new(MockServerState::default());
+        let server = MockServer::start(state.clone()).await;
+
+        let tmp = tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("dup.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string(&entries_body).expect("serialize"),
+        )
+        .expect("write manifest");
+
+        let output = Command::new(bt_binary_path())
+            .current_dir(tmp.path())
+            .args([
+                "functions",
+                "--json",
+                "push",
+                "--manifest",
+                manifest_path.to_str().expect("path utf8"),
+                "-p",
+                "fresh-project",
+                "--yes",
+            ])
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_ORG_NAME", "test-org")
+            .env("BRAINTRUST_API_URL", &server.base_url)
+            .env("BRAINTRUST_APP_URL", &server.base_url)
+            .env("BRAINTRUST_NO_COLOR", "1")
+            .env_remove("BRAINTRUST_PROFILE")
+            .output()
+            .expect("run bt");
+
+        server.stop().await;
+
+        assert!(!output.status.success(), "duplicate slugs must fail");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("duplicate slug"),
+            "expected 'duplicate slug' in stderr"
+        );
+        assert!(
+            state.projects.lock().expect("lock").is_empty(),
+            "duplicate detection must run before project creation"
+        );
+        assert!(
+            state.inserted_functions.lock().expect("lock").is_empty(),
+            "no functions should be inserted"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_manifest_json_failure_reports_manifest_path() {
+    let state = Arc::new(MockServerState::default());
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let manifest_path = tmp.path().join("bad.json");
+    std::fs::write(&manifest_path, "{ this is not json").expect("write manifest");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--manifest",
+            manifest_path.to_str().expect("path utf8"),
+            "-p",
+            "any-project",
+            "--yes",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt");
+
+    server.stop().await;
+
+    assert!(!output.status.success(), "invalid JSON must fail");
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("parse summary");
+    assert_eq!(summary["status"].as_str(), Some("failed"));
+    assert_eq!(summary["total_files"].as_u64(), Some(1));
+    assert_eq!(
+        summary["files"][0]["source_file"].as_str(),
+        Some(manifest_path.display().to_string().as_str()),
+        "failure JSON should report the manifest path as source_file"
+    );
+    assert_eq!(
+        summary["files"][0]["error_reason"].as_str(),
+        Some("manifest_invalid_json"),
+        "JSON parse failure should map to manifest_invalid_json, not manifest_schema_invalid"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_push_manifest_creates_missing_default_project() {
+    let state = Arc::new(MockServerState::default());
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let manifest_path = tmp.path().join("new.json");
+    let manifest_body = serde_json::json!({
+        "name": "x",
+        "slug": "x-v1",
+        "function_type": "facet",
+        "function_data": {"type": "facet"}
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string(&manifest_body).expect("serialize"),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "push",
+            "--manifest",
+            manifest_path.to_str().expect("path utf8"),
+            "-p",
+            "fresh-project",
+            "--yes",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .output()
+        .expect("run bt");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        panic!(
+            "manifest push failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let projects = state.projects.lock().expect("lock").clone();
+    assert!(
+        projects.iter().any(|p| p.name == "fresh-project"),
+        "default project should have been created via --create-missing-projects"
+    );
+
+    let inserted = state.inserted_functions.lock().expect("lock").clone();
+    assert_eq!(inserted.len(), 1);
+    let project_id = inserted[0]
+        .get("project_id")
+        .and_then(Value::as_str)
+        .expect("project_id");
+    assert!(
+        project_id.starts_with("proj_created_"),
+        "entry should be associated with the freshly-created project, got '{project_id}'"
     );
 }
 

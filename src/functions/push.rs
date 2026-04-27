@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use dialoguer::console::style;
 use dialoguer::Confirm;
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::args::BaseArgs;
@@ -27,7 +27,7 @@ use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
 use crate::source_language::{classify_runtime_extension, SourceLanguage};
-use crate::ui::{animations_enabled, is_interactive, is_quiet};
+use crate::ui::{animations_enabled, is_interactive, is_quiet, with_spinner};
 
 use super::api;
 use super::{
@@ -277,6 +277,10 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             );
         }
     };
+
+    if let Some(manifest_path) = args.manifest.clone() {
+        return run_manifest_push(base, args, auth_ctx, manifest_path).await;
+    }
 
     let files = args.resolved_files();
     let classified = match collect_classified_files(&files) {
@@ -686,6 +690,332 @@ struct FileSuccess {
     uploaded_entries: usize,
     ignored_entries: usize,
     bundle_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RawFunctionEntry {
+    name: String,
+    slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_data: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    if_exists: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+// Push function definitions from a raw JSON manifest, skipping the SDK runner.
+async fn run_manifest_push(
+    base: BaseArgs,
+    args: PushArgs,
+    auth_ctx: super::AuthContext,
+    manifest_path: PathBuf,
+) -> Result<()> {
+    let raw = match std::fs::read_to_string(&manifest_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ManifestPathMissing,
+                format!("failed to read manifest {}: {err}", manifest_path.display()),
+                "failed to read manifest file",
+            );
+        }
+    };
+
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ManifestInvalidJson,
+                format!(
+                    "manifest {} is not valid JSON: {err}",
+                    manifest_path.display()
+                ),
+                "manifest JSON parse failed",
+            );
+        }
+    };
+
+    let parse_result = match parsed {
+        Value::Array(_) => serde_json::from_value::<Vec<RawFunctionEntry>>(parsed),
+        Value::Object(mut obj)
+            if obj.len() == 1 && matches!(obj.get("functions"), Some(Value::Array(_))) =>
+        {
+            serde_json::from_value(obj.remove("functions").unwrap())
+        }
+        other => serde_json::from_value::<RawFunctionEntry>(other).map(|e| vec![e]),
+    };
+    let mut entries = match parse_result {
+        Ok(es) => es,
+        Err(err) => {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ManifestSchemaInvalid,
+                format!("manifest {} schema invalid: {err}", manifest_path.display()),
+                "manifest schema invalid",
+            );
+        }
+    };
+
+    if entries.is_empty() {
+        return fail_manifest_push(
+            &base,
+            &manifest_path,
+            HardFailureReason::ManifestSchemaInvalid,
+            "manifest contains no function definitions".to_string(),
+            "empty manifest",
+        );
+    }
+
+    let default_project_name = match resolve_default_project_name(&base) {
+        Ok(name) => name,
+        Err(err) => {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ManifestSchemaInvalid,
+                format!("{err:#}"),
+                "invalid default project name",
+            );
+        }
+    };
+    let source_label = manifest_path.display().to_string();
+    let mut preflight = ProjectPreflight {
+        default_project_name,
+        requires_default_project: false,
+        named_projects: BTreeSet::new(),
+        direct_project_ids: BTreeSet::new(),
+    };
+
+    let mut seen_local: BTreeSet<(String, String)> = BTreeSet::new();
+    for entry in &entries {
+        let selector = match parse_project_selector(
+            entry.project_id.as_deref(),
+            entry.project_name.as_deref(),
+        ) {
+            Ok(selector) => selector,
+            Err(err) => {
+                return fail_manifest_push(
+                    &base,
+                    &manifest_path,
+                    HardFailureReason::ManifestSchemaInvalid,
+                    format!("manifest entry '{}': {err:#}", entry.slug),
+                    "invalid project selector in manifest entry",
+                );
+            }
+        };
+        let project_key = match &selector {
+            ProjectSelector::Id(id) => format!("id:{id}"),
+            ProjectSelector::Name(name) => format!("name:{name}"),
+            ProjectSelector::Fallback => match preflight.default_project_name.as_deref() {
+                Some(default) => format!("name:{default}"),
+                None => "fallback".to_string(),
+            },
+        };
+        if !seen_local.insert((entry.slug.clone(), project_key)) {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ManifestSchemaInvalid,
+                format!(
+                    "duplicate slug '{}' for the same project in '{}'",
+                    entry.slug, source_label
+                ),
+                "manifest contains duplicate slugs",
+            );
+        }
+        if let Err(err) = add_selector_requirement(
+            &source_label,
+            &entry.slug,
+            &selector,
+            preflight.default_project_name.as_deref(),
+            &mut preflight.named_projects,
+            &mut preflight.direct_project_ids,
+            &mut preflight.requires_default_project,
+        ) {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ManifestSchemaInvalid,
+                format!("{err:#}"),
+                "manifest entry missing project",
+            );
+        }
+    }
+
+    if !args.yes && is_interactive() {
+        let project_names: Vec<String> = preflight.named_projects.iter().cloned().collect();
+        let prompt = build_push_confirm_prompt(&auth_ctx, &[&source_label], &project_names);
+        let confirmed = Confirm::new()
+            .with_prompt(prompt)
+            .default(false)
+            .interact()?;
+        if !confirmed {
+            return cancel_push(&base, &[manifest_path]);
+        }
+    }
+
+    if let Err(err) = validate_direct_project_ids(&auth_ctx, &preflight.direct_project_ids).await {
+        return fail_manifest_push(
+            &base,
+            &manifest_path,
+            HardFailureReason::ResponseInvalid,
+            format!("{err:#}"),
+            "manifest direct project_id validation failed",
+        );
+    }
+
+    let mut project_name_cache = match resolve_named_projects(
+        &auth_ctx,
+        &preflight.named_projects,
+        args.create_missing_projects,
+    )
+    .await
+    {
+        Ok(cache) => cache,
+        Err(err) => {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ResponseInvalid,
+                format!("{err:#}"),
+                "failed to resolve named projects in manifest",
+            );
+        }
+    };
+
+    let cli_project_default_id = match resolve_default_project_id(&preflight, &project_name_cache) {
+        Ok(id) => id,
+        Err(err) => {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::ManifestSchemaInvalid,
+                format!("{err:#}"),
+                "failed to resolve default project id",
+            );
+        }
+    };
+
+    let mut resolved_targets = Vec::with_capacity(entries.len());
+    for entry in &mut entries {
+        let project_id = match resolve_project_id(
+            &auth_ctx.client,
+            cli_project_default_id.as_deref(),
+            entry.project_id.as_deref(),
+            entry.project_name.as_deref(),
+            &mut project_name_cache,
+            args.create_missing_projects,
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                return fail_manifest_push(
+                    &base,
+                    &manifest_path,
+                    HardFailureReason::ManifestSchemaInvalid,
+                    format!("manifest entry '{}': {err:#}", entry.slug),
+                    "failed to resolve project for manifest entry",
+                );
+            }
+        };
+
+        resolved_targets.push(ResolvedEntryTarget {
+            source_file: source_label.clone(),
+            slug: entry.slug.clone(),
+            project_id: project_id.clone(),
+        });
+        entry.project_id = Some(project_id);
+        entry.project_name = None;
+        entry
+            .if_exists
+            .get_or_insert_with(|| args.if_exists.as_str().to_string());
+    }
+
+    if let Err(err) = validate_duplicate_slugs(&resolved_targets) {
+        return fail_manifest_push(
+            &base,
+            &manifest_path,
+            HardFailureReason::ManifestSchemaInvalid,
+            format!("{err:#}"),
+            "manifest contains duplicate slugs",
+        );
+    }
+
+    let payload: Vec<Value> = entries
+        .iter()
+        .map(|e| serde_json::to_value(e).expect("RawFunctionEntry serializes to Value"))
+        .collect();
+
+    // Spinner stderr noise breaks --json consumers that read stderr.
+    let insert_future = api::insert_functions(&auth_ctx.client, &payload);
+    let insert = if base.json {
+        insert_future.await
+    } else {
+        with_spinner("Pushing manifest...", insert_future).await
+    };
+    let insert_result = match insert {
+        Ok(result) => result,
+        Err(err) => {
+            return fail_manifest_push(
+                &base,
+                &manifest_path,
+                HardFailureReason::InsertFunctionsFailed,
+                format!(
+                    "failed to insert manifest functions from {}: {err:#}",
+                    manifest_path.display()
+                ),
+                "failed to insert manifest functions",
+            );
+        }
+    };
+
+    let (uploaded_entries, ignored_entries) =
+        calculate_upload_counts(payload.len(), insert_result.ignored_entries);
+
+    let summary = PushSummary {
+        status: CommandStatus::Success,
+        total_files: 1,
+        uploaded_files: 1,
+        failed_files: 0,
+        skipped_files: 0,
+        ignored_entries,
+        files: vec![PushFileReport {
+            source_file: manifest_path.display().to_string(),
+            status: FileStatus::Success,
+            uploaded_entries,
+            skipped_reason: None,
+            error_reason: None,
+            bundle_id: None,
+            message: None,
+        }],
+        warnings: vec![],
+        errors: vec![],
+    };
+
+    if !base.json {
+        eprintln!(
+            "{} Pushed {} entries from {}",
+            style("✓").green(),
+            uploaded_entries,
+            manifest_path.display(),
+        );
+    }
+
+    emit_summary(&base, &summary)?;
+    Ok(())
 }
 
 fn default_code_location(index: usize) -> Value {
@@ -2298,7 +2628,7 @@ fn collect_project_preflight(
             };
 
             add_selector_requirement(
-                file,
+                &file.source_file,
                 entry_slug(entry)?,
                 &selector,
                 default_project_name.as_deref(),
@@ -2331,7 +2661,7 @@ fn entry_slug(entry: &ManifestEntry) -> Result<&str> {
 }
 
 fn add_selector_requirement(
-    file: &ManifestFile,
+    source_label: &str,
     slug: &str,
     selector: &ProjectSelector,
     default_project_name: Option<&str>,
@@ -2351,7 +2681,7 @@ fn add_selector_requirement(
                 bail!(
                     "missing project for slug '{}' in '{}'; set project in the definition or pass --project",
                     slug,
-                    file.source_file
+                    source_label
                 );
             };
             *requires_default_project = true;
@@ -2868,6 +3198,41 @@ fn emit_failed_push_summary(
     emit_summary(base, &summary)
 }
 
+fn fail_manifest_push(
+    base: &BaseArgs,
+    manifest_path: &Path,
+    reason: HardFailureReason,
+    message: String,
+    file_message: &str,
+) -> Result<()> {
+    if base.json {
+        let summary = PushSummary {
+            status: CommandStatus::Failed,
+            total_files: 1,
+            uploaded_files: 0,
+            failed_files: 1,
+            skipped_files: 0,
+            ignored_entries: 0,
+            files: vec![PushFileReport {
+                source_file: manifest_path.display().to_string(),
+                status: FileStatus::Failed,
+                uploaded_entries: 0,
+                skipped_reason: None,
+                error_reason: Some(reason),
+                bundle_id: None,
+                message: Some(file_message.to_string()),
+            }],
+            warnings: vec![],
+            errors: vec![ReportError {
+                reason,
+                message: message.clone(),
+            }],
+        };
+        emit_summary(base, &summary)?;
+    }
+    bail!(message);
+}
+
 fn fail_push(
     base: &BaseArgs,
     total_files: usize,
@@ -2916,6 +3281,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manifest_entry_requires_name_and_slug() {
+        for missing in ["name", "slug"] {
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), Value::String("x".into()));
+            obj.insert("slug".into(), Value::String("x-v1".into()));
+            obj.remove(missing);
+            let err = serde_json::from_value::<RawFunctionEntry>(Value::Object(obj))
+                .expect_err("missing field should fail");
+            assert!(err.to_string().contains(missing), "error: {err}");
+        }
+    }
+
+    #[test]
+    fn manifest_entry_accepts_minimal_shape() {
+        let entry: RawFunctionEntry = serde_json::from_value(json!({"name": "x", "slug": "x-v1"}))
+            .expect("name+slug only should parse");
+        assert!(entry.function_type.is_none());
+        assert!(entry.function_data.is_none());
+    }
+
+    #[test]
     fn supported_extension_filtering() {
         assert_eq!(
             classify_source_file(Path::new("a.ts")),
@@ -2948,17 +3334,12 @@ mod tests {
 
     #[test]
     fn fallback_selector_requires_default_project_name() {
-        let file = ManifestFile {
-            source_file: "a.ts".to_string(),
-            entries: vec![],
-            python_bundle: None,
-        };
         let mut named_projects = BTreeSet::new();
         let mut direct_project_ids = BTreeSet::new();
         let mut requires_default_project = false;
 
         let err = add_selector_requirement(
-            &file,
+            "a.ts",
             "same",
             &ProjectSelector::Fallback,
             None,
@@ -3027,6 +3408,7 @@ mod tests {
         let args = PushArgs {
             files: vec![PathBuf::from(".")],
             file_flag: vec![],
+            manifest: None,
             if_exists: IfExistsMode::Error,
             terminate_on_failure: false,
             create_missing_projects: true,
@@ -3056,6 +3438,7 @@ mod tests {
         let args = PushArgs {
             files: vec![PathBuf::from("a.ts"), PathBuf::from("b.py")],
             file_flag: vec![],
+            manifest: None,
             if_exists: IfExistsMode::Error,
             terminate_on_failure: false,
             create_missing_projects: true,

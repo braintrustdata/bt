@@ -1,0 +1,5 @@
+{
+  "command": ["functions", "push", "--manifest", "fn.json", "extra.ts"],
+  "expect_success": false,
+  "stderr_contains": ["--manifest"]
+}
