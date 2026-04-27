@@ -13,6 +13,7 @@
 - **Do not add eval code** unless explicitly requested.
 - **Do not add manual flush/shutdown logic.**
 - **If SDK is already installed/configured, do not duplicate work.**
+- **Do not create setup-only files or directories in the repo.** Do not write `.bt/setup/`, `.bt/skills/docs/`, agent skill directories, or setup task files unless explicitly asked by the user.
 
 ---
 
@@ -69,7 +70,9 @@ The project name is the project field of `bt status --json`. The project must be
 
 Most language SDKs print a direct URL to the emitted trace after the app runs. Capture that URL and print it.
 
-If the SDK does not print a URL, construct one manually using the URL format documented in `{SDK_INSTALL_DIR}/braintrust-url-formats.md`:
+If the SDK does not print a URL, construct one manually using the URL format documented in `{SDK_INSTALL_DIR}/braintrust-url-formats.md`.
+
+Use `bt status --json` to confirm the active org/project/API URL before reporting validation results. If you use `bt sql` or another BTQL query to verify traces/logs, include a timestamp filter (for example `created >= NOW() - INTERVAL 1 HOUR`) or a `root_span_id` filter.
 
 ---
 
@@ -88,8 +91,8 @@ Summarize:
 
 Tell the user:
 
-- Braintrust agent skills have been installed and are available to your coding agent to help you integrate Braintrust into your product.
-- The Braintrust MCP server can be added to make your coding agent even more helpful when working with Braintrust — run `bt setup mcp` to install it. More information at https://www.braintrust.dev/docs/integrations/developer-tools/mcp
+- Reusable Braintrust coding-agent skills were not installed by default. The user can opt in later with `bt setup skills`.
+- The Braintrust MCP server can be added explicitly with `bt setup mcp`. More information at https://www.braintrust.dev/docs/integrations/developer-tools/mcp
 - For more information on Braintrust, visit https://www.braintrust.dev/docs
 
 {WORKFLOW_CONTEXT}

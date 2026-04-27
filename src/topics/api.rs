@@ -44,6 +44,12 @@ pub struct TopicsConfigReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TopicsDeleteReport {
+    pub project: TopicsProjectSummary,
+    pub automation: TopicAutomationConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TopicMapConfigUpdate {
     pub automation: TopicAutomationConfig,
     pub topic_map_id: String,
@@ -533,6 +539,28 @@ pub async fn enable_topics_config(
 
     let mut function_cache = HashMap::new();
     build_topic_automation_config(&ctx.client, &automation_row, &mut function_cache).await
+}
+
+pub async fn delete_topics_config(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+) -> Result<TopicsDeleteReport> {
+    let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    let row = resolve_single_topic_automation_row(rows, automation_id)?;
+    let mut function_cache = HashMap::new();
+    let automation = build_topic_automation_config(&ctx.client, &row, &mut function_cache).await?;
+
+    delete_topic_automation(&ctx.client, &automation.id).await?;
+
+    Ok(TopicsDeleteReport {
+        project: TopicsProjectSummary {
+            id: ctx.project.id.clone(),
+            name: ctx.project.name.clone(),
+            org_name: ctx.client.org_name().to_string(),
+            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+        },
+        automation,
+    })
 }
 
 pub async fn fetch_topics_config(
@@ -1543,6 +1571,11 @@ async fn load_function_row(
     let value: Value = client.get(&path).await?;
     function_cache.insert(function_id.to_string(), value.clone());
     Ok(value)
+}
+
+async fn delete_topic_automation(client: &ApiClient, automation_id: &str) -> Result<()> {
+    let path = format!("/v1/project_automation/{}", encode(automation_id));
+    client.delete(&path).await
 }
 
 async fn build_topic_status_bars(

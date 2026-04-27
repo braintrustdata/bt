@@ -42,6 +42,7 @@ use ratatui::Terminal;
 
 use crate::args::BaseArgs;
 use crate::auth::resolved_auth_env;
+use crate::python_runner;
 use crate::ui::{animations_enabled, is_quiet};
 
 const MAX_NAME_LENGTH: usize = 40;
@@ -216,6 +217,7 @@ const JS_RUNNER_FILE: &str = "eval-runner.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
+const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
 
 struct SocketCleanupGuard {
     path: PathBuf,
@@ -2341,26 +2343,39 @@ fn build_python_command(
     runner: &Path,
     files: &[String],
 ) -> Result<Command> {
-    let runner_override = runner_override
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("BT_EVAL_PYTHON_RUNNER").ok())
-        .or_else(|| std::env::var("BT_EVAL_PYTHON").ok());
-
-    let command = if let Some(explicit) = runner_override {
-        let mut command = Command::new(explicit);
-        command.arg(runner).args(files);
-        command
-    } else if let Some(python) = find_python_binary() {
-        let mut command = Command::new(python);
-        command.arg(runner).args(files);
-        command
-    } else {
+    let search_roots = python_runner_search_roots(files);
+    let Some(python) = python_runner::resolve_python_interpreter_for_roots(
+        runner_override,
+        PYTHON_INTERPRETER_ENV_OVERRIDES,
+        &search_roots,
+    ) else {
         anyhow::bail!(
-            "No Python interpreter found in PATH. Please install python or pass --runner."
+            "No Python interpreter found. Please install python, create a virtualenv, or pass --runner."
         );
     };
 
+    let mut command = Command::new(python);
+    command.arg(runner).args(files);
     Ok(command)
+}
+
+fn python_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
+    let mut search_roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        search_roots.push(cwd.clone());
+        for file in files {
+            let path = PathBuf::from(file);
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            if let Some(parent) = absolute.parent() {
+                search_roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    search_roots
 }
 
 fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
@@ -2495,16 +2510,6 @@ fn set_node_heap_size_env(command: &mut Command) {
 
 fn is_ts_node_runner(runner_command: &Path) -> bool {
     runner_bin_name(runner_command).is_some_and(|n| n == "ts-node" || n == "ts-node-esm")
-}
-
-fn find_python_binary() -> Option<PathBuf> {
-    if let Some(venv_root) = std::env::var_os("VIRTUAL_ENV") {
-        let candidate = PathBuf::from(venv_root).join("bin").join("python");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    find_binary_in_path(&["python3", "python"])
 }
 
 fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
