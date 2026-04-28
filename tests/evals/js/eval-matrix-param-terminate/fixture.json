@@ -1,9 +1,5 @@
 {
   "files": ["matrix-terminate.eval.mjs"],
-  "args": [
-    "--matrix-param",
-    "model=fail,ok,ok2",
-    "--terminate-on-failure"
-  ],
+  "args": ["--matrix-param", "model=fail,ok,ok2", "--terminate-on-failure"],
   "expect_success": false
 }
