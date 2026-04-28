@@ -2495,14 +2495,10 @@ async function main() {
       return;
     }
 
-    if (config.matrix && config.matrix.length > 0) {
-      if (filteredEvaluators.length !== 1) {
-        const names = filteredEvaluators.map((e) => e.evaluator.evalName);
-        const listed =
-          names.length === 0
-            ? "  (none matched)"
-            : names.map((n) => `  - ${n}`).join("\n");
-        const message = `--matrix-param is not supported when running multiple evals.\nMatched evals:\n${listed}\nUse --filter to select exactly one eval.`;
+    if (btEvalMains.length > 0) {
+      if (config.matrix && config.matrix.length > 0) {
+        const message =
+          "--matrix-param is not supported for eval files that export btEvalMain. Remove the btEvalMain export or drop --matrix-param.";
         if (runner.sse) {
           runner.sse.send("error", serializeError(new Error(message)));
         } else {
@@ -2511,36 +2507,6 @@ async function main() {
         ok = false;
         return;
       }
-      const [sourceEntry] = filteredEvaluators;
-      const combos = matrixCombinations(config.matrix);
-      filteredEvaluators = combos.map((combo) => {
-        const label = formatMatrixLabel(combo);
-        const paramsOverride: Record<string, unknown> = {};
-        for (const [key, value] of combo) {
-          paramsOverride[key] = value;
-        }
-        const origExperimentName = sourceEntry.evaluator.experimentName;
-        const newExperimentName =
-          typeof origExperimentName === "string" &&
-          origExperimentName.length > 0
-            ? `${origExperimentName} [${label}]`
-            : `[${label}]`;
-        // Disambiguate the progress-bar / tracking key too — the runner emits progress
-        // events keyed by evalName, so combos must have distinct evalNames or bars collapse.
-        const newEvalName = `${sourceEntry.evaluator.evalName} [${label}]`;
-        return {
-          evaluator: {
-            ...sourceEntry.evaluator,
-            evalName: newEvalName,
-            experimentName: newExperimentName,
-          },
-          reporter: sourceEntry.reporter,
-          paramsOverride,
-        } satisfies EvaluatorEntry;
-      });
-    }
-
-    if (btEvalMains.length > 0) {
       globalThis._lazy_load = false;
       for (const main of btEvalMains) {
         try {
@@ -2555,6 +2521,50 @@ async function main() {
         }
       }
     } else {
+      if (config.matrix && config.matrix.length > 0) {
+        if (filteredEvaluators.length !== 1) {
+          const names = filteredEvaluators.map((e) => e.evaluator.evalName);
+          const listed =
+            names.length === 0
+              ? "  (none matched)"
+              : names.map((n) => `  - ${n}`).join("\n");
+          const message = `--matrix-param is not supported when running multiple evals.\nMatched evals:\n${listed}\nUse --filter to select exactly one eval.`;
+          if (runner.sse) {
+            runner.sse.send("error", serializeError(new Error(message)));
+          } else {
+            console.error(message);
+          }
+          ok = false;
+          return;
+        }
+        const [sourceEntry] = filteredEvaluators;
+        const combos = matrixCombinations(config.matrix);
+        filteredEvaluators = combos.map((combo) => {
+          const label = formatMatrixLabel(combo);
+          const paramsOverride: Record<string, unknown> = {};
+          for (const [key, value] of combo) {
+            paramsOverride[key] = value;
+          }
+          const origExperimentName = sourceEntry.evaluator.experimentName;
+          const newExperimentName =
+            typeof origExperimentName === "string" &&
+            origExperimentName.length > 0
+              ? `${origExperimentName} [${label}]`
+              : `[${label}]`;
+          // Disambiguate the progress-bar / tracking key too — the runner emits progress
+          // events keyed by evalName, so combos must have distinct evalNames or bars collapse.
+          const newEvalName = `${sourceEntry.evaluator.evalName} [${label}]`;
+          return {
+            evaluator: {
+              ...sourceEntry.evaluator,
+              evalName: newEvalName,
+              experimentName: newExperimentName,
+            },
+            reporter: sourceEntry.reporter,
+            paramsOverride,
+          } satisfies EvaluatorEntry;
+        });
+      }
       if (discoveredEvaluators.length === 0) {
         console.error("No evaluators found. Did you call Eval() in the file?");
         process.exit(1);
