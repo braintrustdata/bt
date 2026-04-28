@@ -92,10 +92,12 @@ Summarize:
 
 ---
 
-### 7. Next Steps
+### 7. Post-Success Verification and Next Steps
 
-Tell the user:
+Tell the user exactly how to verify the setup after this run:
 
+- Run the instrumented application path again and open the Braintrust logs link for the configured org/project. If you emitted a specific trace, include the trace permalink from Step 5; otherwise include the project logs URL.
+- If eval code was added or requested, include the Braintrust experiments/evals page URL for the configured org/project.
 - Reusable Braintrust coding-agent skills were not installed by default. The user can opt in later with `bt setup skills`.
 - The Braintrust MCP server can be added explicitly with `bt setup mcp`. More information at https://www.braintrust.dev/docs/integrations/developer-tools/mcp
 - For more information on Braintrust, visit https://www.braintrust.dev/docs
