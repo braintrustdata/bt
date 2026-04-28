@@ -1771,7 +1771,7 @@ async fn select_project_for_setup(
         client,
         None,
         Some("Select project"),
-        ui::ProjectSelectMode::AllowCreate,
+        ui::ProjectSelectMode::AllowCreateWithDefaultProjectNote,
     )
     .await
 }
