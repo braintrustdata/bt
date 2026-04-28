@@ -18,7 +18,17 @@ Thumbs.db
 # Node
 node_modules/
 tests/evals/js/eval-bun/test-data.txt
+
 .bt/
+
+# Agents
+# claude is tracked
+.agents
+.codex
+.copilot
+.cursor
+.gemini
+.qwen
 
 __pycache__
 
