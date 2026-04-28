@@ -11,6 +11,7 @@ import re
 import socket
 import sys
 import traceback
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -54,6 +55,12 @@ class EvalFilter:
 
 
 @dataclass(frozen=True)
+class MatrixAxis:
+    key: str
+    values: list[Any]
+
+
+@dataclass(frozen=True)
 class RunnerConfig:
     jsonl: bool
     list_only: bool
@@ -66,6 +73,7 @@ class RunnerConfig:
     dev_mode: str | None
     dev_request_json: str | None
     params: dict[str, Any] | None
+    matrix: list[MatrixAxis] | None
 
 
 @dataclass
@@ -176,6 +184,46 @@ def parse_params_json(raw: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+def parse_matrix_json(raw: str | None) -> list[MatrixAxis] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"BT_EVAL_MATRIX_JSON is not valid JSON: {raw}") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("BT_EVAL_MATRIX_JSON must be a JSON array.")
+    axes: list[MatrixAxis] = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            raise ValueError("BT_EVAL_MATRIX_JSON entries must be objects with key and values.")
+        key = entry.get("key")
+        values = entry.get("values")
+        if not isinstance(key, str) or not key:
+            raise ValueError("BT_EVAL_MATRIX_JSON entry missing string key.")
+        if not isinstance(values, list) or not values:
+            raise ValueError(
+                f"BT_EVAL_MATRIX_JSON axis \"{key}\" must have a non-empty values array."
+            )
+        axes.append(MatrixAxis(key=key, values=values))
+    return axes if axes else None
+
+
+def matrix_combinations(axes: list[MatrixAxis]) -> list[list[tuple[str, Any]]]:
+    combos: list[list[tuple[str, Any]]] = [[]]
+    for axis in axes:
+        next_combos: list[list[tuple[str, Any]]] = []
+        for existing in combos:
+            for value in axis.values:
+                next_combos.append(existing + [(axis.key, value)])
+        combos = next_combos
+    return combos
+
+
+def format_matrix_label(combo: list[tuple[str, Any]]) -> str:
+    return ", ".join(f"{k}={json.dumps(v)}" for k, v in combo)
+
+
 def get_declared_parameter_keys(parameters: Any) -> set[str] | None:
     if parameters is None:
         return None
@@ -213,6 +261,7 @@ def read_runner_config() -> RunnerConfig:
         dev_mode=parse_dev_mode(os.getenv("BT_EVAL_DEV_MODE")),
         dev_request_json=os.getenv("BT_EVAL_DEV_REQUEST_JSON"),
         params=parse_params_json(os.getenv("BT_EVAL_PARAMS_JSON")),
+        matrix=parse_matrix_json(os.getenv("BT_EVAL_MATRIX_JSON")),
     )
 
 
@@ -1164,6 +1213,49 @@ async def run_once(
             print(evaluator_instance.evaluator.eval_name)
         return True
 
+    if config.matrix:
+        if len(evaluators) != 1:
+            names = [ev.evaluator.eval_name for ev in evaluators]
+            listed = "  (none matched)" if not names else "\n".join(f"  - {n}" for n in names)
+            message = (
+                "--matrix-param is not supported when running multiple evals.\n"
+                f"Matched evals:\n{listed}\n"
+                "Use --filter to select exactly one eval."
+            )
+            if sse:
+                sse.send("error", serialize_error(message, None))
+            else:
+                eprint(message)
+            return False
+
+        source = evaluators[0]
+        expanded: list[EvaluatorInstance] = []
+        for combo in matrix_combinations(config.matrix):
+            label = format_matrix_label(combo)
+            overlay = {k: v for k, v in combo}
+            orig_experiment_name = getattr(source.evaluator, "experiment_name", None)
+            new_experiment_name = (
+                f"{orig_experiment_name} [{label}]"
+                if isinstance(orig_experiment_name, str) and orig_experiment_name
+                else f"[{label}]"
+            )
+            # Disambiguate the progress-bar / tracking key too — progress events are
+            # keyed by eval_name, so combos must have distinct eval_names or bars collapse.
+            new_eval_name = f"{source.evaluator.eval_name} [{label}]"
+            cloned_evaluator = dataclasses.replace(
+                source.evaluator,
+                eval_name=new_eval_name,
+                experiment_name=new_experiment_name,
+            )
+            cloned_instance = EvaluatorInstance(
+                evaluator=cloned_evaluator,
+                reporter=source.reporter,
+            )
+            # Attach the overlay so run_single_evaluator can merge it on top of config.params.
+            setattr(cloned_instance, "_bt_matrix_params_override", overlay)
+            expanded.append(cloned_instance)
+        evaluators = expanded
+
     if sse:
         sse.send("processing", {"evaluators": len(evaluators)})
 
@@ -1182,11 +1274,17 @@ async def run_once(
             return evaluator_instance, None, None, err
 
         progress_cb = create_progress_reporter(sse, evaluator_instance.evaluator.eval_name)
-        if config.params is not None and evaluator_instance.evaluator.parameters is not None:
+        matrix_override = getattr(evaluator_instance, "_bt_matrix_params_override", None)
+        effective_params: dict[str, Any] | None
+        if matrix_override is not None:
+            effective_params = {**(config.params or {}), **matrix_override}
+        else:
+            effective_params = config.params
+        if effective_params is not None and evaluator_instance.evaluator.parameters is not None:
             evaluator = evaluator_instance.evaluator
             # Drop any --param keys the evaluator doesn't declare so a single
             # command running multiple evaluators doesn't fail on unrelated params.
-            filtered_params = filter_params_for_evaluator(config.params, evaluator.parameters)
+            filtered_params = filter_params_for_evaluator(effective_params, evaluator.parameters)
             evaluator.parameters = validate_parameters(filtered_params, evaluator.parameters)
         try:
             result = await run_evaluator_task(
