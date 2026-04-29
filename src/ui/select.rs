@@ -115,11 +115,10 @@ pub async fn select_project(
 
 fn project_selection_labels(projects: &[api::Project], mode: ProjectSelectMode) -> Vec<String> {
     if mode_allows_create(mode) {
-        let show_default_project_note = matches!(
-            mode,
-            ProjectSelectMode::AllowCreateWithDefaultProjectNote
-        ) && projects.len() == 1
-            && projects[0].name == "My Project";
+        let show_default_project_note =
+            matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
+                && projects.len() == 1
+                && projects[0].name == "My Project";
 
         let mut labels = vec!["+ Create new project".to_string()];
         labels.extend(projects.iter().map(|project| {
