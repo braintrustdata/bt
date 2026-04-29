@@ -2824,8 +2824,10 @@ fn resolve_instrument_invocation(
                 }
             } else {
                 copilot_args.extend([
-                    "--output-format".to_string(),
-                    "json".to_string(),
+                    "--no-ask-user".to_string(),
+                    "--stream".to_string(),
+                    "on".to_string(),
+                    "-s".to_string(),
                     "-p".to_string(),
                 ]);
                 InstrumentInvocation::Program {
@@ -2834,7 +2836,7 @@ fn resolve_instrument_invocation(
                     stdin_file: None,
                     prompt_file_arg: Some(task_path.to_path_buf()),
                     initial_prompt: None,
-                    stream_json: true,
+                    stream_json: false,
                     interactive: false,
                 }
             }
@@ -5866,14 +5868,16 @@ mod tests {
                 assert_eq!(
                     args,
                     vec![
-                        "--output-format".to_string(),
-                        "json".to_string(),
+                        "--no-ask-user".to_string(),
+                        "--stream".to_string(),
+                        "on".to_string(),
+                        "-s".to_string(),
                         "-p".to_string(),
                     ]
                 );
                 assert_eq!(stdin_file, None);
                 assert_eq!(prompt_file_arg, Some(task_path));
-                assert!(stream_json);
+                assert!(!stream_json);
                 assert!(!interactive);
             }
             InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
