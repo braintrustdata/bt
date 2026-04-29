@@ -115,11 +115,15 @@ pub async fn select_project(
 
 fn project_selection_labels(projects: &[api::Project], mode: ProjectSelectMode) -> Vec<String> {
     if mode_allows_create(mode) {
+        let show_default_project_note = matches!(
+            mode,
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote
+        ) && projects.len() == 1
+            && projects[0].name == "My Project";
+
         let mut labels = vec!["+ Create new project".to_string()];
         labels.extend(projects.iter().map(|project| {
-            if matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
-                && project.name == "My Project"
-            {
+            if show_default_project_note && project.name == "My Project" {
                 "My Project (default starter project)".to_string()
             } else {
                 project.name.clone()
@@ -244,7 +248,22 @@ mod tests {
     }
 
     #[test]
-    fn allow_create_with_default_project_note_annotates_my_project() {
+    fn allow_create_with_default_project_note_annotates_my_project_when_it_is_the_only_project() {
+        let labels = project_selection_labels(
+            &[project("My Project")],
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+        );
+        assert_eq!(
+            labels,
+            vec![
+                "+ Create new project".to_string(),
+                "My Project (default starter project)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_create_with_default_project_note_hides_note_when_there_are_multiple_projects() {
         let labels = project_selection_labels(
             &[project("My Project"), project("alpha")],
             ProjectSelectMode::AllowCreateWithDefaultProjectNote,
@@ -253,7 +272,7 @@ mod tests {
             labels,
             vec![
                 "+ Create new project".to_string(),
-                "My Project (default starter project)".to_string(),
+                "My Project".to_string(),
                 "alpha".to_string(),
             ]
         );
