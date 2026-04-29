@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
 use toml::Value as TomlValue;
+use urlencoding::encode;
 
 use crate::args::{ArgValueSource, BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
 use crate::auth;
@@ -2204,6 +2205,7 @@ async fn run_instrument_setup(
     if !base.json {
         eprintln!();
         eprintln!("{} Braintrust SDK setup completed.", style("✓").green());
+        print_post_agent_followups(&base);
         if offer_skills_after_success && setup_can_prompt(&base) && !args.yes {
             let term = ui::prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
             let install_skills = Confirm::with_theme(&ColorfulTheme::default())
@@ -2222,6 +2224,45 @@ async fn run_instrument_setup(
         }
     }
     Ok(())
+}
+
+fn print_post_agent_followups(base: &BaseArgs) {
+    eprintln!();
+    eprintln!("Verify your setup in Braintrust:");
+
+    if let Some(logs_url) = setup_project_logs_url(base) {
+        eprintln!("  • Project logs: {logs_url}");
+    }
+    eprintln!("  • Tracing docs: https://www.braintrust.dev/docs/instrument");
+    eprintln!("  • Eval docs: https://www.braintrust.dev/docs/evaluation");
+}
+
+fn setup_project_logs_url(base: &BaseArgs) -> Option<String> {
+    let (org, project) = setup_project_context(base)?;
+    let app_url = base
+        .app_url
+        .as_deref()
+        .unwrap_or(DEFAULT_APP_URL)
+        .trim_end_matches('/');
+    Some(format!(
+        "{}/app/{}/p/{}/logs",
+        app_url,
+        encode(&org),
+        encode(&project)
+    ))
+}
+
+fn setup_project_context(base: &BaseArgs) -> Option<(String, String)> {
+    if let (Some(org), Some(project)) = (base.org_name.as_ref(), base.project.as_ref()) {
+        return Some((org.clone(), project.clone()));
+    }
+
+    let config_path = std::env::current_dir()
+        .ok()?
+        .join(".bt")
+        .join("config.json");
+    let cfg = config::load_file(&config_path);
+    Some((cfg.org?, cfg.project?))
 }
 
 async fn install_reusable_skills_after_setup(base: &BaseArgs, selected: Agent) -> Result<()> {
