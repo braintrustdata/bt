@@ -2724,6 +2724,7 @@ fn resolve_instrument_invocation(
                 }
             } else {
                 gemini_args.extend([
+                    "--skip-trust".to_string(),
                     "-p".to_string(),
                     String::new(),
                     "--output-format".to_string(),
@@ -5679,6 +5680,7 @@ mod tests {
                 assert_eq!(
                     args,
                     vec![
+                        "--skip-trust".to_string(),
                         "-p".to_string(),
                         String::new(),
                         "--output-format".to_string(),
