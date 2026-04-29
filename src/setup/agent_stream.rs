@@ -30,6 +30,14 @@ enum StreamLine {
         #[serde(flatten)]
         _extra: Value,
     },
+    // cursor-agent emits tool_call events instead of stream_event
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        subtype: String,
+        tool_call: Value,
+        #[serde(flatten)]
+        _extra: Value,
+    },
     #[serde(rename = "user")]
     User {
         #[serde(flatten)]
@@ -126,6 +134,20 @@ impl AgentStreamDisplay {
     fn handle(&mut self, line: StreamLine) {
         match line {
             StreamLine::StreamEvent { event, .. } => self.handle_event(event),
+            StreamLine::ToolCall {
+                subtype, tool_call, ..
+            } => {
+                if subtype == "started" {
+                    self.clear_spinner();
+                    if self.has_text_output {
+                        eprintln!();
+                        self.has_text_output = false;
+                    }
+                    self.start_spinner(&cursor_tool_display(&tool_call));
+                } else if subtype == "completed" {
+                    self.finish_spinner_with(&cursor_tool_done_display(&tool_call));
+                }
+            }
             StreamLine::Assistant { .. } | StreamLine::User { .. } | StreamLine::Unknown => {}
             StreamLine::Result { .. } => {}
         }
@@ -340,6 +362,55 @@ fn short_path(path: &str) -> String {
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn cursor_tool_display(tool_call: &Value) -> String {
+    if let Some(cmd) = tool_call
+        .pointer("/shellToolCall/args/command")
+        .and_then(|v| v.as_str())
+    {
+        return format!("Running: {}", truncate(cmd, 50));
+    }
+    cursor_tool_label(tool_call, false)
+}
+
+fn cursor_tool_done_display(tool_call: &Value) -> String {
+    if let Some(cmd) = tool_call
+        .pointer("/shellToolCall/args/command")
+        .and_then(|v| v.as_str())
+    {
+        return format!("Ran: {}", truncate(cmd, 50));
+    }
+    if let Some(cmd) = tool_call
+        .pointer("/shellToolCall/result/success/command")
+        .and_then(|v| v.as_str())
+    {
+        return format!("Ran: {}", truncate(cmd, 50));
+    }
+    cursor_tool_label(tool_call, true)
+}
+
+fn cursor_tool_label(tool_call: &Value, done: bool) -> String {
+    let key = tool_call
+        .as_object()
+        .and_then(|o| o.keys().next())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let k = key.as_str();
+    match done {
+        false if k.contains("read") || k.contains("view") => "Reading".to_string(),
+        true if k.contains("read") || k.contains("view") => "Read".to_string(),
+        false if k.contains("edit") || k.contains("write") => "Editing".to_string(),
+        true if k.contains("edit") || k.contains("write") => "Edited".to_string(),
+        false if k.contains("create") => "Creating".to_string(),
+        true if k.contains("create") => "Created".to_string(),
+        false if k.contains("glob") => "Finding files".to_string(),
+        true if k.contains("glob") => "Found files".to_string(),
+        false if k.contains("search") || k.contains("grep") => "Searching".to_string(),
+        true if k.contains("search") || k.contains("grep") => "Searched".to_string(),
+        true => "Done".to_string(),
+        false => "Working".to_string(),
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

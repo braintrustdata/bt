@@ -2760,7 +2760,6 @@ fn resolve_instrument_invocation(
                     "-p".to_string(),
                     "--output-format".to_string(),
                     "stream-json".to_string(),
-                    "--stream-partial-output".to_string(),
                 ]);
                 InstrumentInvocation::Program {
                     program: "cursor-agent".to_string(),
@@ -5744,7 +5743,6 @@ mod tests {
                         "-p".to_string(),
                         "--output-format".to_string(),
                         "stream-json".to_string(),
-                        "--stream-partial-output".to_string(),
                     ]
                 );
                 assert_eq!(stdin_file, None);
