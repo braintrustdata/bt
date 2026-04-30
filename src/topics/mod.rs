@@ -1,9 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use crate::{
-    args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode,
-};
+use crate::{args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode};
 
 pub(crate) mod api;
 mod config;

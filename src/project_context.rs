@@ -23,13 +23,11 @@ pub(crate) async fn resolve_project_optional(
     let config_project = config::load().ok().and_then(|config| config.project);
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(project_name) => Some(project_name.to_string()),
-        None if allow_interactive_selection && is_interactive() => {
-            Some(
-                select_project(client, None, None, ProjectSelectMode::ExistingOnly)
-                    .await?
-                    .name,
-            )
-        }
+        None if allow_interactive_selection && is_interactive() => Some(
+            select_project(client, None, None, ProjectSelectMode::ExistingOnly)
+                .await?
+                .name,
+        ),
         None => None,
     };
 

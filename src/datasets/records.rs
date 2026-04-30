@@ -17,6 +17,7 @@ pub(crate) struct PreparedDatasetRecord {
     pub id: String,
     pub input: Option<Value>,
     pub expected: Option<Value>,
+    pub output: Option<Value>,
     pub metadata: Option<Map<String, Value>>,
     pub tags: Option<Vec<String>>,
 }
@@ -38,6 +39,9 @@ impl PreparedDatasetRecord {
         }
         if let Some(expected) = &self.expected {
             row.insert("expected".to_string(), expected.clone());
+        }
+        if let Some(output) = &self.output {
+            row.insert("output".to_string(), output.clone());
         }
         if let Some(metadata) = &self.metadata {
             row.insert("metadata".to_string(), Value::Object(metadata.clone()));
@@ -285,10 +289,8 @@ fn prepared_record_from_input_object(
     Ok(PreparedDatasetRecord {
         id,
         input: object.get("input").cloned(),
-        expected: object
-            .get("expected")
-            .cloned()
-            .or_else(|| object.get("output").cloned()),
+        expected: object.get("expected").cloned(),
+        output: object.get("output").cloned(),
         metadata: parse_metadata(object.get("metadata"))?,
         tags: parse_tags(object.get("tags"))?,
     })
@@ -470,5 +472,34 @@ mod tests {
         let prepared = prepare_records(vec![record], "custom.record_id", true)
             .expect("custom id-field root should be allowed");
         assert_eq!(prepared[0].id, "case-1");
+    }
+
+    #[test]
+    fn prepare_records_preserves_expected_and_output_fields() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "case-1",
+            "expected": "gold",
+            "output": "predicted"
+        }))
+        .expect("map");
+        let prepared = prepare_records(vec![record], "id", true).expect("prepare records");
+        assert_eq!(
+            prepared[0].expected,
+            Some(Value::String("gold".to_string()))
+        );
+        assert_eq!(
+            prepared[0].output,
+            Some(Value::String("predicted".to_string()))
+        );
+
+        let row = prepared[0].to_upload_row("dataset_1");
+        assert_eq!(
+            row.get("expected"),
+            Some(&Value::String("gold".to_string()))
+        );
+        assert_eq!(
+            row.get("output"),
+            Some(&Value::String("predicted".to_string()))
+        );
     }
 }
