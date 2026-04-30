@@ -10,9 +10,11 @@ use chrono::Utc;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
-use crate::utils::new_uuid_id;
+use crate::utils::{lookup_object_path, new_uuid_id};
 
 pub(crate) const DATASET_UPLOAD_BATCH_SIZE: usize = 1000;
+pub(crate) const DATASET_RECORD_FIELDS: [&str; 6] =
+    ["id", "input", "expected", "metadata", "tags", "origin"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PreparedDatasetRecord {
@@ -21,6 +23,7 @@ pub(crate) struct PreparedDatasetRecord {
     pub expected: Option<Value>,
     pub metadata: Option<Map<String, Value>>,
     pub tags: Option<Vec<String>>,
+    pub origin: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +35,7 @@ struct DatasetRecordInput {
     expected: Option<Value>,
     metadata: Option<Map<String, Value>>,
     tags: Option<Vec<String>>,
+    origin: Option<Value>,
 }
 
 impl PreparedDatasetRecord {
@@ -63,6 +67,9 @@ impl PreparedDatasetRecord {
                 "tags".to_string(),
                 Value::Array(tags.iter().cloned().map(Value::String).collect()),
             );
+        }
+        if let Some(origin) = &self.origin {
+            row.insert("origin".to_string(), origin.clone());
         }
         row
     }
@@ -210,7 +217,6 @@ fn prepare_records(
     let mut seen_ids = HashSet::new();
 
     for (row_index, raw_record) in raw_records.into_iter().enumerate() {
-        let raw_record = strip_ignored_system_fields(raw_record, &id_root);
         let (input_record, explicit_id) =
             deserialize_input_record(raw_record, &id_path, &id_root, row_index)?;
         let record =
@@ -226,18 +232,6 @@ fn prepare_records(
     }
 
     Ok(records)
-}
-
-fn strip_ignored_system_fields(
-    mut object: Map<String, Value>,
-    id_root: &str,
-) -> Map<String, Value> {
-    for field in ["dataset_id", "created"] {
-        if field != id_root {
-            object.remove(field);
-        }
-    }
-    object
 }
 
 fn deserialize_input_record(
@@ -268,7 +262,7 @@ fn deserialize_input_record(
 }
 
 fn is_sdk_record_field(field: &str) -> bool {
-    matches!(field, "id" | "input" | "expected" | "metadata" | "tags")
+    DATASET_RECORD_FIELDS.contains(&field)
 }
 
 fn prepare_record_from_input(
@@ -284,6 +278,7 @@ fn prepare_record_from_input(
         expected,
         metadata,
         tags,
+        origin,
     } = input_record;
     let explicit_id = explicit_id.or(standard_id);
 
@@ -303,6 +298,7 @@ fn prepare_record_from_input(
         expected,
         metadata,
         tags,
+        origin,
     })
 }
 
@@ -355,14 +351,6 @@ fn push_id_field_segment(path: &mut Vec<String>, segment: &str) -> Result<()> {
     }
     path.push(segment.to_string());
     Ok(())
-}
-
-fn lookup_object_path<'a>(object: &'a Map<String, Value>, path: &[String]) -> Option<&'a Value> {
-    let mut current = object.get(path.first()?.as_str())?;
-    for part in path.iter().skip(1) {
-        current = current.as_object()?.get(part.as_str())?;
-    }
-    Some(current)
 }
 
 fn parse_id_value(value: &Value) -> Result<String> {
@@ -645,7 +633,8 @@ mod tests {
     fn prepare_records_uploads_expected_field() {
         let record = serde_json::from_value(serde_json::json!({
             "id": "case-1",
-            "expected": "gold"
+            "expected": "gold",
+            "origin": {"source": "fixture"}
         }))
         .expect("map");
         let prepared = prepare_records(vec![record], "id", true).expect("prepare records");
@@ -659,6 +648,10 @@ mod tests {
             row.get("expected"),
             Some(&Value::String("gold".to_string()))
         );
+        assert_eq!(
+            row.get("origin"),
+            Some(&serde_json::json!({"source": "fixture"}))
+        );
         assert!(row.get("output").is_none());
         assert!(row.get("_is_merge").is_none());
     }
@@ -671,6 +664,7 @@ mod tests {
             expected: None,
             metadata: None,
             tags: None,
+            origin: None,
         };
 
         let row = record.to_upload_row("dataset_1", true);
@@ -678,20 +672,52 @@ mod tests {
     }
 
     #[test]
-    fn prepare_records_ignores_dataset_view_system_fields() {
+    fn prepare_records_rejects_system_fields() {
         let record = serde_json::from_value(serde_json::json!({
             "id": "case-1",
             "input": {"prompt": "hello"},
             "expected": "world",
             "dataset_id": "dataset_1",
-            "created": "2026-01-01T00:00:00Z"
+            "created": "2026-01-01T00:00:00Z",
+            "_is_merge": true
         }))
         .expect("map");
-        let prepared = prepare_records(vec![record], "id", true).expect("prepare records");
+        let err = prepare_records(vec![record], "id", true)
+            .expect_err("system fields should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("dataset record 1 does not match the supported record shape"));
+        assert!(message.contains("unknown field"));
+    }
+
+    #[test]
+    fn prepare_records_accepts_dataset_view_json_rows_wrapper() {
+        let records = parse_record_objects(
+            r#"{
+                "dataset": {"id": "dataset_1"},
+                "rows": [
+                    {
+                        "id": "case-1",
+                        "input": {"prompt": "hello"},
+                        "expected": "world",
+                        "metadata": {"topic": "math"},
+                        "tags": ["smoke"],
+                        "origin": {"source": "view"}
+                    }
+                ],
+                "rows_truncated": false,
+                "rows_previewed": true
+            }"#,
+        )
+        .expect("parse view json wrapper");
+        let prepared = prepare_records(records, "id", true).expect("prepare records");
         assert_eq!(prepared[0].id, "case-1");
         assert_eq!(
             prepared[0].expected,
             Some(Value::String("world".to_string()))
+        );
+        assert_eq!(
+            prepared[0].origin,
+            Some(serde_json::json!({"source": "view"}))
         );
     }
 

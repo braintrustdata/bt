@@ -7,6 +7,8 @@ use urlencoding::encode;
 
 use crate::http::ApiClient;
 
+use super::records::DATASET_RECORD_FIELDS;
+
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
 const MAX_DATASET_ROWS_PAGES: usize = 10_000;
 const DATASET_ROWS_SINCE: &str = "1970-01-01T00:00:00Z";
@@ -222,7 +224,7 @@ fn build_dataset_rows_query(
     preview_length: DatasetRowsPreviewLength,
 ) -> Value {
     let mut query = json!({
-        "select": [{"op": "star"}],
+        "select": dataset_rows_select_fields(),
         "from": {
             "op": "function",
             "name": {"op": "ident", "name": ["dataset"]},
@@ -242,6 +244,13 @@ fn build_dataset_rows_query(
     query
 }
 
+fn dataset_rows_select_fields() -> Vec<Value> {
+    DATASET_RECORD_FIELDS
+        .iter()
+        .map(|field| json!({"op": "ident", "name": [field]}))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,7 +266,14 @@ mod tests {
         assert_eq!(
             query,
             serde_json::json!({
-                "select": [{"op": "star"}],
+                "select": [
+                    {"op": "ident", "name": ["id"]},
+                    {"op": "ident", "name": ["input"]},
+                    {"op": "ident", "name": ["expected"]},
+                    {"op": "ident", "name": ["metadata"]},
+                    {"op": "ident", "name": ["tags"]},
+                    {"op": "ident", "name": ["origin"]}
+                ],
                 "from": {
                     "op": "function",
                     "name": {"op": "ident", "name": ["dataset"]},

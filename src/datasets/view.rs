@@ -10,7 +10,7 @@ use crate::ui::{
     styled_table, truncate, with_spinner, CommandStatus,
 };
 
-use super::{api, ResolvedContext};
+use super::{api, records::DATASET_RECORD_FIELDS, ResolvedContext};
 
 const DATASET_ROWS_COMPACT_PREVIEW_LENGTH: usize = 125;
 
@@ -118,7 +118,7 @@ pub async fn run(
             output,
             "{}",
             console::style(
-                "Showing row id/input/expected/output/metadata/tags only. Re-run with --verbose to inspect all returned row fields."
+                "Showing row id/input/expected/metadata/tags/origin only. Re-run with --verbose to inspect all returned row fields."
             )
             .dim()
         )?;
@@ -151,9 +151,9 @@ pub async fn run(
             header("ID"),
             header("Input"),
             header("Expected"),
-            header("Output"),
             header("Metadata"),
             header("Tags"),
+            header("Origin"),
         ]);
         apply_column_padding(&mut table, (0, 2));
 
@@ -163,9 +163,9 @@ pub async fn run(
                 format_compact_value(compact.get("id"), 30),
                 format_compact_value(compact.get("input"), 40),
                 format_compact_value(compact.get("expected"), 40),
-                format_compact_value(compact.get("output"), 40),
                 format_compact_value(compact.get("metadata"), 40),
                 format_compact_value(compact.get("tags"), 30),
+                format_compact_value(compact.get("origin"), 30),
             ]);
         }
 
@@ -179,13 +179,7 @@ pub async fn run(
 fn compact_row_for_display(row: &Map<String, Value>) -> Map<String, Value> {
     let mut compact = Map::new();
 
-    if let Some(value) = row.get("id").cloned() {
-        compact.insert("id".to_string(), value);
-    } else if let Some(value) = row.get("span_id").cloned() {
-        compact.insert("id".to_string(), value);
-    }
-
-    for key in ["input", "expected", "output", "metadata", "tags"] {
+    for key in DATASET_RECORD_FIELDS {
         if let Some(value) = row.get(key).cloned() {
             compact.insert(key.to_string(), value);
         }
@@ -228,26 +222,31 @@ mod tests {
             "expected": "world",
             "metadata": {"topic": "math"},
             "tags": ["smoke"],
+            "origin": {"source": "fixture"},
+            "output": "ignored",
             "span_id": "span-1"
         }))
         .expect("row map");
 
         let compact = compact_row_for_display(&row);
-        assert_eq!(compact.len(), 5);
+        assert_eq!(compact.len(), 6);
         assert_eq!(
             compact.get("id"),
             Some(&Value::String("case-1".to_string()))
         );
         assert!(compact.get("dataset_id").is_none());
         assert!(compact.get("created").is_none());
+        assert!(compact.get("output").is_none());
+        assert!(compact.get("span_id").is_none());
         assert!(compact.get("input").is_some());
         assert!(compact.get("expected").is_some());
         assert!(compact.get("metadata").is_some());
         assert!(compact.get("tags").is_some());
+        assert!(compact.get("origin").is_some());
     }
 
     #[test]
-    fn compact_row_for_display_falls_back_to_span_id_and_output() {
+    fn compact_row_for_display_ignores_unselected_fields() {
         let row = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
             "span_id": "span-1",
             "output": "value",
@@ -256,14 +255,7 @@ mod tests {
         .expect("row map");
 
         let compact = compact_row_for_display(&row);
-        assert_eq!(
-            compact.get("id"),
-            Some(&Value::String("span-1".to_string()))
-        );
-        assert_eq!(
-            compact.get("output"),
-            Some(&Value::String("value".to_string()))
-        );
+        assert!(compact.is_empty());
         assert!(compact.get("created").is_none());
     }
 

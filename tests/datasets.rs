@@ -277,9 +277,10 @@ async fn mock_create_dataset(
 async fn mock_btql(
     state: web::Data<Arc<MockServerState>>,
     req: HttpRequest,
-    _body: web::Bytes,
+    body: web::Bytes,
 ) -> HttpResponse {
     log_request(state.get_ref(), &req);
+    let select_fields = mock_btql_select_fields(&body);
 
     let Some(dataset_id) = state
         .btql_dataset_id
@@ -297,11 +298,53 @@ async fn mock_btql(
         .get(&dataset_id)
         .map(|rows| rows.values().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
+    let rows = rows
+        .into_iter()
+        .map(|row| mock_btql_select_row(row, select_fields.as_deref()))
+        .collect::<Vec<_>>();
 
     HttpResponse::Ok().json(serde_json::json!({
         "data": rows,
         "cursor": null,
     }))
+}
+
+fn mock_btql_select_fields(body: &[u8]) -> Option<Vec<String>> {
+    let payload: Value = serde_json::from_slice(body).ok()?;
+    let select = payload
+        .get("query")
+        .and_then(|query| query.get("select"))
+        .and_then(Value::as_array)?;
+    let mut fields = Vec::with_capacity(select.len());
+    for item in select {
+        if item.get("op").and_then(Value::as_str) == Some("star") {
+            return None;
+        }
+        let Some(name) = item.get("name").and_then(Value::as_array) else {
+            return None;
+        };
+        if name.len() != 1 {
+            return None;
+        }
+        let Some(field) = name.first().and_then(Value::as_str) else {
+            return None;
+        };
+        fields.push(field.to_string());
+    }
+    Some(fields)
+}
+
+fn mock_btql_select_row(
+    row: Map<String, Value>,
+    select_fields: Option<&[String]>,
+) -> Map<String, Value> {
+    let Some(select_fields) = select_fields else {
+        return row;
+    };
+    select_fields
+        .iter()
+        .filter_map(|field| row.get(field).cloned().map(|value| (field.clone(), value)))
+        .collect()
 }
 
 async fn mock_version(state: web::Data<Arc<MockServerState>>, req: HttpRequest) -> HttpResponse {
