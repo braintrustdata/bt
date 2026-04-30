@@ -4880,7 +4880,6 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::Mutex as AsyncMutex;
 
     fn cwd_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4890,11 +4889,6 @@ mod tests {
     fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn async_env_test_lock() -> &'static AsyncMutex<()> {
-        static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 
     #[cfg(unix)]
@@ -5967,7 +5961,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_agent_invocation_sets_extra_env_for_program_launches() {
-        let _guard = async_env_test_lock().lock().await;
+        let _guard = env_test_lock().lock().expect("lock env test");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -6020,7 +6014,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_agent_invocation_inherits_process_api_key_env() {
-        let _guard = async_env_test_lock().lock().await;
+        let _guard = env_test_lock().lock().expect("lock env test");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
