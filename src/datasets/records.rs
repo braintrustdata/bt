@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::utils::new_uuid_id;
@@ -20,6 +21,17 @@ pub(crate) struct PreparedDatasetRecord {
     pub expected: Option<Value>,
     pub metadata: Option<Map<String, Value>>,
     pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatasetRecordInput {
+    #[serde(default, deserialize_with = "deserialize_optional_record_id")]
+    id: Option<String>,
+    input: Option<Value>,
+    expected: Option<Value>,
+    metadata: Option<Map<String, Value>>,
+    tags: Option<Vec<String>>,
 }
 
 impl PreparedDatasetRecord {
@@ -217,9 +229,10 @@ fn prepare_records(
 
     for (row_index, raw_record) in raw_records.into_iter().enumerate() {
         let raw_record = strip_ignored_system_fields(raw_record, &id_root);
-        validate_supported_fields(&raw_record, &id_root, row_index)?;
+        let (input_record, explicit_id) =
+            deserialize_input_record(raw_record, &id_path, &id_root, row_index)?;
         let record =
-            prepared_record_from_input_object(raw_record, &id_path, require_ids, row_index)?;
+            prepare_record_from_input(input_record, explicit_id, &id_path, require_ids, row_index)?;
         if !seen_ids.insert(record.id.clone()) {
             bail!("duplicate dataset record id '{}' in input", record.id);
         }
@@ -245,46 +258,52 @@ fn strip_ignored_system_fields(
     object
 }
 
-fn validate_supported_fields(
-    object: &Map<String, Value>,
+fn deserialize_input_record(
+    object: Map<String, Value>,
+    id_path: &[String],
     id_root: &str,
     row_index: usize,
-) -> Result<()> {
-    const BASE_ALLOWED_FIELDS: [&str; 6] =
-        ["id", "input", "expected", "output", "metadata", "tags"];
-    let mut unsupported = object
-        .keys()
-        .filter(|field| !BASE_ALLOWED_FIELDS.contains(&field.as_str()) && field.as_str() != id_root)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if unsupported.is_empty() {
-        return Ok(());
+) -> Result<(DatasetRecordInput, Option<String>)> {
+    let explicit_id = if id_path == ["id"] {
+        None
+    } else {
+        lookup_object_path(&object, id_path)
+            .map(parse_id_value)
+            .transpose()?
+    };
+    let mut record_object = object;
+    if !is_sdk_record_field(id_root) {
+        record_object.remove(id_root);
     }
 
-    unsupported.sort();
-    let id_clause = if BASE_ALLOWED_FIELDS.contains(&id_root) {
-        String::new()
-    } else {
-        format!(", and id root '{}'", id_root)
-    };
-    bail!(
-        "dataset record {} contains unsupported top-level field(s): {}. Allowed fields are id, input, expected, output, metadata, tags{}",
-        row_index + 1,
-        unsupported.join(", "),
-        id_clause
-    );
+    let input = serde_json::from_value(Value::Object(record_object)).map_err(|err| {
+        anyhow!(
+            "dataset record {} does not match the supported record shape: {err}",
+            row_index + 1
+        )
+    })?;
+    Ok((input, explicit_id))
 }
 
-fn prepared_record_from_input_object(
-    object: Map<String, Value>,
+fn is_sdk_record_field(field: &str) -> bool {
+    matches!(field, "id" | "input" | "expected" | "metadata" | "tags")
+}
+
+fn prepare_record_from_input(
+    input_record: DatasetRecordInput,
+    explicit_id: Option<String>,
     id_path: &[String],
     require_id: bool,
     row_index: usize,
 ) -> Result<PreparedDatasetRecord> {
-    let explicit_id = lookup_object_path(&object, id_path)
-        .map(coerce_id_value)
-        .transpose()?;
+    let DatasetRecordInput {
+        id: standard_id,
+        input,
+        expected,
+        metadata,
+        tags,
+    } = input_record;
+    let explicit_id = explicit_id.or(standard_id);
 
     let id = match explicit_id {
         Some(id) => id,
@@ -298,23 +317,25 @@ fn prepared_record_from_input_object(
 
     Ok(PreparedDatasetRecord {
         id,
-        input: object.get("input").cloned(),
-        expected: expected_value(&object, row_index)?,
-        metadata: parse_metadata(object.get("metadata"))?,
-        tags: parse_tags(object.get("tags"))?,
+        input,
+        expected,
+        metadata,
+        tags,
     })
 }
 
-fn expected_value(object: &Map<String, Value>, row_index: usize) -> Result<Option<Value>> {
-    match (object.get("expected"), object.get("output")) {
-        (Some(_), Some(_)) => bail!(
-            "dataset record {} specifies both expected and output. Use expected; output is deprecated",
-            row_index + 1
-        ),
-        (Some(expected), None) => Ok(Some(expected.clone())),
-        (None, Some(output)) => Ok(Some(output.clone())),
-        (None, None) => Ok(None),
-    }
+fn deserialize_optional_record_id<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    value
+        .as_ref()
+        .map(parse_id_value)
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 fn parse_id_field_path(id_field: &str) -> Result<Vec<String>> {
@@ -338,45 +359,16 @@ fn lookup_object_path<'a>(object: &'a Map<String, Value>, path: &[String]) -> Op
     Some(current)
 }
 
-fn coerce_id_value(value: &Value) -> Result<String> {
+fn parse_id_value(value: &Value) -> Result<String> {
     match value {
         Value::String(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
+            if value.is_empty() {
                 bail!("dataset record id cannot be empty");
             }
-            Ok(trimmed.to_string())
+            Ok(value.clone())
         }
-        Value::Number(value) => Ok(value.to_string()),
-        Value::Bool(value) => Ok(value.to_string()),
         Value::Null => bail!("dataset record id cannot be null"),
-        _ => Err(anyhow!(
-            "dataset record id must be a string, number, or boolean"
-        )),
-    }
-}
-
-fn parse_metadata(value: Option<&Value>) -> Result<Option<Map<String, Value>>> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(metadata)) => Ok(Some(metadata.clone())),
-        Some(_) => bail!("dataset record metadata must be a JSON object"),
-    }
-}
-
-fn parse_tags(value: Option<&Value>) -> Result<Option<Vec<String>>> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) => values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| match value {
-                Value::String(value) => Ok(value.clone()),
-                _ => bail!("dataset record tags[{index}] must be a string"),
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(Some),
-        Some(_) => bail!("dataset record tags must be an array of strings"),
+        _ => Err(anyhow!("dataset record id must be a string")),
     }
 }
 
@@ -467,9 +459,62 @@ mod tests {
             serde_json::from_value(serde_json::json!({"id": "case-1", "foo": "bar"})).expect("map");
         let err = prepare_records(vec![record], "id", true)
             .expect_err("unsupported top-level field should error");
-        assert!(err
-            .to_string()
-            .contains("unsupported top-level field(s): foo"));
+        let message = err.to_string();
+        assert!(message.contains("dataset record 1 does not match the supported record shape"));
+        assert!(message.contains("unknown field `foo`"));
+    }
+
+    #[test]
+    fn prepare_records_rejects_non_object_metadata() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "case-1",
+            "metadata": "bad"
+        }))
+        .expect("map");
+        let err =
+            prepare_records(vec![record], "id", true).expect_err("metadata should be an object");
+        let message = err.to_string();
+        assert!(message.contains("dataset record 1 does not match the supported record shape"));
+        assert!(message.contains("expected a map"));
+    }
+
+    #[test]
+    fn prepare_records_rejects_non_string_tags() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "case-1",
+            "tags": ["smoke", 1]
+        }))
+        .expect("map");
+        let err = prepare_records(vec![record], "id", true).expect_err("tags should be strings");
+        let message = err.to_string();
+        assert!(message.contains("dataset record 1 does not match the supported record shape"));
+        assert!(message.contains("expected a string"));
+    }
+
+    #[test]
+    fn prepare_records_rejects_non_string_id() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": 123,
+            "input": {"prompt": "hello"}
+        }))
+        .expect("map");
+        let err = prepare_records(vec![record], "id", true).expect_err("id should be a string");
+        let message = err.to_string();
+        assert!(message.contains("dataset record 1 does not match the supported record shape"));
+        assert!(message.contains("dataset record id must be a string"));
+    }
+
+    #[test]
+    fn prepare_records_rejects_output_field() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "case-1",
+            "output": "gold"
+        }))
+        .expect("map");
+        let err = prepare_records(vec![record], "id", true).expect_err("output should be rejected");
+        let message = err.to_string();
+        assert!(message.contains("dataset record 1 does not match the supported record shape"));
+        assert!(message.contains("unknown field `output`"));
     }
 
     #[test]
@@ -504,42 +549,6 @@ mod tests {
             Some(&Value::String("gold".to_string()))
         );
         assert!(row.get("output").is_none());
-    }
-
-    #[test]
-    fn prepare_records_maps_deprecated_output_to_expected() {
-        let record = serde_json::from_value(serde_json::json!({
-            "id": "case-1",
-            "output": "gold"
-        }))
-        .expect("map");
-        let prepared = prepare_records(vec![record], "id", true).expect("prepare records");
-        assert_eq!(
-            prepared[0].expected,
-            Some(Value::String("gold".to_string()))
-        );
-
-        let row = prepared[0].to_upload_row("dataset_1");
-        assert_eq!(
-            row.get("expected"),
-            Some(&Value::String("gold".to_string()))
-        );
-        assert!(row.get("output").is_none());
-    }
-
-    #[test]
-    fn prepare_records_rejects_expected_and_output_together() {
-        let record = serde_json::from_value(serde_json::json!({
-            "id": "case-1",
-            "expected": "gold",
-            "output": "legacy"
-        }))
-        .expect("map");
-        let err = prepare_records(vec![record], "id", true)
-            .expect_err("expected and output should conflict");
-        assert!(err
-            .to_string()
-            .contains("specifies both expected and output"));
     }
 
     #[test]

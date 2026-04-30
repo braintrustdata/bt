@@ -173,7 +173,7 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt datasets view my-dataset` — show dataset metadata and previewed row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust, `--all-rows` to load every row, `--full` for exact values, or `bt sync pull dataset:<id>` to export full rows to files.
 - `update`/`add`/`refresh` require explicit stable IDs via `id` or `--id-field`.
 - `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
-- Accepted top-level record fields are `id`, `input`, `expected`, `output`, `metadata`, and `tags` (plus the root field referenced by `--id-field`, if different).
+- Accepted top-level record fields are `id`, `input`, `expected`, `metadata`, and `tags` (plus the root field referenced by `--id-field`, if different).
 
 ## `bt sql`
 

@@ -2,10 +2,9 @@ use std::collections::HashSet;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use urlencoding::encode;
 
-use crate::btql::{BtqlExpr, BtqlQuery};
 use crate::http::ApiClient;
 
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
@@ -221,18 +220,26 @@ fn build_dataset_rows_query(
     limit: usize,
     cursor: Option<&str>,
     preview_length: DatasetRowsPreviewLength,
-) -> BtqlQuery {
-    BtqlQuery::select_all(BtqlExpr::function(
-        "dataset",
-        vec![BtqlExpr::literal_str(dataset_id)],
-    ))
-    .filter(BtqlExpr::ge(
-        BtqlExpr::ident(&["created"]),
-        BtqlExpr::literal_str(DATASET_ROWS_SINCE),
-    ))
-    .preview_length(preview_length.btql_value())
-    .limit(limit)
-    .cursor(cursor)
+) -> Value {
+    let mut query = json!({
+        "select": [{"op": "star"}],
+        "from": {
+            "op": "function",
+            "name": {"op": "ident", "name": ["dataset"]},
+            "args": [{"op": "literal", "value": dataset_id}]
+        },
+        "filter": {
+            "op": "ge",
+            "left": {"op": "ident", "name": ["created"]},
+            "right": {"op": "literal", "value": DATASET_ROWS_SINCE}
+        },
+        "preview_length": preview_length.btql_value(),
+        "limit": limit
+    });
+    if let Some(cursor) = cursor {
+        query["cursor"] = Value::String(cursor.to_string());
+    }
+    query
 }
 
 #[cfg(test)]
@@ -248,7 +255,7 @@ mod tests {
             DatasetRowsPreviewLength::Preview(125),
         );
         assert_eq!(
-            serde_json::to_value(query).expect("serialize query"),
+            query,
             serde_json::json!({
                 "select": [{"op": "star"}],
                 "from": {
@@ -275,8 +282,11 @@ mod tests {
             Some("cursor-123"),
             DatasetRowsPreviewLength::Preview(125),
         );
-        assert_eq!(query.cursor.as_deref(), Some("cursor-123"));
-        assert_eq!(query.limit, Some(200));
+        assert_eq!(
+            query.get("cursor").and_then(Value::as_str),
+            Some("cursor-123")
+        );
+        assert_eq!(query.get("limit").and_then(Value::as_u64), Some(200));
     }
 
     #[test]
@@ -288,8 +298,8 @@ mod tests {
             DatasetRowsPreviewLength::Preview(125),
         );
         assert_eq!(
-            serde_json::to_value(query.source).expect("serialize source"),
-            serde_json::json!({
+            query.get("from").expect("from"),
+            &serde_json::json!({
                 "op": "function",
                 "name": {"op": "ident", "name": ["dataset"]},
                 "args": [{"op": "literal", "value": "dataset'with-quote"}]
@@ -301,7 +311,10 @@ mod tests {
     fn dataset_rows_query_uses_full_preview_length_for_exact_values() {
         let query =
             build_dataset_rows_query("dataset-id", 100, None, DatasetRowsPreviewLength::Full);
-        assert_eq!(query.preview_length, Some(-1));
+        assert_eq!(
+            query.get("preview_length").and_then(Value::as_i64),
+            Some(-1)
+        );
     }
 
     #[test]
