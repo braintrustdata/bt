@@ -103,6 +103,11 @@ pub async fn list_dataset_rows_limited(
     let mut truncated = false;
 
     loop {
+        let Some(page_limit) = resolve_dataset_rows_page_limit(max_rows, rows.len()) else {
+            truncated = true;
+            break;
+        };
+
         page_count += 1;
         if page_count > MAX_DATASET_ROWS_PAGES {
             bail!(
@@ -120,8 +125,7 @@ pub async fn list_dataset_rows_limited(
             }
         }
 
-        let query =
-            build_dataset_rows_query(dataset_id, MAX_DATASET_ROWS_PAGE_LIMIT, cursor.as_deref());
+        let query = build_dataset_rows_query(dataset_id, page_limit, cursor.as_deref());
         let body = serde_json::json!({
             "query": query,
             "fmt": "json",
@@ -199,6 +203,20 @@ pub async fn delete_dataset(client: &ApiClient, dataset_id: &str) -> Result<()> 
     client.delete(&path).await
 }
 
+fn resolve_dataset_rows_page_limit(max_rows: Option<usize>, loaded_rows: usize) -> Option<usize> {
+    match max_rows {
+        None => Some(MAX_DATASET_ROWS_PAGE_LIMIT),
+        Some(max_rows) => {
+            let remaining = max_rows.saturating_sub(loaded_rows);
+            if remaining == 0 {
+                None
+            } else {
+                Some(remaining.min(MAX_DATASET_ROWS_PAGE_LIMIT))
+            }
+        }
+    }
+}
+
 fn build_dataset_rows_query(dataset_id: &str, limit: usize, cursor: Option<&str>) -> String {
     let cursor_clause = cursor
         .map(|cursor| format!(" | cursor: {}", btql_quote(cursor)))
@@ -244,5 +262,24 @@ mod tests {
     fn dataset_rows_query_escapes_dataset_id() {
         let query = build_dataset_rows_query("dataset'with-quote", 10, None);
         assert!(query.contains("from: dataset('dataset''with-quote')"));
+    }
+
+    #[test]
+    fn dataset_rows_page_limit_defaults_to_api_max() {
+        assert_eq!(
+            resolve_dataset_rows_page_limit(None, 0),
+            Some(MAX_DATASET_ROWS_PAGE_LIMIT)
+        );
+    }
+
+    #[test]
+    fn dataset_rows_page_limit_caps_to_remaining() {
+        assert_eq!(resolve_dataset_rows_page_limit(Some(200), 0), Some(200));
+        assert_eq!(resolve_dataset_rows_page_limit(Some(1500), 600), Some(900));
+    }
+
+    #[test]
+    fn dataset_rows_page_limit_stops_when_limit_reached() {
+        assert_eq!(resolve_dataset_rows_page_limit(Some(200), 200), None);
     }
 }
