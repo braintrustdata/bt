@@ -214,7 +214,7 @@ fn prepare_records(
         let (input_record, explicit_id) =
             deserialize_input_record(raw_record, &id_path, &id_root, row_index)?;
         let record =
-            prepare_record_from_input(input_record, explicit_id, &id_path, require_ids, row_index)?;
+            prepare_record_from_input(input_record, explicit_id, id_field, require_ids, row_index)?;
         if !seen_ids.insert(record.id.clone()) {
             bail!("duplicate dataset record id '{}' in input", record.id);
         }
@@ -274,7 +274,7 @@ fn is_sdk_record_field(field: &str) -> bool {
 fn prepare_record_from_input(
     input_record: DatasetRecordInput,
     explicit_id: Option<String>,
-    id_path: &[String],
+    id_field: &str,
     require_id: bool,
     row_index: usize,
 ) -> Result<PreparedDatasetRecord> {
@@ -292,7 +292,7 @@ fn prepare_record_from_input(
         None if require_id => bail!(
             "dataset record {} is missing a stable id at '{}'. `bt datasets update`/`add`/`refresh` require explicit ids; include an id field or pass --id-field",
             row_index + 1,
-            id_path.join(".")
+            id_field
         ),
         None => new_uuid_id(),
     };
@@ -321,16 +321,40 @@ where
 }
 
 fn parse_id_field_path(id_field: &str) -> Result<Vec<String>> {
-    let path = id_field
-        .split('.')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if path.is_empty() {
+    let id_field = id_field.trim();
+    if id_field.is_empty() {
         bail!("id field path cannot be empty");
     }
+
+    let mut path = Vec::new();
+    let mut segment = String::new();
+    let mut chars = id_field.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '.' => {
+                push_id_field_segment(&mut path, &segment)?;
+                segment.clear();
+            }
+            '\\' => match chars.next() {
+                Some('.') => segment.push('.'),
+                Some('\\') => segment.push('\\'),
+                Some(other) => bail!("invalid escape '\\{other}' in id field path"),
+                None => bail!("id field path cannot end with an escape"),
+            },
+            _ => segment.push(ch),
+        }
+    }
+    push_id_field_segment(&mut path, &segment)?;
     Ok(path)
+}
+
+fn push_id_field_segment(path: &mut Vec<String>, segment: &str) -> Result<()> {
+    let segment = segment.trim();
+    if segment.is_empty() {
+        bail!("id field path cannot contain empty segments");
+    }
+    path.push(segment.to_string());
+    Ok(())
 }
 
 fn lookup_object_path<'a>(object: &'a Map<String, Value>, path: &[String]) -> Option<&'a Value> {
@@ -436,6 +460,76 @@ mod tests {
         )
         .expect("prepare records");
         assert_eq!(records[0].id, "case-1");
+    }
+
+    #[test]
+    fn prepare_records_uses_escaped_dot_in_nested_id_field() {
+        let records = prepare_records(
+            vec![serde_json::from_value(serde_json::json!({
+                "metadata": {"case.id": "case-1"},
+                "input": {"text": "hello"},
+                "expected": "world"
+            }))
+            .expect("map")],
+            r"metadata.case\.id",
+            true,
+        )
+        .expect("prepare records");
+        assert_eq!(records[0].id, "case-1");
+    }
+
+    #[test]
+    fn prepare_records_uses_escaped_dot_in_root_id_field() {
+        let records = prepare_records(
+            vec![serde_json::from_value(serde_json::json!({
+                "metadata.case_id": "case-1",
+                "input": {"text": "hello"},
+                "expected": "world"
+            }))
+            .expect("map")],
+            r"metadata\.case_id",
+            true,
+        )
+        .expect("prepare records");
+        assert_eq!(records[0].id, "case-1");
+    }
+
+    #[test]
+    fn prepare_records_uses_escaped_backslash_in_id_field() {
+        let records = prepare_records(
+            vec![serde_json::from_value(serde_json::json!({
+                "metadata": {"case\\id": "case-1"},
+                "input": {"text": "hello"},
+                "expected": "world"
+            }))
+            .expect("map")],
+            r"metadata.case\\id",
+            true,
+        )
+        .expect("prepare records");
+        assert_eq!(records[0].id, "case-1");
+    }
+
+    #[test]
+    fn parse_id_field_path_rejects_empty_segments() {
+        let err = parse_id_field_path("metadata..case_id").expect_err("empty segment");
+        assert!(err
+            .to_string()
+            .contains("id field path cannot contain empty segments"));
+    }
+
+    #[test]
+    fn parse_id_field_path_rejects_trailing_escape() {
+        let err = parse_id_field_path(r"metadata.case_id\").expect_err("trailing escape");
+        assert!(err
+            .to_string()
+            .contains("id field path cannot end with an escape"));
+    }
+
+    #[test]
+    fn parse_id_field_path_rejects_unknown_escape() {
+        let err = parse_id_field_path(r"metadata.case\_id").expect_err("unknown escape");
+        assert!(err.to_string().contains("invalid escape"));
     }
 
     #[test]

@@ -172,6 +172,7 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id` — alias for `update` with explicit id path (fails if the dataset does not exist, and does not delete remote rows missing from the input).
 - `bt datasets view my-dataset` — show dataset metadata and previewed row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust, `--all-rows` to load every row, `--full` for exact values, or `bt sync pull dataset:<id>` to export full rows to files.
 - `update`/`add`/`refresh` require explicit stable IDs via `id` or `--id-field`.
+- `--id-field` uses dot-separated paths; escape literal dots as `\.` and literal backslashes as `\\`.
 - `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
 - Accepted top-level record fields are `id`, `input`, `expected`, `metadata`, and `tags` (plus the root field referenced by `--id-field`, if different).
 

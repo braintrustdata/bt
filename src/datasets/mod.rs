@@ -64,7 +64,8 @@ struct DatasetInputArgs {
     )]
     rows: Option<String>,
 
-    /// Dot-separated field path used to read stable record ids.
+    /// Dot-separated field path used to read stable record ids. Escape literal dots with `\.`
+    /// and literal backslashes with `\\`.
     #[arg(
         long,
         env = "BT_DATASETS_ID_FIELD",
