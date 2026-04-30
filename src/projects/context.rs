@@ -26,7 +26,7 @@ pub(crate) async fn resolve_project_context(
         login(base).await?
     };
     let client = ApiClient::new(&auth)?;
-    let config_project = config::load().ok().and_then(|c| c.project);
+    let config_project = config::configured_project_for_context(base, Some(client.org_name()));
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(p) => p.to_string(),
         None if is_interactive() => {

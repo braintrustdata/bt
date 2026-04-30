@@ -426,7 +426,7 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
 }
 
 pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
-    if !has_cached_project_id() {
+    if !has_cached_project_id(base) {
         return login(base).await;
     }
 
@@ -499,7 +499,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     let project = base
         .project
         .clone()
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
+        .or_else(|| crate::config::configured_project_for_context(base, auth.org_name.as_deref()));
     if let Some(project) = &project {
         builder = builder.default_project(project);
     }
@@ -544,10 +544,8 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     })
 }
 
-fn has_cached_project_id() -> bool {
-    crate::config::load()
-        .ok()
-        .and_then(|config| config.project_id)
+fn has_cached_project_id(base: &BaseArgs) -> bool {
+    crate::config::configured_project_id_for_base(base)
         .is_some_and(|project_id| !project_id.trim().is_empty())
 }
 
@@ -598,14 +596,32 @@ fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
 
 pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     let mut store = load_auth_store()?;
-    let cfg_org = crate::config::load().ok().and_then(|c| c.org);
-    let mut auth = resolve_auth_from_store_with_cfg(base, &store, &cfg_org)?;
+    let mut auth_base = base.clone();
+    let cfg_org = if trimmed(base.profile.as_deref()).is_none()
+        && trimmed(base.org_name.as_deref()).is_none()
+    {
+        let cfg = crate::config::load().unwrap_or_default();
+        auth_base.profile = cfg.profile.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        auth_base.profile.is_none().then_some(cfg.org).flatten()
+    } else {
+        None
+    };
+
+    let mut auth = resolve_auth_from_store_with_secret_lookup(
+        &auth_base,
+        &store,
+        load_profile_secret,
+        &cfg_org,
+    )?;
     if !auth.is_oauth {
         return Ok(auth);
     }
 
-    let effective_org = base.org_name.as_deref().or(cfg_org.as_deref());
-    let profile_name = base
+    let effective_org = auth_base.org_name.as_deref().or(cfg_org.as_deref());
+    let profile_name = auth_base
         .profile
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -714,14 +730,6 @@ fn resolve_profile_for_org<'a>(org: &str, store: &'a AuthStore) -> Option<&'a st
     }
 }
 
-fn resolve_auth_from_store_with_cfg(
-    base: &BaseArgs,
-    store: &AuthStore,
-    cfg_org: &Option<String>,
-) -> Result<ResolvedAuth> {
-    resolve_auth_from_store_with_secret_lookup(base, store, load_profile_secret, cfg_org)
-}
-
 fn resolve_auth_from_store_with_secret_lookup<F>(
     base: &BaseArgs,
     store: &AuthStore,
@@ -795,6 +803,10 @@ where
         org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
         is_oauth: false,
     })
+}
+
+fn trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {

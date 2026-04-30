@@ -1138,6 +1138,7 @@ fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
     {
         base.org_name = cfg
             .org
+            .as_deref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
     }
@@ -1148,10 +1149,8 @@ fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        base.project = cfg
-            .project
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        base.project =
+            config::project_from_config_for_context(base, &cfg, base.org_name.as_deref());
     }
 }
 

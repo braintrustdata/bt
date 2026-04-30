@@ -18,6 +18,7 @@ mod set;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
+    pub profile: Option<String>,
     pub org: Option<String>,
     pub project: Option<String>,
     pub project_id: Option<String>,
@@ -25,11 +26,12 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["org", "project", "project_id"];
+pub const KNOWN_KEYS: &[&str] = &["profile", "org", "project", "project_id"];
 
 impl Config {
     pub fn get_field(&self, key: &str) -> Option<&str> {
         match key {
+            "profile" => self.profile.as_deref(),
             "org" => self.org.as_deref(),
             "project" => self.project.as_deref(),
             "project_id" => self.project_id.as_deref(),
@@ -39,6 +41,7 @@ impl Config {
 
     pub fn set_field(&mut self, key: &str, value: String) -> bool {
         match key {
+            "profile" => self.profile = Some(value),
             "org" => self.org = Some(value),
             "project" => {
                 self.project = Some(value);
@@ -52,6 +55,7 @@ impl Config {
 
     pub fn unset_field(&mut self, key: &str) -> bool {
         match key {
+            "profile" => self.profile = None,
             "org" => self.org = None,
             "project" => {
                 self.project = None;
@@ -70,7 +74,7 @@ impl Config {
             .collect()
     }
 
-    fn merge(&self, other: &Config) -> Config {
+    pub(crate) fn merge(&self, other: &Config) -> Config {
         let mut extra = self.extra.clone();
         extra.extend(other.extra.clone());
         let project = other.project.clone().or_else(|| self.project.clone());
@@ -80,6 +84,7 @@ impl Config {
             self.project_id.clone()
         };
         Config {
+            profile: other.profile.clone().or_else(|| self.profile.clone()),
             org: other.org.clone().or_else(|| self.org.clone()),
             project,
             project_id,
@@ -146,6 +151,54 @@ pub fn load() -> Result<Config> {
         None => Config::default(),
     };
     Ok(global.merge(&local))
+}
+
+pub fn configured_project_for_context(
+    base: &BaseArgs,
+    resolved_org: Option<&str>,
+) -> Option<String> {
+    load()
+        .ok()
+        .and_then(|cfg| project_from_config_for_context(base, &cfg, resolved_org))
+}
+
+pub fn configured_project_id_for_base(base: &BaseArgs) -> Option<String> {
+    load().ok().and_then(|cfg| {
+        config_matches_context(base, &cfg, None)
+            .then(|| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
+            .flatten()
+    })
+}
+
+pub(crate) fn project_from_config_for_context(
+    base: &BaseArgs,
+    cfg: &Config,
+    resolved_org: Option<&str>,
+) -> Option<String> {
+    config_matches_context(base, cfg, resolved_org)
+        .then(|| trimmed_option(cfg.project.as_deref()).map(str::to_string))
+        .flatten()
+}
+
+fn config_matches_context(base: &BaseArgs, cfg: &Config, resolved_org: Option<&str>) -> bool {
+    let selected_profile = trimmed_option(base.profile.as_deref());
+    let cfg_profile = trimmed_option(cfg.profile.as_deref());
+    let cfg_org = trimmed_option(cfg.org.as_deref());
+    let resolved_org = trimmed_option(resolved_org);
+
+    match selected_profile {
+        Some(profile) => {
+            cfg_profile == Some(profile)
+                || (cfg_profile.is_none() && cfg_org.is_some() && cfg_org == resolved_org)
+        }
+        None => cfg_org
+            .zip(resolved_org)
+            .is_none_or(|(cfg, resolved)| cfg == resolved),
+    }
+}
+
+fn trimmed_option(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 pub fn save_file(path: &Path, config: &Config) -> Result<()> {
@@ -261,14 +314,14 @@ enum ConfigCommands {
     },
     /// Get a config value
     Get {
-        /// Config key (org, project, project_id)
+        /// Config key (profile, org, project, project_id)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,
     },
     /// Set a config value
     Set {
-        /// Config key (org, project, project_id)
+        /// Config key (profile, org, project, project_id)
         key: String,
         /// Value to set
         value: String,
@@ -277,7 +330,7 @@ enum ConfigCommands {
     },
     /// Remove a config value
     Unset {
-        /// Config key (org, project, project_id)
+        /// Config key (profile, org, project, project_id)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,
@@ -374,6 +427,59 @@ mod tests {
         let merged = base.merge(&other);
         assert_eq!(merged.org, Some("base-org".into()));
         assert_eq!(merged.project, Some("other-proj".into()));
+    }
+
+    fn base_with_profile(profile: Option<&str>) -> BaseArgs {
+        BaseArgs {
+            json: false,
+            verbose: false,
+            quiet: false,
+            quiet_source: None,
+            no_color: false,
+            no_input: false,
+            profile: profile.map(str::to_string),
+            profile_explicit: profile.is_some(),
+            org_name: None,
+            project: None,
+            api_key: None,
+            api_key_source: None,
+            prefer_profile: false,
+            api_url: None,
+            app_url: None,
+            ca_cert: None,
+            env_file: None,
+        }
+    }
+
+    fn config(profile: Option<&str>, org: Option<&str>, project: Option<&str>) -> Config {
+        Config {
+            profile: profile.map(str::to_string),
+            org: org.map(str::to_string),
+            project: project.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn project_config_matches_explicit_profile_or_legacy_org() {
+        let base = base_with_profile(Some("work"));
+        let cases = [
+            (config(None, Some("acme"), Some("demo")), Some("demo")),
+            (config(None, Some("other"), Some("demo")), None),
+            (config(None, None, Some("demo")), None),
+            (config(Some("other"), Some("acme"), Some("demo")), None),
+            (
+                config(Some("work"), Some("acme"), Some("demo")),
+                Some("demo"),
+            ),
+        ];
+
+        for (cfg, expected) in cases {
+            assert_eq!(
+                project_from_config_for_context(&base, &cfg, Some("acme")).as_deref(),
+                expected
+            );
+        }
     }
 
     #[test]
