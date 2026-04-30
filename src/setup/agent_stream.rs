@@ -172,14 +172,20 @@ impl AgentStreamDisplay {
                     }
                     self.start_spinner(&desc);
                 } else if subtype == "completed" {
-                    let done = self.current_tool_desc.take()
+                    let done = self
+                        .current_tool_desc
+                        .take()
                         .as_deref()
                         .map(tool_done_from_in_progress)
                         .unwrap_or_else(|| cursor_tool_done_display(&tool_call));
                     self.finish_spinner_with(&done);
                 }
             }
-            StreamLine::GeminiToolUse { tool_name, parameters, .. } => {
+            StreamLine::GeminiToolUse {
+                tool_name,
+                parameters,
+                ..
+            } => {
                 let desc = gemini_tool_display(&tool_name, &parameters);
                 self.current_tool_desc = Some(desc.clone());
                 self.clear_spinner();
@@ -190,13 +196,20 @@ impl AgentStreamDisplay {
                 self.start_spinner(&desc);
             }
             StreamLine::GeminiToolResult { .. } => {
-                let done = self.current_tool_desc.take()
+                let done = self
+                    .current_tool_desc
+                    .take()
                     .as_deref()
                     .map(tool_done_from_in_progress)
                     .unwrap_or_else(|| "Done".to_string());
                 self.finish_spinner_with(&done);
             }
-            StreamLine::GeminiMessage { role, content, delta, .. } => {
+            StreamLine::GeminiMessage {
+                role,
+                content,
+                delta,
+                ..
+            } => {
                 if role == "assistant" && delta && !content.is_empty() {
                     self.clear_spinner();
                     eprint!("{}", style(&content).dim());
@@ -447,13 +460,21 @@ fn gemini_tool_display(tool_name: &str, parameters: &Value) -> String {
             "Running command".to_string()
         }
         "search_files" | "grep" | "search" => {
-            if let Some(q) = parameters.get("pattern").or_else(|| parameters.get("query")).and_then(|v| v.as_str()) {
+            if let Some(q) = parameters
+                .get("pattern")
+                .or_else(|| parameters.get("query"))
+                .and_then(|v| v.as_str())
+            {
                 return format!("Searching {}", truncate(q, 30));
             }
             "Searching".to_string()
         }
         "list_directory" | "ls" => {
-            if let Some(p) = parameters.get("directory_path").or_else(|| parameters.get("path")).and_then(|v| v.as_str()) {
+            if let Some(p) = parameters
+                .get("directory_path")
+                .or_else(|| parameters.get("path"))
+                .and_then(|v| v.as_str())
+            {
                 return format!("Listing {}", short_path(p));
             }
             "Listing directory".to_string()

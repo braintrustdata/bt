@@ -135,13 +135,7 @@ fn setup_uses_codex_detected_on_path_without_explicit_agent() {
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .args([
-            "setup",
-            "--global",
-            "--no-instrument",
-            "--no-workflow",
-            "--no-input",
-        ])
+        .args(["setup", "skills", "--global", "--no-workflow", "--no-input"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Selected agents: codex").not());
@@ -166,13 +160,7 @@ fn setup_uses_gemini_detected_on_path_without_explicit_agent() {
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .args([
-            "setup",
-            "--global",
-            "--no-instrument",
-            "--no-workflow",
-            "--no-input",
-        ])
+        .args(["setup", "skills", "--global", "--no-workflow", "--no-input"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Selected agents: gemini").not());
@@ -197,13 +185,7 @@ fn setup_uses_qwen_detected_on_path_without_explicit_agent() {
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .args([
-            "setup",
-            "--global",
-            "--no-instrument",
-            "--no-workflow",
-            "--no-input",
-        ])
+        .args(["setup", "skills", "--global", "--no-workflow", "--no-input"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Selected agents: qwen").not());
@@ -228,13 +210,7 @@ fn setup_uses_copilot_detected_on_path_without_explicit_agent() {
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .args([
-            "setup",
-            "--global",
-            "--no-instrument",
-            "--no-workflow",
-            "--no-input",
-        ])
+        .args(["setup", "skills", "--global", "--no-workflow", "--no-input"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Selected agents: copilot").not());
@@ -243,6 +219,7 @@ fn setup_uses_copilot_detected_on_path_without_explicit_agent() {
         .path()
         .join(".agents/skills/braintrust/SKILL.md")
         .exists());
+    assert!(home.path().join(".copilot/skills").exists());
 }
 
 #[test]
@@ -261,9 +238,9 @@ fn setup_verbose_prints_agent_summary() {
         .env("PATH", bin_dir.path())
         .args([
             "setup",
+            "skills",
             "--verbose",
             "--global",
-            "--no-instrument",
             "--no-workflow",
             "--no-input",
         ])

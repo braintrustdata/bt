@@ -335,7 +335,7 @@ impl Agent {
                 binary: "copilot",
                 repo_marker: Some(".copilot"),
                 home_markers: &[".copilot"],
-                skill_alias_dir: None,
+                skill_alias_dir: Some(".copilot"),
             },
             Agent::Cursor => AgentMetadata {
                 binary: "cursor-agent",
@@ -4286,12 +4286,44 @@ fn install_mcp_for_copilot(
     api_key: &str,
     mcp_url: &str,
 ) -> Result<AgentInstallResult> {
-    let path = match scope {
-        InstallScope::Local => scope_root(scope, local_root, home)?.join(".mcp.json"),
-        InstallScope::Global => home.join(".copilot/mcp-config.json"),
+    let mut args = vec![
+        "mcp".to_string(),
+        "add".to_string(),
+        "--transport".to_string(),
+        "http".to_string(),
+        "--header".to_string(),
+        format!("Authorization: Bearer {api_key}"),
+    ];
+    let (cwd, scope_name) = match scope {
+        InstallScope::Local => {
+            let root = scope_root(scope, local_root, home)?;
+            args.extend([
+                "--config-dir".to_string(),
+                root.join(".copilot").display().to_string(),
+            ]);
+            (root.to_path_buf(), "project")
+        }
+        InstallScope::Global => (home.to_path_buf(), "user"),
     };
-    install_mcp_config_file(Agent::Copilot, path, "installed MCP config", |path| {
-        merge_mcp_config(path, api_key, mcp_url)
+    args.extend(["braintrust".to_string(), mcp_url.to_string()]);
+
+    let status = std::process::Command::new("copilot")
+        .args(&args)
+        .current_dir(&cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| "failed to run `copilot mcp add`")?;
+
+    if !status.success() {
+        bail!("`copilot mcp add` exited with status {status}");
+    }
+
+    Ok(AgentInstallResult {
+        agent: Agent::Copilot,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec![format!("copilot:{scope_name}")],
     })
 }
 
@@ -6720,16 +6752,32 @@ mod tests {
     }
 
     #[test]
-    fn install_mcp_for_agent_writes_copilot_local_mcp_json() {
+    fn install_mcp_for_agent_invokes_copilot_with_config_dir_for_local() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("bt-agents-copilot-mcp-local-{unique}"));
-        fs::create_dir_all(&root).expect("create temp root");
+        let root = env::temp_dir().join(format!("bt-agents-copilot-mcp-local-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("copilot.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("copilot"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
-
         let result = install_mcp_for_agent(
             Agent::Copilot,
             InstallScope::Local,
@@ -6739,36 +6787,52 @@ mod tests {
             "https://api.example.com/mcp",
         )
         .expect("install copilot local mcp");
-        assert!(matches!(result.status, InstallStatus::Installed));
 
-        let mcp_path = root.join(".mcp.json");
-        assert!(mcp_path.exists());
-        let parsed: Value =
-            serde_json::from_str(&fs::read_to_string(&mcp_path).expect("read mcp")).expect("json");
-        let servers = parsed
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .expect("mcpServers object");
-        assert!(servers.contains_key("braintrust"));
-        assert_eq!(
-            servers["braintrust"]["url"].as_str(),
-            Some("https://api.example.com/mcp")
-        );
-        assert_eq!(
-            servers["braintrust"]["headers"]["Authorization"].as_str(),
-            Some("Bearer copilot-api-key")
-        );
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["copilot:project".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read copilot log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("add"));
+        assert!(log.contains("--transport"));
+        assert!(log.contains("http"));
+        assert!(log.contains("--header"));
+        assert!(log.contains("Authorization: Bearer copilot-api-key"));
+        assert!(log.contains("--config-dir"));
+        assert!(log.contains(".copilot"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains(&root.display().to_string()));
     }
 
     #[test]
-    fn install_mcp_for_agent_writes_copilot_global_mcp_config() {
+    fn install_mcp_for_agent_invokes_copilot_without_config_dir_for_global() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let home = std::env::temp_dir().join(format!("bt-agents-copilot-mcp-global-home-{unique}"));
-        fs::create_dir_all(&home).expect("create temp home");
+        let root = env::temp_dir().join(format!("bt-agents-copilot-mcp-global-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("copilot-global.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
 
+        write_executable(
+            &bin_dir.join("copilot"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
         let result = install_mcp_for_agent(
             Agent::Copilot,
             InstallScope::Global,
@@ -6778,25 +6842,17 @@ mod tests {
             "https://api.example.com/mcp",
         )
         .expect("install copilot global mcp");
-        assert!(matches!(result.status, InstallStatus::Installed));
 
-        let mcp_path = home.join(".copilot/mcp-config.json");
-        assert!(mcp_path.exists());
-        let parsed: Value =
-            serde_json::from_str(&fs::read_to_string(&mcp_path).expect("read mcp")).expect("json");
-        let servers = parsed
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .expect("mcpServers object");
-        assert!(servers.contains_key("braintrust"));
-        assert_eq!(
-            servers["braintrust"]["url"].as_str(),
-            Some("https://api.example.com/mcp")
-        );
-        assert_eq!(
-            servers["braintrust"]["headers"]["Authorization"].as_str(),
-            Some("Bearer copilot-api-key")
-        );
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["copilot:user".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read copilot log");
+        assert!(!log.contains("--config-dir"));
+        assert!(log.contains("Authorization: Bearer copilot-api-key"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains(&home.display().to_string()));
     }
 
     #[test]
@@ -6876,6 +6932,7 @@ mod tests {
             .expect("install copilot");
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
+        assert!(root.join(".copilot/skills").exists());
     }
 
     #[test]

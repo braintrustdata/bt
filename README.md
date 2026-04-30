@@ -320,7 +320,7 @@ Current behavior:
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
 - Gemini and Qwen integration symlink `.gemini/skills`/`.qwen/skills` to `.agents/skills/braintrust/SKILL.md`.
-- Copilot integration installs the Braintrust skill file at `.agents/skills/braintrust/SKILL.md`. MCP config is written to `.mcp.json` (local) or `~/.copilot/mcp-config.json` (global).
+- Copilot integration symlinks `.copilot/skills` to `.agents/skills/braintrust/SKILL.md`. MCP config is written via `copilot mcp add` to the project `.copilot` dir (local) or the default user config (global).
 - Cursor integration installs `.cursor/rules/braintrust.mdc` with the same shared Braintrust guidance plus an auto-generated command-reference excerpt from this README.
 - Setup-time docs prefetch writes to `.bt/skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `.bt/skills/docs/README.md` and per-section `.bt/skills/docs/<section>/_index.md` (or the global equivalents under `~/.config/bt/skills/docs`).

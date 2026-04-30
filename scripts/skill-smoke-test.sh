@@ -166,8 +166,11 @@ find_skill_path() {
     claude)
       echo ".claude/skills/braintrust/SKILL.md"
       ;;
-    codex|copilot|opencode)
+    codex|opencode)
       echo ".agents/skills/braintrust/SKILL.md"
+      ;;
+    copilot)
+      echo ".copilot/skills/braintrust/SKILL.md"
       ;;
     cursor)
       echo ".cursor/rules/braintrust.mdc"
@@ -214,7 +217,7 @@ verify_demo() {
       [[ -n "$line" ]] && changed_user_files+=("$line")
     done < <(
       printf '%s\n' "${changed_files[@]}" \
-        | rg -v '^(\.claude/|\.agents/|\.cursor/|\.qwen/|skills/docs/|AGENT_TASK\.md$)' || true
+        | rg -v '^(\.claude/|\.agents/|\.copilot/|\.cursor/|\.qwen/|skills/docs/|AGENT_TASK\.md$)' || true
     )
   fi
 
