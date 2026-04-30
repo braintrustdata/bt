@@ -60,14 +60,6 @@ struct ListResponse {
     objects: Vec<Dataset>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DatasetRowsResponse {
-    #[serde(default)]
-    data: Vec<DatasetRow>,
-    #[serde(default)]
-    cursor: Option<String>,
-}
-
 pub async fn list_datasets(client: &ApiClient, project_id: &str) -> Result<Vec<Dataset>> {
     let path = format!(
         "/v1/dataset?org_name={}&project_id={}",
@@ -126,18 +118,7 @@ pub async fn list_dataset_rows_limited(
         }
 
         let query = build_dataset_rows_query(dataset_id, page_limit, cursor.as_deref());
-        let body = serde_json::json!({
-            "query": query,
-            "fmt": "json",
-        });
-        let org_name = client.org_name();
-        let headers = if !org_name.is_empty() {
-            vec![("x-bt-org-name", org_name)]
-        } else {
-            Vec::new()
-        };
-        let response: DatasetRowsResponse =
-            client.post_with_headers("/btql", &body, &headers).await?;
+        let response = client.btql::<DatasetRow>(&query).await?;
 
         let next_cursor = response.cursor.filter(|cursor| !cursor.is_empty());
 

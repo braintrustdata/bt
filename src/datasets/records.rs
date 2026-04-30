@@ -18,7 +18,6 @@ pub(crate) struct PreparedDatasetRecord {
     pub id: String,
     pub input: Option<Value>,
     pub expected: Option<Value>,
-    pub output: Option<Value>,
     pub metadata: Option<Map<String, Value>>,
     pub tags: Option<Vec<String>>,
 }
@@ -40,9 +39,6 @@ impl PreparedDatasetRecord {
         }
         if let Some(expected) = &self.expected {
             row.insert("expected".to_string(), expected.clone());
-        }
-        if let Some(output) = &self.output {
-            row.insert("output".to_string(), output.clone());
         }
         if let Some(metadata) = &self.metadata {
             row.insert("metadata".to_string(), Value::Object(metadata.clone()));
@@ -303,11 +299,22 @@ fn prepared_record_from_input_object(
     Ok(PreparedDatasetRecord {
         id,
         input: object.get("input").cloned(),
-        expected: object.get("expected").cloned(),
-        output: object.get("output").cloned(),
+        expected: expected_value(&object, row_index)?,
         metadata: parse_metadata(object.get("metadata"))?,
         tags: parse_tags(object.get("tags"))?,
     })
+}
+
+fn expected_value(object: &Map<String, Value>, row_index: usize) -> Result<Option<Value>> {
+    match (object.get("expected"), object.get("output")) {
+        (Some(_), Some(_)) => bail!(
+            "dataset record {} specifies both expected and output. Use expected; output is deprecated",
+            row_index + 1
+        ),
+        (Some(expected), None) => Ok(Some(expected.clone())),
+        (None, Some(output)) => Ok(Some(output.clone())),
+        (None, None) => Ok(None),
+    }
 }
 
 fn parse_id_field_path(id_field: &str) -> Result<Vec<String>> {
@@ -479,11 +486,10 @@ mod tests {
     }
 
     #[test]
-    fn prepare_records_preserves_expected_and_output_fields() {
+    fn prepare_records_uploads_expected_field() {
         let record = serde_json::from_value(serde_json::json!({
             "id": "case-1",
-            "expected": "gold",
-            "output": "predicted"
+            "expected": "gold"
         }))
         .expect("map");
         let prepared = prepare_records(vec![record], "id", true).expect("prepare records");
@@ -491,9 +497,26 @@ mod tests {
             prepared[0].expected,
             Some(Value::String("gold".to_string()))
         );
+
+        let row = prepared[0].to_upload_row("dataset_1");
         assert_eq!(
-            prepared[0].output,
-            Some(Value::String("predicted".to_string()))
+            row.get("expected"),
+            Some(&Value::String("gold".to_string()))
+        );
+        assert!(row.get("output").is_none());
+    }
+
+    #[test]
+    fn prepare_records_maps_deprecated_output_to_expected() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "case-1",
+            "output": "gold"
+        }))
+        .expect("map");
+        let prepared = prepare_records(vec![record], "id", true).expect("prepare records");
+        assert_eq!(
+            prepared[0].expected,
+            Some(Value::String("gold".to_string()))
         );
 
         let row = prepared[0].to_upload_row("dataset_1");
@@ -501,10 +524,22 @@ mod tests {
             row.get("expected"),
             Some(&Value::String("gold".to_string()))
         );
-        assert_eq!(
-            row.get("output"),
-            Some(&Value::String("predicted".to_string()))
-        );
+        assert!(row.get("output").is_none());
+    }
+
+    #[test]
+    fn prepare_records_rejects_expected_and_output_together() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "case-1",
+            "expected": "gold",
+            "output": "legacy"
+        }))
+        .expect("map");
+        let err = prepare_records(vec![record], "id", true)
+            .expect_err("expected and output should conflict");
+        assert!(err
+            .to_string()
+            .contains("specifies both expected and output"));
     }
 
     #[test]
