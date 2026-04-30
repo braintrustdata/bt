@@ -71,6 +71,7 @@ Projects & resources
   experiments  Manage experiments
 
 Data & evaluation
+  datasets     Manage datasets
   eval         Run eval files
   sql          Run SQL queries against Braintrust
   sync         Synchronize project logs between Braintrust and local NDJSON files

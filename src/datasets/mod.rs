@@ -15,6 +15,7 @@ pub(crate) mod api;
 mod create;
 mod delete;
 mod list;
+mod pipeline;
 mod records;
 mod update;
 mod utils;
@@ -107,6 +108,8 @@ enum DatasetsCommands {
     View(ViewArgs),
     /// Delete a dataset
     Delete(DeleteArgs),
+    /// Run dataset pipeline workflows
+    Pipeline(pipeline::PipelineArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -253,10 +256,17 @@ pub(crate) async fn select_dataset_interactive(
 }
 
 pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
-    let read_only = datasets_command_is_read_only(args.command.as_ref());
+    let command = match args.command {
+        Some(DatasetsCommands::Pipeline(pipeline_args)) => {
+            return pipeline::run(base, pipeline_args).await;
+        }
+        command => command,
+    };
+
+    let read_only = datasets_command_is_read_only(command.as_ref());
     let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
-    match args.command {
+    match command {
         None | Some(DatasetsCommands::List) => list::run(&ctx, base.json).await,
         Some(DatasetsCommands::Create(create_args)) => {
             create::run(
@@ -296,6 +306,7 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
         Some(DatasetsCommands::Delete(delete_args)) => {
             delete::run(&ctx, delete_args.name(), delete_args.force).await
         }
+        Some(DatasetsCommands::Pipeline(_)) => unreachable!("pipeline handled before context"),
     }
 }
 

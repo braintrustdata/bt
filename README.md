@@ -114,6 +114,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt auth`        | Authenticate with Braintrust                                       |
 | `bt switch`      | Switch org and project context                                     |
 | `bt status`      | Show current org and project context                               |
+| `bt datasets`    | Manage datasets and dataset pipelines                              |
 | `bt eval`        | Run eval files (Unix only)                                         |
 | `bt sql`         | Run SQL queries against Braintrust                                 |
 | `bt view`        | View logs, traces, and spans                                       |
@@ -176,6 +177,28 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
 - Accepted top-level record fields are `id`, `input`, `expected`, `metadata`, `tags`, and `origin` (plus the root field referenced by `--id-field`, if different).
 - Inputs may also be a JSON object with a top-level `rows` array, matching `bt datasets view --json`; sibling wrapper fields are ignored, and each row inside `rows` is still validated strictly.
+
+### `bt datasets pipeline`
+
+Run TypeScript dataset pipelines declared with `DatasetPipeline(...)` from the `braintrust` SDK.
+
+```bash
+# One-shot execution: discover refs, transform, and insert up to 100 new rows.
+bt datasets pipeline run ./pipeline.ts --target 100
+
+# Staged execution for human or agent review.
+bt datasets pipeline fetch ./pipeline.ts --target 500 --out refs.jsonl
+bt datasets pipeline transform ./pipeline.ts --in refs.jsonl --out proposed.jsonl
+bt datasets pipeline review ./pipeline.ts --in proposed.jsonl --out approved.jsonl
+bt datasets pipeline commit ./pipeline.ts --in approved.jsonl
+```
+
+Useful flags:
+
+- `--root-span-id <id>` restricts fetching to one or more specific root spans.
+- `--extra-where-sql <predicate>` appends a source SQL predicate.
+- `--max-concurrency <n>` controls transform concurrency.
+- `--name <name>` selects a pipeline when the file defines more than one.
 
 ## `bt sql`
 

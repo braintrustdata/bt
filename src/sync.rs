@@ -27,6 +27,8 @@ use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 
+pub(crate) mod discovery;
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
 const DEFAULT_PAGE_SIZE: usize = 1000;
@@ -1476,8 +1478,7 @@ async fn process_trace_chunk(
             let serialized = rows
                 .iter()
                 .map(|row| {
-                    let line =
-                        serde_json::to_string(row).context("failed to serialize trace row")?;
+                    let line = serialize_jsonl_value(row)?;
                     bytes_written += (line.len() + 1) as u64;
                     Result::<String>::Ok(line)
                 })
@@ -2057,16 +2058,21 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_btql_query(
+async fn execute_btql_request<Q, T>(
     client: &ApiClient,
     ctx: &LoginContext,
-    query: &str,
+    query: &Q,
+    query_source: &str,
     btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
-) -> Result<BtqlResponse> {
+) -> Result<T>
+where
+    Q: Serialize + ?Sized,
+    T: DeserializeOwned,
+{
     let body = json!({
         "query": query,
         "fmt": "json",
-        "query_source": "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
+        "query_source": query_source,
     });
     let org_name = ctx.login.org_name().unwrap_or_default();
     let client = client.clone();
@@ -2101,7 +2107,7 @@ async fn execute_btql_query(
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            return response.json::<BtqlResponse>().await.map_err(|err| {
+                            return response.json::<T>().await.map_err(|err| {
                                 BackoffError::permanent(anyhow!("failed to parse BTQL response: {err}"))
                             });
                         }
@@ -2146,6 +2152,31 @@ async fn execute_btql_query(
         let attempts = attempt_counter.load(Ordering::Relaxed).max(1);
         anyhow!(err).context(format!("BTQL request failed after {attempts} attempt(s)"))
     })
+}
+
+async fn execute_btql_query(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &str,
+    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
+) -> Result<BtqlResponse> {
+    execute_btql_request(
+        client,
+        ctx,
+        query,
+        "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
+        btql_retry_tracker,
+    )
+    .await
+}
+
+async fn execute_btql_json_query<T: DeserializeOwned>(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &Value,
+    query_source: &str,
+) -> Result<T> {
+    execute_btql_request(client, ctx, query, query_source, None).await
 }
 
 async fn execute_btql_query_timed(
@@ -3728,8 +3759,68 @@ fn open_jsonl_part_writer(base_dir: &Path, append: bool) -> Result<JsonlPartWrit
     JsonlPartWriter::new(base_dir, append)
 }
 
+pub(crate) fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut values = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| {
+            format!("failed to read line {} from {}", index + 1, path.display())
+        })?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        values.push(serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "failed to parse JSON on line {} from {}",
+                index + 1,
+                path.display()
+            )
+        })?);
+    }
+    Ok(values)
+}
+
+fn serialize_jsonl_value<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    serde_json::to_string(value).context("failed to serialize row to JSONL")
+}
+
+pub(crate) fn write_jsonl_value<T: Serialize + ?Sized>(
+    writer: &mut dyn Write,
+    value: &T,
+) -> Result<usize> {
+    let encoded = serialize_jsonl_value(value)?;
+    writer
+        .write_all(encoded.as_bytes())
+        .context("failed to write JSONL row")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write JSONL newline")?;
+    Ok(encoded.len() + 1)
+}
+
+pub(crate) fn write_jsonl_values<T: Serialize>(out: Option<&Path>, values: &[T]) -> Result<()> {
+    let mut writer: Box<dyn Write> = if let Some(path) = out {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        Box::new(BufWriter::new(File::create(path).with_context(|| {
+            format!("failed to create {}", path.display())
+        })?))
+    } else {
+        Box::new(BufWriter::new(std::io::stdout()))
+    };
+
+    for value in values {
+        write_jsonl_value(writer.as_mut(), value)?;
+    }
+    writer.flush().context("failed to flush JSONL output")
+}
+
 fn write_jsonl_row(writer: &mut JsonlPartWriter, row: &Map<String, Value>) -> Result<usize> {
-    let encoded = serde_json::to_string(row).context("failed to serialize row to JSONL")?;
+    let encoded = serialize_jsonl_value(row)?;
     writer
         .write_line(&encoded)
         .context("failed to write JSONL row")
@@ -4287,6 +4378,63 @@ fn spinner_bar(message: &str) -> ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_jsonl_value_serializes_one_line_and_reports_bytes() -> Result<()> {
+        let mut output = Vec::new();
+
+        let bytes = write_jsonl_value(&mut output, &json!({ "id": "row-1" }))?;
+
+        assert_eq!(bytes, output.len());
+        assert_eq!(String::from_utf8(output)?, "{\"id\":\"row-1\"}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn read_jsonl_values_skips_blank_lines() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-read-jsonl-values-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+
+        fs::write(&path, "{\"id\":\"row-1\"}\n\n{\"id\":\"row-2\"}\n")?;
+        let values = read_jsonl_values(&path)?;
+
+        assert_eq!(
+            values,
+            vec![json!({ "id": "row-1" }), json!({ "id": "row-2" })]
+        );
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn write_jsonl_values_writes_file() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-write-jsonl-values-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+
+        write_jsonl_values(
+            Some(&path),
+            &[json!({ "id": "row-1" }), json!({ "id": "row-2" })],
+        )?;
+
+        let content = fs::read_to_string(&path)?;
+        assert_eq!(content, "{\"id\":\"row-1\"}\n{\"id\":\"row-2\"}\n");
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
 
     #[test]
     fn push_checkpoint_line_offset_advances_only_after_commit() {

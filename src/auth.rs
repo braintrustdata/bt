@@ -688,6 +688,18 @@ pub async fn resolved_auth_env(base: &BaseArgs) -> Result<Vec<(String, String)>>
     Ok(envs)
 }
 
+pub async fn resolved_runner_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
+    let mut envs = resolved_auth_env(base).await?;
+    let project = base
+        .project
+        .clone()
+        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
+    if let Some(project) = project {
+        envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project));
+    }
+    Ok(envs)
+}
+
 fn resolve_profile_for_org<'a>(org: &str, store: &'a AuthStore) -> Option<&'a str> {
     if store.profiles.contains_key(org) {
         return Some(
