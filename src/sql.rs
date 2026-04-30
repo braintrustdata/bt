@@ -3,8 +3,8 @@ use std::io;
 use std::io::Read;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
-use clap::Args;
+use anyhow::{bail, Context, Result};
+use clap::{builder::BoolishValueParser, Args};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,8 +23,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
-use crate::http::ApiClient;
+use crate::http::{ApiClient, HttpError};
 use crate::ui::with_spinner;
+
+const QUERY_SOURCE: &str = "bt_sql_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d";
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -40,6 +42,15 @@ pub struct SqlArgs {
     /// Force non-interactive mode
     #[arg(long)]
     pub non_interactive: bool,
+
+    /// Run the query even when the SQL linter reports failures
+    #[arg(
+        long,
+        env = "BRAINTRUST_SQL_FORCE_IGNORE_LINTER",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    pub force_ignore_linter: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,8 +63,17 @@ struct SqlResponse {
     pub freshness_state: Option<FreshnessState>,
     #[serde(default)]
     pub realtime_state: Option<RealtimeState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<QueryLint>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QueryLint {
+    code: String,
+    message: String,
+    stage: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,9 +103,18 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let client = ApiClient::new(&ctx)?;
     let interactive = !base.json && crate::ui::is_interactive() && !args.non_interactive;
     let query = read_non_interactive_query(&args.query, interactive)?;
+    let lint_mode = if args.force_ignore_linter {
+        "default"
+    } else {
+        "strict"
+    };
 
     if let Some(query) = query {
-        let response = with_spinner("Running query...", execute_query(&client, &query)).await?;
+        let response = with_spinner(
+            "Running query...",
+            execute_query(&client, &query, lint_mode),
+        )
+        .await?;
         print_response(&response, base.json)?;
         return Ok(());
     }
@@ -96,7 +125,7 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
         );
     }
 
-    run_interactive(base, client).await
+    run_interactive(base, client, lint_mode.to_string()).await
 }
 
 fn read_non_interactive_query(
@@ -123,9 +152,9 @@ fn read_non_interactive_query(
     Ok(Some(trimmed.to_string()))
 }
 
-async fn run_interactive(base: BaseArgs, client: ApiClient) -> Result<()> {
+async fn run_interactive(base: BaseArgs, client: ApiClient, lint_mode: String) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| run_interactive_blocking(base.json, client, handle))
+    tokio::task::block_in_place(|| run_interactive_blocking(base.json, client, handle, lint_mode))
 }
 
 struct TerminalGuard;
@@ -141,6 +170,7 @@ fn run_interactive_blocking(
     json_output: bool,
     client: ApiClient,
     handle: tokio::runtime::Handle,
+    lint_mode: String,
 ) -> Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -149,7 +179,7 @@ fn run_interactive_blocking(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, json_output, client, handle);
+    let res = run_app(&mut terminal, json_output, client, handle, lint_mode);
     terminal.show_cursor().ok();
     res
 }
@@ -159,8 +189,9 @@ fn run_app(
     json_output: bool,
     client: ApiClient,
     handle: tokio::runtime::Handle,
+    lint_mode: String,
 ) -> Result<()> {
-    let mut app = App::new(json_output);
+    let mut app = App::new(json_output, lint_mode);
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
@@ -204,7 +235,7 @@ fn handle_key_event(
             }
 
             app.status = "Running query...".to_string();
-            let result = handle.block_on(execute_query(client, &query));
+            let result = handle.block_on(execute_query(client, &query, app.lint_mode.as_str()));
             match result {
                 Ok(response) => {
                     app.output = format_response(&response, app.json_output)?;
@@ -276,12 +307,8 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
     }
 }
 
-async fn execute_query(client: &ApiClient, query: &str) -> Result<SqlResponse> {
-    let body = json!({
-        "query": query,
-        "fmt": "json",
-        "query_source": "bt_sql_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
-    });
+async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
+    let body = query_body(query, lint_mode);
 
     let org_name = client.org_name();
     let headers = if !org_name.is_empty() {
@@ -290,13 +317,84 @@ async fn execute_query(client: &ApiClient, query: &str) -> Result<SqlResponse> {
         vec![]
     };
 
-    client.post_with_headers("/btql", &body, &headers).await
+    match client.post_with_headers("/btql", &body, &headers).await {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            if let Some(message) = format_strict_lint_error(&err) {
+                Err(err).context(message)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn query_body(query: &str, lint_mode: &str) -> Value {
+    json!({
+        "query": query,
+        "fmt": "json",
+        "lint_mode": lint_mode,
+        "strict_lint_mode": lint_mode == "strict",
+        "query_source": QUERY_SOURCE,
+    })
 }
 
 fn print_response(response: &SqlResponse, json_output: bool) -> Result<()> {
     let output = format_response(response, json_output)?;
+    if !json_output {
+        for warning in &response.warnings {
+            eprintln!(
+                "warning[{}:{}]: {}",
+                warning.stage, warning.code, warning.message
+            );
+        }
+    }
     println!("{output}");
     Ok(())
+}
+
+fn format_strict_lint_error(err: &anyhow::Error) -> Option<String> {
+    let http_error = err.downcast_ref::<HttpError>()?;
+    let body: Value = serde_json::from_str(&http_error.body).ok()?;
+    format_strict_lint_message(body.get("Message")?.as_str()?)
+}
+
+fn format_strict_lint_message(message: &str) -> Option<String> {
+    let marker = "Query blocked by strict lint mode due to";
+    let strict_lint_start = message.find(marker)?;
+    let strict_lint_message = &message[strict_lint_start..];
+    let (_, details) = strict_lint_message.split_once(':')?;
+    let mut output = String::from("Query blocked due to lint failures");
+
+    for failure in details
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(format_strict_lint_failure)
+    {
+        output.push_str("\n\n  - ");
+        output.push_str(&failure);
+    }
+
+    Some(output)
+}
+
+fn format_strict_lint_failure(line: &str) -> String {
+    let line = strip_api_context_suffix(line);
+    if let Some((_, message)) = line.split_once("):") {
+        return message.trim().to_string();
+    }
+    line.to_string()
+}
+
+fn strip_api_context_suffix(line: &str) -> &str {
+    let mut end = line.len();
+    for marker in [" [user_email=", " [timestamp="] {
+        if let Some(idx) = line.find(marker) {
+            end = end.min(idx);
+        }
+    }
+    line[..end].trim()
 }
 
 fn render_table(response: &SqlResponse) -> Option<String> {
@@ -423,10 +521,11 @@ struct App {
     history: Vec<String>,
     history_index: Option<usize>,
     json_output: bool,
+    lint_mode: String,
 }
 
 impl App {
-    fn new(json_output: bool) -> Self {
+    fn new(json_output: bool, lint_mode: String) -> Self {
         Self {
             input: String::new(),
             cursor: 0,
@@ -435,6 +534,7 @@ impl App {
             history: Vec::new(),
             history_index: None,
             json_output,
+            lint_mode,
         }
     }
 
@@ -564,4 +664,63 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
     let mut iter = s[idx..].char_indices();
     iter.next();
     iter.next().map(|(i, _)| idx + i).unwrap_or_else(|| s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_body_sets_lint_mode() {
+        let body = query_body("select 1", "strict");
+
+        assert_eq!(body["query"], "select 1");
+        assert_eq!(body["fmt"], "json");
+        assert_eq!(body["lint_mode"], "strict");
+        assert_eq!(body["strict_lint_mode"], true);
+        assert_eq!(body["query_source"], QUERY_SOURCE);
+    }
+
+    #[test]
+    fn sql_response_decodes_warnings() {
+        let response: SqlResponse = serde_json::from_value(json!({
+            "data": [],
+            "schema": {"type": "array"},
+            "warnings": [{
+                "code": "filterPushdown",
+                "message": "Rewrite this filter.",
+                "stage": "optimizer",
+                "severity": "warning"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(response.warnings.len(), 1);
+        assert_eq!(response.warnings[0].code, "filterPushdown");
+        assert_eq!(response.warnings[0].message, "Rewrite this filter.");
+    }
+
+    #[test]
+    fn formats_strict_lint_http_error() {
+        let message = "Brainstore btql/query request failed 400 (Bad Request) after 9 ms: Query blocked by strict lint mode due to 1 lint:\nNo filters available for segment elimination. Add a range filter on created, _xact_id, or _pagination_key, or scope to a specific root_span_id or id. [user_email=test@example.com] [timestamp=123]";
+
+        let formatted = format_strict_lint_message(message).unwrap();
+
+        assert_eq!(
+            formatted,
+            "Query blocked due to lint failures\n\n  - No filters available for segment elimination. Add a range filter on created, _xact_id, or _pagination_key, or scope to a specific root_span_id or id."
+        );
+    }
+
+    #[test]
+    fn formats_rule_prefixed_strict_lint_lines() {
+        let message = "Query blocked by strict lint mode due to 1 lint:\nmissingSegmentEliminationSpecs (optimizer/warning): No filters available for segment elimination.";
+
+        let formatted = format_strict_lint_message(message).unwrap();
+
+        assert_eq!(
+            formatted,
+            "Query blocked due to lint failures\n\n  - No filters available for segment elimination."
+        );
+    }
 }
