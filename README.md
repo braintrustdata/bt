@@ -157,7 +157,7 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt eval --first 20 qa.eval.ts` — run the first 20 examples and clearly label the summary as a non-final smoke run.
 - `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
 - If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
- 
+
 ## `bt datasets`
 
 - `bt datasets` works directly against remote Braintrust datasets — no local `bt sync` artifact flow is required.
@@ -166,14 +166,15 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt datasets create my-dataset --file records.jsonl` — create the remote dataset and seed it from a JSON/JSONL file.
 - `cat records.jsonl | bt datasets create my-dataset` — create the dataset and seed it from stdin.
 - `bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'` — create the dataset from inline JSON rows.
-- `bt datasets create my-dataset --rows '[{"input":{"text":"hi"},"expected":"hello"}]'` — create a dataset when rows do not include `id`; bt auto-generates deterministic record IDs.
+- `bt datasets create my-dataset --rows '[{"input":{"text":"hi"},"expected":"hello"}]'` — create a dataset when rows do not include `id`; bt auto-generates record IDs.
 - `bt datasets update my-dataset --file records.jsonl` — upsert rows by stable record id.
 - `bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `update`.
 - `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id` — alias for `update` with explicit id path (fails if the dataset does not exist, and does not delete remote rows missing from the input).
-- `bt datasets view my-dataset` — show dataset metadata and row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust or `--all-rows` to load everything.
+- `bt datasets view my-dataset` — show dataset metadata and previewed row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust, `--all-rows` to load every row, `--full` for exact values, or `bt sync pull dataset:<id>` to export full rows to files.
 - `update`/`add`/`refresh` require explicit stable IDs via `id` or `--id-field`.
 - `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
 - Accepted top-level record fields are `id`, `input`, `expected`, `output`, `metadata`, and `tags` (plus the root field referenced by `--id-field`, if different).
+
 ## `bt sql`
 
 - Runs interactively on TTY by default.

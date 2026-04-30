@@ -68,7 +68,9 @@
         "\"id\":\"case-1\"",
         "\"expected\":\"A2\"",
         "\"id\":\"case-3\"",
-        "\"id\":\"case-2\""
+        "\"id\":\"case-2\"",
+        "\"rows_previewed\":true",
+        "\"preview_length\":125"
       ],
       "stdout_not_contains": []
     }

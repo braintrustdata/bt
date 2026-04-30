@@ -11,6 +11,21 @@ const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
 const MAX_DATASET_ROWS_PAGES: usize = 10_000;
 const DATASET_ROWS_SINCE: &str = "1970-01-01T00:00:00Z";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatasetRowsPreviewLength {
+    Full,
+    Preview(usize),
+}
+
+impl DatasetRowsPreviewLength {
+    pub(crate) fn btql_value(self) -> i64 {
+        match self {
+            Self::Full => -1,
+            Self::Preview(length) => length as i64,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dataset {
     pub id: String,
@@ -83,6 +98,7 @@ pub async fn list_dataset_rows_limited(
     client: &ApiClient,
     dataset_id: &str,
     max_rows: Option<usize>,
+    preview_length: DatasetRowsPreviewLength,
 ) -> Result<(Vec<DatasetRow>, bool)> {
     if matches!(max_rows, Some(0)) {
         return Ok((Vec::new(), false));
@@ -117,7 +133,8 @@ pub async fn list_dataset_rows_limited(
             }
         }
 
-        let query = build_dataset_rows_query(dataset_id, page_limit, cursor.as_deref());
+        let query =
+            build_dataset_rows_query(dataset_id, page_limit, cursor.as_deref(), preview_length);
         let response = client.btql::<DatasetRow>(&query).await?;
 
         let next_cursor = response.cursor.filter(|cursor| !cursor.is_empty());
@@ -198,14 +215,20 @@ fn resolve_dataset_rows_page_limit(max_rows: Option<usize>, loaded_rows: usize) 
     }
 }
 
-fn build_dataset_rows_query(dataset_id: &str, limit: usize, cursor: Option<&str>) -> String {
+fn build_dataset_rows_query(
+    dataset_id: &str,
+    limit: usize,
+    cursor: Option<&str>,
+    preview_length: DatasetRowsPreviewLength,
+) -> String {
     let cursor_clause = cursor
         .map(|cursor| format!(" | cursor: {}", btql_quote(cursor)))
         .unwrap_or_default();
     format!(
-        "select: * | from: dataset({}) | filter: created >= {} | limit: {}{}",
+        "select: * | from: dataset({}) | filter: created >= {} | preview_length: {} | limit: {}{}",
         sql_quote(dataset_id),
         btql_quote(DATASET_ROWS_SINCE),
+        preview_length.btql_value(),
         limit,
         cursor_clause
     )
@@ -226,23 +249,45 @@ mod tests {
 
     #[test]
     fn dataset_rows_query_includes_required_filter() {
-        let query = build_dataset_rows_query("dataset-id", 1000, None);
+        let query = build_dataset_rows_query(
+            "dataset-id",
+            1000,
+            None,
+            DatasetRowsPreviewLength::Preview(125),
+        );
         assert_eq!(
             query,
-            "select: * | from: dataset('dataset-id') | filter: created >= \"1970-01-01T00:00:00Z\" | limit: 1000"
+            "select: * | from: dataset('dataset-id') | filter: created >= \"1970-01-01T00:00:00Z\" | preview_length: 125 | limit: 1000"
         );
     }
 
     #[test]
     fn dataset_rows_query_quotes_cursor() {
-        let query = build_dataset_rows_query("dataset-id", 200, Some("cursor-123"));
+        let query = build_dataset_rows_query(
+            "dataset-id",
+            200,
+            Some("cursor-123"),
+            DatasetRowsPreviewLength::Preview(125),
+        );
         assert!(query.contains("limit: 200 | cursor: \"cursor-123\""));
     }
 
     #[test]
     fn dataset_rows_query_escapes_dataset_id() {
-        let query = build_dataset_rows_query("dataset'with-quote", 10, None);
+        let query = build_dataset_rows_query(
+            "dataset'with-quote",
+            10,
+            None,
+            DatasetRowsPreviewLength::Preview(125),
+        );
         assert!(query.contains("from: dataset('dataset''with-quote')"));
+    }
+
+    #[test]
+    fn dataset_rows_query_uses_full_preview_length_for_exact_values() {
+        let query =
+            build_dataset_rows_query("dataset-id", 100, None, DatasetRowsPreviewLength::Full);
+        assert!(query.contains("preview_length: -1"));
     }
 
     #[test]

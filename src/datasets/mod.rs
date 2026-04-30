@@ -155,7 +155,7 @@ struct ViewArgs {
     )]
     web: bool,
 
-    /// Show full dataset row payloads
+    /// Show all returned row fields instead of compact columns.
     #[arg(
         long,
         env = "BT_DATASETS_VERBOSE",
@@ -164,11 +164,20 @@ struct ViewArgs {
     )]
     verbose: bool,
 
+    /// Fetch full row values instead of BTQL previews.
+    #[arg(
+        long,
+        env = "BT_DATASETS_VIEW_FULL",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    full: bool,
+
     /// Maximum number of rows to load. Defaults to 200 unless --all-rows is passed.
     #[arg(long, env = "BT_DATASETS_VIEW_LIMIT", value_name = "N")]
     limit: Option<usize>,
 
-    /// Load all rows (can be expensive for large datasets).
+    /// Load all rows. Values are still previewed unless --full is passed.
     #[arg(
         long = "all-rows",
         env = "BT_DATASETS_VIEW_ALL",
@@ -278,6 +287,7 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
                 base.json,
                 view_args.web,
                 view_args.verbose,
+                view_args.full,
                 resolve_view_row_limit(&view_args),
             )
             .await
@@ -453,6 +463,7 @@ mod tests {
             "my-dataset",
             "--web",
             "--verbose",
+            "--full",
             "--limit",
             "25",
         ])
@@ -463,6 +474,7 @@ mod tests {
         assert_eq!(view.name(), Some("my-dataset"));
         assert!(view.web);
         assert!(view.verbose);
+        assert!(view.full);
         assert_eq!(view.limit, Some(25));
         assert!(!view.all_rows);
     }
@@ -487,6 +499,7 @@ mod tests {
             },
             web: false,
             verbose: false,
+            full: false,
             limit: None,
             all_rows: false,
         };
@@ -541,6 +554,7 @@ mod tests {
                 },
                 web: false,
                 verbose: false,
+                full: false,
                 limit: None,
                 all_rows: false,
             })

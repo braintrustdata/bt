@@ -12,12 +12,15 @@ use crate::ui::{
 
 use super::{api, ResolvedContext};
 
+const DATASET_ROWS_COMPACT_PREVIEW_LENGTH: usize = 125;
+
 pub async fn run(
     ctx: &ResolvedContext,
     name: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
+    full: bool,
     max_rows: Option<usize>,
 ) -> Result<()> {
     let dataset = match name {
@@ -49,9 +52,11 @@ pub async fn run(
         return Ok(());
     }
 
+    let preview_length = dataset_rows_preview_length(full);
+    let full_rows_command = format!("bt sync pull dataset:{}", dataset.id);
     let (rows, rows_truncated) = with_spinner(
         "Loading dataset rows...",
-        api::list_dataset_rows_limited(&ctx.client, &dataset.id, max_rows),
+        api::list_dataset_rows_limited(&ctx.client, &dataset.id, max_rows, preview_length),
     )
     .await?;
 
@@ -63,6 +68,8 @@ pub async fn run(
                 "rows": rows,
                 "rows_truncated": rows_truncated,
                 "row_limit": max_rows,
+                "rows_previewed": !full,
+                "preview_length": preview_length.btql_value(),
             }))?
         );
         return Ok(());
@@ -111,8 +118,18 @@ pub async fn run(
             output,
             "{}",
             console::style(
-                "Showing row id/input/expected/output/metadata/tags only. Re-run with --verbose to inspect full row payloads."
+                "Showing row id/input/expected/output/metadata/tags only. Re-run with --verbose to inspect all returned row fields."
             )
+            .dim()
+        )?;
+    }
+    if !full {
+        writeln!(
+            output,
+            "{}",
+            console::style(format!(
+                "Row values are previews. Re-run with --full for exact values, or use `{full_rows_command}` to download the dataset to files."
+            ))
             .dim()
         )?;
     }
@@ -121,7 +138,7 @@ pub async fn run(
             output,
             "{}",
             console::style(
-                "Row output was truncated. Re-run with --all-rows or a larger --limit to inspect more rows."
+                "Row list was truncated. Re-run with --all-rows or a larger --limit to inspect more rows."
             )
             .dim()
         )?;
@@ -189,6 +206,14 @@ fn format_compact_value(value: Option<&Value>, max_len: usize) -> String {
     truncate(&rendered, max_len)
 }
 
+fn dataset_rows_preview_length(full: bool) -> api::DatasetRowsPreviewLength {
+    if full {
+        api::DatasetRowsPreviewLength::Full
+    } else {
+        api::DatasetRowsPreviewLength::Preview(DATASET_ROWS_COMPACT_PREVIEW_LENGTH)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +274,17 @@ mod tests {
             "abc"
         );
         assert_eq!(format_compact_value(None, 10), "-");
+    }
+
+    #[test]
+    fn dataset_rows_preview_length_uses_preview_by_default() {
+        assert_eq!(
+            dataset_rows_preview_length(false),
+            api::DatasetRowsPreviewLength::Preview(DATASET_ROWS_COMPACT_PREVIEW_LENGTH)
+        );
+        assert_eq!(
+            dataset_rows_preview_length(true),
+            api::DatasetRowsPreviewLength::Full
+        );
     }
 }

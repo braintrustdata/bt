@@ -56,7 +56,12 @@
     },
     {
       "command": ["datasets", "--json", "--no-input", "view", "inline-fixture"],
-      "stdout_contains": ["\"id\":\"inline-1\"", "\"expected\":\"ok\""]
+      "stdout_contains": [
+        "\"id\":\"inline-1\"",
+        "\"expected\":\"ok\"",
+        "\"rows_previewed\":true",
+        "\"preview_length\":125"
+      ]
     }
   ],
   "expected_logs3_requests": 3
