@@ -1,0 +1,71 @@
+{
+  "env": {
+    "BRAINTRUST_API_KEY": "fixture-api-key",
+    "BRAINTRUST_API_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_APP_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_ORG_NAME": "test-org",
+    "BRAINTRUST_DEFAULT_PROJECT": "fixtures-project"
+  },
+  "steps": [
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "file-fixture",
+        "--file",
+        "rows.jsonl"
+      ],
+      "stdout_contains": [
+        "\"name\":\"file-fixture\"",
+        "\"uploaded\":2",
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "stdin-fixture"
+      ],
+      "stdin_file": "rows.jsonl",
+      "stdout_contains": [
+        "\"name\":\"stdin-fixture\"",
+        "\"uploaded\":2",
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "inline-fixture",
+        "--rows",
+        "[{\"id\":\"inline-1\",\"input\":{\"prompt\":\"inline\"},\"expected\":\"ok\",\"origin\":{\"source\":\"inline\"}}]"
+      ],
+      "stdout_contains": [
+        "\"name\":\"inline-fixture\"",
+        "\"uploaded\":1",
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": ["datasets", "--json", "--no-input", "view", "inline-fixture"],
+      "btql_dataset": "inline-fixture",
+      "stdout_contains": [
+        "\"id\":\"inline-1\"",
+        "\"expected\":\"ok\"",
+        "\"origin\":{\"source\":\"inline\"}",
+        "\"rows_previewed\":true",
+        "\"preview_length\":125"
+      ],
+      "stdout_not_contains": ["\"dataset_id\"", "\"_is_merge\""]
+    }
+  ],
+  "expected_logs3_requests": 3
+}
