@@ -75,6 +75,24 @@
         "\"preview_length\":125"
       ],
       "stdout_not_contains": ["\"dataset_id\"", "\"_is_merge\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "view",
+        "qa-fixture",
+        "--limit",
+        "1"
+      ],
+      "btql_dataset": "qa-fixture",
+      "stdout_contains": [
+        "\"id\":\"case-1\"",
+        "\"rows_truncated\":true",
+        "\"row_limit\":1"
+      ],
+      "stdout_not_contains": ["\"id\":\"case-2\"", "\"id\":\"case-3\""]
     }
   ],
   "expected_logs3_requests": 3

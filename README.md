@@ -175,6 +175,7 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `--id-field` uses dot-separated paths; escape literal dots as `\.` and literal backslashes as `\\`.
 - `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
 - Accepted top-level record fields are `id`, `input`, `expected`, `metadata`, `tags`, and `origin` (plus the root field referenced by `--id-field`, if different).
+- Inputs may also be a JSON object with a top-level `rows` array, matching `bt datasets view --json`; sibling wrapper fields are ignored, and each row inside `rows` is still validated strictly.
 
 ## `bt sql`
 

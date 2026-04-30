@@ -722,6 +722,29 @@ mod tests {
     }
 
     #[test]
+    fn prepare_records_validates_rows_inside_view_json_wrapper() {
+        let records = parse_record_objects(
+            r#"{
+                "dataset": {"id": "dataset_1"},
+                "rows": [
+                    {
+                        "id": "case-1",
+                        "input": {"prompt": "hello"},
+                        "foo": "bar"
+                    }
+                ],
+                "rows_truncated": false
+            }"#,
+        )
+        .expect("parse view json wrapper");
+        let err = prepare_records(records, "id", true)
+            .expect_err("wrapped rows should still be validated strictly");
+        let message = err.to_string();
+        assert!(message.contains("dataset record 1 does not match the supported record shape"));
+        assert!(message.contains("unknown field `foo`"));
+    }
+
+    #[test]
     fn prepare_records_keeps_dataset_id_when_used_as_id_field() {
         let record = serde_json::from_value(serde_json::json!({
             "dataset_id": "case-1",
