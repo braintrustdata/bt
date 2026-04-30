@@ -15,6 +15,7 @@ mod functions;
 mod http;
 mod init;
 mod js_runner;
+mod project_context;
 mod projects;
 mod prompts;
 mod python_runner;
@@ -62,6 +63,7 @@ Core
 Projects & resources
   projects     Manage projects
   topics       Inspect and control Topics automation
+  datasets     Manage datasets
   prompts      Manage prompts
   functions    Manage functions (tools, scorers, and more)
   tools        Manage tools
@@ -137,6 +139,8 @@ enum Commands {
     Projects(CLIArgs<projects::ProjectsArgs>),
     /// Inspect and control Topics automation
     Topics(CLIArgs<topics::TopicsArgs>),
+    /// Manage datasets
+    Datasets(CLIArgs<datasets::DatasetsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
     #[command(name = "self")]
@@ -150,8 +154,6 @@ enum Commands {
     Functions(CLIArgs<functions::FunctionsArgs>),
     /// Manage experiments
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
-    /// Manage datasets
-    Datasets(CLIArgs<datasets::DatasetsArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
     /// Local utility commands
@@ -177,13 +179,13 @@ impl Commands {
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
             Commands::Topics(cmd) => &cmd.base,
+            Commands::Datasets(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
             Commands::SelfCommand(cmd) => &cmd.base,
             Commands::Tools(cmd) => &cmd.base,
             Commands::Scorers(cmd) => &cmd.base,
             Commands::Functions(cmd) => &cmd.base,
             Commands::Experiments(cmd) => &cmd.base,
-            Commands::Datasets(cmd) => &cmd.base,
             Commands::Sync(cmd) => &cmd.base,
             Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
@@ -202,6 +204,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
+            Commands::Datasets(cmd) => &mut cmd.base,
             Commands::Topics(cmd) => &mut cmd.base,
             Commands::Prompts(cmd) => &mut cmd.base,
             Commands::SelfCommand(cmd) => &mut cmd.base,
@@ -209,7 +212,6 @@ impl Commands {
             Commands::Scorers(cmd) => &mut cmd.base,
             Commands::Functions(cmd) => &mut cmd.base,
             Commands::Experiments(cmd) => &mut cmd.base,
-            Commands::Datasets(cmd) => &mut cmd.base,
             Commands::Sync(cmd) => &mut cmd.base,
             Commands::Util(cmd) => &mut cmd.base,
             Commands::Switch(cmd) => &mut cmd.base,
@@ -264,7 +266,6 @@ fn try_main() -> Result<()> {
     apply_base_output_defaults(&mut cli.command);
     configure_output(cli.command.base());
     apply_runtime_env_overrides(cli.command.base());
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -281,13 +282,13 @@ fn try_main() -> Result<()> {
             #[cfg(unix)]
             Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
             Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+            Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
             Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
             Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
             Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
             Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
             Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
             Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
-            Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
             Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
             Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
             Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,

@@ -1,0 +1,99 @@
+{
+  "env": {
+    "BRAINTRUST_API_KEY": "fixture-api-key",
+    "BRAINTRUST_API_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_APP_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_ORG_NAME": "test-org",
+    "BRAINTRUST_DEFAULT_PROJECT": "fixtures-project"
+  },
+  "steps": [
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "qa-fixture",
+        "--file",
+        "upload.jsonl"
+      ],
+      "stdout_contains": [
+        "\"uploaded\":2",
+        "\"created_dataset\":true",
+        "\"mode\":\"create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--no-input",
+        "update",
+        "qa-fixture",
+        "--rows",
+        "[{\"input\":{\"prompt\":\"missing-id\"},\"expected\":\"nope\"}]"
+      ],
+      "expect_success": false,
+      "stderr_contains": [
+        "missing a stable id at 'id'",
+        "update`/`add`/`refresh` require explicit ids"
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "refresh",
+        "qa-fixture",
+        "--file",
+        "refresh.jsonl"
+      ],
+      "stdout_contains": ["\"mode\":\"update\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "refresh",
+        "qa-fixture",
+        "--file",
+        "refresh.jsonl"
+      ],
+      "stdout_contains": ["\"mode\":\"update\""]
+    },
+    {
+      "command": ["datasets", "--json", "--no-input", "view", "qa-fixture"],
+      "btql_dataset": "qa-fixture",
+      "stdout_contains": [
+        "\"id\":\"case-1\"",
+        "\"expected\":\"A2\"",
+        "\"origin\":{\"source\":\"refresh\"}",
+        "\"id\":\"case-3\"",
+        "\"id\":\"case-2\"",
+        "\"rows_previewed\":true",
+        "\"preview_length\":125"
+      ],
+      "stdout_not_contains": ["\"dataset_id\"", "\"_is_merge\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "view",
+        "qa-fixture",
+        "--limit",
+        "1"
+      ],
+      "btql_dataset": "qa-fixture",
+      "stdout_contains": [
+        "\"id\":\"case-1\"",
+        "\"rows_truncated\":true",
+        "\"row_limit\":1"
+      ],
+      "stdout_not_contains": ["\"id\":\"case-2\"", "\"id\":\"case-3\""]
+    }
+  ],
+  "expected_logs3_requests": 3
+}

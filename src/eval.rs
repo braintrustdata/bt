@@ -369,6 +369,20 @@ pub struct EvalArgs {
     )]
     pub param: Vec<String>,
 
+    /// Run the selected eval once per combination of matrix values.
+    /// Two value formats are supported:
+    ///   key=v1,v2,v3          comma-separated (each value parsed as JSON, falling back to string)
+    ///   key=[JSON_ARRAY]      JSON array, e.g. --matrix-param model='["gpt-4","hello, world"]'
+    ///                         Use the JSON array form when values must contain commas.
+    /// Repeat the flag to sweep multiple keys; the Cartesian product of all values is run.
+    /// Requires exactly one eval after filters; multiple evals error out.
+    #[arg(
+        long = "matrix-param",
+        value_name = "KEY=V1,V2,... | KEY=[JSON_ARRAY]",
+        allow_hyphen_values = true
+    )]
+    pub matrix_param: Vec<String>,
+
     /// Arguments forwarded to the eval file via process.argv (everything after `--`).
     /// Example: bt eval foo.eval.ts -- --description "Prod" --shard=1/4
     #[arg(last = true, value_name = "ARG")]
@@ -424,6 +438,7 @@ struct EvalRunOptions {
     verbose: bool,
     extra_args: Vec<String>,
     params: Vec<String>,
+    matrix_axes: Vec<(String, Vec<serde_json::Value>)>,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
@@ -455,6 +470,15 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         EvalSamplingMode::Full
     };
 
+    let matrix_axes = if args.matrix_param.is_empty() {
+        Vec::new()
+    } else {
+        if args.watch || args.dev || args.list {
+            anyhow::bail!("--matrix-param cannot be combined with --watch, --dev, or --list");
+        }
+        parse_matrix_params(&args.matrix_param)?
+    };
+
     let options = EvalRunOptions {
         jsonl: args.jsonl,
         terminate_on_failure: args.terminate_on_failure,
@@ -465,6 +489,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         sampling,
         extra_args: args.extra_args,
         params: args.param,
+        matrix_axes,
     };
 
     if args.dev {
@@ -855,6 +880,21 @@ async fn spawn_eval_runner(
         let serialized =
             serde_json::to_string(&parsed).context("failed to serialize eval params")?;
         cmd.env("BT_EVAL_PARAMS_JSON", serialized);
+    }
+    if !options.matrix_axes.is_empty() {
+        let payload: Vec<serde_json::Value> = options
+            .matrix_axes
+            .iter()
+            .map(|(key, values)| {
+                serde_json::json!({
+                    "key": key,
+                    "values": values,
+                })
+            })
+            .collect();
+        let serialized =
+            serde_json::to_string(&payload).context("failed to serialize matrix axes")?;
+        cmd.env("BT_EVAL_MATRIX_JSON", serialized);
     }
     cmd.env(
         "BT_EVAL_SSE_SOCK",
@@ -1827,6 +1867,50 @@ fn parse_eval_params(params: &[String]) -> Result<serde_json::Map<String, serde_
         }
     }
     Ok(result)
+}
+
+fn parse_matrix_params(raw: &[String]) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+    let mut axes: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for entry in raw {
+        let trimmed = entry.trim();
+        let eq_pos = trimmed.find('=').ok_or_else(|| {
+            anyhow::anyhow!("--matrix-param value must be in key=V1,V2,... format: {entry}")
+        })?;
+        let key = trimmed[..eq_pos].trim();
+        if key.is_empty() {
+            anyhow::bail!("--matrix-param key must not be empty: {entry}");
+        }
+        if axes.iter().any(|(k, _)| k == key) {
+            anyhow::bail!("--matrix-param key specified more than once: {key}");
+        }
+        let rest = &trimmed[eq_pos + 1..];
+        let rest_trimmed = rest.trim();
+        let values: Vec<serde_json::Value> = if rest_trimmed.starts_with('[') {
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_str(rest_trimmed).with_context(|| {
+                    format!("--matrix-param value is not a valid JSON array: {entry}")
+                })?;
+            if arr.is_empty() {
+                anyhow::bail!("--matrix-param must have at least one value: {entry}");
+            }
+            arr
+        } else {
+            let pieces: Vec<&str> = rest.split(',').collect();
+            if pieces.iter().all(|p| p.trim().is_empty()) {
+                anyhow::bail!("--matrix-param must have at least one value: {entry}");
+            }
+            pieces
+                .iter()
+                .map(|piece| {
+                    let s = piece.trim();
+                    serde_json::from_str(s)
+                        .unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
+                })
+                .collect()
+        };
+        axes.push((key.to_string(), values));
+    }
+    Ok(axes)
 }
 
 fn parse_eval_filter_expression(expression: &str) -> Result<RunnerFilter> {
@@ -2839,11 +2923,10 @@ impl EvalUi {
             EvalEvent::Error { message, stack, .. } => {
                 let show_hint = message.contains("Please specify an api key");
                 if self.verbose {
-                    let line = message.as_str().red().to_string();
-                    let _ = self.progress.println(line);
+                    self.print_persistent_line(message.as_str().red().to_string());
                     if let Some(stack) = stack {
                         for line in stack.lines() {
-                            let _ = self.progress.println(line.dark_grey().to_string());
+                            self.print_persistent_line(line.dark_grey().to_string());
                         }
                     }
                 } else {
@@ -4548,6 +4631,121 @@ mod tests {
         let err = parse_eval_params(&params).expect_err("should fail");
         assert!(
             err.to_string().contains("key must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_single_axis_multiple_values() {
+        let raw = vec!["model=\"gpt-4\",\"gpt-5\"".to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(axes.len(), 1);
+        assert_eq!(axes[0].0, "model");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!("gpt-4"), serde_json::json!("gpt-5"),]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_bare_strings_fallback() {
+        let raw = vec!["model=gpt-4,gpt-5".to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!("gpt-4"), serde_json::json!("gpt-5"),]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_mixed_types() {
+        let raw = vec!["enableBashTool=true,false".to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!(true), serde_json::json!(false)]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_duplicate_key() {
+        let raw = vec!["model=a,b".to_string(), "model=c,d".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("specified more than once"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_empty_key() {
+        let raw = vec!["=a,b".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_missing_equals() {
+        let raw = vec!["modelonly".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key=V1,V2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_empty_values() {
+        let raw = vec!["model=".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("at least one value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_allows_values_with_commas() {
+        let raw = vec![r#"prompt=["hello, world","goodbye, friend"]"#.to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![
+                serde_json::json!("hello, world"),
+                serde_json::json!("goodbye, friend"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_supports_nested_json() {
+        let raw = vec![r#"tools=[[1,2],[3,4]]"#.to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!([1, 2]), serde_json::json!([3, 4])]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_rejects_empty() {
+        let raw = vec!["model=[]".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("at least one value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_rejects_malformed() {
+        let raw = vec!["model=[\"a\"".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("not a valid JSON array"),
             "unexpected error: {err}"
         );
     }

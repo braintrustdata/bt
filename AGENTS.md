@@ -18,3 +18,16 @@
   - a timestamp filter (for example, `created >= NOW() - INTERVAL ...` or `created >= "<ts>"`), or
   - a `root_span_id` filter.
 - Do not run BTQL queries that lack both constraints.
+
+## Tooling
+
+- This repo is managed with `mise` and `pre-commit`; prefer using the repo-defined toolchain and hooks when running local validation.
+
+## CLI Implementation Conventions
+
+- Follow existing resource-command patterns before adding new structure; `projects/` is a good reference for module layout and command dispatch.
+- Guard interactive prompts with TTY checks, and make non-interactive failures actionable.
+- Prefer existing output helpers for status messages, tables, pagers, JSON output, and spinners instead of ad-hoc `println!` / `eprintln!`.
+- Keep progress indicators on stderr and machine-readable output on stdout.
+- Prefer actionable errors with exact command hints where possible, and add `anyhow::Context` when it improves user-facing debugging.
+- For API helpers, follow existing list/get conventions: `ListResponse { objects }`, `get_by_* -> Option<T>`, and URL-encoded query params.

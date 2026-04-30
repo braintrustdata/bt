@@ -6,7 +6,6 @@ use crate::auth::login;
 use crate::http::ApiClient;
 
 pub(crate) mod api;
-pub(crate) mod context;
 pub(crate) mod create;
 mod delete;
 mod list;

@@ -16,7 +16,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectSelectMode {
     ExistingOnly,
-    AllowCreate,
+    AllowCreateWithDefaultProjectNote,
 }
 
 /// Open a Term for interactive prompts.
@@ -82,7 +82,6 @@ pub async fn select_project(
     mode: ProjectSelectMode,
 ) -> Result<api::Project> {
     let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
-
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
     let names = project_selection_labels(&projects, mode);
@@ -90,7 +89,7 @@ pub async fn select_project(
     let label = select_label.unwrap_or("Select project");
     let selection = fuzzy_select(label, &names, default)?;
 
-    if matches!(mode, ProjectSelectMode::AllowCreate) && selection == 0 {
+    if mode_allows_create(mode) && selection == 0 {
         let default_name = default_new_project_name();
         let name: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Project name")
@@ -115,9 +114,20 @@ pub async fn select_project(
 }
 
 fn project_selection_labels(projects: &[api::Project], mode: ProjectSelectMode) -> Vec<String> {
-    if matches!(mode, ProjectSelectMode::AllowCreate) {
+    if mode_allows_create(mode) {
+        let show_default_project_note =
+            matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
+                && projects.len() == 1
+                && projects[0].name == "My Project";
+
         let mut labels = vec!["+ Create new project".to_string()];
-        labels.extend(projects.iter().map(|project| project.name.clone()));
+        labels.extend(projects.iter().map(|project| {
+            if show_default_project_note && project.name == "My Project" {
+                "My Project (default starter project)".to_string()
+            } else {
+                project.name.clone()
+            }
+        }));
         return labels;
     }
     projects
@@ -132,7 +142,7 @@ fn default_project_selection(
     mode: ProjectSelectMode,
 ) -> Result<usize> {
     if projects.is_empty() {
-        if matches!(mode, ProjectSelectMode::AllowCreate) {
+        if mode_allows_create(mode) {
             return Ok(0);
         }
         bail!("no projects found");
@@ -141,7 +151,7 @@ fn default_project_selection(
     Ok(current
         .and_then(|c| projects.iter().position(|project| project.name == c))
         .map(|idx| {
-            if matches!(mode, ProjectSelectMode::AllowCreate) {
+            if mode_allows_create(mode) {
                 idx + 1
             } else {
                 idx
@@ -151,11 +161,15 @@ fn default_project_selection(
 }
 
 fn selected_project_index(selection: usize, mode: ProjectSelectMode) -> usize {
-    if matches!(mode, ProjectSelectMode::AllowCreate) {
+    if mode_allows_create(mode) {
         selection - 1
     } else {
         selection
     }
+}
+
+fn mode_allows_create(mode: ProjectSelectMode) -> bool {
+    matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
 }
 
 fn default_new_project_name() -> String {
@@ -216,7 +230,10 @@ mod tests {
 
     #[test]
     fn allow_create_adds_create_option() {
-        let labels = project_selection_labels(&[project("alpha")], ProjectSelectMode::AllowCreate);
+        let labels = project_selection_labels(
+            &[project("alpha")],
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+        );
         assert_eq!(
             labels,
             vec!["+ Create new project".to_string(), "alpha".to_string()]
@@ -230,10 +247,45 @@ mod tests {
     }
 
     #[test]
+    fn allow_create_with_default_project_note_annotates_my_project_when_it_is_the_only_project() {
+        let labels = project_selection_labels(
+            &[project("My Project")],
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+        );
+        assert_eq!(
+            labels,
+            vec![
+                "+ Create new project".to_string(),
+                "My Project (default starter project)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_create_with_default_project_note_hides_note_when_there_are_multiple_projects() {
+        let labels = project_selection_labels(
+            &[project("My Project"), project("alpha")],
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+        );
+        assert_eq!(
+            labels,
+            vec![
+                "+ Create new project".to_string(),
+                "My Project".to_string(),
+                "alpha".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn allow_create_defaults_to_create_when_project_list_is_empty() {
         assert_eq!(
-            default_project_selection(&[], None, ProjectSelectMode::AllowCreate)
-                .expect("default selection"),
+            default_project_selection(
+                &[],
+                None,
+                ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+            )
+            .expect("default selection"),
             0
         );
     }
@@ -245,7 +297,10 @@ mod tests {
 
     #[test]
     fn allow_create_project_selection_skips_create_row() {
-        assert_eq!(selected_project_index(1, ProjectSelectMode::AllowCreate), 0);
+        assert_eq!(
+            selected_project_index(1, ProjectSelectMode::AllowCreateWithDefaultProjectNote),
+            0
+        );
     }
 
     #[test]

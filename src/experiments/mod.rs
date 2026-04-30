@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use crate::{
     args::BaseArgs,
     http::ApiClient,
-    projects::context::{resolve_project_context, ProjectContext},
+    project_context::resolve_project_command_context_with_auth_mode,
     ui::{self, with_spinner},
 };
 
@@ -15,7 +15,7 @@ mod view;
 
 use api::{self as experiments_api, Experiment};
 
-pub(crate) type ResolvedContext = ProjectContext;
+pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -106,32 +106,26 @@ pub(crate) async fn select_experiment_interactive(
 }
 
 pub async fn run(base: BaseArgs, args: ExperimentsArgs) -> Result<()> {
+    let read_only = experiments_command_is_read_only(args.command.as_ref());
+    let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
+
     match args.command {
-        None | Some(ExperimentsCommands::List) => {
-            let ctx = resolve_project_context(&base, true).await?;
-            list::run(&ctx, base.json).await
-        }
-        Some(ExperimentsCommands::View(v)) => {
-            let ctx = resolve_project_context(&base, true).await?;
-            view::run(&ctx, v.name(), base.json, v.web).await
-        }
-        Some(ExperimentsCommands::Delete(d)) => {
-            let ctx = resolve_project_context(&base, false).await?;
-            delete::run(&ctx, d.name(), d.force).await
-        }
+        None | Some(ExperimentsCommands::List) => list::run(&ctx, base.json).await,
+        Some(ExperimentsCommands::View(v)) => view::run(&ctx, v.name(), base.json, v.web).await,
+        Some(ExperimentsCommands::Delete(d)) => delete::run(&ctx, d.name(), d.force).await,
     }
+}
+
+fn experiments_command_is_read_only(command: Option<&ExperimentsCommands>) -> bool {
+    matches!(
+        command,
+        None | Some(ExperimentsCommands::List) | Some(ExperimentsCommands::View(_))
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn experiments_command_is_read_only(command: Option<&ExperimentsCommands>) -> bool {
-        matches!(
-            command,
-            None | Some(ExperimentsCommands::List) | Some(ExperimentsCommands::View(_))
-        )
-    }
 
     #[test]
     fn experiments_routes_list_and_view_to_read_only_auth() {
