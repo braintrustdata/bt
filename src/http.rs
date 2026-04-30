@@ -229,6 +229,22 @@ impl ApiClient {
     }
 
     pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
+        self.btql_with_query(query).await
+    }
+
+    pub async fn btql_structured<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
+    where
+        T: DeserializeOwned,
+        Q: Serialize + ?Sized,
+    {
+        self.btql_with_query(query).await
+    }
+
+    async fn btql_with_query<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
+    where
+        T: DeserializeOwned,
+        Q: Serialize + ?Sized,
+    {
         let body = json!({
             "query": query,
             "fmt": "json",

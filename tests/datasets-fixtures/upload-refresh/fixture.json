@@ -64,6 +64,7 @@
     },
     {
       "command": ["datasets", "--json", "--no-input", "view", "qa-fixture"],
+      "btql_dataset": "qa-fixture",
       "stdout_contains": [
         "\"id\":\"case-1\"",
         "\"expected\":\"A2\"",

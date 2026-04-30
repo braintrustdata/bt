@@ -4,6 +4,7 @@ use std::ffi::{OsStr, OsString};
 
 mod args;
 mod auth;
+mod btql;
 #[allow(dead_code)]
 mod config;
 mod datasets;

@@ -23,6 +23,8 @@ struct FixtureStep {
     command: Vec<String>,
     #[serde(default)]
     stdin_file: Option<String>,
+    #[serde(default)]
+    btql_dataset: Option<String>,
     #[serde(default = "default_expect_success")]
     expect_success: bool,
     #[serde(default)]
@@ -108,6 +110,7 @@ struct MockServerState {
     projects: Mutex<Vec<MockProject>>,
     datasets: Mutex<Vec<MockDataset>>,
     dataset_rows: Mutex<BTreeMap<String, BTreeMap<String, Map<String, Value>>>>,
+    btql_dataset_id: Mutex<Option<String>>,
 }
 
 impl MockServerState {
@@ -121,6 +124,7 @@ impl MockServerState {
             }]),
             datasets: Mutex::new(Vec::new()),
             dataset_rows: Mutex::new(BTreeMap::new()),
+            btql_dataset_id: Mutex::new(None),
         }
     }
 }
@@ -270,23 +274,20 @@ async fn mock_create_dataset(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-struct BtqlRequest {
-    query: String,
-}
-
 async fn mock_btql(
     state: web::Data<Arc<MockServerState>>,
     req: HttpRequest,
-    body: web::Json<BtqlRequest>,
+    _body: web::Bytes,
 ) -> HttpResponse {
     log_request(state.get_ref(), &req);
-    if !body.query.contains("filter: created >=") {
-        return HttpResponse::BadRequest().body("BTQL query must include a timestamp filter");
-    }
 
-    let Some(dataset_id) = extract_dataset_id_from_query(&body.query) else {
-        return HttpResponse::BadRequest().body("missing dataset(...) source in BTQL query");
+    let Some(dataset_id) = state
+        .btql_dataset_id
+        .lock()
+        .expect("btql dataset lock")
+        .clone()
+    else {
+        return HttpResponse::BadRequest().body("missing mock dataset id for BTQL response");
     };
 
     let rows = state
@@ -353,14 +354,6 @@ async fn mock_logs3(
     HttpResponse::Ok().json(serde_json::json!({}))
 }
 
-fn extract_dataset_id_from_query(query: &str) -> Option<String> {
-    let marker = "from: dataset('";
-    let start = query.find(marker)? + marker.len();
-    let rest = &query[start..];
-    let end = rest.find("')")?;
-    Some(rest[..end].replace("''", "'"))
-}
-
 fn log_request(state: &Arc<MockServerState>, req: &HttpRequest) {
     let entry = if req.query_string().is_empty() {
         req.path().to_string()
@@ -391,6 +384,18 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
         values.insert(key, value);
     }
     values
+}
+
+fn prepare_mock_btql_dataset_for_step(state: &Arc<MockServerState>, dataset_name: Option<&str>) {
+    let dataset_id = dataset_name.and_then(|name| {
+        let datasets = state.datasets.lock().expect("datasets lock");
+        datasets
+            .iter()
+            .find(|dataset| dataset.name == name)
+            .map(|dataset| dataset.id.clone())
+    });
+
+    *state.btql_dataset_id.lock().expect("btql dataset lock") = dataset_id;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -438,6 +443,7 @@ async fn datasets_fixtures() {
                     index + 1
                 );
             }
+            prepare_mock_btql_dataset_for_step(&state, step.btql_dataset.as_deref());
 
             let mut cmd = Command::new(&bt_path);
             cmd.args(&step.command).current_dir(&dir);

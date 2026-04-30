@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use urlencoding::encode;
 
+use crate::btql::{BtqlExpr, BtqlQuery};
 use crate::http::ApiClient;
 
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
@@ -135,7 +136,7 @@ pub async fn list_dataset_rows_limited(
 
         let query =
             build_dataset_rows_query(dataset_id, page_limit, cursor.as_deref(), preview_length);
-        let response = client.btql::<DatasetRow>(&query).await?;
+        let response = client.btql_structured::<DatasetRow, _>(&query).await?;
 
         let next_cursor = response.cursor.filter(|cursor| !cursor.is_empty());
 
@@ -220,27 +221,18 @@ fn build_dataset_rows_query(
     limit: usize,
     cursor: Option<&str>,
     preview_length: DatasetRowsPreviewLength,
-) -> String {
-    let cursor_clause = cursor
-        .map(|cursor| format!(" | cursor: {}", btql_quote(cursor)))
-        .unwrap_or_default();
-    format!(
-        "select: * | from: dataset({}) | filter: created >= {} | preview_length: {} | limit: {}{}",
-        sql_quote(dataset_id),
-        btql_quote(DATASET_ROWS_SINCE),
-        preview_length.btql_value(),
-        limit,
-        cursor_clause
-    )
-}
-
-fn btql_quote(value: &str) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
-}
-
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+) -> BtqlQuery {
+    BtqlQuery::select_all(BtqlExpr::function(
+        "dataset",
+        vec![BtqlExpr::literal_str(dataset_id)],
+    ))
+    .filter(BtqlExpr::ge(
+        BtqlExpr::ident(&["created"]),
+        BtqlExpr::literal_str(DATASET_ROWS_SINCE),
+    ))
+    .preview_length(preview_length.btql_value())
+    .limit(limit)
+    .cursor(cursor)
 }
 
 #[cfg(test)]
@@ -256,38 +248,60 @@ mod tests {
             DatasetRowsPreviewLength::Preview(125),
         );
         assert_eq!(
-            query,
-            "select: * | from: dataset('dataset-id') | filter: created >= \"1970-01-01T00:00:00Z\" | preview_length: 125 | limit: 1000"
+            serde_json::to_value(query).expect("serialize query"),
+            serde_json::json!({
+                "select": [{"op": "star"}],
+                "from": {
+                    "op": "function",
+                    "name": {"op": "ident", "name": ["dataset"]},
+                    "args": [{"op": "literal", "value": "dataset-id"}]
+                },
+                "filter": {
+                    "op": "ge",
+                    "left": {"op": "ident", "name": ["created"]},
+                    "right": {"op": "literal", "value": "1970-01-01T00:00:00Z"}
+                },
+                "preview_length": 125,
+                "limit": 1000
+            })
         );
     }
 
     #[test]
-    fn dataset_rows_query_quotes_cursor() {
+    fn dataset_rows_query_sets_cursor() {
         let query = build_dataset_rows_query(
             "dataset-id",
             200,
             Some("cursor-123"),
             DatasetRowsPreviewLength::Preview(125),
         );
-        assert!(query.contains("limit: 200 | cursor: \"cursor-123\""));
+        assert_eq!(query.cursor.as_deref(), Some("cursor-123"));
+        assert_eq!(query.limit, Some(200));
     }
 
     #[test]
-    fn dataset_rows_query_escapes_dataset_id() {
+    fn dataset_rows_query_keeps_dataset_id_as_literal() {
         let query = build_dataset_rows_query(
             "dataset'with-quote",
             10,
             None,
             DatasetRowsPreviewLength::Preview(125),
         );
-        assert!(query.contains("from: dataset('dataset''with-quote')"));
+        assert_eq!(
+            serde_json::to_value(query.source).expect("serialize source"),
+            serde_json::json!({
+                "op": "function",
+                "name": {"op": "ident", "name": ["dataset"]},
+                "args": [{"op": "literal", "value": "dataset'with-quote"}]
+            })
+        );
     }
 
     #[test]
     fn dataset_rows_query_uses_full_preview_length_for_exact_values() {
         let query =
             build_dataset_rows_query("dataset-id", 100, None, DatasetRowsPreviewLength::Full);
-        assert!(query.contains("preview_length: -1"));
+        assert_eq!(query.preview_length, Some(-1));
     }
 
     #[test]
