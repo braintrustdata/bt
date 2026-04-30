@@ -7,14 +7,13 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
-const WORKFLOWS: &[&str] = &["instrument", "observe", "annotate", "evaluate", "deploy"];
 const BRAINTRUST_CLI_ENVS: &[&str] = &[
     "BRAINTRUST_VERBOSE",
     "BRAINTRUST_QUIET",
@@ -29,13 +28,74 @@ const BRAINTRUST_CLI_ENVS: &[&str] = &[
     "BRAINTRUST_ENV_FILE",
 ];
 
+struct SetupRunOutcome {
+    repo: tempfile::TempDir,
+    home: tempfile::TempDir,
+    _config_home: tempfile::TempDir,
+    claude_log: PathBuf,
+    codex_log: PathBuf,
+    requests: Vec<String>,
+}
+
 #[test]
-fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
+fn setup_supports_oauth_api_key_creation_and_explicit_claude_selection() {
+    let outcome = run_setup_flow("claude");
+    assert_common_setup_outcome(&outcome);
+
+    let claude_args = fs::read_to_string(&outcome.claude_log).expect("read claude log");
+    assert!(
+        claude_args.contains("mcp add -s user --transport http braintrust"),
+        "{claude_args}"
+    );
+    assert!(
+        claude_args.contains("Authorization: Bearer generated-api-key"),
+        "{claude_args}"
+    );
+    assert!(
+        claude_args.contains("-p --permission-mode acceptEdits"),
+        "{claude_args}"
+    );
+    assert!(
+        claude_args.contains("ENV=generated-api-key"),
+        "{claude_args}"
+    );
+    assert!(
+        !outcome.codex_log.exists(),
+        "codex should not be invoked when Claude is selected"
+    );
+    assert!(outcome.home.path().join(".claude/skills").exists());
+}
+
+#[test]
+fn setup_supports_oauth_api_key_creation_and_explicit_codex_selection() {
+    let outcome = run_setup_flow("codex");
+    assert_common_setup_outcome(&outcome);
+
+    let codex_args = fs::read_to_string(&outcome.codex_log).expect("read codex log");
+    assert!(codex_args.contains("mcp remove braintrust"), "{codex_args}");
+    assert!(
+        codex_args.contains("mcp add braintrust --url"),
+        "{codex_args}"
+    );
+    assert!(
+        codex_args.contains("--bearer-token-env-var BRAINTRUST_API_KEY"),
+        "{codex_args}"
+    );
+    assert!(codex_args.contains("exec -"), "{codex_args}");
+    assert!(codex_args.contains("ENV=generated-api-key"), "{codex_args}");
+    assert!(
+        !outcome.claude_log.exists(),
+        "claude should not be invoked when Codex is selected"
+    );
+}
+
+fn run_setup_flow(selected_agent: &str) -> SetupRunOutcome {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let browser_log = home.path().join("opened-url.txt");
+    let claude_log = repo.path().join("claude.log");
     let codex_log = repo.path().join("codex.log");
     let path_env = format!(
         "{}:{}",
@@ -44,13 +104,21 @@ fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
     );
 
     write_executable(
+        &bin_dir.path().join("claude"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" >> '{}'\nexit 0\n",
+            claude_log.display(),
+            claude_log.display()
+        ),
+    );
+    write_executable(
         &bin_dir.path().join("codex"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" >> '{}'\nexit 0\n",
+            codex_log.display(),
             codex_log.display()
         ),
     );
-    write_executable(&bin_dir.path().join("claude"), "#!/bin/sh\nexit 0\n");
     write_executable(
         &bin_dir.path().join("fake-browser"),
         &format!(
@@ -66,9 +134,6 @@ fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
         ),
     );
     write_executable(&bin_dir.path().join("secret-tool"), "#!/bin/sh\nexit 1\n");
-
-    seed_docs_cache(&config_home.path().join("bt").join("skills").join("docs"));
-    seed_docs_cache(&repo.path().join(".bt").join("skills").join("docs"));
 
     let server = FakeBtServer::start();
     let bt_bin = cargo_bin("bt");
@@ -95,6 +160,9 @@ fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
             &server.base_url,
             "--app-url",
             &server.base_url,
+            "--mcp",
+            "--background",
+            "--no-workflow",
         ],
     );
 
@@ -110,9 +178,7 @@ fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
         pty.wait_for("Select organization", TIMEOUT);
     }
 
-    pty.send("\u{1b}[B");
-    pty.send("\u{1b}[A");
-    pty.send("\u{1b}[B");
+    pty.send("Target");
     pty.send("\r");
 
     pty.wait_for("Select project", TIMEOUT);
@@ -121,6 +187,7 @@ fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
     pty.send("\r");
 
     pty.wait_for("Select coding agent", TIMEOUT);
+    pty.send(selected_agent);
     pty.send("\r");
 
     let status = pty.wait(TIMEOUT);
@@ -145,36 +212,72 @@ fn bare_setup_supports_interactive_oauth_org_project_and_agent_selection() {
         "{config_text}"
     );
 
-    let codex_args = fs::read_to_string(&codex_log).expect("read codex log");
-    assert!(!codex_args.trim().is_empty(), "codex was not invoked");
+    SetupRunOutcome {
+        repo,
+        home,
+        _config_home: config_home,
+        claude_log,
+        codex_log,
+        requests: server.requests(),
+    }
+}
 
-    let requests = server.requests();
+fn assert_common_setup_outcome(outcome: &SetupRunOutcome) {
     assert!(
-        requests
+        outcome
+            .requests
             .iter()
             .any(|request| request == "POST /oauth/token"),
-        "missing oauth token request: {requests:?}"
+        "missing oauth token request: {:?}",
+        outcome.requests
     );
     assert!(
-        requests
+        outcome
+            .requests
             .iter()
             .filter(|request| request.starts_with("POST /api/apikey/login"))
             .count()
             >= 1,
-        "missing api login request: {requests:?}"
+        "missing api login request: {:?}",
+        outcome.requests
     );
     assert!(
-        requests
+        outcome
+            .requests
+            .iter()
+            .any(|request| request == "GET /v1/api_key"),
+        "missing api key list request: {:?}",
+        outcome.requests
+    );
+    assert!(
+        outcome
+            .requests
+            .iter()
+            .any(|request| request == "POST /v1/api_key"),
+        "missing api key create request: {:?}",
+        outcome.requests
+    );
+    assert!(
+        outcome
+            .requests
             .iter()
             .any(|request| request.contains("GET /v1/project?org_name=Target%20Org")),
-        "missing target org project request: {requests:?}"
+        "missing target org project request: {:?}",
+        outcome.requests
     );
 
-    assert!(home
+    assert!(outcome
+        .repo
+        .path()
+        .join(".bt/skills/docs/sdk-install/_index.md")
+        .exists());
+    assert!(outcome
+        .home
         .path()
         .join(".agents/skills/braintrust/SKILL.md")
         .exists());
-    assert!(repo
+    assert!(outcome
+        .repo
         .path()
         .join(".agents/skills/braintrust/SKILL.md")
         .exists());
@@ -191,18 +294,6 @@ fn write_executable(path: &Path, content: &str) {
     let mut perms = fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).expect("chmod");
-}
-
-fn seed_docs_cache(output_dir: &Path) {
-    fs::create_dir_all(output_dir.join("reference")).expect("create docs dir");
-    fs::write(output_dir.join("README.md"), "# Docs\n").expect("write docs readme");
-    fs::write(output_dir.join("reference").join("sql.md"), "# SQL\n").expect("write sql doc");
-    for workflow in WORKFLOWS {
-        let workflow_dir = output_dir.join(workflow);
-        fs::create_dir_all(&workflow_dir).expect("create workflow dir");
-        fs::write(workflow_dir.join("_index.md"), format!("# {workflow}\n"))
-            .expect("write workflow doc");
-    }
 }
 
 struct PtyProcess {
@@ -340,12 +431,10 @@ fn wait_for_authorize_url(pty: &PtyProcess, browser_log: &Path, timeout: Duratio
                 return url;
             }
         }
-        if let Some(url) = extract_authorize_url(&pty.snapshot()) {
-            return url;
-        }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for authorize url\n{}",
+            "timed out waiting for authorize url from browser log {}\n{}",
+            browser_log.display(),
             pty.snapshot()
         );
         thread::sleep(Duration::from_millis(50));
