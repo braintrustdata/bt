@@ -446,7 +446,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         )
     };
 
-    let preflight = match collect_project_preflight(&base, &manifest) {
+    let preflight = match collect_project_preflight(&base, &manifest, auth_ctx.client.org_name()) {
         Ok(preflight) => preflight,
         Err(err) => {
             let message = format!("failed to resolve project selectors in manifest: {err}");
@@ -2262,11 +2262,14 @@ fn cancel_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
     bail!("push cancelled by user");
 }
 
-fn resolve_default_project_name(base: &BaseArgs) -> Result<Option<String>> {
+fn resolve_default_project_name(
+    base: &BaseArgs,
+    resolved_org: Option<&str>,
+) -> Result<Option<String>> {
     let configured = base
         .project
         .clone()
-        .or_else(|| config::load().ok().and_then(|value| value.project));
+        .or_else(|| config::configured_project_for_context(base, resolved_org));
     let Some(configured) = configured else {
         return Ok(None);
     };
@@ -2280,8 +2283,9 @@ fn resolve_default_project_name(base: &BaseArgs) -> Result<Option<String>> {
 fn collect_project_preflight(
     base: &BaseArgs,
     manifest: &RunnerManifest,
+    resolved_org: &str,
 ) -> Result<ProjectPreflight> {
-    let default_project_name = resolve_default_project_name(base)?;
+    let default_project_name = resolve_default_project_name(base, Some(resolved_org))?;
     let mut requires_default_project = false;
     let mut named_projects = BTreeSet::new();
     let mut direct_project_ids = BTreeSet::new();
@@ -3000,7 +3004,7 @@ mod tests {
             baseline_dep_versions: vec![],
         };
 
-        let preflight = collect_project_preflight(&base, &manifest).expect("preflight");
+        let preflight = collect_project_preflight(&base, &manifest, "demo-org").expect("preflight");
         assert!(preflight.requires_default_project);
         assert!(
             preflight.named_projects.contains("demo-project"),

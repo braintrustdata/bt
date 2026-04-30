@@ -516,7 +516,8 @@ pub(crate) async fn resolve_project_context_optional(
     auth_ctx: &AuthContext,
     allow_interactive_selection: bool,
 ) -> Result<Option<Project>> {
-    let config_project = config::load().ok().and_then(|c| c.project);
+    let config_project =
+        config::configured_project_for_context(base, Some(auth_ctx.client.org_name()));
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(p) => Some(p.to_string()),
         None if allow_interactive_selection && is_interactive() => Some(
