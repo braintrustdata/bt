@@ -2612,16 +2612,20 @@ fn parse_duration_to_seconds(input: &str) -> Result<u64> {
         return Ok(seconds);
     }
 
-    let (num_str, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
+    let suffix = trimmed.chars().last().filter(|ch| ch.is_ascii_alphabetic());
+    let (num_str, unit) = match suffix {
+        Some(unit) => (&trimmed[..trimmed.len() - unit.len_utf8()], unit),
+        None => (trimmed, 's'),
+    };
     let value: u64 = num_str
         .trim()
         .parse()
         .with_context(|| format!("invalid duration '{input}'"))?;
-    let multiplier = match unit.to_ascii_lowercase().as_str() {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 60 * 60 * 24,
+    let multiplier = match unit.to_ascii_lowercase() {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 60 * 60 * 24,
         _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
     };
     Ok(value.saturating_mul(multiplier))
@@ -4107,7 +4111,7 @@ fn collect_seen_roots_until_offset(
         let file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let reader = BufReader::new(file);
-        for (line_index, line) in reader.lines().enumerate() {
+        for line in reader.lines() {
             if global_line_index >= line_offset {
                 break 'files;
             }
@@ -4117,7 +4121,7 @@ fn collect_seen_roots_until_offset(
                     format!(
                         "invalid JSON in {} at line {} while rebuilding trace resume state",
                         path.display(),
-                        line_index + 1
+                        global_line_index + 1
                     )
                 })?;
                 if let Some(root_id) = row_root_span_id(&row) {
@@ -4287,6 +4291,14 @@ fn spinner_bar(message: &str) -> ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_duration_to_seconds_rejects_non_ascii_suffix_without_panicking() {
+        for input in ["1–", "1é", "1🙂"] {
+            let err = parse_duration_to_seconds(input).expect_err("invalid unicode suffix");
+            assert!(err.to_string().contains("invalid duration"));
+        }
+    }
 
     #[test]
     fn push_checkpoint_line_offset_advances_only_after_commit() {
