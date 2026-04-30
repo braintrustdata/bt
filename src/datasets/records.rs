@@ -8,7 +8,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
+
+use crate::utils::new_uuid_id;
 
 pub(crate) const DATASET_UPLOAD_BATCH_SIZE: usize = 1000;
 
@@ -296,7 +297,7 @@ fn prepared_record_from_input_object(
             row_index + 1,
             id_path.join(".")
         ),
-        None => generated_record_id(&object, row_index)?,
+        None => new_uuid_id(),
     };
 
     Ok(PreparedDatasetRecord {
@@ -372,16 +373,6 @@ fn parse_tags(value: Option<&Value>) -> Result<Option<Vec<String>>> {
     }
 }
 
-fn generated_record_id(object: &Map<String, Value>, row_index: usize) -> Result<String> {
-    let payload = serde_json::to_vec(object).context("failed to serialize dataset record")?;
-    let digest = Sha256::digest(payload);
-    let mut short_hash = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        short_hash.push_str(&format!("{byte:02x}"));
-    }
-    Ok(format!("bt-dataset-{row_index:06}-{short_hash}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_records_generates_stable_id_when_missing() {
+    fn prepare_records_generates_uuid_id_when_missing() {
         let source: Map<String, Value> = serde_json::from_value(serde_json::json!({
             "input": {"text": "hello"},
             "expected": "world"
@@ -440,7 +431,7 @@ mod tests {
         .expect("map");
         let first = prepare_records(vec![source.clone()], "id", false).expect("first");
         let second = prepare_records(vec![source], "id", false).expect("second");
-        assert_eq!(first[0].id, second[0].id);
+        assert_ne!(first[0].id, second[0].id);
     }
 
     #[test]
