@@ -35,13 +35,16 @@ struct DatasetRecordInput {
 }
 
 impl PreparedDatasetRecord {
-    pub fn to_upload_row(&self, dataset_id: &str) -> Map<String, Value> {
+    pub fn to_upload_row(&self, dataset_id: &str, is_merge: bool) -> Map<String, Value> {
         let mut row = Map::new();
         row.insert("id".to_string(), Value::String(self.id.clone()));
         row.insert(
             "dataset_id".to_string(),
             Value::String(dataset_id.to_string()),
         );
+        if is_merge {
+            row.insert("_is_merge".to_string(), Value::Bool(true));
+        }
         row.insert(
             "created".to_string(),
             Value::String(Utc::now().to_rfc3339()),
@@ -115,26 +118,36 @@ fn parse_record_objects(contents: &str) -> Result<Vec<Map<String, Value>>> {
         bail!("dataset input is empty");
     }
 
-    if trimmed.starts_with('[') {
-        return parse_json_records(trimmed);
-    }
-
-    if trimmed.starts_with('{') {
-        let json_result = parse_json_records(trimmed);
-        if json_result.is_ok() {
-            return json_result;
-        }
-
-        if trimmed.lines().skip(1).any(|line| !line.trim().is_empty()) {
-            if let Ok(records) = parse_jsonl_records(trimmed) {
-                return Ok(records);
+    let values = parse_stream_values(trimmed)?;
+    match values.as_slice() {
+        [Value::Array(_)] => match values.into_iter().next().expect("one value") {
+            Value::Array(values) => values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| expect_record_object(value, Some(index + 1)))
+                .collect(),
+            _ => unreachable!("matched array"),
+        },
+        [Value::Object(object)] if object.contains_key("rows") => {
+            match values.into_iter().next().expect("one value") {
+                Value::Object(mut object) => match object.remove("rows") {
+                    Some(Value::Array(values)) => values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| expect_record_object(value, Some(index + 1)))
+                        .collect(),
+                    Some(_) => bail!("dataset JSON field 'rows' must be an array of objects"),
+                    None => unreachable!("checked rows key"),
+                },
+                _ => unreachable!("matched object"),
             }
         }
-
-        return json_result;
+        _ => values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| expect_record_object(value, Some(index + 1)))
+            .collect(),
     }
-
-    parse_jsonl_records(trimmed)
 }
 
 fn read_input_contents(
@@ -160,58 +173,27 @@ fn read_input_contents(
     }
 }
 
-fn parse_json_records(contents: &str) -> Result<Vec<Map<String, Value>>> {
-    let value: Value = serde_json::from_str(contents).context("invalid dataset JSON input")?;
-    match value {
-        Value::Array(values) => values
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| expect_record_object(value, Some(index + 1)))
-            .collect(),
-        Value::Object(mut object) => {
-            if let Some(rows) = object.remove("rows") {
-                match rows {
-                    Value::Array(values) => values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, value)| expect_record_object(value, Some(index + 1)))
-                        .collect(),
-                    _ => bail!("dataset JSON field 'rows' must be an array of objects"),
-                }
-            } else {
-                Ok(vec![object])
-            }
-        }
-        _ => bail!("dataset JSON input must be an object, an array of objects, or an object with a 'rows' array"),
-    }
-}
-
-fn parse_jsonl_records(contents: &str) -> Result<Vec<Map<String, Value>>> {
-    let mut rows = Vec::new();
-    for (line_index, raw_line) in contents.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(line)
-            .with_context(|| format!("invalid JSON on line {}", line_index + 1))?;
-        rows.push(expect_record_object(value, Some(line_index + 1))?);
+fn parse_stream_values(contents: &str) -> Result<Vec<Value>> {
+    let mut values = Vec::new();
+    for (record_index, value) in serde_json::Deserializer::from_str(contents)
+        .into_iter::<Value>()
+        .enumerate()
+    {
+        values.push(value.with_context(|| format!("invalid JSON record {}", record_index + 1))?);
     }
 
-    if rows.is_empty() {
+    if values.is_empty() {
         bail!("dataset input did not contain any records");
     }
 
-    Ok(rows)
+    Ok(values)
 }
 
-fn expect_record_object(value: Value, line_number: Option<usize>) -> Result<Map<String, Value>> {
+fn expect_record_object(value: Value, record_number: Option<usize>) -> Result<Map<String, Value>> {
     match value {
         Value::Object(object) => Ok(object),
-        _ => match line_number {
-            Some(line_number) => {
-                bail!("dataset record on line {line_number} must be a JSON object")
-            }
+        _ => match record_number {
+            Some(record_number) => bail!("dataset record {record_number} must be a JSON object"),
             None => bail!("dataset record must be a JSON object"),
         },
     }
@@ -379,7 +361,7 @@ mod tests {
     #[test]
     fn parse_json_rows_wrapper_extracts_rows() {
         let records =
-            parse_json_records(r#"{"dataset":{"id":"ds"},"rows":[{"id":"a"},{"id":"b"}]}"#)
+            parse_record_objects(r#"{"dataset":{"id":"ds"},"rows":[{"id":"a"},{"id":"b"}]}"#)
                 .expect("parse rows wrapper");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].get("id"), Some(&Value::String("a".to_string())));
@@ -395,6 +377,41 @@ mod tests {
         .expect("parse jsonl records");
         assert_eq!(records.len(), 2);
         assert_eq!(records[1].get("id"), Some(&Value::String("b".to_string())));
+    }
+
+    #[test]
+    fn parse_record_objects_accepts_adjacent_json_objects() {
+        let records =
+            parse_record_objects(r#"{"id":"a"}{"id":"b"}"#).expect("parse adjacent objects");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].get("id"), Some(&Value::String("a".to_string())));
+        assert_eq!(records[1].get("id"), Some(&Value::String("b".to_string())));
+    }
+
+    #[test]
+    fn parse_record_objects_accepts_pretty_adjacent_json_objects() {
+        let records = parse_record_objects(
+            r#"{
+  "id": "a"
+}
+{
+  "id": "b"
+}
+"#,
+        )
+        .expect("parse adjacent pretty objects");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].get("id"), Some(&Value::String("a".to_string())));
+        assert_eq!(records[1].get("id"), Some(&Value::String("b".to_string())));
+    }
+
+    #[test]
+    fn parse_record_objects_only_expands_array_when_it_is_the_whole_stream() {
+        let err = parse_record_objects(r#"[{"id":"a"}]{"id":"b"}"#)
+            .expect_err("array should not expand when followed by another value");
+        assert!(err
+            .to_string()
+            .contains("dataset record 1 must be a JSON object"));
     }
 
     #[test]
@@ -543,12 +560,27 @@ mod tests {
             Some(Value::String("gold".to_string()))
         );
 
-        let row = prepared[0].to_upload_row("dataset_1");
+        let row = prepared[0].to_upload_row("dataset_1", false);
         assert_eq!(
             row.get("expected"),
             Some(&Value::String("gold".to_string()))
         );
         assert!(row.get("output").is_none());
+        assert!(row.get("_is_merge").is_none());
+    }
+
+    #[test]
+    fn to_upload_row_marks_merge_rows() {
+        let record = PreparedDatasetRecord {
+            id: "case-1".to_string(),
+            input: None,
+            expected: None,
+            metadata: None,
+            tags: None,
+        };
+
+        let row = record.to_upload_row("dataset_1", true);
+        assert_eq!(row.get("_is_merge"), Some(&Value::Bool(true)));
     }
 
     #[test]

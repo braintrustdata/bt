@@ -36,6 +36,7 @@ pub async fn run(
         ctx,
         &dataset.id,
         &local_records,
+        true,
         "Updating remote dataset...",
         "dataset update failed",
     )

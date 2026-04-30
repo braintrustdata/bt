@@ -52,6 +52,7 @@ pub async fn run(
             ctx,
             &dataset.id,
             records,
+            false,
             "Uploading dataset rows...",
             "dataset upload failed",
         )

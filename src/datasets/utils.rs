@@ -15,12 +15,13 @@ pub(crate) async fn submit_prepared_records(
     ctx: &ResolvedContext,
     dataset_id: &str,
     records: &[PreparedDatasetRecord],
+    is_merge: bool,
     spinner_label: &str,
     error_context: &str,
 ) -> Result<()> {
     let rows = records
         .iter()
-        .map(|record| record.to_upload_row(dataset_id))
+        .map(|record| record.to_upload_row(dataset_id, is_merge))
         .collect::<Vec<_>>();
     submit_rows(ctx, &rows, spinner_label, error_context).await
 }
