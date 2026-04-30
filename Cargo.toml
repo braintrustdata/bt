@@ -1,6 +1,6 @@
 [package]
 name = "bt"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.86.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
