@@ -37,12 +37,14 @@ const BT_README: &str = include_str!("../../README.md");
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
     "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
 ];
-const ALL_AGENTS: [Agent; 5] = [
+const ALL_AGENTS: [Agent; 7] = [
     Agent::Claude,
     Agent::Codex,
+    Agent::Copilot,
     Agent::Cursor,
     Agent::Gemini,
     Agent::Opencode,
+    Agent::Qwen,
 ];
 const ALL_WORKFLOWS: [WorkflowArg; 5] = [
     WorkflowArg::Instrument,
@@ -265,9 +267,11 @@ struct AgentsDoctorArgs {
 enum AgentArg {
     Claude,
     Codex,
+    Copilot,
     Cursor,
     Gemini,
     Opencode,
+    Qwen,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize)]
@@ -275,9 +279,18 @@ enum AgentArg {
 enum Agent {
     Claude,
     Codex,
+    Copilot,
     Cursor,
     Gemini,
     Opencode,
+    Qwen,
+}
+
+struct AgentMetadata {
+    binary: &'static str,
+    repo_marker: Option<&'static str>,
+    home_markers: &'static [&'static str],
+    skill_alias_dir: Option<&'static str>,
 }
 
 impl Agent {
@@ -285,9 +298,11 @@ impl Agent {
         match self {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
+            Agent::Copilot => "copilot",
             Agent::Cursor => "cursor",
             Agent::Gemini => "gemini",
             Agent::Opencode => "opencode",
+            Agent::Qwen => "qwen",
         }
     }
 
@@ -295,10 +310,69 @@ impl Agent {
         match self {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",
+            Agent::Copilot => "Copilot",
             Agent::Cursor => "Cursor",
             Agent::Gemini => "Gemini",
             Agent::Opencode => "Opencode",
+            Agent::Qwen => "Qwen",
         }
+    }
+
+    fn metadata(self) -> AgentMetadata {
+        match self {
+            Agent::Claude => AgentMetadata {
+                binary: "claude",
+                repo_marker: Some(".claude"),
+                home_markers: &[".claude"],
+                skill_alias_dir: Some(".claude"),
+            },
+            Agent::Codex => AgentMetadata {
+                binary: "codex",
+                repo_marker: None,
+                home_markers: &[".codex"],
+                skill_alias_dir: None,
+            },
+            Agent::Copilot => AgentMetadata {
+                binary: "copilot",
+                repo_marker: Some(".copilot"),
+                home_markers: &[".copilot"],
+                skill_alias_dir: Some(".copilot"),
+            },
+            Agent::Cursor => AgentMetadata {
+                binary: "cursor-agent",
+                repo_marker: Some(".cursor"),
+                home_markers: &[".cursor"],
+                skill_alias_dir: Some(".cursor"),
+            },
+            Agent::Gemini => AgentMetadata {
+                binary: "gemini",
+                repo_marker: Some(".gemini"),
+                home_markers: &[".gemini"],
+                skill_alias_dir: Some(".gemini"),
+            },
+            Agent::Opencode => AgentMetadata {
+                binary: "opencode",
+                repo_marker: Some(".opencode"),
+                home_markers: &[".opencode", ".config/opencode"],
+                skill_alias_dir: None,
+            },
+            Agent::Qwen => AgentMetadata {
+                binary: "qwen",
+                repo_marker: Some(".qwen"),
+                home_markers: &[".qwen"],
+                skill_alias_dir: Some(".qwen"),
+            },
+        }
+    }
+
+    fn install_skill(
+        self,
+        scope: InstallScope,
+        local_root: Option<&Path>,
+        home: &Path,
+    ) -> Result<AgentInstallResult> {
+        let alias_dir = self.metadata().skill_alias_dir;
+        install_agent_skill(self, scope, local_root, home, alias_dir)
     }
 }
 
@@ -1873,13 +1947,7 @@ async fn execute_skills_setup(
     }
 
     for agent in selected_agents.iter().copied() {
-        let result = match agent {
-            Agent::Claude => install_claude(scope, local_root.as_deref(), &home),
-            Agent::Codex => install_codex(scope, local_root.as_deref(), &home),
-            Agent::Cursor => install_cursor(scope, local_root.as_deref(), &home),
-            Agent::Gemini => install_gemini(scope, local_root.as_deref(), &home),
-            Agent::Opencode => install_opencode(scope, local_root.as_deref(), &home),
-        };
+        let result = agent.install_skill(scope, local_root.as_deref(), &home);
 
         match result {
             Ok(r) => {
@@ -1942,9 +2010,11 @@ async fn execute_skills_setup(
 enum InstrumentAgentArg {
     Claude,
     Codex,
+    Copilot,
     Cursor,
     Gemini,
     Opencode,
+    Qwen,
 }
 
 /// Languages supported by `--language`.  Variants map to canonical display
@@ -2415,9 +2485,11 @@ fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
     match agent {
         Agent::Claude => AgentArg::Claude,
         Agent::Codex => AgentArg::Codex,
+        Agent::Copilot => AgentArg::Copilot,
         Agent::Cursor => AgentArg::Cursor,
         Agent::Gemini => AgentArg::Gemini,
         Agent::Opencode => AgentArg::Opencode,
+        Agent::Qwen => AgentArg::Qwen,
     }
 }
 
@@ -2425,9 +2497,11 @@ fn map_agent_to_instrument_agent_arg(agent: Agent) -> InstrumentAgentArg {
     match agent {
         Agent::Claude => InstrumentAgentArg::Claude,
         Agent::Codex => InstrumentAgentArg::Codex,
+        Agent::Copilot => InstrumentAgentArg::Copilot,
         Agent::Cursor => InstrumentAgentArg::Cursor,
         Agent::Gemini => InstrumentAgentArg::Gemini,
         Agent::Opencode => InstrumentAgentArg::Opencode,
+        Agent::Qwen => InstrumentAgentArg::Qwen,
     }
 }
 
@@ -2440,9 +2514,12 @@ fn skill_config_path(
     let root = scope_root(scope, local_root, home)?;
     let path = match agent {
         Agent::Claude => root.join(".claude/skills/braintrust/SKILL.md"),
-        Agent::Codex | Agent::Opencode | Agent::Cursor | Agent::Gemini => {
-            root.join(".agents/skills/braintrust/SKILL.md")
-        }
+        Agent::Codex
+        | Agent::Copilot
+        | Agent::Opencode
+        | Agent::Cursor
+        | Agent::Gemini
+        | Agent::Qwen => root.join(".agents/skills/braintrust/SKILL.md"),
     };
     Ok(path)
 }
@@ -2688,6 +2765,7 @@ fn resolve_instrument_invocation(
                 }
             } else {
                 gemini_args.extend([
+                    "--skip-trust".to_string(),
                     "-p".to_string(),
                     String::new(),
                     "--output-format".to_string(),
@@ -2724,7 +2802,6 @@ fn resolve_instrument_invocation(
                     "-p".to_string(),
                     "--output-format".to_string(),
                     "stream-json".to_string(),
-                    "--stream-partial-output".to_string(),
                 ]);
                 InstrumentInvocation::Program {
                     program: "cursor-agent".to_string(),
@@ -2733,6 +2810,75 @@ fn resolve_instrument_invocation(
                     prompt_file_arg: Some(task_path.to_path_buf()),
                     initial_prompt: None,
                     stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
+        Agent::Qwen => {
+            let mut qwen_args = vec![];
+            if bypass_permissions {
+                qwen_args.push("--yolo".to_string());
+            }
+            if interactive {
+                qwen_args.push("-i".to_string());
+                InstrumentInvocation::Program {
+                    program: "qwen".to_string(),
+                    args: qwen_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                qwen_args.extend([
+                    "-p".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--include-partial-messages".to_string(),
+                ]);
+                InstrumentInvocation::Program {
+                    program: "qwen".to_string(),
+                    args: qwen_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: true,
+                    interactive: false,
+                }
+            }
+        }
+        Agent::Copilot => {
+            let mut copilot_args = vec![];
+            if bypass_permissions {
+                copilot_args.push("--yolo".to_string());
+            }
+            if interactive {
+                copilot_args.push("-i".to_string());
+                InstrumentInvocation::Program {
+                    program: "copilot".to_string(),
+                    args: copilot_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
+                    interactive: true,
+                }
+            } else {
+                copilot_args.extend([
+                    "--no-ask-user".to_string(),
+                    "--stream".to_string(),
+                    "on".to_string(),
+                    "-s".to_string(),
+                    "-p".to_string(),
+                ]);
+                InstrumentInvocation::Program {
+                    program: "copilot".to_string(),
+                    args: copilot_args,
+                    stdin_file: None,
+                    prompt_file_arg: Some(task_path.to_path_buf()),
+                    initial_prompt: None,
+                    stream_json: false,
                     interactive: false,
                 }
             }
@@ -3266,9 +3412,11 @@ fn run_doctor(base: BaseArgs, args: AgentsDoctorArgs) -> Result<()> {
     let agents = [
         Agent::Claude,
         Agent::Codex,
+        Agent::Copilot,
         Agent::Cursor,
         Agent::Gemini,
         Agent::Opencode,
+        Agent::Qwen,
     ]
     .iter()
     .map(|agent| doctor_agent_status(*agent, scope, local_root.as_deref(), &home, &detected))
@@ -3636,9 +3784,11 @@ fn map_instrument_agent_arg_to_agent_arg(agent: InstrumentAgentArg) -> AgentArg 
     match agent {
         InstrumentAgentArg::Claude => AgentArg::Claude,
         InstrumentAgentArg::Codex => AgentArg::Codex,
+        InstrumentAgentArg::Copilot => AgentArg::Copilot,
         InstrumentAgentArg::Cursor => AgentArg::Cursor,
         InstrumentAgentArg::Gemini => AgentArg::Gemini,
         InstrumentAgentArg::Opencode => AgentArg::Opencode,
+        InstrumentAgentArg::Qwen => AgentArg::Qwen,
     }
 }
 
@@ -3646,9 +3796,11 @@ fn map_agent_arg(agent: AgentArg) -> Agent {
     match agent {
         AgentArg::Claude => Agent::Claude,
         AgentArg::Codex => Agent::Codex,
+        AgentArg::Copilot => Agent::Copilot,
         AgentArg::Cursor => Agent::Cursor,
         AgentArg::Gemini => Agent::Gemini,
         AgentArg::Opencode => Agent::Opencode,
+        AgentArg::Qwen => Agent::Qwen,
     }
 }
 
@@ -3661,6 +3813,8 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
         Agent::Codex,
         Agent::Claude,
         Agent::Gemini,
+        Agent::Qwen,
+        Agent::Copilot,
         Agent::Cursor,
         Agent::Opencode,
     ];
@@ -3711,23 +3865,11 @@ fn detected_agents_on_path(detected: &[DetectionSignal]) -> Vec<Agent> {
 }
 
 fn detect_runnable_agents() -> Vec<Agent> {
-    let mut agents = Vec::new();
-    if command_exists("claude") {
-        agents.push(Agent::Claude);
-    }
-    if command_exists("codex") {
-        agents.push(Agent::Codex);
-    }
-    if command_exists("cursor-agent") {
-        agents.push(Agent::Cursor);
-    }
-    if command_exists("gemini") {
-        agents.push(Agent::Gemini);
-    }
-    if command_exists("opencode") {
-        agents.push(Agent::Opencode);
-    }
-    agents
+    ALL_AGENTS
+        .iter()
+        .copied()
+        .filter(|agent| command_exists(agent.metadata().binary))
+        .collect()
 }
 
 fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
@@ -3748,37 +3890,17 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
     let mut by_agent: BTreeMap<Agent, BTreeSet<(bool, String)>> = BTreeMap::new();
 
     if let Some(root) = local_root {
-        if root.join(".claude").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Claude,
-                false,
-                ".claude exists in repo root",
-            );
-        }
-        if root.join(".cursor").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Cursor,
-                false,
-                ".cursor exists in repo root",
-            );
-        }
-        if root.join(".gemini").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Gemini,
-                false,
-                ".gemini exists in repo root",
-            );
-        }
-        if root.join(".opencode").exists() {
-            add_signal(
-                &mut by_agent,
-                Agent::Opencode,
-                false,
-                ".opencode exists in repo root",
-            );
+        for agent in ALL_AGENTS {
+            if let Some(marker) = agent.metadata().repo_marker {
+                if root.join(marker).exists() {
+                    add_signal(
+                        &mut by_agent,
+                        agent,
+                        false,
+                        &format!("{marker} exists in repo root"),
+                    );
+                }
+            }
         }
         if root.join(".agents").exists() || root.join(".agents/skills").exists() {
             add_signal(
@@ -3804,17 +3926,12 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
         }
     }
 
-    if home.join(".claude").exists() {
-        add_signal(&mut by_agent, Agent::Claude, false, "~/.claude exists");
-    }
-    if home.join(".cursor").exists() {
-        add_signal(&mut by_agent, Agent::Cursor, false, "~/.cursor exists");
-    }
-    if home.join(".gemini").exists() {
-        add_signal(&mut by_agent, Agent::Gemini, false, "~/.gemini exists");
-    }
-    if home.join(".codex").exists() {
-        add_signal(&mut by_agent, Agent::Codex, false, "~/.codex exists");
+    for agent in ALL_AGENTS {
+        for marker in agent.metadata().home_markers {
+            if home.join(marker).exists() {
+                add_signal(&mut by_agent, agent, false, &format!("~/{} exists", marker));
+            }
+        }
     }
     if home.join(".agents/skills").exists() {
         add_signal(
@@ -3839,45 +3956,16 @@ fn detect_agents(local_root: Option<&Path>, home: &Path) -> Vec<DetectionSignal>
         );
     }
 
-    if command_exists("claude") {
-        add_signal(
-            &mut by_agent,
-            Agent::Claude,
-            true,
-            "`claude` binary found in PATH",
-        );
-    }
-    if command_exists("codex") {
-        add_signal(
-            &mut by_agent,
-            Agent::Codex,
-            true,
-            "`codex` binary found in PATH",
-        );
-    }
-    if command_exists("cursor-agent") {
-        add_signal(
-            &mut by_agent,
-            Agent::Cursor,
-            true,
-            "`cursor-agent` binary found in PATH",
-        );
-    }
-    if command_exists("gemini") {
-        add_signal(
-            &mut by_agent,
-            Agent::Gemini,
-            true,
-            "`gemini` binary found in PATH",
-        );
-    }
-    if command_exists("opencode") {
-        add_signal(
-            &mut by_agent,
-            Agent::Opencode,
-            true,
-            "`opencode` binary found in PATH",
-        );
+    for agent in ALL_AGENTS {
+        let binary = agent.metadata().binary;
+        if command_exists(binary) {
+            add_signal(
+                &mut by_agent,
+                agent,
+                true,
+                &format!("`{binary}` binary found in PATH"),
+            );
+        }
     }
 
     let mut out = Vec::new();
@@ -3904,19 +3992,27 @@ fn add_signal(
         .insert((on_path, reason.to_string()));
 }
 
-fn install_claude(
+fn install_agent_skill(
+    agent: Agent,
     scope: InstallScope,
     local_root: Option<&Path>,
     home: &Path,
+    alias_dir: Option<&str>,
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
     let skill_content = render_braintrust_skill();
-    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-    let alias = ensure_agent_skills_alias(root, ".claude", &skill_content)?;
-    let changed = skill_changed || alias.changed;
+    let (canonical_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let mut changed = canonical_changed;
+    let mut paths = vec![skill_path.display().to_string()];
+
+    if let Some(alias_dir) = alias_dir {
+        let alias = ensure_agent_skills_alias(root, alias_dir, &skill_content)?;
+        changed |= alias.changed;
+        paths.push(alias.path.display().to_string());
+    }
 
     Ok(AgentInstallResult {
-        agent: Agent::Claude,
+        agent,
         status: if changed {
             InstallStatus::Installed
         } else {
@@ -3927,120 +4023,7 @@ fn install_claude(
         } else {
             "already configured".to_string()
         },
-        paths: vec![
-            skill_path.display().to_string(),
-            alias.path.display().to_string(),
-        ],
-    })
-}
-
-fn install_codex(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Codex,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![skill_path.display().to_string()],
-    })
-}
-
-fn install_opencode(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Opencode,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![skill_path.display().to_string()],
-    })
-}
-
-fn install_cursor(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-    let alias = ensure_agent_skills_alias(root, ".cursor", &skill_content)?;
-    let changed = skill_changed || alias.changed;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Cursor,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![
-            skill_path.display().to_string(),
-            alias.path.display().to_string(),
-        ],
-    })
-}
-
-fn install_gemini(
-    scope: InstallScope,
-    local_root: Option<&Path>,
-    home: &Path,
-) -> Result<AgentInstallResult> {
-    let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (skill_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
-    let alias = ensure_agent_skills_alias(root, ".gemini", &skill_content)?;
-    let changed = skill_changed || alias.changed;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Gemini,
-        status: if changed {
-            InstallStatus::Installed
-        } else {
-            InstallStatus::Skipped
-        },
-        message: if changed {
-            "installed skill".to_string()
-        } else {
-            "already configured".to_string()
-        },
-        paths: vec![
-            skill_path.display().to_string(),
-            alias.path.display().to_string(),
-        ],
+        paths,
     })
 }
 
@@ -4162,8 +4145,10 @@ fn install_mcp_for_agent(
             InstallScope::Global => install_mcp_for_codex(mcp_url, api_key),
         },
         Agent::Cursor => install_mcp_for_cursor(scope, local_root, home, api_key, mcp_url),
+        Agent::Copilot => install_mcp_for_copilot(scope, local_root, home, api_key, mcp_url),
         Agent::Gemini => install_mcp_for_gemini(scope, local_root, home, api_key, mcp_url),
         Agent::Opencode => install_mcp_for_opencode(scope, local_root, home, api_key, mcp_url),
+        Agent::Qwen => install_mcp_for_qwen(scope, local_root, home, api_key, mcp_url),
     }
 }
 
@@ -4203,13 +4188,8 @@ fn install_mcp_for_codex_local(
 ) -> Result<AgentInstallResult> {
     let root = scope_root(InstallScope::Local, local_root, home)?;
     let path = root.join(".codex/config.toml");
-    merge_codex_config(&path, api_key, mcp_url)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Codex,
-        status: InstallStatus::Installed,
-        message: "installed MCP config".to_string(),
-        paths: vec![path.display().to_string()],
+    install_mcp_config_file(Agent::Codex, path, "installed MCP config", |path| {
+        merge_codex_config(path, api_key, mcp_url)
     })
 }
 
@@ -4224,13 +4204,32 @@ fn install_mcp_for_cursor(
         InstallScope::Local => scope_root(scope, local_root, home)?.join(".cursor/mcp.json"),
         InstallScope::Global => home.join(".cursor/mcp.json"),
     };
-    merge_mcp_config(&path, api_key, mcp_url)?;
-    enable_cursor_mcp(local_root)?;
+    install_mcp_config_file(
+        Agent::Cursor,
+        path,
+        "installed MCP config and enabled server",
+        |path| {
+            merge_mcp_config(path, api_key, mcp_url)?;
+            enable_cursor_mcp(local_root)
+        },
+    )
+}
+
+fn install_mcp_config_file<F>(
+    agent: Agent,
+    path: PathBuf,
+    message: &str,
+    install: F,
+) -> Result<AgentInstallResult>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    install(&path)?;
 
     Ok(AgentInstallResult {
-        agent: Agent::Cursor,
+        agent,
         status: InstallStatus::Installed,
-        message: "installed MCP config and enabled server".to_string(),
+        message: message.to_string(),
         paths: vec![path.display().to_string()],
     })
 }
@@ -4265,43 +4264,18 @@ fn install_mcp_for_claude(
     mcp_url: &str,
     api_key: &str,
 ) -> Result<AgentInstallResult> {
-    let (scope_name, cwd, path_label) = match scope {
-        InstallScope::Local => (
-            "project",
-            Some(scope_root(scope, local_root, home)?.to_path_buf()),
-            "claude:project".to_string(),
-        ),
-        InstallScope::Global => ("user", None, "claude:user".to_string()),
-    };
-
-    let status = std::process::Command::new("claude")
-        .args([
-            "mcp",
-            "add",
-            "-s",
-            scope_name,
-            "--transport",
-            "http",
-            "braintrust",
-            mcp_url,
-            "--header",
-            &format!("Authorization: Bearer {api_key}"),
-        ])
-        .current_dir(cwd.unwrap_or_else(|| home.to_path_buf()))
-        .stdout(Stdio::null())
-        .status()
-        .with_context(|| format!("failed to run `claude mcp add -s {scope_name}`"))?;
-
-    if !status.success() {
-        bail!("`claude mcp add -s {scope_name}` exited with status {status}");
-    }
-
-    Ok(AgentInstallResult {
-        agent: Agent::Claude,
-        status: InstallStatus::Installed,
-        message: "installed MCP config".to_string(),
-        paths: vec![path_label],
-    })
+    install_mcp_for_http_cli_agent(
+        McpHttpCliAgentConfig {
+            agent: Agent::Claude,
+            binary: "claude",
+            header_flag: "--header",
+        },
+        scope,
+        local_root,
+        home,
+        api_key,
+        mcp_url,
+    )
 }
 
 fn install_mcp_for_gemini(
@@ -4311,16 +4285,112 @@ fn install_mcp_for_gemini(
     api_key: &str,
     mcp_url: &str,
 ) -> Result<AgentInstallResult> {
-    let (scope_name, cwd, path_label) = match scope {
+    install_mcp_for_http_cli_agent(
+        McpHttpCliAgentConfig {
+            agent: Agent::Gemini,
+            binary: "gemini",
+            header_flag: "-H",
+        },
+        scope,
+        local_root,
+        home,
+        api_key,
+        mcp_url,
+    )
+}
+
+fn install_mcp_for_qwen(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    install_mcp_for_http_cli_agent(
+        McpHttpCliAgentConfig {
+            agent: Agent::Qwen,
+            binary: "qwen",
+            header_flag: "-H",
+        },
+        scope,
+        local_root,
+        home,
+        api_key,
+        mcp_url,
+    )
+}
+
+fn install_mcp_for_copilot(
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    let mut args = vec![
+        "mcp".to_string(),
+        "add".to_string(),
+        "--transport".to_string(),
+        "http".to_string(),
+        "--header".to_string(),
+        format!("Authorization: Bearer {api_key}"),
+    ];
+    let (cwd, scope_name) = match scope {
+        InstallScope::Local => {
+            let root = scope_root(scope, local_root, home)?;
+            args.extend([
+                "--config-dir".to_string(),
+                root.join(".copilot").display().to_string(),
+            ]);
+            (root.to_path_buf(), "project")
+        }
+        InstallScope::Global => (home.to_path_buf(), "user"),
+    };
+    args.extend(["braintrust".to_string(), mcp_url.to_string()]);
+
+    let status = std::process::Command::new("copilot")
+        .args(&args)
+        .current_dir(&cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| "failed to run `copilot mcp add`")?;
+
+    if !status.success() {
+        bail!("`copilot mcp add` exited with status {status}");
+    }
+
+    Ok(AgentInstallResult {
+        agent: Agent::Copilot,
+        status: InstallStatus::Installed,
+        message: "installed MCP config".to_string(),
+        paths: vec![format!("copilot:{scope_name}")],
+    })
+}
+
+struct McpHttpCliAgentConfig {
+    agent: Agent,
+    binary: &'static str,
+    header_flag: &'static str,
+}
+
+fn install_mcp_for_http_cli_agent(
+    config: McpHttpCliAgentConfig,
+    scope: InstallScope,
+    local_root: Option<&Path>,
+    home: &Path,
+    api_key: &str,
+    mcp_url: &str,
+) -> Result<AgentInstallResult> {
+    let (scope_name, cwd) = match scope {
         InstallScope::Local => (
             "project",
             scope_root(scope, local_root, home)?.to_path_buf(),
-            "gemini:project".to_string(),
         ),
-        InstallScope::Global => ("user", home.to_path_buf(), "gemini:user".to_string()),
+        InstallScope::Global => ("user", home.to_path_buf()),
     };
 
-    let status = std::process::Command::new("gemini")
+    let status = std::process::Command::new(config.binary)
         .args([
             "mcp",
             "add",
@@ -4330,23 +4400,26 @@ fn install_mcp_for_gemini(
             "http",
             "braintrust",
             mcp_url,
-            "-H",
+            config.header_flag,
             &format!("Authorization: Bearer {api_key}"),
         ])
         .current_dir(&cwd)
         .stdout(Stdio::null())
         .status()
-        .with_context(|| format!("failed to run `gemini mcp add -s {scope_name}`"))?;
+        .with_context(|| format!("failed to run `{} mcp add -s {scope_name}`", config.binary))?;
 
     if !status.success() {
-        bail!("`gemini mcp add -s {scope_name}` exited with status {status}");
+        bail!(
+            "`{} mcp add -s {scope_name}` exited with status {status}",
+            config.binary
+        );
     }
 
     Ok(AgentInstallResult {
-        agent: Agent::Gemini,
+        agent: config.agent,
         status: InstallStatus::Installed,
         message: "installed MCP config".to_string(),
-        paths: vec![path_label],
+        paths: vec![format!("{}:{scope_name}", config.agent.as_str())],
     })
 }
 
@@ -4365,13 +4438,8 @@ fn install_mcp_for_opencode(
         InstallScope::Local => scope_root(scope, local_root, home)?.join("opencode.json"),
         InstallScope::Global => home.join(".config/opencode/opencode.json"),
     };
-    merge_opencode_config(&path, api_key, mcp_url)?;
-
-    Ok(AgentInstallResult {
-        agent: Agent::Opencode,
-        status: InstallStatus::Installed,
-        message: "installed MCP config".to_string(),
-        paths: vec![path.display().to_string()],
+    install_mcp_config_file(Agent::Opencode, path, "installed MCP config", |path| {
+        merge_opencode_config(path, api_key, mcp_url)
     })
 }
 
@@ -5679,6 +5747,7 @@ mod tests {
                 assert_eq!(
                     args,
                     vec![
+                        "--skip-trust".to_string(),
                         "-p".to_string(),
                         String::new(),
                         "--output-format".to_string(),
@@ -5745,7 +5814,6 @@ mod tests {
                         "-p".to_string(),
                         "--output-format".to_string(),
                         "stream-json".to_string(),
-                        "--stream-partial-output".to_string(),
                     ]
                 );
                 assert_eq!(stdin_file, None);
@@ -5775,6 +5843,135 @@ mod tests {
             } => {
                 assert_eq!(program, "cursor-agent");
                 assert!(args.is_empty());
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn qwen_instrument_invocation_uses_stream_json_with_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Qwen, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "qwen");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-p".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                        "--include-partial-messages".to_string(),
+                    ]
+                );
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(stream_json);
+                assert!(!interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn qwen_interactive_instrument_invocation_uses_prompt_interactive() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Qwen, None, &task_path, true, true, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "qwen");
+                assert_eq!(args, vec!["--yolo".to_string(), "-i".to_string()]);
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn copilot_instrument_invocation_uses_json_output_with_prompt_arg() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Copilot, None, &task_path, false, false, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "copilot");
+                assert_eq!(
+                    args,
+                    vec![
+                        "--no-ask-user".to_string(),
+                        "--stream".to_string(),
+                        "on".to_string(),
+                        "-s".to_string(),
+                        "-p".to_string(),
+                    ]
+                );
+                assert_eq!(stdin_file, None);
+                assert_eq!(prompt_file_arg, Some(task_path));
+                assert!(!stream_json);
+                assert!(!interactive);
+            }
+            InstrumentInvocation::Shell(_) => panic!("expected program invocation"),
+        }
+    }
+
+    #[test]
+    fn copilot_interactive_instrument_invocation_uses_interactive_flag() {
+        let task_path = PathBuf::from("/tmp/AGENT_TASK.instrument.md");
+        let invocation =
+            resolve_instrument_invocation(Agent::Copilot, None, &task_path, true, true, &[])
+                .expect("resolve instrument invocation");
+
+        match invocation {
+            InstrumentInvocation::Program {
+                program,
+                args,
+                stdin_file,
+                prompt_file_arg,
+                stream_json,
+                interactive,
+                ..
+            } => {
+                assert_eq!(program, "copilot");
+                assert_eq!(args, vec!["--yolo".to_string(), "-i".to_string()]);
                 assert_eq!(stdin_file, None);
                 assert_eq!(prompt_file_arg, Some(task_path));
                 assert!(!stream_json);
@@ -5934,6 +6131,38 @@ mod tests {
     fn doctor_agent_status_reports_gemini_global_skill_path() {
         let home = std::env::temp_dir();
         let status = doctor_agent_status(Agent::Gemini, InstallScope::Global, None, &home, &[]);
+        assert!(!status.configured);
+        assert_eq!(
+            status.config_path,
+            Some(
+                home.join(".agents/skills/braintrust/SKILL.md")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(status.notes.is_empty());
+    }
+
+    #[test]
+    fn doctor_agent_status_reports_qwen_global_skill_path() {
+        let home = std::env::temp_dir();
+        let status = doctor_agent_status(Agent::Qwen, InstallScope::Global, None, &home, &[]);
+        assert!(!status.configured);
+        assert_eq!(
+            status.config_path,
+            Some(
+                home.join(".agents/skills/braintrust/SKILL.md")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(status.notes.is_empty());
+    }
+
+    #[test]
+    fn doctor_agent_status_reports_copilot_global_skill_path() {
+        let home = std::env::temp_dir();
+        let status = doctor_agent_status(Agent::Copilot, InstallScope::Global, None, &home, &[]);
         assert!(!status.configured);
         assert_eq!(
             status.config_path,
@@ -6458,6 +6687,210 @@ mod tests {
     }
 
     #[test]
+    fn install_mcp_for_agent_invokes_qwen_project_scope_for_local() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-qwen-mcp-local-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("qwen.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("qwen"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Qwen,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "qwen-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install qwen local mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["qwen:project".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read qwen log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("add"));
+        assert!(log.contains("-s"));
+        assert!(log.contains("project"));
+        assert!(log.contains("--transport"));
+        assert!(log.contains("http"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains("Authorization: Bearer qwen-api-key"));
+        assert!(log.contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn install_mcp_for_agent_invokes_qwen_user_scope_for_global() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-qwen-mcp-global-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("qwen-global.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("qwen"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Qwen,
+            InstallScope::Global,
+            None,
+            &home,
+            "qwen-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install qwen global mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["qwen:user".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read qwen log");
+        assert!(log.contains("user"));
+        assert!(log.contains(&home.display().to_string()));
+    }
+
+    #[test]
+    fn install_mcp_for_agent_invokes_copilot_with_config_dir_for_local() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-copilot-mcp-local-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("copilot.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("copilot"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Copilot,
+            InstallScope::Local,
+            Some(&root),
+            &home,
+            "copilot-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install copilot local mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["copilot:project".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read copilot log");
+        assert!(log.contains("mcp"));
+        assert!(log.contains("add"));
+        assert!(log.contains("--transport"));
+        assert!(log.contains("http"));
+        assert!(log.contains("--header"));
+        assert!(log.contains("Authorization: Bearer copilot-api-key"));
+        assert!(log.contains("--config-dir"));
+        assert!(log.contains(".copilot"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn install_mcp_for_agent_invokes_copilot_without_config_dir_for_global() {
+        let _guard = cwd_test_lock().lock().expect("lock cwd test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("bt-agents-copilot-mcp-global-{unique}"));
+        let bin_dir = root.join("bin");
+        let log_path = root.join("copilot-global.log");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&root).expect("create root");
+
+        write_executable(
+            &bin_dir.join("copilot"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\npwd >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        );
+
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", format!("{}:{old_path}", bin_dir.display()));
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+        let result = install_mcp_for_agent(
+            Agent::Copilot,
+            InstallScope::Global,
+            None,
+            &home,
+            "copilot-api-key",
+            "https://api.example.com/mcp",
+        )
+        .expect("install copilot global mcp");
+
+        env::set_var("PATH", old_path);
+
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert_eq!(result.paths, vec!["copilot:user".to_string()]);
+        let log = fs::read_to_string(&log_path).expect("read copilot log");
+        assert!(!log.contains("--config-dir"));
+        assert!(log.contains("Authorization: Bearer copilot-api-key"));
+        assert!(log.contains("braintrust"));
+        assert!(log.contains("https://api.example.com/mcp"));
+        assert!(log.contains(&home.display().to_string()));
+    }
+
+    #[test]
     fn install_codex_is_idempotent_when_skill_is_unchanged() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6468,11 +6901,14 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let first = install_codex(InstallScope::Local, Some(&root), &home).expect("first install");
+        let first = Agent::Codex
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("first install");
         assert!(matches!(first.status, InstallStatus::Installed));
 
-        let second =
-            install_codex(InstallScope::Local, Some(&root), &home).expect("second install");
+        let second = Agent::Codex
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("second install");
         assert!(matches!(second.status, InstallStatus::Skipped));
         assert!(second.message.contains("already configured"));
     }
@@ -6488,11 +6924,50 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result =
-            install_gemini(InstallScope::Local, Some(&root), &home).expect("install gemini");
+        let result = Agent::Gemini
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("install gemini");
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
         assert!(root.join(".gemini/skills").exists());
+    }
+
+    #[test]
+    fn install_qwen_uses_canonical_agents_skill_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-qwen-skill-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let result = Agent::Qwen
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("install qwen");
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
+        assert!(root.join(".qwen/skills").exists());
+    }
+
+    #[test]
+    fn install_copilot_uses_canonical_agents_skill_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bt-agents-copilot-skill-{unique}"));
+        fs::create_dir_all(&root).expect("create temp root");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let result = Agent::Copilot
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("install copilot");
+        assert!(matches!(result.status, InstallStatus::Installed));
+        assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
+        assert!(root.join(".copilot/skills").exists());
     }
 
     #[test]
@@ -6506,8 +6981,9 @@ mod tests {
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create temp home");
 
-        let result =
-            install_cursor(InstallScope::Local, Some(&root), &home).expect("install cursor");
+        let result = Agent::Cursor
+            .install_skill(InstallScope::Local, Some(&root), &home)
+            .expect("install cursor");
         assert!(matches!(result.status, InstallStatus::Installed));
         assert!(root.join(".agents/skills/braintrust/SKILL.md").exists());
         assert!(root.join(".cursor/skills").exists());
