@@ -114,6 +114,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt auth`        | Authenticate with Braintrust                                       |
 | `bt switch`      | Switch org and project context                                     |
 | `bt status`      | Show current org and project context                               |
+| `bt datasets`    | Manage datasets and dataset pipelines                              |
 | `bt eval`        | Run eval files (Unix only)                                         |
 | `bt sql`         | Run SQL queries against Braintrust                                 |
 | `bt view`        | View logs, traces, and spans                                       |
@@ -156,6 +157,28 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt eval --first 20 qa.eval.ts` — run the first 20 examples and clearly label the summary as a non-final smoke run.
 - `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
 - If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
+
+## `bt datasets pipeline`
+
+Run TypeScript dataset pipelines declared with `DatasetPipeline(...)` from the `braintrust` SDK.
+
+```bash
+# One-shot execution: discover refs, transform, and insert up to 100 new rows.
+bt datasets pipeline run ./pipeline.ts --target 100
+
+# Staged execution for human or agent review.
+bt datasets pipeline fetch ./pipeline.ts --target 500 --out refs.jsonl
+bt datasets pipeline transform ./pipeline.ts --in refs.jsonl --out proposed.jsonl
+bt datasets pipeline review ./pipeline.ts --in proposed.jsonl --out approved.jsonl
+bt datasets pipeline commit ./pipeline.ts --in approved.jsonl
+```
+
+Useful flags:
+
+- `--root-span-id <id>` restricts fetching to one or more specific root spans.
+- `--extra-where-sql <predicate>` appends a source SQL predicate.
+- `--max-concurrency <n>` controls transform concurrency.
+- `--name <name>` selects a pipeline when the file defines more than one.
 
 ## `bt sql`
 

@@ -41,7 +41,8 @@ use ratatui::widgets::{Cell, Row, Table};
 use ratatui::Terminal;
 
 use crate::args::BaseArgs;
-use crate::auth::resolved_auth_env;
+use crate::auth::resolved_runner_env;
+use crate::js_runner;
 use crate::python_runner;
 use crate::ui::{animations_enabled, is_quiet};
 
@@ -795,7 +796,7 @@ async fn spawn_eval_runner(
         set_node_heap_size_env(&mut cmd);
     }
 
-    cmd.envs(build_env(base).await?);
+    cmd.envs(resolved_runner_env(base).await?);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -2049,18 +2050,6 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
-    let mut envs = resolved_auth_env(base).await?;
-    let project = base
-        .project
-        .clone()
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
-    if let Some(project) = &project {
-        envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
-    }
-    Ok(envs)
-}
-
 fn detect_eval_language(
     files: &[String],
     language_override: Option<EvalLanguage>,
@@ -2261,7 +2250,7 @@ fn build_js_plan(
 ) -> Result<JsRunnerPlan> {
     if let Some(explicit) = runner_override {
         let resolved_runner = resolve_js_runner_command(explicit, files);
-        if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
+        if is_deno_runner(explicit) || js_runner::is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
@@ -2276,7 +2265,7 @@ fn build_js_plan(
     }
 
     if let Some(auto_runner) = find_js_runner_binary(files) {
-        if is_deno_runner_path(&auto_runner) {
+        if js_runner::is_deno_runner_path(&auto_runner) {
             let runner_script = prepare_js_runner_in_cwd()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
@@ -2300,7 +2289,7 @@ fn build_js_plan(
 
 fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<Command> {
     if let Some(path) = find_node_module_bin_for_files("vite-node", files)
-        .or_else(|| find_binary_in_path(&["vite-node"]))
+        .or_else(|| js_runner::find_binary_in_path(&["vite-node"]))
     {
         let mut command = Command::new(path);
         command.arg(runner).args(files);
@@ -2327,15 +2316,7 @@ fn build_deno_js_command(
 }
 
 fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("run"),
-        OsString::from("-A"),
-        OsString::from("--node-modules-dir=auto"),
-        OsString::from("--unstable-detect-cjs"),
-        runner.as_os_str().to_os_string(),
-    ];
-    args.extend(files.iter().map(OsString::from));
-    args
+    js_runner::deno_runner_args(runner, &files_as_paths(files))
 }
 
 fn build_python_command(
@@ -2379,104 +2360,38 @@ fn python_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
 }
 
 fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
-    // Prefer local project bins first, then PATH. `tsx` remains the preferred
-    // default, with other common TS runners as fallback.
-    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm", "deno"];
-
-    for candidate in RUNNER_CANDIDATES {
-        if let Some(path) = find_node_module_bin_for_files(candidate, files) {
-            return Some(path);
-        }
-    }
-
-    find_binary_in_path(RUNNER_CANDIDATES)
+    js_runner::find_js_runner_binary(&files_as_paths(files))
 }
 
 fn resolve_js_runner_command(runner: &str, files: &[String]) -> PathBuf {
-    if is_path_like_runner(runner) {
-        return PathBuf::from(runner);
-    }
-
-    find_node_module_bin_for_files(runner, files)
-        .or_else(|| find_binary_in_path(&[runner]))
-        .unwrap_or_else(|| PathBuf::from(runner))
-}
-
-fn is_path_like_runner(runner: &str) -> bool {
-    let path = Path::new(runner);
-    path.is_absolute() || runner.contains('/') || runner.contains('\\') || runner.starts_with('.')
+    js_runner::resolve_js_runner_command(runner, &files_as_paths(files))
 }
 
 fn find_node_module_bin_for_files(binary: &str, files: &[String]) -> Option<PathBuf> {
-    let search_roots = js_runner_search_roots(files);
-    for root in &search_roots {
-        if let Some(path) = find_node_module_bin(binary, root) {
-            return Some(path);
-        }
-    }
-    None
+    js_runner::find_node_module_bin_for_files(binary, &files_as_paths(files))
 }
 
-fn js_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
-    let mut search_roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        search_roots.push(cwd.clone());
-        for file in files {
-            let path = PathBuf::from(file);
-            let absolute = if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            };
-            if let Some(parent) = absolute.parent() {
-                search_roots.push(parent.to_path_buf());
-            }
-        }
-    }
-    search_roots
+fn files_as_paths(files: &[String]) -> Vec<PathBuf> {
+    files.iter().map(PathBuf::from).collect()
 }
 
 fn is_deno_runner(runner: &str) -> bool {
-    let file_name = Path::new(runner)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(runner);
-    file_name.eq_ignore_ascii_case("deno") || file_name.eq_ignore_ascii_case("deno.exe")
-}
-
-fn is_deno_runner_path(runner: &Path) -> bool {
-    runner
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(|name| name.eq_ignore_ascii_case("deno") || name.eq_ignore_ascii_case("deno.exe"))
-        .unwrap_or(false)
+    js_runner::is_deno_runner_path(Path::new(runner))
 }
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
-    if is_ts_node_runner(runner_command) {
+    if js_runner::is_ts_node_runner_path(runner_command) {
         return prepare_js_runner_in_cwd();
     }
     Ok(default_runner.to_path_buf())
 }
 
 fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = cwd
-        .join(".bt")
-        .join("eval-runners")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&cache_dir).with_context(|| {
-        format!(
-            "failed to create eval runner cache dir {}",
-            cache_dir.display()
-        )
-    })?;
-    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+    js_runner::materialize_runner_script_in_cwd("eval-runners", JS_RUNNER_FILE, JS_RUNNER_SOURCE)
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
-    let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
-    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+    js_runner::runner_bin_name(runner_command)
 }
 
 fn runner_kind_for_bin(runner_command: &Path) -> RunnerKind {
@@ -2506,47 +2421,6 @@ fn set_node_heap_size_env(command: &mut Command) {
         format!("{existing} {heap_option}")
     };
     command.env("NODE_OPTIONS", merged);
-}
-
-fn is_ts_node_runner(runner_command: &Path) -> bool {
-    runner_bin_name(runner_command).is_some_and(|n| n == "ts-node" || n == "ts-node-esm")
-}
-
-fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        let base = dir.join("node_modules").join(".bin").join(binary);
-        if base.is_file() {
-            return Some(base);
-        }
-        if cfg!(windows) {
-            let cmd = base.with_extension("cmd");
-            if cmd.is_file() {
-                return Some(cmd);
-            }
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        for candidate in candidates {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-            if cfg!(windows) {
-                let cmd = path.with_extension("cmd");
-                if cmd.is_file() {
-                    return Some(cmd);
-                }
-            }
-        }
-    }
-    None
 }
 
 fn build_sse_socket_path() -> Result<PathBuf> {
@@ -2621,13 +2495,7 @@ fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
-    let path = cache_dir.join(file_name);
-    let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(source) {
-        std::fs::write(&path, source)
-            .with_context(|| format!("failed to write eval runner script {}", path.display()))?;
-    }
-    Ok(path)
+    js_runner::materialize_runner_script(cache_dir, file_name, source)
 }
 
 #[derive(Debug)]
