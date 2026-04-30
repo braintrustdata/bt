@@ -219,6 +219,7 @@ fn prepare_records(
     let mut seen_ids = HashSet::new();
 
     for (row_index, raw_record) in raw_records.into_iter().enumerate() {
+        let raw_record = strip_ignored_system_fields(raw_record, &id_root);
         validate_supported_fields(&raw_record, &id_root, row_index)?;
         let record =
             prepared_record_from_input_object(raw_record, &id_path, require_ids, row_index)?;
@@ -233,6 +234,18 @@ fn prepare_records(
     }
 
     Ok(records)
+}
+
+fn strip_ignored_system_fields(
+    mut object: Map<String, Value>,
+    id_root: &str,
+) -> Map<String, Value> {
+    for field in ["dataset_id", "created"] {
+        if field != id_root {
+            object.remove(field);
+        }
+    }
+    object
 }
 
 fn validate_supported_fields(
@@ -501,5 +514,35 @@ mod tests {
             row.get("output"),
             Some(&Value::String("predicted".to_string()))
         );
+    }
+
+    #[test]
+    fn prepare_records_ignores_dataset_view_system_fields() {
+        let record = serde_json::from_value(serde_json::json!({
+            "id": "case-1",
+            "input": {"prompt": "hello"},
+            "expected": "world",
+            "dataset_id": "dataset_1",
+            "created": "2026-01-01T00:00:00Z"
+        }))
+        .expect("map");
+        let prepared = prepare_records(vec![record], "id", true).expect("prepare records");
+        assert_eq!(prepared[0].id, "case-1");
+        assert_eq!(
+            prepared[0].expected,
+            Some(Value::String("world".to_string()))
+        );
+    }
+
+    #[test]
+    fn prepare_records_keeps_dataset_id_when_used_as_id_field() {
+        let record = serde_json::from_value(serde_json::json!({
+            "dataset_id": "case-1",
+            "input": {"prompt": "hello"},
+            "expected": "world"
+        }))
+        .expect("map");
+        let prepared = prepare_records(vec![record], "dataset_id", true).expect("prepare records");
+        assert_eq!(prepared[0].id, "case-1");
     }
 }
