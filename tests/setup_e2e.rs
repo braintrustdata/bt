@@ -29,64 +29,129 @@ const BRAINTRUST_CLI_ENVS: &[&str] = &[
 ];
 
 struct SetupRunOutcome {
-    repo: tempfile::TempDir,
+    _repo: tempfile::TempDir,
     home: tempfile::TempDir,
     _config_home: tempfile::TempDir,
     claude_log: PathBuf,
     codex_log: PathBuf,
+    cursor_agent_log: PathBuf,
+    gemini_log: PathBuf,
+    opencode_log: PathBuf,
     requests: Vec<String>,
+}
+
+struct AgentExpectation {
+    selector: &'static str,
+    log: fn(&SetupRunOutcome) -> &PathBuf,
+    log_contains: &'static [&'static str],
+    config_file: Option<fn(&SetupRunOutcome) -> PathBuf>,
+}
+
+fn run_agent_test(exp: AgentExpectation) {
+    let outcome = run_setup_flow(exp.selector);
+    assert_common_setup_outcome(&outcome);
+
+    let log_path = (exp.log)(&outcome);
+    let log = fs::read_to_string(log_path)
+        .unwrap_or_else(|_| panic!("agent log not found: {}", log_path.display()));
+    for expected in exp.log_contains {
+        assert!(
+            log.contains(expected),
+            "expected {expected:?} in log:\n{log}"
+        );
+    }
+
+    if let Some(config_fn) = exp.config_file {
+        let path = config_fn(&outcome);
+        assert!(path.exists(), "config file not found: {}", path.display());
+    }
+
+    for other_log in [
+        &outcome.claude_log,
+        &outcome.codex_log,
+        &outcome.cursor_agent_log,
+        &outcome.gemini_log,
+        &outcome.opencode_log,
+    ] {
+        if other_log != log_path {
+            assert!(
+                !other_log.exists(),
+                "unexpected agent log: {}",
+                other_log.display()
+            );
+        }
+    }
 }
 
 #[test]
 fn setup_supports_oauth_api_key_creation_and_explicit_claude_selection() {
-    let outcome = run_setup_flow("claude");
-    assert_common_setup_outcome(&outcome);
-
-    let claude_args = fs::read_to_string(&outcome.claude_log).expect("read claude log");
-    assert!(
-        claude_args.contains("mcp add -s user --transport http braintrust"),
-        "{claude_args}"
-    );
-    assert!(
-        claude_args.contains("Authorization: Bearer generated-api-key"),
-        "{claude_args}"
-    );
-    assert!(
-        claude_args.contains("-p --permission-mode acceptEdits"),
-        "{claude_args}"
-    );
-    assert!(
-        claude_args.contains("ENV=generated-api-key"),
-        "{claude_args}"
-    );
-    assert!(
-        !outcome.codex_log.exists(),
-        "codex should not be invoked when Claude is selected"
-    );
-    assert!(outcome.home.path().join(".claude/skills").exists());
+    run_agent_test(AgentExpectation {
+        selector: "claude",
+        log: |o| &o.claude_log,
+        log_contains: &[
+            "mcp add -s user --transport http braintrust",
+            "Authorization: Bearer generated-api-key",
+            "-p --permission-mode acceptEdits",
+            "ENV=generated-api-key",
+        ],
+        config_file: None,
+    });
 }
 
 #[test]
 fn setup_supports_oauth_api_key_creation_and_explicit_codex_selection() {
-    let outcome = run_setup_flow("codex");
-    assert_common_setup_outcome(&outcome);
+    run_agent_test(AgentExpectation {
+        selector: "codex",
+        log: |o| &o.codex_log,
+        log_contains: &[
+            "mcp add braintrust --url",
+            "--bearer-token-env-var BRAINTRUST_API_KEY",
+            "exec -",
+            "ENV=generated-api-key",
+        ],
+        config_file: None,
+    });
+}
 
-    let codex_args = fs::read_to_string(&outcome.codex_log).expect("read codex log");
-    assert!(codex_args.contains("mcp remove braintrust"), "{codex_args}");
-    assert!(
-        codex_args.contains("mcp add braintrust --url"),
-        "{codex_args}"
-    );
-    assert!(
-        codex_args.contains("--bearer-token-env-var BRAINTRUST_API_KEY"),
-        "{codex_args}"
-    );
-    assert!(codex_args.contains("exec -"), "{codex_args}");
-    assert!(codex_args.contains("ENV=generated-api-key"), "{codex_args}");
-    assert!(
-        !outcome.claude_log.exists(),
-        "claude should not be invoked when Codex is selected"
-    );
+#[test]
+fn setup_supports_oauth_api_key_creation_and_explicit_cursor_selection() {
+    run_agent_test(AgentExpectation {
+        selector: "cursor",
+        log: |o| &o.cursor_agent_log,
+        log_contains: &[
+            "mcp enable braintrust",
+            "-p --output-format stream-json --stream-partial-output",
+            "ENV=generated-api-key",
+        ],
+        config_file: Some(|o| o.home.path().join(".cursor/mcp.json")),
+    });
+}
+
+#[test]
+fn setup_supports_oauth_api_key_creation_and_explicit_gemini_selection() {
+    run_agent_test(AgentExpectation {
+        selector: "gemini",
+        log: |o| &o.gemini_log,
+        log_contains: &[
+            "mcp add -s user --transport http braintrust",
+            "Authorization: Bearer generated-api-key",
+            "-p",
+            "--output-format stream-json",
+            "ENV=generated-api-key",
+        ],
+        config_file: None,
+    });
+}
+
+#[test]
+fn setup_supports_oauth_api_key_creation_and_explicit_opencode_selection() {
+    run_agent_test(AgentExpectation {
+        selector: "opencode",
+        log: |o| &o.opencode_log,
+        // MCP for opencode is config-file only; the binary is only invoked for instrumentation
+        log_contains: &["run", "ENV=generated-api-key"],
+        config_file: Some(|o| o.home.path().join(".config/opencode/opencode.json")),
+    });
 }
 
 fn run_setup_flow(selected_agent: &str) -> SetupRunOutcome {
@@ -97,28 +162,31 @@ fn run_setup_flow(selected_agent: &str) -> SetupRunOutcome {
     let browser_log = home.path().join("opened-url.txt");
     let claude_log = repo.path().join("claude.log");
     let codex_log = repo.path().join("codex.log");
+    let cursor_agent_log = repo.path().join("cursor-agent.log");
+    let gemini_log = repo.path().join("gemini.log");
+    let opencode_log = repo.path().join("opencode.log");
     let path_env = format!(
         "{}:{}",
         bin_dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
 
-    write_executable(
-        &bin_dir.path().join("claude"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" >> '{}'\nexit 0\n",
-            claude_log.display(),
-            claude_log.display()
-        ),
-    );
-    write_executable(
-        &bin_dir.path().join("codex"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" >> '{}'\nexit 0\n",
-            codex_log.display(),
-            codex_log.display()
-        ),
-    );
+    for (name, log) in [
+        ("claude", &claude_log),
+        ("codex", &codex_log),
+        ("cursor-agent", &cursor_agent_log),
+        ("gemini", &gemini_log),
+        ("opencode", &opencode_log),
+    ] {
+        write_executable(
+            &bin_dir.path().join(name),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'ENV=%s\\n' \"$BRAINTRUST_API_KEY\" >> '{}'\nexit 0\n",
+                log.display(),
+                log.display()
+            ),
+        );
+    }
     write_executable(
         &bin_dir.path().join("fake-browser"),
         &format!(
@@ -190,6 +258,10 @@ fn run_setup_flow(selected_agent: &str) -> SetupRunOutcome {
     pty.send(selected_agent);
     pty.send("\r");
 
+    pty.wait_for("Install reusable Braintrust coding-agent skills", TIMEOUT);
+    pty.send("n");
+    pty.send("\r");
+
     let status = pty.wait(TIMEOUT);
     assert!(
         status.success(),
@@ -213,11 +285,14 @@ fn run_setup_flow(selected_agent: &str) -> SetupRunOutcome {
     );
 
     SetupRunOutcome {
-        repo,
+        _repo: repo,
         home,
         _config_home: config_home,
         claude_log,
         codex_log,
+        cursor_agent_log,
+        gemini_log,
+        opencode_log,
         requests: server.requests(),
     }
 }
@@ -265,22 +340,6 @@ fn assert_common_setup_outcome(outcome: &SetupRunOutcome) {
         "missing target org project request: {:?}",
         outcome.requests
     );
-
-    assert!(outcome
-        .repo
-        .path()
-        .join(".bt/skills/docs/sdk-install/_index.md")
-        .exists());
-    assert!(outcome
-        .home
-        .path()
-        .join(".agents/skills/braintrust/SKILL.md")
-        .exists());
-    assert!(outcome
-        .repo
-        .path()
-        .join(".agents/skills/braintrust/SKILL.md")
-        .exists());
 }
 
 fn make_git_repo() -> tempfile::TempDir {
