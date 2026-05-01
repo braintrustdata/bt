@@ -313,7 +313,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
                 );
             }
         };
-        match resolve_project_names(&winners, projects) {
+        match resolve_project_names(&materializable, projects) {
             Ok(names) => names,
             Err(err) => {
                 spinner.finish_and_clear();
