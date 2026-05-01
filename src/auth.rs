@@ -597,14 +597,12 @@ fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
 pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     let mut store = load_auth_store()?;
     let mut auth_base = base.clone();
-    let cfg_org = if trimmed(base.profile.as_deref()).is_none()
-        && trimmed(base.org_name.as_deref()).is_none()
+    let cfg_org = if crate::config::trimmed_option(base.profile.as_deref()).is_none()
+        && crate::config::trimmed_option(base.org_name.as_deref()).is_none()
     {
         let cfg = crate::config::load().unwrap_or_default();
-        auth_base.profile = cfg.profile.and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        });
+        auth_base.profile =
+            crate::config::trimmed_option(cfg.profile.as_deref()).map(str::to_string);
         auth_base.profile.is_none().then_some(cfg.org).flatten()
     } else {
         None
@@ -803,10 +801,6 @@ where
         org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
         is_oauth: false,
     })
-}
-
-fn trimmed(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {

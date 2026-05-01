@@ -144,8 +144,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     };
 
     let mut cfg = config::load_file(&path);
-    let config_profile = profile_name.as_deref().or(base.profile.as_deref());
-    apply_switch_config(&mut cfg, config_profile, &org_name, &project);
+    let config_profile =
+        config::trimmed_option(profile_name.as_deref().or(base.profile.as_deref()))
+            .map(str::to_string);
+    apply_switch_config(&mut cfg, config_profile.as_deref(), &org_name, &project);
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 
@@ -236,10 +238,9 @@ fn apply_switch_config(
     org_name: &str,
     project: &api::Project,
 ) {
-    cfg.profile = profile_name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    if let Some(profile_name) = config::trimmed_option(profile_name) {
+        cfg.profile = Some(profile_name.to_string());
+    }
     cfg.org = Some(org_name.to_string());
     cfg.project = Some(project.name.clone());
     cfg.project_id = Some(project.id.clone());
@@ -518,6 +519,25 @@ mod tests {
         assert_eq!(cfg.org.as_deref(), Some("acme-org"));
         assert_eq!(cfg.project.as_deref(), Some("my-project"));
         assert_eq!(cfg.project_id.as_deref(), Some("proj_123"));
+    }
+
+    #[test]
+    fn apply_switch_config_preserves_existing_profile_when_no_new_profile() {
+        let mut cfg = config::Config {
+            profile: Some("work".to_string()),
+            ..Default::default()
+        };
+        let project = api::Project {
+            id: "proj_456".to_string(),
+            name: "next-project".to_string(),
+            org_id: "org_123".to_string(),
+            description: None,
+        };
+
+        apply_switch_config(&mut cfg, None, "acme-org", &project);
+
+        assert_eq!(cfg.profile.as_deref(), Some("work"));
+        assert_eq!(cfg.project.as_deref(), Some("next-project"));
     }
 
     #[test]

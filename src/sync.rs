@@ -532,16 +532,19 @@ struct JsonlPartWriter {
 }
 
 pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
-    match args.command {
+    let command = match args.command {
+        SyncCommand::Status(status) => return run_status(base.json, status),
+        command => command,
+    };
+
+    let ctx = login(&base).await?;
+    let client = ApiClient::new(&ctx)?;
+    let project = base.project.clone().or_else(|| {
+        crate::config::configured_project_for_context(&base, ctx.login.org_name().as_deref())
+    });
+
+    match command {
         SyncCommand::Pull(pull) => {
-            let ctx = login(&base).await?;
-            let client = ApiClient::new(&ctx)?;
-            let project = base.project.clone().or_else(|| {
-                crate::config::configured_project_for_context(
-                    &base,
-                    ctx.login.org_name().as_deref(),
-                )
-            });
             run_pull(
                 base.json,
                 base.verbose,
@@ -553,17 +556,9 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
             .await
         }
         SyncCommand::Push(push) => {
-            let ctx = login(&base).await?;
-            let client = ApiClient::new(&ctx)?;
-            let project = base.project.clone().or_else(|| {
-                crate::config::configured_project_for_context(
-                    &base,
-                    ctx.login.org_name().as_deref(),
-                )
-            });
             run_push(base.json, &ctx, &client, project.as_deref(), push).await
         }
-        SyncCommand::Status(status) => run_status(base.json, status),
+        SyncCommand::Status(_) => unreachable!(),
     }
 }
 

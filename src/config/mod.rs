@@ -197,7 +197,7 @@ fn config_matches_context(base: &BaseArgs, cfg: &Config, resolved_org: Option<&s
     }
 }
 
-fn trimmed_option(value: Option<&str>) -> Option<&str> {
+pub(crate) fn trimmed_option(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
