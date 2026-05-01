@@ -441,7 +441,7 @@ fn prepare_pipeline_records(rows: Vec<Value>) -> Result<Vec<records::PreparedDat
         }
     }
 
-    records::prepare_upload_records(objects)
+    records::prepare_records(objects, "id", false)
         .context("dataset pipeline transform produced invalid dataset rows")
 }
 

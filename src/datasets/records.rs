@@ -95,12 +95,6 @@ pub(crate) fn load_refresh_records(
     prepare_records(raw, id_field, true)
 }
 
-pub(crate) fn prepare_upload_records(
-    raw_records: Vec<Map<String, Value>>,
-) -> Result<Vec<PreparedDatasetRecord>> {
-    prepare_records(raw_records, "id", false)
-}
-
 fn load_required_record_objects(
     input_path: Option<&Path>,
     inline_rows: Option<&str>,
@@ -212,7 +206,7 @@ fn expect_record_object(value: Value, record_number: Option<usize>) -> Result<Ma
     }
 }
 
-fn prepare_records(
+pub(crate) fn prepare_records(
     raw_records: Vec<Map<String, Value>>,
     id_field: &str,
     require_ids: bool,
