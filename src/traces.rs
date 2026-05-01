@@ -1028,6 +1028,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
                 &object_ref_arg,
                 next_cursor.as_deref(),
                 profile_flag,
+                args.limit,
             ),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1191,6 +1192,7 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
                 &trace_id,
                 next_cursor.as_deref(),
                 profile_flag,
+                args.limit,
             ),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -4844,16 +4846,22 @@ fn logs_hints(
     object_ref: &str,
     next_cursor: Option<&str>,
     profile: Option<&str>,
+    limit: usize,
 ) -> Vec<String> {
     let mut hints = vec![
         "Rows are truncated by preview_length; fetch a single span for full content.".to_string(),
         "Use --json to get machine-readable envelopes for agent workflows.".to_string(),
         "Write large responses to a file to preserve full output context.".to_string(),
     ];
+    let limit_suffix = if limit != 50 {
+        format!(" --limit {limit}")
+    } else {
+        String::new()
+    };
     if has_more {
         if let Some(cursor) = next_cursor {
             hints.push(format!(
-                "Next page: bt view logs{} --object-ref {object_ref} --cursor {cursor}",
+                "Next page: bt view logs{} --object-ref {object_ref} --cursor {cursor}{limit_suffix}",
                 profile_flag_suffix(profile)
             ));
         } else {
@@ -4871,6 +4879,7 @@ fn trace_hints(
     trace_id: &str,
     next_cursor: Option<&str>,
     profile: Option<&str>,
+    limit: usize,
 ) -> Vec<String> {
     let mut hints = vec![
         format!(
@@ -4879,10 +4888,15 @@ fn trace_hints(
         ),
         "Write output to a file for long traces.".to_string(),
     ];
+    let limit_suffix = if limit != 50 {
+        format!(" --limit {limit}")
+    } else {
+        String::new()
+    };
     if has_more {
         if let Some(cursor) = next_cursor {
             hints.push(format!(
-                "Next page: bt view trace{} --object-ref {object_ref} --trace-id {trace_id} --cursor {cursor}",
+                "Next page: bt view trace{} --object-ref {object_ref} --trace-id {trace_id} --cursor {cursor}{limit_suffix}",
                 profile_flag_suffix(profile)
             ));
         } else {
@@ -4934,9 +4948,14 @@ fn print_logs_text(
     }
     println!("\nTruncated fields use preview_length={preview_length}.");
     if let Some(cursor) = next_cursor {
+        let limit_suffix = if limit != 50 {
+            format!(" --limit {limit}")
+        } else {
+            String::new()
+        };
         println!("next_cursor: {cursor}");
         println!(
-            "next: bt view logs{} --object-ref {object_ref} --cursor {cursor} --non-interactive",
+            "next: bt view logs{} --object-ref {object_ref} --cursor {cursor} --non-interactive{limit_suffix}",
             profile_flag_suffix(profile)
         );
     } else {
@@ -4980,9 +4999,14 @@ fn print_trace_text(
         object_ref
     );
     if let Some(cursor) = next_cursor {
+        let limit_suffix = if limit != 50 {
+            format!(" --limit {limit}")
+        } else {
+            String::new()
+        };
         println!("next_cursor: {cursor}");
         println!(
-            "next: bt view trace{} --object-ref {} --trace-id {} --cursor {} --non-interactive",
+            "next: bt view trace{} --object-ref {} --trace-id {} --cursor {} --non-interactive{limit_suffix}",
             profile_flag_suffix(profile),
             object_ref,
             trace_id,
