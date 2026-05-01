@@ -48,6 +48,8 @@ impl std::error::Error for HttpError {}
 #[derive(Debug, Deserialize)]
 pub struct BtqlResponse<T> {
     pub data: Vec<T>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 impl ApiClient {
@@ -69,6 +71,10 @@ impl ApiClient {
 
     pub fn api_key(&self) -> &str {
         &self.api_key
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     pub fn org_name(&self) -> &str {
@@ -223,6 +229,22 @@ impl ApiClient {
     }
 
     pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
+        self.btql_with_query(query).await
+    }
+
+    pub async fn btql_structured<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
+    where
+        T: DeserializeOwned,
+        Q: Serialize + ?Sized,
+    {
+        self.btql_with_query(query).await
+    }
+
+    async fn btql_with_query<T, Q>(&self, query: &Q) -> Result<BtqlResponse<T>>
+    where
+        T: DeserializeOwned,
+        Q: Serialize + ?Sized,
+    {
         let body = json!({
             "query": query,
             "fmt": "json",
@@ -267,4 +289,30 @@ pub async fn put_signed_url(
         return Err(HttpError { status, body }.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn btql_response_deserializes_optional_cursor() {
+        let response: BtqlResponse<serde_json::Value> = serde_json::from_value(json!({
+            "data": [],
+            "cursor": "cursor-1",
+        }))
+        .expect("btql response");
+
+        assert_eq!(response.cursor.as_deref(), Some("cursor-1"));
+    }
+
+    #[test]
+    fn btql_response_cursor_defaults_to_none() {
+        let response: BtqlResponse<serde_json::Value> = serde_json::from_value(json!({
+            "data": [],
+        }))
+        .expect("btql response");
+
+        assert_eq!(response.cursor, None);
+    }
 }

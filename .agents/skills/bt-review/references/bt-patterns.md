@@ -278,7 +278,10 @@ impl ViewArgs {
 }
 ```
 
-**Key rule**: Positional takes precedence over flag. Both are optional (falls back to interactive).
+**Key rules**:
+
+- Every positional argument MUST have a corresponding `--flag` alternative. Bare positionals without a flag equivalent are not allowed — scripts and automation must be able to pass every argument by name.
+- Positional takes precedence over flag. Both are optional (falls back to interactive).
 
 ### Project resolution pattern
 

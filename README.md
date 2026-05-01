@@ -118,6 +118,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt sql`         | Run SQL queries against Braintrust                                 |
 | `bt view`        | View logs, traces, and spans                                       |
 | `bt projects`    | Manage projects (list, create, view, delete)                       |
+| `bt datasets`    | Manage remote datasets (list, create, update, view, delete)        |
 | `bt prompts`     | Manage prompts (list, view, delete)                                |
 | `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
 | `bt self update` | Update bt in-place                                                 |
@@ -156,6 +157,25 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt eval --first 20 qa.eval.ts` — run the first 20 examples and clearly label the summary as a non-final smoke run.
 - `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
 - If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
+
+## `bt datasets`
+
+- `bt datasets` works directly against remote Braintrust datasets — no local `bt sync` artifact flow is required.
+- `bt datasets create my-dataset` — create an empty remote dataset in the current project.
+- `bt datasets create my-dataset --description "Dataset for smoke tests"` — create a dataset with a description.
+- `bt datasets create my-dataset --file records.jsonl` — create the remote dataset and seed it from a JSON/JSONL file.
+- `cat records.jsonl | bt datasets create my-dataset` — create the dataset and seed it from stdin.
+- `bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'` — create the dataset from inline JSON rows.
+- `bt datasets create my-dataset --rows '[{"input":{"text":"hi"},"expected":"hello"}]'` — create a dataset when rows do not include `id`; bt auto-generates record IDs.
+- `bt datasets update my-dataset --file records.jsonl` — upsert rows by stable record id.
+- `bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `update`.
+- `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id` — alias for `update` with explicit id path (fails if the dataset does not exist, and does not delete remote rows missing from the input).
+- `bt datasets view my-dataset` — show dataset metadata and previewed row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust, `--all-rows` to load every row, `--full` for exact values, or `bt sync pull dataset:<id>` to export full rows to files.
+- `update`/`add`/`refresh` require explicit stable IDs via `id` or `--id-field`.
+- `--id-field` uses dot-separated paths; escape literal dots as `\.` and literal backslashes as `\\`.
+- `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
+- Accepted top-level record fields are `id`, `input`, `expected`, `metadata`, `tags`, and `origin` (plus the root field referenced by `--id-field`, if different).
+- Inputs may also be a JSON object with a top-level `rows` array, matching `bt datasets view --json`; sibling wrapper fields are ignored, and each row inside `rows` is still validated strictly.
 
 ## `bt sql`
 

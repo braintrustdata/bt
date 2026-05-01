@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "bt"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -535,6 +535,7 @@ dependencies = [
  "toml",
  "unicode-width 0.1.14",
  "urlencoding",
+ "uuid",
  "windows-sys 0.59.0",
 ]
 

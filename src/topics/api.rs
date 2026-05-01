@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use urlencoding::encode;
 
-use crate::{http::ApiClient, projects::context::ProjectContext};
+use crate::{http::ApiClient, project_context::ProjectContext};
 
 const DEFAULT_TOPIC_AUTOMATION_NAME: &str = "Topics";
 const DEFAULT_TOPIC_AUTOMATION_DESCRIPTION: &str =

@@ -1,0 +1,2 @@
+{"id":"case-1","input":{"prompt":"one"},"expected":"A2","metadata":{"topic":"math"},"tags":["smoke","updated"],"origin":{"source":"refresh"}}
+{"id":"case-3","input":{"prompt":"three"},"expected":"C1"}
