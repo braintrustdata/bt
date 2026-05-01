@@ -1,8 +1,9 @@
 use std::io::IsTerminal;
 
 use anyhow::{bail, Result};
-use dialoguer::console::Term;
+use dialoguer::console::{style, Key, Term};
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 
 use crate::{
     http::ApiClient,
@@ -74,6 +75,169 @@ pub fn fuzzy_select_opt<T: ToString>(
     Ok(selection)
 }
 
+enum PinnedSelectResult {
+    /// User selected the pinned item; the String is what they typed in the search box.
+    Pinned(String),
+    /// User selected the item at this index in the original (unfiltered) items slice.
+    Item(usize),
+}
+
+/// Fuzzy select where the first item is always pinned (visible regardless of search text).
+///
+/// `items` are the filterable choices. `pinned_label` is always shown at position 0.
+/// `default_sel` is the initially-highlighted row (0 = pinned, k = items[k-1]).
+fn fuzzy_select_with_pinned_first(
+    prompt: &str,
+    items: &[String],
+    pinned_label: &str,
+    max_length: usize,
+    default_sel: usize,
+) -> Result<Option<PinnedSelectResult>> {
+    let Some(term) = super::prompt_term() else {
+        bail!("interactive mode requires TTY");
+    };
+
+    let matcher = SkimMatcherV2::default();
+    let mut search_term = String::new();
+    let mut sel = default_sel;
+    let mut starting_row: usize = 0;
+    // max visible filtered items = max_length - 1 (one slot reserved for pinned)
+    let max_filtered_visible = max_length.saturating_sub(1);
+    let mut lines_drawn: usize = 0;
+
+    term.hide_cursor()?;
+
+    loop {
+        // Build the filtered+sorted list of (original_index, display_name).
+        let filtered: Vec<(usize, &String)> = if search_term.is_empty() {
+            items.iter().enumerate().collect()
+        } else {
+            let mut scored: Vec<(i64, usize, &String)> = items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    matcher
+                        .fuzzy_match(item, &search_term)
+                        .map(|score| (score, i, item))
+                })
+                .collect();
+            scored.sort_unstable_by(|(s1, ..), (s2, ..)| s2.cmp(s1));
+            scored.into_iter().map(|(_, i, item)| (i, item)).collect()
+        };
+
+        let total = 1 + filtered.len(); // 1 for the always-visible pinned item
+
+        // Clamp sel and starting_row to valid ranges.
+        if sel >= total {
+            sel = total.saturating_sub(1);
+        }
+        let max_starting_row = filtered.len().saturating_sub(max_filtered_visible);
+        if starting_row > max_starting_row {
+            starting_row = max_starting_row;
+        }
+
+        let visible_filtered =
+            max_filtered_visible.min(filtered.len().saturating_sub(starting_row));
+
+        // Clear lines from the previous render before drawing the new frame.
+        if lines_drawn > 0 {
+            term.clear_last_lines(lines_drawn)?;
+        }
+
+        // Prompt line.
+        term.write_line(&format!(
+            "{} {} › {}",
+            style("?").cyan().bold(),
+            prompt,
+            search_term
+        ))?;
+
+        // Pinned item (always at the top).
+        if sel == 0 {
+            term.write_line(&format!(
+                "  {} {}",
+                style("❯").green().bold(),
+                style(pinned_label).green()
+            ))?;
+        } else {
+            term.write_line(&format!("    {}", pinned_label))?;
+        }
+
+        // Filtered project items.
+        for display_idx in 0..visible_filtered {
+            let filtered_idx = starting_row + display_idx;
+            let (_, item) = filtered[filtered_idx];
+            // sel == 0 is pinned; sel == k means filtered[k-1] is selected.
+            if sel == filtered_idx + 1 {
+                term.write_line(&format!(
+                    "  {} {}",
+                    style("❯").green().bold(),
+                    style(item.as_str()).green()
+                ))?;
+            } else {
+                term.write_line(&format!("    {}", item))?;
+            }
+        }
+
+        term.flush()?;
+        lines_drawn = 1 + 1 + visible_filtered; // prompt + pinned + filtered
+
+        match term.read_key()? {
+            Key::Escape => {
+                term.clear_last_lines(lines_drawn)?;
+                term.show_cursor()?;
+                return Ok(None);
+            }
+            Key::Enter => {
+                term.clear_last_lines(lines_drawn)?;
+                term.show_cursor()?;
+                if sel == 0 {
+                    return Ok(Some(PinnedSelectResult::Pinned(search_term)));
+                }
+                let (orig_idx, _) = filtered[sel - 1];
+                return Ok(Some(PinnedSelectResult::Item(orig_idx)));
+            }
+            Key::ArrowUp | Key::BackTab => {
+                if sel == 0 {
+                    // Wrap from pinned to the last filtered item.
+                    sel = total - 1;
+                    if sel > 0 {
+                        starting_row =
+                            (sel - 1).saturating_sub(max_filtered_visible.saturating_sub(1));
+                    }
+                } else {
+                    sel -= 1;
+                    if sel == 0 {
+                        starting_row = 0;
+                    } else if sel - 1 < starting_row {
+                        starting_row = sel - 1;
+                    }
+                }
+            }
+            Key::ArrowDown | Key::Tab => {
+                sel = (sel + 1) % total;
+                if sel == 0 || sel == 1 {
+                    // Wrapped to pinned, or moved from pinned to first filtered item.
+                    starting_row = 0;
+                } else if sel > starting_row + max_filtered_visible {
+                    starting_row += 1;
+                }
+            }
+            Key::Backspace if !search_term.is_empty() => {
+                search_term.pop();
+                sel = 0;
+                starting_row = 0;
+            }
+            Key::Char(c) if !c.is_ascii_control() => {
+                search_term.push(c);
+                sel = 0;
+                starting_row = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Interactive selector for project data.
 pub async fn select_project(
     client: &ApiClient,
@@ -84,50 +248,78 @@ pub async fn select_project(
     let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let names = project_selection_labels(&projects, mode);
-    let default = default_project_selection(&projects, current, mode)?;
     let label = select_label.unwrap_or("Select project");
-    let selection = fuzzy_select(label, &names, default)?;
 
-    if mode_allows_create(mode) && selection == 0 {
-        let default_name = default_new_project_name();
-        let name: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Project name")
-            .default(default_name)
-            .interact_text_on(
-                &super::prompt_term()
-                    .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?,
-            )?;
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            bail!("project name cannot be empty");
-        }
-        return match create_project_checked(client, trimmed).await? {
-            CreateProjectOutcome::Created(project) | CreateProjectOutcome::Existing(project) => {
-                Ok(project)
+    if mode_allows_create(mode) {
+        let names = project_display_names(&projects, mode);
+        let default_sel = default_project_selection(&projects, current, mode)?;
+
+        return match fuzzy_select_with_pinned_first(
+            label,
+            &names,
+            "+ Create new project",
+            12,
+            default_sel,
+        )? {
+            None => bail!("selection cancelled by user"),
+            Some(PinnedSelectResult::Item(orig_idx)) => Ok(projects[orig_idx].clone()),
+            Some(PinnedSelectResult::Pinned(search_term)) => {
+                let name = if search_term.trim().is_empty() {
+                    // Nothing typed — fall back to prompting.
+                    let default_name = default_new_project_name();
+                    let n: String = Input::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Project name")
+                        .default(default_name)
+                        .interact_text_on(
+                            &super::prompt_term()
+                                .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?,
+                        )?;
+                    n
+                } else {
+                    search_term.trim().to_string()
+                };
+                if name.trim().is_empty() {
+                    bail!("project name cannot be empty");
+                }
+                match create_project_checked(client, name.trim()).await? {
+                    CreateProjectOutcome::Created(project)
+                    | CreateProjectOutcome::Existing(project) => Ok(project),
+                }
             }
         };
     }
 
+    // ExistingOnly: use the standard fuzzy select.
+    let names = project_selection_labels(&projects, mode);
+    let default = default_project_selection(&projects, current, mode)?;
+    let selection = fuzzy_select(label, &names, default)?;
     let project_index = selected_project_index(selection, mode);
     Ok(projects[project_index].clone())
 }
 
-fn project_selection_labels(projects: &[api::Project], mode: ProjectSelectMode) -> Vec<String> {
-    if mode_allows_create(mode) {
-        let show_default_project_note =
-            matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
-                && projects.len() == 1
-                && projects[0].name == "My Project";
+/// Display names for the filterable project list (without the pinned create option).
+fn project_display_names(projects: &[api::Project], mode: ProjectSelectMode) -> Vec<String> {
+    let show_default_project_note =
+        matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
+            && projects.len() == 1
+            && projects[0].name == "My Project";
 
-        let mut labels = vec!["+ Create new project".to_string()];
-        labels.extend(projects.iter().map(|project| {
+    projects
+        .iter()
+        .map(|project| {
             if show_default_project_note && project.name == "My Project" {
                 "My Project (default starter project)".to_string()
             } else {
                 project.name.clone()
             }
-        }));
+        })
+        .collect()
+}
+
+fn project_selection_labels(projects: &[api::Project], mode: ProjectSelectMode) -> Vec<String> {
+    if mode_allows_create(mode) {
+        let mut labels = vec!["+ Create new project".to_string()];
+        labels.extend(project_display_names(projects, mode));
         return labels;
     }
     projects
@@ -187,8 +379,8 @@ fn default_new_project_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_new_project_name, default_project_selection, project_selection_labels,
-        selected_project_index, ProjectSelectMode,
+        default_new_project_name, default_project_selection, project_display_names,
+        project_selection_labels, selected_project_index, ProjectSelectMode,
     };
     use crate::projects::api::Project;
 
@@ -309,5 +501,35 @@ mod tests {
             selected_project_index(1, ProjectSelectMode::ExistingOnly),
             1
         );
+    }
+
+    #[test]
+    fn project_display_names_returns_names_without_create_option() {
+        let names = project_display_names(
+            &[project("alpha"), project("beta")],
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+        );
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn project_display_names_annotates_my_project_when_it_is_the_only_project() {
+        let names = project_display_names(
+            &[project("My Project")],
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+        );
+        assert_eq!(
+            names,
+            vec!["My Project (default starter project)".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_display_names_hides_note_when_there_are_multiple_projects() {
+        let names = project_display_names(
+            &[project("My Project"), project("alpha")],
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
+        );
+        assert_eq!(names, vec!["My Project".to_string(), "alpha".to_string()]);
     }
 }
