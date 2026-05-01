@@ -5,6 +5,8 @@ use dialoguer::console::{style, Key, Term};
 use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 
+const MAX_VISIBLE_ITEMS: usize = 12;
+
 use crate::{
     http::ApiClient,
     projects::{
@@ -69,7 +71,7 @@ pub fn fuzzy_select_opt<T: ToString>(
         .with_prompt(prompt)
         .items(&labels)
         .default(default)
-        .max_length(12)
+        .max_length(MAX_VISIBLE_ITEMS)
         .interact_on_opt(&term)?;
 
     Ok(selection)
@@ -106,6 +108,14 @@ fn fuzzy_select_with_pinned_first(
     let mut lines_drawn: usize = 0;
 
     term.hide_cursor()?;
+    // Restore the cursor on any exit path (return, ?, or SIGINT drop).
+    struct ShowCursorOnDrop<'a>(&'a Term);
+    impl Drop for ShowCursorOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.show_cursor();
+        }
+    }
+    let _guard = ShowCursorOnDrop(&term);
 
     loop {
         // Build the filtered+sorted list of (original_index, display_name).
@@ -183,14 +193,12 @@ fn fuzzy_select_with_pinned_first(
         lines_drawn = 1 + 1 + visible_filtered; // prompt + pinned + filtered
 
         match term.read_key()? {
-            Key::Escape => {
+            Key::Escape | Key::CtrlC => {
                 term.clear_last_lines(lines_drawn)?;
-                term.show_cursor()?;
                 return Ok(None);
             }
             Key::Enter => {
                 term.clear_last_lines(lines_drawn)?;
-                term.show_cursor()?;
                 if sel == 0 {
                     return Ok(Some(PinnedSelectResult::Pinned(search_term)));
                 }
@@ -258,7 +266,7 @@ pub async fn select_project(
             label,
             &names,
             "+ Create new project",
-            12,
+            MAX_VISIBLE_ITEMS,
             default_sel,
         )? {
             None => bail!("selection cancelled by user"),
@@ -290,11 +298,10 @@ pub async fn select_project(
     }
 
     // ExistingOnly: use the standard fuzzy select.
-    let names = project_selection_labels(&projects, mode);
+    let names = project_selection_labels(&projects);
     let default = default_project_selection(&projects, current, mode)?;
     let selection = fuzzy_select(label, &names, default)?;
-    let project_index = selected_project_index(selection, mode);
-    Ok(projects[project_index].clone())
+    Ok(projects[selection].clone())
 }
 
 /// Display names for the filterable project list (without the pinned create option).
@@ -316,12 +323,7 @@ fn project_display_names(projects: &[api::Project], mode: ProjectSelectMode) -> 
         .collect()
 }
 
-fn project_selection_labels(projects: &[api::Project], mode: ProjectSelectMode) -> Vec<String> {
-    if mode_allows_create(mode) {
-        let mut labels = vec!["+ Create new project".to_string()];
-        labels.extend(project_display_names(projects, mode));
-        return labels;
-    }
+fn project_selection_labels(projects: &[api::Project]) -> Vec<String> {
     projects
         .iter()
         .map(|project| project.name.clone())
@@ -352,14 +354,6 @@ fn default_project_selection(
         .unwrap_or(0))
 }
 
-fn selected_project_index(selection: usize, mode: ProjectSelectMode) -> usize {
-    if mode_allows_create(mode) {
-        selection - 1
-    } else {
-        selection
-    }
-}
-
 fn mode_allows_create(mode: ProjectSelectMode) -> bool {
     matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
 }
@@ -380,7 +374,7 @@ fn default_new_project_name() -> String {
 mod tests {
     use super::{
         default_new_project_name, default_project_selection, project_display_names,
-        project_selection_labels, selected_project_index, ProjectSelectMode,
+        project_selection_labels, ProjectSelectMode,
     };
     use crate::projects::api::Project;
 
@@ -421,52 +415,9 @@ mod tests {
     }
 
     #[test]
-    fn allow_create_adds_create_option() {
-        let labels = project_selection_labels(
-            &[project("alpha")],
-            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
-        );
-        assert_eq!(
-            labels,
-            vec!["+ Create new project".to_string(), "alpha".to_string()]
-        );
-    }
-
-    #[test]
-    fn existing_only_does_not_add_create_option() {
-        let labels = project_selection_labels(&[project("alpha")], ProjectSelectMode::ExistingOnly);
+    fn project_selection_labels_returns_project_names() {
+        let labels = project_selection_labels(&[project("alpha")]);
         assert_eq!(labels, vec!["alpha".to_string()]);
-    }
-
-    #[test]
-    fn allow_create_with_default_project_note_annotates_my_project_when_it_is_the_only_project() {
-        let labels = project_selection_labels(
-            &[project("My Project")],
-            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
-        );
-        assert_eq!(
-            labels,
-            vec![
-                "+ Create new project".to_string(),
-                "My Project (default starter project)".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn allow_create_with_default_project_note_hides_note_when_there_are_multiple_projects() {
-        let labels = project_selection_labels(
-            &[project("My Project"), project("alpha")],
-            ProjectSelectMode::AllowCreateWithDefaultProjectNote,
-        );
-        assert_eq!(
-            labels,
-            vec![
-                "+ Create new project".to_string(),
-                "My Project".to_string(),
-                "alpha".to_string(),
-            ]
-        );
     }
 
     #[test]
@@ -485,22 +436,6 @@ mod tests {
     #[test]
     fn default_new_project_name_has_project_suffix() {
         assert!(default_new_project_name().ends_with("-project"));
-    }
-
-    #[test]
-    fn allow_create_project_selection_skips_create_row() {
-        assert_eq!(
-            selected_project_index(1, ProjectSelectMode::AllowCreateWithDefaultProjectNote),
-            0
-        );
-    }
-
-    #[test]
-    fn existing_only_project_selection_uses_same_index() {
-        assert_eq!(
-            selected_project_index(1, ProjectSelectMode::ExistingOnly),
-            1
-        );
     }
 
     #[test]
