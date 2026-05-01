@@ -4,12 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
-use braintrust_sdk_rust::Logs3BatchUploader;
 use clap::{Args, Subcommand};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use urlencoding::encode;
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::args::BaseArgs;
 use crate::auth::{login, resolved_runner_env, LoginContext};
@@ -18,6 +16,8 @@ use crate::js_runner::{build_js_runner_command, materialize_runner_script_in_cwd
 use crate::projects::api::{create_project, get_project_by_name, Project};
 use crate::sync::discovery::{discover_project_log_refs, ProjectLogRefScope};
 use crate::sync::{read_jsonl_values, write_jsonl_value, write_jsonl_values};
+
+use super::{api as datasets_api, records, utils, ResolvedContext};
 
 const RUNNER_FILE: &str = "dataset-pipeline-runner.ts";
 const RUNNER_SOURCE: &str = include_str!("../../scripts/dataset-pipeline-runner.ts");
@@ -242,68 +242,6 @@ impl PipelineScope {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct NamedObject {
-    id: String,
-    name: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CreatedDataset {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct NamedObjectListResponse {
-    objects: Vec<NamedObject>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DatasetPipelineRow {
-    id: Option<String>,
-    input: Option<Value>,
-    expected: Option<Value>,
-    output: Option<Value>,
-    tags: Option<Vec<String>>,
-    metadata: Option<Map<String, Value>>,
-    origin: Option<DatasetPipelineObjectReference>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct DatasetPipelineObjectReference {
-    object_type: String,
-    object_id: String,
-    id: String,
-    #[serde(rename = "_xact_id", skip_serializing_if = "Option::is_none")]
-    xact_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct DatasetPipelineUploadRow {
-    project_id: String,
-    dataset_id: String,
-    id: String,
-    span_id: String,
-    root_span_id: String,
-    span_parents: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tags: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<Map<String, Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    origin: Option<DatasetPipelineObjectReference>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PipelineTransformResponse {
@@ -476,6 +414,41 @@ async fn upload_dataset_rows(
     target: &PipelineTargetInspect,
     rows: Vec<Value>,
 ) -> Result<usize> {
+    let target_ctx = resolve_target_context(base, target).await?;
+    let dataset = resolve_target_dataset(&target_ctx.client, target, &target_ctx.project).await?;
+    let records = prepare_pipeline_records(rows)?;
+    let inserted = records.len();
+
+    utils::submit_prepared_records(
+        &target_ctx,
+        &dataset.id,
+        &records,
+        false,
+        "Uploading dataset rows...",
+        "dataset pipeline upload failed",
+    )
+    .await?;
+
+    Ok(inserted)
+}
+
+fn prepare_pipeline_records(rows: Vec<Value>) -> Result<Vec<records::PreparedDatasetRecord>> {
+    let mut objects = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        match row {
+            Value::Object(row) => objects.push(row),
+            _ => bail!("dataset pipeline row {} must be a JSON object", index + 1),
+        }
+    }
+
+    records::prepare_upload_records(objects)
+        .context("dataset pipeline transform produced invalid dataset rows")
+}
+
+async fn resolve_target_context(
+    base: &BaseArgs,
+    target: &PipelineTargetInspect,
+) -> Result<ResolvedContext> {
     let mut target_base = base.clone();
     if let Some(org_name) = target.org_name.as_deref() {
         target_base.org_name = Some(org_name.to_string());
@@ -483,71 +456,11 @@ async fn upload_dataset_rows(
     let ctx = login(&target_base).await?;
     let client = ApiClient::new(&ctx)?;
     let project = resolve_target_project(&client, target).await?;
-    let dataset = resolve_target_dataset(&client, target, &project).await?;
-    let upload_run_id = chrono::Utc::now().timestamp_millis().to_string();
-
-    let mut prepared_rows = Vec::with_capacity(rows.len());
-    for (index, row) in rows.into_iter().enumerate() {
-        let row: DatasetPipelineRow = serde_json::from_value(row).with_context(|| {
-            format!("dataset pipeline row {index} does not match the expected dataset row schema")
-        })?;
-        let row =
-            prepare_dataset_row_for_upload(row, &project.id, &dataset.id, &upload_run_id, index);
-        prepared_rows.push(upload_row_to_map(row)?);
-    }
-
-    let mut uploader = Logs3BatchUploader::new(
-        ctx.api_url.clone(),
-        ctx.login
-            .api_key()
-            .context("login state missing API key for dataset pipeline upload")?,
-        ctx.login
-            .org_name()
-            .filter(|org_name| !org_name.trim().is_empty()),
-    )
-    .context("failed to initialize dataset pipeline uploader")?;
-    for chunk in prepared_rows.chunks(1000) {
-        uploader
-            .upload_rows(chunk, 1000)
-            .await
-            .map_err(|err| anyhow::anyhow!("dataset pipeline upload failed: {err}"))?;
-    }
-    Ok(prepared_rows.len())
-}
-
-fn prepare_dataset_row_for_upload(
-    row: DatasetPipelineRow,
-    project_id: &str,
-    dataset_id: &str,
-    upload_run_id: &str,
-    row_index: usize,
-) -> DatasetPipelineUploadRow {
-    let id = row
-        .id
-        .clone()
-        .unwrap_or_else(|| format!("dataset-pipeline-{upload_run_id}-{row_index}"));
-
-    DatasetPipelineUploadRow {
-        project_id: project_id.to_string(),
-        dataset_id: dataset_id.to_string(),
-        span_id: id.clone(),
-        root_span_id: id.clone(),
-        id,
-        span_parents: Vec::new(),
-        input: row.input,
-        expected: row.expected,
-        output: row.output,
-        tags: row.tags,
-        metadata: row.metadata,
-        origin: row.origin,
-    }
-}
-
-fn upload_row_to_map(row: DatasetPipelineUploadRow) -> Result<Map<String, Value>> {
-    match serde_json::to_value(row).context("failed to serialize dataset pipeline upload row")? {
-        Value::Object(row) => Ok(row),
-        _ => bail!("serialized dataset pipeline upload row was not an object"),
-    }
+    Ok(ResolvedContext {
+        client,
+        app_url: ctx.app_url,
+        project,
+    })
 }
 
 async fn resolve_target_project(
@@ -582,20 +495,18 @@ async fn resolve_target_dataset(
     client: &ApiClient,
     target: &PipelineTargetInspect,
     project: &Project,
-) -> Result<CreatedDataset> {
+) -> Result<datasets_api::Dataset> {
     let dataset_name = target.dataset_name.trim();
     if dataset_name.is_empty() {
         bail!("dataset pipeline target.datasetName cannot be empty");
     }
 
-    let objects = list_project_datasets(client, &project.id).await?;
-    if let Some(dataset) = objects
+    let datasets = datasets_api::list_datasets(client, &project.id).await?;
+    if let Some(dataset) = datasets
         .iter()
-        .find(|object| object.id == dataset_name || object.name == dataset_name)
+        .find(|dataset| dataset.id == dataset_name || dataset.name == dataset_name)
     {
-        return Ok(CreatedDataset {
-            id: dataset.id.clone(),
-        });
+        return Ok(dataset.clone());
     }
 
     if is_uuid_like(dataset_name) {
@@ -606,41 +517,15 @@ async fn resolve_target_dataset(
         );
     }
 
-    create_dataset(client, &project.id, target)
-        .await
-        .with_context(|| format!("dataset '{dataset_name}' not found, and creating it failed"))
-}
-
-async fn list_project_datasets(client: &ApiClient, project_id: &str) -> Result<Vec<NamedObject>> {
-    let path = format!(
-        "/v1/dataset?org_name={}&project_id={}",
-        encode(client.org_name()),
-        encode(project_id)
-    );
-    let response: NamedObjectListResponse = client.get(&path).await?;
-    Ok(response.objects)
-}
-
-async fn create_dataset(
-    client: &ApiClient,
-    project_id: &str,
-    target: &PipelineTargetInspect,
-) -> Result<CreatedDataset> {
-    let mut body = json!({
-        "name": target.dataset_name.clone(),
-        "project_id": project_id,
-        "org_name": client.org_name(),
-    });
-    if let (Value::Object(body), Some(description)) = (&mut body, target.description.as_deref()) {
-        body.insert(
-            "description".to_string(),
-            Value::String(description.to_string()),
-        );
-    }
-    if let (Value::Object(body), Some(metadata)) = (&mut body, target.metadata.as_ref()) {
-        body.insert("metadata".to_string(), metadata.clone());
-    }
-    client.post("/v1/dataset", &body).await
+    datasets_api::create_dataset_with_metadata(
+        client,
+        &project.id,
+        dataset_name,
+        target.description.as_deref(),
+        target.metadata.as_ref(),
+    )
+    .await
+    .with_context(|| format!("dataset '{dataset_name}' not found, and creating it failed"))
 }
 
 async fn discover_refs(
@@ -850,19 +735,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dataset_pipeline_row_rejects_unknown_fields() {
-        let err = serde_json::from_value::<DatasetPipelineRow>(json!({
+    fn prepare_pipeline_records_reuses_dataset_record_validation() {
+        let err = prepare_pipeline_records(vec![json!({
             "input": "hello",
             "span_attributes": { "type": "llm" },
-        }))
+        })])
         .expect_err("unexpected dataset row fields should be rejected");
 
-        assert!(err.to_string().contains("unknown field"));
+        assert!(err
+            .to_string()
+            .contains("dataset pipeline transform produced invalid dataset rows"));
     }
 
     #[test]
-    fn prepare_dataset_row_for_upload_uses_typed_schema() {
-        let row = serde_json::from_value::<DatasetPipelineRow>(json!({
+    fn prepare_pipeline_records_uses_dataset_record_schema() {
+        let records = prepare_pipeline_records(vec![json!({
             "id": "row-1",
             "input": { "question": "hello" },
             "expected": "world",
@@ -873,20 +760,18 @@ mod tests {
                 "object_id": "source-project",
                 "id": "source-span"
             }
-        }))
+        })])
         .expect("valid dataset pipeline row should deserialize");
 
-        let upload =
-            prepare_dataset_row_for_upload(row, "target-project", "target-dataset", "run", 0);
-        let upload = upload_row_to_map(upload).expect("upload row should serialize");
-
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "row-1");
+        let upload = records[0].to_upload_row("target-dataset", false);
         assert_eq!(upload.get("id"), Some(&json!("row-1")));
-        assert_eq!(upload.get("span_id"), Some(&json!("row-1")));
-        assert_eq!(upload.get("root_span_id"), Some(&json!("row-1")));
-        assert_eq!(upload.get("project_id"), Some(&json!("target-project")));
         assert_eq!(upload.get("dataset_id"), Some(&json!("target-dataset")));
-        assert!(!upload.contains_key("log_id"));
-        assert!(!upload.contains_key("experiment_id"));
+        assert_eq!(upload.get("expected"), Some(&json!("world")));
+        assert!(!upload.contains_key("span_id"));
+        assert!(!upload.contains_key("root_span_id"));
+        assert!(!upload.contains_key("project_id"));
     }
 
     #[test]
