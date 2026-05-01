@@ -149,17 +149,15 @@ pub fn load() -> Result<Config> {
 }
 
 pub fn save_file(path: &Path, config: &Config) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
 
     let json = serde_json::to_string_pretty(config)?;
-    let temp_path = path.with_extension("tmp");
-    let mut file = fs::File::create(&temp_path)?;
-    file.write_all(json.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temp_path, path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(json.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
 
     Ok(())
 }
