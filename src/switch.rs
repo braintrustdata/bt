@@ -144,7 +144,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     };
 
     let mut cfg = config::load_file(&path);
-    apply_switch_config(&mut cfg, &org_name, &project);
+    let config_profile =
+        config::trimmed_option(profile_name.as_deref().or(base.profile.as_deref()))
+            .map(str::to_string);
+    apply_switch_config(&mut cfg, config_profile.as_deref(), &org_name, &project);
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 
@@ -229,7 +232,15 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<ap
     }
 }
 
-fn apply_switch_config(cfg: &mut config::Config, org_name: &str, project: &api::Project) {
+fn apply_switch_config(
+    cfg: &mut config::Config,
+    profile_name: Option<&str>,
+    org_name: &str,
+    project: &api::Project,
+) {
+    if let Some(profile_name) = config::trimmed_option(profile_name) {
+        cfg.profile = Some(profile_name.to_string());
+    }
     cfg.org = Some(org_name.to_string());
     cfg.project = Some(project.name.clone());
     cfg.project_id = Some(project.id.clone());
@@ -502,11 +513,31 @@ mod tests {
             description: None,
         };
 
-        apply_switch_config(&mut cfg, "acme-org", &project);
+        apply_switch_config(&mut cfg, Some("work"), "acme-org", &project);
 
+        assert_eq!(cfg.profile.as_deref(), Some("work"));
         assert_eq!(cfg.org.as_deref(), Some("acme-org"));
         assert_eq!(cfg.project.as_deref(), Some("my-project"));
         assert_eq!(cfg.project_id.as_deref(), Some("proj_123"));
+    }
+
+    #[test]
+    fn apply_switch_config_preserves_existing_profile_when_no_new_profile() {
+        let mut cfg = config::Config {
+            profile: Some("work".to_string()),
+            ..Default::default()
+        };
+        let project = api::Project {
+            id: "proj_456".to_string(),
+            name: "next-project".to_string(),
+            org_id: "org_123".to_string(),
+            description: None,
+        };
+
+        apply_switch_config(&mut cfg, None, "acme-org", &project);
+
+        assert_eq!(cfg.profile.as_deref(), Some("work"));
+        assert_eq!(cfg.project.as_deref(), Some("next-project"));
     }
 
     #[test]

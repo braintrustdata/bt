@@ -2135,10 +2135,13 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
 
 async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
     let mut envs = resolved_auth_env(base).await?;
+    let resolved_org = envs
+        .iter()
+        .find_map(|(key, value)| (key == "BRAINTRUST_ORG_NAME").then_some(value.as_str()));
     let project = base
         .project
         .clone()
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
+        .or_else(|| crate::config::configured_project_for_context(base, resolved_org));
     if let Some(project) = &project {
         envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
     }
