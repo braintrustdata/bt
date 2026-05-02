@@ -627,12 +627,14 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
     if verbose {
         print_wizard_step(1, "Auth");
     }
-    let project_flag = will_instrument.then(|| base.project.clone()).flatten();
     let mut setup_auth = if will_instrument {
         Some(ensure_setup_auth(&mut base, !flag_no_instrument, !flag_no_instrument).await?)
     } else {
         None
     };
+    // Capture after ensure_setup_auth so apply_setup_config_fallbacks has already
+    // populated base.project from the saved config (and cleared stale ones).
+    let project_flag = will_instrument.then(|| base.project.clone()).flatten();
     let org = setup_auth
         .as_ref()
         .map(|auth| auth.client.org_name().to_string());
@@ -995,8 +997,8 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
     let wants_skills = args.skills && !args.no_skills;
     let wants_mcp = args.mcp && !args.no_mcp;
     if will_instrument {
-        let project_flag = base.project.clone();
         let auth = ensure_setup_auth(&mut base, false, true).await?;
+        let project_flag = base.project.clone();
         let org = auth.client.org_name().to_string();
         let project = select_project_with_skip(&auth.client, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
