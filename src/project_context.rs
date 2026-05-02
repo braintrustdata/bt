@@ -20,7 +20,7 @@ pub(crate) async fn resolve_project_optional(
     client: &ApiClient,
     allow_interactive_selection: bool,
 ) -> Result<Option<Project>> {
-    let config_project = config::load().ok().and_then(|config| config.project);
+    let config_project = config::configured_project_for_context(base, Some(client.org_name()));
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(project_name) => Some(project_name.to_string()),
         None if allow_interactive_selection && is_interactive() => Some(

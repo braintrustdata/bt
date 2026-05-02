@@ -51,7 +51,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
 
     let cli_org = cli_flag_value(&["--org", "-o"]);
     let cli_project = cli_flag_value(&["--project", "-p"]);
-    let (org, project, source) = resolve_config(
+    let (mut org, mut project, source) = resolve_config(
         cli_org,
         cli_project,
         &global_cfg,
@@ -59,7 +59,53 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         &local_path,
         &global_path,
     );
-    let profile_info = resolve_profile_info(base.profile.as_deref(), org.as_deref());
+    let merged_cfg = global_cfg.merge(&local_cfg);
+    let selected_profile = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            merged_cfg
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let profile_info = resolve_profile_info(selected_profile.as_deref(), org.as_deref());
+
+    if selected_profile.is_some()
+        && base
+            .org_name
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        if let Some(profile_org) = profile_info.as_ref().and_then(|p| p.org_name.clone()) {
+            org = Some(profile_org);
+        }
+    }
+
+    if base
+        .project
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        let mut project_base = base.clone();
+        if project_base
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            project_base.profile = selected_profile.clone();
+        }
+        project =
+            config::project_from_config_for_context(&project_base, &merged_cfg, org.as_deref());
+    }
 
     if base.json {
         let output = StatusOutput {
@@ -182,7 +228,9 @@ fn resolve_profile_info(profile: Option<&str>, org: Option<&str>) -> Option<auth
     let profiles = auth::list_profiles().ok()?;
 
     if let Some(p) = profile {
-        return profiles.into_iter().find(|pi| pi.name == p);
+        if let Some(profile) = profiles.iter().find(|pi| pi.name == p).cloned() {
+            return Some(profile);
+        }
     }
 
     if let Some(o) = org {
