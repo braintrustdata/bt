@@ -410,6 +410,8 @@ struct ResolvedPushDestination {
     object: ObjectRef,
     object_ref: String,
     project_id: String,
+    project_name: String,
+    object_name: String,
     run_id: Option<String>,
 }
 
@@ -418,13 +420,17 @@ struct ResolvedDestination {
     object: ObjectRef,
     object_ref: String,
     project_id: String,
+    project_name: String,
+    object_name: String,
     run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedNamedObjectTarget {
     object_id: String,
+    object_name: String,
     project_id: String,
+    project_name: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1622,6 +1628,7 @@ async fn run_push(
     args: PushArgs,
 ) -> Result<()> {
     let destination = resolve_push_destination(client, &args.object_ref, project_selector).await?;
+    let object_url = push_destination_url(&ctx.app_url, client.org_name(), &destination);
     let object = destination.object.clone();
     let (scope, limit) = resolve_push_scope_and_limit(args.traces, args.spans)?;
 
@@ -1696,6 +1703,7 @@ async fn run_push(
                     "status": "completed",
                     "message": "already completed for this spec",
                     "source_path": state.source_path,
+                    "object_url": object_url,
                     "items_done": state.items_done,
                     "pages_done": state.pages_done
                 }))?
@@ -1705,6 +1713,7 @@ async fn run_push(
                 "Sync already completed for this spec. input={} items={} pages={}",
                 state.source_path, state.items_done, state.pages_done
             );
+            println!("  URL: {object_url}");
         }
         return Ok(());
     }
@@ -1949,6 +1958,7 @@ async fn run_push(
                     "status": "interrupted",
                     "spec_dir": spec_dir,
                     "input_path": input_path,
+                    "object_url": object_url,
                     "rows_uploaded": state.items_done,
                     "pages_done": state.pages_done,
                     "bytes_sent": state.bytes_sent,
@@ -1964,6 +1974,7 @@ async fn run_push(
                 format_u64_commas(state.bytes_sent)
             );
             println!("  Resume: rerun the same command (use --fresh to restart)");
+            println!("  URL: {object_url}");
         }
         return Ok(());
     }
@@ -1988,6 +1999,7 @@ async fn run_push(
                 "status": "completed",
                 "spec_dir": spec_dir,
                 "input_path": input_path,
+                "object_url": object_url,
                 "rows_uploaded": state.items_done,
                 "pages_done": state.pages_done,
                 "bytes_sent": state.bytes_sent
@@ -2001,6 +2013,7 @@ async fn run_push(
         let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
         let bytes_per_sec = state.bytes_sent as f64 / elapsed_secs as f64;
         println!("Push complete");
+        println!("  URL: {object_url}");
         println!("  Input: {}", input_path.display());
         println!("  Time: {}", format_duration(elapsed_secs));
         println!("  Traces: {}", format_usize_commas(traces_done));
@@ -2019,6 +2032,35 @@ async fn run_push(
         );
     }
     Ok(())
+}
+
+fn push_destination_url(
+    app_url: &str,
+    org_name: &str,
+    destination: &ResolvedPushDestination,
+) -> String {
+    let project_name = if destination.project_name.trim().is_empty() {
+        destination.project_id.as_str()
+    } else {
+        destination.project_name.as_str()
+    };
+    let object_name = if destination.object_name.trim().is_empty() {
+        destination.object.object_name.as_str()
+    } else {
+        destination.object_name.as_str()
+    };
+    let path = match destination.object.object_type {
+        ObjectType::ProjectLogs => "logs".to_string(),
+        ObjectType::Experiment => format!("experiments/{}", encode(object_name)),
+        ObjectType::Dataset => format!("datasets/{}", encode(object_name)),
+    };
+    format!(
+        "{}/app/{}/p/{}/{}",
+        app_url.trim_end_matches('/'),
+        encode(org_name),
+        encode(project_name),
+        path
+    )
 }
 
 fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
@@ -3003,7 +3045,9 @@ async fn resolve_destination(
             Ok(ResolvedDestination {
                 object_ref: format!("project_logs:{}", project.id),
                 object,
-                project_id: project.id,
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                object_name: project.name,
                 run_id: None,
             })
         }
@@ -3037,6 +3081,8 @@ async fn resolve_destination(
                 object_ref: format!("experiment:{}", resolved.object_id),
                 object,
                 project_id: resolved.project_id,
+                project_name: resolved.project_name,
+                object_name: resolved.object_name,
                 run_id,
             })
         }
@@ -3061,6 +3107,8 @@ async fn resolve_destination(
                 object_ref: format!("dataset:{}", resolved.object_id),
                 object,
                 project_id: resolved.project_id,
+                project_name: resolved.project_name,
+                object_name: resolved.object_name,
                 run_id: None,
             })
         }
@@ -3117,7 +3165,9 @@ async fn resolve_named_object_target(
         )?;
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
+            object_name: object.name.clone(),
             project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3133,7 +3183,9 @@ async fn resolve_named_object_target(
         if let Some(object) = objects.iter().find(|value| value.id == object_selector) {
             return Ok(ResolvedNamedObjectTarget {
                 object_id: object.id.clone(),
+                object_name: object.name.clone(),
                 project_id: project.id.clone(),
+                project_name: project.name.clone(),
             });
         }
     }
@@ -3183,7 +3235,9 @@ async fn resolve_push_experiment_target(
     ) {
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
-            project_id: project.id,
+            object_name: object.name.clone(),
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3210,7 +3264,9 @@ async fn resolve_push_experiment_target(
 
     Ok(ResolvedNamedObjectTarget {
         object_id: created.id,
+        object_name: created.name,
         project_id: project.id,
+        project_name: project.name,
     })
 }
 
@@ -3246,7 +3302,9 @@ async fn resolve_push_dataset_target(
     ) {
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
-            project_id: project.id,
+            object_name: object.name.clone(),
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3273,7 +3331,9 @@ async fn resolve_push_dataset_target(
 
     Ok(ResolvedNamedObjectTarget {
         object_id: created.id,
+        object_name: created.name,
         project_id: project.id,
+        project_name: project.name,
     })
 }
 
@@ -3321,6 +3381,8 @@ async fn resolve_push_destination(
         object: resolved.object,
         object_ref: resolved.object_ref,
         project_id: resolved.project_id,
+        project_name: resolved.project_name,
+        object_name: resolved.object_name,
         run_id: resolved.run_id,
     })
 }
@@ -4495,6 +4557,30 @@ mod tests {
         assert_eq!(content, "{\"id\":\"row-1\"}\n{\"id\":\"row-2\"}\n");
         let _ = fs::remove_file(&path);
         Ok(())
+    }
+
+    #[test]
+    fn push_destination_url_links_to_dataset_object() {
+        let destination = ResolvedPushDestination {
+            object: ObjectRef {
+                object_type: ObjectType::Dataset,
+                object_name: "dataset-id".to_string(),
+            },
+            object_ref: "dataset:dataset-id".to_string(),
+            project_id: "project-id".to_string(),
+            project_name: "Facet Optimizer".to_string(),
+            object_name: "Loop Facet Ground Truth".to_string(),
+            run_id: None,
+        };
+
+        assert_eq!(
+            push_destination_url(
+                "https://www.braintrust.dev/",
+                "braintrustdata.com",
+                &destination
+            ),
+            "https://www.braintrust.dev/app/braintrustdata.com/p/Facet%20Optimizer/datasets/Loop%20Facet%20Ground%20Truth"
+        );
     }
 
     #[test]
