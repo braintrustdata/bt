@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import fs from "node:fs";
+import net from "node:net";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 
@@ -9,7 +10,6 @@ type PipelineSource = {
   orgName?: string;
   filter?: string;
   scope?: "span" | "trace";
-  limit?: number;
 };
 
 type PipelineTarget = {
@@ -26,9 +26,16 @@ type DatasetPipelineDefinition = {
   source?: PipelineSource;
   target?: PipelineTarget;
   transform?: (
-    candidate: HydratedCandidate,
-    context: { pipeline: DatasetPipelineDefinition },
+    args: DatasetPipelineTransformArgs,
   ) => unknown | Promise<unknown>;
+};
+
+type DatasetPipelineTransformArgs = {
+  input?: unknown;
+  output?: unknown;
+  expected?: unknown;
+  metadata?: unknown;
+  trace: unknown;
 };
 
 type BraintrustModule = {
@@ -72,6 +79,11 @@ type HydratedCandidate = {
 };
 
 type Stage = "inspect" | "transform";
+
+type SseWriter = {
+  send: (event: string, payload: unknown) => void;
+  close: () => void;
+};
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -229,8 +241,61 @@ async function readRequest(): Promise<unknown> {
   return text.length > 0 ? JSON.parse(text) : {};
 }
 
-function writeResponse(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+function writeResponse(value: unknown, sse: SseWriter | null): void {
+  if (sse) {
+    sse.send("response", value);
+    sse.close();
+  } else {
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+  }
+}
+
+function serializeSseEvent(event: { event?: string; data: string }): string {
+  return (
+    Object.entries(event)
+      .filter(([_key, value]) => value !== undefined)
+      .map(([key, value]) => `${key}: ${value}`)
+      .join("\n") + "\n\n"
+  );
+}
+
+function createSseWriter(): SseWriter | null {
+  const sock = process.env.BT_DATASET_PIPELINE_SSE_SOCK;
+  if (!sock) {
+    return null;
+  }
+  const socket = net.createConnection({ path: sock });
+  socket.on("error", (err) => {
+    console.error(
+      `Failed to connect to dataset pipeline socket: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  });
+  return {
+    send: (event: string, payload: unknown) => {
+      if (!socket.writable) {
+        return;
+      }
+      const data =
+        typeof payload === "string" ? payload : JSON.stringify(payload);
+      socket.write(serializeSseEvent({ event, data }));
+    },
+    close: () => {
+      socket.end();
+    },
+  };
+}
+
+function writeProgress(sse: SseWriter | null, rows: number): void {
+  if (!sse) {
+    return;
+  }
+  sse.send("progress", {
+    type: "dataset_pipeline_progress",
+    kind: "candidate",
+    rows,
+  });
 }
 
 function requireArrayField(request: unknown, field: string): unknown[] {
@@ -263,11 +328,12 @@ function optionalPositiveIntegerField(
 
 function requirePipelineSource(
   pipeline: DatasetPipelineDefinition,
+  sourceOverride?: PipelineSource,
 ): PipelineSource {
   if (!isObject(pipeline.source)) {
     throw new Error("Dataset pipeline source is required.");
   }
-  return pipeline.source;
+  return { ...pipeline.source, ...(sourceOverride ?? {}) };
 }
 
 function requireBraintrustRuntime(braintrust: BraintrustModule) {
@@ -318,22 +384,29 @@ function refSpanRowId(ref: DiscoveryRef): string | undefined {
 async function hydrateDiscoveryRefs(
   braintrust: BraintrustModule,
   pipeline: DatasetPipelineDefinition,
+  sourceOverride: PipelineSource | undefined,
   sourceProjectId: string,
   refs: unknown[],
 ): Promise<HydratedCandidate[]> {
   requireBraintrustRuntime(braintrust);
-  const source = requirePipelineSource(pipeline);
+  const source = requirePipelineSource(pipeline, sourceOverride);
   const state = await stateForOrg(braintrust, source.orgName);
+  const tracesByRootSpanId = new Map<string, unknown>();
   return refs.map((ref) => {
     const rootSpanId = refRootSpanId(ref);
     const id = refSpanRowId(ref as DiscoveryRef);
-    return {
-      trace: new braintrust.LocalTrace!({
+    let trace = tracesByRootSpanId.get(rootSpanId);
+    if (!trace) {
+      trace = new braintrust.LocalTrace!({
         objectType: "project_logs",
         objectId: sourceProjectId,
         rootSpanId,
         state,
-      }),
+      });
+      tracesByRootSpanId.set(rootSpanId, trace);
+    }
+    return {
+      trace,
       ...(id ? { id } : {}),
       ...(id
         ? {
@@ -346,6 +419,50 @@ async function hydrateDiscoveryRefs(
         : {}),
     };
   });
+}
+
+function spanAttr(row: unknown, name: string): unknown {
+  return isObject(row) ? row[name] : undefined;
+}
+
+async function sourceRowForCandidate(
+  candidate: HydratedCandidate,
+): Promise<unknown | undefined> {
+  if (!candidate.id) {
+    return undefined;
+  }
+  const trace = candidate.trace;
+  if (!isObject(trace) || typeof trace.getSpans !== "function") {
+    throw new Error("Hydrated trace does not support getSpans().");
+  }
+  const spans = await trace.getSpans({ includeScorers: true });
+  if (!Array.isArray(spans)) {
+    throw new Error("Hydrated trace getSpans() did not return an array.");
+  }
+  const row = spans.find(
+    (span) =>
+      spanAttr(span, "id") === candidate.id ||
+      spanAttr(span, "span_id") === candidate.id,
+  );
+  if (!row) {
+    throw new Error(
+      `Source span row ${JSON.stringify(candidate.id)} was not found in hydrated trace.`,
+    );
+  }
+  return row;
+}
+
+async function transformArgsForCandidate(
+  candidate: HydratedCandidate,
+): Promise<DatasetPipelineTransformArgs> {
+  const row = await sourceRowForCandidate(candidate);
+  return {
+    input: spanAttr(row, "input"),
+    output: spanAttr(row, "output"),
+    expected: spanAttr(row, "expected"),
+    metadata: spanAttr(row, "metadata"),
+    trace: candidate.trace,
+  };
 }
 
 function normalizeTransformResult(result: unknown): unknown[] {
@@ -398,9 +515,11 @@ function withPipelineDefaults(
 async function transformRefs(
   braintrust: BraintrustModule,
   pipeline: DatasetPipelineDefinition,
+  sourceOverride: PipelineSource | undefined,
   sourceProjectId: string,
   refs: unknown[],
   maxConcurrency = 16,
+  sse: SseWriter | null = null,
 ): Promise<unknown[]> {
   if (!Number.isInteger(maxConcurrency) || maxConcurrency <= 0) {
     throw new Error("maxConcurrency must be a positive integer.");
@@ -411,6 +530,7 @@ async function transformRefs(
   const candidates = await hydrateDiscoveryRefs(
     braintrust,
     pipeline,
+    sourceOverride,
     sourceProjectId,
     refs,
   );
@@ -421,7 +541,8 @@ async function transformRefs(
     while (nextIndex < candidates.length) {
       const index = nextIndex++;
       const candidate = candidates[index];
-      const result = await pipeline.transform!(candidate, { pipeline });
+      const args = await transformArgsForCandidate(candidate);
+      const result = await pipeline.transform!(args);
       const rows = normalizeTransformResult(result);
       transformedRows[index] = rows.map((row, rowIndex) =>
         withPipelineDefaults(
@@ -430,6 +551,7 @@ async function transformRefs(
           rows.length > 1 ? rowIndex : undefined,
         ),
       );
+      writeProgress(sse, transformedRows[index].length);
     }
   }
 
@@ -453,25 +575,38 @@ async function main() {
     process.env.BT_DATASET_PIPELINE_NAME || undefined,
   );
   const stage = parseStage();
+  const sse = createSseWriter();
 
   if (stage === "inspect") {
-    writeResponse({
-      name: pipeline.name,
-      source: pipeline.source,
-      target: pipeline.target,
-    });
+    writeResponse(
+      {
+        name: pipeline.name,
+        source: pipeline.source,
+        target: pipeline.target,
+      },
+      sse,
+    );
   } else if (stage === "transform") {
     const request = await readRequest();
     const refs = requireArrayField(request, "refs");
     const sourceProjectId = requireStringField(request, "sourceProjectId");
+    const sourceOverride =
+      isObject(request) && isObject(request.source)
+        ? (request.source as PipelineSource)
+        : undefined;
     const rows = await transformRefs(
       braintrust,
       pipeline,
+      sourceOverride,
       sourceProjectId,
       refs,
       optionalPositiveIntegerField(request, "maxConcurrency"),
+      sse,
     );
-    writeResponse({ candidates: refs.length, rowCount: rows.length, rows });
+    writeResponse(
+      { candidates: refs.length, rowCount: rows.length, rows },
+      sse,
+    );
   } else {
     throw new Error(`Unsupported dataset pipeline stage: ${stage}`);
   }

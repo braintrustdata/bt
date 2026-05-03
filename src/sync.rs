@@ -47,6 +47,14 @@ pub(crate) fn default_workers() -> usize {
         .unwrap_or(DEFAULT_WORKERS_FALLBACK)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPushFileArgs {
+    pub object_ref: String,
+    pub input: PathBuf,
+    pub root: PathBuf,
+    pub fresh: bool,
+}
+
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
@@ -562,6 +570,34 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
         }
         SyncCommand::Status(_) => unreachable!(),
     }
+}
+
+pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> Result<()> {
+    let json_output = base.json;
+    let ctx = login(&base).await?;
+    let client = ApiClient::new(&ctx)?;
+    let project = base.project.clone().or_else(|| {
+        crate::config::configured_project_for_context(&base, ctx.login.org_name().as_deref())
+    });
+
+    run_push(
+        json_output,
+        &ctx,
+        &client,
+        project.as_deref(),
+        PushArgs {
+            object_ref: args.object_ref,
+            input: Some(args.input),
+            filter: None,
+            traces: None,
+            spans: None,
+            page_size: DEFAULT_PAGE_SIZE,
+            fresh: args.fresh,
+            root: args.root,
+            workers: default_workers(),
+        },
+    )
+    .await
 }
 
 async fn run_pull(
@@ -3449,13 +3485,26 @@ fn sanitize_segment(value: &str) -> String {
     }
 }
 
-fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
+pub(crate) fn artifact_base_dir(root: &Path, object_type: &str, object_name: &str) -> PathBuf {
     let object_key = format!(
         "{}_{}",
-        sanitize_segment(object.object_type.as_str()),
-        sanitize_segment(&object.object_name)
+        sanitize_segment(object_type),
+        sanitize_segment(object_name)
     );
-    root.join(object_key).join(&hash[..12])
+    root.join(object_key)
+}
+
+pub(crate) fn artifact_spec_dir(
+    root: &Path,
+    object_type: &str,
+    object_name: &str,
+    hash: &str,
+) -> PathBuf {
+    artifact_base_dir(root, object_type, object_name).join(&hash[..12])
+}
+
+fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
+    artifact_spec_dir(root, object.object_type.as_str(), &object.object_name, hash)
 }
 
 fn legacy_spec_dir(
@@ -3504,8 +3553,8 @@ fn resolve_spec_dir(
     }
 }
 
-fn spec_hash(spec: &SyncSpec) -> Result<String> {
-    let canonical = serde_json::to_vec(spec).context("failed to serialize sync spec")?;
+pub(crate) fn stable_spec_hash<T: Serialize + ?Sized>(spec: &T) -> Result<String> {
+    let canonical = serde_json::to_vec(spec).context("failed to serialize spec")?;
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     let digest = hasher.finalize();
@@ -3516,7 +3565,11 @@ fn spec_hash(spec: &SyncSpec) -> Result<String> {
     Ok(out)
 }
 
-fn epoch_seconds() -> u64 {
+fn spec_hash(spec: &SyncSpec) -> Result<String> {
+    stable_spec_hash(spec)
+}
+
+pub(crate) fn epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3803,15 +3856,20 @@ pub(crate) fn write_jsonl_value<T: Serialize + ?Sized>(
     Ok(encoded.len() + 1)
 }
 
+pub(crate) fn create_jsonl_file_writer(path: &Path) -> Result<BufWriter<File>> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Ok(BufWriter::new(File::create(path).with_context(|| {
+        format!("failed to create {}", path.display())
+    })?))
+}
+
+#[cfg(test)]
 pub(crate) fn write_jsonl_values<T: Serialize>(out: Option<&Path>, values: &[T]) -> Result<()> {
     let mut writer: Box<dyn Write> = if let Some(path) = out {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        Box::new(BufWriter::new(File::create(path).with_context(|| {
-            format!("failed to create {}", path.display())
-        })?))
+        Box::new(create_jsonl_file_writer(path)?)
     } else {
         Box::new(BufWriter::new(std::io::stdout()))
     };
@@ -4238,7 +4296,7 @@ fn value_as_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
@@ -4257,7 +4315,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }

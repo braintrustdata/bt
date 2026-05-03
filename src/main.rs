@@ -19,6 +19,7 @@ mod project_context;
 mod projects;
 mod prompts;
 mod python_runner;
+mod runner_sse;
 mod scorers;
 mod self_update;
 mod setup;

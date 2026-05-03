@@ -108,7 +108,7 @@ enum DatasetsCommands {
     View(ViewArgs),
     /// Delete a dataset
     Delete(DeleteArgs),
-    /// Run dataset pipeline workflows
+    /// Run full dataset pipelines, or stage fetch/transform/push
     Pipeline(pipeline::PipelineArgs),
 }
 

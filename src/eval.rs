@@ -3,9 +3,9 @@ use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use actix_web::dev::Service;
 use actix_web::http::header::{
@@ -27,8 +27,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use strip_ansi_escapes::strip;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -44,6 +42,7 @@ use crate::args::BaseArgs;
 use crate::auth::resolved_runner_env;
 use crate::js_runner;
 use crate::python_runner;
+use crate::runner_sse;
 use crate::ui::{animations_enabled, is_quiet};
 
 const MAX_NAME_LENGTH: usize = 40;
@@ -58,7 +57,6 @@ const HEADER_BT_AUTH_TOKEN: &str = "x-bt-auth-token";
 const HEADER_BT_ORG_NAME: &str = "x-bt-org-name";
 const HEADER_CORS_REQ_PRIVATE_NETWORK: &str = "access-control-request-private-network";
 const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
-const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
 const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
 const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
 const DEFAULT_EVAL_SAMPLE_SEED: u64 = 0;
@@ -83,8 +81,6 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     }
     Ok(parsed)
 }
-static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 struct EvalRunOutput {
     status: ExitStatus,
     dependencies: Vec<PathBuf>,
@@ -95,7 +91,7 @@ struct EvalRunnerProcess {
     rx: mpsc::UnboundedReceiver<EvalEvent>,
     sse_task: tokio::task::JoinHandle<()>,
     sse_connected: Arc<AtomicBool>,
-    _socket_cleanup_guard: SocketCleanupGuard,
+    _socket_cleanup_guard: runner_sse::SocketCleanupGuard,
 }
 
 struct EvalProcessOutput {
@@ -219,22 +215,6 @@ const PY_RUNNER_FILE: &str = "eval-runner.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
-
-struct SocketCleanupGuard {
-    path: PathBuf,
-}
-
-impl SocketCleanupGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for SocketCleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 pub enum EvalLanguage {
@@ -772,7 +752,7 @@ async fn spawn_eval_runner(
     let (js_runner, py_runner) = prepare_eval_runners()?;
     let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
-    let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
+    let (listener, socket_path, socket_cleanup_guard) = runner_sse::bind_sse_listener("bt-eval")?;
     let (tx, rx) = mpsc::unbounded_channel();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
@@ -782,7 +762,11 @@ async fn spawn_eval_runner(
         match listener.accept().await {
             Ok((stream, _)) => {
                 sse_connected_for_task.store(true, Ordering::Relaxed);
-                if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
+                if let Err(err) = runner_sse::read_sse_stream(stream, |event, data| {
+                    handle_sse_event(event, data, &tx_sse);
+                })
+                .await
+                {
                     let _ = tx_sse.send(EvalEvent::Error {
                         message: format!("SSE stream error: {err}"),
                         stack: None,
@@ -911,7 +895,14 @@ async fn spawn_eval_runner(
     if let Some(stdout) = stdout {
         let tx_stdout = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stdout, "stdout", tx_stdout).await {
+            if let Err(err) = runner_sse::forward_stream(stdout, "stdout", |stream, message| {
+                let _ = tx_stdout.send(EvalEvent::Console {
+                    stream: stream.to_string(),
+                    message,
+                });
+            })
+            .await
+            {
                 eprintln!("Failed to read eval stdout: {err}");
             }
         });
@@ -920,7 +911,14 @@ async fn spawn_eval_runner(
     if let Some(stderr) = stderr {
         let tx_stderr = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stderr, "stderr", tx_stderr).await {
+            if let Err(err) = runner_sse::forward_stream(stderr, "stderr", |stream, message| {
+                let _ = tx_stderr.send(EvalEvent::Console {
+                    stream: stream.to_string(),
+                    message,
+                });
+            })
+            .await
+            {
                 eprintln!("Failed to read eval stderr: {err}");
             }
         });
@@ -941,70 +939,64 @@ async fn spawn_eval_runner(
 }
 
 async fn drive_eval_runner<F>(
-    mut process: EvalRunnerProcess,
+    process: EvalRunnerProcess,
     console_policy: ConsolePolicy,
     mut on_event: F,
 ) -> Result<EvalProcessOutput>
 where
     F: FnMut(EvalEvent),
 {
-    let mut status = None;
+    let EvalRunnerProcess {
+        mut child,
+        rx,
+        mut sse_task,
+        sse_connected,
+        _socket_cleanup_guard,
+    } = process;
     let mut dependency_files: Vec<String> = Vec::new();
     let mut error_messages: Vec<String> = Vec::new();
     let mut stderr_lines: Vec<String> = Vec::new();
-
-    loop {
-        tokio::select! {
-            event = process.rx.recv() => {
-                match event {
-                    Some(EvalEvent::Dependencies { files }) => {
-                        dependency_files.extend(files.clone());
-                        on_event(EvalEvent::Dependencies { files });
-                    }
-                    Some(EvalEvent::Error { message, stack, status }) => {
-                        error_messages.push(message.clone());
-                        if let Some(stack) = stack.as_ref() {
-                            error_messages.push(stack.clone());
-                        }
-                        on_event(EvalEvent::Error { message, stack, status });
-                    }
-                    Some(EvalEvent::Console { stream, message }) => {
-                        if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr)
-                        {
-                            stderr_lines.push(message);
-                        } else {
-                            on_event(EvalEvent::Console { stream, message });
-                        }
-                    }
-                    Some(event) => on_event(event),
-                    None => {
-                        if status.is_none() {
-                            status = Some(process.child.wait().await.context("eval runner process failed")?);
-                            if !process.sse_connected.load(Ordering::Relaxed) {
-                                process.sse_task.abort();
-                            }
-                        }
-                        break;
-                    }
+    let wait = Box::pin(async { child.wait().await.context("eval runner process failed") });
+    let status = runner_sse::drive_runner_events(
+        rx,
+        wait,
+        &mut sse_task,
+        &sse_connected,
+        "eval runner process exited without a status",
+        |event| match event {
+            EvalEvent::Dependencies { files } => {
+                dependency_files.extend(files.clone());
+                on_event(EvalEvent::Dependencies { files });
+            }
+            EvalEvent::Error {
+                message,
+                stack,
+                status,
+            } => {
+                error_messages.push(message.clone());
+                if let Some(stack) = stack.as_ref() {
+                    error_messages.push(stack.clone());
+                }
+                on_event(EvalEvent::Error {
+                    message,
+                    stack,
+                    status,
+                });
+            }
+            EvalEvent::Console { stream, message } => {
+                if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr) {
+                    stderr_lines.push(message);
+                } else {
+                    on_event(EvalEvent::Console { stream, message });
                 }
             }
-            exit_status = process.child.wait(), if status.is_none() => {
-                status = Some(exit_status.context("eval runner process failed")?);
-                if !process.sse_connected.load(Ordering::Relaxed) {
-                    process.sse_task.abort();
-                }
-            }
-        }
-
-        if status.is_some() && process.rx.is_closed() {
-            break;
-        }
-    }
-
-    let _ = process.sse_task.await;
+            event => on_event(event),
+        },
+    )
+    .await?;
 
     Ok(EvalProcessOutput {
-        status: status.context("eval runner process exited without a status")?,
+        status,
         dependency_files,
         error_messages,
         stderr_lines,
@@ -2507,49 +2499,6 @@ fn set_node_heap_size_env(command: &mut Command) {
     command.env("NODE_OPTIONS", merged);
 }
 
-fn build_sse_socket_path() -> Result<PathBuf> {
-    let pid = std::process::id();
-    let serial = SSE_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("failed to read system time")?
-        .as_nanos();
-    Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}-{serial}.sock")))
-}
-
-fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
-    let mut last_bind_err: Option<std::io::Error> = None;
-    for _ in 0..SSE_SOCKET_BIND_MAX_ATTEMPTS {
-        let socket_path = build_sse_socket_path()?;
-        let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
-        let _ = std::fs::remove_file(&socket_path);
-        match UnixListener::bind(&socket_path) {
-            Ok(listener) => return Ok((listener, socket_path, socket_cleanup_guard)),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::AddrInUse
-                ) =>
-            {
-                last_bind_err = Some(err);
-                continue;
-            }
-            Err(err) => {
-                return Err(err).context("failed to bind SSE unix socket");
-            }
-        }
-    }
-    let err = last_bind_err.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "failed to allocate a unique SSE socket path",
-        )
-    });
-    Err(err).context(format!(
-        "failed to bind SSE unix socket after {SSE_SOCKET_BIND_MAX_ATTEMPTS} attempts"
-    ))
-}
-
 fn eval_runner_cache_dir() -> PathBuf {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -2712,57 +2661,6 @@ struct SseConsoleEventData {
 #[derive(Debug, Deserialize)]
 struct SseDependenciesEventData {
     files: Vec<String>,
-}
-
-async fn forward_stream<T>(
-    stream: T,
-    name: &'static str,
-    tx: mpsc::UnboundedSender<EvalEvent>,
-) -> Result<()>
-where
-    T: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    while let Some(line) = lines.next_line().await? {
-        let _ = tx.send(EvalEvent::Console {
-            stream: name.to_string(),
-            message: line,
-        });
-    }
-    Ok(())
-}
-
-async fn read_sse_stream<T>(stream: T, tx: mpsc::UnboundedSender<EvalEvent>) -> Result<()>
-where
-    T: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    let mut event: Option<String> = None;
-    let mut data_lines: Vec<String> = Vec::new();
-
-    while let Some(line) = lines.next_line().await? {
-        if line.is_empty() {
-            if event.is_some() || !data_lines.is_empty() {
-                let data = data_lines.join("\n");
-                handle_sse_event(event.take(), data, &tx);
-                data_lines.clear();
-            }
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim_start().to_string());
-        }
-    }
-
-    if event.is_some() || !data_lines.is_empty() {
-        let data = data_lines.join("\n");
-        handle_sse_event(event.take(), data, &tx);
-    }
-
-    Ok(())
 }
 
 fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSender<EvalEvent>) {
@@ -4313,8 +4211,8 @@ mod tests {
 
     #[test]
     fn build_sse_socket_path_is_unique_for_consecutive_calls() {
-        let first = build_sse_socket_path().expect("first socket path");
-        let second = build_sse_socket_path().expect("second socket path");
+        let first = runner_sse::build_sse_socket_path("bt-eval").expect("first socket path");
+        let second = runner_sse::build_sse_socket_path("bt-eval").expect("second socket path");
         assert_ne!(first, second);
     }
 
