@@ -261,13 +261,27 @@ function serializeSseEvent(event: { event?: string; data: string }): string {
 
 function createSseWriter(): SseWriter | null {
   const sock = process.env.BT_DATASET_PIPELINE_SSE_SOCK;
-  if (!sock) {
+  const addr = process.env.BT_DATASET_PIPELINE_SSE_ADDR;
+  if (!sock && !addr) {
     return null;
   }
-  const socket = net.createConnection({ path: sock });
+  let socket: net.Socket;
+  if (sock) {
+    socket = net.createConnection({ path: sock });
+  } else if (addr) {
+    const [host, portStr] = addr.split(":");
+    const port = Number(portStr);
+    if (!host || !Number.isFinite(port)) {
+      throw new Error(`Invalid BT_DATASET_PIPELINE_SSE_ADDR: ${addr}`);
+    }
+    socket = net.createConnection({ host, port });
+    socket.setNoDelay(true);
+  } else {
+    return null;
+  }
   socket.on("error", (err) => {
     console.error(
-      `Failed to connect to dataset pipeline socket: ${
+      `Failed to connect to dataset pipeline SSE endpoint: ${
         err instanceof Error ? err.message : String(err)
       }`,
     );

@@ -91,7 +91,7 @@ struct EvalRunnerProcess {
     rx: mpsc::UnboundedReceiver<EvalEvent>,
     sse_task: tokio::task::JoinHandle<()>,
     sse_connected: Arc<AtomicBool>,
-    _socket_cleanup_guard: runner_sse::SocketCleanupGuard,
+    _sse_guard: runner_sse::SseListenerGuard,
 }
 
 struct EvalProcessOutput {
@@ -752,36 +752,30 @@ async fn spawn_eval_runner(
     let (js_runner, py_runner) = prepare_eval_runners()?;
     let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
-    let (listener, socket_path, socket_cleanup_guard) = runner_sse::bind_sse_listener("bt-eval")?;
+    let (listener, sse_guard) = runner_sse::bind_sse_listener("bt-eval")?;
     let (tx, rx) = mpsc::unbounded_channel();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
     let tx_sse = tx.clone();
     let sse_connected_for_task = Arc::clone(&sse_connected);
     let sse_task = tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        if let Err(err) = runner_sse::accept_and_read_sse_stream(
+            listener,
+            || {
                 sse_connected_for_task.store(true, Ordering::Relaxed);
-                if let Err(err) = runner_sse::read_sse_stream(stream, |event, data| {
-                    handle_sse_event(event, data, &tx_sse);
-                })
-                .await
-                {
-                    let _ = tx_sse.send(EvalEvent::Error {
-                        message: format!("SSE stream error: {err}"),
-                        stack: None,
-                        status: None,
-                    });
-                }
-            }
-            Err(err) => {
-                let _ = tx_sse.send(EvalEvent::Error {
-                    message: format!("Failed to accept SSE connection: {err}"),
-                    stack: None,
-                    status: None,
-                });
-            }
-        };
+            },
+            |event, data| {
+                handle_sse_event(event, data, &tx_sse);
+            },
+        )
+        .await
+        {
+            let _ = tx_sse.send(EvalEvent::Error {
+                message: format!("SSE stream error: {err}"),
+                stack: None,
+                status: None,
+            });
+        }
     });
 
     let (mut cmd, runner_kind) = match language {
@@ -880,10 +874,8 @@ async fn spawn_eval_runner(
             serde_json::to_string(&payload).context("failed to serialize matrix axes")?;
         cmd.env("BT_EVAL_MATRIX_JSON", serialized);
     }
-    cmd.env(
-        "BT_EVAL_SSE_SOCK",
-        socket_path.to_string_lossy().to_string(),
-    );
+    let (sse_env_name, sse_env_value) = sse_guard.env("BT_EVAL_SSE_SOCK", "BT_EVAL_SSE_ADDR");
+    cmd.env(sse_env_name, sse_env_value);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -932,7 +924,7 @@ async fn spawn_eval_runner(
             rx,
             sse_task,
             sse_connected,
-            _socket_cleanup_guard: socket_cleanup_guard,
+            _sse_guard: sse_guard,
         },
         runner_kind,
     })
@@ -951,7 +943,7 @@ where
         rx,
         mut sse_task,
         sse_connected,
-        _socket_cleanup_guard,
+        _sse_guard,
     } = process;
     let mut dependency_files: Vec<String> = Vec::new();
     let mut error_messages: Vec<String> = Vec::new();
@@ -4209,6 +4201,7 @@ mod tests {
         assert!(message.contains("pnpm add -D vite-node"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn build_sse_socket_path_is_unique_for_consecutive_calls() {
         let first = runner_sse::build_sse_socket_path("bt-eval").expect("first socket path");

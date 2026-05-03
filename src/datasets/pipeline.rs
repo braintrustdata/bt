@@ -43,7 +43,7 @@ const PIPELINE_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 #[command(after_help = "\
 Use `run` to run the whole pipeline.
 
-For staged workflows, run `fetch`, then `transform`, inspect or edit the transformed JSONL, then upload it with:
+For staged workflows, run `pull`, then `transform`, inspect or edit the transformed JSONL, then upload it with:
   bt datasets pipeline push ./pipeline.ts
 
 `push` reads the pipeline target and delegates to `bt sync push`.
@@ -55,10 +55,10 @@ pub struct PipelineArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum PipelineCommands {
-    /// Fetch, transform, and insert dataset rows
+    /// Pull, transform, and insert dataset rows
     Run(PipelineRunArgs),
-    /// Discover source trace/span refs to JSONL
-    Fetch(PipelineFetchArgs),
+    /// Pull source trace/span refs to JSONL
+    Pull(PipelineFetchArgs),
     /// Transform candidate JSONL into proposed dataset row JSONL
     Transform(PipelineTransformArgs),
     /// Push transformed dataset rows to the pipeline target
@@ -145,9 +145,16 @@ struct PipelineFetchOptions {
 
 #[derive(Debug, Clone, Args)]
 struct PipelineTransformOptions {
-    /// Maximum concurrent transform calls
-    #[arg(long, default_value_t = 16, value_parser = parse_positive_usize)]
-    max_concurrency: usize,
+    /// Maximum concurrent transform calls. Defaults to the logical CPU count.
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_concurrency: Option<usize>,
+}
+
+impl PipelineTransformOptions {
+    fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+            .unwrap_or_else(default_transform_concurrency)
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -208,7 +215,7 @@ struct PipelineTransformArgs {
     #[command(flatten)]
     transform: PipelineTransformOptions,
 
-    /// Input candidate JSONL file. Defaults to the latest fetch output under --root.
+    /// Input candidate JSONL file. Defaults to the latest pull output under --root.
     #[arg(long = "in")]
     input: Option<PathBuf>,
 
@@ -248,7 +255,15 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
             let tempdir =
                 tempfile::tempdir().context("failed to create dataset pipeline temp dir")?;
             let refs_path = tempdir.path().join("discovered.jsonl");
-            discover_refs(&base, &inspect, &args.fetch, &refs_path).await?;
+            print_pipeline_status(&base, "Fetching source refs...");
+            let fetch_result = discover_refs(&base, &inspect, &args.fetch, &refs_path).await?;
+            print_pipeline_status(
+                &base,
+                format!(
+                    "Fetched {} source ref(s) across {} page(s).",
+                    fetch_result.refs, fetch_result.pages
+                ),
+            );
 
             let refs = read_jsonl_values(&refs_path)?;
             let source_project = resolve_pipeline_source_project(&base, &inspect.source).await?;
@@ -258,7 +273,7 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 &source_project.id,
                 &inspect.source,
                 refs,
-                args.transform.max_concurrency,
+                args.transform.max_concurrency(),
                 None,
             )
             .await?;
@@ -275,7 +290,7 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 false,
             )
         }
-        PipelineCommands::Fetch(args) => {
+        PipelineCommands::Pull(args) => {
             let inspect = inspect_with_overrides(
                 inspect_pipeline(&base, &args.runner).await?,
                 Some(&args.source),
@@ -386,7 +401,7 @@ enum PipelineArtifactStage {
 impl PipelineArtifactStage {
     fn command(self) -> &'static str {
         match self {
-            PipelineArtifactStage::Fetch => "fetch",
+            PipelineArtifactStage::Fetch => "pull",
             PipelineArtifactStage::Transform => "transform",
         }
     }
@@ -440,7 +455,7 @@ struct PipelineTransformArtifactOptions {
 impl From<&PipelineTransformOptions> for PipelineTransformArtifactOptions {
     fn from(options: &PipelineTransformOptions) -> Self {
         Self {
-            max_concurrency: options.max_concurrency,
+            max_concurrency: options.max_concurrency(),
         }
     }
 }
@@ -948,43 +963,37 @@ where
     F: FnMut(PipelineRunnerEvent),
 {
     let mut command = build_runner_command(base, stage, runner, |_, _| Ok(())).await?;
-    let (listener, socket_path, socket_cleanup_guard) =
-        runner_sse::bind_sse_listener("bt-dataset-pipeline")?;
+    let (listener, sse_guard) = runner_sse::bind_sse_listener("bt-dataset-pipeline")?;
     let (tx, rx) = mpsc::unbounded_channel::<PipelineRunnerEvent>();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
     let tx_sse = tx.clone();
     let sse_connected_for_task = Arc::clone(&sse_connected);
     let mut sse_task = tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        if let Err(err) = runner_sse::accept_and_read_sse_stream(
+            listener,
+            || {
                 sse_connected_for_task.store(true, Ordering::Relaxed);
-                if let Err(err) = runner_sse::read_sse_stream(stream, |event, data| {
-                    handle_pipeline_sse_event(event, data, &tx_sse);
-                })
-                .await
-                {
-                    let _ = tx_sse.send(PipelineRunnerEvent::Error {
-                        message: format!("SSE stream error: {err}"),
-                        stack: None,
-                        status: None,
-                    });
-                }
-            }
-            Err(err) => {
-                let _ = tx_sse.send(PipelineRunnerEvent::Error {
-                    message: format!("Failed to accept SSE connection: {err}"),
-                    stack: None,
-                    status: None,
-                });
-            }
+            },
+            |event, data| {
+                handle_pipeline_sse_event(event, data, &tx_sse);
+            },
+        )
+        .await
+        {
+            let _ = tx_sse.send(PipelineRunnerEvent::Error {
+                message: format!("SSE stream error: {err}"),
+                stack: None,
+                status: None,
+            });
         }
     });
 
-    command.env(
+    let (sse_env_name, sse_env_value) = sse_guard.env(
         "BT_DATASET_PIPELINE_SSE_SOCK",
-        socket_path.to_string_lossy().to_string(),
+        "BT_DATASET_PIPELINE_SSE_ADDR",
     );
+    command.env(sse_env_name, sse_env_value);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -1051,7 +1060,7 @@ where
     )
     .await?;
 
-    let _socket_cleanup_guard = socket_cleanup_guard;
+    let _sse_guard = sse_guard;
     if !status.success() {
         let detail = if errors.is_empty() {
             String::new()
@@ -1177,7 +1186,7 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
         &source_project.id,
         &source,
         refs,
-        args.transform.max_concurrency,
+        args.transform.max_concurrency(),
         Some(&mut writer as &mut dyn Write),
     )
     .await?;
@@ -1613,6 +1622,12 @@ fn root_span_id_filter(root_span_ids: &[String]) -> Value {
     })
 }
 
+fn default_transform_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(16)
+}
+
 async fn resolve_source_project(
     base: &BaseArgs,
     client: &ApiClient,
@@ -1658,6 +1673,12 @@ fn print_summary(base: &BaseArgs, summary: Value, force_stderr: bool) -> Result<
         .collect::<Vec<_>>();
     eprintln!("{}", parts.join(", "));
     Ok(())
+}
+
+fn print_pipeline_status(base: &BaseArgs, message: impl AsRef<str>) {
+    if !base.json && !base.quiet {
+        eprintln!("{}", message.as_ref());
+    }
 }
 
 fn summary_value(value: &Value) -> String {
@@ -1971,7 +1992,7 @@ mod tests {
             &runner,
             &source,
             &PipelineTransformOptions {
-                max_concurrency: 16,
+                max_concurrency: Some(16),
             },
             &fetch_artifact.output_path,
         );

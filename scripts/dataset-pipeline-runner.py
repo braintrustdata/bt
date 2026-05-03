@@ -38,9 +38,8 @@ TARGET_KEY_MAP = {
 
 
 class SseWriter:
-    def __init__(self, sock_path: str):
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._socket.connect(sock_path)
+    def __init__(self, sock: socket.socket):
+        self._socket = sock
 
     def send(self, event: str, payload: Any) -> None:
         data = payload if isinstance(payload, str) else json.dumps(payload, separators=(",", ":"))
@@ -54,9 +53,18 @@ class SseWriter:
 def create_sse_writer() -> SseWriter | None:
     sock_path = os.getenv("BT_DATASET_PIPELINE_SSE_SOCK")
     if not sock_path:
-        return None
+        addr = os.getenv("BT_DATASET_PIPELINE_SSE_ADDR")
+        if not addr:
+            return None
+        if ":" not in addr:
+            raise ValueError("BT_DATASET_PIPELINE_SSE_ADDR must be in host:port format")
+        host, port_str = addr.rsplit(":", 1)
+        sock = socket.create_connection((host, int(port_str)))
+        return SseWriter(sock)
     try:
-        return SseWriter(sock_path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_path)
+        return SseWriter(sock)
     except Exception as exc:
         print(f"Failed to connect to dataset pipeline socket: {exc}", file=sys.stderr)
         return None
