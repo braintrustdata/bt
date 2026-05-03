@@ -547,6 +547,16 @@ fn apply_source_overrides(source: &mut PipelineSourceInspect, args: &PipelineSou
     }
 }
 
+fn source_with_resolved_project(
+    source: &PipelineSourceInspect,
+    project: &Project,
+) -> PipelineSourceInspect {
+    let mut source = source.clone();
+    source.project_id = Some(project.id.clone());
+    source.project_name = Some(project.name.clone());
+    source
+}
+
 fn apply_target_overrides(target: &mut PipelineTargetInspect, args: &PipelineTargetArgs) {
     if let Some(project_name) = args.target_project.as_deref() {
         target.project_name = Some(project_name.to_string());
@@ -650,8 +660,10 @@ fn pipeline_language(pipeline_file: &Path) -> Result<SourceLanguage> {
 async fn fetch_refs(
     base: &BaseArgs,
     args: PipelineFetchArgs,
-    inspect: PipelineInspect,
+    mut inspect: PipelineInspect,
 ) -> Result<()> {
+    let source_project = resolve_pipeline_source_project(base, &inspect.source).await?;
+    inspect.source = source_with_resolved_project(&inspect.source, &source_project);
     let spec = pipeline_fetch_artifact_spec(base, &args.runner, &inspect.source, &args.fetch);
     let artifact = resolve_pipeline_output_artifact(
         &args.artifacts.root,
@@ -685,6 +697,8 @@ async fn fetch_refs(
             "refs": result.refs,
             "pages": result.pages,
             "scope": match PipelineScope::from_source(&inspect.source) { PipelineScope::Trace => "trace", PipelineScope::Span => "span" },
+            "source_project": source_project.name,
+            "source_project_id": source_project.id,
             "out": artifact.output_path.display().to_string(),
         }),
         false,
@@ -805,6 +819,41 @@ fn resolve_pipeline_input_path(
     } else {
         resolve_latest_pipeline_stage_output(root, runner, stage)
     }
+}
+
+fn read_pipeline_stage_manifest_for_output(
+    output_path: &Path,
+    stage: PipelineArtifactStage,
+) -> Result<Option<PipelineArtifactManifest>> {
+    let Some(parent) = output_path.parent() else {
+        return Ok(None);
+    };
+    let manifest_path = parent.join(stage.manifest_file());
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let manifest = read_json_file::<PipelineArtifactManifest>(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    if manifest.stage != stage || manifest.status != PipelineArtifactStatus::Completed {
+        return Ok(None);
+    }
+    Ok(Some(manifest))
+}
+
+fn base_with_pipeline_artifact_context(
+    base: &BaseArgs,
+    manifest: Option<&PipelineArtifactManifest>,
+) -> BaseArgs {
+    let mut base = base.clone();
+    if let Some(spec) = manifest.map(|manifest| &manifest.spec) {
+        if base.project.is_none() {
+            base.project = spec.cli_project.clone();
+        }
+        if base.org_name.is_none() {
+            base.org_name = spec.cli_org.clone();
+        }
+    }
+    base
 }
 
 fn resolve_latest_pipeline_stage_output(
@@ -1088,23 +1137,27 @@ fn forward_blocking_stream<T>(
 }
 
 async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<()> {
-    let inspect = inspect_with_overrides(
-        inspect_pipeline(base, &args.runner).await?,
-        Some(&args.source),
-        None,
-    );
-    let source_project = resolve_pipeline_source_project(base, &inspect.source).await?;
     let input_path = resolve_pipeline_input_path(
         &args.input,
         &args.artifacts.root,
         &args.runner,
         PipelineArtifactStage::Fetch,
     )?;
+    let fetch_manifest =
+        read_pipeline_stage_manifest_for_output(&input_path, PipelineArtifactStage::Fetch)?;
+    let inspect = inspect_pipeline(base, &args.runner).await?;
+    let mut source = fetch_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.spec.source.clone())
+        .unwrap_or(inspect.source);
+    apply_source_overrides(&mut source, &args.source);
+    let source_base = base_with_pipeline_artifact_context(base, fetch_manifest.as_ref());
+    let source_project = resolve_pipeline_source_project(&source_base, &source).await?;
     let refs = read_jsonl_values(&input_path)?;
     let spec = pipeline_transform_artifact_spec(
-        base,
+        &source_base,
         &args.runner,
-        &inspect.source,
+        &source,
         &args.transform,
         &input_path,
     );
@@ -1119,10 +1172,10 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
     let started_at = epoch_seconds();
     let mut writer = create_jsonl_file_writer(&artifact.output_path)?;
     let response = transform_source_refs(
-        base,
+        &source_base,
         &args.runner,
         &source_project.id,
-        &inspect.source,
+        &source,
         refs,
         args.transform.max_concurrency,
         Some(&mut writer as &mut dyn Write),
@@ -1763,6 +1816,69 @@ mod tests {
         let target_base = base_with_pipeline_target(&base, &target);
         assert_eq!(target_base.org_name.as_deref(), Some("target-org"));
         assert_eq!(target_base.project.as_deref(), Some("project-id"));
+    }
+
+    #[test]
+    fn pipeline_source_artifact_records_resolved_project() {
+        let source = PipelineSourceInspect {
+            project_id: None,
+            project_name: None,
+            org_name: None,
+            filter: Some("span_attributes.type = 'llm'".to_string()),
+            scope: Some(PipelineScope::Span),
+        };
+        let project = Project {
+            id: "project-id".to_string(),
+            name: "Loop".to_string(),
+            org_id: "org-id".to_string(),
+            description: None,
+        };
+
+        let resolved = source_with_resolved_project(&source, &project);
+
+        assert_eq!(resolved.project_id.as_deref(), Some("project-id"));
+        assert_eq!(resolved.project_name.as_deref(), Some("Loop"));
+        assert_eq!(resolved.filter, source.filter);
+        assert_eq!(resolved.scope, source.scope);
+    }
+
+    #[test]
+    fn pipeline_transform_base_inherits_fetch_artifact_context() {
+        let base = test_base_args();
+        let manifest = PipelineArtifactManifest {
+            schema_version: PIPELINE_ARTIFACT_SCHEMA_VERSION,
+            spec_hash: "hash".to_string(),
+            spec: PipelineArtifactSpec {
+                schema_version: PIPELINE_ARTIFACT_SCHEMA_VERSION,
+                kind: PIPELINE_ARTIFACT_OBJECT_TYPE.to_string(),
+                pipeline: "facet_pipeline.py".to_string(),
+                name: None,
+                cli_project: Some("Loop".to_string()),
+                cli_org: Some("braintrustdata.com".to_string()),
+                stage: PipelineArtifactStage::Fetch,
+                source: None,
+                target: None,
+                fetch: None,
+                transform: None,
+                input_path: None,
+            },
+            status: PipelineArtifactStatus::Completed,
+            stage: PipelineArtifactStage::Fetch,
+            input_path: None,
+            output_path: None,
+            refs: Some(1),
+            candidates: None,
+            rows: None,
+            pages: Some(1),
+            started_at: 1,
+            updated_at: 2,
+            completed_at: Some(2),
+        };
+
+        let inherited = base_with_pipeline_artifact_context(&base, Some(&manifest));
+
+        assert_eq!(inherited.project.as_deref(), Some("Loop"));
+        assert_eq!(inherited.org_name.as_deref(), Some("braintrustdata.com"));
     }
 
     #[test]
