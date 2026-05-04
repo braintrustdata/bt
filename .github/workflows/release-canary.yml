@@ -166,6 +166,13 @@ jobs:
         with:
           arch: amd64_arm64
 
+      - name: Remove Git usr/bin from PATH (prevents Git link.exe shadowing MSVC link.exe)
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        shell: pwsh
+        run: |
+          $clean = $env:PATH -split ';' | Where-Object { $_ -ine 'C:\Program Files\Git\usr\bin' }
+          "PATH=$($clean -join ';')" >> $env:GITHUB_ENV
+
       - name: Build artifacts
         shell: bash
         run: |
