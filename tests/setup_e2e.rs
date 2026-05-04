@@ -482,6 +482,15 @@ impl PtyProcess {
     }
 }
 
+impl Drop for PtyProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        if let Some(thread) = self.reader_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn wait_for_authorize_url(pty: &PtyProcess, browser_log: &Path, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
