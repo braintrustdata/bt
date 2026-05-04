@@ -29,4 +29,4 @@ windows-archive = ".zip"
 install-success-msg = ""
 
 [dist.github-custom-runners]
-aarch64-pc-windows-msvc = "windows-11-arm"
+aarch64-pc-windows-msvc = "windows-2022"

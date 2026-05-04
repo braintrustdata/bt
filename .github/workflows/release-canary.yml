@@ -160,6 +160,12 @@ jobs:
       - name: Install dependencies
         run: ${{ matrix.packages_install }}
 
+      - name: Set up MSVC cross-compilation for Windows ARM64
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: amd64_arm64
+
       - name: Build artifacts
         shell: bash
         run: |
