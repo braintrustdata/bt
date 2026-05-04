@@ -166,12 +166,12 @@ jobs:
         with:
           arch: amd64_arm64
 
-      - name: Remove Git usr/bin from PATH (prevents Git link.exe shadowing MSVC link.exe)
+      - name: Set MSVC ARM64 linker for cargo cross-compilation
         if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
         shell: pwsh
         run: |
-          $clean = $env:PATH -split ';' | Where-Object { $_ -ine 'C:\Program Files\Git\usr\bin' }
-          "PATH=$($clean -join ';')" >> $env:GITHUB_ENV
+          $link = (Get-Command link.exe -ErrorAction Stop).Source
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$link" >> $env:GITHUB_ENV
 
       - name: Build artifacts
         shell: bash
