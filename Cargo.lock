@@ -515,6 +515,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "futures-util",
+ "fuzzy-matcher",
  "getrandom 0.3.4",
  "glob",
  "indicatif",
