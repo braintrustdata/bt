@@ -26,6 +26,7 @@ use crate::experiments::api::create_experiment;
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
+use crate::utils::parse_duration_to_seconds;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
@@ -2604,30 +2605,6 @@ fn build_root_spans_query(
         parts.push(format!("cursor: {}", btql_quote(c)));
     }
     parts.join(" | ")
-}
-
-fn parse_duration_to_seconds(input: &str) -> Result<u64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("duration cannot be empty");
-    }
-    if let Ok(seconds) = trimmed.parse::<u64>() {
-        return Ok(seconds);
-    }
-
-    let (num_str, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
-    let value: u64 = num_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid duration '{input}'"))?;
-    let multiplier = match unit.to_ascii_lowercase().as_str() {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 60 * 60 * 24,
-        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
-    };
-    Ok(value.saturating_mul(multiplier))
 }
 
 fn build_time_filter_clause(window: &str, extra_filter: Option<&str>) -> Result<String> {
