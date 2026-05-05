@@ -16,6 +16,7 @@ mod create;
 mod delete;
 mod list;
 mod records;
+mod snapshots;
 mod update;
 mod utils;
 mod view;
@@ -86,6 +87,13 @@ struct DatasetInputArgs {
   bt datasets update my-dataset --file records.jsonl
   bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'
   bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id
+  bt datasets snapshots list my-dataset
+  bt datasets snapshots create my-dataset
+  bt datasets snapshots create my-dataset baseline
+  bt datasets snapshots create my-dataset baseline --xact-id 1000192656880881099
+  bt datasets snapshots restore my-dataset
+  bt datasets snapshots restore my-dataset --name baseline
+  bt datasets snapshots restore my-dataset --snapshot 1000192656880881099 --force
   bt datasets view my-dataset
   bt datasets delete my-dataset
 "#)]
@@ -107,6 +115,9 @@ enum DatasetsCommands {
     View(ViewArgs),
     /// Delete a dataset
     Delete(DeleteArgs),
+    /// Manage dataset snapshots
+    #[command(visible_aliases = ["versions", "version"])]
+    Snapshots(snapshots::SnapshotsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -296,14 +307,20 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
         Some(DatasetsCommands::Delete(delete_args)) => {
             delete::run(&ctx, delete_args.name(), delete_args.force).await
         }
+        Some(DatasetsCommands::Snapshots(snapshot_args)) => {
+            snapshots::run(&ctx, &base, snapshot_args).await
+        }
     }
 }
 
 fn datasets_command_is_read_only(command: Option<&DatasetsCommands>) -> bool {
-    matches!(
-        command,
-        None | Some(DatasetsCommands::List) | Some(DatasetsCommands::View(_))
-    )
+    match command {
+        None | Some(DatasetsCommands::List) | Some(DatasetsCommands::View(_)) => true,
+        Some(DatasetsCommands::Snapshots(args)) => snapshots::command_is_read_only(args),
+        Some(DatasetsCommands::Create(_))
+        | Some(DatasetsCommands::Update(_))
+        | Some(DatasetsCommands::Delete(_)) => false,
+    }
 }
 
 fn resolve_view_row_limit(args: &ViewArgs) -> Option<usize> {
@@ -320,6 +337,10 @@ mod tests {
 
     use clap::{Parser, Subcommand};
 
+    use super::snapshots::{
+        SnapshotCreateArgs, SnapshotDatasetArgs, SnapshotListArgs, SnapshotNameArgs,
+        SnapshotRestoreArgs, SnapshotsArgs, SnapshotsCommands,
+    };
     use super::*;
 
     #[derive(Debug, Parser)]
@@ -560,6 +581,16 @@ mod tests {
                 all_rows: false,
             })
         )));
+        assert!(datasets_command_is_read_only(Some(
+            &DatasetsCommands::Snapshots(SnapshotsArgs {
+                command: SnapshotsCommands::List(SnapshotListArgs {
+                    dataset: SnapshotDatasetArgs {
+                        dataset_positional: Some("dataset".to_string()),
+                        dataset_flag: None,
+                    },
+                }),
+            })
+        )));
     }
 
     #[test]
@@ -600,5 +631,172 @@ mod tests {
                 force: true,
             })
         )));
+        assert!(!datasets_command_is_read_only(Some(
+            &DatasetsCommands::Snapshots(SnapshotsArgs {
+                command: SnapshotsCommands::Create(SnapshotCreateArgs {
+                    dataset: SnapshotDatasetArgs {
+                        dataset_positional: Some("dataset".to_string()),
+                        dataset_flag: None,
+                    },
+                    snapshot: SnapshotNameArgs {
+                        name_positional: Some("baseline".to_string()),
+                        name_flag: None,
+                    },
+                    xact_id: None,
+                    description: None,
+                }),
+            })
+        )));
+        assert!(!datasets_command_is_read_only(Some(
+            &DatasetsCommands::Snapshots(SnapshotsArgs {
+                command: SnapshotsCommands::Restore(SnapshotRestoreArgs {
+                    dataset: SnapshotDatasetArgs {
+                        dataset_positional: Some("dataset".to_string()),
+                        dataset_flag: None,
+                    },
+                    name: Some("baseline".to_string()),
+                    snapshot: None,
+                    force: false,
+                }),
+            })
+        )));
+    }
+
+    #[test]
+    fn snapshots_list_parses_dataset_name() {
+        let parsed =
+            parse(&["datasets", "snapshots", "list", "my-dataset"]).expect("parse snapshots list");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::List(list) = snapshots.command else {
+            panic!("expected snapshots list command");
+        };
+        assert_eq!(list.dataset_name(), Some("my-dataset"));
+    }
+
+    #[test]
+    fn version_alias_parses_create_flags_for_compatibility() {
+        let parsed = parse(&[
+            "datasets",
+            "version",
+            "create",
+            "--dataset",
+            "my-dataset",
+            "--name",
+            "baseline",
+            "--xact-id",
+            "1000192656880881099",
+            "--description",
+            "Initial snapshot",
+        ])
+        .expect("parse version alias create");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::Create(create) = snapshots.command else {
+            panic!("expected snapshots create command");
+        };
+        assert_eq!(create.dataset_name(), Some("my-dataset"));
+        assert_eq!(create.snapshot_name(), Some("baseline"));
+        assert_eq!(create.xact_id.as_deref(), Some("1000192656880881099"));
+        assert_eq!(create.description.as_deref(), Some("Initial snapshot"));
+    }
+
+    #[test]
+    fn snapshots_create_allows_omitting_xact_id() {
+        let parsed = parse(&["datasets", "snapshots", "create", "my-dataset", "baseline"])
+            .expect("parse snapshots create without xact id");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::Create(create) = snapshots.command else {
+            panic!("expected snapshots create command");
+        };
+        assert_eq!(create.dataset_name(), Some("my-dataset"));
+        assert_eq!(create.snapshot_name(), Some("baseline"));
+        assert!(create.xact_id.is_none());
+    }
+
+    #[test]
+    fn snapshots_create_allows_omitting_snapshot_name() {
+        let parsed = parse(&["datasets", "snapshots", "create", "my-dataset"])
+            .expect("parse snapshots create without snapshot name");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::Create(create) = snapshots.command else {
+            panic!("expected snapshots create command");
+        };
+        assert_eq!(create.dataset_name(), Some("my-dataset"));
+        assert!(create.snapshot_name().is_none());
+    }
+
+    #[test]
+    fn snapshots_restore_parses_name_target() {
+        let parsed = parse(&[
+            "datasets",
+            "snapshots",
+            "restore",
+            "my-dataset",
+            "--name",
+            "baseline",
+        ])
+        .expect("parse snapshots restore --name");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::Restore(restore) = snapshots.command else {
+            panic!("expected snapshots restore command");
+        };
+        assert_eq!(restore.dataset_name(), Some("my-dataset"));
+        assert_eq!(restore.snapshot_name(), Some("baseline"));
+        assert!(restore.snapshot_xact_id().is_none());
+        assert!(!restore.force);
+    }
+
+    #[test]
+    fn version_alias_parses_restore_version_alias_and_force() {
+        let parsed = parse(&[
+            "datasets",
+            "version",
+            "restore",
+            "--dataset",
+            "my-dataset",
+            "--version",
+            "1000192656880881099",
+            "--force",
+        ])
+        .expect("parse version alias restore");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::Restore(restore) = snapshots.command else {
+            panic!("expected snapshots restore command");
+        };
+        assert_eq!(restore.dataset_name(), Some("my-dataset"));
+        assert_eq!(restore.snapshot_xact_id(), Some("1000192656880881099"));
+        assert!(restore.snapshot_name().is_none());
+        assert!(restore.force);
+    }
+
+    #[test]
+    fn snapshots_restore_rejects_name_and_snapshot_together() {
+        let err = parse(&[
+            "datasets",
+            "snapshots",
+            "restore",
+            "my-dataset",
+            "--name",
+            "baseline",
+            "--snapshot",
+            "1000192656880881099",
+        ])
+        .expect_err("restore target conflict should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("--name") && message.contains("--snapshot"),
+            "unexpected clap error: {message}"
+        );
     }
 }
