@@ -1,10 +1,16 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
 fn bt_command() -> Command {
     Command::cargo_bin("bt").expect("bt binary")
+}
+
+fn run_json(cmd: &mut Command) -> Value {
+    let output = cmd.assert().success().get_output().stdout.clone();
+    serde_json::from_slice(&output).expect("valid json output")
 }
 
 fn clear_braintrust_auth_env(cmd: &mut Command) {
@@ -13,6 +19,31 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
         "BRAINTRUST_PROFILE",
         "BRAINTRUST_ORG_NAME",
         "BRAINTRUST_DEFAULT_PROJECT",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
+fn clear_agent_env(cmd: &mut Command) {
+    for key in [
+        "BRAINTRUST_AGENT",
+        "BRAINTRUST_NO_AGENT",
+        "FORCE_AGENT_MODE",
+        "CLAUDECODE",
+        "CLAUDE_CODE",
+        "CURSOR_AGENT",
+        "CODEX",
+        "OPENAI_CODEX",
+        "OPENCODE",
+        "AIDER",
+        "CLINE",
+        "WINDSURF_AGENT",
+        "GITHUB_COPILOT",
+        "AMAZON_Q",
+        "AWS_Q_DEVELOPER",
+        "GEMINI_CODE_ASSIST",
+        "SRC_CODY",
+        "AGENT",
     ] {
         cmd.env_remove(key);
     }
@@ -103,6 +134,91 @@ fn setup_quiet_and_verbose_conflict() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn agent_schema_outputs_verbose_json() {
+    let mut cmd = bt_command();
+    clear_agent_env(&mut cmd);
+    let output = run_json(cmd.args(["agent", "schema"]));
+    assert!(output.get("commands").and_then(Value::as_array).is_some());
+    assert!(output
+        .get("global_flags")
+        .and_then(Value::as_array)
+        .is_some());
+}
+
+#[test]
+fn agent_schema_compact_outputs_minified_json() {
+    let mut cmd = bt_command();
+    clear_agent_env(&mut cmd);
+    let assert = cmd
+        .args(["agent", "schema", "--compact"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    assert!(stdout.lines().count() <= 1 || stdout.lines().count() == 2 && stdout.ends_with('\n'));
+    let parsed: Value = serde_json::from_str(stdout.trim_end()).expect("json");
+    assert!(parsed.get("commands").and_then(Value::as_array).is_some());
+}
+
+#[test]
+fn agent_guide_outputs_expected_sections() {
+    let mut cmd = bt_command();
+    clear_agent_env(&mut cmd);
+    cmd.args(["agent", "guide"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bt agent guide"))
+        .stdout(predicate::str::contains("bt version:"))
+        .stdout(predicate::str::contains("Core discovery commands"));
+}
+
+#[test]
+fn help_in_agent_mode_outputs_json_schema() {
+    let mut cmd = bt_command();
+    clear_agent_env(&mut cmd);
+    let output = run_json(cmd.env("CLAUDE_CODE", "1").args(["--help"]));
+    assert!(output.get("commands").and_then(Value::as_array).is_some());
+}
+
+#[test]
+fn deep_help_in_agent_mode_is_scoped_chain() {
+    let mut cmd = bt_command();
+    clear_agent_env(&mut cmd);
+    let output = run_json(
+        cmd.env("CLAUDE_CODE", "1")
+            .args(["projects", "create", "--help"]),
+    );
+    let commands = output
+        .get("commands")
+        .and_then(Value::as_array)
+        .expect("commands");
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].get("name").and_then(Value::as_str),
+        Some("projects")
+    );
+    let subcommands = commands[0]
+        .get("subcommands")
+        .and_then(Value::as_array)
+        .expect("subcommands");
+    assert_eq!(subcommands.len(), 1);
+    assert_eq!(
+        subcommands[0].get("name").and_then(Value::as_str),
+        Some("create")
+    );
+}
+
+#[test]
+fn help_outside_agent_mode_stays_text() {
+    let mut cmd = bt_command();
+    clear_agent_env(&mut cmd);
+    cmd.args(["--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Core"))
+        .stdout(predicate::str::contains("Flags"));
 }
 
 #[test]

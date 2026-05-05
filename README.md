@@ -120,7 +120,20 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt projects`    | Manage projects (list, create, view, delete)                       |
 | `bt prompts`     | Manage prompts (list, view, delete)                                |
 | `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt agent`       | Agent schema/guide commands and agent-mode help surfaces           |
 | `bt self update` | Update bt in-place                                                 |
+
+## `bt agent`
+
+- Full machine-readable command schema:
+  - `bt agent schema`
+- Compact minified schema:
+  - `bt agent schema --compact`
+- Plain-text operational guide:
+  - `bt agent guide`
+- Agent-mode help interception (JSON schema output):
+  - `CLAUDE_CODE=true bt --help`
+  - `bt --agent --help`
 
 ## `bt eval`
 

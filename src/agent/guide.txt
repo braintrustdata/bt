@@ -1,0 +1,30 @@
+Braintrust CLI Agent Guide
+==========================
+
+Use this guide to quickly operate bt as an AI coding agent.
+
+Core discovery commands
+-----------------------
+- Full schema: `bt agent schema`
+- Compact schema: `bt agent schema --compact`
+- Domain help: `bt <command> <subcommand> --help`
+
+Agent-mode help
+---------------
+When agent mode is enabled, `--help` returns JSON schema instead of text help.
+
+Examples:
+- `CLAUDE_CODE=true bt --help`
+- `bt --agent --help`
+- `CLAUDE_CODE=true bt projects create --help`
+
+Authentication quick start
+--------------------------
+- OAuth: `bt auth login --oauth`
+- API key: `--api-key` or `BRAINTRUST_API_KEY`
+- Check status: `bt auth status`
+
+Output guidance
+---------------
+- Prefer `--json` for machine-readable responses.
+- Use compact schema when token budget is tight.

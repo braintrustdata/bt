@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
+mod agent;
 mod args;
 mod auth;
 #[allow(dead_code)]
@@ -73,6 +74,7 @@ Data & evaluation
   sync         Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
+  agent        Agent-focused schema and guide commands
   docs         Manage workflow docs for coding agents
   self         Self-management commands
   setup        Configure Braintrust setup flows
@@ -83,6 +85,8 @@ Flags
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
       -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
       --json                 Output as JSON
+      --agent                Enable agent mode [env: BRAINTRUST_AGENT=]
+      --no-agent             Disable agent mode [env: BRAINTRUST_NO_AGENT=]
   -v, --verbose              Increase output verbosity [env: BRAINTRUST_VERBOSE=]
   -q, --quiet                Reduce interactive UI output [env: BRAINTRUST_QUIET=]
       --no-color             Disable ANSI color output
@@ -110,6 +114,14 @@ Read the manual at https://braintrust.dev/docs/reference/cli
     after_help = "Docs: https://braintrust.dev/docs",
 )]
 struct Cli {
+    /// Enable agent mode
+    #[arg(id = "agent_mode", long = "agent", env = "BRAINTRUST_AGENT", value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false, conflicts_with = "no_agent_mode")]
+    agent: bool,
+
+    /// Disable agent mode
+    #[arg(id = "no_agent_mode", long = "no-agent", env = "BRAINTRUST_NO_AGENT", value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false, conflicts_with = "agent_mode")]
+    no_agent: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -120,6 +132,8 @@ enum Commands {
     Init(CLIArgs<init::InitArgs>),
     /// Configure Braintrust setup flows
     Setup(CLIArgs<setup::SetupArgs>),
+    /// Agent-focused schema and guide commands
+    Agent(CLIArgs<agent::AgentArgs>),
     /// Manage workflow docs for coding agents
     Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
@@ -165,6 +179,7 @@ impl Commands {
         match self {
             Commands::Init(cmd) => &cmd.base,
             Commands::Setup(cmd) => &cmd.base,
+            Commands::Agent(cmd) => &cmd.base,
             Commands::Docs(cmd) => &cmd.base,
             Commands::Sql(cmd) => &cmd.base,
             Commands::Auth(cmd) => &cmd.base,
@@ -190,6 +205,7 @@ impl Commands {
         match self {
             Commands::Init(cmd) => &mut cmd.base,
             Commands::Setup(cmd) => &mut cmd.base,
+            Commands::Agent(cmd) => &mut cmd.base,
             Commands::Docs(cmd) => &mut cmd.base,
             Commands::Sql(cmd) => &mut cmd.base,
             Commands::Auth(cmd) => &mut cmd.base,
@@ -251,6 +267,10 @@ fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
+    if agent::maybe_intercept_help(&argv)? {
+        return Ok(());
+    }
+
     let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
     apply_base_arg_sources(&matches, cli.command.base_mut());
@@ -271,6 +291,7 @@ fn try_main() -> Result<()> {
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
             Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
+            Commands::Agent(cmd) => agent::run(cmd.base, cmd.args).await?,
             Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
             #[cfg(unix)]
             Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
