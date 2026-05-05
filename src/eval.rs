@@ -849,7 +849,7 @@ async fn run_eval_files_sandbox(
                             "data": { "data": [datum] },
                         });
                         let client_cloned = client.clone();
-                        let org_name = login_ctx.login.org_name.clone();
+                        let org_name = client.org_name().to_string();
                         let project_id = plan.project_id.clone();
                         in_flight.spawn(async move {
                             invoke_sandbox_eval(&client_cloned, &org_name, &project_id, body).await
@@ -1389,6 +1389,11 @@ fn aggregate_sandbox_summary(
                     .collect(),
             )
         },
+        run_mode: None,
+        is_final: None,
+        run_label: None,
+        sample_count: None,
+        sample_seed: None,
     }
 }
 
@@ -4626,16 +4631,21 @@ mod tests {
     fn base_args() -> BaseArgs {
         BaseArgs {
             json: false,
+            verbose: false,
             quiet: false,
+            quiet_source: None,
             no_color: false,
             profile: None,
+            profile_explicit: false,
             org_name: None,
             project: None,
             api_key: None,
+            api_key_source: None,
             prefer_profile: false,
             no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }
@@ -4652,8 +4662,12 @@ mod tests {
             num_workers: None,
             list: false,
             filter: Vec::new(),
-            verbose: false,
+            first: None,
+            sample: None,
+            sample_seed: None,
             watch: false,
+            param: Vec::new(),
+            matrix_param: Vec::new(),
             extra_args: Vec::new(),
             dev: false,
             dev_host: "localhost".to_string(),

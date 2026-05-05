@@ -757,7 +757,7 @@ pub(crate) async fn publish_eval_sandbox_functions(
     validate_manifest_paths(&manifest, &files, language, &classified.allowed_roots)
         .map_err(|failure| anyhow!(failure.message))?;
 
-    let preflight = collect_project_preflight(base, &manifest)?;
+    let preflight = collect_project_preflight(base, &manifest, auth_ctx.client.org_name())?;
     let mut project_name_cache =
         resolve_named_projects(&auth_ctx, &preflight.named_projects, true).await?;
     validate_direct_project_ids(&auth_ctx, &preflight.direct_project_ids).await?;
@@ -789,6 +789,7 @@ pub(crate) async fn publish_eval_sandbox_functions(
             None,
             &classified.allowed_roots,
             &mut project_name_cache,
+            &manifest.baseline_dep_versions,
         )
         .await
         .map_err(|failure| anyhow!(failure.message))?;
@@ -3760,7 +3761,6 @@ mod tests {
         assert_eq!(value["type"], "code");
         assert_eq!(value["data"]["location"], experiment_location);
     }
-
 
     fn test_base_args() -> BaseArgs {
         BaseArgs {
