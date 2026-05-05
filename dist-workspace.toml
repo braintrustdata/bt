@@ -13,7 +13,6 @@ ci = "github"
 create-release = true
 # Which actions to run on pull requests
 pr-run-mode = "plan"
-ssldotcom-windows-sign = "test"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 homepage = "https://github.com/braintrustdata/bt"

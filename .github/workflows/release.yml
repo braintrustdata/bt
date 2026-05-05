@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -148,7 +149,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      HAS_SSLDOTCOM_SIGNING: ${{ secrets.SSLDOTCOM_USERNAME != '' && secrets.SSLDOTCOM_PASSWORD != '' && secrets.SSLDOTCOM_CREDENTIAL_ID != '' && secrets.SSLDOTCOM_TOTP_SECRET != '' }}
+      HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' }}
     steps:
       - name: Enable windows longpaths
         run: git config --global core.longpaths true
@@ -209,31 +210,6 @@ jobs:
           $link = (Get-Command link.exe -ErrorAction Stop).Source
           "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$link" >> $env:GITHUB_ENV
 
-      - name: Configure SSL.com signing env
-        if: ${{ runner.os == 'Windows' && env.HAS_SSLDOTCOM_SIGNING == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
-        shell: bash
-        env:
-          SSLDOTCOM_USERNAME: ${{ secrets.SSLDOTCOM_USERNAME }}
-          SSLDOTCOM_PASSWORD: ${{ secrets.SSLDOTCOM_PASSWORD }}
-          SSLDOTCOM_CREDENTIAL_ID: ${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}
-          SSLDOTCOM_TOTP_SECRET: ${{ secrets.SSLDOTCOM_TOTP_SECRET }}
-        run: |
-          write_github_env() {
-            local key="$1"
-            local value="$2"
-            local delimiter="EOF_${key}_$$"
-            {
-              echo "${key}<<${delimiter}"
-              echo "${value}"
-              echo "${delimiter}"
-            } >> "$GITHUB_ENV"
-          }
-
-          write_github_env "SSLDOTCOM_USERNAME" "$SSLDOTCOM_USERNAME"
-          write_github_env "SSLDOTCOM_PASSWORD" "$SSLDOTCOM_PASSWORD"
-          write_github_env "SSLDOTCOM_CREDENTIAL_ID" "$SSLDOTCOM_CREDENTIAL_ID"
-          write_github_env "SSLDOTCOM_TOTP_SECRET" "$SSLDOTCOM_TOTP_SECRET"
-
       - name: Build artifacts
         shell: bash
         run: |
@@ -241,6 +217,46 @@ jobs:
           BT_VERSION_STRING="${{ needs.plan.outputs.release-version }}" \
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+
+      - name: Azure login for code signing
+        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows executables
+        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+        uses: azure/artifact-signing-action@v0
+        with:
+          azure-endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
+          files-folder: target/distrib
+          files-folder-filter: exe
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Refresh zip archives with signed executables
+        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path "target/distrib" -Filter "*.zip" | ForEach-Object {
+            $zipPath = $_.FullName
+            $stagingDir = Join-Path $_.DirectoryName $_.BaseName
+            if (Test-Path $stagingDir) {
+              Remove-Item $zipPath -Force
+              Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipPath
+              $shaFile = "$zipPath.sha256"
+              if (Test-Path $shaFile) {
+                $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+                "$hash  $($_.Name)" | Set-Content $shaFile -NoNewline
+              }
+            }
+          }
 
       - id: dist-files
         name: Post-build
