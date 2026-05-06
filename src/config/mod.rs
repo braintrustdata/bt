@@ -202,17 +202,15 @@ pub(crate) fn trimmed_option(value: Option<&str>) -> Option<&str> {
 }
 
 pub fn save_file(path: &Path, config: &Config) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
 
     let json = serde_json::to_string_pretty(config)?;
-    let temp_path = path.with_extension("tmp");
-    let mut file = fs::File::create(&temp_path)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(json.as_bytes())?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temp_path, path)?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
 
     Ok(())
 }
