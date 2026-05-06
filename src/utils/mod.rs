@@ -6,7 +6,6 @@ mod json_object;
 mod plurals;
 mod profile;
 
-pub use duration::parse_duration_to_seconds;
 pub use fs_atomic::write_text_atomic;
 pub use git::GitRepo;
 pub(crate) use ids::new_uuid_id;

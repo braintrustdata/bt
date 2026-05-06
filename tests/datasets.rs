@@ -114,13 +114,16 @@ struct MockDatasetSnapshot {
     created: String,
 }
 
+type MockDatasetRows = BTreeMap<String, Map<String, Value>>;
+type MockDatasetRowsByDataset = BTreeMap<String, MockDatasetRows>;
+
 #[derive(Debug)]
 struct MockServerState {
     requests: Mutex<Vec<String>>,
     projects: Mutex<Vec<MockProject>>,
     datasets: Mutex<Vec<MockDataset>>,
     dataset_snapshots: Mutex<Vec<MockDatasetSnapshot>>,
-    dataset_rows: Mutex<BTreeMap<String, BTreeMap<String, Map<String, Value>>>>,
+    dataset_rows: Mutex<MockDatasetRowsByDataset>,
     btql_dataset_id: Mutex<Option<String>>,
 }
 
