@@ -26,7 +26,6 @@ use crate::experiments::api::create_experiment;
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
-use crate::utils::parse_duration_to_seconds;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
