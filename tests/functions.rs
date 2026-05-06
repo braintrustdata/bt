@@ -1373,7 +1373,7 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
     std::fs::write(framework_dir.join("__init__.py"), "").expect("write framework __init__");
     std::fs::write(
         framework_dir.join("global_.py"),
-        "functions = []\nprompts = []\n",
+        "functions = []\nprompts = []\nparameters = []\n",
     )
     .expect("write global_.py");
     std::fs::write(
@@ -1385,7 +1385,9 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
     let sample_path = tmp.path().join("sample_tool.py");
     std::fs::write(
         &sample_path,
-        r#"from braintrust.framework2.global_ import functions
+        r#"from braintrust.framework2.global_ import functions, parameters
+
+print("import noise")
 
 class TypeEnum:
     value = "tool"
@@ -1404,6 +1406,22 @@ class Item:
         self.preview = "def handler(x):\n    return x"
 
 functions.append(Item())
+
+class ParameterItem:
+    def __init__(self):
+        self.project = "My Project"
+
+    def to_function_definition(self, _if_exists, resolver):
+        return {
+            "project_id": resolver.get(self.project),
+            "name": "py-parameters",
+            "slug": "py-parameters",
+            "function_type": "parameters",
+            "function_data": {"type": "parameters", "data": {}, "__schema": {}},
+            "if_exists": _if_exists,
+        }
+
+parameters.append(ParameterItem())
 "#,
     )
     .expect("write sample_tool.py");
@@ -1428,6 +1446,11 @@ functions.append(Item())
         let stderr = String::from_utf8_lossy(&output.stderr);
         panic!("python functions runner failed:\n{stderr}");
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("import noise"),
+        "import-time stdout should be redirected to stderr"
+    );
 
     let manifest: Value = serde_json::from_slice(&output.stdout).expect("parse manifest JSON");
     assert_eq!(
@@ -1462,8 +1485,12 @@ functions.append(Item())
         .get("entries")
         .and_then(Value::as_array)
         .expect("entries array");
-    assert_eq!(entries.len(), 1, "expected one code entry");
-    let entry = entries[0].as_object().expect("entry object");
+    assert_eq!(entries.len(), 2, "expected code and parameter entries");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some("code"))
+        .and_then(Value::as_object)
+        .expect("code entry object");
     assert_eq!(entry.get("kind").and_then(Value::as_str), Some("code"));
     assert_eq!(entry.get("name").and_then(Value::as_str), Some("py-tool"));
     assert_eq!(entry.get("slug").and_then(Value::as_str), Some("py-tool"));
@@ -1474,6 +1501,28 @@ functions.append(Item())
     assert_eq!(
         entry.get("preview").and_then(Value::as_str),
         Some("def handler(x):\n    return x")
+    );
+    let parameter_entry = entries
+        .iter()
+        .find(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some("function_event")
+                && entry
+                    .get("event")
+                    .and_then(|event| event.get("slug"))
+                    .and_then(Value::as_str)
+                    == Some("py-parameters")
+        })
+        .expect("parameter function_event entry");
+    assert_eq!(
+        parameter_entry.get("project_name").and_then(Value::as_str),
+        Some("My Project")
+    );
+    assert_eq!(
+        parameter_entry
+            .get("event")
+            .and_then(|event| event.get("function_type"))
+            .and_then(Value::as_str),
+        Some("parameters")
     );
 
     let bundle = file

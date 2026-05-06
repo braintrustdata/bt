@@ -4,7 +4,7 @@ import inspect
 import json
 import os
 import sys
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 from typing import Any
 
 from python_runner_common import (
@@ -42,7 +42,7 @@ def to_json_value(value: Any) -> Any:
     return str(value)
 
 
-def load_framework_globals() -> tuple[Any, Any, Any]:
+def load_framework_globals() -> tuple[Any, Any, Any, Any]:
     # Prefer current SDK layout first:
     # - braintrust.framework2 exposes module-level `global_`
     # - braintrust.framework exposes `_set_lazy_load`
@@ -50,13 +50,19 @@ def load_framework_globals() -> tuple[Any, Any, Any]:
         from braintrust.framework import _set_lazy_load as lazy
         from braintrust.framework2 import global_ as global_state
 
-        return global_state.functions, global_state.prompts, lazy
+        parameters = getattr(global_state, "parameters", [])
+        return global_state.functions, global_state.prompts, parameters, lazy
     except (ImportError, ModuleNotFoundError):
         # Backward compatibility with older SDK layout.
         from braintrust.framework2.global_ import functions, prompts
         from braintrust.framework2.lazy_load import _set_lazy_load as lazy
 
-        return functions, prompts, lazy
+        try:
+            from braintrust.framework2.global_ import parameters
+        except ImportError:
+            parameters = []
+
+        return functions, prompts, parameters, lazy
 
 
 def normalize_project_selector(project: Any) -> tuple[str | None, str | None]:
@@ -284,9 +290,10 @@ async def process_file(file_path: str) -> dict[str, Any]:
         sys.path.insert(0, cwd)
 
     purge_local_modules(cwd, preserve_modules={__name__, "python_runner_common"})
-    functions_registry, prompts_registry, lazy_loader = load_framework_globals()
+    functions_registry, prompts_registry, parameters_registry, lazy_loader = load_framework_globals()
     clear_registry(functions_registry)
     clear_registry(prompts_registry)
+    clear_registry(parameters_registry)
 
     module_name = import_module_name_from_cwd(cwd, abs_path)
     if module_name is None:
@@ -297,8 +304,9 @@ async def process_file(file_path: str) -> dict[str, Any]:
     with lazy_ctx:
         import_file(module_name, abs_path, extra_paths)
         code_entries = collect_code_entries(functions_registry)
-        event_entries = await collect_function_event_entries(prompts_registry)
-        entries = [*code_entries, *event_entries]
+        prompt_event_entries = await collect_function_event_entries(prompts_registry)
+        parameter_event_entries = await collect_function_event_entries(parameters_registry)
+        entries = [*code_entries, *prompt_event_entries, *parameter_event_entries]
         file_manifest: dict[str, Any] = {
             "source_file": abs_path,
             "entries": entries,
@@ -357,6 +365,7 @@ async def process_file(file_path: str) -> dict[str, Any]:
 
     clear_registry(functions_registry)
     clear_registry(prompts_registry)
+    clear_registry(parameters_registry)
     return file_manifest
 
 
@@ -394,7 +403,8 @@ async def main() -> None:
         "baseline_dep_versions": resolve_baseline_dep_versions(),
     }
     for file_path in files:
-        manifest["files"].append(await process_file(file_path))
+        with redirect_stdout(sys.stderr):
+            manifest["files"].append(await process_file(file_path))
 
     sys.stdout.write(json.dumps(manifest))
 
