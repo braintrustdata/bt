@@ -28,6 +28,7 @@ pub struct ApiClient {
     http: Client,
     base_url: String,
     api_key: String,
+    org_id: String,
     org_name: String,
 }
 
@@ -60,6 +61,7 @@ impl ApiClient {
             http,
             base_url: ctx.api_url.trim_end_matches('/').to_string(),
             api_key: ctx.login.api_key().context("login state missing API key")?,
+            org_id: ctx.login.org_id().unwrap_or_default(),
             org_name: ctx.login.org_name().unwrap_or_default(),
         })
     }
@@ -75,6 +77,10 @@ impl ApiClient {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn org_id(&self) -> &str {
+        &self.org_id
     }
 
     pub fn org_name(&self) -> &str {

@@ -1772,6 +1772,13 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
         key: String,
     }
 
+    let org_id = client.org_id().trim();
+    if org_id.is_empty() {
+        bail!(
+            "setup could not determine the current org_id for API key creation; rerun with a direct API key or re-authenticate so setup can resolve the selected organization"
+        );
+    }
+
     let existing: Vec<String> = client
         .get::<ApiKeyList>("/v1/api_key")
         .await
@@ -1790,7 +1797,7 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
             .expect("name sequence is infinite")
     };
 
-    let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
+    let body = serde_json::json!({ "name": name, "org_id": org_id });
     let created: CreatedKey = client.post("/v1/api_key", &body).await?;
 
     let explicitly_quiet = base.quiet && base.quiet_source.is_some();
@@ -4916,8 +4923,11 @@ fn print_mcp_human_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::LoginContext;
     use std::env;
     use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4968,6 +4978,146 @@ mod tests {
             Some(value) => env::set_var(key, value),
             None => env::remove_var(key),
         }
+    }
+
+    fn make_login_context(
+        api_url: String,
+        app_url: String,
+        org_id: &str,
+        org_name: &str,
+    ) -> LoginContext {
+        let login = braintrust_sdk_rust::LoginState::new();
+        let _ = login.set(
+            "test-api-key".to_string(),
+            org_id.to_string(),
+            org_name.to_string(),
+            api_url.clone(),
+            app_url.clone(),
+        );
+
+        LoginContext {
+            login,
+            api_url,
+            app_url,
+        }
+    }
+
+    #[tokio::test]
+    async fn maybe_create_api_key_for_oauth_uses_org_id_in_request_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept list request");
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).expect("read list request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.starts_with("GET /v1/api_key HTTP/1.1"));
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 14\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "{\"objects\":[]}"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write list response");
+            stream.flush().expect("flush list response");
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().expect("accept create request");
+            let mut header_buf = Vec::new();
+            let mut temp = [0u8; 1024];
+            let header_end;
+            loop {
+                let read = stream.read(&mut temp).expect("read create request");
+                assert!(read > 0, "request closed before headers");
+                header_buf.extend_from_slice(&temp[..read]);
+                if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = pos + 4;
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&header_buf[..header_end]);
+            assert!(headers.starts_with("POST /v1/api_key HTTP/1.1"));
+            let content_length = headers
+                .split("\r\n")
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .expect("content-length header");
+            let mut body = header_buf[header_end..].to_vec();
+            while body.len() < content_length {
+                let read = stream.read(&mut temp).expect("read request body");
+                assert!(read > 0, "request closed before body completed");
+                body.extend_from_slice(&temp[..read]);
+            }
+            let json: serde_json::Value =
+                serde_json::from_slice(&body[..content_length]).expect("parse request body");
+            assert_eq!(json.get("org_id").and_then(|v| v.as_str()), Some("org_123"));
+            assert!(json.get("org_name").is_none());
+            assert!(json.get("name").and_then(|v| v.as_str()).is_some());
+
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 17\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "{\"key\":\"new-key\"}"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write create response");
+            stream.flush().expect("flush create response");
+        });
+
+        let mut base = make_base_args();
+        base.quiet = true;
+        base.quiet_source = Some(ArgValueSource::CommandLine);
+
+        let api_url = format!("http://{addr}");
+        let ctx = make_login_context(
+            api_url,
+            "https://app.example.test".to_string(),
+            "org_123",
+            "Acme",
+        );
+        let client = ApiClient::new(&ctx).expect("client");
+
+        let key = maybe_create_api_key_for_oauth(&base, &client)
+            .await
+            .expect("create api key");
+        assert_eq!(key, "new-key");
+
+        server.join().expect("server join");
+    }
+
+    #[tokio::test]
+    async fn maybe_create_api_key_for_oauth_requires_org_id() {
+        let mut base = make_base_args();
+        base.quiet = true;
+        base.quiet_source = Some(ArgValueSource::CommandLine);
+
+        let ctx = make_login_context(
+            "https://api.example.test".to_string(),
+            "https://app.example.test".to_string(),
+            "",
+            "Acme",
+        );
+        let client = ApiClient::new(&ctx).expect("client");
+
+        let err = maybe_create_api_key_for_oauth(&base, &client)
+            .await
+            .expect_err("missing org_id should fail");
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("org_id") && err_text.contains("API key creation"),
+            "unexpected error: {err_text}"
+        );
     }
 
     #[test]
