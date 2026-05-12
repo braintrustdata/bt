@@ -4924,11 +4924,11 @@ fn print_mcp_human_report(
 mod tests {
     use super::*;
     use crate::auth::LoginContext;
+    use actix_web::{web, App, HttpResponse, HttpServer};
     use std::env;
     use std::ffi::OsString;
-    use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn cwd_test_lock() -> &'static Mutex<()> {
@@ -5002,84 +5002,53 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ApiKeyTestState {
+        create_request_body: Mutex<Option<serde_json::Value>>,
+    }
+
     #[tokio::test]
     async fn maybe_create_api_key_for_oauth_uses_org_id_in_request_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept list request");
-            let mut buffer = [0u8; 4096];
-            let read = stream.read(&mut buffer).expect("read list request");
-            let request = String::from_utf8_lossy(&buffer[..read]);
-            assert!(request.starts_with("GET /v1/api_key HTTP/1.1"));
-            let response = concat!(
-                "HTTP/1.1 200 OK\r\n",
-                "Content-Type: application/json\r\n",
-                "Content-Length: 14\r\n",
-                "Connection: close\r\n",
-                "\r\n",
-                "{\"objects\":[]}"
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write list response");
-            stream.flush().expect("flush list response");
-            drop(stream);
+        let state = Arc::new(ApiKeyTestState::default());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let api_url = format!("http://{addr}");
+        let data = web::Data::new(state.clone());
 
-            let (mut stream, _) = listener.accept().expect("accept create request");
-            let mut header_buf = Vec::new();
-            let mut temp = [0u8; 1024];
-            let header_end;
-            loop {
-                let read = stream.read(&mut temp).expect("read create request");
-                assert!(read > 0, "request closed before headers");
-                header_buf.extend_from_slice(&temp[..read]);
-                if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    header_end = pos + 4;
-                    break;
-                }
-            }
-            let headers = String::from_utf8_lossy(&header_buf[..header_end]);
-            assert!(headers.starts_with("POST /v1/api_key HTTP/1.1"));
-            let content_length = headers
-                .split("\r\n")
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().expect("content length"))
-                })
-                .expect("content-length header");
-            let mut body = header_buf[header_end..].to_vec();
-            while body.len() < content_length {
-                let read = stream.read(&mut temp).expect("read request body");
-                assert!(read > 0, "request closed before body completed");
-                body.extend_from_slice(&temp[..read]);
-            }
-            let json: serde_json::Value =
-                serde_json::from_slice(&body[..content_length]).expect("parse request body");
-            assert_eq!(json.get("org_id").and_then(|v| v.as_str()), Some("org_123"));
-            assert!(json.get("org_name").is_none());
-            assert!(json.get("name").and_then(|v| v.as_str()).is_some());
-
-            let response = concat!(
-                "HTTP/1.1 200 OK\r\n",
-                "Content-Type: application/json\r\n",
-                "Content-Length: 17\r\n",
-                "Connection: close\r\n",
-                "\r\n",
-                "{\"key\":\"new-key\"}"
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write create response");
-            stream.flush().expect("flush create response");
-        });
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(data.clone())
+                .route(
+                    "/v1/api_key",
+                    web::get().to(|| async {
+                        HttpResponse::Ok().json(serde_json::json!({ "objects": [] }))
+                    }),
+                )
+                .route(
+                    "/v1/api_key",
+                    web::post().to(
+                        |state: web::Data<Arc<ApiKeyTestState>>,
+                         body: web::Json<serde_json::Value>| async move {
+                            *state
+                                .create_request_body
+                                .lock()
+                                .expect("lock create request body") = Some(body.into_inner());
+                            HttpResponse::Ok().json(serde_json::json!({ "key": "new-key" }))
+                        },
+                    ),
+                )
+        })
+        .workers(1)
+        .listen(listener)
+        .expect("listen mock server")
+        .run();
+        let handle = server.handle();
+        tokio::spawn(server);
 
         let mut base = make_base_args();
         base.quiet = true;
         base.quiet_source = Some(ArgValueSource::CommandLine);
 
-        let api_url = format!("http://{addr}");
         let ctx = make_login_context(
             api_url,
             "https://app.example.test".to_string(),
@@ -5092,8 +5061,20 @@ mod tests {
             .await
             .expect("create api key");
         assert_eq!(key, "new-key");
+        let request_body = state
+            .create_request_body
+            .lock()
+            .expect("lock create request body")
+            .clone()
+            .expect("captured create request body");
+        assert_eq!(
+            request_body.get("org_id").and_then(|v| v.as_str()),
+            Some("org_123")
+        );
+        assert!(request_body.get("org_name").is_none());
+        assert!(request_body.get("name").and_then(|v| v.as_str()).is_some());
 
-        server.join().expect("server join");
+        handle.stop(true).await;
     }
 
     #[tokio::test]
