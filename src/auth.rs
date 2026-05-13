@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fs;
 use std::io::{IsTerminal, Write};
@@ -551,6 +551,8 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
 
 #[derive(Debug, Deserialize)]
 struct AiProviderSecret {
+    #[serde(default)]
+    id: Option<String>,
     name: String,
     #[serde(default)]
     r#type: Option<String>,
@@ -564,6 +566,18 @@ struct AiProviderSecret {
     created: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct AiProviderKeyStalenessWarningState {
+    #[serde(default)]
+    warned: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleAiProviderSecret {
+    name: String,
+    warning_key: String,
+}
+
 fn parse_ai_provider_secret_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
     let value = value?.trim();
     if value.is_empty() {
@@ -574,12 +588,44 @@ fn parse_ai_provider_secret_timestamp(value: Option<&str>) -> Option<DateTime<Ut
         .map(|parsed| parsed.with_timezone(&Utc))
 }
 
-fn stale_ai_provider_secret_names(secrets: &[AiProviderSecret], now: DateTime<Utc>) -> Vec<String> {
+fn ai_provider_warning_state_path() -> Result<PathBuf> {
+    Ok(crate::config::global_config_dir()?.join("ai_provider_key_warnings.json"))
+}
+
+fn load_ai_provider_warning_state() -> AiProviderKeyStalenessWarningState {
+    let Ok(path) = ai_provider_warning_state_path() else {
+        return AiProviderKeyStalenessWarningState::default();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return AiProviderKeyStalenessWarningState::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+fn save_ai_provider_warning_state(state: &AiProviderKeyStalenessWarningState) -> Result<()> {
+    let path = ai_provider_warning_state_path()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let json = serde_json::to_string_pretty(state)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(json.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
+}
+
+fn stale_ai_provider_secrets(
+    org_id: &str,
+    secrets: &[AiProviderSecret],
+    now: DateTime<Utc>,
+) -> Vec<StaleAiProviderSecret> {
     let Some(cutoff) = now.checked_sub_months(Months::new(6)) else {
         return Vec::new();
     };
 
-    let mut stale_names = secrets
+    let mut stale = secrets
         .iter()
         .filter(|secret| {
             secret
@@ -588,29 +634,47 @@ fn stale_ai_provider_secret_names(secrets: &[AiProviderSecret], now: DateTime<Ut
                 .is_some_and(|preview| !preview.trim().is_empty())
         })
         .filter_map(|secret| {
-            let updated_at = parse_ai_provider_secret_timestamp(
-                secret
-                    .secret_updated_at
-                    .as_deref()
-                    .or(secret.updated_at.as_deref())
-                    .or(secret.created.as_deref()),
-            )?;
-            (updated_at < cutoff).then(|| {
-                secret
-                    .r#type
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or(&secret.name)
-                    .to_string()
-            })
+            let updated_at_raw = secret
+                .secret_updated_at
+                .as_deref()
+                .or(secret.updated_at.as_deref())
+                .or(secret.created.as_deref())?;
+            let updated_at = parse_ai_provider_secret_timestamp(Some(updated_at_raw))?;
+            if updated_at >= cutoff {
+                return None;
+            }
+            let identity = secret
+                .id
+                .as_deref()
+                .or(secret.r#type.as_deref())
+                .unwrap_or(&secret.name);
+            let name = secret.name.clone();
+            let warning_key = format!("{org_id}:{identity}:{updated_at_raw}");
+            Some(StaleAiProviderSecret { name, warning_key })
         })
         .collect::<Vec<_>>();
-    stale_names.sort();
-    stale_names
+    stale.sort_by(|a, b| a.name.cmp(&b.name));
+    stale
+}
+
+fn unwarned_stale_ai_provider_secrets(
+    stale: Vec<StaleAiProviderSecret>,
+    state: &AiProviderKeyStalenessWarningState,
+) -> Vec<StaleAiProviderSecret> {
+    stale
+        .into_iter()
+        .filter(|secret| !state.warned.contains(&secret.warning_key))
+        .collect()
 }
 
 async fn maybe_warn_ai_provider_key_staleness(base: &BaseArgs, ctx: &LoginContext) {
-    if base.json || ui::is_quiet() || ctx.login.org_id().is_none_or(|org_id| org_id.trim().is_empty()) {
+    if base.json
+        || ui::is_quiet()
+        || ctx
+            .login
+            .org_id()
+            .is_none_or(|org_id| org_id.trim().is_empty())
+    {
         return;
     }
     if AI_PROVIDER_KEY_STALENESS_WARNED.swap(true, Ordering::Relaxed) {
@@ -645,23 +709,29 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
         .json::<Vec<AiProviderSecret>>()
         .await
         .context("failed to parse AI provider secrets response")?;
-    let stale_names = stale_ai_provider_secret_names(&secrets, Utc::now());
-    if stale_names.is_empty() {
+    let stale = stale_ai_provider_secrets(&org_id, &secrets, Utc::now());
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let mut state = load_ai_provider_warning_state();
+    let to_warn = unwarned_stale_ai_provider_secrets(stale, &state);
+    if to_warn.is_empty() {
         return Ok(());
     }
 
-    let label = if stale_names.len() == 1 {
-        "key has"
-    } else {
-        "keys have"
-    };
-    ui::print_command_status(
-        ui::CommandStatus::Warning,
-        &format!(
-            "The following AI provider {label} not been rotated in over 6 months: {}",
-            stale_names.join(", ")
-        ),
-    );
+    for secret in &to_warn {
+        ui::print_command_status(
+            ui::CommandStatus::Warning,
+            &format!(
+                "We recommend disabling and rotating AI provider secrets periodically. This {} has not been rotated in over 6 months.",
+                secret.name
+            ),
+        );
+    }
+    state
+        .warned
+        .extend(to_warn.into_iter().map(|secret| secret.warning_key));
+    let _ = save_ai_provider_warning_state(&state);
     Ok(())
 }
 
@@ -3155,6 +3225,75 @@ mod tests {
             ca_cert: None,
             env_file: None,
         }
+    }
+
+    fn dt(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn stale_ai_provider_secrets_returns_configured_keys_older_than_six_months() {
+        let secrets = vec![
+            AiProviderSecret {
+                id: Some("openai-secret".to_string()),
+                name: "OPENAI_API_KEY".to_string(),
+                r#type: Some("openai".to_string()),
+                preview_secret: Some("********".to_string()),
+                secret_updated_at: Some("2025-11-12T00:00:00Z".to_string()),
+                updated_at: None,
+                created: None,
+            },
+            AiProviderSecret {
+                id: Some("anthropic-secret".to_string()),
+                name: "ANTHROPIC_API_KEY".to_string(),
+                r#type: Some("anthropic".to_string()),
+                preview_secret: Some("********".to_string()),
+                secret_updated_at: Some("2025-11-14T00:00:00Z".to_string()),
+                updated_at: None,
+                created: None,
+            },
+            AiProviderSecret {
+                id: Some("gemini-secret".to_string()),
+                name: "GEMINI_API_KEY".to_string(),
+                r#type: Some("google".to_string()),
+                preview_secret: None,
+                secret_updated_at: Some("2025-01-01T00:00:00Z".to_string()),
+                updated_at: None,
+                created: None,
+            },
+        ];
+
+        let stale = stale_ai_provider_secrets("org-id", &secrets, dt("2026-05-13T00:00:00Z"));
+
+        assert_eq!(
+            stale,
+            vec![StaleAiProviderSecret {
+                name: "OPENAI_API_KEY".to_string(),
+                warning_key: "org-id:openai-secret:2025-11-12T00:00:00Z".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unwarned_stale_ai_provider_secrets_skips_previously_warned_key_versions() {
+        let already_warned = StaleAiProviderSecret {
+            name: "openai".to_string(),
+            warning_key: "org-id:secret-id:2025-11-12T00:00:00Z".to_string(),
+        };
+        let newly_stale = StaleAiProviderSecret {
+            name: "openai".to_string(),
+            warning_key: "org-id:secret-id:2026-05-13T00:00:00Z".to_string(),
+        };
+        let state = AiProviderKeyStalenessWarningState {
+            warned: BTreeSet::from([already_warned.warning_key.clone()]),
+        };
+
+        let unwarned =
+            unwarned_stale_ai_provider_secrets(vec![already_warned, newly_stale.clone()], &state);
+
+        assert_eq!(unwarned, vec![newly_stale]);
     }
 
     fn env_test_lock() -> &'static Mutex<()> {
