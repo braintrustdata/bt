@@ -33,6 +33,7 @@ const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
+const AI_PROVIDER_KEY_STALENESS_CHECK_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 static SECRET_STORE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static AI_PROVIDER_KEY_STALENESS_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -570,6 +571,8 @@ struct AiProviderSecret {
 struct AiProviderKeyStalenessWarningState {
     #[serde(default)]
     warned: BTreeSet<String>,
+    #[serde(default)]
+    last_checked_at: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,6 +670,35 @@ fn unwarned_stale_ai_provider_secrets(
         .collect()
 }
 
+fn should_check_ai_provider_key_staleness(
+    state: &AiProviderKeyStalenessWarningState,
+    org_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(last_checked_at) = state
+        .last_checked_at
+        .get(org_id)
+        .and_then(|value| parse_ai_provider_secret_timestamp(Some(value)))
+    else {
+        return true;
+    };
+    if last_checked_at > now {
+        return true;
+    }
+    now.signed_duration_since(last_checked_at).num_seconds()
+        >= AI_PROVIDER_KEY_STALENESS_CHECK_INTERVAL_SECONDS
+}
+
+fn record_ai_provider_key_staleness_check(
+    state: &mut AiProviderKeyStalenessWarningState,
+    org_id: &str,
+    now: DateTime<Utc>,
+) {
+    state
+        .last_checked_at
+        .insert(org_id.to_string(), now.to_rfc3339());
+}
+
 fn ai_provider_key_staleness_warning_message(secret_name: &str) -> String {
     format!(
         "We recommend disabling and rotating AI provider secrets periodically. {secret_name} has not been rotated in over 6 months."
@@ -698,6 +730,14 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
         .login
         .org_id()
         .context("login state missing organization id")?;
+    let now = Utc::now();
+    let mut state = load_ai_provider_warning_state();
+    if !should_check_ai_provider_key_staleness(&state, &org_id, now) {
+        return Ok(());
+    }
+    record_ai_provider_key_staleness_check(&mut state, &org_id, now);
+    let _ = save_ai_provider_warning_state(&state);
+
     let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)?;
     let response = client
         .post(&url)
@@ -715,11 +755,10 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
         .json::<Vec<AiProviderSecret>>()
         .await
         .context("failed to parse AI provider secrets response")?;
-    let stale = stale_ai_provider_secrets(&org_id, &secrets, Utc::now());
+    let stale = stale_ai_provider_secrets(&org_id, &secrets, now);
     if stale.is_empty() {
         return Ok(());
     }
-    let mut state = load_ai_provider_warning_state();
     let to_warn = unwarned_stale_ai_provider_secrets(stale, &state);
     if to_warn.is_empty() {
         return Ok(());
@@ -3371,6 +3410,7 @@ mod tests {
         };
         let state = AiProviderKeyStalenessWarningState {
             warned: BTreeSet::from([already_warned.warning_key.clone()]),
+            last_checked_at: BTreeMap::new(),
         };
 
         let unwarned =
@@ -3384,6 +3424,61 @@ mod tests {
         assert_eq!(
             ai_provider_key_staleness_warning_message("OPENAI_API_KEY"),
             "We recommend disabling and rotating AI provider secrets periodically. OPENAI_API_KEY has not been rotated in over 6 months."
+        );
+    }
+
+    #[test]
+    fn should_check_ai_provider_key_staleness_at_most_once_per_day_per_org() {
+        let state = AiProviderKeyStalenessWarningState {
+            warned: BTreeSet::new(),
+            last_checked_at: BTreeMap::from([
+                (
+                    "org-id".to_string(),
+                    "2026-05-12T12:00:00+00:00".to_string(),
+                ),
+                (
+                    "other-org-id".to_string(),
+                    "2026-05-13T11:00:00+00:00".to_string(),
+                ),
+            ]),
+        };
+
+        assert!(!should_check_ai_provider_key_staleness(
+            &state,
+            "org-id",
+            dt("2026-05-13T11:59:59Z")
+        ));
+        assert!(should_check_ai_provider_key_staleness(
+            &state,
+            "org-id",
+            dt("2026-05-13T12:00:00Z")
+        ));
+        assert!(should_check_ai_provider_key_staleness(
+            &state,
+            "new-org-id",
+            dt("2026-05-13T11:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn record_ai_provider_key_staleness_check_updates_org_timestamp() {
+        let mut state = AiProviderKeyStalenessWarningState {
+            warned: BTreeSet::new(),
+            last_checked_at: BTreeMap::from([(
+                "other-org-id".to_string(),
+                "2026-05-13T11:00:00+00:00".to_string(),
+            )]),
+        };
+
+        record_ai_provider_key_staleness_check(&mut state, "org-id", dt("2026-05-13T12:00:00Z"));
+
+        assert_eq!(
+            state.last_checked_at.get("org-id"),
+            Some(&"2026-05-13T12:00:00+00:00".to_string())
+        );
+        assert_eq!(
+            state.last_checked_at.get("other-org-id"),
+            Some(&"2026-05-13T11:00:00+00:00".to_string())
         );
     }
 
@@ -3401,6 +3496,10 @@ mod tests {
                 "org-id:openai-secret:2025-11-12T00:00:00Z".to_string(),
                 "org-id:anthropic-secret:2025-11-10T00:00:00Z".to_string(),
             ]),
+            last_checked_at: BTreeMap::from([(
+                "org-id".to_string(),
+                "2026-05-13T12:00:00+00:00".to_string(),
+            )]),
         };
 
         save_ai_provider_warning_state(&state).expect("save warning state");
@@ -3410,6 +3509,7 @@ mod tests {
         restore_env_var("APPDATA", previous_appdata);
 
         assert_eq!(loaded.warned, state.warned);
+        assert_eq!(loaded.last_checked_at, state.last_checked_at);
     }
 
     fn env_test_lock() -> &'static Mutex<()> {
