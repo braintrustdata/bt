@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use braintrust_sdk_rust::{BraintrustClient, LoginState};
+use chrono::{DateTime, Months, Utc};
 use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
@@ -18,6 +19,7 @@ use oauth2::{
     AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -32,6 +34,7 @@ const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
 static SECRET_STORE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+static AI_PROVIDER_KEY_STALENESS_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub struct LoginContext {
@@ -537,11 +540,129 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
 
-    Ok(LoginContext {
+    let ctx = LoginContext {
         login,
         api_url,
         app_url,
-    })
+    };
+    maybe_warn_ai_provider_key_staleness(base, &ctx).await;
+    Ok(ctx)
+}
+
+#[derive(Debug, Deserialize)]
+struct AiProviderSecret {
+    name: String,
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    preview_secret: Option<String>,
+    #[serde(default)]
+    secret_updated_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    created: Option<String>,
+}
+
+fn parse_ai_provider_secret_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
+fn stale_ai_provider_secret_names(secrets: &[AiProviderSecret], now: DateTime<Utc>) -> Vec<String> {
+    let Some(cutoff) = now.checked_sub_months(Months::new(6)) else {
+        return Vec::new();
+    };
+
+    let mut stale_names = secrets
+        .iter()
+        .filter(|secret| {
+            secret
+                .preview_secret
+                .as_deref()
+                .is_some_and(|preview| !preview.trim().is_empty())
+        })
+        .filter_map(|secret| {
+            let updated_at = parse_ai_provider_secret_timestamp(
+                secret
+                    .secret_updated_at
+                    .as_deref()
+                    .or(secret.updated_at.as_deref())
+                    .or(secret.created.as_deref()),
+            )?;
+            (updated_at < cutoff).then(|| {
+                secret
+                    .r#type
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(&secret.name)
+                    .to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    stale_names.sort();
+    stale_names
+}
+
+async fn maybe_warn_ai_provider_key_staleness(base: &BaseArgs, ctx: &LoginContext) {
+    if base.json || ui::is_quiet() || ctx.login.org_id().is_none_or(|org_id| org_id.trim().is_empty()) {
+        return;
+    }
+    if AI_PROVIDER_KEY_STALENESS_WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let _ = warn_ai_provider_key_staleness(ctx).await;
+}
+
+async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
+    let app_url = ctx.app_url.trim_end_matches('/');
+    let url = format!("{app_url}/api/ai_secret/get");
+    let api_key = ctx.login.api_key().context("login state missing API key")?;
+    let org_id = ctx
+        .login
+        .org_id()
+        .context("login state missing organization id")?;
+    let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)?;
+    let response = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&json!({ "org_id": org_id }))
+        .send()
+        .await
+        .with_context(|| format!("failed to call AI provider secrets endpoint {url}"))?;
+
+    if !response.status().is_success() {
+        return Ok(());
+    }
+
+    let secrets = response
+        .json::<Vec<AiProviderSecret>>()
+        .await
+        .context("failed to parse AI provider secrets response")?;
+    let stale_names = stale_ai_provider_secret_names(&secrets, Utc::now());
+    if stale_names.is_empty() {
+        return Ok(());
+    }
+
+    let label = if stale_names.len() == 1 {
+        "key has"
+    } else {
+        "keys have"
+    };
+    ui::print_command_status(
+        ui::CommandStatus::Warning,
+        &format!(
+            "The following AI provider {label} not been rotated in over 6 months: {}",
+            stale_names.join(", ")
+        ),
+    );
+    Ok(())
 }
 
 fn has_cached_project_id(base: &BaseArgs) -> bool {
