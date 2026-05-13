@@ -667,6 +667,12 @@ fn unwarned_stale_ai_provider_secrets(
         .collect()
 }
 
+fn ai_provider_key_staleness_warning_message(secret_name: &str) -> String {
+    format!(
+        "We recommend disabling and rotating AI provider secrets periodically. {secret_name} has not been rotated in over 6 months."
+    )
+}
+
 async fn maybe_warn_ai_provider_key_staleness(base: &BaseArgs, ctx: &LoginContext) {
     if base.json
         || ui::is_quiet()
@@ -722,10 +728,7 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
     for secret in &to_warn {
         ui::print_command_status(
             ui::CommandStatus::Warning,
-            &format!(
-                "We recommend disabling and rotating AI provider secrets periodically. This {} has not been rotated in over 6 months.",
-                secret.name
-            ),
+            &ai_provider_key_staleness_warning_message(&secret.name),
         );
     }
     state
@@ -3233,36 +3236,56 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn ai_provider_secret(
+        id: Option<&str>,
+        name: &str,
+        secret_type: Option<&str>,
+        preview_secret: Option<&str>,
+        secret_updated_at: Option<&str>,
+        updated_at: Option<&str>,
+        created: Option<&str>,
+    ) -> AiProviderSecret {
+        AiProviderSecret {
+            id: id.map(str::to_string),
+            name: name.to_string(),
+            r#type: secret_type.map(str::to_string),
+            preview_secret: preview_secret.map(str::to_string),
+            secret_updated_at: secret_updated_at.map(str::to_string),
+            updated_at: updated_at.map(str::to_string),
+            created: created.map(str::to_string),
+        }
+    }
+
     #[test]
     fn stale_ai_provider_secrets_returns_configured_keys_older_than_six_months() {
         let secrets = vec![
-            AiProviderSecret {
-                id: Some("openai-secret".to_string()),
-                name: "OPENAI_API_KEY".to_string(),
-                r#type: Some("openai".to_string()),
-                preview_secret: Some("********".to_string()),
-                secret_updated_at: Some("2025-11-12T00:00:00Z".to_string()),
-                updated_at: None,
-                created: None,
-            },
-            AiProviderSecret {
-                id: Some("anthropic-secret".to_string()),
-                name: "ANTHROPIC_API_KEY".to_string(),
-                r#type: Some("anthropic".to_string()),
-                preview_secret: Some("********".to_string()),
-                secret_updated_at: Some("2025-11-14T00:00:00Z".to_string()),
-                updated_at: None,
-                created: None,
-            },
-            AiProviderSecret {
-                id: Some("gemini-secret".to_string()),
-                name: "GEMINI_API_KEY".to_string(),
-                r#type: Some("google".to_string()),
-                preview_secret: None,
-                secret_updated_at: Some("2025-01-01T00:00:00Z".to_string()),
-                updated_at: None,
-                created: None,
-            },
+            ai_provider_secret(
+                Some("openai-secret"),
+                "OPENAI_API_KEY",
+                Some("openai"),
+                Some("********"),
+                Some("2025-11-12T00:00:00Z"),
+                None,
+                None,
+            ),
+            ai_provider_secret(
+                Some("anthropic-secret"),
+                "ANTHROPIC_API_KEY",
+                Some("anthropic"),
+                Some("********"),
+                Some("2025-11-14T00:00:00Z"),
+                None,
+                None,
+            ),
+            ai_provider_secret(
+                Some("gemini-secret"),
+                "GEMINI_API_KEY",
+                Some("google"),
+                None,
+                Some("2025-01-01T00:00:00Z"),
+                None,
+                None,
+            ),
         ];
 
         let stale = stale_ai_provider_secrets("org-id", &secrets, dt("2026-05-13T00:00:00Z"));
@@ -3274,6 +3297,66 @@ mod tests {
                 warning_key: "org-id:openai-secret:2025-11-12T00:00:00Z".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn stale_ai_provider_secrets_uses_timestamp_fallbacks_and_ignores_invalid_dates() {
+        let secrets = vec![
+            ai_provider_secret(
+                None,
+                "OPENAI_API_KEY",
+                Some("openai"),
+                Some("********"),
+                None,
+                Some("2025-11-12T00:00:00Z"),
+                None,
+            ),
+            ai_provider_secret(
+                None,
+                "ANTHROPIC_API_KEY",
+                Some("anthropic"),
+                Some("********"),
+                None,
+                Some("not-a-date"),
+                Some("2025-01-01T00:00:00Z"),
+            ),
+            ai_provider_secret(
+                None,
+                "GEMINI_API_KEY",
+                Some("google"),
+                Some("********"),
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        let stale = stale_ai_provider_secrets("org-id", &secrets, dt("2026-05-13T00:00:00Z"));
+
+        assert_eq!(
+            stale,
+            vec![StaleAiProviderSecret {
+                name: "OPENAI_API_KEY".to_string(),
+                warning_key: "org-id:openai:2025-11-12T00:00:00Z".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_ai_provider_secrets_does_not_treat_exact_six_month_cutoff_as_stale() {
+        let secrets = vec![ai_provider_secret(
+            Some("openai-secret"),
+            "OPENAI_API_KEY",
+            Some("openai"),
+            Some("********"),
+            Some("2025-11-13T00:00:00Z"),
+            None,
+            None,
+        )];
+
+        let stale = stale_ai_provider_secrets("org-id", &secrets, dt("2026-05-13T00:00:00Z"));
+
+        assert!(stale.is_empty());
     }
 
     #[test]
@@ -3294,6 +3377,39 @@ mod tests {
             unwarned_stale_ai_provider_secrets(vec![already_warned, newly_stale.clone()], &state);
 
         assert_eq!(unwarned, vec![newly_stale]);
+    }
+
+    #[test]
+    fn ai_provider_key_staleness_warning_message_includes_key_name() {
+        assert_eq!(
+            ai_provider_key_staleness_warning_message("OPENAI_API_KEY"),
+            "We recommend disabling and rotating AI provider secrets periodically. OPENAI_API_KEY has not been rotated in over 6 months."
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_provider_warning_state_round_trips_through_global_config_dir() {
+        let _guard = env_test_lock().lock().await;
+        let previous_xdg_config_home = env::var_os("XDG_CONFIG_HOME");
+        let previous_appdata = env::var_os("APPDATA");
+        let config_dir = TempDir::new().expect("create temp config dir");
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        env::set_var("APPDATA", config_dir.path());
+
+        let state = AiProviderKeyStalenessWarningState {
+            warned: BTreeSet::from([
+                "org-id:openai-secret:2025-11-12T00:00:00Z".to_string(),
+                "org-id:anthropic-secret:2025-11-10T00:00:00Z".to_string(),
+            ]),
+        };
+
+        save_ai_provider_warning_state(&state).expect("save warning state");
+        let loaded = load_ai_provider_warning_state();
+
+        restore_env_var("XDG_CONFIG_HOME", previous_xdg_config_home);
+        restore_env_var("APPDATA", previous_appdata);
+
+        assert_eq!(loaded.warned, state.warned);
     }
 
     fn env_test_lock() -> &'static Mutex<()> {
