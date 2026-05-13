@@ -4994,12 +4994,7 @@ fn print_trace_text(
         );
     }
     println!(
-        "\nTrace output is truncated. Use `bt view span{} --object-ref {} --id <row-id>` for full span data.",
-        profile_flag_suffix(profile),
-        object_ref
-    );
-    println!(
-        "For the full trace payload in one call, re-run with --json: `bt view trace --json{} --object-ref {} --trace-id {}`.",
+        "\nTrace output is truncated. Re-run with --json for the full trace (`bt view trace --json{0} --object-ref {1} --trace-id {2}`), or fetch a single span with `bt view span{0} --object-ref {1} --id <row-id>`.",
         profile_flag_suffix(profile),
         object_ref,
         trace_id
