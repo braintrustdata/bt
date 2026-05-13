@@ -4998,6 +4998,12 @@ fn print_trace_text(
         profile_flag_suffix(profile),
         object_ref
     );
+    println!(
+        "For the full trace payload in one call, re-run with --json: `bt view trace --json{} --object-ref {} --trace-id {}`.",
+        profile_flag_suffix(profile),
+        object_ref,
+        trace_id
+    );
     if let Some(cursor) = next_cursor {
         let limit_suffix = if limit != 50 {
             format!(" --limit {limit}")
