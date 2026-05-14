@@ -17,11 +17,12 @@ mod delete;
 mod invoke;
 mod list;
 mod pull;
-mod push;
+pub(crate) mod push;
 pub(crate) mod report;
 mod view;
 
 use api::Function;
+pub(crate) use push::publish_eval_sandbox_functions;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum FunctionTypeFilter {

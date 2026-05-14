@@ -3105,7 +3105,7 @@ async fn resolve_push_experiment_target(
         );
     }
 
-    let created = create_experiment(client, &project.id, experiment_selector)
+    let created = create_experiment(client, &project.id, experiment_selector, false)
         .await
         .with_context(|| {
             format!("experiment '{experiment_selector}' not found, and creating it failed")
