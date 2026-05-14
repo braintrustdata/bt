@@ -230,8 +230,11 @@ Local transaction-id conversion helpers:
   - `bt util xact to-pretty 1000192656880881099`
 - Convert pretty version id to transaction id:
   - `bt util xact from-pretty 81cd05ee665fdfb3`
-- Convert transaction id to timestamp:
+- Convert transaction id, pretty version id, or pagination key to timestamp (local timezone by default):
   - `bt util xact to-time 1000192656880881099`
+  - `bt util xact to-time 81cd05ee665fdfb3`
+  - `bt util xact to-time p07639577379371417602`
+  - `bt util xact to-time p07639577379371417602 --utc`
   - `bt util xact to-time 1000192656880881099 --format unix`
 - Convert timestamp to transaction id:
   - `bt util xact from-time` (defaults to current time)
@@ -241,6 +244,8 @@ Local transaction-id conversion helpers:
 - Inspect any xact value:
   - `bt util xact inspect 1000192656880881099`
   - `bt util xact inspect 81cd05ee665fdfb3`
+  - `bt util xact inspect p07639577379371417602`
+  - `bt util xact inspect p07639577379371417602 --utc`
 
 ## `bt auth`
 
