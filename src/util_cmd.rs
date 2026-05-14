@@ -20,17 +20,17 @@ pub struct UtilArgs {
 enum UtilCommands {
     /// Version and pagination-key conversion utilities
     #[command(name = "version")]
-    Xact(XactArgs),
+    Version(VersionArgs),
 }
 
 #[derive(Debug, Clone, Args)]
-struct XactArgs {
+struct VersionArgs {
     #[command(subcommand)]
-    command: XactCommands,
+    command: VersionCommands,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum XactCommands {
+enum VersionCommands {
     /// Convert a transaction id to a pretty version id
     ToPretty(ToPrettyArgs),
     /// Convert a pretty version id to a transaction id
@@ -140,17 +140,17 @@ struct XactInfo {
 
 pub async fn run(base: BaseArgs, args: UtilArgs) -> Result<()> {
     match args.command {
-        UtilCommands::Xact(xact) => run_xact(base, xact),
+        UtilCommands::Version(version) => run_version(base, version),
     }
 }
 
-fn run_xact(base: BaseArgs, args: XactArgs) -> Result<()> {
+fn run_version(base: BaseArgs, args: VersionArgs) -> Result<()> {
     match args.command {
-        XactCommands::ToPretty(args) => run_to_pretty(base.json, args),
-        XactCommands::FromPretty(args) => run_from_pretty(base.json, args),
-        XactCommands::ToTime(args) => run_to_time(base.json, args),
-        XactCommands::FromTime(args) => run_from_time(base.json, args),
-        XactCommands::Inspect(args) => run_inspect(base.json, args),
+        VersionCommands::ToPretty(args) => run_to_pretty(base.json, args),
+        VersionCommands::FromPretty(args) => run_from_pretty(base.json, args),
+        VersionCommands::ToTime(args) => run_to_time(base.json, args),
+        VersionCommands::FromTime(args) => run_from_time(base.json, args),
+        VersionCommands::Inspect(args) => run_inspect(base.json, args),
     }
 }
 
