@@ -222,30 +222,32 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
   - Detail view: `t` span/thread, `Left/Right` switch panes, `Backspace`/`Esc` back
   - Global: `q` quit
 
-## `bt util xact`
+## `bt util version`
 
-Local transaction-id conversion helpers:
+Local version and pagination-key conversion helpers:
 
 - Convert transaction id to pretty version id:
-  - `bt util xact to-pretty 1000192656880881099`
+  - `bt util version to-pretty 1000192656880881099`
 - Convert pretty version id to transaction id:
-  - `bt util xact from-pretty 81cd05ee665fdfb3`
+  - `bt util version from-pretty 81cd05ee665fdfb3`
 - Convert transaction id, pretty version id, or pagination key to timestamp (local timezone by default):
-  - `bt util xact to-time 1000192656880881099`
-  - `bt util xact to-time 81cd05ee665fdfb3`
-  - `bt util xact to-time p07639577379371417602`
-  - `bt util xact to-time p07639577379371417602 --utc`
-  - `bt util xact to-time 1000192656880881099 --format unix`
+  - `bt util version to-time 1000192656880881099`
+  - `bt util version to-time 81cd05ee665fdfb3`
+  - `bt util version to-time p07639577379371417602`
+  - `bt util version to-time p07639577379371417602 --utc`
+  - `bt util version to-time 1000192656880881099 --format unix`
 - Convert timestamp to transaction id:
-  - `bt util xact from-time` (defaults to current time)
-  - `bt util xact from-time 2025-01-01` (date-only ISO at UTC midnight)
-  - `bt util xact from-time 2024-03-14T18:00:00Z`
-  - `bt util xact from-time 1710439200 --input unix --counter 42`
-- Inspect any xact value:
-  - `bt util xact inspect 1000192656880881099`
-  - `bt util xact inspect 81cd05ee665fdfb3`
-  - `bt util xact inspect p07639577379371417602`
-  - `bt util xact inspect p07639577379371417602 --utc`
+  - `bt util version from-time` (defaults to current time)
+  - `bt util version from-time 2025-01-01` (date-only ISO at UTC midnight)
+  - `bt util version from-time 2024-03-14T18:00:00Z`
+  - `bt util version from-time 1710439200 --input unix --counter 42`
+- Convert timestamp to pagination key:
+  - `bt util version from-time 2026-05-14T08:00:09-07:00 --pagination-key`
+- Inspect any version-like value:
+  - `bt util version inspect 1000192656880881099`
+  - `bt util version inspect 81cd05ee665fdfb3`
+  - `bt util version inspect p07639577379371417602`
+  - `bt util version inspect p07639577379371417602 --utc`
 
 ## `bt auth`
 
