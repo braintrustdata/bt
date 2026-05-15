@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use dialoguer::console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect, Select};
@@ -1220,6 +1221,25 @@ fn setup_wizard_login_url(app_url: &reqwest::Url, login_path: &str) -> Result<re
         .with_context(|| format!("invalid setup browser login path '{login_path}'"))
 }
 
+fn format_setup_wizard_expiry(expires_at: &str, now: DateTime<Utc>) -> String {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(expires_at) else {
+        return format!("The browser setup link expires at {expires_at}.");
+    };
+    let expires_at = parsed.with_timezone(&Utc);
+    let seconds = expires_at.signed_duration_since(now).num_seconds();
+
+    if seconds <= 0 {
+        return "The browser setup link has expired.".to_string();
+    }
+    if seconds < 60 {
+        return "The browser setup link expires in less than a minute.".to_string();
+    }
+
+    let minutes = (seconds + 59) / 60;
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("The browser setup link expires in {minutes} {unit}.")
+}
+
 async fn setup_wizard_response_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     action: &str,
@@ -1337,7 +1357,7 @@ async fn poll_setup_wizard_completion_with_interval(
                 tokio::time::sleep(interval).await;
             }
             SetupWizardPollResult::Expired => {
-                bail!("setup browser session expired; rerun `bt setup` to start a new session");
+                bail!("Browser setup timed out. Rerun `bt setup` to start a new browser session.");
             }
             SetupWizardPollResult::Claimed => {
                 bail!("setup browser session was already claimed; rerun `bt setup` to start a new session");
@@ -1395,8 +1415,8 @@ async fn run_setup_browser_auth(
         eprintln!("{}", style(login_url.as_str()).dim());
         eprintln!();
         eprintln!(
-            "This session expires at {}.",
-            style(&session.expires_at).dim()
+            "{}",
+            style(format_setup_wizard_expiry(&session.expires_at, Utc::now())).dim()
         );
         eprintln!();
     }
@@ -5404,6 +5424,38 @@ mod tests {
             api_url,
             app_url,
         }
+    }
+
+    fn utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("parse timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn setup_wizard_expiry_formats_relative_time() {
+        let now = utc("2026-05-15T12:00:00Z");
+
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T12:15:00Z", now),
+            "The browser setup link expires in 15 minutes."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T13:01:00Z", now),
+            "The browser setup link expires in 61 minutes."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T12:00:30Z", now),
+            "The browser setup link expires in less than a minute."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T12:00:00Z", now),
+            "The browser setup link has expired."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("not-a-timestamp", now),
+            "The browser setup link expires at not-a-timestamp."
+        );
     }
 
     #[derive(Default)]
