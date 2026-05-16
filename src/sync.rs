@@ -40,6 +40,8 @@ const BTQL_RETRY_BASE_DELAY_MS: u64 = 300;
 const BTQL_MAX_BACKOFF_SECS: u64 = 8;
 const PULL_OUTPUT_PART_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const LINE_COUNT_BUFFER_BYTES: usize = 1024 * 1024;
+const PUSH_BATCH_MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const PUSH_MAX_IN_FLIGHT_INPUT_BYTES: usize = 128 * 1024 * 1024;
 
 pub(crate) fn default_workers() -> usize {
     std::thread::available_parallelism()
@@ -159,6 +161,22 @@ struct PushArgs {
     /// Number of concurrent workers for upload mode.
     #[arg(long, default_value_t = default_workers())]
     workers: usize,
+
+    /// Maximum approximate input bytes per upload batch.
+    #[arg(
+        long,
+        env = "BT_SYNC_PUSH_MAX_BATCH_BYTES",
+        default_value_t = PUSH_BATCH_MAX_INPUT_BYTES
+    )]
+    max_batch_bytes: usize,
+
+    /// Maximum approximate input bytes held by in-flight upload batches.
+    #[arg(
+        long,
+        env = "BT_SYNC_PUSH_MAX_IN_FLIGHT_BYTES",
+        default_value_t = PUSH_MAX_IN_FLIGHT_INPUT_BYTES
+    )]
+    max_in_flight_bytes: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -435,6 +453,7 @@ impl DestinationMode {
 struct PushBatchWork {
     batch_index: usize,
     rows: Vec<Map<String, Value>>,
+    input_bytes: usize,
     end_line_offset: usize,
     distinct_roots_done: usize,
 }
@@ -443,6 +462,7 @@ struct PushBatchWork {
 struct PushBatchResult {
     batch_index: usize,
     row_count: usize,
+    input_bytes: usize,
     bytes_sent: u64,
     end_line_offset: usize,
     distinct_roots_done: usize,
@@ -1731,9 +1751,13 @@ async fn run_push(
     }
 
     let worker_count = args.workers.max(1);
+    let max_batch_bytes = args.max_batch_bytes.max(1);
+    let max_in_flight_bytes = args.max_in_flight_bytes.max(max_batch_bytes);
     let mut selected_count: usize = state.items_done;
     let mut batch_end_line_offset = state.line_offset;
     let mut batch_distinct_roots_done = state.distinct_roots_done;
+    let mut batch_input_bytes = 0usize;
+    let mut in_flight_input_bytes = 0usize;
     let mut next_batch_index = 0usize;
     let mut next_commit_index = 0usize;
     let mut pending_results: BTreeMap<usize, PushBatchResult> = BTreeMap::new();
@@ -1759,6 +1783,7 @@ async fn run_push(
             if line.trim().is_empty() {
                 continue;
             }
+            let row_input_bytes = line.len() + 1;
             let mut row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
                 format!(
                     "invalid JSON in {} at line {}",
@@ -1796,16 +1821,44 @@ async fn run_push(
             selected_count += 1;
             batch_end_line_offset = current_line_offset + 1;
             batch_distinct_roots_done = seen_roots.len();
+            batch_input_bytes = batch_input_bytes.saturating_add(row_input_bytes);
             batch.push(row);
 
-            if batch.len() >= args.page_size {
+            if batch.len() >= args.page_size || batch_input_bytes >= max_batch_bytes {
+                while push_upload_needs_backpressure(
+                    join_set.len(),
+                    worker_count,
+                    in_flight_input_bytes,
+                    batch_input_bytes,
+                    max_in_flight_bytes,
+                ) {
+                    wait_for_push_upload_result(
+                        &mut join_set,
+                        &mut pending_results,
+                        &mut in_flight_input_bytes,
+                        &mut next_commit_index,
+                        &mut state,
+                        &state_path,
+                        &pb,
+                        &mut upload_total_task,
+                        &mut upload_total,
+                        push_phase_started_at,
+                        push_baseline_roots_done,
+                        push_baseline_items_done,
+                        push_baseline_bytes_sent,
+                    )
+                    .await?;
+                }
+
                 let work = PushBatchWork {
                     batch_index: next_batch_index,
                     rows: std::mem::take(&mut batch),
+                    input_bytes: batch_input_bytes,
                     end_line_offset: batch_end_line_offset,
                     distinct_roots_done: batch_distinct_roots_done,
                 };
                 next_batch_index += 1;
+                in_flight_input_bytes = in_flight_input_bytes.saturating_add(work.input_bytes);
                 spawn_push_upload_task(
                     &mut join_set,
                     uploader_template.clone(),
@@ -1814,50 +1867,46 @@ async fn run_push(
                 );
                 batch_end_line_offset = state.line_offset;
                 batch_distinct_roots_done = state.distinct_roots_done;
-
-                while join_set.len() >= worker_count {
-                    let result = join_set
-                        .join_next()
-                        .await
-                        .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
-                        .context("push upload worker join failed")??;
-                    pending_results.insert(result.batch_index, result);
-                    flush_ready_push_results(
-                        &mut pending_results,
-                        &mut next_commit_index,
-                        &mut state,
-                        &state_path,
-                        &pb,
-                        upload_total,
-                        push_phase_started_at,
-                        push_baseline_roots_done,
-                        push_baseline_items_done,
-                        push_baseline_bytes_sent,
-                    )?;
-                    update_upload_total_if_ready(
-                        &mut upload_total_task,
-                        &mut upload_total,
-                        &state,
-                        &pb,
-                        push_phase_started_at,
-                        push_baseline_roots_done,
-                        push_baseline_items_done,
-                        push_baseline_bytes_sent,
-                    )
-                    .await?;
-                }
+                batch_input_bytes = 0;
             }
         }
     }
 
     if !batch.is_empty() && !interrupted.load(Ordering::SeqCst) {
+        while push_upload_needs_backpressure(
+            join_set.len(),
+            worker_count,
+            in_flight_input_bytes,
+            batch_input_bytes,
+            max_in_flight_bytes,
+        ) {
+            wait_for_push_upload_result(
+                &mut join_set,
+                &mut pending_results,
+                &mut in_flight_input_bytes,
+                &mut next_commit_index,
+                &mut state,
+                &state_path,
+                &pb,
+                &mut upload_total_task,
+                &mut upload_total,
+                push_phase_started_at,
+                push_baseline_roots_done,
+                push_baseline_items_done,
+                push_baseline_bytes_sent,
+            )
+            .await?;
+        }
+
         let work = PushBatchWork {
             batch_index: next_batch_index,
             rows: std::mem::take(&mut batch),
+            input_bytes: batch_input_bytes,
             end_line_offset: batch_end_line_offset,
             distinct_roots_done: batch_distinct_roots_done,
         };
         next_batch_index += 1;
+        in_flight_input_bytes = in_flight_input_bytes.saturating_add(work.input_bytes);
         spawn_push_upload_task(
             &mut join_set,
             uploader_template.clone(),
@@ -1868,6 +1917,7 @@ async fn run_push(
 
     while let Some(joined) = join_set.join_next().await {
         let result = joined.context("push upload worker join failed")??;
+        in_flight_input_bytes = in_flight_input_bytes.saturating_sub(result.input_bytes);
         pending_results.insert(result.batch_index, result);
         flush_ready_push_results(
             &mut pending_results,
@@ -2654,11 +2704,26 @@ fn spawn_push_upload_task(
         Ok(PushBatchResult {
             batch_index: work.batch_index,
             row_count: work.rows.len(),
+            input_bytes: work.input_bytes,
             bytes_sent: bytes as u64,
             end_line_offset: work.end_line_offset,
             distinct_roots_done: work.distinct_roots_done,
         })
     });
+}
+
+fn push_upload_needs_backpressure(
+    active_uploads: usize,
+    worker_count: usize,
+    in_flight_input_bytes: usize,
+    next_batch_input_bytes: usize,
+    max_in_flight_input_bytes: usize,
+) -> bool {
+    if active_uploads == 0 {
+        return false;
+    }
+    active_uploads >= worker_count
+        || in_flight_input_bytes.saturating_add(next_batch_input_bytes) > max_in_flight_input_bytes
 }
 
 fn spawn_upload_total_task(
@@ -2673,6 +2738,54 @@ fn spawn_upload_total_task(
     Some(tokio::task::spawn_blocking(move || {
         upload_total_for_progress(&input_files, &scope, limit)
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_push_upload_result(
+    join_set: &mut tokio::task::JoinSet<Result<PushBatchResult>>,
+    pending_results: &mut BTreeMap<usize, PushBatchResult>,
+    in_flight_input_bytes: &mut usize,
+    next_commit_index: &mut usize,
+    state: &mut PushState,
+    state_path: &Path,
+    pb: &ProgressBar,
+    upload_total_task: &mut Option<tokio::task::JoinHandle<Result<Option<usize>>>>,
+    upload_total: &mut Option<usize>,
+    push_phase_started_at: u64,
+    push_baseline_roots_done: usize,
+    push_baseline_items_done: usize,
+    push_baseline_bytes_sent: u64,
+) -> Result<()> {
+    let result = join_set
+        .join_next()
+        .await
+        .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
+        .context("push upload worker join failed")??;
+    *in_flight_input_bytes = in_flight_input_bytes.saturating_sub(result.input_bytes);
+    pending_results.insert(result.batch_index, result);
+    flush_ready_push_results(
+        pending_results,
+        next_commit_index,
+        state,
+        state_path,
+        pb,
+        *upload_total,
+        push_phase_started_at,
+        push_baseline_roots_done,
+        push_baseline_items_done,
+        push_baseline_bytes_sent,
+    )?;
+    update_upload_total_if_ready(
+        upload_total_task,
+        upload_total,
+        state,
+        pb,
+        push_phase_started_at,
+        push_baseline_roots_done,
+        push_baseline_items_done,
+        push_baseline_bytes_sent,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4446,6 +4559,7 @@ mod tests {
             PushBatchResult {
                 batch_index: 1,
                 row_count: 2,
+                input_bytes: 20,
                 bytes_sent: 200,
                 end_line_offset: 4,
                 distinct_roots_done: 2,
@@ -4472,6 +4586,7 @@ mod tests {
             PushBatchResult {
                 batch_index: 0,
                 row_count: 2,
+                input_bytes: 10,
                 bytes_sent: 100,
                 end_line_offset: 2,
                 distinct_roots_done: 1,
@@ -4555,6 +4670,14 @@ mod tests {
         assert_eq!(total, Some(2));
         let _ = fs::remove_file(&path);
         Ok(())
+    }
+
+    #[test]
+    fn push_upload_backpressure_limits_workers_and_bytes() {
+        assert!(!push_upload_needs_backpressure(0, 4, 0, 256, 512));
+        assert!(push_upload_needs_backpressure(4, 4, 128, 128, 512));
+        assert!(push_upload_needs_backpressure(2, 4, 400, 200, 512));
+        assert!(!push_upload_needs_backpressure(2, 4, 200, 100, 512));
     }
 
     #[test]
