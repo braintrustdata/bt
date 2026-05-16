@@ -546,15 +546,8 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
 
     match command {
         SyncCommand::Pull(pull) => {
-            run_pull(
-                base.json,
-                base.verbose,
-                &ctx,
-                &client,
-                project.as_deref(),
-                pull,
-            )
-            .await
+            let verbose = base.verbose_explicit();
+            run_pull(base.json, verbose, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
             run_push(base.json, &ctx, &client, project.as_deref(), push).await

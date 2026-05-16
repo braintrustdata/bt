@@ -301,6 +301,7 @@ fn try_main() -> Result<()> {
 }
 
 fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
+    base.verbose_source = find_value_source(matches, "verbose").and_then(map_value_source);
     base.quiet_source = find_value_source(matches, "quiet").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
 }
@@ -499,6 +500,37 @@ mod tests {
         restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
 
         assert_eq!(cli.command.base().api_key_source, None);
+    }
+
+    #[test]
+    fn apply_base_arg_sources_tracks_cli_verbose() {
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "sync", "pull", "--verbose"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        assert_eq!(
+            cli.command.base().verbose_source,
+            Some(ArgValueSource::CommandLine)
+        );
+        assert!(cli.command.base().verbose_explicit());
+    }
+
+    #[test]
+    fn default_verbose_output_is_not_explicit_verbose() {
+        let matches = Cli::command()
+            .try_get_matches_from(["bt", "sync", "pull"])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+        apply_base_output_defaults(&mut cli.command);
+
+        assert!(cli.command.base().verbose);
+        assert_eq!(cli.command.base().verbose_source, None);
+        assert!(!cli.command.base().verbose_explicit());
     }
 
     #[test]
