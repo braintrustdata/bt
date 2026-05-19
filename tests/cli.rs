@@ -122,6 +122,36 @@ fn setup_instrument_accepts_deprecated_agents_alias() {
 }
 
 #[test]
+fn util_version_to_time_accepts_pagination_key_with_utc() {
+    bt_command()
+        .args([
+            "util",
+            "version",
+            "to-time",
+            "p07639577379371417602",
+            "--utc",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2026-05-14T03:01:58Z"));
+}
+
+#[test]
+fn util_version_from_time_can_output_pagination_key() {
+    bt_command()
+        .args([
+            "util",
+            "version",
+            "from-time",
+            "2026-05-14T08:00:09-07:00",
+            "--pagination-key",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("p07639762451734462464"));
+}
+
+#[test]
 fn setup_uses_codex_detected_on_path_without_explicit_agent() {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");
@@ -348,4 +378,28 @@ fn setup_mcp_only_requires_auth_in_non_interactive_mode() {
         .stderr(predicate::str::contains(
             "profile selection required in non-interactive mode",
         ));
+}
+
+#[test]
+fn datasets_requires_profile_selection_when_multiple_profiles_exist() {
+    let repo = make_git_repo();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_auth_store(
+        config_home.path(),
+        &[("alpha", "alpha-org"), ("beta", "beta-org")],
+    );
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["datasets", "--no-input"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("multiple auth profiles available"))
+        .stderr(predicate::str::contains("--profile <NAME>"))
+        .stderr(predicate::str::contains("alpha"))
+        .stderr(predicate::str::contains("beta"));
 }

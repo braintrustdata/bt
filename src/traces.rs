@@ -4994,9 +4994,10 @@ fn print_trace_text(
         );
     }
     println!(
-        "\nTrace output is truncated. Use `bt view span{} --object-ref {} --id <row-id>` for full span data.",
+        "\nTrace output is truncated. Re-run with --json for the full trace (`bt view trace --json{0} --object-ref {1} --trace-id {2}`), or fetch a single span with `bt view span{0} --object-ref {1} --id <row-id>`.",
         profile_flag_suffix(profile),
-        object_ref
+        object_ref,
+        trace_id
     );
     if let Some(cursor) = next_cursor {
         let limit_suffix = if limit != 50 {
@@ -5028,34 +5029,6 @@ fn print_span_text(item: Option<&Map<String, Value>>) {
         }
         None => println!("No span found."),
     }
-}
-
-fn parse_duration_to_seconds(input: &str) -> Result<u64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("duration cannot be empty");
-    }
-    if let Ok(seconds) = trimmed.parse::<u64>() {
-        return Ok(seconds);
-    }
-
-    let suffix = trimmed.chars().last().filter(|ch| ch.is_ascii_alphabetic());
-    let (num_str, unit) = match suffix {
-        Some(unit) => (&trimmed[..trimmed.len() - unit.len_utf8()], unit),
-        None => (trimmed, 's'),
-    };
-    let value: u64 = num_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid duration '{input}'"))?;
-    let multiplier = match unit.to_ascii_lowercase() {
-        's' => 1,
-        'm' => 60,
-        'h' => 60 * 60,
-        'd' => 60 * 60 * 24,
-        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
-    };
-    Ok(value.saturating_mul(multiplier))
 }
 
 fn build_base_filter_clause(
@@ -6087,6 +6060,7 @@ mod tests {
         BaseArgs {
             json: false,
             verbose: false,
+            verbose_source: None,
             quiet: false,
             quiet_source: None,
             no_color: false,
@@ -6180,22 +6154,6 @@ mod tests {
                     "render produced empty buffer at size={size}, iter={i}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn parse_duration_to_seconds_supports_units() {
-        assert_eq!(parse_duration_to_seconds("90").expect("seconds"), 90);
-        assert_eq!(parse_duration_to_seconds("15m").expect("minutes"), 900);
-        assert_eq!(parse_duration_to_seconds("2h").expect("hours"), 7_200);
-        assert_eq!(parse_duration_to_seconds("1d").expect("days"), 86_400);
-    }
-
-    #[test]
-    fn parse_duration_to_seconds_rejects_non_ascii_suffix_without_panicking() {
-        for input in ["1–", "1é", "1🙂"] {
-            let err = parse_duration_to_seconds(input).expect_err("invalid unicode suffix");
-            assert!(err.to_string().contains("invalid duration"));
         }
     }
 

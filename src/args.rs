@@ -21,6 +21,9 @@ pub struct BaseArgs {
     #[arg(long, short = 'v', env = "BRAINTRUST_VERBOSE", global = true, conflicts_with = "quiet", value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub verbose: bool,
 
+    #[arg(skip)]
+    pub verbose_source: Option<ArgValueSource>,
+
     /// Reduce interactive UI output
     #[arg(long, short = 'q', env = "BRAINTRUST_QUIET", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub quiet: bool,
@@ -117,6 +120,10 @@ pub struct CLIArgs<T: Args> {
 impl BaseArgs {
     pub fn ca_cert(&self) -> Option<&Path> {
         self.ca_cert.as_deref()
+    }
+
+    pub fn verbose_explicit(&self) -> bool {
+        self.verbose && self.verbose_source.is_some()
     }
 }
 

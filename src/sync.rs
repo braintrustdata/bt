@@ -38,6 +38,9 @@ const BTQL_MAX_ATTEMPTS: usize = 5;
 const BTQL_RETRY_BASE_DELAY_MS: u64 = 300;
 const BTQL_MAX_BACKOFF_SECS: u64 = 8;
 const PULL_OUTPUT_PART_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const LINE_COUNT_BUFFER_BYTES: usize = 1024 * 1024;
+const PUSH_BATCH_MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const PUSH_MAX_IN_FLIGHT_INPUT_BYTES: usize = 128 * 1024 * 1024;
 
 pub(crate) fn default_workers() -> usize {
     std::thread::available_parallelism()
@@ -157,6 +160,22 @@ struct PushArgs {
     /// Number of concurrent workers for upload mode.
     #[arg(long, default_value_t = default_workers())]
     workers: usize,
+
+    /// Maximum approximate input bytes per upload batch.
+    #[arg(
+        long,
+        env = "BT_SYNC_PUSH_MAX_BATCH_BYTES",
+        default_value_t = PUSH_BATCH_MAX_INPUT_BYTES
+    )]
+    max_batch_bytes: usize,
+
+    /// Maximum approximate input bytes held by in-flight upload batches.
+    #[arg(
+        long,
+        env = "BT_SYNC_PUSH_MAX_IN_FLIGHT_BYTES",
+        default_value_t = PUSH_MAX_IN_FLIGHT_INPUT_BYTES
+    )]
+    max_in_flight_bytes: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -433,6 +452,7 @@ impl DestinationMode {
 struct PushBatchWork {
     batch_index: usize,
     rows: Vec<Map<String, Value>>,
+    input_bytes: usize,
     end_line_offset: usize,
     distinct_roots_done: usize,
 }
@@ -441,6 +461,7 @@ struct PushBatchWork {
 struct PushBatchResult {
     batch_index: usize,
     row_count: usize,
+    input_bytes: usize,
     bytes_sent: u64,
     end_line_offset: usize,
     distinct_roots_done: usize,
@@ -545,15 +566,8 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
 
     match command {
         SyncCommand::Pull(pull) => {
-            run_pull(
-                base.json,
-                base.verbose,
-                &ctx,
-                &client,
-                project.as_deref(),
-                pull,
-            )
-            .await
+            let verbose = base.verbose_explicit();
+            run_pull(base.json, verbose, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
             run_push(base.json, &ctx, &client, project.as_deref(), push).await
@@ -1685,17 +1699,11 @@ async fn run_push(
 
     let project_id = destination.project_id.clone();
     let input_files = resolve_push_input_files(&input_path)?;
-    let upload_total = upload_total_for_progress(&input_files, &scope, limit)?;
+    let mut upload_total_task = spawn_upload_total_task(input_files.clone(), scope.clone(), limit);
+    let mut upload_total: Option<usize> = None;
 
-    let pb = if let Some(total) = upload_total {
-        bounded_bar(total as u64, "Uploading rows", "spans")
-    } else {
-        spinner_bar("Uploading rows")
-    };
+    let pb = spinner_bar("Uploading rows");
     pb.set_prefix("Uploading rows".to_string());
-    if let Some(total) = upload_total {
-        pb.set_position(state.items_done.min(total) as u64);
-    }
 
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_signal = Arc::clone(&interrupted);
@@ -1742,9 +1750,13 @@ async fn run_push(
     }
 
     let worker_count = args.workers.max(1);
+    let max_batch_bytes = args.max_batch_bytes.max(1);
+    let max_in_flight_bytes = args.max_in_flight_bytes.max(max_batch_bytes);
     let mut selected_count: usize = state.items_done;
     let mut batch_end_line_offset = state.line_offset;
     let mut batch_distinct_roots_done = state.distinct_roots_done;
+    let mut batch_input_bytes = 0usize;
+    let mut in_flight_input_bytes = 0usize;
     let mut next_batch_index = 0usize;
     let mut next_commit_index = 0usize;
     let mut pending_results: BTreeMap<usize, PushBatchResult> = BTreeMap::new();
@@ -1770,6 +1782,7 @@ async fn run_push(
             if line.trim().is_empty() {
                 continue;
             }
+            let row_input_bytes = line.len() + 1;
             let mut row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
                 format!(
                     "invalid JSON in {} at line {}",
@@ -1807,16 +1820,44 @@ async fn run_push(
             selected_count += 1;
             batch_end_line_offset = current_line_offset + 1;
             batch_distinct_roots_done = seen_roots.len();
+            batch_input_bytes = batch_input_bytes.saturating_add(row_input_bytes);
             batch.push(row);
 
-            if batch.len() >= args.page_size {
+            if batch.len() >= args.page_size || batch_input_bytes >= max_batch_bytes {
+                while push_upload_needs_backpressure(
+                    join_set.len(),
+                    worker_count,
+                    in_flight_input_bytes,
+                    batch_input_bytes,
+                    max_in_flight_bytes,
+                ) {
+                    wait_for_push_upload_result(
+                        &mut join_set,
+                        &mut pending_results,
+                        &mut in_flight_input_bytes,
+                        &mut next_commit_index,
+                        &mut state,
+                        &state_path,
+                        &pb,
+                        &mut upload_total_task,
+                        &mut upload_total,
+                        push_phase_started_at,
+                        push_baseline_roots_done,
+                        push_baseline_items_done,
+                        push_baseline_bytes_sent,
+                    )
+                    .await?;
+                }
+
                 let work = PushBatchWork {
                     batch_index: next_batch_index,
                     rows: std::mem::take(&mut batch),
+                    input_bytes: batch_input_bytes,
                     end_line_offset: batch_end_line_offset,
                     distinct_roots_done: batch_distinct_roots_done,
                 };
                 next_batch_index += 1;
+                in_flight_input_bytes = in_flight_input_bytes.saturating_add(work.input_bytes);
                 spawn_push_upload_task(
                     &mut join_set,
                     uploader_template.clone(),
@@ -1825,39 +1866,46 @@ async fn run_push(
                 );
                 batch_end_line_offset = state.line_offset;
                 batch_distinct_roots_done = state.distinct_roots_done;
-
-                while join_set.len() >= worker_count {
-                    let result = join_set
-                        .join_next()
-                        .await
-                        .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
-                        .context("push upload worker join failed")??;
-                    pending_results.insert(result.batch_index, result);
-                    flush_ready_push_results(
-                        &mut pending_results,
-                        &mut next_commit_index,
-                        &mut state,
-                        &state_path,
-                        &pb,
-                        upload_total,
-                        push_phase_started_at,
-                        push_baseline_roots_done,
-                        push_baseline_items_done,
-                        push_baseline_bytes_sent,
-                    )?;
-                }
+                batch_input_bytes = 0;
             }
         }
     }
 
     if !batch.is_empty() && !interrupted.load(Ordering::SeqCst) {
+        while push_upload_needs_backpressure(
+            join_set.len(),
+            worker_count,
+            in_flight_input_bytes,
+            batch_input_bytes,
+            max_in_flight_bytes,
+        ) {
+            wait_for_push_upload_result(
+                &mut join_set,
+                &mut pending_results,
+                &mut in_flight_input_bytes,
+                &mut next_commit_index,
+                &mut state,
+                &state_path,
+                &pb,
+                &mut upload_total_task,
+                &mut upload_total,
+                push_phase_started_at,
+                push_baseline_roots_done,
+                push_baseline_items_done,
+                push_baseline_bytes_sent,
+            )
+            .await?;
+        }
+
         let work = PushBatchWork {
             batch_index: next_batch_index,
             rows: std::mem::take(&mut batch),
+            input_bytes: batch_input_bytes,
             end_line_offset: batch_end_line_offset,
             distinct_roots_done: batch_distinct_roots_done,
         };
         next_batch_index += 1;
+        in_flight_input_bytes = in_flight_input_bytes.saturating_add(work.input_bytes);
         spawn_push_upload_task(
             &mut join_set,
             uploader_template.clone(),
@@ -1868,6 +1916,7 @@ async fn run_push(
 
     while let Some(joined) = join_set.join_next().await {
         let result = joined.context("push upload worker join failed")??;
+        in_flight_input_bytes = in_flight_input_bytes.saturating_sub(result.input_bytes);
         pending_results.insert(result.batch_index, result);
         flush_ready_push_results(
             &mut pending_results,
@@ -1881,6 +1930,17 @@ async fn run_push(
             push_baseline_items_done,
             push_baseline_bytes_sent,
         )?;
+        update_upload_total_if_ready(
+            &mut upload_total_task,
+            &mut upload_total,
+            &state,
+            &pb,
+            push_phase_started_at,
+            push_baseline_roots_done,
+            push_baseline_items_done,
+            push_baseline_bytes_sent,
+        )
+        .await?;
     }
 
     if !pending_results.is_empty() || next_commit_index != next_batch_index {
@@ -1891,6 +1951,9 @@ async fn run_push(
 
     let was_interrupted = interrupted.load(Ordering::SeqCst);
     ctrlc_task.abort();
+    if let Some(task) = upload_total_task.take() {
+        task.abort();
+    }
 
     if was_interrupted {
         state.status = RunStatus::Interrupted;
@@ -2606,34 +2669,6 @@ fn build_root_spans_query(
     parts.join(" | ")
 }
 
-fn parse_duration_to_seconds(input: &str) -> Result<u64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("duration cannot be empty");
-    }
-    if let Ok(seconds) = trimmed.parse::<u64>() {
-        return Ok(seconds);
-    }
-
-    let suffix = trimmed.chars().last().filter(|ch| ch.is_ascii_alphabetic());
-    let (num_str, unit) = match suffix {
-        Some(unit) => (&trimmed[..trimmed.len() - unit.len_utf8()], unit),
-        None => (trimmed, 's'),
-    };
-    let value: u64 = num_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid duration '{input}'"))?;
-    let multiplier = match unit.to_ascii_lowercase() {
-        's' => 1,
-        'm' => 60,
-        'h' => 60 * 60,
-        'd' => 60 * 60 * 24,
-        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
-    };
-    Ok(value.saturating_mul(multiplier))
-}
-
 fn build_time_filter_clause(window: &str, extra_filter: Option<&str>) -> Result<String> {
     let seconds = parse_duration_to_seconds(window)?;
     let time_clause = format!("created >= NOW() - INTERVAL {seconds} SECOND");
@@ -2668,11 +2703,128 @@ fn spawn_push_upload_task(
         Ok(PushBatchResult {
             batch_index: work.batch_index,
             row_count: work.rows.len(),
+            input_bytes: work.input_bytes,
             bytes_sent: bytes as u64,
             end_line_offset: work.end_line_offset,
             distinct_roots_done: work.distinct_roots_done,
         })
     });
+}
+
+fn push_upload_needs_backpressure(
+    active_uploads: usize,
+    worker_count: usize,
+    in_flight_input_bytes: usize,
+    next_batch_input_bytes: usize,
+    max_in_flight_input_bytes: usize,
+) -> bool {
+    if active_uploads == 0 {
+        return false;
+    }
+    active_uploads >= worker_count
+        || in_flight_input_bytes.saturating_add(next_batch_input_bytes) > max_in_flight_input_bytes
+}
+
+fn spawn_upload_total_task(
+    input_files: Vec<PathBuf>,
+    scope: ScopeArg,
+    limit: Option<usize>,
+) -> Option<tokio::task::JoinHandle<Result<Option<usize>>>> {
+    if !push_progress_total_needs_line_count(&scope) {
+        return None;
+    }
+
+    Some(tokio::task::spawn_blocking(move || {
+        upload_total_for_progress(&input_files, &scope, limit)
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_push_upload_result(
+    join_set: &mut tokio::task::JoinSet<Result<PushBatchResult>>,
+    pending_results: &mut BTreeMap<usize, PushBatchResult>,
+    in_flight_input_bytes: &mut usize,
+    next_commit_index: &mut usize,
+    state: &mut PushState,
+    state_path: &Path,
+    pb: &ProgressBar,
+    upload_total_task: &mut Option<tokio::task::JoinHandle<Result<Option<usize>>>>,
+    upload_total: &mut Option<usize>,
+    push_phase_started_at: u64,
+    push_baseline_roots_done: usize,
+    push_baseline_items_done: usize,
+    push_baseline_bytes_sent: u64,
+) -> Result<()> {
+    let result = join_set
+        .join_next()
+        .await
+        .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
+        .context("push upload worker join failed")??;
+    *in_flight_input_bytes = in_flight_input_bytes.saturating_sub(result.input_bytes);
+    pending_results.insert(result.batch_index, result);
+    flush_ready_push_results(
+        pending_results,
+        next_commit_index,
+        state,
+        state_path,
+        pb,
+        *upload_total,
+        push_phase_started_at,
+        push_baseline_roots_done,
+        push_baseline_items_done,
+        push_baseline_bytes_sent,
+    )?;
+    update_upload_total_if_ready(
+        upload_total_task,
+        upload_total,
+        state,
+        pb,
+        push_phase_started_at,
+        push_baseline_roots_done,
+        push_baseline_items_done,
+        push_baseline_bytes_sent,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_upload_total_if_ready(
+    upload_total_task: &mut Option<tokio::task::JoinHandle<Result<Option<usize>>>>,
+    upload_total: &mut Option<usize>,
+    state: &PushState,
+    pb: &ProgressBar,
+    push_phase_started_at: u64,
+    push_baseline_roots_done: usize,
+    push_baseline_items_done: usize,
+    push_baseline_bytes_sent: u64,
+) -> Result<()> {
+    if upload_total.is_some()
+        || !upload_total_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    {
+        return Ok(());
+    }
+
+    let total = upload_total_task
+        .take()
+        .expect("checked task above")
+        .await
+        .context("push row count task failed")??;
+    if let Some(total) = total {
+        configure_upload_progress_bar(pb, total);
+        *upload_total = Some(total);
+        pb.set_position(state.items_done.min(total) as u64);
+        pb.set_message(push_progress_message_with_baseline(
+            state,
+            push_phase_started_at,
+            push_baseline_roots_done,
+            push_baseline_items_done,
+            push_baseline_bytes_sent,
+            *upload_total,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4080,26 +4232,70 @@ fn upload_total_for_progress(
     scope: &ScopeArg,
     limit: Option<usize>,
 ) -> Result<Option<usize>> {
-    if matches!(scope, ScopeArg::Traces) {
+    if !push_progress_total_needs_line_count(scope) {
         return Ok(None);
     }
 
-    let total_lines = count_lines(input_files)?;
+    let total_lines = count_lines(input_files, limit)?;
     let capped = limit.map(|l| l.min(total_lines)).unwrap_or(total_lines);
     Ok(Some(capped))
 }
 
-fn count_lines(paths: &[PathBuf]) -> Result<usize> {
+fn push_progress_total_needs_line_count(scope: &ScopeArg) -> bool {
+    !matches!(scope, ScopeArg::Traces)
+}
+
+fn count_lines(paths: &[PathBuf], max_lines: Option<usize>) -> Result<usize> {
     let mut count = 0usize;
     for path in paths {
-        let file =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            line.with_context(|| format!("failed reading {}", path.display()))?;
-            count += 1;
+        if max_lines.is_some_and(|max| count >= max) {
+            break;
+        }
+        let remaining = max_lines.map(|max| max.saturating_sub(count));
+        count += count_lines_in_file(path, remaining)?;
+    }
+    Ok(count)
+}
+
+fn count_lines_in_file(path: &Path, max_lines: Option<usize>) -> Result<usize> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(LINE_COUNT_BUFFER_BYTES, file);
+    let mut count = 0usize;
+    let mut saw_any_byte = false;
+    let mut last_byte = b'\n';
+    let mut reached_max = false;
+
+    loop {
+        let consumed = {
+            let buffer = reader
+                .fill_buf()
+                .with_context(|| format!("failed reading {}", path.display()))?;
+            if buffer.is_empty() {
+                break;
+            }
+            saw_any_byte = true;
+            for byte in buffer {
+                if *byte == b'\n' {
+                    count += 1;
+                    if max_lines.is_some_and(|max| count >= max) {
+                        reached_max = true;
+                        break;
+                    }
+                }
+            }
+            last_byte = *buffer.last().unwrap_or(&last_byte);
+            buffer.len()
+        };
+        reader.consume(consumed);
+        if reached_max {
+            break;
         }
     }
+
+    if !reached_max && saw_any_byte && last_byte != b'\n' {
+        count += 1;
+    }
+
     Ok(count)
 }
 
@@ -4262,18 +4458,17 @@ fn pull_status_line(show_checkpoint_hint: bool, retry_summary: Option<&str>) -> 
     }
 }
 
-fn bounded_bar(total: u64, message: &str, unit_label: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new(total);
+fn configure_upload_progress_bar(pb: &ProgressBar, total: usize) {
+    pb.set_length(total as u64);
+    configure_bounded_bar_style(pb, "spans");
+    pb.set_prefix("Uploading rows".to_string());
+}
+
+fn configure_bounded_bar_style(pb: &ProgressBar, unit_label: &str) {
     let template = format!(
         "{{spinner:.cyan}} {{prefix}} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {unit_label} ({{percent:>3}}%) | {{msg}}"
     );
     pb.set_style(ProgressStyle::with_template(&template).unwrap());
-    pb.set_prefix(message.to_string());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    pb
 }
 
 fn spinner_bar(message: &str) -> ProgressBar {
@@ -4294,14 +4489,6 @@ fn spinner_bar(message: &str) -> ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_duration_to_seconds_rejects_non_ascii_suffix_without_panicking() {
-        for input in ["1–", "1é", "1🙂"] {
-            let err = parse_duration_to_seconds(input).expect_err("invalid unicode suffix");
-            assert!(err.to_string().contains("invalid duration"));
-        }
-    }
 
     #[test]
     fn push_checkpoint_line_offset_advances_only_after_commit() {
@@ -4371,6 +4558,7 @@ mod tests {
             PushBatchResult {
                 batch_index: 1,
                 row_count: 2,
+                input_bytes: 20,
                 bytes_sent: 200,
                 end_line_offset: 4,
                 distinct_roots_done: 2,
@@ -4397,6 +4585,7 @@ mod tests {
             PushBatchResult {
                 batch_index: 0,
                 row_count: 2,
+                input_bytes: 10,
                 bytes_sent: 100,
                 end_line_offset: 2,
                 distinct_roots_done: 1,
@@ -4424,6 +4613,89 @@ mod tests {
         assert!(pending.is_empty());
 
         let _ = fs::remove_file(&state_path);
+        Ok(())
+    }
+
+    #[test]
+    fn upload_total_for_traces_does_not_scan_inputs() -> Result<()> {
+        let missing = PathBuf::from("definitely-missing-sync-input.jsonl");
+
+        let total = upload_total_for_progress(&[missing], &ScopeArg::Traces, Some(25))?;
+
+        assert_eq!(total, None);
+        Ok(())
+    }
+
+    #[test]
+    fn upload_total_for_all_counts_lines() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-upload-total-all-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        fs::write(&path, "{\"id\":\"1\"}\n{\"id\":\"2\"}\n{\"id\":\"3\"}\n")?;
+
+        let total = upload_total_for_progress(std::slice::from_ref(&path), &ScopeArg::All, None)?;
+
+        assert_eq!(total, Some(3));
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn upload_total_for_spans_caps_requested_limit() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-upload-total-spans-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        let missing = std::env::temp_dir().join(format!(
+            "bt-sync-upload-total-spans-missing-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        fs::write(&path, "{\"id\":\"1\"}\n{\"id\":\"2\"}\n")?;
+
+        let total = upload_total_for_progress(&[path.clone(), missing], &ScopeArg::Spans, Some(2))?;
+
+        assert_eq!(total, Some(2));
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn push_upload_backpressure_limits_workers_and_bytes() {
+        assert!(!push_upload_needs_backpressure(0, 4, 0, 256, 512));
+        assert!(push_upload_needs_backpressure(4, 4, 128, 128, 512));
+        assert!(push_upload_needs_backpressure(2, 4, 400, 200, 512));
+        assert!(!push_upload_needs_backpressure(2, 4, 200, 100, 512));
+    }
+
+    #[test]
+    fn count_lines_counts_final_line_without_newline() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-count-lines-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        fs::write(&path, "{\"id\":\"1\"}\n{\"id\":\"2\"}")?;
+
+        let total = count_lines_in_file(&path, None)?;
+
+        assert_eq!(total, 2);
+        let _ = fs::remove_file(&path);
         Ok(())
     }
 
