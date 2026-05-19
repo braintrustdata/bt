@@ -616,6 +616,8 @@ pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> R
             fresh: args.fresh,
             root: args.root,
             workers: default_workers(),
+            max_batch_bytes: PUSH_BATCH_MAX_INPUT_BYTES,
+            max_in_flight_bytes: PUSH_MAX_IN_FLIGHT_INPUT_BYTES,
         },
     )
     .await

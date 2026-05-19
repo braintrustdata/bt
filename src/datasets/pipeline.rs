@@ -1728,6 +1728,7 @@ mod tests {
         BaseArgs {
             json: false,
             verbose: false,
+            verbose_source: None,
             quiet: false,
             quiet_source: None,
             no_color: false,
