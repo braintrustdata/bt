@@ -277,6 +277,7 @@ Auth resolution order for commands is:
 3. `BRAINTRUST_PROFILE`
 4. Org-based profile match (profile whose org matches `--org`/config org)
 5. Single-profile auto-select (if only one profile exists)
+6. Interactive profile picker (if multiple profiles exist and a TTY is available)
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
 
