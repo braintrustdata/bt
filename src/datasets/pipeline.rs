@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -267,6 +268,7 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
 
             let refs = read_jsonl_values(&refs_path)?;
             let source_project = resolve_pipeline_source_project(&base, &inspect.source).await?;
+            let attachment_dir = tempdir.path().join("attachments");
             let transform_response = transform_source_refs(
                 &base,
                 &args.runner,
@@ -274,6 +276,7 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 &inspect.source,
                 refs,
                 args.transform.max_concurrency(),
+                Some(&attachment_dir),
                 None,
             )
             .await?;
@@ -1178,6 +1181,7 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
         Some(&input_path),
     )?;
     artifact.write_spec()?;
+    let attachment_dir = artifact.spec_dir.join("attachments");
     let started_at = epoch_seconds();
     let mut writer = create_jsonl_file_writer(&artifact.output_path)?;
     let response = transform_source_refs(
@@ -1187,6 +1191,7 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
         &source,
         refs,
         args.transform.max_concurrency(),
+        Some(&attachment_dir),
         Some(&mut writer as &mut dyn Write),
     )
     .await?;
@@ -1231,8 +1236,13 @@ async fn transform_source_refs(
     source: &PipelineSourceInspect,
     refs: Vec<Value>,
     max_concurrency: usize,
+    attachment_dir: Option<&Path>,
     mut row_writer: Option<&mut dyn Write>,
 ) -> Result<PipelineTransformResponse> {
+    if let Some(attachment_dir) = attachment_dir {
+        fs::create_dir_all(attachment_dir)
+            .with_context(|| format!("failed to create {}", attachment_dir.display()))?;
+    }
     let progress = pipeline_progress_bar(base, refs.len() as u64, "Transforming candidates");
     progress.set_message("output rows: 0");
     let mut combined = PipelineTransformResponse {
@@ -1247,6 +1257,7 @@ async fn transform_source_refs(
             "sourceProjectId": source_project_id,
             "source": source,
             "refs": batch,
+            "attachmentDir": attachment_dir.map(|path| path.display().to_string()),
             "maxConcurrency": max_concurrency,
         });
         let mut completed_in_batch = 0usize;
@@ -1376,6 +1387,8 @@ async fn push_rows(base: &BaseArgs, args: PipelinePushArgs) -> Result<()> {
         PipelineArtifactStage::Transform,
     )?;
     let target_base = base_with_pipeline_target(base, &inspect.target);
+    let input_path =
+        materialize_deferred_attachments_for_push(base, &inspect.target, &input_path).await?;
 
     crate::sync::push_jsonl_file(
         target_base,
@@ -1410,6 +1423,35 @@ fn pipeline_target_dataset_ref(target: &PipelineTargetInspect) -> Result<String>
     Ok(format!("dataset:{dataset_name}"))
 }
 
+async fn materialize_deferred_attachments_for_push(
+    base: &BaseArgs,
+    target: &PipelineTargetInspect,
+    input_path: &Path,
+) -> Result<PathBuf> {
+    let rows = read_jsonl_values(input_path)?;
+    if !rows.iter().any(contains_deferred_attachment) {
+        return Ok(input_path.to_path_buf());
+    }
+
+    let target_ctx = resolve_target_context(base, target).await?;
+    let rows =
+        materialize_deferred_attachments(rows, &target_ctx.client, input_path.parent()).await?;
+    let output_path = input_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("materialized_for_push.jsonl");
+    let mut writer = create_jsonl_file_writer(&output_path)?;
+    for row in rows {
+        write_jsonl_value(&mut writer, &row)
+            .with_context(|| format!("failed to write {}", output_path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", output_path.display()))?;
+    Ok(output_path)
+}
+
 async fn upload_dataset_rows(
     base: &BaseArgs,
     target: &PipelineTargetInspect,
@@ -1417,6 +1459,7 @@ async fn upload_dataset_rows(
 ) -> Result<usize> {
     let target_ctx = resolve_target_context(base, target).await?;
     let dataset = resolve_target_dataset(&target_ctx.client, target, &target_ctx.project).await?;
+    let rows = materialize_deferred_attachments(rows, &target_ctx.client, None).await?;
     let records = prepare_pipeline_records(rows)?;
     let inserted = records.len();
 
@@ -1431,6 +1474,233 @@ async fn upload_dataset_rows(
     .await?;
 
     Ok(inserted)
+}
+
+fn contains_deferred_attachment(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            is_deferred_attachment_marker(object)
+                || object.values().any(contains_deferred_attachment)
+        }
+        Value::Array(items) => items.iter().any(contains_deferred_attachment),
+        _ => false,
+    }
+}
+
+async fn materialize_deferred_attachments(
+    mut rows: Vec<Value>,
+    client: &ApiClient,
+    base_dir: Option<&Path>,
+) -> Result<Vec<Value>> {
+    let mut specs = Vec::new();
+    for row in &rows {
+        collect_deferred_attachment_specs(row, &mut specs)?;
+    }
+    if specs.is_empty() {
+        return Ok(rows);
+    }
+
+    let mut replacements = HashMap::new();
+    for spec in specs {
+        if replacements.contains_key(&spec.key) {
+            continue;
+        }
+        let reference = upload_deferred_attachment(client, &spec, base_dir)
+            .await
+            .with_context(|| format!("failed to upload deferred attachment {}", spec.filename))?;
+        replacements.insert(spec.key, reference);
+    }
+
+    for row in &mut rows {
+        replace_deferred_attachment_specs(row, &replacements)?;
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone)]
+struct DeferredAttachmentSpec {
+    key: String,
+    filename: String,
+    content_type: String,
+    path: Option<PathBuf>,
+    data: Option<Value>,
+    pretty: bool,
+}
+
+fn collect_deferred_attachment_specs(
+    value: &Value,
+    specs: &mut Vec<DeferredAttachmentSpec>,
+) -> Result<()> {
+    match value {
+        Value::Object(object) if is_deferred_attachment_marker(object) => {
+            specs.push(parse_deferred_attachment_spec(object)?);
+        }
+        Value::Object(object) => {
+            for value in object.values() {
+                collect_deferred_attachment_specs(value, specs)?;
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                collect_deferred_attachment_specs(value, specs)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn replace_deferred_attachment_specs(
+    value: &mut Value,
+    replacements: &HashMap<String, Value>,
+) -> Result<()> {
+    match value {
+        Value::Object(object) if is_deferred_attachment_marker(object) => {
+            let spec = parse_deferred_attachment_spec(object)?;
+            let replacement = replacements
+                .get(&spec.key)
+                .with_context(|| format!("missing replacement for {}", spec.filename))?;
+            *value = replacement.clone();
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                replace_deferred_attachment_specs(value, replacements)?;
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                replace_deferred_attachment_specs(value, replacements)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_deferred_attachment_marker(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "braintrust_deferred_attachment")
+}
+
+fn parse_deferred_attachment_spec(
+    object: &serde_json::Map<String, Value>,
+) -> Result<DeferredAttachmentSpec> {
+    let filename = object
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("deferred attachment is missing filename")?
+        .to_string();
+    let content_type = object
+        .get("content_type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("application/json")
+        .to_string();
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let data = object.get("data").cloned();
+    if path.is_none() && data.is_none() {
+        bail!("deferred attachment {filename} is missing path or data");
+    }
+    let pretty = object
+        .get("pretty")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let key = serde_json::to_string(object)
+        .context("failed to build deferred attachment replacement key")?;
+
+    Ok(DeferredAttachmentSpec {
+        key,
+        filename,
+        content_type,
+        path,
+        data,
+        pretty,
+    })
+}
+
+async fn upload_deferred_attachment(
+    client: &ApiClient,
+    spec: &DeferredAttachmentSpec,
+    base_dir: Option<&Path>,
+) -> Result<Value> {
+    let key = uuid::Uuid::new_v4().to_string();
+    let request = json!({
+        "key": key,
+        "filename": spec.filename,
+        "content_type": spec.content_type,
+        "org_id": client.org_id(),
+    });
+    let metadata: AttachmentUploadMetadata = client
+        .post("/attachment", &request)
+        .await
+        .context("failed to request signed URL from API server")?;
+    let data = deferred_attachment_bytes(spec, base_dir)?;
+    let upload_result =
+        crate::http::put_signed_url_with_headers(&metadata.signed_url, data, &metadata.headers)
+            .await;
+
+    let status = match &upload_result {
+        Ok(()) => json!({ "upload_status": "done" }),
+        Err(err) => json!({ "upload_status": "error", "error_message": err.to_string() }),
+    };
+    let status_request = json!({
+        "key": key,
+        "org_id": client.org_id(),
+        "status": status,
+    });
+    let _: Value = client
+        .post("/attachment/status", &status_request)
+        .await
+        .context("failed to log attachment status")?;
+    upload_result.context("failed to upload attachment to object store")?;
+
+    Ok(json!({
+        "type": "braintrust_attachment",
+        "filename": spec.filename,
+        "content_type": spec.content_type,
+        "key": key,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachmentUploadMetadata {
+    signed_url: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+}
+
+fn deferred_attachment_bytes(
+    spec: &DeferredAttachmentSpec,
+    base_dir: Option<&Path>,
+) -> Result<Vec<u8>> {
+    if let Some(path) = spec.path.as_ref() {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            base_dir.unwrap_or_else(|| Path::new(".")).join(path)
+        };
+        return fs::read(&path).with_context(|| format!("failed to read {}", path.display()));
+    }
+
+    let data = spec
+        .data
+        .as_ref()
+        .context("deferred attachment is missing data")?;
+    let text = if spec.pretty {
+        serde_json::to_string_pretty(data)
+    } else {
+        serde_json::to_string(data)
+    }
+    .context("failed to serialize deferred attachment data")?;
+    Ok(text.into_bytes())
 }
 
 fn prepare_pipeline_records(rows: Vec<Value>) -> Result<Vec<records::PreparedDatasetRecord>> {
@@ -1838,6 +2108,62 @@ mod tests {
         let target_base = base_with_pipeline_target(&base, &target);
         assert_eq!(target_base.org_name.as_deref(), Some("target-org"));
         assert_eq!(target_base.project.as_deref(), Some("project-id"));
+    }
+
+    #[test]
+    fn deferred_attachment_detection_finds_nested_marker() {
+        let row = json!({
+            "id": "row-1",
+            "input": {
+                "full_trace": {
+                    "type": "braintrust_deferred_attachment",
+                    "kind": "json",
+                    "filename": "trace.json",
+                    "content_type": "application/json",
+                    "path": "attachments/trace.json"
+                }
+            }
+        });
+
+        assert!(contains_deferred_attachment(&row));
+
+        let mut specs = Vec::new();
+        collect_deferred_attachment_specs(&row, &mut specs).expect("collect specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].filename, "trace.json");
+        assert_eq!(
+            specs[0].path.as_deref(),
+            Some(Path::new("attachments/trace.json"))
+        );
+    }
+
+    #[test]
+    fn deferred_attachment_replacement_rewrites_nested_marker() {
+        let mut row = json!({
+            "id": "row-1",
+            "input": {
+                "full_trace": {
+                    "type": "braintrust_deferred_attachment",
+                    "kind": "json",
+                    "filename": "trace.json",
+                    "content_type": "application/json",
+                    "data": { "ok": true }
+                }
+            }
+        });
+        let mut specs = Vec::new();
+        collect_deferred_attachment_specs(&row, &mut specs).expect("collect specs");
+        let replacement = json!({
+            "type": "braintrust_attachment",
+            "filename": "trace.json",
+            "content_type": "application/json",
+            "key": "uploaded-key"
+        });
+        let replacements = HashMap::from([(specs[0].key.clone(), replacement.clone())]);
+
+        replace_deferred_attachment_specs(&mut row, &replacements).expect("replace specs");
+
+        assert_eq!(row["input"]["full_trace"], replacement);
     }
 
     #[test]

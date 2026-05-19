@@ -8,6 +8,8 @@ import os
 import socket
 import sys
 import traceback
+import uuid
+from pathlib import Path
 from typing import Any
 
 try:
@@ -35,6 +37,79 @@ TARGET_KEY_MAP = {
     "org_name": "orgName",
     "dataset_name": "datasetName",
 }
+
+_DEFERRED_ATTACHMENT_DIR: Path | None = None
+
+
+class DeferredJSONAttachment:
+    def __init__(
+        self,
+        data: Any,
+        *,
+        filename: str = "data.json",
+        pretty: bool = False,
+    ) -> None:
+        self._reference = deferred_json_attachment_reference(data, filename, pretty)
+
+    @property
+    def reference(self) -> dict[str, Any]:
+        return self._reference
+
+    def upload(self) -> dict[str, Any]:
+        return {"upload_status": "done", "deferred": True}
+
+    def debug_info(self) -> dict[str, Any]:
+        return {"reference": self._reference}
+
+
+def set_deferred_attachment_dir(path: str | None) -> None:
+    global _DEFERRED_ATTACHMENT_DIR
+    _DEFERRED_ATTACHMENT_DIR = Path(path).resolve() if path else None
+    if _DEFERRED_ATTACHMENT_DIR is not None:
+        _DEFERRED_ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def deferred_json_attachment_reference(
+    data: Any,
+    filename: str,
+    pretty: bool,
+) -> dict[str, Any]:
+    serialized = json.dumps(data, indent=2 if pretty else None, ensure_ascii=False)
+    marker: dict[str, Any] = {
+        "type": "braintrust_deferred_attachment",
+        "kind": "json",
+        "filename": filename,
+        "content_type": "application/json",
+    }
+    if _DEFERRED_ATTACHMENT_DIR is None:
+        marker["data"] = data
+        marker["pretty"] = pretty
+        return marker
+
+    path = _DEFERRED_ATTACHMENT_DIR / f"{uuid.uuid4()}.json"
+    path.write_text(serialized, encoding="utf-8")
+    marker["path"] = str(path)
+    return marker
+
+
+def install_deferred_attachment_shims() -> None:
+    braintrust.JSONAttachment = DeferredJSONAttachment
+    import braintrust.logger as logger
+
+    logger.JSONAttachment = DeferredJSONAttachment
+
+
+def normalize_deferred_attachments(value: Any) -> Any:
+    if isinstance(value, DeferredJSONAttachment):
+        return value.reference
+    if isinstance(value, dict):
+        return {
+            key: normalize_deferred_attachments(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [normalize_deferred_attachments(item) for item in value]
+    return value
 
 
 class SseWriter:
@@ -359,6 +434,7 @@ def with_pipeline_defaults(
     candidate: dict[str, Any],
     row_index: int | None,
 ) -> dict[str, Any]:
+    row = normalize_deferred_attachments(row)
     if not isinstance(row, dict):
         raise RuntimeError("Dataset pipeline transform must return an object row.")
     output = dict(row)
@@ -414,12 +490,15 @@ async def main() -> None:
     if len(sys.argv) < 2:
         raise RuntimeError("Pipeline file is required.")
 
+    stage = parse_stage()
+    if stage == "transform":
+        install_deferred_attachment_shims()
+
     module = load_pipeline_file(sys.argv[1])
     pipeline = select_pipeline(
         collect_pipelines(module),
         os.getenv("BT_DATASET_PIPELINE_NAME") or None,
     )
-    stage = parse_stage()
     sse = create_sse_writer()
 
     if stage == "inspect":
@@ -433,6 +512,10 @@ async def main() -> None:
         )
     elif stage == "transform":
         request = read_request()
+        attachment_dir = request.get("attachmentDir")
+        if attachment_dir is not None and not isinstance(attachment_dir, str):
+            raise RuntimeError("Request field attachmentDir must be a string.")
+        set_deferred_attachment_dir(attachment_dir)
         refs = require_array_field(request, "refs")
         source_project_id = require_string_field(request, "sourceProjectId")
         source_override = (

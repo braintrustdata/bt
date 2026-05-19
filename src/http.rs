@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use reqwest::header::HeaderValue;
 use reqwest::{Client, ClientBuilder};
@@ -274,14 +276,30 @@ pub async fn put_signed_url(
     body: Vec<u8>,
     content_encoding: Option<&str>,
 ) -> Result<()> {
+    let mut headers = HashMap::new();
+    if let Some(encoding) = content_encoding {
+        headers.insert("Content-Encoding".to_string(), encoding.to_string());
+    }
+    put_signed_url_with_headers(url, body, &headers).await
+}
+
+pub async fn put_signed_url_with_headers(
+    url: &str,
+    body: Vec<u8>,
+    headers: &HashMap<String, String>,
+) -> Result<()> {
     let client =
         build_http_client(UPLOAD_HTTP_TIMEOUT).context("failed to build signed-url HTTP client")?;
 
     let mut request = client.put(url).body(body);
-    if let Some(encoding) = content_encoding {
-        request = request.header("Content-Encoding", encoding);
+    let mut has_azure_blob_type = false;
+    for (key, value) in headers {
+        if key.eq_ignore_ascii_case("x-ms-blob-type") {
+            has_azure_blob_type = true;
+        }
+        request = request.header(key.as_str(), value.as_str());
     }
-    if url.contains(".blob.core.windows.net") {
+    if url.contains(".blob.core.windows.net") && !has_azure_blob_type {
         request = request.header("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
     }
 
