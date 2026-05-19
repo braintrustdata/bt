@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -18,25 +18,26 @@ pub struct UtilArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum UtilCommands {
-    /// Transaction-id conversion utilities
-    Xact(XactArgs),
+    /// Version and pagination-key conversion utilities
+    #[command(name = "version")]
+    Version(VersionArgs),
 }
 
 #[derive(Debug, Clone, Args)]
-struct XactArgs {
+struct VersionArgs {
     #[command(subcommand)]
-    command: XactCommands,
+    command: VersionCommands,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum XactCommands {
+enum VersionCommands {
     /// Convert a transaction id to a pretty version id
     ToPretty(ToPrettyArgs),
     /// Convert a pretty version id to a transaction id
     FromPretty(FromPrettyArgs),
     /// Convert a transaction id to a timestamp
     ToTime(ToTimeArgs),
-    /// Convert a timestamp to a transaction id
+    /// Convert a timestamp to a transaction id or pagination key
     FromTime(FromTimeArgs),
     /// Decode and display transaction id details
     Inspect(InspectArgs),
@@ -58,13 +59,17 @@ struct FromPrettyArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ToTimeArgs {
-    /// Decimal transaction id
-    #[arg(value_name = "XACT_ID")]
-    xact_id: String,
+    /// Decimal transaction id, 16-char pretty version id, or pagination key
+    #[arg(value_name = "XACT_OR_PAGINATION")]
+    value: String,
 
     /// Output format for non-JSON mode
     #[arg(long, value_enum, default_value_t = TimeOutputFormat::Iso)]
     format: TimeOutputFormat,
+
+    /// Display ISO timestamps in UTC instead of the local timezone
+    #[arg(long)]
+    utc: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Eq, PartialEq)]
@@ -87,6 +92,10 @@ struct FromTimeArgs {
     /// Low 16-bit transaction counter value
     #[arg(long, default_value_t = 0)]
     counter: u16,
+
+    /// Output a pagination key instead of a transaction id
+    #[arg(long)]
+    pagination_key: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Eq, PartialEq)]
@@ -97,9 +106,13 @@ enum TimeInputFormat {
 
 #[derive(Debug, Clone, Args)]
 struct InspectArgs {
-    /// Decimal transaction id or 16-char pretty version id
-    #[arg(value_name = "XACT_OR_VERSION")]
+    /// Decimal transaction id, 16-char pretty version id, or pagination key
+    #[arg(value_name = "XACT_OR_PAGINATION")]
     value: String,
+
+    /// Display ISO timestamps in UTC instead of the local timezone
+    #[arg(long)]
+    utc: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -107,6 +120,7 @@ struct InspectArgs {
 enum InputKind {
     XactId,
     PrettyVersionId,
+    PaginationKey,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,24 +128,29 @@ struct XactInfo {
     input_kind: InputKind,
     xact_id: String,
     pretty_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pagination_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pagination_row_num: Option<u16>,
     unix_seconds: u64,
     iso_utc: String,
+    iso_local: String,
     counter: u16,
 }
 
 pub async fn run(base: BaseArgs, args: UtilArgs) -> Result<()> {
     match args.command {
-        UtilCommands::Xact(xact) => run_xact(base, xact),
+        UtilCommands::Version(version) => run_version(base, version),
     }
 }
 
-fn run_xact(base: BaseArgs, args: XactArgs) -> Result<()> {
+fn run_version(base: BaseArgs, args: VersionArgs) -> Result<()> {
     match args.command {
-        XactCommands::ToPretty(args) => run_to_pretty(base.json, args),
-        XactCommands::FromPretty(args) => run_from_pretty(base.json, args),
-        XactCommands::ToTime(args) => run_to_time(base.json, args),
-        XactCommands::FromTime(args) => run_from_time(base.json, args),
-        XactCommands::Inspect(args) => run_inspect(base.json, args),
+        VersionCommands::ToPretty(args) => run_to_pretty(base.json, args),
+        VersionCommands::FromPretty(args) => run_from_pretty(base.json, args),
+        VersionCommands::ToTime(args) => run_to_time(base.json, args),
+        VersionCommands::FromTime(args) => run_from_time(base.json, args),
+        VersionCommands::Inspect(args) => run_inspect(base.json, args),
     }
 }
 
@@ -169,22 +188,26 @@ fn run_from_pretty(json: bool, args: FromPrettyArgs) -> Result<()> {
 }
 
 fn run_to_time(json: bool, args: ToTimeArgs) -> Result<()> {
-    let xact = parse_xact_id(&args.xact_id)?;
-    let unix_seconds = xact_to_unix_seconds(xact);
-    let iso = unix_seconds_to_iso(unix_seconds)?;
+    let info = inspect_xact_like_input(&args.value)?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "xact_id": xact.to_string(),
-                "unix_seconds": unix_seconds,
-                "iso_utc": iso,
-            }))?
-        );
+        let iso = display_iso(&info, args.utc).to_string();
+        let mut payload = serde_json::json!({
+            "input_kind": input_kind_label(info.input_kind),
+            "xact_id": &info.xact_id,
+            "unix_seconds": info.unix_seconds,
+            "iso": iso,
+            "iso_utc": &info.iso_utc,
+            "iso_local": &info.iso_local,
+            "timezone": timezone_label(args.utc),
+        });
+        if let Some(pagination_key) = info.pagination_key.as_deref() {
+            payload["pagination_key"] = serde_json::json!(pagination_key);
+        }
+        println!("{}", serde_json::to_string(&payload)?);
     } else {
         match args.format {
-            TimeOutputFormat::Iso => println!("{iso}"),
-            TimeOutputFormat::Unix => println!("{unix_seconds}"),
+            TimeOutputFormat::Iso => println!("{}", display_iso(&info, args.utc)),
+            TimeOutputFormat::Unix => println!("{}", info.unix_seconds),
         }
     }
     Ok(())
@@ -194,21 +217,32 @@ fn run_from_time(json: bool, args: FromTimeArgs) -> Result<()> {
     let unix_seconds = parse_timestamp_or_now(args.timestamp.as_deref(), args.input)?;
     let xact = build_xact_id(unix_seconds, args.counter);
     let pretty = prettify_xact(xact);
+    let pagination_key = build_pagination_key(unix_seconds, args.counter, 0);
+    let output_kind = if args.pagination_key {
+        "pagination_key"
+    } else {
+        "xact_id"
+    };
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "input_timestamp": args.timestamp,
-                "input_format": match args.input {
-                    TimeInputFormat::Iso => "iso",
-                    TimeInputFormat::Unix => "unix",
-                },
-                "unix_seconds": unix_seconds,
-                "counter": args.counter,
-                "xact_id": xact.to_string(),
-                "pretty_version": pretty,
-            }))?
-        );
+        let mut payload = serde_json::json!({
+            "output_kind": output_kind,
+            "input_timestamp": args.timestamp,
+            "input_format": match args.input {
+                TimeInputFormat::Iso => "iso",
+                TimeInputFormat::Unix => "unix",
+            },
+            "unix_seconds": unix_seconds,
+            "counter": args.counter,
+            "xact_id": xact.to_string(),
+            "pretty_version": pretty,
+        });
+        if args.pagination_key {
+            payload["pagination_key"] = serde_json::json!(format_pagination_key(pagination_key));
+            payload["pagination_row_num"] = serde_json::json!(0);
+        }
+        println!("{}", serde_json::to_string(&payload)?);
+    } else if args.pagination_key {
+        println!("{}", format_pagination_key(pagination_key));
     } else {
         println!("{xact}");
     }
@@ -218,41 +252,72 @@ fn run_from_time(json: bool, args: FromTimeArgs) -> Result<()> {
 fn run_inspect(json: bool, args: InspectArgs) -> Result<()> {
     let info = inspect_xact_like_input(&args.value)?;
     if json {
-        println!("{}", serde_json::to_string(&info)?);
+        let mut payload = serde_json::to_value(&info)?;
+        payload["iso"] = serde_json::json!(display_iso(&info, args.utc));
+        payload["timezone"] = serde_json::json!(timezone_label(args.utc));
+        println!("{}", serde_json::to_string(&payload)?);
     } else {
-        println!(
-            "Input kind: {}\nXact ID: {}\nPretty version: {}\nUnix seconds: {}\nISO UTC: {}\nCounter: {}",
-            match info.input_kind {
-                InputKind::XactId => "xact_id",
-                InputKind::PrettyVersionId => "pretty_version_id",
-            },
-            info.xact_id,
-            info.pretty_version,
-            info.unix_seconds,
-            info.iso_utc,
-            info.counter
-        );
+        let mut lines = vec![
+            format!("Input kind: {}", input_kind_label(info.input_kind)),
+            format!("Xact ID: {}", info.xact_id),
+            format!("Pretty version: {}", info.pretty_version),
+            format!("Unix seconds: {}", info.unix_seconds),
+            format!(
+                "{}: {}",
+                iso_display_label(args.utc),
+                display_iso(&info, args.utc)
+            ),
+            format!("Counter: {}", info.counter),
+        ];
+        if let Some(pagination_key) = info.pagination_key {
+            lines.insert(1, format!("Pagination key: {pagination_key}"));
+        }
+        if let Some(row_num) = info.pagination_row_num {
+            lines.push(format!("Pagination row number: {row_num}"));
+        }
+        println!("{}", lines.join("\n"));
     }
     Ok(())
 }
 
 fn inspect_xact_like_input(value: &str) -> Result<XactInfo> {
-    let (input_kind, xact_id) = if is_pretty_version(value) {
-        (InputKind::PrettyVersionId, load_pretty_xact(value)?)
+    let is_pagination_key = is_pagination_key_like(value);
+    let (input_kind, xact_id, pagination_key, pagination_row_num) = if is_pagination_key {
+        let parsed = parse_pagination_key(value)?;
+        let unix_seconds = pagination_key_to_unix_seconds(parsed);
+        let counter = pagination_key_xact_counter(parsed);
+        let xact_id = build_xact_id(unix_seconds, counter);
+        (
+            InputKind::PaginationKey,
+            xact_id.to_string(),
+            Some(format_pagination_key(parsed)),
+            Some(pagination_key_row_num(parsed)),
+        )
+    } else if is_pretty_version(value) {
+        (
+            InputKind::PrettyVersionId,
+            load_pretty_xact(value)?,
+            None,
+            None,
+        )
     } else {
         let parsed = parse_xact_id(value)?;
-        (InputKind::XactId, parsed.to_string())
+        (InputKind::XactId, parsed.to_string(), None, None)
     };
 
     let xact = parse_xact_id(&xact_id)?;
     let unix_seconds = xact_to_unix_seconds(xact);
-    let iso_utc = unix_seconds_to_iso(unix_seconds)?;
+    let iso_utc = unix_seconds_to_iso_utc(unix_seconds)?;
+    let iso_local = unix_seconds_to_iso_local(unix_seconds)?;
     Ok(XactInfo {
         input_kind,
         xact_id,
         pretty_version: prettify_xact(xact),
+        pagination_key,
+        pagination_row_num,
         unix_seconds,
         iso_utc,
+        iso_local,
         counter: xact_counter(xact),
     })
 }
@@ -268,6 +333,23 @@ fn parse_xact_id(value: &str) -> Result<u64> {
     value
         .parse::<u64>()
         .with_context(|| format!("invalid transaction id '{value}'"))
+}
+
+fn parse_pagination_key(value: &str) -> Result<u64> {
+    let numeric = value
+        .strip_prefix('p')
+        .or_else(|| value.strip_prefix('P'))
+        .ok_or_else(|| {
+            anyhow!("invalid pagination key '{value}' (expected p followed by digits)")
+        })?;
+
+    if numeric.is_empty() || !numeric.chars().all(|c| c.is_ascii_digit()) {
+        bail!("invalid pagination key '{value}' (expected p followed by digits)");
+    }
+
+    numeric
+        .parse::<u64>()
+        .with_context(|| format!("invalid pagination key '{value}'"))
 }
 
 fn parse_timestamp(value: &str, input: TimeInputFormat) -> Result<u64> {
@@ -335,15 +417,81 @@ fn build_xact_id(unix_seconds: u64, counter: u16) -> u64 {
     TOP_BITS | ((unix_seconds & 0xffff_ffff_ffff) << 16) | u64::from(counter)
 }
 
-fn unix_seconds_to_iso(unix_seconds: u64) -> Result<String> {
+fn build_pagination_key(unix_seconds: u64, counter: u16, row_num: u16) -> u64 {
+    ((unix_seconds & 0xffff_ffff) << 32) | (u64::from(counter) << 16) | u64::from(row_num)
+}
+
+fn format_pagination_key(pagination_key: u64) -> String {
+    format!("p{pagination_key:020}")
+}
+
+fn pagination_key_to_unix_seconds(pagination_key: u64) -> u64 {
+    pagination_key >> 32
+}
+
+fn pagination_key_xact_counter(pagination_key: u64) -> u16 {
+    ((pagination_key >> 16) & 0xffff) as u16
+}
+
+fn pagination_key_row_num(pagination_key: u64) -> u16 {
+    (pagination_key & 0xffff) as u16
+}
+
+fn unix_seconds_to_utc_datetime(unix_seconds: u64) -> Result<DateTime<Utc>> {
     let dt = DateTime::<Utc>::from_timestamp(unix_seconds as i64, 0).ok_or_else(|| {
         anyhow!("cannot represent unix timestamp as UTC datetime: {unix_seconds}")
     })?;
+    Ok(dt)
+}
+
+fn unix_seconds_to_iso_utc(unix_seconds: u64) -> Result<String> {
+    let dt = unix_seconds_to_utc_datetime(unix_seconds)?;
+    Ok(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn unix_seconds_to_iso_local(unix_seconds: u64) -> Result<String> {
+    let dt = unix_seconds_to_utc_datetime(unix_seconds)?.with_timezone(&Local);
     Ok(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 fn is_pretty_version(value: &str) -> bool {
     value.len() == 16 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_pagination_key_like(value: &str) -> bool {
+    value.starts_with('p') || value.starts_with('P')
+}
+
+fn input_kind_label(input_kind: InputKind) -> &'static str {
+    match input_kind {
+        InputKind::XactId => "xact_id",
+        InputKind::PrettyVersionId => "pretty_version_id",
+        InputKind::PaginationKey => "pagination_key",
+    }
+}
+
+fn display_iso(info: &XactInfo, utc: bool) -> &str {
+    if utc {
+        &info.iso_utc
+    } else {
+        &info.iso_local
+    }
+}
+
+fn timezone_label(utc: bool) -> &'static str {
+    if utc {
+        "utc"
+    } else {
+        "local"
+    }
+}
+
+fn iso_display_label(utc: bool) -> &'static str {
+    if utc {
+        "ISO UTC"
+    } else {
+        "ISO local"
+    }
 }
 
 fn current_unix_seconds() -> u64 {
@@ -380,6 +528,20 @@ mod tests {
     }
 
     #[test]
+    fn from_time_to_pagination_key_uses_xact_counter() {
+        let unix_seconds = 1_778_727_718u64;
+        let counter = 31_627u16;
+        let pagination_key = build_pagination_key(unix_seconds, counter, 0);
+        assert_eq!(
+            format_pagination_key(pagination_key),
+            "p07639577379371417600"
+        );
+        assert_eq!(pagination_key_to_unix_seconds(pagination_key), unix_seconds);
+        assert_eq!(pagination_key_xact_counter(pagination_key), counter);
+        assert_eq!(pagination_key_row_num(pagination_key), 0);
+    }
+
+    #[test]
     fn load_pretty_passthrough_for_non_pretty_input() {
         assert_eq!(load_pretty_xact("123").unwrap(), "123");
         assert_eq!(
@@ -393,6 +555,32 @@ mod tests {
         let info = inspect_xact_like_input("81cd05ee665fdfb3").unwrap();
         assert!(matches!(info.input_kind, InputKind::PrettyVersionId));
         assert_eq!(info.xact_id, "1000192656880881099");
+    }
+
+    #[test]
+    fn inspect_decodes_pagination_key_time() {
+        let info = inspect_xact_like_input("p07639577379371417602").unwrap();
+        assert!(matches!(info.input_kind, InputKind::PaginationKey));
+        assert_eq!(
+            info.pagination_key.as_deref(),
+            Some("p07639577379371417602")
+        );
+        assert_eq!(info.xact_id, "1000197162952719243");
+        assert_eq!(info.unix_seconds, 1_778_727_718);
+        assert_eq!(info.iso_utc, "2026-05-14T03:01:58Z");
+        assert_eq!(info.counter, 31_627);
+        assert_eq!(info.pagination_row_num, Some(2));
+    }
+
+    #[test]
+    fn pagination_key_parser_accepts_short_form() {
+        let info = inspect_xact_like_input("p0").unwrap();
+        assert!(matches!(info.input_kind, InputKind::PaginationKey));
+        assert_eq!(
+            info.pagination_key.as_deref(),
+            Some("p00000000000000000000")
+        );
+        assert_eq!(info.unix_seconds, 0);
     }
 
     #[test]

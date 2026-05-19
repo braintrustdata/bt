@@ -846,6 +846,17 @@ def wrap_data_with_adaptive_total(
     if state is None:
         state = {"rows_seen": 0, "last_emitted_total": 0}
 
+    def report_known_total_if_available(value: Any) -> bool:
+        data_total = infer_data_total(value)
+        if data_total is None:
+            return False
+        total = data_total * trial_count
+        if total > state["last_emitted_total"] or not state.get("known_total_emitted"):
+            state["last_emitted_total"] = max(state["last_emitted_total"], total)
+            state["known_total_emitted"] = 1
+            progress_cb("set_total", total)
+        return True
+
     def report_rows_seen() -> None:
         rows_seen = state["rows_seen"]
         if rows_seen <= 0:
@@ -867,6 +878,9 @@ def wrap_data_with_adaptive_total(
         if state["last_emitted_total"] != 0:
             return
         progress_cb("set_total", 0)
+
+    if report_known_total_if_available(data):
+        return data
 
     if inspect.isclass(data):
         return data

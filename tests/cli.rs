@@ -122,6 +122,36 @@ fn setup_instrument_accepts_deprecated_agents_alias() {
 }
 
 #[test]
+fn util_version_to_time_accepts_pagination_key_with_utc() {
+    bt_command()
+        .args([
+            "util",
+            "version",
+            "to-time",
+            "p07639577379371417602",
+            "--utc",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2026-05-14T03:01:58Z"));
+}
+
+#[test]
+fn util_version_from_time_can_output_pagination_key() {
+    bt_command()
+        .args([
+            "util",
+            "version",
+            "from-time",
+            "2026-05-14T08:00:09-07:00",
+            "--pagination-key",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("p07639762451734462464"));
+}
+
+#[test]
 fn setup_uses_codex_detected_on_path_without_explicit_agent() {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");

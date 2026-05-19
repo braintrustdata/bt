@@ -1,6 +1,6 @@
 [package]
 name = "bt"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.86.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
@@ -33,6 +33,7 @@ strip-ansi-escapes = "0.2.0"
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "process", "net", "signal"] }
 unicode-width = "0.1.13"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+fuzzy-matcher = "0.3"
 dotenvy = "0.15"
 open = "5"
 regex = "1"

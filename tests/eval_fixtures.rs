@@ -618,6 +618,75 @@ fn eval_matrix_param_terminate_on_failure_stops_early() {
     );
 }
 
+#[test]
+fn eval_python_callable_list_data_preserves_parallel_scorers() {
+    let _guard = test_lock();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("py").join("callable_parallelization");
+    let python = match ensure_python_env(&fixtures_root.join("py")) {
+        Some(python) => python,
+        None => {
+            if required_runtimes().contains("python") {
+                panic!("python runtime unavailable for callable parallelization test");
+            }
+            eprintln!(
+                "Skipping eval_python_callable_list_data_preserves_parallel_scorers (python runtime unavailable)."
+            );
+            return;
+        }
+    };
+
+    let bt_path = bt_binary_path(&root);
+    let out_file = std::env::temp_dir().join(format!(
+        "bt-callable-parallel-scores-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ));
+
+    let output = Command::new(&bt_path)
+        .arg("eval")
+        .arg("--num-workers")
+        .arg("8")
+        .arg("--runner")
+        .arg(&python)
+        .arg("eval_callable_parallelization.py")
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_PARALLEL_SCORE_OUT", &out_file)
+        .env(
+            "BRAINTRUST_API_KEY",
+            std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
+        )
+        .output()
+        .expect("run bt eval python callable parallelization");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "bt eval callable parallelization should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let contents = fs::read_to_string(&out_file).unwrap_or_default();
+    let _ = fs::remove_file(&out_file);
+    let scores: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        scores.len(),
+        8,
+        "expected one score per row across both evals.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        scores.iter().all(|score| *score == "1.0"),
+        "callable list data should preserve scorer parallelism, got scores {scores:?}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 fn read_fixture_config(path: &Path) -> FixtureConfig {
     let raw = fs::read_to_string(path).expect("read fixture.json");
     serde_json::from_str(&raw).expect("parse fixture.json")
