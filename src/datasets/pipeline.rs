@@ -2167,6 +2167,175 @@ mod tests {
     }
 
     #[test]
+    fn typescript_runner_defers_json_attachments_during_transform() {
+        let Ok(strip_check) = Command::new("node")
+            .arg("--experimental-strip-types")
+            .arg("--eval")
+            .arg("")
+            .output()
+        else {
+            return;
+        };
+        if !strip_check.status.success() {
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let node_modules = root.path().join("node_modules").join("braintrust");
+        fs::create_dir_all(&node_modules).expect("create fake braintrust package");
+        fs::write(
+            node_modules.join("package.json"),
+            r#"{"name":"braintrust","type":"module","exports":{".":{"import":"./index.mjs","require":"./index.cjs"}}}"#,
+        )
+        .expect("write fake package.json");
+        fs::write(
+            node_modules.join("index.cjs"),
+            r#"
+const pipelines = [];
+
+class OriginalJSONAttachment {
+  constructor() {
+    throw new Error("original JSONAttachment should be shimmed");
+  }
+}
+
+module.exports = {
+  DatasetPipeline(definition) {
+    pipelines.push(definition);
+    return definition;
+  },
+  getRegisteredDatasetPipelines() {
+    return pipelines;
+  },
+  isDatasetPipelineDefinition(value) {
+    return !!value && typeof value.transform === "function";
+  },
+  LocalTrace: class {
+    constructor(options) {
+      this.options = options;
+    }
+    getConfiguration() {
+      return { root_span_id: this.options.rootSpanId };
+    }
+  },
+  _internalGetGlobalState() {
+    return {
+      loggedIn: true,
+      orgName: "source-org",
+      login: async function () {
+        return this;
+      },
+    };
+  },
+  loginToState: async function ({ orgName }) {
+    return {
+      loggedIn: true,
+      orgName,
+      login: async function () {
+        return this;
+      },
+    };
+  },
+  JSONAttachment: OriginalJSONAttachment,
+};
+"#,
+        )
+        .expect("write fake braintrust cjs module");
+        fs::write(
+            node_modules.join("index.mjs"),
+            r#"
+export function DatasetPipeline(definition) {
+  return definition;
+}
+
+export class JSONAttachment {
+  constructor(data, options) {
+    const hook = globalThis.__BT_DATASET_PIPELINE_DEFER_JSON_ATTACHMENT__;
+    if (hook) {
+      return hook(data, options);
+    }
+    throw new Error("dataset pipeline deferred JSON hook was not installed");
+  }
+}
+"#,
+        )
+        .expect("write fake braintrust esm module");
+
+        let runner_path = root.path().join("dataset-pipeline-runner.ts");
+        fs::write(&runner_path, RUNNER_SOURCE).expect("write runner source");
+        let pipeline_path = root.path().join("pipeline.ts");
+        fs::write(
+            &pipeline_path,
+            r#"
+import { DatasetPipeline, JSONAttachment } from "braintrust";
+
+export default DatasetPipeline({
+  name: "ts-json-attachment-smoke",
+  source: { projectName: "source-project" },
+  target: { projectName: "target-project", datasetName: "traces" },
+  transform: () => ({
+    input: {
+      full_trace: new JSONAttachment(
+        { ok: true },
+        { filename: "trace.json", pretty: true },
+      ),
+    },
+  }),
+});
+"#,
+        )
+        .expect("write pipeline");
+
+        let attachment_dir = root.path().join("attachments");
+        let request = json!({
+            "refs": [{ "root_span_id": "root-span" }],
+            "sourceProjectId": "source-project-id",
+            "attachmentDir": attachment_dir,
+        });
+        let mut child = Command::new("node")
+            .arg("--experimental-strip-types")
+            .arg(&runner_path)
+            .arg(&pipeline_path)
+            .current_dir(root.path())
+            .env("BT_DATASET_PIPELINE_STAGE", "transform")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn node runner");
+        child
+            .stdin
+            .as_mut()
+            .expect("runner stdin")
+            .write_all(request.to_string().as_bytes())
+            .expect("write runner request");
+        let output = child.wait_with_output().expect("runner output");
+        assert!(
+            output.status.success(),
+            "runner failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let response: Value = serde_json::from_slice(&output.stdout).expect("runner JSON response");
+        assert_eq!(response["rowCount"], json!(1));
+        let marker = &response["rows"][0]["input"]["full_trace"];
+        assert_eq!(marker["type"], "braintrust_deferred_attachment");
+        assert_eq!(marker["kind"], "json");
+        assert_eq!(marker["filename"], "trace.json");
+        assert_eq!(marker["content_type"], "application/json");
+        assert!(marker.get("data").is_none());
+
+        let sidecar_path = marker["path"].as_str().expect("sidecar path");
+        let sidecar = fs::read_to_string(sidecar_path).expect("read sidecar JSON");
+        assert_eq!(
+            serde_json::from_str::<Value>(&sidecar).expect("parse sidecar"),
+            json!({ "ok": true })
+        );
+        assert!(sidecar.contains("\n  \"ok\": true\n"));
+    }
+
+    #[test]
     fn pipeline_source_artifact_records_resolved_project() {
         let source = PipelineSourceInspect {
             project_id: None,

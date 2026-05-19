@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import { pathToFileURL } from "node:url";
@@ -54,6 +55,10 @@ type BraintrustModule = {
   }) => unknown;
   _internalGetGlobalState?: () => BraintrustState;
   loginToState?: (options: { orgName: string }) => Promise<BraintrustState>;
+  JSONAttachment?: new (
+    data: unknown,
+    options?: { filename?: string; pretty?: boolean },
+  ) => unknown;
   default?: BraintrustModule;
 };
 
@@ -85,6 +90,31 @@ type SseWriter = {
   close: () => void;
 };
 
+type DeferredAttachmentReference = {
+  type: "braintrust_deferred_attachment";
+  kind: "json";
+  filename: string;
+  content_type: "application/json";
+  path?: string;
+  data?: unknown;
+  pretty?: boolean;
+};
+
+type DeferredJsonAttachmentHook = (
+  data: unknown,
+  options?: { filename?: string; pretty?: boolean },
+) => DeferredJSONAttachment;
+
+declare global {
+  // Used by ESM imports of hook-aware Braintrust SDKs where named exports cannot
+  // be monkey-patched by the runner.
+  var __BT_DATASET_PIPELINE_DEFER_JSON_ATTACHMENT__:
+    | DeferredJsonAttachmentHook
+    | undefined;
+}
+
+let deferredAttachmentDir: string | null = null;
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -97,6 +127,133 @@ function normalizeBraintrustModule(value: unknown): BraintrustModule {
     return value as BraintrustModule;
   }
   throw new Error("Unable to load braintrust module.");
+}
+
+function setDeferredAttachmentDir(value: unknown): void {
+  if (value === undefined || value === null) {
+    deferredAttachmentDir = null;
+    return;
+  }
+  if (typeof value !== "string") {
+    throw new Error("Request field attachmentDir must be a string.");
+  }
+  deferredAttachmentDir = path.resolve(value);
+}
+
+function deferredJsonAttachmentReference(
+  data: unknown,
+  options?: { filename?: string; pretty?: boolean },
+): DeferredAttachmentReference {
+  const filename = options?.filename ?? "data.json";
+  const pretty = options?.pretty === true;
+  const reference: DeferredAttachmentReference = {
+    type: "braintrust_deferred_attachment",
+    kind: "json",
+    filename,
+    content_type: "application/json",
+  };
+
+  if (deferredAttachmentDir) {
+    fs.mkdirSync(deferredAttachmentDir, { recursive: true });
+    const attachmentPath = path.join(
+      deferredAttachmentDir,
+      `${randomUUID()}.json`,
+    );
+    const serialized = JSON.stringify(data, null, pretty ? 2 : undefined);
+    fs.writeFileSync(
+      attachmentPath,
+      serialized === undefined ? "null" : serialized,
+      "utf8",
+    );
+    reference.path = attachmentPath;
+  } else {
+    reference.data = data;
+    if (pretty) {
+      reference.pretty = true;
+    }
+  }
+
+  return reference;
+}
+
+class DeferredJSONAttachment {
+  readonly reference: DeferredAttachmentReference;
+
+  constructor(
+    data: unknown,
+    options?: { filename?: string; pretty?: boolean },
+  ) {
+    this.reference = deferredJsonAttachmentReference(data, options);
+  }
+
+  async upload(): Promise<Record<string, unknown>> {
+    return { upload_status: "done", deferred: true };
+  }
+
+  async data(): Promise<Blob> {
+    const serialized =
+      this.reference.path !== undefined
+        ? fs.readFileSync(this.reference.path, "utf8")
+        : (JSON.stringify(
+            this.reference.data,
+            null,
+            this.reference.pretty === true ? 2 : undefined,
+          ) ?? "null");
+    return new Blob([serialized], { type: this.reference.content_type });
+  }
+
+  debugInfo(): Record<string, unknown> {
+    return { reference: this.reference };
+  }
+}
+
+function setModuleExport(target: unknown, name: string, value: unknown): void {
+  if (!isObject(target)) {
+    return;
+  }
+  try {
+    Object.defineProperty(target, name, {
+      value,
+      configurable: true,
+      enumerable: true,
+      writable: true,
+    });
+  } catch {
+    try {
+      target[name] = value;
+    } catch {}
+  }
+}
+
+function installDeferredAttachmentShims(braintrust: BraintrustModule): void {
+  globalThis.__BT_DATASET_PIPELINE_DEFER_JSON_ATTACHMENT__ = (data, options) =>
+    new DeferredJSONAttachment(data, options);
+  setModuleExport(braintrust, "JSONAttachment", DeferredJSONAttachment);
+  setModuleExport(braintrust.default, "JSONAttachment", DeferredJSONAttachment);
+}
+
+function normalizeDeferredAttachments(value: unknown): unknown {
+  if (value instanceof DeferredJSONAttachment) {
+    return value.reference;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeDeferredAttachments(item));
+  }
+  if (!isObject(value)) {
+    return value;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      normalizeDeferredAttachments(item),
+    ]),
+  );
 }
 
 function resolveBraintrustPath(pipelineFile: string): string {
@@ -509,18 +666,19 @@ function withPipelineDefaults(
   candidate: HydratedCandidate,
   rowIndex: number | undefined,
 ): unknown {
-  if (!isObject(row)) {
+  const normalizedRow = normalizeDeferredAttachments(row);
+  if (!isObject(normalizedRow)) {
     throw new Error("Dataset pipeline transform must return an object row.");
   }
   const fallbackId = candidateFallbackId(candidate);
   return {
-    ...row,
-    ...(row.id === undefined && fallbackId
+    ...normalizedRow,
+    ...(normalizedRow.id === undefined && fallbackId
       ? {
           id: rowIndex === undefined ? fallbackId : `${fallbackId}:${rowIndex}`,
         }
       : {}),
-    ...(row.origin === undefined && candidate.origin
+    ...(normalizedRow.origin === undefined && candidate.origin
       ? { origin: candidate.origin }
       : {}),
   };
@@ -580,15 +738,16 @@ async function main() {
     throw new Error("Pipeline file is required.");
   }
 
-  const [braintrust, loadedModule] = await Promise.all([
-    loadBraintrust(pipelineFile),
-    loadPipelineFile(pipelineFile),
-  ]);
+  const stage = parseStage();
+  const braintrust = await loadBraintrust(pipelineFile);
+  if (stage === "transform") {
+    installDeferredAttachmentShims(braintrust);
+  }
+  const loadedModule = await loadPipelineFile(pipelineFile);
   const pipeline = selectPipeline(
     collectPipelines(braintrust, loadedModule),
     process.env.BT_DATASET_PIPELINE_NAME || undefined,
   );
-  const stage = parseStage();
   const sse = createSseWriter();
 
   if (stage === "inspect") {
@@ -602,6 +761,7 @@ async function main() {
     );
   } else if (stage === "transform") {
     const request = await readRequest();
+    setDeferredAttachmentDir(isObject(request) ? request.attachmentDir : null);
     const refs = requireArrayField(request, "refs");
     const sourceProjectId = requireStringField(request, "sourceProjectId");
     const sourceOverride =
