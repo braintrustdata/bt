@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
@@ -53,6 +53,18 @@ pub struct TopicsDeleteReport {
 pub struct TopicMapConfigUpdate {
     pub automation: TopicAutomationConfig,
     pub topic_map_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TopicMapReportUrlRequest<'a> {
+    function_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TopicMapReportUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -818,6 +830,18 @@ pub fn topics_url(app_url: &str, org_name: &str, project_name: &str) -> String {
         encode(org_name),
         encode(project_name)
     )
+}
+
+pub async fn fetch_topic_map_report_url(
+    client: &ApiClient,
+    function_id: &str,
+    version: Option<&str>,
+) -> Result<TopicMapReportUrl> {
+    let request = TopicMapReportUrlRequest {
+        function_id,
+        version,
+    };
+    client.post("/topic-map-report-url", &request).await
 }
 
 fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> Result<String> {
@@ -2226,6 +2250,29 @@ mod tests {
         assert_eq!(
             topics_url("https://www.example.com", "test org", "my project"),
             "https://www.example.com/app/test%20org/p/my%20project/topics"
+        );
+    }
+
+    #[test]
+    fn topic_map_report_url_request_matches_endpoint_shape() {
+        let without_version = serde_json::to_value(TopicMapReportUrlRequest {
+            function_id: "fn_123",
+            version: None,
+        })
+        .expect("serialize report url request");
+        assert_eq!(without_version, json!({ "function_id": "fn_123" }));
+
+        let with_version = serde_json::to_value(TopicMapReportUrlRequest {
+            function_id: "fn_123",
+            version: Some("0000000000000001"),
+        })
+        .expect("serialize report url request");
+        assert_eq!(
+            with_version,
+            json!({
+                "function_id": "fn_123",
+                "version": "0000000000000001",
+            })
         );
     }
 

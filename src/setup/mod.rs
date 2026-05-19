@@ -4936,9 +4936,9 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn env_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[cfg(unix)]
@@ -6112,9 +6112,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sync_setup_api_key_sets_base_and_process_env() {
-        let _guard = env_test_lock().lock().expect("lock env test");
+    #[tokio::test]
+    async fn sync_setup_api_key_sets_base_and_process_env() {
+        let _guard = env_test_lock().lock().await;
         let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
         env::remove_var("BRAINTRUST_API_KEY");
 
@@ -6133,7 +6133,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_agent_invocation_sets_extra_env_for_program_launches() {
-        let _guard = env_test_lock().lock().expect("lock env test");
+        let _guard = env_test_lock().lock().await;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -6186,7 +6186,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_agent_invocation_inherits_process_api_key_env() {
-        let _guard = env_test_lock().lock().expect("lock env test");
+        let _guard = env_test_lock().lock().await;
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")

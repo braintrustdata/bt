@@ -151,6 +151,14 @@ impl SlugArgs {
             .as_deref()
             .or(self.slug_flag.as_deref())
     }
+
+    fn slug_positional(&self) -> Option<&str> {
+        self.slug_positional.as_deref()
+    }
+
+    fn slug_flag(&self) -> Option<&str> {
+        self.slug_flag.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -158,6 +166,8 @@ impl SlugArgs {
 Examples:
   bt tools list
   bt tools view my-tool
+  bt tools view fn_123
+  bt tools view --id fn_123
   bt scorers list
   bt scorers delete my-scorer
 ")]
@@ -183,6 +193,8 @@ enum FunctionCommands {
 Examples:
   bt functions list
   bt functions view my-function
+  bt functions view fn_123
+  bt functions view --id fn_123
   bt functions invoke my-function --input '{\"key\":\"value\"}'
   bt functions push --file ./functions
   bt functions pull --output-dir ./braintrust
@@ -418,15 +430,41 @@ impl PullArgs {
 pub struct ViewArgs {
     #[command(flatten)]
     slug: SlugArgs,
+    /// Function id
+    #[arg(long = "id", env = "BT_FUNCTIONS_VIEW_ID")]
+    id: Option<String>,
     /// Open in browser
     #[arg(long)]
     web: bool,
 }
 
 impl ViewArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug.slug()
+    fn selector(&self) -> Result<ViewSelector<'_>> {
+        match (
+            self.id.as_deref(),
+            self.slug.slug_positional(),
+            self.slug.slug_flag(),
+        ) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                bail!("use either --id or a slug, not both")
+            }
+            (Some(id), None, None) => Ok(ViewSelector::Id(id)),
+            (None, Some(positional), None) if is_likely_function_id(positional) => {
+                Ok(ViewSelector::Id(positional))
+            }
+            (None, positional, flag) => Ok(ViewSelector::Slug(positional.or(flag))),
+        }
     }
+}
+
+fn is_likely_function_id(value: &str) -> bool {
+    value.starts_with("fn_") || value.starts_with("func_")
+}
+
+#[derive(Debug)]
+enum ViewSelector<'a> {
+    Id(&'a str),
+    Slug(Option<&'a str>),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -567,15 +605,29 @@ pub(crate) async fn select_function_interactive(
 }
 
 pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
-    let ctx = resolve_context(&base).await?;
     let ft = Some(kind);
     match args.command {
-        None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
-        Some(FunctionCommands::View(v)) => {
-            view::run(&ctx, v.slug(), base.json, v.web, base.verbose, ft).await
+        Some(FunctionCommands::View(v)) => match v.selector()? {
+            ViewSelector::Id(id) => {
+                let auth_ctx = resolve_auth_context(&base).await?;
+                view::run_by_id(&auth_ctx, id, base.json, v.web, base.verbose, ft).await
+            }
+            ViewSelector::Slug(slug) => {
+                let ctx = resolve_context(&base).await?;
+                view::run(&ctx, slug, base.json, v.web, base.verbose, ft).await
+            }
+        },
+        command => {
+            let ctx = resolve_context(&base).await?;
+            match command {
+                None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
+                Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
+                Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
+                Some(FunctionCommands::View(_)) => {
+                    unreachable!("handled before context resolution")
+                }
+            }
         }
-        Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
-        Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
     }
 }
 
@@ -584,6 +636,19 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     match args.command {
         Some(FunctionsCommands::Push(push_args)) => push::run(base, push_args).await,
         Some(FunctionsCommands::Pull(pull_args)) => pull::run(base, pull_args).await,
+        Some(FunctionsCommands::View(v)) => {
+            let ft = v.function_type.or(function_type);
+            match v.inner.selector()? {
+                ViewSelector::Id(id) => {
+                    let auth_ctx = resolve_auth_context(&base).await?;
+                    view::run_by_id(&auth_ctx, id, base.json, v.inner.web, base.verbose, ft).await
+                }
+                ViewSelector::Slug(slug) => {
+                    let ctx = resolve_context(&base).await?;
+                    view::run(&ctx, slug, base.json, v.inner.web, base.verbose, ft).await
+                }
+            }
+        }
         command => {
             let ctx = resolve_context(&base).await?;
             match command {
@@ -591,24 +656,15 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
                 Some(FunctionsCommands::List(la)) => {
                     list::run(&ctx, base.json, la.function_type.or(function_type)).await
                 }
-                Some(FunctionsCommands::View(v)) => {
-                    view::run(
-                        &ctx,
-                        v.inner.slug(),
-                        base.json,
-                        v.inner.web,
-                        base.verbose,
-                        v.function_type.or(function_type),
-                    )
-                    .await
-                }
                 Some(FunctionsCommands::Delete(d)) => {
                     delete::run(&ctx, d.slug(), d.force, d.function_type.or(function_type)).await
                 }
                 Some(FunctionsCommands::Invoke(i)) => {
                     invoke::run(&ctx, &i.inner, base.json, i.function_type.or(function_type)).await
                 }
-                Some(FunctionsCommands::Push(_)) | Some(FunctionsCommands::Pull(_)) => {
+                Some(FunctionsCommands::Push(_))
+                | Some(FunctionsCommands::Pull(_))
+                | Some(FunctionsCommands::View(_)) => {
                     unreachable!("handled before context resolution")
                 }
             }
@@ -936,6 +992,58 @@ mod tests {
             panic!("expected pull command");
         };
         assert_eq!(pull.slug_flag, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn view_accepts_id_selector() {
+        let _guard = test_lock();
+        let parsed = parse(&["functions", "view", "--id", "f1"]).expect("parse view");
+        let FunctionsCommands::View(view) = parsed.command.expect("subcommand") else {
+            panic!("expected view command");
+        };
+        match view.inner.selector().expect("view selector") {
+            ViewSelector::Id(id) => assert_eq!(id, "f1"),
+            ViewSelector::Slug(_) => panic!("expected id selector"),
+        }
+    }
+
+    #[test]
+    fn view_auto_detects_positional_function_id() {
+        let _guard = test_lock();
+        for value in ["fn_123", "func_123"] {
+            let parsed = parse(&["functions", "view", value]).expect("parse view");
+            let FunctionsCommands::View(view) = parsed.command.expect("subcommand") else {
+                panic!("expected view command");
+            };
+            match view.inner.selector().expect("view selector") {
+                ViewSelector::Id(id) => assert_eq!(id, value),
+                ViewSelector::Slug(_) => panic!("expected id selector for {value}"),
+            }
+        }
+    }
+
+    #[test]
+    fn view_slug_flag_forces_slug_even_when_value_looks_like_id() {
+        let _guard = test_lock();
+        let parsed = parse(&["functions", "view", "--slug", "fn_123"]).expect("parse view");
+        let FunctionsCommands::View(view) = parsed.command.expect("subcommand") else {
+            panic!("expected view command");
+        };
+        match view.inner.selector().expect("view selector") {
+            ViewSelector::Slug(Some(slug)) => assert_eq!(slug, "fn_123"),
+            other => panic!("expected slug selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_rejects_id_and_slug_together() {
+        let _guard = test_lock();
+        let parsed = parse(&["functions", "view", "--id", "f1", "slug"]).expect("parse view");
+        let FunctionsCommands::View(view) = parsed.command.expect("subcommand") else {
+            panic!("expected view command");
+        };
+        let err = view.inner.selector().expect_err("id and slug conflict");
+        assert!(err.to_string().contains("either --id or a slug"));
     }
 
     #[test]

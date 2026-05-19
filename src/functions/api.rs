@@ -94,6 +94,21 @@ pub async fn get_function_by_slug(
     Ok(response.data.into_iter().next())
 }
 
+pub async fn get_function_by_id(client: &ApiClient, id: &str) -> Result<Option<Function>> {
+    let query = FunctionListQuery {
+        id: Some(id.to_string()),
+        ..Default::default()
+    };
+    let page = list_functions_page(client, &query).await?;
+    let Some(raw) = page.objects.into_iter().next() else {
+        return Ok(None);
+    };
+
+    serde_json::from_value(raw)
+        .map(Some)
+        .context("unexpected function response shape")
+}
+
 pub async fn invoke_function(
     client: &ApiClient,
     body: &serde_json::Value,

@@ -104,12 +104,16 @@ struct MockDataset {
     created: String,
 }
 
+type MockDatasetRow = Map<String, Value>;
+type MockDatasetRowsById = BTreeMap<String, MockDatasetRow>;
+type MockDatasetRowsByDataset = BTreeMap<String, MockDatasetRowsById>;
+
 #[derive(Debug)]
 struct MockServerState {
     requests: Mutex<Vec<String>>,
     projects: Mutex<Vec<MockProject>>,
     datasets: Mutex<Vec<MockDataset>>,
-    dataset_rows: Mutex<BTreeMap<String, BTreeMap<String, Map<String, Value>>>>,
+    dataset_rows: Mutex<MockDatasetRowsByDataset>,
     btql_dataset_id: Mutex<Option<String>>,
 }
 
@@ -320,15 +324,11 @@ fn mock_btql_select_fields(body: &[u8]) -> Option<Vec<String>> {
         if item.get("op").and_then(Value::as_str) == Some("star") {
             return None;
         }
-        let Some(name) = item.get("name").and_then(Value::as_array) else {
-            return None;
-        };
+        let name = item.get("name").and_then(Value::as_array)?;
         if name.len() != 1 {
             return None;
         }
-        let Some(field) = name.first().and_then(Value::as_str) else {
-            return None;
-        };
+        let field = name.first().and_then(Value::as_str)?;
         fields.push(field.to_string());
     }
     Some(fields)
