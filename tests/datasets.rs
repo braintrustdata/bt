@@ -320,10 +320,19 @@ fn mock_btql_select_fields(body: &[u8]) -> Option<Vec<String>> {
         if item.get("op").and_then(Value::as_str) == Some("star") {
             return None;
         }
-        let Some(name) = item.get("name").and_then(Value::as_array) else {
+        let Some(expr) = item.get("expr").and_then(Value::as_object) else {
+            return None;
+        };
+        if expr.get("op").and_then(Value::as_str) != Some("ident") {
+            return None;
+        }
+        let Some(name) = expr.get("name").and_then(Value::as_array) else {
             return None;
         };
         if name.len() != 1 {
+            return None;
+        }
+        if item.get("alias").and_then(Value::as_str).is_none() {
             return None;
         }
         let Some(field) = name.first().and_then(Value::as_str) else {
