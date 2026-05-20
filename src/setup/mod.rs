@@ -1399,6 +1399,7 @@ async fn poll_setup_wizard_completion(
 
 async fn run_setup_browser_auth(
     base: &mut BaseArgs,
+    profile_name: Option<&str>,
     _project_name: Option<&str>,
     _project_was_explicit: bool,
     _requested_org: Option<&str>,
@@ -1455,9 +1456,21 @@ async fn run_setup_browser_auth(
         org_id: completed.org_id.clone(),
         description: None,
     };
+    let stored_profiles = auth::list_profiles()?;
+    let profile_name = setup_browser_profile_name(profile_name, &org.name, &stored_profiles);
+
+    auth::commit_api_key_profile(
+        &profile_name,
+        &completed.api_key,
+        login.api_url.clone(),
+        Some(login.app_url.clone()),
+        Some(org.name.clone()),
+    )
+    .context("failed to save Braintrust auth profile after browser setup")?;
 
     base.api_key = Some(completed.api_key);
     base.api_key_source = None;
+    base.profile = Some(profile_name);
     base.org_name = Some(org.name);
     base.project = Some(selected_project.name.clone());
 
@@ -1466,6 +1479,33 @@ async fn run_setup_browser_auth(
         is_oauth: false,
         selected_project: Some(selected_project),
     })
+}
+
+fn setup_browser_profile_name(
+    selected_profile_name: Option<&str>,
+    org_name: &str,
+    profiles: &[auth::ProfileInfo],
+) -> String {
+    if let Some(profile_name) = selected_profile_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return profile_name.to_string();
+    }
+
+    let base_name = if org_name.trim().is_empty() {
+        "default"
+    } else {
+        org_name.trim()
+    };
+    if !profiles.iter().any(|profile| profile.name == base_name) {
+        return base_name.to_string();
+    }
+
+    (2u32..)
+        .map(|idx| format!("{base_name}-{idx}"))
+        .find(|candidate| !profiles.iter().any(|profile| profile.name == *candidate))
+        .expect("profile name sequence is infinite")
 }
 
 fn resolve_profile_name_for_setup(
@@ -1734,6 +1774,7 @@ async fn ensure_profile_or_setup_browser_auth(
                 }
                 return run_setup_browser_auth(
                     base,
+                    Some(&profile_name),
                     project_name,
                     project_was_explicit,
                     requested_org,
@@ -1756,7 +1797,14 @@ async fn ensure_profile_or_setup_browser_auth(
     if base.verbose {
         eprintln!("Starting browser setup.\n");
     }
-    run_setup_browser_auth(base, project_name, project_was_explicit, requested_org).await
+    run_setup_browser_auth(
+        base,
+        None,
+        project_name,
+        project_was_explicit,
+        requested_org,
+    )
+    .await
 }
 
 async fn ensure_profile_or_setup_browser_auth_context(
@@ -5769,6 +5817,39 @@ mod tests {
         let err =
             resolve_profile_name_for_setup(&base, &profiles, false).expect_err("missing profile");
         assert!(err.to_string().contains("profile 'missing' not found"));
+    }
+
+    #[test]
+    fn setup_browser_profile_name_reuses_selected_profile_or_suffixed_org_name() {
+        let profiles = vec![
+            auth::ProfileInfo {
+                name: "Acme".to_string(),
+                org_name: Some("Acme".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+            auth::ProfileInfo {
+                name: "Acme-2".to_string(),
+                org_name: Some("Acme".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+        ];
+
+        assert_eq!(
+            setup_browser_profile_name(Some("work"), "Acme", &profiles),
+            "work"
+        );
+        assert_eq!(
+            setup_browser_profile_name(None, "Acme", &profiles),
+            "Acme-3"
+        );
+        assert_eq!(
+            setup_browser_profile_name(None, "New Org", &profiles),
+            "New Org"
+        );
     }
 
     #[test]
