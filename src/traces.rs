@@ -36,6 +36,7 @@ use crate::args::BaseArgs;
 use crate::auth::{self, login};
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
+use crate::utils::parse_duration_to_seconds;
 
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
@@ -4994,9 +4995,10 @@ fn print_trace_text(
         );
     }
     println!(
-        "\nTrace output is truncated. Use `bt view span{} --object-ref {} --id <row-id>` for full span data.",
+        "\nTrace output is truncated. Re-run with --json for the full trace (`bt view trace --json{0} --object-ref {1} --trace-id {2}`), or fetch a single span with `bt view span{0} --object-ref {1} --id <row-id>`.",
         profile_flag_suffix(profile),
-        object_ref
+        object_ref,
+        trace_id
     );
     if let Some(cursor) = next_cursor {
         let limit_suffix = if limit != 50 {
@@ -5028,30 +5030,6 @@ fn print_span_text(item: Option<&Map<String, Value>>) {
         }
         None => println!("No span found."),
     }
-}
-
-fn parse_duration_to_seconds(input: &str) -> Result<u64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("duration cannot be empty");
-    }
-    if let Ok(seconds) = trimmed.parse::<u64>() {
-        return Ok(seconds);
-    }
-
-    let (num_str, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
-    let value: u64 = num_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid duration '{input}'"))?;
-    let multiplier = match unit.to_ascii_lowercase().as_str() {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 60 * 60 * 24,
-        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
-    };
-    Ok(value.saturating_mul(multiplier))
 }
 
 fn build_base_filter_clause(
@@ -6083,6 +6061,7 @@ mod tests {
         BaseArgs {
             json: false,
             verbose: false,
+            verbose_source: None,
             quiet: false,
             quiet_source: None,
             no_color: false,
@@ -6177,14 +6156,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn parse_duration_to_seconds_supports_units() {
-        assert_eq!(parse_duration_to_seconds("90").expect("seconds"), 90);
-        assert_eq!(parse_duration_to_seconds("15m").expect("minutes"), 900);
-        assert_eq!(parse_duration_to_seconds("2h").expect("hours"), 7_200);
-        assert_eq!(parse_duration_to_seconds("1d").expect("days"), 86_400);
     }
 
     #[test]

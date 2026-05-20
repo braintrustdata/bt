@@ -247,7 +247,12 @@ fn build_dataset_rows_query(
 fn dataset_rows_select_fields() -> Vec<Value> {
     DATASET_RECORD_FIELDS
         .iter()
-        .map(|field| json!({"op": "ident", "name": [field]}))
+        .map(|field| {
+            json!({
+                "alias": field,
+                "expr": {"op": "ident", "name": [field]}
+            })
+        })
         .collect()
 }
 
@@ -267,12 +272,12 @@ mod tests {
             query,
             serde_json::json!({
                 "select": [
-                    {"op": "ident", "name": ["id"]},
-                    {"op": "ident", "name": ["input"]},
-                    {"op": "ident", "name": ["expected"]},
-                    {"op": "ident", "name": ["metadata"]},
-                    {"op": "ident", "name": ["tags"]},
-                    {"op": "ident", "name": ["origin"]}
+                    {"alias": "id", "expr": {"op": "ident", "name": ["id"]}},
+                    {"alias": "input", "expr": {"op": "ident", "name": ["input"]}},
+                    {"alias": "expected", "expr": {"op": "ident", "name": ["expected"]}},
+                    {"alias": "metadata", "expr": {"op": "ident", "name": ["metadata"]}},
+                    {"alias": "tags", "expr": {"op": "ident", "name": ["tags"]}},
+                    {"alias": "origin", "expr": {"op": "ident", "name": ["origin"]}}
                 ],
                 "from": {
                     "op": "function",
