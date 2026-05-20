@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "braintrust": "^2.2.0",
+    "braintrust": "^3.11.0",
     "zod": "^3.0.0"
   },
   "devDependencies": {
