@@ -8,17 +8,21 @@ pub const DOCS_URL: &str = "https://www.braintrust.dev/docs";
 pub const WIZARD_CANCEL_MESSAGE: &str = "Setup cancelled.";
 
 pub fn wizard_login_prompt(login_url: &str, verification_code: &str) -> String {
+    let code = dialoguer::console::style(verification_code)
+        .white()
+        .bright();
     format!(
-        "Open this URL in your browser to finish signing in:\n  {login_url}\n\nVerification code: {verification_code}\n\nPick the org and project you want to use; the wizard will resume here."
+        "Open this URL in your browser to finish signing in:\n  {login_url}\n\nVerification code: {code}\n\nPick the org and project you want to use; the wizard will resume here."
     )
 }
 
 pub fn skill_next_step_hint(agent_display_name: Option<&str>) -> String {
+    let action = dialoguer::console::style("run the /instrument-code skill")
+        .red()
+        .bright();
     match agent_display_name {
-        Some(name) => format!("Open {name} in this repo and run the /instrument-code skill."),
-        None => {
-            "Open your coding agent in this repo and run the /instrument-code skill.".to_string()
-        }
+        Some(name) => format!("Open {name} in this repo and {action}."),
+        None => format!("Open your coding agent in this repo and {action}."),
     }
 }
 

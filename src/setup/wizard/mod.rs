@@ -8,6 +8,7 @@ use clap::Args;
 
 use crate::args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
 use crate::http::build_http_client;
+use dialoguer::console::style;
 
 mod agents;
 mod auth;
@@ -87,7 +88,8 @@ pub async fn run(base: BaseArgs, args: WizardArgs) -> Result<()> {
 
     cliclack::log::success(format!(
         "Browser setup complete.\n  org: {}\n  project: {}",
-        session.org_name, session.project_name
+        style(&session.org_name).green().bright(),
+        style(&session.project_name).green().bright()
     ))
     .ok();
 
@@ -95,7 +97,7 @@ pub async fn run(base: BaseArgs, args: WizardArgs) -> Result<()> {
         let env_result = write_env_braintrust(root, &session.api_key)?;
         cliclack::log::success(format!(
             "Wrote BRAINTRUST_API_KEY to {}.",
-            env_result.env_file_path.display()
+            display_relative(&env_result.env_file_path, &cwd)
         ))
         .ok();
         if env_result.added_to_gitignore {
@@ -109,8 +111,7 @@ pub async fn run(base: BaseArgs, args: WizardArgs) -> Result<()> {
             project: &session.project_name,
             project_id: &session.project_id,
         };
-        let cfg_result = write_bt_config(root, &cfg)?;
-        cliclack::log::success(format!("Wrote {}.", cfg_result.config_path.display())).ok();
+        write_bt_config(root, &cfg)?;
     } else {
         cliclack::log::info(format!(
             "BRAINTRUST_API_KEY={}\nNot in a git repo — set this in your environment manually.",
@@ -294,4 +295,10 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 
 fn strip_trailing_slash(url: &str) -> &str {
     url.trim_end_matches('/')
+}
+
+fn display_relative(path: &Path, cwd: &Path) -> String {
+    pathdiff::diff_paths(path, cwd)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
