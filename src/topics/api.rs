@@ -691,6 +691,11 @@ pub async fn update_topic_map_config(
     )
     .await?;
 
+    if let Some(source_facet) = patch.source_facet.as_deref() {
+        validate_topic_map_source_facet(&ctx.client, &resolved, &mut function_cache, source_facet)
+            .await?;
+    }
+
     let function_row =
         load_function_row(&ctx.client, &mut function_cache, &resolved.function_id).await?;
     let mut function_data = function_row
@@ -1038,6 +1043,43 @@ async fn list_topic_automation_rows(client: &ApiClient, project_id: &str) -> Res
         })
         .cloned()
         .collect())
+}
+
+async fn validate_topic_map_source_facet(
+    client: &ApiClient,
+    resolved: &ResolvedTopicMapTarget,
+    function_cache: &mut HashMap<String, Value>,
+    source_facet: &str,
+) -> Result<()> {
+    let config = resolved
+        .automation_row
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let facets =
+        summarize_function_refs(client, function_cache, config.get("facet_functions")).await?;
+
+    if facets.iter().any(|facet| facet.name == source_facet) {
+        return Ok(());
+    }
+
+    let available = facets
+        .iter()
+        .map(|facet| facet.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let automation_name =
+        string_value(resolved.automation_row.get("name")).unwrap_or_else(|| "Topics".to_string());
+
+    let detail = if available.is_empty() {
+        "this automation has no configured facets".to_string()
+    } else {
+        format!("available facets: {available}")
+    };
+    bail!(
+        "source facet '{source_facet}' was not found in topic automation '{automation_name}'; {detail}"
+    )
 }
 
 async fn create_topic_map_function_refs(
