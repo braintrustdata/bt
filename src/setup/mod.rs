@@ -517,6 +517,8 @@ struct SetupWizardSession {
     session_token: String,
     poll_token: String,
     login_path: String,
+    #[serde(default, alias = "verificationCode")]
+    verification_code: Option<String>,
     expires_at: String,
 }
 
@@ -1415,6 +1417,15 @@ async fn run_setup_browser_auth(
         eprintln!();
         eprintln!("{}", style(login_url.as_str()).dim());
         eprintln!();
+        if let Some(verification_code) = session
+            .verification_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            eprintln!("Verification code: {}", style(verification_code).bold());
+            eprintln!();
+        }
         eprintln!(
             "{}",
             style(format_setup_wizard_expiry(&session.expires_at, Utc::now())).dim()
@@ -5536,6 +5547,7 @@ mod tests {
                             "session_token": "session-token",
                             "poll_token": "poll-token",
                             "login_path": "/app/wizard-login?session_token=session-token",
+                            "verification_code": "ABCD-1234",
                             "expires_at": "2099-01-01T00:00:00.000Z",
                         }))
                     }),
@@ -5587,6 +5599,7 @@ mod tests {
             .expect("create session");
         assert_eq!(session.session_token, "session-token");
         assert_eq!(session.poll_token, "poll-token");
+        assert_eq!(session.verification_code.as_deref(), Some("ABCD-1234"));
         assert_eq!(
             setup_wizard_login_url(&app_url, &session.login_path)
                 .expect("login url")
