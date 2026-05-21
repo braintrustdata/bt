@@ -536,14 +536,7 @@ mod tests {
     #[test]
     fn apply_base_output_defaults_keeps_setup_quiet_by_default() {
         let matches = Cli::command()
-            .try_get_matches_from([
-                "bt",
-                "setup",
-                "--no-instrument",
-                "--global",
-                "--agent",
-                "codex",
-            ])
+            .try_get_matches_from(["bt", "setup", "skills", "--global", "--agent", "codex"])
             .expect("matches");
         let mut cli = Cli::from_arg_matches(&matches).expect("cli");
 
@@ -573,7 +566,7 @@ mod tests {
                 "bt",
                 "setup",
                 "--verbose",
-                "--no-instrument",
+                "skills",
                 "--global",
                 "--agent",
                 "codex",

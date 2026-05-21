@@ -93,9 +93,9 @@ fn setup_quiet_and_verbose_conflict() {
     bt_command()
         .args([
             "setup",
+            "skills",
             "--quiet",
             "--verbose",
-            "--no-instrument",
             "--global",
             "--agent",
             "codex",
@@ -280,7 +280,7 @@ fn setup_verbose_prints_agent_summary() {
 }
 
 #[test]
-fn setup_no_instrument_does_not_require_auth_in_git_repo() {
+fn setup_skills_does_not_require_auth_in_git_repo() {
     let repo = make_git_repo();
     let nested = repo.path().join("nested");
     fs::create_dir_all(&nested).expect("create nested");
@@ -298,51 +298,13 @@ fn setup_no_instrument_does_not_require_auth_in_git_repo() {
         .env("PATH", bin_dir.path())
         .args([
             "setup",
+            "skills",
             "--global",
-            "--no-instrument",
             "--no-workflow",
             "--no-input",
-        ])
-        .assert()
-        .success();
-}
-
-#[test]
-fn setup_interactive_no_instrument_does_not_require_auth_in_git_repo() {
-    let repo = make_git_repo();
-    let nested = repo.path().join("nested");
-    fs::create_dir_all(&nested).expect("create nested");
-
-    let home = tempfile::tempdir().expect("home tempdir");
-    let config_home = tempfile::tempdir().expect("config tempdir");
-    let bin_dir = tempfile::tempdir().expect("bin tempdir");
-    write_executable(&bin_dir.path().join("codex"));
-
-    let mut cmd = bt_command();
-    clear_braintrust_auth_env(&mut cmd);
-    cmd.current_dir(&nested)
-        .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .env("PATH", bin_dir.path())
-        .args([
-            "setup",
-            "--interactive",
-            "--global",
             "--agent",
             "codex",
-            "--skills",
-            "--no-mcp",
-            "--no-instrument",
-            "--no-input",
         ])
-        .assert()
-        .success();
-}
-
-#[test]
-fn setup_accepts_no_skill_alias() {
-    bt_command()
-        .args(["setup", "--no-skill", "--help"])
         .assert()
         .success();
 }
@@ -365,14 +327,7 @@ fn setup_mcp_only_requires_auth_in_non_interactive_mode() {
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .args([
-            "setup",
-            "--global",
-            "--mcp",
-            "--no-skills",
-            "--no-instrument",
-            "--no-input",
-        ])
+        .args(["setup", "mcp", "--global", "--agent", "codex", "--no-input"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(

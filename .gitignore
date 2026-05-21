@@ -33,3 +33,5 @@ tests/evals/js/eval-bun/test-data.txt
 __pycache__
 
 bt-sync
+.env.braintrust
+.bt/

@@ -13,40 +13,31 @@ fn setup_accepts_deprecated_quiet_flag() {
 }
 
 #[test]
-fn setup_prints_banner_without_interactive_flag() {
+fn setup_help_lists_subcommands() {
     let mut cmd = Command::cargo_bin("bt").expect("bt binary");
-    cmd.env("TERM", "xterm-256color")
-        .env_remove("NO_COLOR")
-        .args([
-            "setup",
-            "--no-instrument",
-            "--no-skills",
-            "--no-mcp",
-            "--agent",
-            "codex",
-        ]);
+    cmd.args(["setup", "--help"]);
     cmd.assert()
         .success()
-        .stderr(contains("Braintrust"))
-        .stderr(contains("\u{1b}[34m"));
+        .stdout(contains("skills"))
+        .stdout(contains("instrument"))
+        .stdout(contains("mcp"))
+        .stdout(contains("doctor"));
 }
 
 #[test]
-fn setup_no_color_disables_banner_styling() {
+fn setup_with_no_input_requires_credentials() {
     let mut cmd = Command::cargo_bin("bt").expect("bt binary");
-    cmd.env("TERM", "xterm-256color")
-        .env_remove("NO_COLOR")
-        .args([
-            "setup",
-            "--no-color",
-            "--no-instrument",
-            "--no-skills",
-            "--no-mcp",
-            "--agent",
-            "codex",
-        ]);
+    cmd.args(["setup", "--no-input"]);
     cmd.assert()
-        .success()
-        .stderr(contains("Braintrust"))
-        .stderr(contains("\u{1b}[").not());
+        .failure()
+        .stderr(contains("credentials required").or(contains("TTY required")));
+}
+
+#[test]
+fn setup_with_json_is_rejected() {
+    let mut cmd = Command::cargo_bin("bt").expect("bt binary");
+    cmd.args(["setup", "--json"]);
+    cmd.assert()
+        .failure()
+        .stderr(contains("interactive").and(contains("--json")));
 }
