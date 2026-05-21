@@ -2,7 +2,7 @@ use super::language::DetectedLanguage;
 
 const SDK_INSTALL_DOCS_BASE: &str = "https://www.braintrust.dev/docs/instrument/trace-llm-calls";
 
-const TEMPLATE: &str = r#"# Braintrust SDK Installation (Agent Instructions)
+const TEMPLATE: &str = r"# Braintrust SDK Installation (Agent Instructions)
 
 ## Hard Rules
 
@@ -70,7 +70,7 @@ Summarize:
 ## Latest Braintrust Setup Docs
 
 Use the canonical Braintrust docs at https://www.braintrust.dev/docs as the source of truth for SDK setup behavior. Prefer local `bt` CLI commands over direct API calls when verifying state.
-"#;
+";
 
 const INSTALL_SDK_REQUIREMENTS: &str = "- Install the latest Braintrust SDK via the language's package manager. Do not hard-pin the SDK version unless the user asks. Build-time dependencies called out by the language-specific resource (e.g. Orchestrion for Go) must still be pinned to an exact version.
 - Modify only dependency files, a minimal application entry point (e.g., main/bootstrap), and any existing build/run scripts or checked-in env/config that must change to keep auto-instrumentation active in normal use. Auto-instrument the app (except for Java and C# which don't support auto-instrumentation).

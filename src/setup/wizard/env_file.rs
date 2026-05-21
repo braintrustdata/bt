@@ -102,9 +102,8 @@ pub fn gitignore_covers(content: &str, filename: &str) -> bool {
     for line in content.lines() {
         let _ = builder.add_line(None, line);
     }
-    let gi = match builder.build() {
-        Ok(g) => g,
-        Err(_) => return false,
+    let Ok(gi) = builder.build() else {
+        return false;
     };
     gi.matched(filename, false).is_ignore()
 }

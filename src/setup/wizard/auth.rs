@@ -111,7 +111,7 @@ impl WizardSessionAuthClient {
             let json: serde_json::Value = serde_json::from_str(&body)
                 .with_context(|| format!("parsing poll response: {body}"))?;
             match json.get("status").and_then(|v| v.as_str()) {
-                Some("pending") => continue,
+                Some("pending") => {}
                 Some("expired") => bail!("Wizard session expired before approval."),
                 Some("claimed") => bail!("Wizard session was already claimed by another client."),
                 Some("complete") => return parse_complete(&json),
@@ -144,6 +144,6 @@ fn require_string(json: &serde_json::Value, key: &str) -> Result<String> {
     json.get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .ok_or_else(|| anyhow!("Wizard session complete response missing field `{key}`"))
 }

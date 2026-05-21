@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -476,33 +475,6 @@ pub use docs::run_docs_top;
 
 fn in_ci() -> bool {
     std::env::var_os("CI").is_some()
-}
-
-fn setup_banner_color_enabled(base: &BaseArgs) -> bool {
-    if base.no_color || std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-
-    !matches!(std::env::var_os("TERM"), Some(term) if term == OsStr::new("dumb"))
-}
-
-fn print_setup_banner(base: &BaseArgs) {
-    let color_enabled = setup_banner_color_enabled(base);
-    eprintln!(
-        "{}",
-        style(crate::BANNER)
-            .for_stderr()
-            .blue()
-            .force_styling(color_enabled)
-    );
-    eprintln!(
-        "{}",
-        style("Braintrust")
-            .for_stderr()
-            .blue()
-            .force_styling(color_enabled)
-    );
-    eprintln!();
 }
 
 fn print_coding_agent_selection_intro() {
@@ -1215,82 +1187,6 @@ async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> 
     Ok(created.key)
 }
 
-async fn select_project_for_setup(
-    client: &ApiClient,
-    project_name: Option<&str>,
-) -> Result<crate::projects::api::Project> {
-    if let Some(name) = project_name {
-        let projects = with_spinner(
-            "Loading projects...",
-            crate::projects::api::list_projects(client),
-        )
-        .await?;
-        if let Some(project) = projects.into_iter().find(|project| project.name == name) {
-            return Ok(project);
-        }
-        bail!(
-            "project '{}' not found in org '{}'",
-            name,
-            client.org_name()
-        )
-    }
-
-    if !ui::can_prompt() {
-        bail!(
-            "project choice required in non-interactive mode; pass --project <NAME> or set BRAINTRUST_DEFAULT_PROJECT"
-        );
-    }
-
-    ui::select_project(
-        client,
-        None,
-        Some("Select project"),
-        ui::ProjectSelectMode::AllowCreateWithDefaultProjectNote,
-    )
-    .await
-}
-
-async fn select_project_with_skip(
-    client: &ApiClient,
-    project_name: Option<&str>,
-    quiet: bool,
-) -> Result<Option<crate::projects::api::Project>> {
-    let project = select_project_for_setup(client, project_name).await?;
-    if !quiet {
-        eprintln!("{} Select project · {}", style("✔").green(), project.name);
-    }
-    Ok(Some(project))
-}
-
-fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> {
-    let config_path = std::env::current_dir()?.join(".bt").join("config.json");
-    let mut cfg = if config_path.exists() {
-        let existing = config::load_file(&config_path);
-        let matches = existing.org.as_deref() == Some(org)
-            && existing.project.as_deref() == Some(project.name.as_str());
-        if matches && existing.project_id.as_deref() == Some(project.id.as_str()) {
-            return Ok(());
-        }
-        existing
-    } else {
-        config::Config::default()
-    };
-
-    cfg.org = Some(org.to_string());
-    cfg.project = Some(project.name.clone());
-    cfg.project_id = Some(project.id.clone());
-    config::save_local(&cfg, true)?;
-    Ok(())
-}
-
-fn default_setup_scope(args: &AgentsSetupArgs) -> InstallScope {
-    if args.local {
-        InstallScope::Local
-    } else {
-        InstallScope::Global
-    }
-}
-
 async fn run_setup(base: BaseArgs, args: AgentsSetupArgs) -> Result<()> {
     let outcome = execute_skills_setup(&base, &args, false).await?;
     if base.json {
@@ -1653,12 +1549,34 @@ async fn run_instrument_setup(
     } else if base.verbose {
         eprintln!();
         for result in &results {
-            print_wizard_agent_result(result);
+            let (indicator, status_text) = match result.status {
+                InstallStatus::Installed => (style("✓").green(), "installed"),
+                InstallStatus::Skipped => (style("—").dim(), "already configured"),
+                InstallStatus::Failed => (style("✗").red(), "failed"),
+            };
+            eprintln!(
+                "   {} {} — {}",
+                indicator,
+                result.agent.display_name(),
+                status_text
+            );
         }
         for warning in &warnings {
             eprintln!("   {} {}", style("!").dim(), style(warning).dim());
         }
-        print_wizard_done(!status.success());
+        if status.success() {
+            eprintln!(
+                "\n{} {}",
+                style("✓").green(),
+                style("Setup complete").bold()
+            );
+        } else {
+            eprintln!(
+                "\n{} {}",
+                style("!").dim(),
+                style("Setup complete (with warnings)").bold()
+            );
+        }
     }
 
     if !status.success() {
@@ -1868,18 +1786,6 @@ fn detect_languages_from_dir(dir: &std::path::Path) -> Vec<LanguageArg> {
     found.into_iter().collect()
 }
 
-fn resolve_prompted_instrument_workflows(mut workflows: Vec<WorkflowArg>) -> Vec<WorkflowArg> {
-    if workflows.is_empty() {
-        return workflows;
-    }
-    if !workflows.contains(&WorkflowArg::Instrument) {
-        workflows.push(WorkflowArg::Instrument);
-    }
-    workflows.sort();
-    workflows.dedup();
-    workflows
-}
-
 fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
     match agent {
         Agent::Claude => AgentArg::Claude,
@@ -1889,18 +1795,6 @@ fn map_agent_to_agent_arg(agent: Agent) -> AgentArg {
         Agent::Gemini => AgentArg::Gemini,
         Agent::Opencode => AgentArg::Opencode,
         Agent::Qwen => AgentArg::Qwen,
-    }
-}
-
-fn map_agent_to_instrument_agent_arg(agent: Agent) -> InstrumentAgentArg {
-    match agent {
-        Agent::Claude => InstrumentAgentArg::Claude,
-        Agent::Codex => InstrumentAgentArg::Codex,
-        Agent::Copilot => InstrumentAgentArg::Copilot,
-        Agent::Cursor => InstrumentAgentArg::Cursor,
-        Agent::Gemini => InstrumentAgentArg::Gemini,
-        Agent::Opencode => InstrumentAgentArg::Opencode,
-        Agent::Qwen => InstrumentAgentArg::Qwen,
     }
 }
 
@@ -3225,18 +3119,6 @@ fn pick_agent_mode_target(candidates: &[Agent]) -> Option<Agent> {
     candidates.first().copied()
 }
 
-fn determine_wizard_instrument_agent(flag_agent: Option<AgentArg>) -> Option<InstrumentAgentArg> {
-    if let Some(arg) = flag_agent {
-        return Some(map_agent_to_instrument_agent_arg(map_agent_arg(arg)));
-    }
-
-    let runnable_agents = detect_runnable_agents();
-    if runnable_agents.len() == 1 {
-        return Some(map_agent_to_instrument_agent_arg(runnable_agents[0]));
-    }
-    None
-}
-
 fn promptable_instrument_agents(
     runnable_agents: &[Agent],
     detected: &[DetectionSignal],
@@ -3261,14 +3143,6 @@ fn detected_agents_on_path(detected: &[DetectionSignal]) -> Vec<Agent> {
         }
     }
     agents.into_iter().collect()
-}
-
-fn detect_runnable_agents() -> Vec<Agent> {
-    ALL_AGENTS
-        .iter()
-        .copied()
-        .filter(|agent| command_exists(agent.metadata().binary))
-        .collect()
 }
 
 fn resolve_workflow_selection(requested: &[WorkflowArg]) -> Vec<WorkflowArg> {
@@ -4182,42 +4056,6 @@ fn command_exists(binary: &str) -> bool {
     false
 }
 
-// ── Wizard output helpers ──
-
-fn print_wizard_step(number: u8, label: &str) {
-    eprintln!("\n{}. {}", style(number).bold(), style(label).bold());
-}
-
-fn print_wizard_agent_result(result: &AgentInstallResult) {
-    let (indicator, status_text) = match result.status {
-        InstallStatus::Installed => (style("✓").green(), "installed"),
-        InstallStatus::Skipped => (style("—").dim(), "already configured"),
-        InstallStatus::Failed => (style("✗").red(), "failed"),
-    };
-    eprintln!(
-        "   {} {} — {}",
-        indicator,
-        result.agent.display_name(),
-        status_text
-    );
-}
-
-fn print_wizard_done(had_failures: bool) {
-    if had_failures {
-        eprintln!(
-            "\n{} {}",
-            style("!").dim(),
-            style("Setup complete (with warnings)").bold()
-        );
-    } else {
-        eprintln!(
-            "\n{} {}",
-            style("✓").green(),
-            style("Setup complete").bold()
-        );
-    }
-}
-
 fn print_human_report(
     include_header: bool,
     scope: InstallScope,
@@ -4993,15 +4831,6 @@ mod tests {
     }
 
     #[test]
-    fn prompted_instrument_workflows_always_include_instrument_when_non_empty() {
-        let resolved = resolve_prompted_instrument_workflows(vec![WorkflowArg::Evaluate]);
-        assert_eq!(
-            resolved,
-            vec![WorkflowArg::Instrument, WorkflowArg::Evaluate]
-        );
-    }
-
-    #[test]
     fn pick_agent_mode_target_prefers_codex() {
         let selected = pick_agent_mode_target(&[Agent::Claude, Agent::Codex, Agent::Cursor]);
         assert_eq!(selected, Some(Agent::Codex));
@@ -5748,58 +5577,6 @@ mod tests {
         std::env::set_current_dir(old).expect("restore cwd");
 
         assert!(matches!(scope, InstallScope::Global));
-    }
-
-    #[test]
-    fn maybe_init_preserves_existing_extra_config_fields() {
-        let _guard = cwd_test_lock().lock().expect("lock cwd test");
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = env::temp_dir().join(format!("bt-maybe-init-extra-{unique}"));
-        let bt_dir = root.join(".bt");
-        fs::create_dir_all(&bt_dir).expect("create .bt dir");
-        fs::write(
-            bt_dir.join("config.json"),
-            r#"{
-  "org": "old-org",
-  "project": "old-project",
-  "project_id": "old-project-id",
-  "custom_flag": true,
-  "nested": {
-    "keep": "me"
-  }
-}
-"#,
-        )
-        .expect("write config");
-
-        let old = env::current_dir().expect("cwd");
-        env::set_current_dir(&root).expect("cd root");
-
-        let project = crate::projects::api::Project {
-            id: "project-id".to_string(),
-            name: "new-project".to_string(),
-            org_id: "org-id".to_string(),
-            description: None,
-        };
-        maybe_init("new-org", &project).expect("maybe init");
-
-        env::set_current_dir(old).expect("restore cwd");
-
-        let saved = config::load_file(&bt_dir.join("config.json"));
-        assert_eq!(saved.org.as_deref(), Some("new-org"));
-        assert_eq!(saved.project.as_deref(), Some("new-project"));
-        assert_eq!(saved.project_id.as_deref(), Some("project-id"));
-        assert_eq!(
-            saved.extra.get("custom_flag"),
-            Some(&serde_json::Value::Bool(true))
-        );
-        assert_eq!(
-            saved.extra.get("nested"),
-            Some(&serde_json::json!({ "keep": "me" }))
-        );
     }
 
     #[test]

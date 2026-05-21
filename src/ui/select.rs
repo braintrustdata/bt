@@ -19,6 +19,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectSelectMode {
     ExistingOnly,
+    #[allow(dead_code)]
     AllowCreateWithDefaultProjectNote,
 }
 
