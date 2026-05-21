@@ -311,6 +311,13 @@ def optional_positive_integer_field(request: dict[str, Any], field: str) -> int 
     return value
 
 
+def set_optional_env(name: str, value: Any) -> None:
+    if isinstance(value, str) and value:
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
+
+
 def merged_source(pipeline: Any, source_override: Any) -> dict[str, Any]:
     source = camelize_mapping(pipeline_source(pipeline), SOURCE_KEY_MAP)
     if isinstance(source_override, dict):
@@ -369,13 +376,11 @@ def hydrate_discovery_refs(
         candidate: dict[str, Any] = {
             "trace": trace,
         }
+        origin = ref.get("origin") if isinstance(ref, dict) else None
+        if isinstance(origin, dict):
+            candidate["origin"] = origin
         if row_id:
             candidate["id"] = row_id
-            candidate["origin"] = {
-                "object_type": "project_logs",
-                "object_id": source_project_id,
-                "id": row_id,
-            }
         candidates.append(candidate)
     return candidates
 
@@ -520,6 +525,15 @@ async def main() -> None:
         source_project_id = require_string_field(request, "sourceProjectId")
         source_override = (
             request.get("source") if isinstance(request.get("source"), dict) else None
+        )
+        source_for_env = (
+            source_override
+            if isinstance(source_override, dict)
+            else camelize_mapping(object_get(pipeline, "source"), SOURCE_KEY_MAP)
+        )
+        set_optional_env(
+            "BT_DATASET_PIPELINE_SOURCE_ORG_NAME",
+            source_for_env.get("orgName") if isinstance(source_for_env, dict) else None,
         )
         rows = await transform_refs(
             pipeline,

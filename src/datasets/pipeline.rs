@@ -266,8 +266,9 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 ),
             );
 
+            let (_, _, source_project) =
+                resolve_pipeline_source_context(&base, &inspect.source).await?;
             let refs = read_jsonl_values(&refs_path)?;
-            let source_project = resolve_pipeline_source_project(&base, &inspect.source).await?;
             let attachment_dir = tempdir.path().join("attachments");
             let transform_response = transform_source_refs(
                 &base,
@@ -568,10 +569,14 @@ fn apply_source_overrides(source: &mut PipelineSourceInspect, args: &PipelineSou
 fn source_with_resolved_project(
     source: &PipelineSourceInspect,
     project: &Project,
+    org_name: &str,
 ) -> PipelineSourceInspect {
     let mut source = source.clone();
     source.project_id = Some(project.id.clone());
     source.project_name = Some(project.name.clone());
+    if source.org_name.is_none() && !org_name.trim().is_empty() {
+        source.org_name = Some(org_name.to_string());
+    }
     source
 }
 
@@ -680,8 +685,10 @@ async fn fetch_refs(
     args: PipelineFetchArgs,
     mut inspect: PipelineInspect,
 ) -> Result<()> {
-    let source_project = resolve_pipeline_source_project(base, &inspect.source).await?;
-    inspect.source = source_with_resolved_project(&inspect.source, &source_project);
+    let (_, source_client, source_project) =
+        resolve_pipeline_source_context(base, &inspect.source).await?;
+    inspect.source =
+        source_with_resolved_project(&inspect.source, &source_project, source_client.org_name());
     let spec = pipeline_fetch_artifact_spec(base, &args.runner, &inspect.source, &args.fetch);
     let artifact = resolve_pipeline_output_artifact(
         &args.artifacts.root,
@@ -1164,7 +1171,9 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
         .unwrap_or(inspect.source);
     apply_source_overrides(&mut source, &args.source);
     let source_base = base_with_pipeline_artifact_context(base, fetch_manifest.as_ref());
-    let source_project = resolve_pipeline_source_project(&source_base, &source).await?;
+    let (_, source_client, source_project) =
+        resolve_pipeline_source_context(&source_base, &source).await?;
+    source = source_with_resolved_project(&source, &source_project, source_client.org_name());
     let refs = read_jsonl_values(&input_path)?;
     let spec = pipeline_transform_artifact_spec(
         &source_base,
@@ -1839,14 +1848,6 @@ fn project_log_ref_scope(scope: PipelineScope) -> ProjectLogRefScope {
     }
 }
 
-async fn resolve_pipeline_source_project(
-    base: &BaseArgs,
-    source: &PipelineSourceInspect,
-) -> Result<Project> {
-    let (_, _, project) = resolve_pipeline_source_context(base, source).await?;
-    Ok(project)
-}
-
 async fn resolve_pipeline_source_context(
     base: &BaseArgs,
     source: &PipelineSourceInspect,
@@ -2288,7 +2289,16 @@ export default DatasetPipeline({
 
         let attachment_dir = root.path().join("attachments");
         let request = json!({
-            "refs": [{ "root_span_id": "root-span" }],
+            "refs": [{
+                "root_span_id": "root-span",
+                "origin": {
+                    "object_type": "project_logs",
+                    "object_id": "source-project-id",
+                    "id": "source-row",
+                    "created": "2026-05-19T00:00:00Z",
+                    "_xact_id": "123"
+                }
+            }],
             "sourceProjectId": "source-project-id",
             "attachmentDir": attachment_dir,
         });
@@ -2325,6 +2335,16 @@ export default DatasetPipeline({
         assert_eq!(marker["filename"], "trace.json");
         assert_eq!(marker["content_type"], "application/json");
         assert!(marker.get("data").is_none());
+        assert_eq!(
+            response["rows"][0]["origin"],
+            json!({
+                "object_type": "project_logs",
+                "object_id": "source-project-id",
+                "id": "source-row",
+                "created": "2026-05-19T00:00:00Z",
+                "_xact_id": "123"
+            })
+        );
 
         let sidecar_path = marker["path"].as_str().expect("sidecar path");
         let sidecar = fs::read_to_string(sidecar_path).expect("read sidecar JSON");
@@ -2351,10 +2371,11 @@ export default DatasetPipeline({
             description: None,
         };
 
-        let resolved = source_with_resolved_project(&source, &project);
+        let resolved = source_with_resolved_project(&source, &project, "braintrustdata.com");
 
         assert_eq!(resolved.project_id.as_deref(), Some("project-id"));
         assert_eq!(resolved.project_name.as_deref(), Some("Loop"));
+        assert_eq!(resolved.org_name.as_deref(), Some("braintrustdata.com"));
         assert_eq!(resolved.filter, source.filter);
         assert_eq!(resolved.scope, source.scope);
     }

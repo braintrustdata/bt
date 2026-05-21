@@ -80,6 +80,8 @@ type HydratedCandidate = {
     object_type: "project_logs";
     object_id: string;
     id: string;
+    created?: string;
+    _xact_id?: string;
   };
 };
 
@@ -497,6 +499,14 @@ function optionalPositiveIntegerField(
   return value as number;
 }
 
+function setOptionalEnv(name: string, value: unknown): void {
+  if (typeof value === "string" && value.length > 0) {
+    process.env[name] = value;
+  } else {
+    delete process.env[name];
+  }
+}
+
 function requirePipelineSource(
   pipeline: DatasetPipelineDefinition,
   sourceOverride?: PipelineSource,
@@ -576,18 +586,14 @@ async function hydrateDiscoveryRefs(
       });
       tracesByRootSpanId.set(rootSpanId, trace);
     }
+    const origin =
+      isObject(ref) && isObject(ref.origin)
+        ? (ref.origin as HydratedCandidate["origin"])
+        : undefined;
     return {
       trace,
       ...(id ? { id } : {}),
-      ...(id
-        ? {
-            origin: {
-              object_type: "project_logs" as const,
-              object_id: sourceProjectId,
-              id,
-            },
-          }
-        : {}),
+      ...(origin ? { origin } : {}),
     };
   });
 }
@@ -768,6 +774,11 @@ async function main() {
       isObject(request) && isObject(request.source)
         ? (request.source as PipelineSource)
         : undefined;
+    const sourceForEnv = sourceOverride ?? pipeline.source;
+    setOptionalEnv(
+      "BT_DATASET_PIPELINE_SOURCE_ORG_NAME",
+      isObject(sourceForEnv) ? sourceForEnv.orgName : undefined,
+    );
     const rows = await transformRefs(
       braintrust,
       pipeline,
