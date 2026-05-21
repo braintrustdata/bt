@@ -1524,6 +1524,13 @@ parameters.append(ParameterItem())
             .and_then(Value::as_str),
         Some("parameters")
     );
+    assert!(
+        parameter_entry
+            .get("event")
+            .and_then(|event| event.get("if_exists"))
+            .is_none(),
+        "unset parameter if_exists should be omitted so CLI fallback applies"
+    );
 
     let bundle = file
         .get("python_bundle")

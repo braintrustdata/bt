@@ -272,6 +272,8 @@ async def collect_function_event_entries(prompts_registry: Any) -> list[dict[str
                 definition = await definition
             normalized = to_json_value(definition)
             if isinstance(normalized, dict):
+                if normalized.get("if_exists") is None:
+                    normalized.pop("if_exists", None)
                 project_id, project_name = normalize_project_selector(getattr(item, "project", None))
                 event_entry: dict[str, Any] = {"kind": "function_event", "event": normalized}
                 if project_id:
