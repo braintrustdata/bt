@@ -57,10 +57,7 @@ pub async fn run(base: BaseArgs, args: SparkArgs) -> Result<()> {
     forward_braintrust_env(&mut command, &base);
     command.env("BT_WIZARD_HARNESS_BIN", &harness_bin);
 
-    let status = command
-        .status()
-        .await
-        .with_context(|| node_spawn_error_hint())?;
+    let status = command.status().await.context(NODE_SPAWN_HINT)?;
 
     if !status.success() {
         let code = status.code().unwrap_or(1);
@@ -167,7 +164,5 @@ fn forward_braintrust_env(command: &mut Command, base: &BaseArgs) {
     }
 }
 
-fn node_spawn_error_hint() -> String {
-    "failed to spawn `node` for the embedded spark CLI; install Node.js (>= 22) and ensure `node` is on PATH"
-        .to_string()
-}
+const NODE_SPAWN_HINT: &str =
+    "failed to spawn `node` for the embedded spark CLI; install Node.js (>= 22) and ensure `node` is on PATH";
