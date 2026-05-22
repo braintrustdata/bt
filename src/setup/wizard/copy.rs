@@ -7,12 +7,22 @@ pub const DOCS_URL: &str = "https://www.braintrust.dev/docs";
 
 pub const WIZARD_CANCEL_MESSAGE: &str = "Setup cancelled.";
 
-pub fn wizard_login_prompt(login_url: &str, verification_code: &str) -> String {
+pub fn terminal_hyperlink(url: &str) -> String {
+    // Emit an OSC 8 hyperlink when the terminal advertises support; otherwise
+    // print the URL as plain text. Detection is via `supports-hyperlinks`.
+    if supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr) {
+        format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+    } else {
+        url.to_string()
+    }
+}
+
+pub fn wizard_login_prompt(verification_code: &str) -> String {
     let code = dialoguer::console::style(verification_code)
         .color256(231)
         .bold();
     format!(
-        "Open this URL in your browser to finish signing in:\n  {login_url}\n\nVerification code: {code}\n\nPick the org and project you want to use; the wizard will resume here."
+        "Open the URL above in your browser to finish signing in.\n\nAfter signing in, verify this code matches the one shown in your browser: {code}\n\nPick the org and project you want to use; the wizard will resume here."
     )
 }
 

@@ -534,6 +534,7 @@ dependencies = [
  "serde_json 1.0.149",
  "sha2",
  "strip-ansi-escapes",
+ "supports-hyperlinks",
  "tempfile",
  "tokio",
  "toml",
@@ -3118,6 +3119,12 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "supports-hyperlinks"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e396b6523b11ccb83120b115a0b7366de372751aa6edf19844dfb13a6af97e91"
 
 [[package]]
 name = "syn"

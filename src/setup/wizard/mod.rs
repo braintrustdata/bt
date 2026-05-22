@@ -20,8 +20,8 @@ mod skill_install;
 
 use auth::{WizardSessionAuthClient, WizardSessionComplete};
 use copy::{
-    build_cleanup_message, no_agent_fallback_note, skill_next_step_hint, wizard_login_prompt,
-    DOCS_URL, NOT_GIT_REPO_WARNING, WIZARD_CANCEL_MESSAGE, WIZARD_TITLE,
+    build_cleanup_message, no_agent_fallback_note, skill_next_step_hint, terminal_hyperlink,
+    wizard_login_prompt, DOCS_URL, NOT_GIT_REPO_WARNING, WIZARD_CANCEL_MESSAGE, WIZARD_TITLE,
 };
 use env_file::{write_bt_config, write_env_braintrust, BtConfig};
 use language::{detect_languages, DetectedLanguage};
@@ -96,7 +96,7 @@ pub async fn run(base: BaseArgs, args: WizardArgs) -> Result<()> {
 
     if let Some(root) = &git_root {
         let env_result = write_env_braintrust(root, &session.api_key)?;
-        cliclack::log::success(format!(
+        cliclack::log::info(format!(
             "Wrote BRAINTRUST_API_KEY to {}.",
             display_relative(&env_result.env_file_path, &cwd)
         ))
@@ -174,11 +174,8 @@ async fn login(
     let session = client.create_session().await?;
     let login_url = client.build_login_url(&session);
 
-    cliclack::note(
-        "Login",
-        wizard_login_prompt(&login_url, &session.verification_code),
-    )
-    .ok();
+    cliclack::log::info(terminal_hyperlink(&login_url)).ok();
+    cliclack::note("Login", wizard_login_prompt(&session.verification_code)).ok();
     let _ = open::that_detached(&login_url);
 
     let spinner = cliclack::spinner();

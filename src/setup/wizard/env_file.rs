@@ -189,6 +189,9 @@ mod tests {
         write_bt_config(dir.path(), &cfg).unwrap();
         let gi = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         let count = gi.matches(".bt/").count();
-        assert_eq!(count, 1, "gitignore should contain .bt/ exactly once, got:\n{gi}");
+        assert_eq!(
+            count, 1,
+            "gitignore should contain .bt/ exactly once, got:\n{gi}"
+        );
     }
 }
