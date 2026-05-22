@@ -42,6 +42,15 @@ jobs:
             -KeyUsage DigitalSignature `
             -HashAlgorithm SHA256 `
             -NotAfter (Get-Date).AddDays(7)
+
+          # signtool verify always validates the chain to a trusted root — there's
+          # no flag for structural-only validation. Import the public cert into the
+          # runner's trusted root store so the chain check passes for this self-
+          # signed cert. Test workflow only; never do this on a real machine.
+          $cerPath = Join-Path $env:RUNNER_TEMP "test-signing.cer"
+          Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $cerPath | Out-Null
+          Import-Certificate -FilePath $cerPath -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+
           $pfxPath = Join-Path $env:RUNNER_TEMP "test-signing.pfx"
           $pwd = ConvertTo-SecureString -String "testpassword" -Force -AsPlainText
           Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $pfxPath -Password $pwd | Out-Null
@@ -75,9 +84,11 @@ jobs:
       - name: Verify signature on raw exe
         shell: pwsh
         run: |
-          # /pa would require a trusted root — self-signed certs won't pass that, but the
-          # signature itself must still be structurally valid and timestamped.
-          & $env:SIGNTOOL verify /v target/distrib/bt-x86_64-pc-windows-msvc/bt.exe
+          # /pa selects the default authenticode verification policy, which is the
+          # correct policy for code signing. The chain check passes because the
+          # cert generation step above imported the self-signed cert into
+          # CurrentUser\Root.
+          & $env:SIGNTOOL verify /pa /v target/distrib/bt-x86_64-pc-windows-msvc/bt.exe
           if ($LASTEXITCODE -ne 0) { throw "Signature verification failed on raw exe" }
 
       - name: Refresh zip archives with signed executables (verbatim from release.yml)
@@ -103,7 +114,7 @@ jobs:
           $verifyDir = Join-Path $env:RUNNER_TEMP "verify"
           New-Item -ItemType Directory -Path $verifyDir -Force | Out-Null
           Expand-Archive -Path target/distrib/bt-x86_64-pc-windows-msvc.zip -DestinationPath $verifyDir -Force
-          & $env:SIGNTOOL verify /v (Join-Path $verifyDir "bt.exe")
+          & $env:SIGNTOOL verify /pa /v (Join-Path $verifyDir "bt.exe")
           if ($LASTEXITCODE -ne 0) { throw "Signature was lost after zip refresh" }
           Write-Host "Signature survived the zip refresh"
 
