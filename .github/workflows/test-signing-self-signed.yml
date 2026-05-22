@@ -42,19 +42,6 @@ jobs:
             -KeyUsage DigitalSignature `
             -HashAlgorithm SHA256 `
             -NotAfter (Get-Date).AddDays(7)
-
-          # signtool verify always validates the chain to a trusted root — there's
-          # no flag for structural-only validation. Trust the self-signed cert at
-          # the runner level so the chain check passes. Both Import-Certificate
-          # and X509Store.Add() against a Root store trigger a CryptUI consent
-          # dialog that hangs headless runners. certutil is a subprocess that
-          # bypasses CryptUI entirely. Test workflow only; never do this on a
-          # real machine.
-          $cerPath = Join-Path $env:RUNNER_TEMP "test-signing.cer"
-          Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $cerPath | Out-Null
-          & certutil.exe -addstore -f -user Root $cerPath
-          if ($LASTEXITCODE -ne 0) { throw "certutil -addstore failed with exit code $LASTEXITCODE" }
-
           $pfxPath = Join-Path $env:RUNNER_TEMP "test-signing.pfx"
           $pwd = ConvertTo-SecureString -String "testpassword" -Force -AsPlainText
           Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $pfxPath -Password $pwd | Out-Null
@@ -88,12 +75,20 @@ jobs:
       - name: Verify signature on raw exe
         shell: pwsh
         run: |
-          # /pa selects the default authenticode verification policy, which is the
-          # correct policy for code signing. The chain check passes because the
-          # cert generation step above imported the self-signed cert into
-          # CurrentUser\Root.
-          & $env:SIGNTOOL verify /pa /v target/distrib/bt-x86_64-pc-windows-msvc/bt.exe
-          if ($LASTEXITCODE -ne 0) { throw "Signature verification failed on raw exe" }
+          # Get-AuthenticodeSignature returns a structured status. We accept
+          # NotTrusted (untrusted self-signed root, but signature itself is valid
+          # and timestamped) — that's the expected state for this test. signtool
+          # verify can't be used because every supported way to install a self-
+          # signed cert into the runner's Root store hangs on a CryptUI prompt.
+          # Production signing uses Trusted Signing, which chains to a trusted
+          # Microsoft root and verifies cleanly without any of this.
+          $sig = Get-AuthenticodeSignature target/distrib/bt-x86_64-pc-windows-msvc/bt.exe
+          if ($sig.Status -notin @('Valid', 'NotTrusted')) {
+            throw "Signature invalid (status=$($sig.Status)): $($sig.StatusMessage)"
+          }
+          if (-not $sig.SignerCertificate)     { throw "Signature missing signer certificate" }
+          if (-not $sig.TimeStamperCertificate) { throw "Signature missing RFC3161 timestamp" }
+          Write-Host "Raw exe signature OK (status=$($sig.Status), signer=$($sig.SignerCertificate.Subject))"
 
       - name: Refresh zip archives with signed executables (verbatim from release.yml)
         shell: pwsh
@@ -118,9 +113,13 @@ jobs:
           $verifyDir = Join-Path $env:RUNNER_TEMP "verify"
           New-Item -ItemType Directory -Path $verifyDir -Force | Out-Null
           Expand-Archive -Path target/distrib/bt-x86_64-pc-windows-msvc.zip -DestinationPath $verifyDir -Force
-          & $env:SIGNTOOL verify /pa /v (Join-Path $verifyDir "bt.exe")
-          if ($LASTEXITCODE -ne 0) { throw "Signature was lost after zip refresh" }
-          Write-Host "Signature survived the zip refresh"
+          $sig = Get-AuthenticodeSignature (Join-Path $verifyDir "bt.exe")
+          if ($sig.Status -notin @('Valid', 'NotTrusted')) {
+            throw "Signature lost after zip refresh (status=$($sig.Status)): $($sig.StatusMessage)"
+          }
+          if (-not $sig.SignerCertificate)     { throw "Signature missing signer certificate after zip refresh" }
+          if (-not $sig.TimeStamperCertificate) { throw "Signature missing RFC3161 timestamp after zip refresh" }
+          Write-Host "Signature survived the zip refresh (status=$($sig.Status))"
 
       - name: Verify sha256 file matches the refreshed zip
         shell: pwsh
