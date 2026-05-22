@@ -146,6 +146,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
+    # Azure federated identity credentials require an exact-subject match; we
+    # scope OIDC tokens via this environment instead of branch/tag patterns.
+    # Azure secrets and signing config live on the environment, not the repo.
+    environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
@@ -220,7 +224,7 @@ jobs:
 
       - name: Azure login for code signing
         if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
-        uses: azure/login@v2
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -228,9 +232,9 @@ jobs:
 
       - name: Sign Windows executables
         if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
-        uses: azure/artifact-signing-action@v0
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
-          azure-endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
           files-folder: target/distrib
