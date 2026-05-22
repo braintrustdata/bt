@@ -21,7 +21,11 @@
 // fire-and-forget tail). .mts is needed here because top-level await requires
 // ESM at the loader for tsx/Bun/Deno; vite-node is format-agnostic but uses
 // the same source.
-import { main } from "./eval-runner-impl.ts";
+// `.js` extension is the TS+ESM convention: TypeScript's NodeNext resolver
+// maps it to `./eval-runner-impl.ts`, and vite-node's resolver does the same
+// at runtime. Avoids the cross-runner tsconfig dance around
+// `allowImportingTsExtensions`.
+import { main } from "./eval-runner-impl.js";
 
 try {
   await main();

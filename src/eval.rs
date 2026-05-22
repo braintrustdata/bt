@@ -4501,8 +4501,8 @@ mod tests {
             "vite-node entry must await main() at the top level"
         );
         assert!(
-            JS_RUNNER_VITE_NODE_SOURCE.contains("eval-runner-impl.ts"),
-            "vite-node entry should import the shared impl as a sibling"
+            JS_RUNNER_VITE_NODE_SOURCE.contains("from \"./eval-runner-impl.js\""),
+            "vite-node entry should import main from the sibling impl"
         );
     }
 
