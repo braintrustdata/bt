@@ -2600,7 +2600,17 @@ fn js_runner_path_for_kind(default_path: &Path, kind: RunnerKind) -> PathBuf {
 }
 
 fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
-    let cache_dir = prepare_js_runner_cache_dir_in_cwd()?;
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    let cache_dir = cwd
+        .join(".bt")
+        .join("eval-runners")
+        .join(env!("CARGO_PKG_VERSION"));
+    std::fs::create_dir_all(&cache_dir).with_context(|| {
+        format!(
+            "failed to create eval runner cache dir {}",
+            cache_dir.display()
+        )
+    })?;
     materialize_runner_script(
         &cache_dir,
         JS_RUNNER_DEFAULT_FILE,
@@ -2617,21 +2627,6 @@ fn js_runner_default_source() -> String {
     source.push_str(JS_RUNNER_IMPL_SOURCE);
     source.push_str(JS_RUNNER_FIRE_AND_FORGET_ENTRY);
     source
-}
-
-fn prepare_js_runner_cache_dir_in_cwd() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = cwd
-        .join(".bt")
-        .join("eval-runners")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&cache_dir).with_context(|| {
-        format!(
-            "failed to create eval runner cache dir {}",
-            cache_dir.display()
-        )
-    })?;
-    Ok(cache_dir)
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
