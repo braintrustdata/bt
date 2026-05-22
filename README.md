@@ -180,14 +180,14 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 
 ### `bt datasets pipeline`
 
-Run full dataset pipelines declared with `DatasetPipeline(...)`, or stage fetch/transform/push.
+Run full dataset pipelines declared with `DatasetPipeline(...)`, or stage pull/transform/push.
 
 ```bash
 # One-shot execution: discover refs, transform, and insert up to 100 new rows.
 bt datasets pipeline run ./pipeline.ts --limit 100
 
 # Staged execution for inspection or agent editing.
-bt datasets pipeline fetch ./pipeline.ts --limit 500
+bt datasets pipeline pull ./pipeline.ts --limit 500
 bt datasets pipeline transform ./pipeline.ts
 # Inspect or edit the transformed JSONL, then push to the pipeline target.
 bt datasets pipeline push ./pipeline.ts
@@ -199,13 +199,14 @@ bt datasets pipeline run ./pipeline.py --project "<source project>" --limit 100
 Useful flags:
 
 - `--limit <n>` controls how many source refs to discover.
-- `--root-span-id <id>` restricts fetching to one or more specific root spans.
-- `--root <path>` controls where staged artifacts are written; it defaults to `bt-sync`. A staged run writes `fetched.jsonl` and `transformed.jsonl` in the same managed directory.
-- `--out` can override the managed output path for `fetch` and `transform`.
-- `--in` can override the latest fetch artifact for `transform`, or the latest transform artifact for `push`.
+- `--window <duration>` constrains source ref discovery by `created` time; defaults to `1d`.
+- `--root-span-id <id>` restricts pulling to one or more specific root spans.
+- `--root <path>` controls where staged artifacts are written; it defaults to `bt-sync`. A staged run writes `pulled.jsonl` and `transformed.jsonl` in the same managed directory.
+- `--out` can override the managed output path for `pull` and `transform`.
+- `--in` can override the latest pull artifact for `transform`, or the latest transform artifact for `push`.
 - `push` reads the target from the pipeline and delegates to `bt sync push`; pass `--fresh` to restart an already completed push spec.
 - `--project <name>` supplies the active source project when the pipeline source omits a project.
-- `--source-project`, `--source-project-id`, `--source-org`, and `--source-filter` explicitly override source fields on `fetch`, `transform`, and `run`.
+- `--source-project`, `--source-project-id`, `--source-org`, and `--source-filter` explicitly override source fields on `pull`, `transform`, and `run`.
 - `--target-project`, `--target-project-id`, `--target-org`, and `--target-dataset` override target fields on `run` and `push`.
 - `--max-concurrency <n>` controls transform concurrency.
 - `--name <name>` selects a pipeline when the file defines more than one.

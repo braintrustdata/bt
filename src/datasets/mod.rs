@@ -168,7 +168,7 @@ struct ViewArgs {
     )]
     verbose: bool,
 
-    /// Fetch full row values instead of BTQL previews.
+    /// Load full row values instead of BTQL previews.
     #[arg(
         long,
         env = "BT_DATASETS_VIEW_FULL",

@@ -29,6 +29,7 @@ use crate::sync::{
     artifact_base_dir, artifact_spec_dir, create_jsonl_file_writer, epoch_seconds, read_json_file,
     read_jsonl_values, stable_spec_hash, write_json_atomic, write_jsonl_value, SyncPushFileArgs,
 };
+use crate::utils::parse_duration_to_seconds;
 use tokio::sync::mpsc;
 
 use super::{api as datasets_api, records, utils, ResolvedContext};
@@ -59,7 +60,7 @@ enum PipelineCommands {
     /// Pull, transform, and insert dataset rows
     Run(PipelineRunArgs),
     /// Pull source trace/span refs to JSONL
-    Pull(PipelineFetchArgs),
+    Pull(PipelinePullArgs),
     /// Transform candidate JSONL into proposed dataset row JSONL
     Transform(PipelineTransformArgs),
     /// Push transformed dataset rows to the pipeline target
@@ -125,19 +126,18 @@ struct PipelineTargetArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct PipelineFetchOptions {
+struct PipelinePullOptions {
     /// Maximum number of source refs to discover
-    #[arg(
-        long,
-        alias = "target",
-        default_value_t = 100,
-        value_parser = parse_positive_usize
-    )]
+    #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
     limit: usize,
 
     /// Restrict the source query to one or more root span ids
     #[arg(long = "root-span-id")]
     root_span_ids: Vec<String>,
+
+    /// Relative time window for source ref discovery when --root-span-id is not set
+    #[arg(long, env = "BT_DATASET_PIPELINE_WINDOW", default_value = "1d")]
+    window: String,
 
     /// Page size for discovery BTQL pagination
     #[arg(long, default_value_t = 1000, value_parser = parse_positive_usize)]
@@ -177,14 +177,14 @@ struct PipelineRunArgs {
     target: PipelineTargetArgs,
 
     #[command(flatten)]
-    fetch: PipelineFetchOptions,
+    pull: PipelinePullOptions,
 
     #[command(flatten)]
     transform: PipelineTransformOptions,
 }
 
 #[derive(Debug, Clone, Args)]
-struct PipelineFetchArgs {
+struct PipelinePullArgs {
     #[command(flatten)]
     runner: PipelineRunnerArgs,
 
@@ -195,7 +195,7 @@ struct PipelineFetchArgs {
     source: PipelineSourceArgs,
 
     #[command(flatten)]
-    fetch: PipelineFetchOptions,
+    pull: PipelinePullOptions,
 
     /// Output JSONL file. Defaults to a managed path under --root.
     #[arg(long)]
@@ -256,13 +256,13 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
             let tempdir =
                 tempfile::tempdir().context("failed to create dataset pipeline temp dir")?;
             let refs_path = tempdir.path().join("discovered.jsonl");
-            print_pipeline_status(&base, "Fetching source refs...");
-            let fetch_result = discover_refs(&base, &inspect, &args.fetch, &refs_path).await?;
+            print_pipeline_status(&base, "Pulling source refs...");
+            let pull_result = discover_refs(&base, &inspect, &args.pull, &refs_path).await?;
             print_pipeline_status(
                 &base,
                 format!(
-                    "Fetched {} source ref(s) across {} page(s).",
-                    fetch_result.refs, fetch_result.pages
+                    "Pulled {} source ref(s) across {} page(s).",
+                    pull_result.refs, pull_result.pages
                 ),
             );
 
@@ -300,7 +300,7 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 Some(&args.source),
                 None,
             );
-            fetch_refs(&base, args, inspect).await
+            pull_refs(&base, args, inspect).await
         }
         PipelineCommands::Transform(args) => transform_refs(&base, args).await,
         PipelineCommands::Push(args) => push_rows(&base, args).await,
@@ -398,35 +398,35 @@ struct PipelineRunnerErrorPayload {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum PipelineArtifactStage {
-    Fetch,
+    Pull,
     Transform,
 }
 
 impl PipelineArtifactStage {
     fn command(self) -> &'static str {
         match self {
-            PipelineArtifactStage::Fetch => "pull",
+            PipelineArtifactStage::Pull => "pull",
             PipelineArtifactStage::Transform => "transform",
         }
     }
 
     fn output_file(self) -> &'static str {
         match self {
-            PipelineArtifactStage::Fetch => "fetched.jsonl",
+            PipelineArtifactStage::Pull => "pulled.jsonl",
             PipelineArtifactStage::Transform => "transformed.jsonl",
         }
     }
 
     fn spec_file(self) -> &'static str {
         match self {
-            PipelineArtifactStage::Fetch => "fetch.spec.json",
+            PipelineArtifactStage::Pull => "pull.spec.json",
             PipelineArtifactStage::Transform => "transform.spec.json",
         }
     }
 
     fn manifest_file(self) -> &'static str {
         match self {
-            PipelineArtifactStage::Fetch => "fetch.manifest.json",
+            PipelineArtifactStage::Pull => "pull.manifest.json",
             PipelineArtifactStage::Transform => "transform.manifest.json",
         }
     }
@@ -434,17 +434,19 @@ impl PipelineArtifactStage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PipelineFetchArtifactOptions {
+struct PipelinePullArtifactOptions {
     limit: usize,
     root_span_ids: Vec<String>,
+    window: String,
     page_size: usize,
 }
 
-impl From<&PipelineFetchOptions> for PipelineFetchArtifactOptions {
-    fn from(options: &PipelineFetchOptions) -> Self {
+impl From<&PipelinePullOptions> for PipelinePullArtifactOptions {
+    fn from(options: &PipelinePullOptions) -> Self {
         Self {
             limit: options.limit,
             root_span_ids: options.root_span_ids.clone(),
+            window: options.window.clone(),
             page_size: options.page_size,
         }
     }
@@ -482,7 +484,7 @@ struct PipelineArtifactSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<PipelineTargetInspect>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    fetch: Option<PipelineFetchArtifactOptions>,
+    pull: Option<PipelinePullArtifactOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transform: Option<PipelineTransformArtifactOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -680,16 +682,16 @@ fn pipeline_language(pipeline_file: &Path) -> Result<SourceLanguage> {
     })
 }
 
-async fn fetch_refs(
+async fn pull_refs(
     base: &BaseArgs,
-    args: PipelineFetchArgs,
+    args: PipelinePullArgs,
     mut inspect: PipelineInspect,
 ) -> Result<()> {
     let (_, source_client, source_project) =
         resolve_pipeline_source_context(base, &inspect.source).await?;
     inspect.source =
         source_with_resolved_project(&inspect.source, &source_project, source_client.org_name());
-    let spec = pipeline_fetch_artifact_spec(base, &args.runner, &inspect.source, &args.fetch);
+    let spec = pipeline_pull_artifact_spec(base, &args.runner, &inspect.source, &args.pull);
     let artifact = resolve_pipeline_output_artifact(
         &args.artifacts.root,
         &args.runner,
@@ -699,13 +701,13 @@ async fn fetch_refs(
     )?;
     artifact.write_spec()?;
     let started_at = epoch_seconds();
-    let result = discover_refs(base, &inspect, &args.fetch, &artifact.output_path).await?;
+    let result = discover_refs(base, &inspect, &args.pull, &artifact.output_path).await?;
     artifact.write_manifest(PipelineArtifactManifest {
         schema_version: PIPELINE_ARTIFACT_SCHEMA_VERSION,
         spec_hash: artifact.spec_hash.clone(),
         spec: artifact.spec.clone(),
         status: PipelineArtifactStatus::Completed,
-        stage: PipelineArtifactStage::Fetch,
+        stage: PipelineArtifactStage::Pull,
         input_path: None,
         output_path: Some(artifact.output_path.display().to_string()),
         refs: Some(result.refs),
@@ -730,15 +732,15 @@ async fn fetch_refs(
     )
 }
 
-fn pipeline_fetch_artifact_spec(
+fn pipeline_pull_artifact_spec(
     base: &BaseArgs,
     runner: &PipelineRunnerArgs,
     source: &PipelineSourceInspect,
-    options: &PipelineFetchOptions,
+    options: &PipelinePullOptions,
 ) -> PipelineArtifactSpec {
-    base_pipeline_artifact_spec(base, runner, PipelineArtifactStage::Fetch)
+    base_pipeline_artifact_spec(base, runner, PipelineArtifactStage::Pull)
         .with_source(source.clone())
-        .with_fetch(options.into())
+        .with_pull(options.into())
 }
 
 fn pipeline_transform_artifact_spec(
@@ -769,7 +771,7 @@ fn base_pipeline_artifact_spec(
         stage,
         source: None,
         target: None,
-        fetch: None,
+        pull: None,
         transform: None,
         input_path: None,
     }
@@ -781,8 +783,8 @@ impl PipelineArtifactSpec {
         self
     }
 
-    fn with_fetch(mut self, fetch: PipelineFetchArtifactOptions) -> Self {
-        self.fetch = Some(fetch);
+    fn with_pull(mut self, pull: PipelinePullArtifactOptions) -> Self {
+        self.pull = Some(pull);
         self
     }
 
@@ -812,7 +814,7 @@ fn resolve_pipeline_output_artifact(
         &pipeline_artifact_name(runner),
         &spec_hash,
     );
-    let spec_dir = if matches!(stage, PipelineArtifactStage::Fetch) {
+    let spec_dir = if matches!(stage, PipelineArtifactStage::Pull) {
         hashed_spec_dir
     } else {
         input_path
@@ -1160,17 +1162,17 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
         &args.input,
         &args.artifacts.root,
         &args.runner,
-        PipelineArtifactStage::Fetch,
+        PipelineArtifactStage::Pull,
     )?;
-    let fetch_manifest =
-        read_pipeline_stage_manifest_for_output(&input_path, PipelineArtifactStage::Fetch)?;
+    let pull_manifest =
+        read_pipeline_stage_manifest_for_output(&input_path, PipelineArtifactStage::Pull)?;
     let inspect = inspect_pipeline(base, &args.runner).await?;
-    let mut source = fetch_manifest
+    let mut source = pull_manifest
         .as_ref()
         .and_then(|manifest| manifest.spec.source.clone())
         .unwrap_or(inspect.source);
     apply_source_overrides(&mut source, &args.source);
-    let source_base = base_with_pipeline_artifact_context(base, fetch_manifest.as_ref());
+    let source_base = base_with_pipeline_artifact_context(base, pull_manifest.as_ref());
     let (_, source_client, source_project) =
         resolve_pipeline_source_context(&source_base, &source).await?;
     source = source_with_resolved_project(&source, &source_project, source_client.org_name());
@@ -1811,13 +1813,13 @@ async fn resolve_target_dataset(
 async fn discover_refs(
     base: &BaseArgs,
     inspect: &PipelineInspect,
-    options: &PipelineFetchOptions,
+    options: &PipelinePullOptions,
     out: &Path,
 ) -> Result<ProjectLogRefDiscoveryResult> {
     let (ctx, client, project) = resolve_pipeline_source_context(base, &inspect.source).await?;
     let scope = PipelineScope::from_source(&inspect.source);
     let limit = options.limit;
-    let filter = discovery_filter(&inspect.source, options);
+    let filter = discovery_filter(&inspect.source, options)?;
 
     let mut writer = create_jsonl_file_writer(out)?;
 
@@ -1864,9 +1866,12 @@ async fn resolve_pipeline_source_context(
 
 fn discovery_filter(
     source: &PipelineSourceInspect,
-    options: &PipelineFetchOptions,
-) -> Option<Value> {
+    options: &PipelinePullOptions,
+) -> Result<Option<Value>> {
     let mut filters = Vec::new();
+    if options.root_span_ids.is_empty() {
+        filters.push(discovery_window_filter(&options.window)?);
+    }
     if let Some(filter) = source
         .filter
         .as_deref()
@@ -1878,11 +1883,19 @@ fn discovery_filter(
     if !options.root_span_ids.is_empty() {
         filters.push(root_span_id_filter(&options.root_span_ids));
     }
-    match filters.len() {
+    Ok(match filters.len() {
         0 => None,
         1 => filters.into_iter().next(),
         _ => Some(json!({ "op": "and", "children": filters })),
-    }
+    })
+}
+
+fn discovery_window_filter(window: &str) -> Result<Value> {
+    let seconds = parse_duration_to_seconds(window)
+        .with_context(|| format!("invalid dataset pipeline pull window '{window}'"))?;
+    Ok(json!({
+        "btql": format!("created >= NOW() - INTERVAL {seconds} SECOND")
+    }))
 }
 
 fn root_span_id_filter(root_span_ids: &[String]) -> Value {
@@ -1995,6 +2008,22 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct PipelineHarness {
+        #[command(subcommand)]
+        command: PipelineCommands,
+    }
+
+    fn parse_pipeline(args: &[&str]) -> anyhow::Result<PipelineCommands> {
+        let mut argv = vec!["bt"];
+        argv.extend_from_slice(args);
+        Ok(PipelineHarness::try_parse_from(argv)?.command)
+    }
+
     fn test_base_args() -> BaseArgs {
         BaseArgs {
             json: false,
@@ -2016,6 +2045,112 @@ mod tests {
             ca_cert: None,
             env_file: None,
         }
+    }
+
+    fn test_source() -> PipelineSourceInspect {
+        PipelineSourceInspect {
+            project_id: None,
+            project_name: Some("Loop".to_string()),
+            org_name: None,
+            filter: None,
+            scope: Some(PipelineScope::Span),
+        }
+    }
+
+    fn test_pull_options() -> PipelinePullOptions {
+        PipelinePullOptions {
+            limit: 100,
+            root_span_ids: Vec::new(),
+            window: "1d".to_string(),
+            page_size: 1000,
+        }
+    }
+
+    #[test]
+    fn pipeline_pull_command_parses() {
+        let command =
+            parse_pipeline(&["pull", "pipeline.ts", "--limit", "7"]).expect("parse pull command");
+        let PipelineCommands::Pull(pull) = command else {
+            panic!("expected pull command");
+        };
+        assert_eq!(pull.runner.pipeline, PathBuf::from("pipeline.ts"));
+        assert_eq!(pull.pull.limit, 7);
+        assert_eq!(pull.pull.window, "1d");
+    }
+
+    #[test]
+    fn pipeline_pull_window_parses() {
+        let command =
+            parse_pipeline(&["pull", "pipeline.ts", "--window", "2h"]).expect("parse pull window");
+        let PipelineCommands::Pull(pull) = command else {
+            panic!("expected pull command");
+        };
+        assert_eq!(pull.pull.window, "2h");
+    }
+
+    #[test]
+    fn pipeline_pull_rejects_target_alias_for_limit() {
+        let err = parse_pipeline(&["pull", "pipeline.ts", "--target", "7"])
+            .expect_err("target alias should not parse");
+
+        assert!(err.to_string().contains("unexpected argument '--target'"));
+    }
+
+    #[test]
+    fn discovery_filter_adds_default_window() {
+        let filter =
+            discovery_filter(&test_source(), &test_pull_options()).expect("discovery filter");
+
+        assert_eq!(
+            filter,
+            Some(json!({
+                "btql": "created >= NOW() - INTERVAL 86400 SECOND"
+            }))
+        );
+    }
+
+    #[test]
+    fn discovery_filter_combines_window_and_source_filter() {
+        let source = PipelineSourceInspect {
+            filter: Some("metadata.topic = 'test'".to_string()),
+            ..test_source()
+        };
+        let filter = discovery_filter(&source, &test_pull_options()).expect("discovery filter");
+
+        assert_eq!(
+            filter,
+            Some(json!({
+                "op": "and",
+                "children": [
+                    { "btql": "created >= NOW() - INTERVAL 86400 SECOND" },
+                    { "btql": "metadata.topic = 'test'" }
+                ]
+            }))
+        );
+    }
+
+    #[test]
+    fn discovery_filter_uses_root_span_filter_without_window() {
+        let options = PipelinePullOptions {
+            root_span_ids: vec!["root-1".to_string()],
+            ..test_pull_options()
+        };
+        let filter = discovery_filter(&test_source(), &options).expect("discovery filter");
+
+        assert_eq!(filter, Some(root_span_id_filter(&["root-1".to_string()])));
+    }
+
+    #[test]
+    fn discovery_filter_rejects_invalid_window() {
+        let options = PipelinePullOptions {
+            window: "bad".to_string(),
+            ..test_pull_options()
+        };
+        let err = discovery_filter(&test_source(), &options).expect_err("invalid window");
+
+        assert!(err
+            .to_string()
+            .contains("invalid dataset pipeline pull window 'bad'"));
     }
 
     #[test]
@@ -2381,7 +2516,7 @@ export default DatasetPipeline({
     }
 
     #[test]
-    fn pipeline_transform_base_inherits_fetch_artifact_context() {
+    fn pipeline_transform_base_inherits_pull_artifact_context() {
         let base = test_base_args();
         let manifest = PipelineArtifactManifest {
             schema_version: PIPELINE_ARTIFACT_SCHEMA_VERSION,
@@ -2393,15 +2528,15 @@ export default DatasetPipeline({
                 name: None,
                 cli_project: Some("Loop".to_string()),
                 cli_org: Some("braintrustdata.com".to_string()),
-                stage: PipelineArtifactStage::Fetch,
+                stage: PipelineArtifactStage::Pull,
                 source: None,
                 target: None,
-                fetch: None,
+                pull: None,
                 transform: None,
                 input_path: None,
             },
             status: PipelineArtifactStatus::Completed,
-            stage: PipelineArtifactStage::Fetch,
+            stage: PipelineArtifactStage::Pull,
             input_path: None,
             output_path: None,
             refs: Some(1),
@@ -2428,7 +2563,7 @@ export default DatasetPipeline({
             runner: None,
         };
         let spec =
-            base_pipeline_artifact_spec(&test_base_args(), &runner, PipelineArtifactStage::Fetch);
+            base_pipeline_artifact_spec(&test_base_args(), &runner, PipelineArtifactStage::Pull);
 
         let artifact = resolve_pipeline_output_artifact(root.path(), &runner, spec, None, None)
             .expect("artifact path");
@@ -2436,7 +2571,7 @@ export default DatasetPipeline({
         assert!(artifact
             .output_path
             .starts_with(root.path().join("dataset_pipeline_facet_pipeline")));
-        assert_eq!(artifact.output_path.file_name().unwrap(), "fetched.jsonl");
+        assert_eq!(artifact.output_path.file_name().unwrap(), "pulled.jsonl");
     }
 
     #[test]
@@ -2448,7 +2583,7 @@ export default DatasetPipeline({
             runner: None,
         };
         let spec =
-            base_pipeline_artifact_spec(&test_base_args(), &runner, PipelineArtifactStage::Fetch);
+            base_pipeline_artifact_spec(&test_base_args(), &runner, PipelineArtifactStage::Pull);
         let artifact = resolve_pipeline_output_artifact(root.path(), &runner, spec, None, None)
             .expect("artifact path");
 
@@ -2464,7 +2599,7 @@ export default DatasetPipeline({
                 spec_hash: artifact.spec_hash.clone(),
                 spec: artifact.spec.clone(),
                 status: PipelineArtifactStatus::Completed,
-                stage: PipelineArtifactStage::Fetch,
+                stage: PipelineArtifactStage::Pull,
                 input_path: None,
                 output_path: Some(artifact.output_path.display().to_string()),
                 refs: Some(1),
@@ -2478,14 +2613,14 @@ export default DatasetPipeline({
             .expect("write manifest");
 
         let resolved =
-            resolve_pipeline_input_path(&None, root.path(), &runner, PipelineArtifactStage::Fetch)
+            resolve_pipeline_input_path(&None, root.path(), &runner, PipelineArtifactStage::Pull)
                 .expect("default input");
 
         assert_eq!(resolved, artifact.output_path);
     }
 
     #[test]
-    fn pipeline_transform_output_defaults_to_fetch_artifact_dir() {
+    fn pipeline_transform_output_defaults_to_pull_artifact_dir() {
         let root = tempfile::tempdir().expect("tempdir");
         let runner = PipelineRunnerArgs {
             pipeline: PathBuf::from("facet_pipeline.py"),
@@ -2499,11 +2634,11 @@ export default DatasetPipeline({
             filter: None,
             scope: Some(PipelineScope::Span),
         };
-        let fetch_spec =
-            base_pipeline_artifact_spec(&test_base_args(), &runner, PipelineArtifactStage::Fetch);
-        let fetch_artifact =
-            resolve_pipeline_output_artifact(root.path(), &runner, fetch_spec, None, None)
-                .expect("fetch artifact");
+        let pull_spec =
+            base_pipeline_artifact_spec(&test_base_args(), &runner, PipelineArtifactStage::Pull);
+        let pull_artifact =
+            resolve_pipeline_output_artifact(root.path(), &runner, pull_spec, None, None)
+                .expect("pull artifact");
         let transform_spec = pipeline_transform_artifact_spec(
             &test_base_args(),
             &runner,
@@ -2511,7 +2646,7 @@ export default DatasetPipeline({
             &PipelineTransformOptions {
                 max_concurrency: Some(16),
             },
-            &fetch_artifact.output_path,
+            &pull_artifact.output_path,
         );
 
         let transform_artifact = resolve_pipeline_output_artifact(
@@ -2519,14 +2654,14 @@ export default DatasetPipeline({
             &runner,
             transform_spec,
             None,
-            Some(&fetch_artifact.output_path),
+            Some(&pull_artifact.output_path),
         )
         .expect("transform artifact");
 
-        assert_eq!(transform_artifact.spec_dir, fetch_artifact.spec_dir);
+        assert_eq!(transform_artifact.spec_dir, pull_artifact.spec_dir);
         assert_eq!(
             transform_artifact.output_path,
-            fetch_artifact.spec_dir.join("transformed.jsonl")
+            pull_artifact.spec_dir.join("transformed.jsonl")
         );
     }
 }
