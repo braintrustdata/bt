@@ -4,12 +4,14 @@ use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use dialoguer::console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, MultiSelect, Select};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::process::Command;
 use toml::Value as TomlValue;
@@ -34,6 +36,10 @@ const SHARED_WORKFLOW_GUIDE: &str = include_str!("../../skills/shared/workflows.
 const SHARED_SKILL_TEMPLATE: &str = include_str!("../../skills/shared/skill_template.md");
 const SKILL_FRONTMATTER: &str = include_str!("../../skills/shared/skill_frontmatter.md");
 const BT_README: &str = include_str!("../../README.md");
+const SETUP_WIZARD_CREATE_PATH: &str = "/api/cli/wizard-session/create";
+const SETUP_WIZARD_POLL_PATH: &str = "/api/cli/wizard-session/poll";
+const SETUP_WIZARD_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES: usize = 30;
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
     "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
 ];
@@ -497,6 +503,50 @@ struct McpSelection {
 struct SetupAuthContext {
     client: ApiClient,
     api_key: String,
+    selected_project: Option<crate::projects::api::Project>,
+}
+
+struct SetupAuthLogin {
+    login: LoginContext,
+    is_oauth: bool,
+    selected_project: Option<crate::projects::api::Project>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupWizardSession {
+    session_token: String,
+    poll_token: String,
+    login_path: String,
+    #[serde(default, alias = "verificationCode")]
+    verification_code: Option<String>,
+    expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct SetupWizardCompletion {
+    api_key: String,
+    org_id: String,
+    org_name: String,
+    project_id: String,
+    project_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SetupWizardPollResult {
+    Pending {
+        #[serde(rename = "expires_at")]
+        _expires_at: String,
+    },
+    Expired,
+    Claimed,
+    Complete {
+        api_key: String,
+        org_id: String,
+        org_name: String,
+        project_id: String,
+        project_name: String,
+    },
 }
 
 struct SkillsSetupOutcome {
@@ -654,7 +704,7 @@ async fn run_setup_wizard(mut base: BaseArgs, flags: WizardFlags) -> Result<()> 
         eprintln!("Projects organize AI features in your application. Each project contains logs, experiments, datasets, prompts, and other functions.");
     }
     let project = if let Some(auth) = setup_auth.as_ref() {
-        select_project_with_skip(&auth.client, project_flag.as_deref(), !verbose).await?
+        select_project_for_auth_context(auth, project_flag.as_deref(), !verbose).await?
     } else {
         None
     };
@@ -998,7 +1048,7 @@ async fn run_default_setup(mut base: BaseArgs, args: SetupArgs) -> Result<()> {
         let project_flag = base.project.clone();
         let auth = ensure_setup_auth(&mut base, false, true).await?;
         let org = auth.client.org_name().to_string();
-        let project = select_project_with_skip(&auth.client, project_flag.as_deref(), true).await?;
+        let project = select_project_for_auth_context(&auth, project_flag.as_deref(), true).await?;
         if let Some(ref project) = project {
             maybe_init(&org, project)?;
         }
@@ -1156,6 +1206,317 @@ fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
 
 fn setup_can_prompt(base: &BaseArgs) -> bool {
     !base.json && !base.no_input && !in_ci() && ui::can_prompt()
+}
+
+fn setup_wizard_app_url(base: &BaseArgs) -> Result<reqwest::Url> {
+    let app_url = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    reqwest::Url::parse(app_url).context("invalid Braintrust app URL")
+}
+
+fn setup_wizard_login_url(app_url: &reqwest::Url, login_path: &str) -> Result<reqwest::Url> {
+    if let Ok(url) = reqwest::Url::parse(login_path) {
+        return Ok(url);
+    }
+
+    app_url
+        .join(login_path)
+        .with_context(|| format!("invalid setup browser login path '{login_path}'"))
+}
+
+fn format_setup_wizard_expiry(expires_at: &str, now: DateTime<Utc>) -> String {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(expires_at) else {
+        return format!("The browser setup link expires at {expires_at}.");
+    };
+    let expires_at = parsed.with_timezone(&Utc);
+    let seconds = expires_at.signed_duration_since(now).num_seconds();
+
+    if seconds <= 0 {
+        return "The browser setup link has expired.".to_string();
+    }
+    if seconds < 60 {
+        return "The browser setup link expires in less than a minute.".to_string();
+    }
+
+    let minutes = (seconds + 59) / 60;
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("The browser setup link expires in {minutes} {unit}.")
+}
+
+async fn setup_wizard_response_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    action: &str,
+) -> Result<T> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("setup browser {action} failed ({status}): {body}");
+    }
+
+    response
+        .json()
+        .await
+        .with_context(|| format!("failed to parse setup browser {action} response"))
+}
+
+async fn create_setup_wizard_session(
+    http: &reqwest::Client,
+    app_url: &reqwest::Url,
+) -> Result<SetupWizardSession> {
+    let url = app_url
+        .join(SETUP_WIZARD_CREATE_PATH)
+        .context("failed to build setup browser session URL")?;
+    let response = http
+        .post(url.clone())
+        .send()
+        .await
+        .with_context(|| format!("failed to create setup browser session at {url}"))?;
+
+    setup_wizard_response_json(response, "session creation").await
+}
+
+async fn poll_setup_wizard_completion_with_interval(
+    http: &reqwest::Client,
+    app_url: &reqwest::Url,
+    session_token: &str,
+    poll_token: &str,
+    interval: Duration,
+) -> Result<SetupWizardCompletion> {
+    let mut consecutive_failures = 0usize;
+    let mut last_failure = String::new();
+
+    loop {
+        let mut url = app_url
+            .join(SETUP_WIZARD_POLL_PATH)
+            .context("failed to build setup browser polling URL")?;
+        url.query_pairs_mut()
+            .append_pair("session_token", session_token);
+
+        let response = http.get(url.clone()).bearer_auth(poll_token).send().await;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                consecutive_failures += 1;
+                last_failure = format!("failed to poll setup browser session at {url}: {err}");
+                if consecutive_failures >= SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES {
+                    bail!(
+                        "setup browser session polling failed {} consecutive times; last error: {}",
+                        consecutive_failures,
+                        last_failure
+                    );
+                }
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            if status.is_server_error()
+                || matches!(
+                    status,
+                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+                )
+            {
+                consecutive_failures += 1;
+                last_failure = format!("setup browser session polling failed ({status}): {body}");
+                if consecutive_failures >= SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES {
+                    bail!(
+                        "setup browser session polling failed {} consecutive times; last error: {}",
+                        consecutive_failures,
+                        last_failure
+                    );
+                }
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+
+            bail!("setup browser session polling failed ({status}): {body}");
+        }
+
+        let poll_result = match response.json::<SetupWizardPollResult>().await {
+            Ok(result) => result,
+            Err(err) => {
+                consecutive_failures += 1;
+                last_failure =
+                    format!("failed to parse setup browser session polling response: {err}");
+                if consecutive_failures >= SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES {
+                    bail!(
+                        "setup browser session polling failed {} consecutive times; last error: {}",
+                        consecutive_failures,
+                        last_failure
+                    );
+                }
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+        };
+        consecutive_failures = 0;
+        last_failure.clear();
+
+        match poll_result {
+            SetupWizardPollResult::Pending { .. } => {
+                tokio::time::sleep(interval).await;
+            }
+            SetupWizardPollResult::Expired => {
+                bail!("Browser setup timed out. Rerun `bt setup` to start a new browser session.");
+            }
+            SetupWizardPollResult::Claimed => {
+                bail!("setup browser session was already claimed; rerun `bt setup` to start a new session");
+            }
+            SetupWizardPollResult::Complete {
+                api_key,
+                org_id,
+                org_name,
+                project_id,
+                project_name,
+            } => {
+                return Ok(SetupWizardCompletion {
+                    api_key,
+                    org_id,
+                    org_name,
+                    project_id,
+                    project_name,
+                });
+            }
+        }
+    }
+}
+
+async fn poll_setup_wizard_completion(
+    http: &reqwest::Client,
+    app_url: &reqwest::Url,
+    session_token: &str,
+    poll_token: &str,
+) -> Result<SetupWizardCompletion> {
+    poll_setup_wizard_completion_with_interval(
+        http,
+        app_url,
+        session_token,
+        poll_token,
+        SETUP_WIZARD_POLL_INTERVAL,
+    )
+    .await
+}
+
+async fn run_setup_browser_auth(
+    base: &mut BaseArgs,
+    profile_name: Option<&str>,
+    _project_name: Option<&str>,
+    _project_was_explicit: bool,
+    _requested_org: Option<&str>,
+) -> Result<SetupAuthLogin> {
+    let app_url = setup_wizard_app_url(base)?;
+    let http = crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)?;
+    let session = create_setup_wizard_session(&http, &app_url).await?;
+    let login_url = setup_wizard_login_url(&app_url, &session.login_path)?;
+    let explicitly_quiet = base.quiet && base.quiet_source.is_some();
+
+    if !explicitly_quiet {
+        eprintln!("Complete Braintrust setup in your browser:");
+        eprintln!();
+        eprintln!("{}", style(login_url.as_str()).dim());
+        eprintln!();
+        if let Some(verification_code) = session
+            .verification_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            eprintln!("Verification code: {}", style(verification_code).bold());
+            eprintln!();
+        }
+        eprintln!(
+            "{}",
+            style(format_setup_wizard_expiry(&session.expires_at, Utc::now())).dim()
+        );
+        eprintln!();
+    }
+    if let Err(err) = open::that(login_url.as_str()) {
+        eprintln!("warning: failed to open browser automatically: {err}");
+        eprintln!("Visit this URL to continue setup:\n{login_url}");
+    }
+
+    let completed = with_spinner(
+        "Waiting for browser setup to finish...",
+        poll_setup_wizard_completion(&http, &app_url, &session.session_token, &session.poll_token),
+    )
+    .await?;
+    if !explicitly_quiet {
+        eprintln!("{} Browser setup complete.", style("✔").green());
+        eprintln!("   Org: {}", style(&completed.org_name).green());
+        eprintln!("   Project: {}", style(&completed.project_name).green());
+        eprintln!();
+    }
+
+    let app_url_string = app_url.as_str().trim_end_matches('/').to_string();
+    let available_orgs = list_available_orgs_for_setup(&completed.api_key, &app_url_string)
+        .await
+        .context("failed to resolve Braintrust organization after browser setup")?;
+    let org = find_available_org(&available_orgs, &completed.org_name)
+        .cloned()
+        .unwrap_or_else(|| auth::AvailableOrg {
+            id: completed.org_id.clone(),
+            name: completed.org_name.clone(),
+            api_url: base.api_url.clone(),
+        });
+    let login = build_api_key_login_context(base, &completed.api_key, &org);
+    let selected_project = crate::projects::api::Project {
+        id: completed.project_id.clone(),
+        name: completed.project_name.clone(),
+        org_id: completed.org_id.clone(),
+        description: None,
+    };
+    let stored_profiles = auth::list_profiles()?;
+    let profile_name = setup_browser_profile_name(profile_name, &org.name, &stored_profiles);
+
+    auth::commit_api_key_profile(
+        &profile_name,
+        &completed.api_key,
+        login.api_url.clone(),
+        Some(login.app_url.clone()),
+        Some(org.name.clone()),
+    )
+    .context("failed to save Braintrust auth profile after browser setup")?;
+
+    base.api_key = Some(completed.api_key);
+    base.api_key_source = None;
+    base.profile = Some(profile_name);
+    base.org_name = Some(org.name);
+    base.project = Some(selected_project.name.clone());
+
+    Ok(SetupAuthLogin {
+        login,
+        is_oauth: false,
+        selected_project: Some(selected_project),
+    })
+}
+
+fn setup_browser_profile_name(
+    selected_profile_name: Option<&str>,
+    org_name: &str,
+    profiles: &[auth::ProfileInfo],
+) -> String {
+    if let Some(profile_name) = selected_profile_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return profile_name.to_string();
+    }
+
+    let base_name = if org_name.trim().is_empty() {
+        "default"
+    } else {
+        org_name.trim()
+    };
+    if !profiles.iter().any(|profile| profile.name == base_name) {
+        return base_name.to_string();
+    }
+
+    (2u32..)
+        .map(|idx| format!("{base_name}-{idx}"))
+        .find(|candidate| !profiles.iter().any(|profile| profile.name == *candidate))
+        .expect("profile name sequence is infinite")
 }
 
 fn resolve_profile_name_for_setup(
@@ -1381,10 +1742,13 @@ fn matching_profile_org_names(
     org_names
 }
 
-async fn ensure_profile_or_oauth_auth(
+async fn ensure_profile_or_setup_browser_auth(
     base: &mut BaseArgs,
     prompt_for_profile_choice: bool,
-) -> Result<(LoginContext, bool)> {
+    project_name: Option<&str>,
+    project_was_explicit: bool,
+    requested_org: Option<&str>,
+) -> Result<SetupAuthLogin> {
     let profiles = auth::list_profiles()?;
     let can_prompt = setup_can_prompt(base);
     let should_prompt_for_profile_choice = prompt_for_profile_choice && can_prompt;
@@ -1401,23 +1765,32 @@ async fn ensure_profile_or_oauth_auth(
             Ok(ctx) => {
                 base.profile = auth_base.profile.clone();
                 let is_oauth = auth::resolve_auth(&auth_base).await?.is_oauth;
-                return Ok((ctx, is_oauth));
+                return Ok(SetupAuthLogin {
+                    login: ctx,
+                    is_oauth,
+                    selected_project: None,
+                });
             }
             Err(err) if auth::is_missing_credential_error(&err) => {
                 if base.verbose {
                     eprintln!(
-                        "   Profile '{}' credentials inaccessible ({}). Re-authenticating via OAuth...",
+                        "   Profile '{}' credentials inaccessible ({}). Re-authenticating in the browser...",
                         profile_name, err
                     );
                 }
                 if !can_prompt {
                     bail!(
-                        "setup needs interactive OAuth re-authentication; rerun without --no-input/--json or pass a working API key"
+                        "setup needs interactive browser authentication; rerun without --no-input/--json or pass a working API key"
                     );
                 }
-                auth::login_interactive_oauth(&mut auth_base).await?;
-                base.profile = auth_base.profile.clone();
-                return Ok((auth::login(&auth_base).await?, true));
+                return run_setup_browser_auth(
+                    base,
+                    Some(&profile_name),
+                    project_name,
+                    project_was_explicit,
+                    requested_org,
+                )
+                .await;
             }
             Err(err) => return Err(err),
         }
@@ -1426,18 +1799,50 @@ async fn ensure_profile_or_oauth_auth(
     if !can_prompt {
         if profiles.is_empty() {
             bail!(
-                "setup needs interactive authentication; rerun without --no-input/--json or pass a valid API key/profile"
+                "setup needs interactive browser authentication; rerun without --no-input/--json or pass a valid API key/profile"
             );
         }
         bail!("profile selection required in non-interactive mode; pass --profile <NAME>");
     }
 
     if base.verbose {
-        eprintln!("Starting OAuth login.\n");
+        eprintln!("Starting browser setup.\n");
     }
-    auth::login_interactive_oauth(&mut auth_base).await?;
-    base.profile = auth_base.profile.clone();
-    Ok((auth::login(&auth_base).await?, true))
+    run_setup_browser_auth(
+        base,
+        None,
+        project_name,
+        project_was_explicit,
+        requested_org,
+    )
+    .await
+}
+
+async fn ensure_profile_or_setup_browser_auth_context(
+    base: &mut BaseArgs,
+    prompt_for_profile_choice: bool,
+    needs_api_key: bool,
+    project_name: Option<&str>,
+    project_was_explicit: bool,
+    requested_org: Option<&str>,
+) -> Result<SetupAuthContext> {
+    let login = ensure_profile_or_setup_browser_auth(
+        base,
+        prompt_for_profile_choice,
+        project_name,
+        project_was_explicit,
+        requested_org,
+    )
+    .await?;
+    let client = ApiClient::new(&login.login)?;
+    build_setup_auth_context(
+        base,
+        client,
+        login.is_oauth,
+        needs_api_key,
+        login.selected_project,
+    )
+    .await
 }
 
 async fn ensure_setup_auth(
@@ -1525,22 +1930,38 @@ async fn ensure_setup_auth(
                     &org.name,
                 )
                 .await?;
-                return build_setup_auth_context(base, client, false, needs_api_key).await;
+                return build_setup_auth_context(base, client, false, needs_api_key, None).await;
             }
 
-            let (login_ctx, is_oauth) =
-                ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
-            let client = ApiClient::new(&login_ctx)?;
-            let resolved_org = client.org_name().to_string();
-            ensure_selected_setup_project(
+            let login = ensure_profile_or_setup_browser_auth(
                 base,
-                &client,
-                &mut project_name,
+                prompt_for_profile_choice,
+                project_name.as_deref(),
                 project_was_explicit,
-                &resolved_org,
+                org_name.as_deref(),
             )
             .await?;
-            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
+            let selected_project = login.selected_project.clone();
+            let client = ApiClient::new(&login.login)?;
+            let resolved_org = client.org_name().to_string();
+            if selected_project.is_none() {
+                ensure_selected_setup_project(
+                    base,
+                    &client,
+                    &mut project_name,
+                    project_was_explicit,
+                    &resolved_org,
+                )
+                .await?;
+            }
+            return build_setup_auth_context(
+                base,
+                client,
+                login.is_oauth,
+                needs_api_key,
+                selected_project,
+            )
+            .await;
         }
 
         if let Some(org_name) = org_name.as_deref() {
@@ -1562,22 +1983,38 @@ async fn ensure_setup_auth(
                     org_name,
                 )
                 .await?;
-                return build_setup_auth_context(base, client, false, needs_api_key).await;
+                return build_setup_auth_context(base, client, false, needs_api_key, None).await;
             }
 
-            let (login_ctx, is_oauth) =
-                ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
-            let client = ApiClient::new(&login_ctx)?;
-            let resolved_org = client.org_name().to_string();
-            ensure_selected_setup_project(
+            let login = ensure_profile_or_setup_browser_auth(
                 base,
-                &client,
-                &mut project_name,
+                prompt_for_profile_choice,
+                project_name.as_deref(),
                 project_was_explicit,
-                &resolved_org,
+                Some(org_name),
             )
             .await?;
-            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
+            let selected_project = login.selected_project.clone();
+            let client = ApiClient::new(&login.login)?;
+            let resolved_org = client.org_name().to_string();
+            if selected_project.is_none() {
+                ensure_selected_setup_project(
+                    base,
+                    &client,
+                    &mut project_name,
+                    project_was_explicit,
+                    &resolved_org,
+                )
+                .await?;
+            }
+            return build_setup_auth_context(
+                base,
+                client,
+                login.is_oauth,
+                needs_api_key,
+                selected_project,
+            )
+            .await;
         }
 
         if base.prefer_profile {
@@ -1589,10 +2026,15 @@ async fn ensure_setup_auth(
                     None => available_orgs.clone(),
                 };
                 if matched_orgs.is_empty() {
-                    let (login_ctx, is_oauth) =
-                        ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
-                    let client = ApiClient::new(&login_ctx)?;
-                    return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
+                    return ensure_profile_or_setup_browser_auth_context(
+                        base,
+                        prompt_for_profile_choice,
+                        needs_api_key,
+                        project_name.as_deref(),
+                        project_was_explicit,
+                        org_name.as_deref(),
+                    )
+                    .await;
                 }
                 let org = select_api_key_org_for_setup(
                     base,
@@ -1613,7 +2055,7 @@ async fn ensure_setup_auth(
                     base.app_url.clone(),
                     Some(org.name.clone()),
                 )?;
-                return build_setup_auth_context(base, client, false, needs_api_key).await;
+                return build_setup_auth_context(base, client, false, needs_api_key, None).await;
             }
 
             let preferred_org_names = matching_profile_org_names(&stored_profiles, None);
@@ -1623,10 +2065,15 @@ async fn ensure_setup_auth(
                 .cloned()
                 .collect::<Vec<_>>();
             if matching_orgs.is_empty() {
-                let (login_ctx, is_oauth) =
-                    ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
-                let client = ApiClient::new(&login_ctx)?;
-                return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
+                return ensure_profile_or_setup_browser_auth_context(
+                    base,
+                    prompt_for_profile_choice,
+                    needs_api_key,
+                    project_name.as_deref(),
+                    project_was_explicit,
+                    org_name.as_deref(),
+                )
+                .await;
             }
 
             let candidate_orgs = match project_name.as_deref() {
@@ -1636,10 +2083,15 @@ async fn ensure_setup_auth(
                 None => matching_orgs,
             };
             if candidate_orgs.is_empty() {
-                let (login_ctx, is_oauth) =
-                    ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
-                let client = ApiClient::new(&login_ctx)?;
-                return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
+                return ensure_profile_or_setup_browser_auth_context(
+                    base,
+                    prompt_for_profile_choice,
+                    needs_api_key,
+                    project_name.as_deref(),
+                    project_was_explicit,
+                    org_name.as_deref(),
+                )
+                .await;
             }
             let org = select_api_key_org_for_setup(
                 base,
@@ -1648,7 +2100,7 @@ async fn ensure_setup_auth(
                 &preferred_org_names,
             )?;
             let client = build_api_key_client(base, api_key, &org).await?;
-            return build_setup_auth_context(base, client, false, needs_api_key).await;
+            return build_setup_auth_context(base, client, false, needs_api_key, None).await;
         }
 
         let candidate_orgs = match project_name.as_deref() {
@@ -1658,21 +2110,31 @@ async fn ensure_setup_auth(
             None => available_orgs.clone(),
         };
         if candidate_orgs.is_empty() {
-            let (login_ctx, is_oauth) =
-                ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
-            let client = ApiClient::new(&login_ctx)?;
-            return build_setup_auth_context(base, client, is_oauth, needs_api_key).await;
+            return ensure_profile_or_setup_browser_auth_context(
+                base,
+                prompt_for_profile_choice,
+                needs_api_key,
+                project_name.as_deref(),
+                project_was_explicit,
+                org_name.as_deref(),
+            )
+            .await;
         }
         let org =
             select_api_key_org_for_setup(base, &candidate_orgs, project_name.as_deref(), &[])?;
         let client = build_api_key_client(base, api_key, &org).await?;
-        return build_setup_auth_context(base, client, false, needs_api_key).await;
+        return build_setup_auth_context(base, client, false, needs_api_key, None).await;
     }
 
-    let (login_ctx, is_oauth) =
-        ensure_profile_or_oauth_auth(base, prompt_for_profile_choice).await?;
-    let client = ApiClient::new(&login_ctx)?;
-    build_setup_auth_context(base, client, is_oauth, needs_api_key).await
+    ensure_profile_or_setup_browser_auth_context(
+        base,
+        prompt_for_profile_choice,
+        needs_api_key,
+        project_name.as_deref(),
+        project_was_explicit,
+        org_name.as_deref(),
+    )
+    .await
 }
 
 async fn ensure_selected_setup_project(
@@ -1726,6 +2188,7 @@ async fn build_setup_auth_context(
     client: ApiClient,
     is_oauth: bool,
     needs_api_key: bool,
+    selected_project: Option<crate::projects::api::Project>,
 ) -> Result<SetupAuthContext> {
     let api_key = if should_create_api_key_for_setup(is_oauth, base, needs_api_key) {
         maybe_create_api_key_for_oauth(base, &client).await?
@@ -1737,7 +2200,11 @@ async fn build_setup_auth_context(
         sync_setup_api_key(base, &api_key);
     }
 
-    Ok(SetupAuthContext { client, api_key })
+    Ok(SetupAuthContext {
+        client,
+        api_key,
+        selected_project,
+    })
 }
 
 fn should_create_api_key_for_setup(is_oauth: bool, base: &BaseArgs, needs_api_key: bool) -> bool {
@@ -1867,6 +2334,21 @@ async fn select_project_with_skip(
         eprintln!("{} Select project · {}", style("✔").green(), project.name);
     }
     Ok(Some(project))
+}
+
+async fn select_project_for_auth_context(
+    auth: &SetupAuthContext,
+    project_name: Option<&str>,
+    quiet: bool,
+) -> Result<Option<crate::projects::api::Project>> {
+    if let Some(project) = auth.selected_project.clone() {
+        if !quiet {
+            eprintln!("{} Select project · {}", style("✔").green(), project.name);
+        }
+        return Ok(Some(project));
+    }
+
+    select_project_with_skip(&auth.client, project_name, quiet).await
 }
 
 fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> {
@@ -4924,10 +5406,11 @@ fn print_mcp_human_report(
 mod tests {
     use super::*;
     use crate::auth::LoginContext;
-    use actix_web::{web, App, HttpResponse, HttpServer};
+    use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
     use std::env;
     use std::ffi::OsString;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5003,9 +5486,160 @@ mod tests {
         }
     }
 
+    fn utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("parse timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn setup_wizard_expiry_formats_relative_time() {
+        let now = utc("2026-05-15T12:00:00Z");
+
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T12:15:00Z", now),
+            "The browser setup link expires in 15 minutes."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T13:01:00Z", now),
+            "The browser setup link expires in 61 minutes."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T12:00:30Z", now),
+            "The browser setup link expires in less than a minute."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("2026-05-15T12:00:00Z", now),
+            "The browser setup link has expired."
+        );
+        assert_eq!(
+            format_setup_wizard_expiry("not-a-timestamp", now),
+            "The browser setup link expires at not-a-timestamp."
+        );
+    }
+
     #[derive(Default)]
     struct ApiKeyTestState {
         create_request_body: Mutex<Option<serde_json::Value>>,
+    }
+
+    #[derive(Default)]
+    struct WizardSessionTestState {
+        poll_count: AtomicUsize,
+        auth_header: Mutex<Option<String>>,
+        query_string: Mutex<Option<String>>,
+    }
+
+    #[tokio::test]
+    async fn setup_browser_wizard_creates_and_polls_session() {
+        let state = Arc::new(WizardSessionTestState::default());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let app_url = reqwest::Url::parse(&format!("http://{addr}")).expect("app url");
+        let data = web::Data::new(state.clone());
+
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(data.clone())
+                .route(
+                    SETUP_WIZARD_CREATE_PATH,
+                    web::post().to(|| async {
+                        HttpResponse::Ok().json(serde_json::json!({
+                            "session_token": "session-token",
+                            "poll_token": "poll-token",
+                            "login_path": "/app/wizard-login?session_token=session-token",
+                            "verification_code": "ABCD-1234",
+                            "expires_at": "2099-01-01T00:00:00.000Z",
+                        }))
+                    }),
+                )
+                .route(
+                    SETUP_WIZARD_POLL_PATH,
+                    web::get().to(
+                        |state: web::Data<Arc<WizardSessionTestState>>,
+                         req: HttpRequest| async move {
+                            *state.auth_header.lock().expect("lock auth header") = req
+                                .headers()
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string);
+                            *state.query_string.lock().expect("lock query string") =
+                                Some(req.query_string().to_string());
+
+                            match state.poll_count.fetch_add(1, Ordering::SeqCst) {
+                                0 => HttpResponse::InternalServerError()
+                                    .json(serde_json::json!({ "error": "transient" })),
+                                1 => HttpResponse::Ok().json(serde_json::json!({
+                                    "status": "pending",
+                                    "expires_at": "2099-01-01T00:00:00.000Z",
+                                })),
+                                _ => HttpResponse::Ok().json(serde_json::json!({
+                                    "status": "complete",
+                                    "api_key": "wizard-api-key",
+                                    "org_id": "org_123",
+                                    "org_name": "Acme",
+                                    "project_id": "project_123",
+                                    "project_name": "Demo",
+                                })),
+                            }
+                        },
+                    ),
+                )
+        })
+        .workers(1)
+        .listen(listener)
+        .expect("listen mock server")
+        .run();
+        let handle = server.handle();
+        tokio::spawn(server);
+
+        let http =
+            crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT).expect("http client");
+        let session = create_setup_wizard_session(&http, &app_url)
+            .await
+            .expect("create session");
+        assert_eq!(session.session_token, "session-token");
+        assert_eq!(session.poll_token, "poll-token");
+        assert_eq!(session.verification_code.as_deref(), Some("ABCD-1234"));
+        assert_eq!(
+            setup_wizard_login_url(&app_url, &session.login_path)
+                .expect("login url")
+                .as_str(),
+            format!("{app_url}app/wizard-login?session_token=session-token")
+        );
+
+        let completion = poll_setup_wizard_completion_with_interval(
+            &http,
+            &app_url,
+            &session.session_token,
+            &session.poll_token,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("poll completion");
+
+        assert_eq!(completion.api_key, "wizard-api-key");
+        assert_eq!(completion.org_name, "Acme");
+        assert_eq!(completion.project_name, "Demo");
+        assert_eq!(state.poll_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            state
+                .auth_header
+                .lock()
+                .expect("lock auth header")
+                .as_deref(),
+            Some("Bearer poll-token")
+        );
+        assert_eq!(
+            state
+                .query_string
+                .lock()
+                .expect("lock query string")
+                .as_deref(),
+            Some("session_token=session-token")
+        );
+
+        handle.stop(true).await;
     }
 
     #[tokio::test]
@@ -5197,6 +5831,39 @@ mod tests {
         let err =
             resolve_profile_name_for_setup(&base, &profiles, false).expect_err("missing profile");
         assert!(err.to_string().contains("profile 'missing' not found"));
+    }
+
+    #[test]
+    fn setup_browser_profile_name_reuses_selected_profile_or_suffixed_org_name() {
+        let profiles = vec![
+            auth::ProfileInfo {
+                name: "Acme".to_string(),
+                org_name: Some("Acme".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+            auth::ProfileInfo {
+                name: "Acme-2".to_string(),
+                org_name: Some("Acme".to_string()),
+                user_name: None,
+                email: None,
+                api_key_hint: None,
+            },
+        ];
+
+        assert_eq!(
+            setup_browser_profile_name(Some("work"), "Acme", &profiles),
+            "work"
+        );
+        assert_eq!(
+            setup_browser_profile_name(None, "Acme", &profiles),
+            "Acme-3"
+        );
+        assert_eq!(
+            setup_browser_profile_name(None, "New Org", &profiles),
+            "New Org"
+        );
     }
 
     #[test]

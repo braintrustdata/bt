@@ -379,3 +379,27 @@ fn setup_mcp_only_requires_auth_in_non_interactive_mode() {
             "profile selection required in non-interactive mode",
         ));
 }
+
+#[test]
+fn datasets_requires_profile_selection_when_multiple_profiles_exist() {
+    let repo = make_git_repo();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_auth_store(
+        config_home.path(),
+        &[("alpha", "alpha-org"), ("beta", "beta-org")],
+    );
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["datasets", "--no-input"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("multiple auth profiles available"))
+        .stderr(predicate::str::contains("--profile <NAME>"))
+        .stderr(predicate::str::contains("alpha"))
+        .stderr(predicate::str::contains("beta"));
+}
