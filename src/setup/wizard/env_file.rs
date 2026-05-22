@@ -101,7 +101,9 @@ pub fn gitignore_covers(content: &str, filename: &str) -> bool {
     let Ok(gi) = builder.build() else {
         return false;
     };
-    gi.matched(filename, false).is_ignore()
+    // matched_path_or_any_parents walks parent dirs so a directory pattern
+    // like `.bt/` correctly covers `.bt/config.json`.
+    gi.matched_path_or_any_parents(filename, false).is_ignore()
 }
 
 fn read_to_string_if_exists(path: &Path) -> Result<String> {
@@ -172,5 +174,21 @@ mod tests {
         assert!(parsed["profile"].is_null());
         let gi = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert!(gi.contains(".bt/"));
+    }
+
+    #[test]
+    fn write_bt_config_is_idempotent_against_gitignore() {
+        let dir = tempdir().unwrap();
+        let cfg = BtConfig {
+            org: "acme",
+            project: "demo",
+            project_id: "p_123",
+        };
+        write_bt_config(dir.path(), &cfg).unwrap();
+        write_bt_config(dir.path(), &cfg).unwrap();
+        write_bt_config(dir.path(), &cfg).unwrap();
+        let gi = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let count = gi.matches(".bt/").count();
+        assert_eq!(count, 1, "gitignore should contain .bt/ exactly once, got:\n{gi}");
     }
 }
