@@ -224,6 +224,25 @@ const JS_RUNNER_FILE: &str = "eval-runner.mts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
 const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.mts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
+// ts-node 10.x cannot load `.mts` on Node 20 (Node refuses to `require()` an
+// ESM file). ts-node isn't affected by the vite-node server-close race that
+// motivated the TLA, so we generate a CJS-compatible legacy variant for it by
+// swapping the TLA entry back to the original fire-and-forget pattern.
+const JS_RUNNER_LEGACY_FILE: &str = "eval-runner.ts";
+const JS_RUNNER_TLA_BLOCK: &str = concat!(
+    "try {\n",
+    "  await main();\n",
+    "} catch (err) {\n",
+    "  console.error(err);\n",
+    "  process.exit(1);\n",
+    "}\n",
+);
+const JS_RUNNER_LEGACY_BLOCK: &str = concat!(
+    "main().catch((err) => {\n",
+    "  console.error(err);\n",
+    "  process.exit(1);\n",
+    "});\n",
+);
 const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
 
 struct SocketCleanupGuard {
@@ -2548,12 +2567,26 @@ fn is_deno_runner_path(runner: &Path) -> bool {
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
     if is_ts_node_runner(runner_command) {
-        return prepare_js_runner_in_cwd();
+        return prepare_js_runner_in_cwd_legacy();
     }
     Ok(default_runner.to_path_buf())
 }
 
 fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
+    let cache_dir = prepare_js_runner_cache_dir_in_cwd()?;
+    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+}
+
+fn prepare_js_runner_in_cwd_legacy() -> Result<PathBuf> {
+    let cache_dir = prepare_js_runner_cache_dir_in_cwd()?;
+    materialize_runner_script(
+        &cache_dir,
+        JS_RUNNER_LEGACY_FILE,
+        &js_runner_legacy_source(),
+    )
+}
+
+fn prepare_js_runner_cache_dir_in_cwd() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
     let cache_dir = cwd
         .join(".bt")
@@ -2565,7 +2598,16 @@ fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
             cache_dir.display()
         )
     })?;
-    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+    Ok(cache_dir)
+}
+
+fn js_runner_legacy_source() -> String {
+    let result = JS_RUNNER_SOURCE.replace(JS_RUNNER_TLA_BLOCK, JS_RUNNER_LEGACY_BLOCK);
+    debug_assert_ne!(
+        result, JS_RUNNER_SOURCE,
+        "JS_RUNNER_TLA_BLOCK is out of sync with scripts/eval-runner.mts"
+    );
+    result
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
@@ -4362,6 +4404,23 @@ mod tests {
         assert_eq!(runner_kind_for_bin(Path::new("bun")), RunnerKind::Bun);
         assert_eq!(runner_kind_for_bin(Path::new("bunx")), RunnerKind::Bun);
         assert_eq!(runner_kind_for_bin(Path::new("deno")), RunnerKind::Other);
+    }
+
+    #[test]
+    fn js_runner_legacy_source_replaces_tla_block() {
+        let legacy = js_runner_legacy_source();
+        assert_ne!(
+            legacy, JS_RUNNER_SOURCE,
+            "legacy generator should differ from the .mts source"
+        );
+        assert!(
+            legacy.contains("main().catch"),
+            "legacy variant should use the fire-and-forget entry"
+        );
+        assert!(
+            !legacy.contains("await main()"),
+            "legacy variant should not contain top-level await"
+        );
     }
 
     #[test]
