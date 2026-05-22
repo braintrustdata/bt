@@ -44,15 +44,16 @@ jobs:
             -NotAfter (Get-Date).AddDays(7)
 
           # signtool verify always validates the chain to a trusted root — there's
-          # no flag for structural-only validation. Add the public cert to the
-          # runner's CurrentUser\Root store so the chain check passes for this
-          # self-signed cert. Use X509Store directly (not Import-Certificate),
-          # which triggers a CryptUI confirmation dialog that hangs headless
-          # runners forever. Test workflow only; never do this on a real machine.
-          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser')
-          $store.Open('ReadWrite')
-          $store.Add($cert)
-          $store.Close()
+          # no flag for structural-only validation. Trust the self-signed cert at
+          # the runner level so the chain check passes. Both Import-Certificate
+          # and X509Store.Add() against a Root store trigger a CryptUI consent
+          # dialog that hangs headless runners. certutil is a subprocess that
+          # bypasses CryptUI entirely. Test workflow only; never do this on a
+          # real machine.
+          $cerPath = Join-Path $env:RUNNER_TEMP "test-signing.cer"
+          Export-Certificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $cerPath | Out-Null
+          & certutil.exe -addstore -f -user Root $cerPath
+          if ($LASTEXITCODE -ne 0) { throw "certutil -addstore failed with exit code $LASTEXITCODE" }
 
           $pfxPath = Join-Path $env:RUNNER_TEMP "test-signing.pfx"
           $pwd = ConvertTo-SecureString -String "testpassword" -Force -AsPlainText
