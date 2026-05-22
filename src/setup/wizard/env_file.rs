@@ -61,11 +61,7 @@ pub struct BtConfig<'a> {
     pub project_id: &'a str,
 }
 
-pub struct BtConfigWriteResult {
-    pub config_path: PathBuf,
-}
-
-pub fn write_bt_config(git_root: &Path, config: &BtConfig<'_>) -> Result<BtConfigWriteResult> {
+pub fn write_bt_config(git_root: &Path, config: &BtConfig<'_>) -> Result<()> {
     let dir = git_root.join(BT_DIR);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let config_path = dir.join(BT_CONFIG_FILE);
@@ -94,7 +90,7 @@ pub fn write_bt_config(git_root: &Path, config: &BtConfig<'_>) -> Result<BtConfi
             .with_context(|| format!("writing {}", gitignore_path.display()))?;
     }
 
-    Ok(BtConfigWriteResult { config_path })
+    Ok(())
 }
 
 pub fn gitignore_covers(content: &str, filename: &str) -> bool {
@@ -167,8 +163,8 @@ mod tests {
             project: "demo",
             project_id: "p_123",
         };
-        let result = write_bt_config(dir.path(), &cfg).unwrap();
-        let body = fs::read_to_string(&result.config_path).unwrap();
+        write_bt_config(dir.path(), &cfg).unwrap();
+        let body = fs::read_to_string(dir.path().join(".bt/config.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["org"], "acme");
         assert_eq!(parsed["project"], "demo");

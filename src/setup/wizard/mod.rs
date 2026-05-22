@@ -71,6 +71,7 @@ pub async fn run(base: BaseArgs, args: WizardArgs) -> Result<()> {
     let app_url = strip_trailing_slash(&app_url).to_string();
     let api_url = strip_trailing_slash(&api_url).to_string();
 
+    cliclack::set_theme(WizardTheme);
     cliclack::intro(WIZARD_TITLE).context("rendering intro")?;
 
     let git_root = find_git_root(&cwd);
@@ -295,6 +296,20 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 
 fn strip_trailing_slash(url: &str) -> &str {
     url.trim_end_matches('/')
+}
+
+/// Theme override: cliclack's default dims note bodies via `input_style`, which
+/// flattens our own foreground colors (verification code, etc.) to grey. This
+/// theme keeps every default behavior except that dim.
+struct WizardTheme;
+
+impl cliclack::Theme for WizardTheme {
+    fn input_style(&self, state: &cliclack::ThemeState) -> console::Style {
+        match state {
+            cliclack::ThemeState::Cancel => console::Style::new().strikethrough(),
+            _ => console::Style::new(),
+        }
+    }
 }
 
 fn display_relative(path: &Path, cwd: &Path) -> String {

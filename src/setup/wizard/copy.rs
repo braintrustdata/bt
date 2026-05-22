@@ -9,8 +9,8 @@ pub const WIZARD_CANCEL_MESSAGE: &str = "Setup cancelled.";
 
 pub fn wizard_login_prompt(login_url: &str, verification_code: &str) -> String {
     let code = dialoguer::console::style(verification_code)
-        .white()
-        .bright();
+        .color256(231)
+        .bold();
     format!(
         "Open this URL in your browser to finish signing in:\n  {login_url}\n\nVerification code: {code}\n\nPick the org and project you want to use; the wizard will resume here."
     )
