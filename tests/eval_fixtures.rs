@@ -358,7 +358,7 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         );
     }
 
-    let runner_script = root.join("scripts").join("eval-runner.ts");
+    let runner_script = root.join("scripts").join("eval-runner.mts");
     let output = Command::new(&runner)
         .arg(&runner_script)
         .arg("tests/remote-list-params.eval.ts")
@@ -366,7 +366,7 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         .env("BT_EVAL_DEV_MODE", "list")
         .env("BT_EVAL_NO_SEND_LOGS", "1")
         .output()
-        .expect("run eval-runner.ts in list mode");
+        .expect("run eval-runner.mts in list mode");
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -698,10 +698,10 @@ fn collect_deno_eval_diagnostics(dir: &Path, files: &[String]) -> Option<String>
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let runner_script = root.join("scripts").join("eval-runner.ts");
+    let runner_script = root.join("scripts").join("eval-runner.mts");
     let local_runner_dir = dir.join(".bt").join("eval-runners");
     fs::create_dir_all(&local_runner_dir).ok()?;
-    let local_runner = local_runner_dir.join("diag-eval-runner.ts");
+    let local_runner = local_runner_dir.join("diag-eval-runner.mts");
     fs::copy(&runner_script, &local_runner).ok()?;
     let runner_script_str = local_runner.to_string_lossy().to_string();
 

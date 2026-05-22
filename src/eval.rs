@@ -213,9 +213,16 @@ struct RunnerFilter {
     pattern: String,
 }
 
-const JS_RUNNER_FILE: &str = "eval-runner.ts";
+// `.mts` (rather than `.ts`) forces tsx/bun/deno to treat the source as ESM
+// so its top-level `await main()` is allowed. Without that await, vite-node
+// closes its dev server while `main()` still has in-flight dynamic imports,
+// and the next `transformRequest` throws `ERR_CLOSED_SERVER` against the
+// closing dev environment. A sibling `package.json` `{"type":"module"}`
+// would have the same effect but would also shadow the user's `package.json`
+// for Deno's dependency resolution, so we use the file extension instead.
+const JS_RUNNER_FILE: &str = "eval-runner.mts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
-const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
+const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.mts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
 

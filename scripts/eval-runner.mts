@@ -2578,7 +2578,14 @@ async function main() {
   }
 }
 
-main().catch((err) => {
+// Top-level await ensures every async operation main() schedules — including
+// dynamic imports of user eval files — completes before this module's body
+// returns. Without it, runners that close their dev server when the entry
+// module finishes (e.g. vite-node) tear down the server while main() still
+// has in-flight import() calls, producing ERR_CLOSED_SERVER from vite.
+try {
+  await main();
+} catch (err) {
   console.error(err);
   process.exit(1);
-});
+}
