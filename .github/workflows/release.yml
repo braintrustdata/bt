@@ -2,8 +2,10 @@ name: release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
+    paths:
+      - Cargo.toml
   workflow_dispatch:
     inputs:
       tag:
@@ -25,22 +27,57 @@ jobs:
       tag: ${{ steps.resolve-tag.outputs.tag }}
       tag-flag: ${{ steps.resolve-tag.outputs.tag_flag }}
       release-version: ${{ steps.resolve-tag.outputs.release_version }}
+      should-release: ${{ steps.resolve-tag.outputs.should_release }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - id: resolve-tag
         name: Resolve release tag
         shell: bash
         run: |
+          set -euo pipefail
+
+          should_release=true
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             tag="${{ inputs.tag }}"
-          else
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             tag="${{ github.ref_name }}"
+          else
+            version="$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)"
+            if [ -z "$version" ]; then
+              echo "Failed to parse version from Cargo.toml" >&2
+              exit 1
+            fi
+
+            previous_version=""
+            before_sha="${{ github.event.before }}"
+            if [ -n "$before_sha" ] && [ "$before_sha" != "0000000000000000000000000000000000000000" ]; then
+              if git cat-file -e "${before_sha}^{commit}" 2>/dev/null && git show "${before_sha}:Cargo.toml" >/dev/null 2>&1; then
+                previous_version="$(git show "${before_sha}:Cargo.toml" | grep -m1 '^version = "' | cut -d '"' -f2 || true)"
+              fi
+            fi
+
+            tag="v${version}"
+            if [ "$version" = "$previous_version" ]; then
+              echo "Cargo.toml version is unchanged (${version}); no release needed."
+              should_release=false
+            elif git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "Tag ${tag} already exists; nothing to release."
+              should_release=false
+            else
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git tag -a "$tag" -m "Release $tag" "$GITHUB_SHA"
+              git push origin "refs/tags/$tag"
+            fi
           fi
 
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -51,8 +88,17 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "tag_flag=--tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release_version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$tag" > release-tag.txt
+
+      - name: Upload resolved release tag
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-metadata
+          path: release-tag.txt
 
       - name: Configure git auth for private dependencies
+        if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
         run: |
           token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
@@ -62,16 +108,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dist
+        if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
         run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
 
       - name: Cache dist
+        if: steps.resolve-tag.outputs.should_release == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
 
       - id: plan
+        if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
         run: |
           dist host --steps=create --tag="${{ steps.resolve-tag.outputs.tag }}" --output-format=json > plan-dist-manifest.json
@@ -80,6 +129,7 @@ jobs:
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dist plan manifest
+        if: steps.resolve-tag.outputs.should_release == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifacts-plan-dist-manifest
@@ -89,7 +139,7 @@ jobs:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
+    if: ${{ needs.plan.outputs.should-release == 'true' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
@@ -200,6 +250,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+    if: ${{ needs.plan.outputs.should-release == 'true' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -254,12 +305,24 @@ jobs:
             ${{ steps.dist-files.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
+  release-approval:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    if: ${{ always() && needs.plan.outputs.should-release == 'true' && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    runs-on: ubuntu-22.04
+    environment: release
+    steps:
+      - run: echo "Approved stable release ${{ needs.plan.outputs.tag }}"
+
   host:
     needs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    if: ${{ always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+      - release-approval
+    if: ${{ always() && needs.plan.outputs.should-release == 'true' && needs.plan.result == 'success' && needs.release-approval.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
