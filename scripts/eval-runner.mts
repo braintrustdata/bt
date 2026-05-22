@@ -2578,11 +2578,16 @@ async function main() {
   }
 }
 
-// Top-level await ensures every async operation main() schedules — including
-// dynamic imports of user eval files — completes before this module's body
-// returns. Without it, runners that close their dev server when the entry
-// module finishes (e.g. vite-node) tear down the server while main() still
-// has in-flight import() calls, producing ERR_CLOSED_SERVER from vite.
+// vite-node's CLI awaits the entry module's body via runner.executeFile, then
+// closes its dev server. The body completes when vite-node's async wrapper
+// around it resolves: immediately if main() is fire-and-forget. After that,
+// main()'s in-flight dynamic imports try to fetch through a closed dev server
+// and throw ERR_CLOSED_SERVER. Awaiting main() here keeps the wrapper pending
+// until the work is actually done.
+//
+// vite-node v5.3.0 source:
+//   https://github.com/antfu-collective/vite-node/blob/v5.3.0/src/cli.ts#L146-L152
+//   https://github.com/antfu-collective/vite-node/blob/v5.3.0/src/client.ts#L578-L599
 try {
   await main();
 } catch (err) {
