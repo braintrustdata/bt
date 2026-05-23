@@ -222,45 +222,16 @@ jobs:
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
-      - name: Azure login for code signing
+      - name: Sign Windows artifacts
         if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        uses: ./.github/actions/sign-windows-artifacts
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Sign Windows executables
-        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
-        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
-        with:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
-          files-folder: target/distrib
-          files-folder-filter: exe
-          files-folder-recurse: true
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Refresh zip archives with signed executables
-        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
-        shell: pwsh
-        run: |
-          Get-ChildItem -Path "target/distrib" -Filter "*.zip" | ForEach-Object {
-            $zipPath = $_.FullName
-            $stagingDir = Join-Path $_.DirectoryName $_.BaseName
-            if (Test-Path $stagingDir) {
-              Remove-Item $zipPath -Force
-              Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipPath
-              $shaFile = "$zipPath.sha256"
-              if (Test-Path $shaFile) {
-                $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
-                "$hash  $($_.Name)" | Set-Content $shaFile -NoNewline
-              }
-            }
-          }
+          account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          cert-profile: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
 
       - id: dist-files
         name: Post-build
