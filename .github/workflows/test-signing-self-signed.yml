@@ -43,7 +43,7 @@ jobs:
             -HashAlgorithm SHA256 `
             -NotAfter (Get-Date).AddDays(7)
           $pfxPath = Join-Path $env:RUNNER_TEMP "test-signing.pfx"
-          $pwd = ConvertTo-SecureString -String "testpassword" -Force -AsPlainText
+          $pwd = ConvertTo-SecureString -String "1d4cbcfd39a6560c5edabc499725ed1e7d4a7d6d72266803c91398821e06b744" -Force -AsPlainText
           Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $pfxPath -Password $pwd | Out-Null
           "PFX_PATH=$pfxPath" >> $env:GITHUB_ENV
 
@@ -64,7 +64,7 @@ jobs:
             Write-Host "Signing: $($_.FullName)"
             & $env:SIGNTOOL sign `
               /f $env:PFX_PATH `
-              /p "testpassword" `
+              /p "1d4cbcfd39a6560c5edabc499725ed1e7d4a7d6d72266803c91398821e06b744" `
               /fd SHA256 `
               /tr http://timestamp.digicert.com `
               /td SHA256 `

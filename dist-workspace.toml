@@ -28,4 +28,4 @@ windows-archive = ".zip"
 install-success-msg = ""
 
 [dist.github-custom-runners]
-aarch64-pc-windows-msvc = "windows-2022"
+aarch64-pc-windows-msvc = "windows-2022" # azure/artifact-signing-action doesn't run on ARM, so we need to cross-compile bt.exe for ARM64 and sign it on windows amd64
