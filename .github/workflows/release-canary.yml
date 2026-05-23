@@ -111,9 +111,8 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
-    # Only claim the release env on main so the OIDC token's subject matches
-    # the AAD federated credential. Other branches get no env, no env secrets,
-    # and skip signing.
+    # OIDC token subject must match the AAD federated credential, which is
+    # scoped to the `release` environment — only claim it on main.
     environment: ${{ github.ref == 'refs/heads/main' && 'release' || '' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
