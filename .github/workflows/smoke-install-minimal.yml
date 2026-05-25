@@ -20,6 +20,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -54,9 +55,20 @@ jobs:
             exit 1
           fi
 
+      - name: Download release metadata
+        if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.name == 'release' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/release-metadata
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - id: resolve
         name: Resolve release tag and repo
         shell: sh
+        env:
+          RELEASE_TAG_FILE: ${{ runner.temp }}/release-metadata/release-tag.txt
         run: |
           set -eu
 
@@ -72,9 +84,18 @@ jobs:
             branch="${HEAD_BRANCH:-}"
             sha="${HEAD_SHA:-}"
 
+            if [ -z "$sha" ]; then
+              echo "Failed to resolve triggering workflow SHA."
+              exit 1
+            fi
+
             case "$workflow" in
               release)
-                tag="$branch"
+                if [ ! -s "$RELEASE_TAG_FILE" ]; then
+                  echo "Release metadata artifact did not contain release-tag.txt"
+                  exit 1
+                fi
+                tag=$(head -n 1 "$RELEASE_TAG_FILE")
                 ;;
               release-canary)
                 short_sha=$(printf '%s' "$sha" | cut -c1-12)
