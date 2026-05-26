@@ -23,6 +23,12 @@
 
 - This repo is managed with `mise` and `pre-commit`; prefer using the repo-defined toolchain and hooks when running local validation.
 
+## Privacy and Test Data
+
+- Do not add real customer, organization, profile, project, function, dataset, experiment, or user names/IDs to tests, fixtures, docs, examples, snapshots, or committed files.
+- Use synthetic placeholders instead, for example `test-profile`, `test-org`, `test-project`, `fn_test_topic_map`, or UUIDs clearly marked as fake.
+- If a user-provided command includes real identifiers, do not copy them into code or tests; translate them to synthetic values before writing files.
+
 ## CLI Implementation Conventions
 
 - Follow existing resource-command patterns before adding new structure; `projects/` is a good reference for module layout and command dispatch.
