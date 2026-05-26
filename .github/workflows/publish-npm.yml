@@ -1,0 +1,102 @@
+name: publish-npm
+
+# Publishes @braintrust/cli (wrapper) and its @braintrust/cli-<platform>
+# optional-dependency packages to npm using the archives attached to a GitHub
+# Release by the `release` workflow.
+#
+# Triggers:
+#   - automatically after `release` workflow concludes successfully on a tag,
+#   - manually via workflow_dispatch with an explicit tag.
+
+on:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.9.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required for npm --provenance
+
+jobs:
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: npm-publish
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            # Pull the tag from the artifact uploaded by release.yml's `plan` job.
+            run_id="${{ github.event.workflow_run.id }}"
+            gh run download "$run_id" -n release-metadata -D /tmp/release-metadata
+            tag="$(cat /tmp/release-metadata/release-tag.txt)"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release archives
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p archives
+          # Each cargo-dist archive is named bt-<target>.<ext>. Grab only those.
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'bt-*.tar.gz' \
+            --pattern 'bt-*.zip' \
+            --dir archives
+          ls -la archives
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build npm packages
+        run: |
+          node npm/scripts/build-platform-packages.mjs \
+            --version "${{ steps.tag.outputs.version }}" \
+            --archives-dir archives \
+            --out-dir npm/dist
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Publish platform packages first so the wrapper's optionalDependencies
+          # resolve when consumers install it.
+          for dir in npm/dist/cli-*; do
+            echo "Publishing $dir"
+            (cd "$dir" && npm publish --access public --provenance)
+          done
+
+      - name: Publish wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm/dist/cli
+          npm publish --access public --provenance
