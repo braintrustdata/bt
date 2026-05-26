@@ -6,7 +6,10 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use dialoguer::console;
 
-use crate::ui::{print_with_pager, with_spinner};
+use crate::{
+    ui::{print_with_pager, with_spinner},
+    utils::parse_duration_to_seconds,
+};
 
 use super::{
     api::{self, TopicAutomationStatus, TopicRuntimeSnapshot, TopicsStatusReport},
@@ -22,11 +25,18 @@ pub async fn run(ctx: &ResolvedContext, args: StatusArgs, json: bool) -> Result<
         bail!("--watch is not supported with --json");
     }
 
+    let progress_window_seconds = resolve_progress_window_seconds(args.progress_window.as_deref())?;
+    let include_progress = args.full || progress_window_seconds.is_some();
+
     if args.watch {
-        return watch(ctx, args.full).await;
+        return watch(ctx, args.full, include_progress, progress_window_seconds).await;
     }
 
-    let report = with_spinner("Loading Topics status...", api::fetch_topics_status(ctx)).await?;
+    let report = with_spinner(
+        "Loading Topics status...",
+        api::fetch_topics_status(ctx, include_progress, progress_window_seconds),
+    )
+    .await?;
     if json {
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
@@ -37,7 +47,12 @@ pub async fn run(ctx: &ResolvedContext, args: StatusArgs, json: bool) -> Result<
     Ok(())
 }
 
-async fn watch(ctx: &ResolvedContext, full: bool) -> Result<()> {
+async fn watch(
+    ctx: &ResolvedContext,
+    full: bool,
+    include_progress: bool,
+    progress_window_seconds: Option<i64>,
+) -> Result<()> {
     let is_tty = io::stdout().is_terminal();
     let mut first_frame = true;
     let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -50,7 +65,7 @@ async fn watch(ctx: &ResolvedContext, full: bool) -> Result<()> {
                 }
                 break;
             }
-            report = api::fetch_topics_status(ctx) => report?,
+            report = api::fetch_topics_status(ctx, include_progress, progress_window_seconds) => report?,
         };
         let output = render_report(&report, full);
 
@@ -79,6 +94,19 @@ async fn watch(ctx: &ResolvedContext, full: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_progress_window_seconds(value: Option<&str>) -> Result<Option<i64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let seconds = parse_duration_to_seconds(value)?;
+    if seconds == 0 {
+        bail!("progress window must be greater than zero");
+    }
+    let seconds =
+        i64::try_from(seconds).map_err(|_| anyhow::anyhow!("progress window is too large"))?;
+    Ok(Some(seconds))
 }
 
 fn render_report(report: &TopicsStatusReport, full: bool) -> String {
@@ -130,19 +158,26 @@ fn write_automation_summary(
     if let Some(error) = format_last_error_summary(automation) {
         writeln!(output, "{error}")?;
     }
-    writeln!(
-        output,
-        "coverage: {}",
-        format_coverage_summary(automation, &progress_window)
-    )?;
-    writeln!(output, "labels: {}", format_label_summary(automation))?;
+    if automation.progress_loaded {
+        writeln!(
+            output,
+            "coverage: {}",
+            format_coverage_summary(automation, &progress_window)
+        )?;
+        writeln!(output, "labels: {}", format_label_summary(automation))?;
+    } else {
+        writeln!(
+            output,
+            "progress: not loaded (run `bt topics status --full` or set `--progress-window` for trace counts)"
+        )?;
+    }
     writeln!(
         output,
         "facets: {}",
         format_facet_processing_status(automation)
     )?;
 
-    if !automation.facets.is_empty() && automation.total_traces > 0 {
+    if automation.progress_loaded && !automation.facets.is_empty() && automation.total_traces > 0 {
         writeln!(output)?;
         writeln!(output, "facet progress:")?;
         for line in render_progress_lines(
@@ -160,7 +195,7 @@ fn write_automation_summary(
             writeln!(output, "{line}")?;
         }
     }
-    if !automation.topics.is_empty() && automation.total_traces > 0 {
+    if automation.progress_loaded && !automation.topics.is_empty() && automation.total_traces > 0 {
         writeln!(output)?;
         writeln!(output, "topic progress:")?;
         for line in render_progress_lines(
@@ -318,29 +353,35 @@ fn render_transition_requirements(
             lines
         }
         "backfilling_topic_classifications" => {
-            let eligible = automation
-                .topics
-                .iter()
-                .map(|item| item.matched_count)
-                .sum::<usize>();
-            let checked = automation
-                .topics
-                .iter()
-                .map(|item| item.checked_count)
-                .sum::<usize>();
-            let labeled = automation
-                .topics
-                .iter()
-                .map(|item| item.completed_count)
-                .sum::<usize>();
-            let mut lines = vec![
-                "  - segment replay must catch up through the recompute snapshot".to_string(),
+            let label_progress = if automation.progress_loaded {
+                let eligible = automation
+                    .topics
+                    .iter()
+                    .map(|item| item.matched_count)
+                    .sum::<usize>();
+                let checked = automation
+                    .topics
+                    .iter()
+                    .map(|item| item.checked_count)
+                    .sum::<usize>();
+                let labeled = automation
+                    .topics
+                    .iter()
+                    .map(|item| item.completed_count)
+                    .sum::<usize>();
                 format!(
                     "  - current replay progress: {}/{} checked ({} labeled)",
                     format_count(checked),
                     format_count(eligible),
                     format_count(labeled)
-                ),
+                )
+            } else {
+                "  - current replay progress: not loaded; run `bt topics status --full` or set `--progress-window` for trace counts"
+                    .to_string()
+            };
+            let mut lines = vec![
+                "  - segment replay must catch up through the recompute snapshot".to_string(),
+                label_progress,
                 format!(
                     "  - pending segments: {}",
                     automation.cursor.pending_segments
@@ -577,7 +618,8 @@ fn format_reason(reason: &str) -> String {
 
 fn format_progress_window_label(automation: &TopicAutomationStatus) -> String {
     automation
-        .window_seconds
+        .progress_window_seconds
+        .or(automation.window_seconds)
         .or_else(|| {
             automation
                 .object_cursor
@@ -585,7 +627,17 @@ fn format_progress_window_label(automation: &TopicAutomationStatus) -> String {
                 .as_ref()
                 .and_then(|runtime| runtime.selected_window_seconds)
         })
-        .map(|seconds| format!("{} topic window", format_duration_compact(Some(seconds))))
+        .map(|seconds| {
+            let prefix = if automation.progress_loaded
+                && automation.progress_window_seconds.is_some()
+                && automation.progress_window_seconds != automation.window_seconds
+            {
+                "status window"
+            } else {
+                "topic window"
+            };
+            format!("{} {prefix}", format_duration_compact(Some(seconds)))
+        })
         .unwrap_or_else(|| "current topic window".to_string())
 }
 
@@ -758,6 +810,10 @@ mod tests {
     }
 
     fn sample_report() -> TopicsStatusReport {
+        sample_report_with_progress(true)
+    }
+
+    fn sample_report_with_progress(progress_loaded: bool) -> TopicsStatusReport {
         TopicsStatusReport {
             project: TopicsProjectSummary {
                 id: "proj_123".to_string(),
@@ -778,6 +834,8 @@ mod tests {
                 idle_seconds: Some(600),
                 configured_facets: 3,
                 configured_topic_maps: 2,
+                progress_loaded,
+                progress_window_seconds: progress_loaded.then_some(86400),
                 processing_lag_label: Some("4m behind".to_string()),
                 processing_lag_seconds: Some(240),
                 total_traces: 1010,
@@ -906,20 +964,20 @@ mod tests {
     }
 
     #[test]
-    fn compact_report_includes_summary_details() {
-        let output = strip_ansi(&render_report(&sample_report(), false));
+    fn compact_report_skips_trace_counts_when_progress_is_not_loaded() {
+        let output = strip_ansi(&render_report(&sample_report_with_progress(false), false));
         assert!(output.contains("Project:"));
         assert!(!output.contains("Topic automations: 1"));
         assert!(output.contains("demo-project (proj_123)"));
         assert!(output.contains("status: idle"));
-        assert!(output
-            .contains("coverage: 1,004/1,010 traces have facet labels in the 1d topic window"));
-        assert!(output.contains("labels: 920/1,076 considered | 698 labeled"));
+        assert!(output.contains(
+            "progress: not loaded (run `bt topics status --full` or set `--progress-window` for trace counts)"
+        ));
         assert!(output.contains("facets: "));
-        assert!(output.contains("facet progress:"));
-        assert!(output.contains("topic progress:"));
-        assert!(output.contains("considered | matched | running | errors"));
-        assert!(output.contains("considered | labeled | running | errors"));
+        assert!(!output.contains("coverage: 1,004/1,010 traces"));
+        assert!(!output.contains("labels: 920/1,076 considered"));
+        assert!(!output.contains("facet progress:"));
+        assert!(!output.contains("topic progress:"));
         assert!(!output.contains("processing:"));
         assert!(!output.contains("state machine:"));
     }
@@ -927,6 +985,13 @@ mod tests {
     #[test]
     fn full_report_includes_diagnostics_and_flow() {
         let output = strip_ansi(&render_report(&sample_report(), true));
+        assert!(output
+            .contains("coverage: 1,004/1,010 traces have facet labels in the 1d topic window"));
+        assert!(output.contains("labels: 920/1,076 considered | 698 labeled"));
+        assert!(output.contains("facet progress:"));
+        assert!(output.contains("topic progress:"));
+        assert!(output.contains("considered | matched | running | errors"));
+        assert!(output.contains("considered | labeled | running | errors"));
         assert!(output.contains("details:"));
         assert!(output.contains("  scope: trace"));
         assert!(output.contains("  state since: "));
@@ -1001,6 +1066,31 @@ mod tests {
         let report = sample_report();
         let label = format_progress_window_label(&report.automations[0]);
         assert_eq!(label, "1d topic window");
+    }
+
+    #[test]
+    fn progress_window_label_mentions_status_window_when_capped() {
+        let mut report = sample_report();
+        let automation = report.automations.first_mut().expect("automation");
+        automation.window_seconds = Some(7 * 24 * 60 * 60);
+        automation.progress_window_seconds = Some(24 * 60 * 60);
+
+        let label = format_progress_window_label(automation);
+        assert_eq!(label, "1d status window");
+    }
+
+    #[test]
+    fn resolve_progress_window_seconds_accepts_duration() {
+        assert_eq!(
+            resolve_progress_window_seconds(Some("7d")).expect("window"),
+            Some(7 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn resolve_progress_window_seconds_rejects_zero() {
+        let error = resolve_progress_window_seconds(Some("0")).expect_err("expected error");
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]
