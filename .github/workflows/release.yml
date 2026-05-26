@@ -488,3 +488,62 @@ jobs:
           & $btExe --version
           $env:PATH = "$binDir;$env:PATH"
           & $btExe self update --check --channel stable
+
+  publish-npm:
+    needs:
+      - plan
+      - announce
+    if: ${{ needs.announce.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download release archives
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p archives
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'bt-*.tar.gz' \
+            --pattern 'bt-*.zip' \
+            --dir archives
+          ls -la archives
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build npm packages
+        run: |
+          node npm/scripts/build-platform-packages.mjs \
+            --version "${{ needs.plan.outputs.release-version }}" \
+            --archives-dir archives \
+            --out-dir npm/dist
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in npm/dist/bt-*; do
+            echo "Publishing $dir"
+            (cd "$dir" && npm publish --access public --provenance)
+          done
+
+      - name: Publish wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          cd npm/dist/bt
+          npm publish --access public --provenance
