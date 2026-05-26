@@ -228,7 +228,8 @@ struct RunnerFilter {
 //                          body plus a fire-and-forget `main().catch(...)`
 //                          appended. Generated at materialization time so the
 //                          impl source stays the single point of truth.
-//   eval-runner.mts      — vite-node only. Two-line wrapper that imports
+//   eval-runner-vite-node.mts
+//                        — vite-node only. Two-line wrapper that imports
 //                          `main` from a sibling `eval-runner-impl.ts` and
 //                          awaits it via top-level await, keeping vite-node's
 //                          wrapper pending until the work is done.
@@ -240,10 +241,10 @@ struct RunnerFilter {
 // for non-vite-node runners, the import only exists in the vite-node `.mts`,
 // where we control the loader.
 const JS_RUNNER_DEFAULT_FILE: &str = "eval-runner.ts";
-const JS_RUNNER_VITE_NODE_FILE: &str = "eval-runner.mts";
+const JS_RUNNER_VITE_NODE_FILE: &str = "eval-runner-vite-node.mts";
 const JS_RUNNER_IMPL_FILE: &str = "eval-runner-impl.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
-const JS_RUNNER_VITE_NODE_SOURCE: &str = include_str!("../scripts/eval-runner.mts");
+const JS_RUNNER_VITE_NODE_SOURCE: &str = include_str!("../scripts/eval-runner-vite-node.mts");
 const JS_RUNNER_IMPL_SOURCE: &str = include_str!("../scripts/eval-runner-impl.ts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 // Appended to the impl source to produce the standalone default `.ts` entry.
@@ -2590,7 +2591,7 @@ fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> 
 /// synchronous top-level returns. The default `.ts` entry uses fire-and-forget,
 /// so under vite-node specifically we swap to the `.mts` entry that wraps
 /// `main()` in top-level await and keeps the wrapper pending until the work
-/// is done. See `scripts/eval-runner.mts` for the full annotation.
+/// is done. See `scripts/eval-runner-vite-node.mts` for the full annotation.
 fn js_runner_path_for_kind(default_path: &Path, kind: RunnerKind) -> PathBuf {
     if matches!(kind, RunnerKind::ViteNode) {
         default_path.with_file_name(JS_RUNNER_VITE_NODE_FILE)
@@ -4490,7 +4491,7 @@ mod tests {
         );
 
         // The vite-node entry must use TLA so vite-node's CLI waits for main()
-        // before tearing down its dev server. See scripts/eval-runner.mts.
+        // before tearing down its dev server. See scripts/eval-runner-vite-node.mts.
         assert!(
             JS_RUNNER_VITE_NODE_SOURCE.contains("await main()"),
             "vite-node entry must await main() at the top level"
