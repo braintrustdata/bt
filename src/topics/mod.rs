@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use std::path::PathBuf;
 
 use crate::{args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode};
 
@@ -8,6 +9,7 @@ mod config;
 mod formatting;
 mod open;
 mod poke;
+mod report;
 mod rewind;
 mod status;
 
@@ -25,6 +27,8 @@ Examples:
   bt topics config delete
   bt topics config set --topic-window 1h --generation-cadence 1d
   bt topics config topic-map set Task --embedding-model brain-embedding-1
+  bt topics report fn_123
+  bt topics report fn_123 --version 0000000000000001
   bt topics poke
   bt topics rewind 7d
   bt topics open
@@ -44,6 +48,8 @@ enum TopicsCommands {
     Poke,
     /// Rewind recent Topics history and queue it to reprocess
     Rewind(RewindArgs),
+    /// Download a saved topic map report JSON file
+    Report(ReportArgs),
     /// Open the Topics page in the browser
     Open,
 }
@@ -244,11 +250,49 @@ struct RewindArgs {
     topic_window: String,
 }
 
+#[derive(Debug, Clone, Args)]
+struct ReportArgs {
+    /// Topic map function ID
+    #[arg(value_name = "FUNCTION_ID")]
+    function_id_positional: Option<String>,
+
+    /// Topic map function ID
+    #[arg(long = "id", env = "BT_TOPICS_REPORT_FUNCTION_ID")]
+    id: Option<String>,
+
+    /// Specific topic map version/xact ID
+    #[arg(long, env = "BT_TOPICS_REPORT_VERSION")]
+    version: Option<String>,
+
+    /// Output file path. Omit to write the report JSON to stdout.
+    #[arg(long, env = "BT_TOPICS_REPORT_OUTPUT")]
+    output: Option<PathBuf>,
+}
+
+impl ReportArgs {
+    fn function_id(&self) -> Result<&str> {
+        match (self.function_id_positional.as_deref(), self.id.as_deref()) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("use either --id or a positional function id, not both")
+            }
+            (Some(id), None) | (None, Some(id)) => Ok(id),
+            (None, None) => {
+                anyhow::bail!("topic map function id required. Use: bt topics report <function-id>")
+            }
+        }
+    }
+}
+
 pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
+    if let Some(TopicsCommands::Report(report_args)) = args.command.as_ref() {
+        return report::run(&base, report_args, base.json).await;
+    }
+
     let read_only = match args.command.as_ref() {
         None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
         Some(TopicsCommands::Config(config_args)) => config_args.command.is_none(),
         Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
+        Some(TopicsCommands::Report(_)) => unreachable!("handled before project resolution"),
     };
     let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
@@ -302,6 +346,7 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         Some(TopicsCommands::Rewind(rewind_args)) => {
             rewind::run(&ctx, &rewind_args, base.json).await
         }
+        Some(TopicsCommands::Report(_)) => unreachable!("handled before project resolution"),
         Some(TopicsCommands::Open) => open::run(&ctx).await,
     }
 }
@@ -337,6 +382,7 @@ mod tests {
             None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
             Some(TopicsCommands::Config(config_args)) => config_args.command.is_none(),
             Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
+            Some(TopicsCommands::Report(_)) => true,
         }
     }
 
@@ -357,6 +403,9 @@ mod tests {
 
         let parsed = parse(&["topics", "open"]).expect("parse");
         assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let parsed = parse(&["topics", "report", "fn_123"]).expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
     }
 
     #[test]
@@ -369,6 +418,46 @@ mod tests {
     fn topics_rewind_uses_validated_auth() {
         let parsed = parse(&["topics", "rewind", "7d"]).expect("parse");
         assert!(!topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
+    fn topics_report_parses_function_id_version_and_output() {
+        let parsed = parse(&[
+            "topics",
+            "report",
+            "--id",
+            "fn_123",
+            "--version",
+            "0000000000000001",
+            "--output",
+            "report.json",
+        ])
+        .expect("parse");
+
+        let Some(TopicsCommands::Report(args)) = parsed.command.as_ref() else {
+            panic!("expected report command");
+        };
+        assert_eq!(args.function_id().expect("function id"), "fn_123");
+        assert_eq!(args.version.as_deref(), Some("0000000000000001"));
+        assert_eq!(
+            args.output.as_deref(),
+            Some(std::path::Path::new("report.json"))
+        );
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
+    fn topics_report_accepts_id_flag_without_output() {
+        let parsed = parse(&["topics", "report", "--id", "fn_test_topic_map"]).expect("parse");
+
+        let Some(TopicsCommands::Report(args)) = parsed.command.as_ref() else {
+            panic!("expected report command");
+        };
+        assert_eq!(
+            args.function_id().expect("function id"),
+            "fn_test_topic_map"
+        );
+        assert_eq!(args.output, None);
     }
 
     #[test]

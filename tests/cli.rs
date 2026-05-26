@@ -80,6 +80,24 @@ fn setup_verbose_is_accepted_after_subcommand() {
 }
 
 #[test]
+fn topics_report_help_accepts_global_org_short_conflict_free() {
+    bt_command()
+        .args([
+            "topics",
+            "report",
+            "--profile",
+            "test-profile",
+            "--id",
+            "fn_123",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--id"))
+        .stdout(predicate::str::contains("--output"));
+}
+
+#[test]
 fn status_quiet_and_verbose_conflict() {
     bt_command()
         .args(["status", "--quiet", "--verbose"])

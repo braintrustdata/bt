@@ -114,8 +114,9 @@ struct MockDatasetSnapshot {
     created: String,
 }
 
-type MockDatasetRows = BTreeMap<String, Map<String, Value>>;
-type MockDatasetRowsByDataset = BTreeMap<String, MockDatasetRows>;
+type MockDatasetRow = Map<String, Value>;
+type MockDatasetRowsById = BTreeMap<String, MockDatasetRow>;
+type MockDatasetRowsByDataset = BTreeMap<String, MockDatasetRowsById>;
 
 #[derive(Debug)]
 struct MockServerState {

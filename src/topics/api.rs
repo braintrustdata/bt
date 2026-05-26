@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
@@ -53,6 +53,18 @@ pub struct TopicsDeleteReport {
 pub struct TopicMapConfigUpdate {
     pub automation: TopicAutomationConfig,
     pub topic_map_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TopicMapReportUrlRequest<'a> {
+    function_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TopicMapReportUrl {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -691,6 +703,11 @@ pub async fn update_topic_map_config(
     )
     .await?;
 
+    if let Some(source_facet) = patch.source_facet.as_deref() {
+        validate_topic_map_source_facet(&ctx.client, &resolved, &mut function_cache, source_facet)
+            .await?;
+    }
+
     let function_row =
         load_function_row(&ctx.client, &mut function_cache, &resolved.function_id).await?;
     let mut function_data = function_row
@@ -818,6 +835,18 @@ pub fn topics_url(app_url: &str, org_name: &str, project_name: &str) -> String {
         encode(org_name),
         encode(project_name)
     )
+}
+
+pub async fn fetch_topic_map_report_url(
+    client: &ApiClient,
+    function_id: &str,
+    version: Option<&str>,
+) -> Result<TopicMapReportUrl> {
+    let request = TopicMapReportUrlRequest {
+        function_id,
+        version,
+    };
+    client.post("/topic-map-report-url", &request).await
 }
 
 fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> Result<String> {
@@ -1038,6 +1067,43 @@ async fn list_topic_automation_rows(client: &ApiClient, project_id: &str) -> Res
         })
         .cloned()
         .collect())
+}
+
+async fn validate_topic_map_source_facet(
+    client: &ApiClient,
+    resolved: &ResolvedTopicMapTarget,
+    function_cache: &mut HashMap<String, Value>,
+    source_facet: &str,
+) -> Result<()> {
+    let config = resolved
+        .automation_row
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let facets =
+        summarize_function_refs(client, function_cache, config.get("facet_functions")).await?;
+
+    if facets.iter().any(|facet| facet.name == source_facet) {
+        return Ok(());
+    }
+
+    let available = facets
+        .iter()
+        .map(|facet| facet.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let automation_name =
+        string_value(resolved.automation_row.get("name")).unwrap_or_else(|| "Topics".to_string());
+
+    let detail = if available.is_empty() {
+        "this automation has no configured facets".to_string()
+    } else {
+        format!("available facets: {available}")
+    };
+    bail!(
+        "source facet '{source_facet}' was not found in topic automation '{automation_name}'; {detail}"
+    )
 }
 
 async fn create_topic_map_function_refs(
@@ -2226,6 +2292,29 @@ mod tests {
         assert_eq!(
             topics_url("https://www.example.com", "test org", "my project"),
             "https://www.example.com/app/test%20org/p/my%20project/topics"
+        );
+    }
+
+    #[test]
+    fn topic_map_report_url_request_matches_endpoint_shape() {
+        let without_version = serde_json::to_value(TopicMapReportUrlRequest {
+            function_id: "fn_123",
+            version: None,
+        })
+        .expect("serialize report url request");
+        assert_eq!(without_version, json!({ "function_id": "fn_123" }));
+
+        let with_version = serde_json::to_value(TopicMapReportUrlRequest {
+            function_id: "fn_123",
+            version: Some("0000000000000001"),
+        })
+        .expect("serialize report url request");
+        assert_eq!(
+            with_version,
+            json!({
+                "function_id": "fn_123",
+                "version": "0000000000000001",
+            })
         );
     }
 
