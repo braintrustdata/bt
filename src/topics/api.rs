@@ -2114,13 +2114,31 @@ fn status_progress_time_filter_clause(
 ) -> Option<(String, i64)> {
     let window_seconds = match progress_window_seconds_override {
         Some(window_seconds) => window_seconds,
-        None => backfill_time_range_to_window_seconds(backfill_time_range)
-            .or(runtime_window_seconds)
-            .map(cap_status_progress_window_seconds)?,
+        None => {
+            if let Some(absolute_filter) = absolute_time_filter_clause(backfill_time_range) {
+                return Some(absolute_filter);
+            }
+            backfill_time_range_to_window_seconds(backfill_time_range)
+                .or(runtime_window_seconds)
+                .map(cap_status_progress_window_seconds)?
+        }
     };
     Some((
         created_time_filter_clause_from_window_seconds(Some(window_seconds))?,
         window_seconds,
+    ))
+}
+
+fn absolute_time_filter_clause(value: Option<&Value>) -> Option<(String, i64)> {
+    let value = value?;
+    let map = value.as_object()?;
+    let from_raw = map.get("from")?.as_str()?;
+    let to_raw = map.get("to")?.as_str()?;
+    let from = from_raw.replace('\'', "''");
+    let to = to_raw.replace('\'', "''");
+    Some((
+        format!("created >= '{from}' AND created <= '{to}'"),
+        backfill_time_range_to_window_seconds(Some(value))?,
     ))
 }
 
@@ -2338,6 +2356,22 @@ mod tests {
             Some((
                 "created >= NOW() - INTERVAL 604800 SECOND".to_string(),
                 604800
+            ))
+        );
+    }
+
+    #[test]
+    fn status_progress_time_filter_preserves_absolute_ranges() {
+        let range = json!({
+            "from": "2026-04-13T10:00:00Z",
+            "to": "2026-04-13T11:30:00Z",
+        });
+        assert_eq!(
+            status_progress_time_filter_clause(Some(&range), None, None),
+            Some((
+                "created >= '2026-04-13T10:00:00Z' AND created <= '2026-04-13T11:30:00Z'"
+                    .to_string(),
+                5400
             ))
         );
     }
