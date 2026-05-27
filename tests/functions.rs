@@ -177,6 +177,7 @@ fn sanitized_env_keys() -> &'static [&'static str] {
         "BT_FUNCTIONS_PUSH_REQUIREMENTS",
         "BT_FUNCTIONS_PUSH_TSCONFIG",
         "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+        "BT_FUNCTIONS_VIEW_ID",
         "BT_FUNCTIONS_PULL_OUTPUT_DIR",
         "BT_FUNCTIONS_PULL_PROJECT_ID",
         "BT_FUNCTIONS_PULL_PROJECT_NAME",
@@ -1373,7 +1374,7 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
     std::fs::write(framework_dir.join("__init__.py"), "").expect("write framework __init__");
     std::fs::write(
         framework_dir.join("global_.py"),
-        "functions = []\nprompts = []\n",
+        "functions = []\nprompts = []\nparameters = []\n",
     )
     .expect("write global_.py");
     std::fs::write(
@@ -1385,7 +1386,9 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
     let sample_path = tmp.path().join("sample_tool.py");
     std::fs::write(
         &sample_path,
-        r#"from braintrust.framework2.global_ import functions
+        r#"from braintrust.framework2.global_ import functions, parameters
+
+print("import noise")
 
 class TypeEnum:
     value = "tool"
@@ -1404,6 +1407,22 @@ class Item:
         self.preview = "def handler(x):\n    return x"
 
 functions.append(Item())
+
+class ParameterItem:
+    def __init__(self):
+        self.project = "My Project"
+
+    def to_function_definition(self, _if_exists, resolver):
+        return {
+            "project_id": resolver.get(self.project),
+            "name": "py-parameters",
+            "slug": "py-parameters",
+            "function_type": "parameters",
+            "function_data": {"type": "parameters", "data": {}, "__schema": {}},
+            "if_exists": _if_exists,
+        }
+
+parameters.append(ParameterItem())
 "#,
     )
     .expect("write sample_tool.py");
@@ -1428,6 +1447,11 @@ functions.append(Item())
         let stderr = String::from_utf8_lossy(&output.stderr);
         panic!("python functions runner failed:\n{stderr}");
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("import noise"),
+        "import-time stdout should be redirected to stderr"
+    );
 
     let manifest: Value = serde_json::from_slice(&output.stdout).expect("parse manifest JSON");
     assert_eq!(
@@ -1462,8 +1486,12 @@ functions.append(Item())
         .get("entries")
         .and_then(Value::as_array)
         .expect("entries array");
-    assert_eq!(entries.len(), 1, "expected one code entry");
-    let entry = entries[0].as_object().expect("entry object");
+    assert_eq!(entries.len(), 2, "expected code and parameter entries");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some("code"))
+        .and_then(Value::as_object)
+        .expect("code entry object");
     assert_eq!(entry.get("kind").and_then(Value::as_str), Some("code"));
     assert_eq!(entry.get("name").and_then(Value::as_str), Some("py-tool"));
     assert_eq!(entry.get("slug").and_then(Value::as_str), Some("py-tool"));
@@ -1474,6 +1502,35 @@ functions.append(Item())
     assert_eq!(
         entry.get("preview").and_then(Value::as_str),
         Some("def handler(x):\n    return x")
+    );
+    let parameter_entry = entries
+        .iter()
+        .find(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some("function_event")
+                && entry
+                    .get("event")
+                    .and_then(|event| event.get("slug"))
+                    .and_then(Value::as_str)
+                    == Some("py-parameters")
+        })
+        .expect("parameter function_event entry");
+    assert_eq!(
+        parameter_entry.get("project_name").and_then(Value::as_str),
+        Some("My Project")
+    );
+    assert_eq!(
+        parameter_entry
+            .get("event")
+            .and_then(|event| event.get("function_type"))
+            .and_then(Value::as_str),
+        Some("parameters")
+    );
+    assert!(
+        parameter_entry
+            .get("event")
+            .and_then(|event| event.get("if_exists"))
+            .is_none(),
+        "unset parameter if_exists should be omitted so CLI fallback applies"
     );
 
     let bundle = file
@@ -2196,6 +2253,72 @@ exit 24
                 .expect("tsconfig path should be valid UTF-8 for test")
         )),
         "uploaded bundle should include tsconfig marker emitted by bundler path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_view_by_positional_id_does_not_require_project_context() {
+    let state = Arc::new(MockServerState::default());
+    state
+        .pull_rows
+        .lock()
+        .expect("pull rows lock")
+        .push(serde_json::json!({
+            "id": "fn_123",
+            "name": "Doc Search",
+            "slug": "doc-search",
+            "project_id": "proj_mock",
+            "description": "Search docs",
+            "function_type": "tool",
+            "function_data": { "type": "code", "data": { "type": "inline", "code": "export default async function handler() {}" } },
+            "_xact_id": "0000000000000001"
+        }));
+
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tempdir().expect("config dir");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args(["functions", "--json", "view", "fn_123"])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env("BRAINTRUST_NO_INPUT", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_DEFAULT_PROJECT")
+        .env_remove("BT_FUNCTIONS_VIEW_ID")
+        .output()
+        .expect("run bt functions view fn_123");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock view by id failed:\n{stderr}");
+    }
+
+    let function: Value = serde_json::from_slice(&output.stdout).expect("parse function JSON");
+    assert_eq!(function["id"].as_str(), Some("fn_123"));
+    assert_eq!(function["slug"].as_str(), Some("doc-search"));
+
+    let requests = state.requests.lock().expect("requests lock").clone();
+    assert!(
+        requests
+            .iter()
+            .any(|entry| entry == "/v1/function?ids=fn_123"),
+        "view request should fetch the function by id, got {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|entry| entry.starts_with("/v1/project")),
+        "view by id should not resolve project context, got {requests:?}"
     );
 }
 

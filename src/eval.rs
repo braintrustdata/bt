@@ -210,10 +210,45 @@ struct RunnerFilter {
     pattern: String,
 }
 
-const JS_RUNNER_FILE: &str = "eval-runner.ts";
+// vite-node's CLI has a unique lifecycle: it `await runner.executeFile(file)`
+// and then immediately `await server.close()`. `executeFile` resolves the
+// moment vite-node's async wrapper around the entry body resolves — which is
+// immediately if the body uses fire-and-forget. Any in-flight dynamic imports
+// inside `main()` then race against `server.close()` and throw
+// ERR_CLOSED_SERVER. Every other supported runner (tsx, bun, deno, ts-node,
+// plain Node) has Node-style event-loop semantics where fire-and-forget at the
+// top level is the natural pattern.
+//
+// So bt ships two entry shapes:
+//
+//   eval-runner.ts       — default. Standalone: the full `eval-runner-impl.ts`
+//                          body plus a fire-and-forget `main().catch(...)`
+//                          appended. Generated at materialization time so the
+//                          impl source stays the single point of truth.
+//   eval-runner-vite-node.mts
+//                        — vite-node only. Two-line wrapper that imports
+//                          `main` from a sibling `eval-runner-impl.ts` and
+//                          awaits it via top-level await, keeping vite-node's
+//                          wrapper pending until the work is done.
+//
+// The default `.ts` is standalone (no import) because a shared impl file would
+// force a cross-runner import-extension conflict: Deno requires explicit `.ts`
+// extensions in import paths, while ts-node 10.x rejects them by default
+// (TS5097 unless `allowImportingTsExtensions`). With the impl appended inline
+// for non-vite-node runners, the import only exists in the vite-node `.mts`,
+// where we control the loader.
+const JS_RUNNER_DEFAULT_FILE: &str = "eval-runner.ts";
+const JS_RUNNER_VITE_NODE_FILE: &str = "eval-runner-vite-node.mts";
+const JS_RUNNER_IMPL_FILE: &str = "eval-runner-impl.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
-const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
+const JS_RUNNER_VITE_NODE_SOURCE: &str = include_str!("../scripts/eval-runner-vite-node.mts");
+const JS_RUNNER_IMPL_SOURCE: &str = include_str!("../scripts/eval-runner-impl.ts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
+// Appended to the impl source to produce the standalone default `.ts` entry.
+// `main` is `export async function main()` in the impl, but it's still callable
+// from within the same file via the local binding.
+const JS_RUNNER_FIRE_AND_FORGET_ENTRY: &str =
+    "\nmain().catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n";
 const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -2327,6 +2362,7 @@ fn build_js_plan(
         }
         let kind = runner_kind_for_bin(resolved_runner.as_ref());
         let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
+        let runner_script = js_runner_path_for_kind(&runner_script, kind);
         let mut command = Command::new(resolved_runner);
         command.arg(runner_script).args(files);
         return Ok(JsRunnerPlan { cmd: command, kind });
@@ -2342,6 +2378,7 @@ fn build_js_plan(
         }
         let kind = runner_kind_for_bin(auto_runner.as_ref());
         let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
+        let runner_script = js_runner_path_for_kind(&runner_script, kind);
         let mut command = Command::new(auto_runner);
         command.arg(runner_script).args(files);
         return Ok(JsRunnerPlan { cmd: command, kind });
@@ -2449,13 +2486,41 @@ fn is_deno_runner(runner: &str) -> bool {
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
     if js_runner::is_ts_node_runner_path(runner_command) {
+        // ts-node resolves modules relative to the cwd's node_modules, so the
+        // runner must live inside the project tree.
         return prepare_js_runner_in_cwd();
     }
     Ok(default_runner.to_path_buf())
 }
 
+/// vite-node's CLI tears down its dev server the moment `runner.executeFile`
+/// resolves, and its module wrapper resolves the instant the entry body's
+/// synchronous top-level returns. The default `.ts` entry uses fire-and-forget,
+/// so under vite-node specifically we swap to the `.mts` entry that wraps
+/// `main()` in top-level await and keeps the wrapper pending until the work
+/// is done. See `scripts/eval-runner-vite-node.mts` for the full annotation.
+fn js_runner_path_for_kind(default_path: &Path, kind: RunnerKind) -> PathBuf {
+    if matches!(kind, RunnerKind::ViteNode) {
+        default_path.with_file_name(JS_RUNNER_VITE_NODE_FILE)
+    } else {
+        default_path.to_path_buf()
+    }
+}
+
 fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
-    js_runner::materialize_runner_script_in_cwd("eval-runners", JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+    let source = js_runner_default_source();
+    js_runner::materialize_runner_script_in_cwd("eval-runners", JS_RUNNER_DEFAULT_FILE, &source)
+}
+
+/// Builds the standalone default entry: the impl body with a fire-and-forget
+/// `main().catch(...)` appended. Used everywhere except vite-node, which gets
+/// the `.mts` wrapper that uses TLA against the same impl as a sibling file.
+fn js_runner_default_source() -> String {
+    let mut source =
+        String::with_capacity(JS_RUNNER_IMPL_SOURCE.len() + JS_RUNNER_FIRE_AND_FORGET_ENTRY.len());
+    source.push_str(JS_RUNNER_IMPL_SOURCE);
+    source.push_str(JS_RUNNER_FIRE_AND_FORGET_ENTRY);
+    source
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
@@ -2514,7 +2579,21 @@ fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
         )
     })?;
 
-    let js_runner = materialize_runner_script(cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
+    // vite-node needs the impl as a sibling file because its `.mts` wrapper
+    // imports `main` from it. Every other runner uses the standalone default
+    // `.ts` (impl + fire-and-forget appended). Both are materialized so the
+    // runner-kind-aware path swap in `js_runner_path_for_kind` works.
+    materialize_runner_script(cache_dir, JS_RUNNER_IMPL_FILE, JS_RUNNER_IMPL_SOURCE)?;
+    materialize_runner_script(
+        cache_dir,
+        JS_RUNNER_VITE_NODE_FILE,
+        JS_RUNNER_VITE_NODE_SOURCE,
+    )?;
+    let js_runner = materialize_runner_script(
+        cache_dir,
+        JS_RUNNER_DEFAULT_FILE,
+        &js_runner_default_source(),
+    )?;
     let py_runner = materialize_runner_script(cache_dir, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
     Ok((js_runner, py_runner))
 }
@@ -3671,10 +3750,34 @@ mod tests {
         let (js_runner, py_runner) =
             prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
 
-        let js = fs::read_to_string(js_runner).expect("js runner should be readable");
+        let js = fs::read_to_string(&js_runner).expect("js runner should be readable");
         let py = fs::read_to_string(py_runner).expect("python runner should be readable");
-        assert_eq!(js, JS_RUNNER_SOURCE);
+        assert_eq!(js, js_runner_default_source());
         assert_eq!(py, PY_RUNNER_SOURCE);
+
+        // The shared impl and vite-node entry are materialized alongside the
+        // default entry so vite-node's `.mts` can import the impl as a sibling.
+        let impl_path = dir.join(JS_RUNNER_IMPL_FILE);
+        let vite_node_path = dir.join(JS_RUNNER_VITE_NODE_FILE);
+        assert_eq!(
+            fs::read_to_string(&impl_path).expect("impl should be readable"),
+            JS_RUNNER_IMPL_SOURCE
+        );
+        assert_eq!(
+            fs::read_to_string(&vite_node_path).expect("vite-node entry should be readable"),
+            JS_RUNNER_VITE_NODE_SOURCE
+        );
+
+        // The vite-node entry sits in the same directory as the default entry,
+        // which is what `js_runner_path_for_kind` relies on.
+        assert_eq!(
+            js_runner_path_for_kind(&js_runner, RunnerKind::ViteNode),
+            vite_node_path
+        );
+        assert_eq!(
+            js_runner_path_for_kind(&js_runner, RunnerKind::Tsx),
+            js_runner
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4110,6 +4213,44 @@ mod tests {
         assert_eq!(runner_kind_for_bin(Path::new("bun")), RunnerKind::Bun);
         assert_eq!(runner_kind_for_bin(Path::new("bunx")), RunnerKind::Bun);
         assert_eq!(runner_kind_for_bin(Path::new("deno")), RunnerKind::Other);
+    }
+
+    #[test]
+    fn js_runner_entries_have_their_expected_shapes() {
+        // The default entry must use fire-and-forget so non-vite-node hosts
+        // (which observe the full event loop) keep main()'s pending promises
+        // alive after the module body returns.
+        let default_source = js_runner_default_source();
+        assert!(
+            default_source.contains("main().catch"),
+            "default entry should fire main() without awaiting"
+        );
+        assert!(
+            !default_source.contains("await main()"),
+            "default entry should not use top-level await"
+        );
+        // The default entry is standalone (impl + fire-and-forget appended),
+        // not an import-based wrapper. ts-node and Deno can't agree on `.ts`
+        // import extensions, so we inline.
+        assert!(
+            default_source.contains("export async function main"),
+            "default entry should be the impl body plus the fire-and-forget tail"
+        );
+        assert!(
+            !default_source.contains("from \"./eval-runner-impl"),
+            "default entry should be standalone, not import the impl"
+        );
+
+        // The vite-node entry must use TLA so vite-node's CLI waits for main()
+        // before tearing down its dev server. See scripts/eval-runner-vite-node.mts.
+        assert!(
+            JS_RUNNER_VITE_NODE_SOURCE.contains("await main()"),
+            "vite-node entry must await main() at the top level"
+        );
+        assert!(
+            JS_RUNNER_VITE_NODE_SOURCE.contains("from \"./eval-runner-impl.js\""),
+            "vite-node entry should import main from the sibling impl"
+        );
     }
 
     #[test]

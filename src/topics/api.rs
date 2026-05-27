@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
@@ -18,6 +18,7 @@ const DEFAULT_TOPIC_RELABEL_OVERLAP_SECONDS: i64 = 60 * 60;
 const DEFAULT_TOPIC_IDLE_SECONDS: i64 = 10 * 60;
 const DEFAULT_TOPIC_SAMPLING_RATE: f64 = 1.0;
 const DEFAULT_TOPIC_EMBEDDING_MODEL: &str = "brain-embedding-1";
+const MAX_STATUS_PROGRESS_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicsStatusReport {
@@ -56,6 +57,18 @@ pub struct TopicMapConfigUpdate {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct TopicMapReportUrlRequest<'a> {
+    function_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TopicMapReportUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TopicsProjectSummary {
     pub id: String,
     pub name: String,
@@ -76,6 +89,8 @@ pub struct TopicAutomationStatus {
     pub idle_seconds: Option<i64>,
     pub configured_facets: usize,
     pub configured_topic_maps: usize,
+    pub progress_loaded: bool,
+    pub progress_window_seconds: Option<i64>,
     pub processing_lag_label: Option<String>,
     pub processing_lag_seconds: Option<i64>,
     pub total_traces: usize,
@@ -350,14 +365,25 @@ struct BtqlValueRequest<'a> {
     brainstore_realtime: bool,
 }
 
-pub async fn fetch_topics_status(ctx: &ProjectContext) -> Result<TopicsStatusReport> {
+pub async fn fetch_topics_status(
+    ctx: &ProjectContext,
+    include_progress: bool,
+    progress_window_seconds_override: Option<i64>,
+) -> Result<TopicsStatusReport> {
     let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
     let mut function_cache = HashMap::new();
     let mut automations = Vec::with_capacity(rows.len());
     for row in &rows {
         automations.push(
-            build_topic_automation_status(&ctx.client, &ctx.project.id, row, &mut function_cache)
-                .await?,
+            build_topic_automation_status(
+                &ctx.client,
+                &ctx.project.id,
+                row,
+                include_progress,
+                progress_window_seconds_override,
+                &mut function_cache,
+            )
+            .await?,
         );
     }
     automations.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
@@ -825,6 +851,18 @@ pub fn topics_url(app_url: &str, org_name: &str, project_name: &str) -> String {
     )
 }
 
+pub async fn fetch_topic_map_report_url(
+    client: &ApiClient,
+    function_id: &str,
+    version: Option<&str>,
+) -> Result<TopicMapReportUrl> {
+    let request = TopicMapReportUrlRequest {
+        function_id,
+        version,
+    };
+    client.post("/topic-map-report-url", &request).await
+}
+
 fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> Result<String> {
     let data_scope_mapping = data_scope.and_then(Value::as_object);
     let scope_type = string_value(data_scope_mapping.and_then(|scope| scope.get("type")));
@@ -1177,6 +1215,8 @@ async fn build_topic_automation_status(
     client: &ApiClient,
     project_id: &str,
     row: &Value,
+    include_progress: bool,
+    progress_window_seconds_override: Option<i64>,
     function_cache: &mut HashMap<String, Value>,
 ) -> Result<TopicAutomationStatus> {
     let config = row
@@ -1199,36 +1239,40 @@ async fn build_topic_automation_status(
             .await?;
     let facet_functions =
         summarize_function_refs(client, function_cache, config.get("facet_functions")).await?;
-    let topic_bars = build_topic_status_bars(client, function_cache, &config).await?;
-    let facet_bars = build_facet_status_bars(client, function_cache, &config, &topic_bars).await?;
 
     let mut total_traces = 0;
     let mut facet_current_count = 0;
     let mut facets = Vec::new();
     let mut topics = Vec::new();
-    let time_filter_clause =
-        created_time_filter_clause(config.get("backfill_time_range")).or_else(|| {
-            created_time_filter_clause_from_window_seconds(
-                object_cursor
-                    .topic_runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.selected_window_seconds),
+    let mut progress_window_seconds = None;
+    if include_progress {
+        let topic_bars = build_topic_status_bars(client, function_cache, &config).await?;
+        let facet_bars =
+            build_facet_status_bars(client, function_cache, &config, &topic_bars).await?;
+        let runtime_window_seconds = object_cursor
+            .topic_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.selected_window_seconds);
+        if let Some((time_filter_clause, window_seconds)) = status_progress_time_filter_clause(
+            config.get("backfill_time_range"),
+            runtime_window_seconds,
+            progress_window_seconds_override,
+        ) {
+            progress_window_seconds = Some(window_seconds);
+            let progress = fetch_topic_automation_progress(
+                client,
+                project_id,
+                &time_filter_clause,
+                &cursor,
+                &facet_bars,
+                &topic_bars,
             )
-        });
-    if let Some(time_filter_clause) = time_filter_clause {
-        let progress = fetch_topic_automation_progress(
-            client,
-            project_id,
-            &time_filter_clause,
-            &cursor,
-            &facet_bars,
-            &topic_bars,
-        )
-        .await?;
-        total_traces = progress.total_traces;
-        facet_current_count = progress.facet_current_count;
-        facets = progress.facets;
-        topics = progress.topics;
+            .await?;
+            total_traces = progress.total_traces;
+            facet_current_count = progress.facet_current_count;
+            facets = progress.facets;
+            topics = progress.topics;
+        }
     }
 
     Ok(TopicAutomationStatus {
@@ -1249,6 +1293,8 @@ async fn build_topic_automation_status(
             .get("topic_map_functions")
             .and_then(Value::as_array)
             .map_or(0, Vec::len),
+        progress_loaded: include_progress,
+        progress_window_seconds,
         processing_lag_label: format_processing_lag_from_xact_range(
             cursor.pending_min_executed_xact_id.as_deref(),
             cursor.pending_max_compacted_xact_id.as_deref(),
@@ -2076,26 +2122,6 @@ fn escape_btql_ident_path(parts: &[&str]) -> String {
         .join(".")
 }
 
-fn created_time_filter_clause(value: Option<&Value>) -> Option<String> {
-    let value = value?;
-    if let Some(value) = value.as_str() {
-        if let Some(interval_ms) = value.strip_prefix("interval_ms:") {
-            let interval_ms = interval_ms.parse::<i64>().ok()?;
-            return Some(format!(
-                "created >= NOW() - INTERVAL {} SECOND",
-                std::cmp::max(1, (interval_ms as f64 / 1000.0).round() as i64)
-            ));
-        }
-        return parse_duration_to_seconds(value)
-            .map(|seconds| format!("created >= NOW() - INTERVAL {seconds} SECOND"));
-    }
-
-    let map = value.as_object()?;
-    let from = map.get("from")?.as_str()?.replace('\'', "''");
-    let to = map.get("to")?.as_str()?.replace('\'', "''");
-    Some(format!("created >= '{from}' AND created <= '{to}'"))
-}
-
 fn created_time_filter_clause_from_window_seconds(window_seconds: Option<i64>) -> Option<String> {
     window_seconds.map(|window_seconds| {
         format!(
@@ -2103,6 +2129,45 @@ fn created_time_filter_clause_from_window_seconds(window_seconds: Option<i64>) -
             std::cmp::max(1, window_seconds)
         )
     })
+}
+
+fn status_progress_time_filter_clause(
+    backfill_time_range: Option<&Value>,
+    runtime_window_seconds: Option<i64>,
+    progress_window_seconds_override: Option<i64>,
+) -> Option<(String, i64)> {
+    let window_seconds = match progress_window_seconds_override {
+        Some(window_seconds) => window_seconds,
+        None => {
+            if let Some(absolute_filter) = absolute_time_filter_clause(backfill_time_range) {
+                return Some(absolute_filter);
+            }
+            backfill_time_range_to_window_seconds(backfill_time_range)
+                .or(runtime_window_seconds)
+                .map(cap_status_progress_window_seconds)?
+        }
+    };
+    Some((
+        created_time_filter_clause_from_window_seconds(Some(window_seconds))?,
+        window_seconds,
+    ))
+}
+
+fn absolute_time_filter_clause(value: Option<&Value>) -> Option<(String, i64)> {
+    let value = value?;
+    let map = value.as_object()?;
+    let from_raw = map.get("from")?.as_str()?;
+    let to_raw = map.get("to")?.as_str()?;
+    let from = from_raw.replace('\'', "''");
+    let to = to_raw.replace('\'', "''");
+    Some((
+        format!("created >= '{from}' AND created <= '{to}'"),
+        backfill_time_range_to_window_seconds(Some(value))?,
+    ))
+}
+
+fn cap_status_progress_window_seconds(window_seconds: i64) -> i64 {
+    window_seconds.clamp(1, MAX_STATUS_PROGRESS_WINDOW_SECONDS)
 }
 
 fn processing_lag_seconds_from_xact_range(
@@ -2272,6 +2337,29 @@ mod tests {
     }
 
     #[test]
+    fn topic_map_report_url_request_matches_endpoint_shape() {
+        let without_version = serde_json::to_value(TopicMapReportUrlRequest {
+            function_id: "fn_123",
+            version: None,
+        })
+        .expect("serialize report url request");
+        assert_eq!(without_version, json!({ "function_id": "fn_123" }));
+
+        let with_version = serde_json::to_value(TopicMapReportUrlRequest {
+            function_id: "fn_123",
+            version: Some("0000000000000001"),
+        })
+        .expect("serialize report url request");
+        assert_eq!(
+            with_version,
+            json!({
+                "function_id": "fn_123",
+                "version": "0000000000000001",
+            })
+        );
+    }
+
+    #[test]
     fn backfill_time_range_supports_duration_strings_and_intervals() {
         assert_eq!(
             backfill_time_range_to_window_seconds(Some(&json!("6h"))),
@@ -2280,6 +2368,58 @@ mod tests {
         assert_eq!(
             backfill_time_range_to_window_seconds(Some(&json!("interval_ms:90000"))),
             Some(90)
+        );
+    }
+
+    #[test]
+    fn status_progress_time_filter_caps_to_one_day() {
+        assert_eq!(
+            status_progress_time_filter_clause(Some(&json!("7d")), None, None),
+            Some((
+                "created >= NOW() - INTERVAL 86400 SECOND".to_string(),
+                86400
+            ))
+        );
+        assert_eq!(
+            status_progress_time_filter_clause(Some(&json!("6h")), None, None),
+            Some((
+                "created >= NOW() - INTERVAL 21600 SECOND".to_string(),
+                21600
+            ))
+        );
+        assert_eq!(
+            status_progress_time_filter_clause(None, Some(604800), None),
+            Some((
+                "created >= NOW() - INTERVAL 86400 SECOND".to_string(),
+                86400
+            ))
+        );
+    }
+
+    #[test]
+    fn status_progress_time_filter_allows_explicit_override() {
+        assert_eq!(
+            status_progress_time_filter_clause(Some(&json!("1d")), None, Some(604800)),
+            Some((
+                "created >= NOW() - INTERVAL 604800 SECOND".to_string(),
+                604800
+            ))
+        );
+    }
+
+    #[test]
+    fn status_progress_time_filter_preserves_absolute_ranges() {
+        let range = json!({
+            "from": "2026-04-13T10:00:00Z",
+            "to": "2026-04-13T11:30:00Z",
+        });
+        assert_eq!(
+            status_progress_time_filter_clause(Some(&range), None, None),
+            Some((
+                "created >= '2026-04-13T10:00:00Z' AND created <= '2026-04-13T11:30:00Z'"
+                    .to_string(),
+                5400
+            ))
         );
     }
 

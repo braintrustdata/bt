@@ -1,0 +1,130 @@
+name: test-signing-self-signed
+
+# Zero-cost validation of the Windows signing pipeline.
+# Mirrors the release.yml signing flow but uses a self-signed certificate
+# via signtool directly instead of azure/artifact-signing-action. This proves
+# the signing mechanics and the zip-refresh logic work end to end without
+# any Azure resources or costs.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/test-signing-self-signed.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  signing-mechanics:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up fake distrib layout (mirrors release.yml output)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path target/distrib/bt-x86_64-pc-windows-msvc -Force | Out-Null
+          # Use a real signable PE — copy a system exe so signtool has something legitimate to sign
+          Copy-Item C:\Windows\System32\where.exe target/distrib/bt-x86_64-pc-windows-msvc/bt.exe
+          # Build the matching zip that release.yml's "Refresh zip" step expects to find
+          Compress-Archive -Path target/distrib/bt-x86_64-pc-windows-msvc/* -DestinationPath target/distrib/bt-x86_64-pc-windows-msvc.zip
+          $hash = (Get-FileHash target/distrib/bt-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  bt-x86_64-pc-windows-msvc.zip" | Set-Content target/distrib/bt-x86_64-pc-windows-msvc.zip.sha256 -NoNewline
+
+      - name: Create self-signed code-signing certificate
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -Subject "CN=BT Self-Signed Test" `
+            -Type CodeSigningCert `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -KeyUsage DigitalSignature `
+            -HashAlgorithm SHA256 `
+            -NotAfter (Get-Date).AddDays(7)
+          $pfxPath = Join-Path $env:RUNNER_TEMP "test-signing.pfx"
+          $pwd = ConvertTo-SecureString -String "midwife-ding-car-haskell-matador-jeff-dungeon" -Force -AsPlainText
+          Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" -FilePath $pfxPath -Password $pwd | Out-Null
+          "PFX_PATH=$pfxPath" >> $env:GITHUB_ENV
+
+      - name: Locate signtool
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found on runner" }
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+
+      - name: Sign exe (mirrors azure/artifact-signing-action behavior)
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path target/distrib -Filter *.exe -Recurse | ForEach-Object {
+            Write-Host "Signing: $($_.FullName)"
+            & $env:SIGNTOOL sign `
+              /f $env:PFX_PATH `
+              /p "midwife-ding-car-haskell-matador-jeff-dungeon" `
+              /fd SHA256 `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+          }
+
+      - name: Verify signature on raw exe
+        shell: pwsh
+        run: |
+          # Get-AuthenticodeSignature returns a structured status. We accept
+          # NotTrusted (untrusted self-signed root, but signature itself is valid
+          # and timestamped) — that's the expected state for this test. signtool
+          # verify can't be used because every supported way to install a self-
+          # signed cert into the runner's Root store hangs on a CryptUI prompt.
+          # Production signing uses Trusted Signing, which chains to a trusted
+          # Microsoft root and verifies cleanly without any of this.
+          $sig = Get-AuthenticodeSignature target/distrib/bt-x86_64-pc-windows-msvc/bt.exe
+          if ($sig.Status -notin @('Valid', 'NotTrusted')) {
+            throw "Signature invalid (status=$($sig.Status)): $($sig.StatusMessage)"
+          }
+          if (-not $sig.SignerCertificate)     { throw "Signature missing signer certificate" }
+          if (-not $sig.TimeStamperCertificate) { throw "Signature missing RFC3161 timestamp" }
+          Write-Host "Raw exe signature OK (status=$($sig.Status), signer=$($sig.SignerCertificate.Subject))"
+
+      - name: Refresh zip archives with signed executables (verbatim from release.yml)
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path "target/distrib" -Filter "*.zip" | ForEach-Object {
+            $zipPath = $_.FullName
+            $stagingDir = Join-Path $_.DirectoryName $_.BaseName
+            if (Test-Path $stagingDir) {
+              Remove-Item $zipPath -Force
+              Compress-Archive -Path "$stagingDir\*" -DestinationPath $zipPath
+              $shaFile = "$zipPath.sha256"
+              if (Test-Path $shaFile) {
+                $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+                "$hash  $($_.Name)" | Set-Content $shaFile -NoNewline
+              }
+            }
+          }
+
+      - name: Verify signature survives the zip refresh
+        shell: pwsh
+        run: |
+          $verifyDir = Join-Path $env:RUNNER_TEMP "verify"
+          New-Item -ItemType Directory -Path $verifyDir -Force | Out-Null
+          Expand-Archive -Path target/distrib/bt-x86_64-pc-windows-msvc.zip -DestinationPath $verifyDir -Force
+          $sig = Get-AuthenticodeSignature (Join-Path $verifyDir "bt.exe")
+          if ($sig.Status -notin @('Valid', 'NotTrusted')) {
+            throw "Signature lost after zip refresh (status=$($sig.Status)): $($sig.StatusMessage)"
+          }
+          if (-not $sig.SignerCertificate)     { throw "Signature missing signer certificate after zip refresh" }
+          if (-not $sig.TimeStamperCertificate) { throw "Signature missing RFC3161 timestamp after zip refresh" }
+          Write-Host "Signature survived the zip refresh (status=$($sig.Status))"
+
+      - name: Verify sha256 file matches the refreshed zip
+        shell: pwsh
+        run: |
+          $expected = (Get-Content target/distrib/bt-x86_64-pc-windows-msvc.zip.sha256 -Raw).Split(' ')[0].Trim()
+          $actual   = (Get-FileHash target/distrib/bt-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "sha256 mismatch: expected=$expected actual=$actual" }
+          Write-Host "sha256 file matches the refreshed zip"

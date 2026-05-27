@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -145,10 +146,13 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
+    # OIDC token subject must match the AAD federated credential, which is
+    # scoped to the `release` environment.
+    environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      HAS_SSLDOTCOM_SIGNING: ${{ secrets.SSLDOTCOM_USERNAME != '' && secrets.SSLDOTCOM_PASSWORD != '' && secrets.SSLDOTCOM_CREDENTIAL_ID != '' && secrets.SSLDOTCOM_TOTP_SECRET != '' }}
+      HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' }}
     steps:
       - name: Enable windows longpaths
         run: git config --global core.longpaths true
@@ -196,30 +200,18 @@ jobs:
       - name: Install dependencies
         run: ${{ matrix.packages_install }}
 
-      - name: Configure SSL.com signing env
-        if: ${{ runner.os == 'Windows' && env.HAS_SSLDOTCOM_SIGNING == 'true' && !fromJson(needs.plan.outputs.val).announcement_is_prerelease }}
-        shell: bash
-        env:
-          SSLDOTCOM_USERNAME: ${{ secrets.SSLDOTCOM_USERNAME }}
-          SSLDOTCOM_PASSWORD: ${{ secrets.SSLDOTCOM_PASSWORD }}
-          SSLDOTCOM_CREDENTIAL_ID: ${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}
-          SSLDOTCOM_TOTP_SECRET: ${{ secrets.SSLDOTCOM_TOTP_SECRET }}
-        run: |
-          write_github_env() {
-            local key="$1"
-            local value="$2"
-            local delimiter="EOF_${key}_$$"
-            {
-              echo "${key}<<${delimiter}"
-              echo "${value}"
-              echo "${delimiter}"
-            } >> "$GITHUB_ENV"
-          }
+      - name: Set up MSVC cross-compilation for Windows ARM64
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: amd64_arm64
 
-          write_github_env "SSLDOTCOM_USERNAME" "$SSLDOTCOM_USERNAME"
-          write_github_env "SSLDOTCOM_PASSWORD" "$SSLDOTCOM_PASSWORD"
-          write_github_env "SSLDOTCOM_CREDENTIAL_ID" "$SSLDOTCOM_CREDENTIAL_ID"
-          write_github_env "SSLDOTCOM_TOTP_SECRET" "$SSLDOTCOM_TOTP_SECRET"
+      - name: Set MSVC ARM64 linker for cargo cross-compilation
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        shell: pwsh
+        run: |
+          $link = (Get-Command link.exe -ErrorAction Stop).Source
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$link" >> $env:GITHUB_ENV
 
       - name: Build artifacts
         shell: bash
@@ -228,6 +220,17 @@ jobs:
           BT_VERSION_STRING="${{ needs.plan.outputs.release-version }}" \
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+
+      - name: Sign Windows artifacts
+        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
+        uses: ./.github/actions/sign-windows-artifacts
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          cert-profile: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
 
       - id: dist-files
         name: Post-build

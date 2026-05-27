@@ -2409,7 +2409,7 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   };
 }
 
-async function main() {
+export async function main() {
   const config = readRunnerConfig();
   const files = process.argv.slice(2);
   if (files.length === 0) {
@@ -2577,8 +2577,3 @@ async function main() {
     runner.finish(ok);
   }
 }
-
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
