@@ -448,6 +448,84 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
 }
 
 #[test]
+fn eval_python_runner_list_mode_serializes_remote_parameter_container() {
+    let _guard = test_lock();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("py").join("remote_list_params");
+    let python = match ensure_python_env(&fixtures_root.join("py")) {
+        Some(python) => python,
+        None => {
+            if required_runtimes().contains("python") {
+                panic!("python runtime unavailable for list-mode parameter test");
+            }
+            eprintln!(
+                "Skipping eval_python_runner_list_mode_serializes_remote_parameter_container (python runtime unavailable)."
+            );
+            return;
+        }
+    };
+
+    let output = Command::new(&python)
+        .arg(root.join("scripts").join("eval-runner.py"))
+        .arg("eval_remote_list_params.py")
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_DEV_MODE", "list")
+        .env("BT_EVAL_NO_SEND_LOGS", "1")
+        .output()
+        .expect("run python eval-runner in list mode");
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "python list-mode runner failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status, stdout, stderr
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let manifest_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("runner should emit manifest JSON");
+    let manifest: Value = serde_json::from_str(manifest_line).expect("parse manifest json");
+
+    let evaluator = manifest
+        .get("test-cli-python-remote-list-params")
+        .and_then(Value::as_object)
+        .expect("manifest should include evaluator");
+    let parameters = evaluator
+        .get("parameters")
+        .and_then(Value::as_object)
+        .expect("evaluator should include parameter container");
+    assert_eq!(
+        parameters.get("type").and_then(Value::as_str),
+        Some("braintrust.staticParameters")
+    );
+    assert!(
+        parameters.get("source").is_some_and(Value::is_null),
+        "static parameter container should include null source"
+    );
+
+    let thresholds = parameters
+        .get("schema")
+        .and_then(Value::as_object)
+        .and_then(|schema| schema.get("thresholds"))
+        .and_then(Value::as_object)
+        .expect("thresholds static parameter should exist");
+    assert_eq!(thresholds.get("type").and_then(Value::as_str), Some("data"));
+    assert!(
+        thresholds
+            .get("schema")
+            .and_then(Value::as_object)
+            .is_some(),
+        "thresholds data parameter should include a JSON schema"
+    );
+}
+
+#[test]
 fn eval_matrix_param_single_runs_all_combinations() {
     let _guard = test_lock();
     if !command_exists("node") {
@@ -996,8 +1074,12 @@ fn enforce_required_runtimes(fixtures_root: &Path) {
         let python = ensure_python_env(&fixtures_root.join("py"))
             .expect("python runtime is required but uv/python is unavailable");
         assert!(
-            python_can_import_braintrust(python.to_string_lossy().as_ref()),
+            python_can_import_module(python.to_string_lossy().as_ref(), "braintrust"),
             "python runtime is required but braintrust package is unavailable"
+        );
+        assert!(
+            python_can_import_module(python.to_string_lossy().as_ref(), "pydantic"),
+            "python runtime is required but pydantic package is unavailable"
         );
     }
 }
@@ -1095,17 +1177,19 @@ fn ensure_python_env(fixtures_root: &Path) -> Option<PathBuf> {
         }
     }
 
-    if !python_can_import_braintrust(python.to_string_lossy().as_ref()) {
-        let status = Command::new("uv")
-            .args([
-                "pip",
-                "install",
-                "--python",
-                python.to_string_lossy().as_ref(),
-                "braintrust",
-            ])
-            .status()
-            .ok()?;
+    let mut missing_packages = Vec::new();
+    if !python_can_import_module(python.to_string_lossy().as_ref(), "braintrust") {
+        missing_packages.push("braintrust");
+    }
+    if !python_can_import_module(python.to_string_lossy().as_ref(), "pydantic") {
+        missing_packages.push("pydantic");
+    }
+
+    if !missing_packages.is_empty() {
+        let python_arg = python.to_string_lossy().to_string();
+        let mut args = vec!["pip", "install", "--python", python_arg.as_str()];
+        args.extend(missing_packages);
+        let status = Command::new("uv").args(args).status().ok()?;
         if !status.success() {
             return None;
         }
@@ -1122,9 +1206,13 @@ fn venv_python_path(venv: &Path) -> PathBuf {
     }
 }
 
-fn python_can_import_braintrust(python: &str) -> bool {
+fn python_can_import_module(python: &str, module: &str) -> bool {
     Command::new(python)
-        .args(["-c", "import braintrust"])
+        .args([
+            "-c",
+            "import importlib, sys; importlib.import_module(sys.argv[1])",
+            module,
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
