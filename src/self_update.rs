@@ -195,7 +195,7 @@ fn ensure_installer_managed_executable(exe: &Path) -> Result<()> {
     }
 
     anyhow::bail!(
-        "update is only supported for official installer installs.\ncurrent executable: {}\nif this was installed with npm, update with npm; otherwise reinstall with the official installer",
+        "update is only supported for official installer installs.\ncurrent executable: {}\nif this was installed with Homebrew/npm, update with that package manager; otherwise reinstall with the official installer",
         exe.display()
     );
 }
