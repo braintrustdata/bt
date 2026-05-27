@@ -40,10 +40,7 @@ type DatasetPipelineTransformArgs = {
 };
 
 type BraintrustModule = {
-  DatasetPipeline?: (
-    definition: DatasetPipelineDefinition,
-  ) => DatasetPipelineDefinition;
-  getRegisteredDatasetPipelines?: () => DatasetPipelineDefinition[];
+  DatasetPipeline?: (definition: DatasetPipelineDefinition) => void;
   isDatasetPipelineDefinition?: (
     value: unknown,
   ) => value is DatasetPipelineDefinition;
@@ -113,6 +110,9 @@ declare global {
   var __BT_DATASET_PIPELINE_DEFER_JSON_ATTACHMENT__:
     | DeferredJsonAttachmentHook
     | undefined;
+  // Public SDK registry consumed by bt. Keep this name/interface in sync with
+  // braintrust-js DatasetPipeline.
+  var __braintrust_dataset_pipelines: DatasetPipelineDefinition[] | undefined;
 }
 
 let deferredAttachmentDir: string | null = null;
@@ -329,7 +329,7 @@ function collectPipelines(
       isObject(value.target) &&
       typeof value.transform === "function");
 
-  for (const pipeline of braintrust.getRegisteredDatasetPipelines?.() ?? []) {
+  for (const pipeline of globalThis.__braintrust_dataset_pipelines ?? []) {
     pipelines.add(pipeline);
   }
 
@@ -631,7 +631,12 @@ async function sourceRowForCandidate(
 
 async function transformArgsForCandidate(
   candidate: HydratedCandidate,
+  scope: "span" | "trace",
 ): Promise<DatasetPipelineTransformArgs> {
+  if (scope === "trace") {
+    return { trace: candidate.trace };
+  }
+
   const row = await sourceRowForCandidate(candidate);
   return {
     input: spanAttr(row, "input"),
@@ -705,6 +710,8 @@ async function transformRefs(
   if (typeof pipeline.transform !== "function") {
     throw new Error("Dataset pipeline transform must be a function.");
   }
+  const source = requirePipelineSource(pipeline, sourceOverride);
+  const scope = source.scope ?? "span";
   const candidates = await hydrateDiscoveryRefs(
     braintrust,
     pipeline,
@@ -719,7 +726,7 @@ async function transformRefs(
     while (nextIndex < candidates.length) {
       const index = nextIndex++;
       const candidate = candidates[index];
-      const args = await transformArgsForCandidate(candidate);
+      const args = await transformArgsForCandidate(candidate, scope);
       const result = await pipeline.transform!(args);
       const rows = normalizeTransformResult(result);
       transformedRows[index] = rows.map((row, rowIndex) =>

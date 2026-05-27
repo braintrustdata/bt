@@ -2327,8 +2327,6 @@ mod tests {
         fs::write(
             node_modules.join("index.cjs"),
             r#"
-const pipelines = [];
-
 class OriginalJSONAttachment {
   constructor() {
     throw new Error("original JSONAttachment should be shimmed");
@@ -2337,14 +2335,14 @@ class OriginalJSONAttachment {
 
 module.exports = {
   DatasetPipeline(definition) {
-    pipelines.push(definition);
-    return definition;
-  },
-  getRegisteredDatasetPipelines() {
-    return pipelines;
-  },
-  isDatasetPipelineDefinition(value) {
-    return !!value && typeof value.transform === "function";
+    globalThis.__braintrust_dataset_pipelines ??= [];
+    globalThis.__braintrust_dataset_pipelines.push({
+      ...definition,
+      source: {
+        ...definition.source,
+        scope: definition.source.scope ?? "span",
+      },
+    });
   },
   LocalTrace: class {
     constructor(options) {
@@ -2381,7 +2379,14 @@ module.exports = {
             node_modules.join("index.mjs"),
             r#"
 export function DatasetPipeline(definition) {
-  return definition;
+  globalThis.__braintrust_dataset_pipelines ??= [];
+  globalThis.__braintrust_dataset_pipelines.push({
+    ...definition,
+    source: {
+      ...definition.source,
+      scope: definition.source.scope ?? "span",
+    },
+  });
 }
 
 export class JSONAttachment {
@@ -2407,16 +2412,21 @@ import { DatasetPipeline, JSONAttachment } from "braintrust";
 
 export default DatasetPipeline({
   name: "ts-json-attachment-smoke",
-  source: { projectName: "source-project" },
+  source: { projectName: "source-project", scope: "trace" },
   target: { projectName: "target-project", datasetName: "traces" },
-  transform: () => ({
-    input: {
-      full_trace: new JSONAttachment(
-        { ok: true },
-        { filename: "trace.json", pretty: true },
-      ),
-    },
-  }),
+  transform: (args) => {
+    if ("input" in args || "output" in args || "expected" in args || "metadata" in args) {
+      throw new Error("trace-scoped transforms should only receive trace");
+    }
+    return {
+      input: {
+        full_trace: new JSONAttachment(
+          { ok: true, root: args.trace.getConfiguration().root_span_id },
+          { filename: "trace.json", pretty: true },
+        ),
+      },
+    };
+  },
 });
 "#,
         )
@@ -2485,9 +2495,9 @@ export default DatasetPipeline({
         let sidecar = fs::read_to_string(sidecar_path).expect("read sidecar JSON");
         assert_eq!(
             serde_json::from_str::<Value>(&sidecar).expect("parse sidecar"),
-            json!({ "ok": true })
+            json!({ "ok": true, "root": "root-span" })
         );
-        assert!(sidecar.contains("\n  \"ok\": true\n"));
+        assert!(sidecar.contains("\n  \"ok\": true,"));
     }
 
     #[test]
