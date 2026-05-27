@@ -104,6 +104,16 @@ struct MockDataset {
     created: String,
 }
 
+#[derive(Debug, Clone)]
+struct MockDatasetSnapshot {
+    id: String,
+    dataset_id: String,
+    name: String,
+    xact_id: String,
+    description: Option<String>,
+    created: String,
+}
+
 type MockDatasetRow = Map<String, Value>;
 type MockDatasetRowsById = BTreeMap<String, MockDatasetRow>;
 type MockDatasetRowsByDataset = BTreeMap<String, MockDatasetRowsById>;
@@ -113,6 +123,7 @@ struct MockServerState {
     requests: Mutex<Vec<String>>,
     projects: Mutex<Vec<MockProject>>,
     datasets: Mutex<Vec<MockDataset>>,
+    dataset_snapshots: Mutex<Vec<MockDatasetSnapshot>>,
     dataset_rows: Mutex<MockDatasetRowsByDataset>,
     btql_dataset_id: Mutex<Option<String>>,
 }
@@ -127,6 +138,7 @@ impl MockServerState {
                 org_id: "org_mock".to_string(),
             }]),
             datasets: Mutex::new(Vec::new()),
+            dataset_snapshots: Mutex::new(Vec::new()),
             dataset_rows: Mutex::new(BTreeMap::new()),
             btql_dataset_id: Mutex::new(None),
         }
@@ -152,6 +164,14 @@ impl MockServer {
                 .route("/v1/project", web::get().to(mock_list_projects))
                 .route("/v1/dataset", web::get().to(mock_list_datasets))
                 .route("/v1/dataset", web::post().to(mock_create_dataset))
+                .route(
+                    "/v1/dataset_snapshot",
+                    web::get().to(mock_list_dataset_snapshots),
+                )
+                .route(
+                    "/v1/dataset_snapshot",
+                    web::post().to(mock_create_dataset_snapshot),
+                )
                 .route("/btql", web::post().to(mock_btql))
                 .route("/version", web::get().to(mock_version))
                 .route("/logs3", web::post().to(mock_logs3))
@@ -276,6 +296,123 @@ async fn mock_create_dataset(
         "project_id": created.project_id,
         "created": created.created
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDatasetSnapshotRequest {
+    dataset_id: String,
+    name: String,
+    xact_id: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    dataset_snapshot_name: Option<String>,
+}
+
+async fn mock_create_dataset_snapshot(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    body: web::Json<CreateDatasetSnapshotRequest>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+
+    if body.dataset_snapshot_name.is_some() {
+        return HttpResponse::BadRequest()
+            .body("dataset_snapshot_name should not be sent to data plane endpoint");
+    }
+    if body.name.trim().is_empty() {
+        return HttpResponse::BadRequest().body("snapshot name is required");
+    }
+
+    let datasets = state.datasets.lock().expect("datasets lock");
+    let Some(dataset) = datasets
+        .iter()
+        .find(|dataset| dataset.id == body.dataset_id)
+        .cloned()
+    else {
+        return HttpResponse::BadRequest()
+            .body(format!("unknown dataset id '{}'", body.dataset_id));
+    };
+    if dataset.name == body.dataset_id {
+        return HttpResponse::BadRequest().body("snapshot request used dataset name instead of id");
+    }
+    drop(datasets);
+
+    let mut snapshots = state
+        .dataset_snapshots
+        .lock()
+        .expect("dataset snapshots lock");
+    if let Some(snapshot) = snapshots
+        .iter()
+        .find(|snapshot| snapshot.dataset_id == body.dataset_id && snapshot.xact_id == body.xact_id)
+        .cloned()
+    {
+        return HttpResponse::Ok()
+            .insert_header(("x-bt-found-existing", "true"))
+            .json(serde_json::json!({
+                "id": snapshot.id,
+                "dataset_id": snapshot.dataset_id,
+                "name": snapshot.name,
+                "xact_id": snapshot.xact_id,
+                "description": snapshot.description,
+                "created": snapshot.created
+            }));
+    }
+
+    let snapshot = MockDatasetSnapshot {
+        id: format!("snapshot_{}", snapshots.len() + 1),
+        dataset_id: body.dataset_id.clone(),
+        name: body.name.clone(),
+        xact_id: body.xact_id.clone(),
+        description: body.description.clone(),
+        created: "2026-01-02T00:00:00Z".to_string(),
+    };
+    snapshots.push(snapshot.clone());
+
+    HttpResponse::Ok()
+        .insert_header(("x-bt-found-existing", "false"))
+        .json(serde_json::json!({
+            "id": snapshot.id,
+            "dataset_id": snapshot.dataset_id,
+            "name": snapshot.name,
+            "xact_id": snapshot.xact_id,
+            "description": snapshot.description,
+            "created": snapshot.created
+        }))
+}
+
+async fn mock_list_dataset_snapshots(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let query = parse_query(req.query_string());
+    let requested_dataset_id = query.get("dataset_id").cloned();
+    let snapshots = state
+        .dataset_snapshots
+        .lock()
+        .expect("dataset snapshots lock")
+        .clone();
+    let objects = snapshots
+        .into_iter()
+        .filter(|snapshot| {
+            requested_dataset_id
+                .as_deref()
+                .is_none_or(|dataset_id| snapshot.dataset_id == dataset_id)
+        })
+        .map(|snapshot| {
+            serde_json::json!({
+                "id": snapshot.id,
+                "dataset_id": snapshot.dataset_id,
+                "name": snapshot.name,
+                "xact_id": snapshot.xact_id,
+                "description": snapshot.description,
+                "created": snapshot.created
+            })
+        })
+        .collect::<Vec<_>>();
+
+    HttpResponse::Ok().json(serde_json::json!({ "objects": objects }))
 }
 
 async fn mock_btql(

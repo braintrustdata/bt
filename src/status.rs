@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::args::BaseArgs;
 use crate::auth;
-use crate::config;
+use crate::{config, utils::resolve_profile_info};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -221,37 +221,6 @@ fn cli_flag_value(flags: &[&str]) -> Option<String> {
             }
         }
     }
-    None
-}
-
-fn resolve_profile_info(profile: Option<&str>, org: Option<&str>) -> Option<auth::ProfileInfo> {
-    let profiles = auth::list_profiles().ok()?;
-
-    if let Some(p) = profile {
-        if let Some(profile) = profiles.iter().find(|pi| pi.name == p).cloned() {
-            return Some(profile);
-        }
-    }
-
-    if let Some(o) = org {
-        if profiles.iter().any(|pi| pi.name == o) {
-            return profiles.into_iter().find(|pi| pi.name == o);
-        }
-        let org_matches: Vec<&auth::ProfileInfo> = profiles
-            .iter()
-            .filter(|pi| pi.org_name.as_deref() == Some(o))
-            .collect();
-        if org_matches.len() == 1 {
-            let name = org_matches[0].name.clone();
-            return profiles.into_iter().find(|pi| pi.name == name);
-        }
-        return None;
-    }
-
-    if profiles.len() == 1 {
-        return profiles.into_iter().next();
-    }
-
     None
 }
 
