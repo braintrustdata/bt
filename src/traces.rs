@@ -36,6 +36,7 @@ use crate::args::BaseArgs;
 use crate::auth::{self, login};
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
+use crate::utils::parse_duration_to_seconds;
 
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
