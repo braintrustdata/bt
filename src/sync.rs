@@ -28,6 +28,8 @@ use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
 use crate::utils::parse_duration_to_seconds;
 
+pub(crate) mod discovery;
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
 const DEFAULT_PAGE_SIZE: usize = 1000;
@@ -47,6 +49,14 @@ pub(crate) fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(DEFAULT_WORKERS_FALLBACK)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPushFileArgs {
+    pub object_ref: String,
+    pub input: PathBuf,
+    pub root: PathBuf,
+    pub fresh: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -420,6 +430,8 @@ struct ResolvedPushDestination {
     object: ObjectRef,
     object_ref: String,
     project_id: String,
+    project_name: String,
+    object_name: String,
     run_id: Option<String>,
 }
 
@@ -428,13 +440,17 @@ struct ResolvedDestination {
     object: ObjectRef,
     object_ref: String,
     project_id: String,
+    project_name: String,
+    object_name: String,
     run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedNamedObjectTarget {
     object_id: String,
+    object_name: String,
     project_id: String,
+    project_name: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -575,6 +591,36 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
         }
         SyncCommand::Status(_) => unreachable!(),
     }
+}
+
+pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> Result<()> {
+    let json_output = base.json;
+    let ctx = login(&base).await?;
+    let client = ApiClient::new(&ctx)?;
+    let project = base.project.clone().or_else(|| {
+        crate::config::configured_project_for_context(&base, ctx.login.org_name().as_deref())
+    });
+
+    run_push(
+        json_output,
+        &ctx,
+        &client,
+        project.as_deref(),
+        PushArgs {
+            object_ref: args.object_ref,
+            input: Some(args.input),
+            filter: None,
+            traces: None,
+            spans: None,
+            page_size: DEFAULT_PAGE_SIZE,
+            fresh: args.fresh,
+            root: args.root,
+            workers: default_workers(),
+            max_batch_bytes: PUSH_BATCH_MAX_INPUT_BYTES,
+            max_in_flight_bytes: PUSH_MAX_IN_FLIGHT_INPUT_BYTES,
+        },
+    )
+    .await
 }
 
 async fn run_pull(
@@ -1494,8 +1540,7 @@ async fn process_trace_chunk(
             let serialized = rows
                 .iter()
                 .map(|row| {
-                    let line =
-                        serde_json::to_string(row).context("failed to serialize trace row")?;
+                    let line = serialize_jsonl_value(row)?;
                     bytes_written += (line.len() + 1) as u64;
                     Result::<String>::Ok(line)
                 })
@@ -1600,6 +1645,7 @@ async fn run_push(
     args: PushArgs,
 ) -> Result<()> {
     let destination = resolve_push_destination(client, &args.object_ref, project_selector).await?;
+    let object_url = push_destination_url(&ctx.app_url, client.org_name(), &destination);
     let object = destination.object.clone();
     let (scope, limit) = resolve_push_scope_and_limit(args.traces, args.spans)?;
 
@@ -1674,6 +1720,7 @@ async fn run_push(
                     "status": "completed",
                     "message": "already completed for this spec",
                     "source_path": state.source_path,
+                    "object_url": object_url,
                     "items_done": state.items_done,
                     "pages_done": state.pages_done
                 }))?
@@ -1683,6 +1730,7 @@ async fn run_push(
                 "Sync already completed for this spec. input={} items={} pages={}",
                 state.source_path, state.items_done, state.pages_done
             );
+            println!("  URL: {object_url}");
         }
         return Ok(());
     }
@@ -1976,6 +2024,7 @@ async fn run_push(
                     "status": "interrupted",
                     "spec_dir": spec_dir,
                     "input_path": input_path,
+                    "object_url": object_url,
                     "rows_uploaded": state.items_done,
                     "pages_done": state.pages_done,
                     "bytes_sent": state.bytes_sent,
@@ -1991,6 +2040,7 @@ async fn run_push(
                 format_u64_commas(state.bytes_sent)
             );
             println!("  Resume: rerun the same command (use --fresh to restart)");
+            println!("  URL: {object_url}");
         }
         return Ok(());
     }
@@ -2015,6 +2065,7 @@ async fn run_push(
                 "status": "completed",
                 "spec_dir": spec_dir,
                 "input_path": input_path,
+                "object_url": object_url,
                 "rows_uploaded": state.items_done,
                 "pages_done": state.pages_done,
                 "bytes_sent": state.bytes_sent
@@ -2028,6 +2079,7 @@ async fn run_push(
         let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
         let bytes_per_sec = state.bytes_sent as f64 / elapsed_secs as f64;
         println!("Push complete");
+        println!("  URL: {object_url}");
         println!("  Input: {}", input_path.display());
         println!("  Time: {}", format_duration(elapsed_secs));
         println!("  Traces: {}", format_usize_commas(traces_done));
@@ -2046,6 +2098,35 @@ async fn run_push(
         );
     }
     Ok(())
+}
+
+fn push_destination_url(
+    app_url: &str,
+    org_name: &str,
+    destination: &ResolvedPushDestination,
+) -> String {
+    let project_name = if destination.project_name.trim().is_empty() {
+        destination.project_id.as_str()
+    } else {
+        destination.project_name.as_str()
+    };
+    let object_name = if destination.object_name.trim().is_empty() {
+        destination.object.object_name.as_str()
+    } else {
+        destination.object_name.as_str()
+    };
+    let path = match destination.object.object_type {
+        ObjectType::ProjectLogs => "logs".to_string(),
+        ObjectType::Experiment => format!("experiments/{}", encode(object_name)),
+        ObjectType::Dataset => format!("datasets/{}", encode(object_name)),
+    };
+    format!(
+        "{}/app/{}/p/{}/{}",
+        app_url.trim_end_matches('/'),
+        encode(org_name),
+        encode(project_name),
+        path
+    )
 }
 
 fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
@@ -2124,16 +2205,21 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_btql_query(
+async fn execute_btql_request<Q, T>(
     client: &ApiClient,
     ctx: &LoginContext,
-    query: &str,
+    query: &Q,
+    query_source: &str,
     btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
-) -> Result<BtqlResponse> {
+) -> Result<T>
+where
+    Q: Serialize + ?Sized,
+    T: DeserializeOwned,
+{
     let body = json!({
         "query": query,
         "fmt": "json",
-        "query_source": "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
+        "query_source": query_source,
     });
     let org_name = ctx.login.org_name().unwrap_or_default();
     let client = client.clone();
@@ -2168,7 +2254,7 @@ async fn execute_btql_query(
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            return response.json::<BtqlResponse>().await.map_err(|err| {
+                            return response.json::<T>().await.map_err(|err| {
                                 BackoffError::permanent(anyhow!("failed to parse BTQL response: {err}"))
                             });
                         }
@@ -2213,6 +2299,31 @@ async fn execute_btql_query(
         let attempts = attempt_counter.load(Ordering::Relaxed).max(1);
         anyhow!(err).context(format!("BTQL request failed after {attempts} attempt(s)"))
     })
+}
+
+async fn execute_btql_query(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &str,
+    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
+) -> Result<BtqlResponse> {
+    execute_btql_request(
+        client,
+        ctx,
+        query,
+        "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
+        btql_retry_tracker,
+    )
+    .await
+}
+
+async fn execute_btql_json_query<T: DeserializeOwned>(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &Value,
+    query_source: &str,
+) -> Result<T> {
+    execute_btql_request(client, ctx, query, query_source, None).await
 }
 
 async fn execute_btql_query_timed(
@@ -3093,7 +3204,9 @@ async fn resolve_destination(
             Ok(ResolvedDestination {
                 object_ref: format!("project_logs:{}", project.id),
                 object,
-                project_id: project.id,
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                object_name: project.name,
                 run_id: None,
             })
         }
@@ -3127,6 +3240,8 @@ async fn resolve_destination(
                 object_ref: format!("experiment:{}", resolved.object_id),
                 object,
                 project_id: resolved.project_id,
+                project_name: resolved.project_name,
+                object_name: resolved.object_name,
                 run_id,
             })
         }
@@ -3151,6 +3266,8 @@ async fn resolve_destination(
                 object_ref: format!("dataset:{}", resolved.object_id),
                 object,
                 project_id: resolved.project_id,
+                project_name: resolved.project_name,
+                object_name: resolved.object_name,
                 run_id: None,
             })
         }
@@ -3207,7 +3324,9 @@ async fn resolve_named_object_target(
         )?;
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
+            object_name: object.name.clone(),
             project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3223,7 +3342,9 @@ async fn resolve_named_object_target(
         if let Some(object) = objects.iter().find(|value| value.id == object_selector) {
             return Ok(ResolvedNamedObjectTarget {
                 object_id: object.id.clone(),
+                object_name: object.name.clone(),
                 project_id: project.id.clone(),
+                project_name: project.name.clone(),
             });
         }
     }
@@ -3273,7 +3394,9 @@ async fn resolve_push_experiment_target(
     ) {
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
-            project_id: project.id,
+            object_name: object.name.clone(),
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3300,7 +3423,9 @@ async fn resolve_push_experiment_target(
 
     Ok(ResolvedNamedObjectTarget {
         object_id: created.id,
+        object_name: created.name,
         project_id: project.id,
+        project_name: project.name,
     })
 }
 
@@ -3336,7 +3461,9 @@ async fn resolve_push_dataset_target(
     ) {
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
-            project_id: project.id,
+            object_name: object.name.clone(),
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3363,7 +3490,9 @@ async fn resolve_push_dataset_target(
 
     Ok(ResolvedNamedObjectTarget {
         object_id: created.id,
+        object_name: created.name,
         project_id: project.id,
+        project_name: project.name,
     })
 }
 
@@ -3411,6 +3540,8 @@ async fn resolve_push_destination(
         object: resolved.object,
         object_ref: resolved.object_ref,
         project_id: resolved.project_id,
+        project_name: resolved.project_name,
+        object_name: resolved.object_name,
         run_id: resolved.run_id,
     })
 }
@@ -3575,13 +3706,26 @@ fn sanitize_segment(value: &str) -> String {
     }
 }
 
-fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
+pub(crate) fn artifact_base_dir(root: &Path, object_type: &str, object_name: &str) -> PathBuf {
     let object_key = format!(
         "{}_{}",
-        sanitize_segment(object.object_type.as_str()),
-        sanitize_segment(&object.object_name)
+        sanitize_segment(object_type),
+        sanitize_segment(object_name)
     );
-    root.join(object_key).join(&hash[..12])
+    root.join(object_key)
+}
+
+pub(crate) fn artifact_spec_dir(
+    root: &Path,
+    object_type: &str,
+    object_name: &str,
+    hash: &str,
+) -> PathBuf {
+    artifact_base_dir(root, object_type, object_name).join(&hash[..12])
+}
+
+fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
+    artifact_spec_dir(root, object.object_type.as_str(), &object.object_name, hash)
 }
 
 fn legacy_spec_dir(
@@ -3630,8 +3774,8 @@ fn resolve_spec_dir(
     }
 }
 
-fn spec_hash(spec: &SyncSpec) -> Result<String> {
-    let canonical = serde_json::to_vec(spec).context("failed to serialize sync spec")?;
+pub(crate) fn stable_spec_hash<T: Serialize + ?Sized>(spec: &T) -> Result<String> {
+    let canonical = serde_json::to_vec(spec).context("failed to serialize spec")?;
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     let digest = hasher.finalize();
@@ -3642,7 +3786,11 @@ fn spec_hash(spec: &SyncSpec) -> Result<String> {
     Ok(out)
 }
 
-fn epoch_seconds() -> u64 {
+fn spec_hash(spec: &SyncSpec) -> Result<String> {
+    stable_spec_hash(spec)
+}
+
+pub(crate) fn epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3888,8 +4036,73 @@ fn open_jsonl_part_writer(base_dir: &Path, append: bool) -> Result<JsonlPartWrit
     JsonlPartWriter::new(base_dir, append)
 }
 
+pub(crate) fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut values = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| {
+            format!("failed to read line {} from {}", index + 1, path.display())
+        })?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        values.push(serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "failed to parse JSON on line {} from {}",
+                index + 1,
+                path.display()
+            )
+        })?);
+    }
+    Ok(values)
+}
+
+fn serialize_jsonl_value<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    serde_json::to_string(value).context("failed to serialize row to JSONL")
+}
+
+pub(crate) fn write_jsonl_value<T: Serialize + ?Sized>(
+    writer: &mut dyn Write,
+    value: &T,
+) -> Result<usize> {
+    let encoded = serialize_jsonl_value(value)?;
+    writer
+        .write_all(encoded.as_bytes())
+        .context("failed to write JSONL row")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write JSONL newline")?;
+    Ok(encoded.len() + 1)
+}
+
+pub(crate) fn create_jsonl_file_writer(path: &Path) -> Result<BufWriter<File>> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Ok(BufWriter::new(File::create(path).with_context(|| {
+        format!("failed to create {}", path.display())
+    })?))
+}
+
+#[cfg(test)]
+pub(crate) fn write_jsonl_values<T: Serialize>(out: Option<&Path>, values: &[T]) -> Result<()> {
+    let mut writer: Box<dyn Write> = if let Some(path) = out {
+        Box::new(create_jsonl_file_writer(path)?)
+    } else {
+        Box::new(BufWriter::new(std::io::stdout()))
+    };
+
+    for value in values {
+        write_jsonl_value(writer.as_mut(), value)?;
+    }
+    writer.flush().context("failed to flush JSONL output")
+}
+
 fn write_jsonl_row(writer: &mut JsonlPartWriter, row: &Map<String, Value>) -> Result<usize> {
-    let encoded = serde_json::to_string(row).context("failed to serialize row to JSONL")?;
+    let encoded = serialize_jsonl_value(row)?;
     writer
         .write_line(&encoded)
         .context("failed to write JSONL row")
@@ -4348,7 +4561,7 @@ fn value_as_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
@@ -4367,7 +4580,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
@@ -4490,6 +4703,87 @@ fn spinner_bar(message: &str) -> ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_jsonl_value_serializes_one_line_and_reports_bytes() -> Result<()> {
+        let mut output = Vec::new();
+
+        let bytes = write_jsonl_value(&mut output, &json!({ "id": "row-1" }))?;
+
+        assert_eq!(bytes, output.len());
+        assert_eq!(String::from_utf8(output)?, "{\"id\":\"row-1\"}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn read_jsonl_values_skips_blank_lines() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-read-jsonl-values-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+
+        fs::write(&path, "{\"id\":\"row-1\"}\n\n{\"id\":\"row-2\"}\n")?;
+        let values = read_jsonl_values(&path)?;
+
+        assert_eq!(
+            values,
+            vec![json!({ "id": "row-1" }), json!({ "id": "row-2" })]
+        );
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn write_jsonl_values_writes_file() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-write-jsonl-values-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+
+        write_jsonl_values(
+            Some(&path),
+            &[json!({ "id": "row-1" }), json!({ "id": "row-2" })],
+        )?;
+
+        let content = fs::read_to_string(&path)?;
+        assert_eq!(content, "{\"id\":\"row-1\"}\n{\"id\":\"row-2\"}\n");
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn push_destination_url_links_to_dataset_object() {
+        let destination = ResolvedPushDestination {
+            object: ObjectRef {
+                object_type: ObjectType::Dataset,
+                object_name: "dataset-id".to_string(),
+            },
+            object_ref: "dataset:dataset-id".to_string(),
+            project_id: "project-id".to_string(),
+            project_name: "Facet Optimizer".to_string(),
+            object_name: "Loop Facet Ground Truth".to_string(),
+            run_id: None,
+        };
+
+        assert_eq!(
+            push_destination_url(
+                "https://www.braintrust.dev/",
+                "braintrustdata.com",
+                &destination
+            ),
+            "https://www.braintrust.dev/app/braintrustdata.com/p/Facet%20Optimizer/datasets/Loop%20Facet%20Ground%20Truth"
+        );
+    }
 
     #[test]
     fn push_checkpoint_line_offset_advances_only_after_commit() {

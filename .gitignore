@@ -19,6 +19,9 @@ Thumbs.db
 node_modules/
 tests/evals/js/eval-bun/test-data.txt
 
+# Python
+.venv/
+
 .bt/
 
 # Agents

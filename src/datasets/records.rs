@@ -206,7 +206,7 @@ fn expect_record_object(value: Value, record_number: Option<usize>) -> Result<Ma
     }
 }
 
-fn prepare_records(
+pub(crate) fn prepare_records(
     raw_records: Vec<Map<String, Value>>,
     id_field: &str,
     require_ids: bool,

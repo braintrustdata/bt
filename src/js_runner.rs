@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -105,16 +105,20 @@ pub fn resolve_js_runner_command(runner: &str, files: &[PathBuf]) -> PathBuf {
 
 fn build_deno_command(deno_runner: &OsStr, runner_script: &Path, files: &[PathBuf]) -> Command {
     let mut command = Command::new(deno_runner);
+    command.args(deno_runner_args(runner_script, files));
     command
-        .arg("run")
-        .arg("-A")
-        .arg("--node-modules-dir=auto")
-        .arg("--unstable-detect-cjs")
-        .arg(runner_script);
-    for file in files {
-        command.arg(file);
-    }
-    command
+}
+
+pub fn deno_runner_args(runner_script: &Path, files: &[PathBuf]) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("run"),
+        OsString::from("-A"),
+        OsString::from("--node-modules-dir=auto"),
+        OsString::from("--unstable-detect-cjs"),
+        runner_script.as_os_str().to_os_string(),
+    ];
+    args.extend(files.iter().map(|file| file.as_os_str().to_os_string()));
+    args
 }
 
 fn is_path_like_runner(runner: &str) -> bool {
@@ -122,7 +126,7 @@ fn is_path_like_runner(runner: &str) -> bool {
     path.is_absolute() || runner.contains('/') || runner.contains('\\') || runner.starts_with('.')
 }
 
-fn is_deno_runner_path(runner: &Path) -> bool {
+pub fn is_deno_runner_path(runner: &Path) -> bool {
     runner
         .file_name()
         .and_then(|value| value.to_str())
@@ -130,7 +134,7 @@ fn is_deno_runner_path(runner: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn find_node_module_bin_for_files(binary: &str, files: &[PathBuf]) -> Option<PathBuf> {
+pub fn find_node_module_bin_for_files(binary: &str, files: &[PathBuf]) -> Option<PathBuf> {
     for root in js_runner_search_roots(files) {
         if let Some(path) = find_node_module_bin(binary, &root) {
             return Some(path);
@@ -176,7 +180,7 @@ fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
+pub fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         for candidate in candidates {
@@ -194,6 +198,15 @@ fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+pub fn runner_bin_name(runner_command: &Path) -> Option<String> {
+    let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
+    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+}
+
+pub fn is_ts_node_runner_path(runner_command: &Path) -> bool {
+    runner_bin_name(runner_command).is_some_and(|name| name == "ts-node" || name == "ts-node-esm")
 }
 
 #[cfg(windows)]

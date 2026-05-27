@@ -15,6 +15,7 @@ pub(crate) mod api;
 mod create;
 mod delete;
 mod list;
+mod pipeline;
 mod records;
 mod snapshots;
 mod update;
@@ -118,6 +119,8 @@ enum DatasetsCommands {
     /// Manage dataset snapshots
     #[command(visible_aliases = ["versions", "version"])]
     Snapshots(snapshots::SnapshotsArgs),
+    /// Run full dataset pipelines, or stage pull/transform/push
+    Pipeline(pipeline::PipelineArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -176,7 +179,7 @@ struct ViewArgs {
     )]
     verbose: bool,
 
-    /// Fetch full row values instead of BTQL previews.
+    /// Load full row values instead of BTQL previews.
     #[arg(
         long,
         env = "BT_DATASETS_VIEW_FULL",
@@ -264,10 +267,17 @@ pub(crate) async fn select_dataset_interactive(
 }
 
 pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
-    let read_only = datasets_command_is_read_only(args.command.as_ref());
+    let command = match args.command {
+        Some(DatasetsCommands::Pipeline(pipeline_args)) => {
+            return pipeline::run(base, pipeline_args).await;
+        }
+        command => command,
+    };
+
+    let read_only = datasets_command_is_read_only(command.as_ref());
     let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
-    match args.command {
+    match command {
         None | Some(DatasetsCommands::List) => list::run(&ctx, base.json).await,
         Some(DatasetsCommands::Create(create_args)) => {
             create::run(
@@ -310,6 +320,7 @@ pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
         Some(DatasetsCommands::Snapshots(snapshot_args)) => {
             snapshots::run(&ctx, &base, snapshot_args).await
         }
+        Some(DatasetsCommands::Pipeline(_)) => unreachable!("pipeline handled before context"),
     }
 }
 

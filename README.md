@@ -114,6 +114,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt auth`        | Authenticate with Braintrust                                       |
 | `bt switch`      | Switch org and project context                                     |
 | `bt status`      | Show current org and project context                               |
+| `bt datasets`    | Manage datasets and dataset pipelines                              |
 | `bt eval`        | Run eval files (Unix only)                                         |
 | `bt sql`         | Run SQL queries against Braintrust                                 |
 | `bt view`        | View logs, traces, and spans                                       |
@@ -176,6 +177,39 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
 - Accepted top-level record fields are `id`, `input`, `expected`, `metadata`, `tags`, and `origin` (plus the root field referenced by `--id-field`, if different).
 - Inputs may also be a JSON object with a top-level `rows` array, matching `bt datasets view --json`; sibling wrapper fields are ignored, and each row inside `rows` is still validated strictly.
+
+### `bt datasets pipeline`
+
+Run full dataset pipelines declared with `DatasetPipeline(...)`, or stage pull/transform/push.
+
+```bash
+# One-shot execution: discover refs, transform, and insert up to 100 new rows.
+bt datasets pipeline run ./pipeline.ts --limit 100
+
+# Staged execution for inspection or agent editing.
+bt datasets pipeline pull ./pipeline.ts --limit 500
+bt datasets pipeline transform ./pipeline.ts
+# Inspect or edit the transformed JSONL, then push to the pipeline target.
+bt datasets pipeline push ./pipeline.ts
+
+# Python pipelines are supported too.
+bt datasets pipeline run ./pipeline.py --project "<source project>" --limit 100
+```
+
+Useful flags:
+
+- `--limit <n>` controls how many source refs to discover.
+- `--window <duration>` constrains source ref discovery by `created` time; defaults to `1d`.
+- `--root-span-id <id>` restricts pulling to one or more specific root spans.
+- `--root <path>` controls where staged artifacts are written; it defaults to `bt-sync`. A staged run writes `pulled.jsonl` and `transformed.jsonl` in the same managed directory.
+- `--out` can override the managed output path for `pull` and `transform`.
+- `--in` can override the latest pull artifact for `transform`, or the latest transform artifact for `push`.
+- `push` reads the target from the pipeline and delegates to `bt sync push`; pass `--fresh` to restart an already completed push spec.
+- `--project <name>` supplies the active source project when the pipeline source omits a project.
+- `--source-project`, `--source-project-id`, `--source-org`, and `--source-filter` explicitly override source fields on `pull`, `transform`, and `run`.
+- `--target-project`, `--target-project-id`, `--target-org`, and `--target-dataset` override target fields on `run` and `push`.
+- `--max-concurrency <n>` controls transform concurrency.
+- `--name <name>` selects a pipeline when the file defines more than one.
 
 ## `bt sql`
 

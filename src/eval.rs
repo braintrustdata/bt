@@ -3,9 +3,9 @@ use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use actix_web::dev::Service;
 use actix_web::http::header::{
@@ -27,8 +27,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use strip_ansi_escapes::strip;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -41,8 +39,10 @@ use ratatui::widgets::{Cell, Row, Table};
 use ratatui::Terminal;
 
 use crate::args::BaseArgs;
-use crate::auth::resolved_auth_env;
+use crate::auth::resolved_runner_env;
+use crate::js_runner;
 use crate::python_runner;
+use crate::runner_sse;
 use crate::ui::{animations_enabled, is_quiet};
 
 const MAX_NAME_LENGTH: usize = 40;
@@ -57,7 +57,6 @@ const HEADER_BT_AUTH_TOKEN: &str = "x-bt-auth-token";
 const HEADER_BT_ORG_NAME: &str = "x-bt-org-name";
 const HEADER_CORS_REQ_PRIVATE_NETWORK: &str = "access-control-request-private-network";
 const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
-const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
 const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
 const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
 const DEFAULT_EVAL_SAMPLE_SEED: u64 = 0;
@@ -82,8 +81,6 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     }
     Ok(parsed)
 }
-static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 struct EvalRunOutput {
     status: ExitStatus,
     dependencies: Vec<PathBuf>,
@@ -94,7 +91,7 @@ struct EvalRunnerProcess {
     rx: mpsc::UnboundedReceiver<EvalEvent>,
     sse_task: tokio::task::JoinHandle<()>,
     sse_connected: Arc<AtomicBool>,
-    _socket_cleanup_guard: SocketCleanupGuard,
+    _sse_guard: runner_sse::SseListenerGuard,
 }
 
 struct EvalProcessOutput {
@@ -253,22 +250,6 @@ const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 const JS_RUNNER_FIRE_AND_FORGET_ENTRY: &str =
     "\nmain().catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n";
 const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
-
-struct SocketCleanupGuard {
-    path: PathBuf,
-}
-
-impl SocketCleanupGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for SocketCleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 pub enum EvalLanguage {
@@ -806,32 +787,30 @@ async fn spawn_eval_runner(
     let (js_runner, py_runner) = prepare_eval_runners()?;
     let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
-    let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
+    let (listener, sse_guard) = runner_sse::bind_sse_listener("bt-eval")?;
     let (tx, rx) = mpsc::unbounded_channel();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
     let tx_sse = tx.clone();
     let sse_connected_for_task = Arc::clone(&sse_connected);
     let sse_task = tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        if let Err(err) = runner_sse::accept_and_read_sse_stream(
+            listener,
+            || {
                 sse_connected_for_task.store(true, Ordering::Relaxed);
-                if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
-                    let _ = tx_sse.send(EvalEvent::Error {
-                        message: format!("SSE stream error: {err}"),
-                        stack: None,
-                        status: None,
-                    });
-                }
-            }
-            Err(err) => {
-                let _ = tx_sse.send(EvalEvent::Error {
-                    message: format!("Failed to accept SSE connection: {err}"),
-                    stack: None,
-                    status: None,
-                });
-            }
-        };
+            },
+            |event, data| {
+                handle_sse_event(event, data, &tx_sse);
+            },
+        )
+        .await
+        {
+            let _ = tx_sse.send(EvalEvent::Error {
+                message: format!("SSE stream error: {err}"),
+                stack: None,
+                status: None,
+            });
+        }
     });
 
     let (mut cmd, runner_kind) = match language {
@@ -855,7 +834,7 @@ async fn spawn_eval_runner(
         set_node_heap_size_env(&mut cmd);
     }
 
-    cmd.envs(build_env(base).await?);
+    cmd.envs(resolved_runner_env(base).await?);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -930,10 +909,8 @@ async fn spawn_eval_runner(
             serde_json::to_string(&payload).context("failed to serialize matrix axes")?;
         cmd.env("BT_EVAL_MATRIX_JSON", serialized);
     }
-    cmd.env(
-        "BT_EVAL_SSE_SOCK",
-        socket_path.to_string_lossy().to_string(),
-    );
+    let (sse_env_name, sse_env_value) = sse_guard.env("BT_EVAL_SSE_SOCK", "BT_EVAL_SSE_ADDR");
+    cmd.env(sse_env_name, sse_env_value);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -945,7 +922,14 @@ async fn spawn_eval_runner(
     if let Some(stdout) = stdout {
         let tx_stdout = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stdout, "stdout", tx_stdout).await {
+            if let Err(err) = runner_sse::forward_stream(stdout, "stdout", |stream, message| {
+                let _ = tx_stdout.send(EvalEvent::Console {
+                    stream: stream.to_string(),
+                    message,
+                });
+            })
+            .await
+            {
                 eprintln!("Failed to read eval stdout: {err}");
             }
         });
@@ -954,7 +938,14 @@ async fn spawn_eval_runner(
     if let Some(stderr) = stderr {
         let tx_stderr = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stderr, "stderr", tx_stderr).await {
+            if let Err(err) = runner_sse::forward_stream(stderr, "stderr", |stream, message| {
+                let _ = tx_stderr.send(EvalEvent::Console {
+                    stream: stream.to_string(),
+                    message,
+                });
+            })
+            .await
+            {
                 eprintln!("Failed to read eval stderr: {err}");
             }
         });
@@ -968,77 +959,71 @@ async fn spawn_eval_runner(
             rx,
             sse_task,
             sse_connected,
-            _socket_cleanup_guard: socket_cleanup_guard,
+            _sse_guard: sse_guard,
         },
         runner_kind,
     })
 }
 
 async fn drive_eval_runner<F>(
-    mut process: EvalRunnerProcess,
+    process: EvalRunnerProcess,
     console_policy: ConsolePolicy,
     mut on_event: F,
 ) -> Result<EvalProcessOutput>
 where
     F: FnMut(EvalEvent),
 {
-    let mut status = None;
+    let EvalRunnerProcess {
+        mut child,
+        rx,
+        mut sse_task,
+        sse_connected,
+        _sse_guard,
+    } = process;
     let mut dependency_files: Vec<String> = Vec::new();
     let mut error_messages: Vec<String> = Vec::new();
     let mut stderr_lines: Vec<String> = Vec::new();
-
-    loop {
-        tokio::select! {
-            event = process.rx.recv() => {
-                match event {
-                    Some(EvalEvent::Dependencies { files }) => {
-                        dependency_files.extend(files.clone());
-                        on_event(EvalEvent::Dependencies { files });
-                    }
-                    Some(EvalEvent::Error { message, stack, status }) => {
-                        error_messages.push(message.clone());
-                        if let Some(stack) = stack.as_ref() {
-                            error_messages.push(stack.clone());
-                        }
-                        on_event(EvalEvent::Error { message, stack, status });
-                    }
-                    Some(EvalEvent::Console { stream, message }) => {
-                        if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr)
-                        {
-                            stderr_lines.push(message);
-                        } else {
-                            on_event(EvalEvent::Console { stream, message });
-                        }
-                    }
-                    Some(event) => on_event(event),
-                    None => {
-                        if status.is_none() {
-                            status = Some(process.child.wait().await.context("eval runner process failed")?);
-                            if !process.sse_connected.load(Ordering::Relaxed) {
-                                process.sse_task.abort();
-                            }
-                        }
-                        break;
-                    }
+    let wait = Box::pin(async { child.wait().await.context("eval runner process failed") });
+    let status = runner_sse::drive_runner_events(
+        rx,
+        wait,
+        &mut sse_task,
+        &sse_connected,
+        "eval runner process exited without a status",
+        |event| match event {
+            EvalEvent::Dependencies { files } => {
+                dependency_files.extend(files.clone());
+                on_event(EvalEvent::Dependencies { files });
+            }
+            EvalEvent::Error {
+                message,
+                stack,
+                status,
+            } => {
+                error_messages.push(message.clone());
+                if let Some(stack) = stack.as_ref() {
+                    error_messages.push(stack.clone());
+                }
+                on_event(EvalEvent::Error {
+                    message,
+                    stack,
+                    status,
+                });
+            }
+            EvalEvent::Console { stream, message } => {
+                if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr) {
+                    stderr_lines.push(message);
+                } else {
+                    on_event(EvalEvent::Console { stream, message });
                 }
             }
-            exit_status = process.child.wait(), if status.is_none() => {
-                status = Some(exit_status.context("eval runner process failed")?);
-                if !process.sse_connected.load(Ordering::Relaxed) {
-                    process.sse_task.abort();
-                }
-            }
-        }
-
-        if status.is_some() && process.rx.is_closed() {
-            break;
-        }
-    }
-
-    let _ = process.sse_task.await;
+            event => on_event(event),
+        },
+    )
+    .await?;
 
     Ok(EvalProcessOutput {
-        status: status.context("eval runner process exited without a status")?,
+        status,
         dependency_files,
         error_messages,
         stderr_lines,
@@ -2168,21 +2153,6 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
-    let mut envs = resolved_auth_env(base).await?;
-    let resolved_org = envs
-        .iter()
-        .find_map(|(key, value)| (key == "BRAINTRUST_ORG_NAME").then_some(value.as_str()));
-    let project = base
-        .project
-        .clone()
-        .or_else(|| crate::config::configured_project_for_context(base, resolved_org));
-    if let Some(project) = &project {
-        envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
-    }
-    Ok(envs)
-}
-
 fn detect_eval_language(
     files: &[String],
     language_override: Option<EvalLanguage>,
@@ -2383,7 +2353,7 @@ fn build_js_plan(
 ) -> Result<JsRunnerPlan> {
     if let Some(explicit) = runner_override {
         let resolved_runner = resolve_js_runner_command(explicit, files);
-        if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
+        if is_deno_runner(explicit) || js_runner::is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
@@ -2399,7 +2369,7 @@ fn build_js_plan(
     }
 
     if let Some(auto_runner) = find_js_runner_binary(files) {
-        if is_deno_runner_path(&auto_runner) {
+        if js_runner::is_deno_runner_path(&auto_runner) {
             let runner_script = prepare_js_runner_in_cwd()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
@@ -2424,7 +2394,7 @@ fn build_js_plan(
 
 fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<Command> {
     if let Some(path) = find_node_module_bin_for_files("vite-node", files)
-        .or_else(|| find_binary_in_path(&["vite-node"]))
+        .or_else(|| js_runner::find_binary_in_path(&["vite-node"]))
     {
         let mut command = Command::new(path);
         command.arg(runner).args(files);
@@ -2451,15 +2421,7 @@ fn build_deno_js_command(
 }
 
 fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("run"),
-        OsString::from("-A"),
-        OsString::from("--node-modules-dir=auto"),
-        OsString::from("--unstable-detect-cjs"),
-        runner.as_os_str().to_os_string(),
-    ];
-    args.extend(files.iter().map(OsString::from));
-    args
+    js_runner::deno_runner_args(runner, &files_as_paths(files))
 }
 
 fn build_python_command(
@@ -2503,84 +2465,29 @@ fn python_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
 }
 
 fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
-    // Prefer local project bins first, then PATH. `tsx` remains the preferred
-    // default, with other common TS runners as fallback.
-    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm", "deno"];
-
-    for candidate in RUNNER_CANDIDATES {
-        if let Some(path) = find_node_module_bin_for_files(candidate, files) {
-            return Some(path);
-        }
-    }
-
-    find_binary_in_path(RUNNER_CANDIDATES)
+    js_runner::find_js_runner_binary(&files_as_paths(files))
 }
 
 fn resolve_js_runner_command(runner: &str, files: &[String]) -> PathBuf {
-    if is_path_like_runner(runner) {
-        return PathBuf::from(runner);
-    }
-
-    find_node_module_bin_for_files(runner, files)
-        .or_else(|| find_binary_in_path(&[runner]))
-        .unwrap_or_else(|| PathBuf::from(runner))
-}
-
-fn is_path_like_runner(runner: &str) -> bool {
-    let path = Path::new(runner);
-    path.is_absolute() || runner.contains('/') || runner.contains('\\') || runner.starts_with('.')
+    js_runner::resolve_js_runner_command(runner, &files_as_paths(files))
 }
 
 fn find_node_module_bin_for_files(binary: &str, files: &[String]) -> Option<PathBuf> {
-    let search_roots = js_runner_search_roots(files);
-    for root in &search_roots {
-        if let Some(path) = find_node_module_bin(binary, root) {
-            return Some(path);
-        }
-    }
-    None
+    js_runner::find_node_module_bin_for_files(binary, &files_as_paths(files))
 }
 
-fn js_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
-    let mut search_roots = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        search_roots.push(cwd.clone());
-        for file in files {
-            let path = PathBuf::from(file);
-            let absolute = if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            };
-            if let Some(parent) = absolute.parent() {
-                search_roots.push(parent.to_path_buf());
-            }
-        }
-    }
-    search_roots
+fn files_as_paths(files: &[String]) -> Vec<PathBuf> {
+    files.iter().map(PathBuf::from).collect()
 }
 
 fn is_deno_runner(runner: &str) -> bool {
-    let file_name = Path::new(runner)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(runner);
-    file_name.eq_ignore_ascii_case("deno") || file_name.eq_ignore_ascii_case("deno.exe")
-}
-
-fn is_deno_runner_path(runner: &Path) -> bool {
-    runner
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(|name| name.eq_ignore_ascii_case("deno") || name.eq_ignore_ascii_case("deno.exe"))
-        .unwrap_or(false)
+    js_runner::is_deno_runner_path(Path::new(runner))
 }
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
-    if is_ts_node_runner(runner_command) {
+    if js_runner::is_ts_node_runner_path(runner_command) {
         // ts-node resolves modules relative to the cwd's node_modules, so the
-        // runner must live inside the project tree. The in-cwd cache holds the
-        // default `.ts` entry alongside the shared impl.
+        // runner must live inside the project tree.
         return prepare_js_runner_in_cwd();
     }
     Ok(default_runner.to_path_buf())
@@ -2601,22 +2508,8 @@ fn js_runner_path_for_kind(default_path: &Path, kind: RunnerKind) -> PathBuf {
 }
 
 fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = cwd
-        .join(".bt")
-        .join("eval-runners")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&cache_dir).with_context(|| {
-        format!(
-            "failed to create eval runner cache dir {}",
-            cache_dir.display()
-        )
-    })?;
-    materialize_runner_script(
-        &cache_dir,
-        JS_RUNNER_DEFAULT_FILE,
-        &js_runner_default_source(),
-    )
+    let source = js_runner_default_source();
+    js_runner::materialize_runner_script_in_cwd("eval-runners", JS_RUNNER_DEFAULT_FILE, &source)
 }
 
 /// Builds the standalone default entry: the impl body with a fire-and-forget
@@ -2631,8 +2524,7 @@ fn js_runner_default_source() -> String {
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
-    let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
-    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+    js_runner::runner_bin_name(runner_command)
 }
 
 fn runner_kind_for_bin(runner_command: &Path) -> RunnerKind {
@@ -2662,90 +2554,6 @@ fn set_node_heap_size_env(command: &mut Command) {
         format!("{existing} {heap_option}")
     };
     command.env("NODE_OPTIONS", merged);
-}
-
-fn is_ts_node_runner(runner_command: &Path) -> bool {
-    runner_bin_name(runner_command).is_some_and(|n| n == "ts-node" || n == "ts-node-esm")
-}
-
-fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        let base = dir.join("node_modules").join(".bin").join(binary);
-        if base.is_file() {
-            return Some(base);
-        }
-        if cfg!(windows) {
-            let cmd = base.with_extension("cmd");
-            if cmd.is_file() {
-                return Some(cmd);
-            }
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        for candidate in candidates {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-            if cfg!(windows) {
-                let cmd = path.with_extension("cmd");
-                if cmd.is_file() {
-                    return Some(cmd);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn build_sse_socket_path() -> Result<PathBuf> {
-    let pid = std::process::id();
-    let serial = SSE_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("failed to read system time")?
-        .as_nanos();
-    Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}-{serial}.sock")))
-}
-
-fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
-    let mut last_bind_err: Option<std::io::Error> = None;
-    for _ in 0..SSE_SOCKET_BIND_MAX_ATTEMPTS {
-        let socket_path = build_sse_socket_path()?;
-        let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
-        let _ = std::fs::remove_file(&socket_path);
-        match UnixListener::bind(&socket_path) {
-            Ok(listener) => return Ok((listener, socket_path, socket_cleanup_guard)),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::AddrInUse
-                ) =>
-            {
-                last_bind_err = Some(err);
-                continue;
-            }
-            Err(err) => {
-                return Err(err).context("failed to bind SSE unix socket");
-            }
-        }
-    }
-    let err = last_bind_err.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "failed to allocate a unique SSE socket path",
-        )
-    });
-    Err(err).context(format!(
-        "failed to bind SSE unix socket after {SSE_SOCKET_BIND_MAX_ATTEMPTS} attempts"
-    ))
 }
 
 fn eval_runner_cache_dir() -> PathBuf {
@@ -2791,13 +2599,7 @@ fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
-    let path = cache_dir.join(file_name);
-    let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(source) {
-        std::fs::write(&path, source)
-            .with_context(|| format!("failed to write eval runner script {}", path.display()))?;
-    }
-    Ok(path)
+    js_runner::materialize_runner_script(cache_dir, file_name, source)
 }
 
 #[derive(Debug)]
@@ -2930,57 +2732,6 @@ struct SseConsoleEventData {
 #[derive(Debug, Deserialize)]
 struct SseDependenciesEventData {
     files: Vec<String>,
-}
-
-async fn forward_stream<T>(
-    stream: T,
-    name: &'static str,
-    tx: mpsc::UnboundedSender<EvalEvent>,
-) -> Result<()>
-where
-    T: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    while let Some(line) = lines.next_line().await? {
-        let _ = tx.send(EvalEvent::Console {
-            stream: name.to_string(),
-            message: line,
-        });
-    }
-    Ok(())
-}
-
-async fn read_sse_stream<T>(stream: T, tx: mpsc::UnboundedSender<EvalEvent>) -> Result<()>
-where
-    T: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    let mut event: Option<String> = None;
-    let mut data_lines: Vec<String> = Vec::new();
-
-    while let Some(line) = lines.next_line().await? {
-        if line.is_empty() {
-            if event.is_some() || !data_lines.is_empty() {
-                let data = data_lines.join("\n");
-                handle_sse_event(event.take(), data, &tx);
-                data_lines.clear();
-            }
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim_start().to_string());
-        }
-    }
-
-    if event.is_some() || !data_lines.is_empty() {
-        let data = data_lines.join("\n");
-        handle_sse_event(event.take(), data, &tx);
-    }
-
-    Ok(())
 }
 
 fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSender<EvalEvent>) {
@@ -4591,10 +4342,11 @@ mod tests {
         assert!(message.contains("pnpm add -D vite-node"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn build_sse_socket_path_is_unique_for_consecutive_calls() {
-        let first = build_sse_socket_path().expect("first socket path");
-        let second = build_sse_socket_path().expect("second socket path");
+        let first = runner_sse::build_sse_socket_path("bt-eval").expect("first socket path");
+        let second = runner_sse::build_sse_socket_path("bt-eval").expect("second socket path");
         assert_ne!(first, second);
     }
 
