@@ -2,7 +2,7 @@
 name = "bt"
 version = "0.9.2"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version = "1.95.0"
 authors = ["Braintrust engineering <eng@braintrust.dev>"]
 description = "The Braintrust command line interface"
 license = "Apache-2.0"
