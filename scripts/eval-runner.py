@@ -27,6 +27,11 @@ try:
     )
     from braintrust.logger import Dataset, init as init_logger_experiment, parent_context, _internal_get_global_state
     from braintrust.parameters import parameters_to_json_schema, validate_parameters
+
+    try:
+        from braintrust.parameters import serialize_remote_eval_parameters_container
+    except ImportError:
+        serialize_remote_eval_parameters_container = None
     from braintrust.util import eprint
     from braintrust.span_identifier_v4 import parse_parent
 except Exception as exc:  # pragma: no cover - runtime guard
@@ -567,10 +572,18 @@ def build_eval_definitions(evaluator_instances: list[EvaluatorInstance]) -> dict
         evaluator = evaluator_instance.evaluator
         scores = [{"name": getattr(score, "__name__", f"scorer_{i}")} for i, score in enumerate(evaluator.scores)]
         definitions[evaluator.eval_name] = {
-            "parameters": parameters_to_json_schema(evaluator.parameters) if evaluator.parameters else {},
+            "parameters": serialize_evaluator_parameters(evaluator.parameters),
             "scores": scores,
         }
     return definitions
+
+
+def serialize_evaluator_parameters(parameters: Any) -> dict[str, Any] | None:
+    if not parameters:
+        return {}
+    if serialize_remote_eval_parameters_container is not None:
+        return serialize_remote_eval_parameters_container(parameters)
+    return parameters_to_json_schema(parameters)
 
 
 def collect_files(input_path: str) -> list[str]:
