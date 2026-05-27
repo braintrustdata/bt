@@ -35,6 +35,56 @@ pub async fn run_view(
     Ok(())
 }
 
+pub async fn run_view_target(
+    ctx: &ResolvedContext,
+    automation_id: Option<&str>,
+    target: &str,
+    json: bool,
+) -> Result<()> {
+    let report = with_spinner(
+        "Loading Topics config...",
+        api::fetch_topics_config(ctx, automation_id),
+    )
+    .await?;
+    let target = normalize_target(target)?;
+
+    if let Some(automation) = resolve_automation_config_target(&report, target)? {
+        if json {
+            println!("{}", serde_json::to_string(automation)?);
+            return Ok(());
+        }
+
+        print_with_pager(&render_single_config(
+            &format_project_header(
+                &report.project.name,
+                &report.project.id,
+                &report.project.org_name,
+            ),
+            automation,
+        ))?;
+        return Ok(());
+    }
+
+    let resolved = resolve_topic_map_config_target(&report, target)?;
+    print_topic_map_view(&report, resolved, json)
+}
+
+pub async fn run_topic_map_view(
+    ctx: &ResolvedContext,
+    automation_id: Option<&str>,
+    topic_map: &str,
+    json: bool,
+) -> Result<()> {
+    let report = with_spinner(
+        "Loading Topics topic map config...",
+        api::fetch_topics_config(ctx, automation_id),
+    )
+    .await?;
+    let topic_map = normalize_target(topic_map)?;
+    let resolved = resolve_topic_map_config_target(&report, topic_map)?;
+    print_topic_map_view(&report, resolved, json)
+}
+
 pub async fn run_set(ctx: &ResolvedContext, args: &ConfigSetArgs, json: bool) -> Result<()> {
     let patch = args.to_patch()?;
     let updated = with_spinner(
@@ -190,6 +240,20 @@ fn render_single_topic_map_update(header: &str, updated: &TopicMapConfigUpdate) 
     output
 }
 
+fn render_single_topic_map_config(
+    header: &str,
+    automation: &TopicAutomationConfig,
+    topic_map: &FunctionSummary,
+) -> String {
+    let mut output = String::new();
+    output.push_str(header);
+    output.push('\n');
+    output.push('\n');
+    output.push_str(&render_topic_map_config_block(automation, topic_map));
+    output.push('\n');
+    output
+}
+
 fn render_delete_report(report: &TopicsDeleteReport) -> String {
     let mut output = format_project_header(
         &report.project.name,
@@ -307,23 +371,169 @@ fn render_config_block(automation: &TopicAutomationConfig) -> String {
 }
 
 fn render_topic_map_update_block(automation: &TopicAutomationConfig, topic_map_id: &str) -> String {
-    let mut lines = vec![format!("{} ({})", automation.name, automation.id)];
     let Some(topic_map) = automation
         .topic_map_functions
         .iter()
         .find(|function| function.id.as_deref() == Some(topic_map_id))
     else {
+        let mut lines = vec![format!("{} ({})", automation.name, automation.id)];
         lines.push(format!("  topic map id: {topic_map_id}"));
         lines.push("  details: unavailable after update".to_string());
         return lines.join("\n");
     };
 
+    render_topic_map_config_block(automation, topic_map)
+}
+
+fn render_topic_map_config_block(
+    automation: &TopicAutomationConfig,
+    topic_map: &FunctionSummary,
+) -> String {
+    let mut lines = vec![format!("{} ({})", automation.name, automation.id)];
     lines.push(format!(
         "  topic map: {}",
         format_function_identity(topic_map)
     ));
     push_topic_map_details(&mut lines, topic_map, "    ");
     lines.join("\n")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TopicMapConfigMatch<'a> {
+    automation: &'a TopicAutomationConfig,
+    topic_map: &'a FunctionSummary,
+}
+
+fn print_topic_map_view(
+    report: &TopicsConfigReport,
+    resolved: TopicMapConfigMatch<'_>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let value = serde_json::json!({
+            "project": &report.project,
+            "automation": resolved.automation,
+            "topic_map": resolved.topic_map,
+        });
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(());
+    }
+
+    print_with_pager(&render_single_topic_map_config(
+        &format_project_header(
+            &report.project.name,
+            &report.project.id,
+            &report.project.org_name,
+        ),
+        resolved.automation,
+        resolved.topic_map,
+    ))?;
+    Ok(())
+}
+
+fn normalize_target(target: &str) -> Result<&str> {
+    let target = target.trim();
+    if target.is_empty() {
+        bail!("target cannot be empty");
+    }
+    Ok(target)
+}
+
+fn resolve_automation_config_target<'a>(
+    report: &'a TopicsConfigReport,
+    target: &str,
+) -> Result<Option<&'a TopicAutomationConfig>> {
+    let id_matches = report
+        .automations
+        .iter()
+        .filter(|automation| automation.id == target)
+        .collect::<Vec<_>>();
+    if !id_matches.is_empty() {
+        return Ok(Some(single_automation_match(id_matches, target)?));
+    }
+
+    let name_matches = report
+        .automations
+        .iter()
+        .filter(|automation| automation.name.eq_ignore_ascii_case(target))
+        .collect::<Vec<_>>();
+    if name_matches.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(single_automation_match(name_matches, target)?))
+}
+
+fn single_automation_match<'a>(
+    matches: Vec<&'a TopicAutomationConfig>,
+    target: &str,
+) -> Result<&'a TopicAutomationConfig> {
+    if matches.len() == 1 {
+        return Ok(matches[0]);
+    }
+
+    let choices = matches
+        .iter()
+        .map(|automation| format!("{} ({})", automation.name, automation.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "topic automation '{target}' matched multiple entries ({choices}); re-run with --automation-id"
+    )
+}
+
+fn resolve_topic_map_config_target<'a>(
+    report: &'a TopicsConfigReport,
+    target: &str,
+) -> Result<TopicMapConfigMatch<'a>> {
+    let mut id_matches = Vec::new();
+    let mut name_matches = Vec::new();
+
+    for automation in &report.automations {
+        for topic_map in &automation.topic_map_functions {
+            if topic_map.id.as_deref() == Some(target) {
+                id_matches.push(TopicMapConfigMatch {
+                    automation,
+                    topic_map,
+                });
+            }
+            if topic_map.name.eq_ignore_ascii_case(target) {
+                name_matches.push(TopicMapConfigMatch {
+                    automation,
+                    topic_map,
+                });
+            }
+        }
+    }
+
+    let matches = if id_matches.is_empty() {
+        name_matches
+    } else {
+        id_matches
+    };
+    if matches.is_empty() {
+        bail!(
+            "topic automation or topic map '{target}' was not found; run `bt topics config` to list IDs"
+        );
+    }
+    if matches.len() == 1 {
+        return Ok(matches[0]);
+    }
+
+    let choices = matches
+        .iter()
+        .map(|item| {
+            let topic_map_id = item.topic_map.id.as_deref().unwrap_or("unknown");
+            format!(
+                "{} (topic map id: {}, automation: {} [{}])",
+                item.topic_map.name, topic_map_id, item.automation.name, item.automation.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "topic map '{target}' matched multiple entries ({choices}); re-run with --automation-id or the topic map function ID"
+    )
 }
 
 fn resolve_single_automation_for_action(
@@ -767,6 +977,19 @@ mod tests {
         }
     }
 
+    fn sample_report() -> TopicsConfigReport {
+        TopicsConfigReport {
+            project: TopicsProjectSummary {
+                id: "proj_123".to_string(),
+                name: "demo-project".to_string(),
+                org_name: "demo-org".to_string(),
+                topics_url: "https://app.example.com/app/demo-org/p/demo-project/topics"
+                    .to_string(),
+            },
+            automations: vec![sample_config()],
+        }
+    }
+
     #[test]
     fn render_config_block_includes_meanings() {
         let output = render_config_block(&sample_config());
@@ -788,6 +1011,32 @@ mod tests {
             "generation: algorithm hdbscan | reduction umap | min cluster size 25 | min samples 10"
         ));
         assert!(output.contains("distance threshold: 0.35"));
+    }
+
+    #[test]
+    fn render_topic_map_config_block_includes_settings() {
+        let config = sample_config();
+        let topic_map = config.topic_map_functions.first().expect("topic map");
+        let output = render_single_topic_map_config(
+            "Project: demo-org / demo-project (proj_123)",
+            &config,
+            topic_map,
+        );
+
+        assert!(output.contains("Topics (auto_123)"));
+        assert!(output.contains("topic map: Task (id: func_1)"));
+        assert!(output.contains("source facet: Task"));
+        assert!(output.contains("embedding model: brain-embedding-1"));
+        assert!(output.contains("distance threshold: 0.35"));
+    }
+
+    #[test]
+    fn resolve_topic_map_config_target_matches_id() {
+        let report = sample_report();
+        let resolved = resolve_topic_map_config_target(&report, "func_1").expect("topic map");
+
+        assert_eq!(resolved.automation.id, "auto_123");
+        assert_eq!(resolved.topic_map.name, "Task");
     }
 
     #[test]

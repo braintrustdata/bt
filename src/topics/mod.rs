@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
@@ -23,9 +23,11 @@ Examples:
   bt topics status --full
   bt topics status --watch
   bt topics config
+  bt topics config <automation-or-topic-map-id>
   bt topics config enable
   bt topics config delete
   bt topics config set --topic-window 1h --generation-cadence 1d
+  bt topics config topic-map <topic-map-id>
   bt topics config topic-map set Task --embedding-model brain-embedding-1
   bt topics report fn_123
   bt topics report fn_123 --version 0000000000000001
@@ -56,9 +58,17 @@ enum TopicsCommands {
 
 #[derive(Debug, Clone, Args)]
 struct StatusArgs {
-    /// Show expanded diagnostics, including the state machine
+    /// Show expanded diagnostics and progress counts
     #[arg(long)]
     full: bool,
+
+    /// Window for status progress counts, for example 1h or 7d
+    #[arg(
+        long = "progress-window",
+        env = "BT_TOPICS_STATUS_PROGRESS_WINDOW",
+        value_name = "WINDOW"
+    )]
+    progress_window: Option<String>,
 
     /// Refresh every 2 seconds until interrupted
     #[arg(long)]
@@ -70,6 +80,10 @@ struct ConfigArgs {
     /// Specific automation ID to show
     #[arg(long = "automation-id")]
     automation_id: Option<String>,
+
+    /// Automation ID/name or topic map name/function ID to show
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
 
     #[command(subcommand)]
     command: Option<ConfigCommands>,
@@ -83,7 +97,7 @@ enum ConfigCommands {
     Delete(ConfigDeleteArgs),
     /// Update editable Topics config fields
     Set(ConfigSetArgs),
-    /// Edit per-topic-map settings
+    /// View or edit per-topic-map settings
     #[command(name = "topic-map")]
     TopicMap(TopicMapArgs),
 }
@@ -164,14 +178,35 @@ struct ConfigDeleteArgs {
 
 #[derive(Debug, Clone, Args)]
 struct TopicMapArgs {
+    /// Topic map name or function ID to show
+    #[arg(value_name = "TOPIC_MAP")]
+    topic_map: Option<String>,
+
+    /// Specific automation ID to search within
+    #[arg(long = "automation-id")]
+    automation_id: Option<String>,
+
     #[command(subcommand)]
-    command: TopicMapCommands,
+    command: Option<TopicMapCommands>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
 enum TopicMapCommands {
+    /// Show a configured Topics topic map by name or function ID
+    #[command(alias = "view")]
+    Show(TopicMapViewArgs),
     /// Update a configured Topics topic map by name or function ID
     Set(TopicMapSetArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct TopicMapViewArgs {
+    /// Specific automation ID to search within
+    #[arg(long = "automation-id")]
+    automation_id: Option<String>,
+
+    /// Topic map name or function ID
+    topic_map: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -290,7 +325,18 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
 
     let read_only = match args.command.as_ref() {
         None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
-        Some(TopicsCommands::Config(config_args)) => config_args.command.is_none(),
+        Some(TopicsCommands::Config(config_args)) => match config_args.command.as_ref() {
+            None => true,
+            Some(ConfigCommands::TopicMap(topic_map_args)) => {
+                matches!(
+                    topic_map_args.command,
+                    None | Some(TopicMapCommands::Show(_))
+                )
+            }
+            Some(ConfigCommands::Enable(_))
+            | Some(ConfigCommands::Delete(_))
+            | Some(ConfigCommands::Set(_)) => false,
+        },
         Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
         Some(TopicsCommands::Report(_)) => unreachable!("handled before project resolution"),
     };
@@ -302,6 +348,7 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
                 &ctx,
                 StatusArgs {
                     full: false,
+                    progress_window: None,
                     watch: false,
                 },
                 base.json,
@@ -313,8 +360,22 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         }
         Some(TopicsCommands::Config(config_args)) => {
             let parent_automation_id = config_args.automation_id;
+            let target = config_args.target;
             match config_args.command {
-                None => config::run_view(&ctx, parent_automation_id.as_deref(), base.json).await,
+                None => match target {
+                    Some(target) => {
+                        config::run_view_target(
+                            &ctx,
+                            parent_automation_id.as_deref(),
+                            &target,
+                            base.json,
+                        )
+                        .await
+                    }
+                    None => {
+                        config::run_view(&ctx, parent_automation_id.as_deref(), base.json).await
+                    }
+                },
                 Some(ConfigCommands::Enable(enable_args)) => {
                     config::run_enable(&ctx, &enable_args, base.json).await
                 }
@@ -334,12 +395,43 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
                     set_args.automation_id = set_args.automation_id.or(parent_automation_id);
                     config::run_set(&ctx, &set_args, base.json).await
                 }
-                Some(ConfigCommands::TopicMap(topic_map_args)) => match topic_map_args.command {
-                    TopicMapCommands::Set(mut set_args) => {
-                        set_args.automation_id = set_args.automation_id.or(parent_automation_id);
-                        config::run_topic_map_set(&ctx, &set_args, base.json).await
+                Some(ConfigCommands::TopicMap(topic_map_args)) => {
+                    let topic_map_automation_id =
+                        topic_map_args.automation_id.or(parent_automation_id);
+                    match topic_map_args.command {
+                        None => {
+                            let Some(topic_map) = topic_map_args.topic_map else {
+                                bail!(
+                                    "topic map name or function ID is required; try `bt topics config topic-map <topic-map-id>`"
+                                );
+                            };
+                            config::run_topic_map_view(
+                                &ctx,
+                                topic_map_automation_id.as_deref(),
+                                &topic_map,
+                                base.json,
+                            )
+                            .await
+                        }
+                        Some(TopicMapCommands::Show(view_args)) => {
+                            config::run_topic_map_view(
+                                &ctx,
+                                view_args
+                                    .automation_id
+                                    .or(topic_map_automation_id)
+                                    .as_deref(),
+                                &view_args.topic_map,
+                                base.json,
+                            )
+                            .await
+                        }
+                        Some(TopicMapCommands::Set(mut set_args)) => {
+                            set_args.automation_id =
+                                set_args.automation_id.or(topic_map_automation_id);
+                            config::run_topic_map_set(&ctx, &set_args, base.json).await
+                        }
                     }
-                },
+                }
             }
         }
         Some(TopicsCommands::Poke) => poke::run(&ctx, base.json).await,
@@ -380,7 +472,18 @@ mod tests {
     fn topics_command_is_read_only(command: Option<&TopicsCommands>) -> bool {
         match command {
             None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
-            Some(TopicsCommands::Config(config_args)) => config_args.command.is_none(),
+            Some(TopicsCommands::Config(config_args)) => match config_args.command.as_ref() {
+                None => true,
+                Some(ConfigCommands::TopicMap(topic_map_args)) => {
+                    matches!(
+                        topic_map_args.command,
+                        None | Some(TopicMapCommands::Show(_))
+                    )
+                }
+                Some(ConfigCommands::Enable(_))
+                | Some(ConfigCommands::Delete(_))
+                | Some(ConfigCommands::Set(_)) => false,
+            },
             Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
             Some(TopicsCommands::Report(_)) => true,
         }
@@ -400,6 +503,14 @@ mod tests {
         };
         assert!(status.full);
         assert!(status.watch);
+        assert_eq!(status.progress_window, None);
+
+        let parsed = parse(&["topics", "status", "--progress-window", "7d"]).expect("parse");
+        let Some(TopicsCommands::Status(status)) = parsed.command.as_ref() else {
+            panic!("expected status command");
+        };
+        assert_eq!(status.progress_window.as_deref(), Some("7d"));
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
 
         let parsed = parse(&["topics", "open"]).expect("parse");
         assert!(topics_command_is_read_only(parsed.command.as_ref()));
@@ -463,6 +574,32 @@ mod tests {
     #[test]
     fn topics_config_view_uses_read_only_auth() {
         let parsed = parse(&["topics", "config"]).expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let parsed = parse(&["topics", "config", "func_1"]).expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let Some(TopicsCommands::Config(config_args)) = parsed.command.as_ref() else {
+            panic!("expected config command");
+        };
+        assert_eq!(config_args.target.as_deref(), Some("func_1"));
+    }
+
+    #[test]
+    fn topics_config_topic_map_view_uses_read_only_auth() {
+        let parsed = parse(&["topics", "config", "topic-map", "func_1"]).expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let Some(TopicsCommands::Config(config_args)) = parsed.command.as_ref() else {
+            panic!("expected config command");
+        };
+        let Some(ConfigCommands::TopicMap(topic_map_args)) = config_args.command.as_ref() else {
+            panic!("expected topic-map command");
+        };
+        assert_eq!(topic_map_args.topic_map.as_deref(), Some("func_1"));
+        assert!(topic_map_args.command.is_none());
+
+        let parsed = parse(&["topics", "config", "topic-map", "show", "func_1"]).expect("parse");
         assert!(topics_command_is_read_only(parsed.command.as_ref()));
     }
 
@@ -625,7 +762,9 @@ mod tests {
         let Some(ConfigCommands::TopicMap(topic_map_args)) = config_args.command.as_ref() else {
             panic!("expected topic-map set command");
         };
-        let TopicMapCommands::Set(set_args) = &topic_map_args.command;
+        let Some(TopicMapCommands::Set(set_args)) = &topic_map_args.command else {
+            panic!("expected topic-map set command");
+        };
 
         assert_eq!(set_args.topic_map, "Task");
         assert_eq!(
