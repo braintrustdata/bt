@@ -32,6 +32,7 @@ type DatasetPipelineDefinition = {
 };
 
 type DatasetPipelineTransformArgs = {
+  id?: string;
   input?: unknown;
   output?: unknown;
   expected?: unknown;
@@ -40,10 +41,6 @@ type DatasetPipelineTransformArgs = {
 };
 
 type BraintrustModule = {
-  DatasetPipeline?: (definition: DatasetPipelineDefinition) => void;
-  isDatasetPipelineDefinition?: (
-    value: unknown,
-  ) => value is DatasetPipelineDefinition;
   LocalTrace?: new (options: {
     objectType: "project_logs";
     objectId: string;
@@ -315,37 +312,6 @@ async function loadPipelineFile(file: string): Promise<unknown> {
 
 function formatError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-function collectPipelines(
-  braintrust: BraintrustModule,
-  loadedModule: unknown,
-): DatasetPipelineDefinition[] {
-  const pipelines = new Set<DatasetPipelineDefinition>();
-  const isPipeline = (value: unknown): value is DatasetPipelineDefinition =>
-    (braintrust.isDatasetPipelineDefinition?.(value) ?? false) ||
-    (isObject(value) &&
-      isObject(value.source) &&
-      isObject(value.target) &&
-      typeof value.transform === "function");
-
-  for (const pipeline of globalThis.__braintrust_dataset_pipelines ?? []) {
-    pipelines.add(pipeline);
-  }
-
-  if (isObject(loadedModule)) {
-    for (const value of Object.values(loadedModule)) {
-      if (isPipeline(value)) {
-        pipelines.add(value);
-      }
-    }
-  }
-
-  if (isPipeline(loadedModule)) {
-    pipelines.add(loadedModule);
-  }
-
-  return [...pipelines];
 }
 
 function selectPipeline(
@@ -639,6 +605,7 @@ async function transformArgsForCandidate(
 
   const row = await sourceRowForCandidate(candidate);
   return {
+    ...(candidate.id ? { id: candidate.id } : {}),
     input: spanAttr(row, "input"),
     output: spanAttr(row, "output"),
     expected: spanAttr(row, "expected"),
@@ -681,17 +648,16 @@ function withPipelineDefaults(
   if (!isObject(normalizedRow)) {
     throw new Error("Dataset pipeline transform must return an object row.");
   }
+  const { origin: _origin, ...rowWithoutOrigin } = normalizedRow;
   const fallbackId = candidateFallbackId(candidate);
   return {
-    ...normalizedRow,
-    ...(normalizedRow.id === undefined && fallbackId
+    ...rowWithoutOrigin,
+    ...(rowWithoutOrigin.id === undefined && fallbackId
       ? {
           id: rowIndex === undefined ? fallbackId : `${fallbackId}:${rowIndex}`,
         }
       : {}),
-    ...(normalizedRow.origin === undefined && candidate.origin
-      ? { origin: candidate.origin }
-      : {}),
+    ...(candidate.origin ? { origin: candidate.origin } : {}),
   };
 }
 
@@ -756,9 +722,9 @@ async function main() {
   if (stage === "transform") {
     installDeferredAttachmentShims(braintrust);
   }
-  const loadedModule = await loadPipelineFile(pipelineFile);
+  await loadPipelineFile(pipelineFile);
   const pipeline = selectPipeline(
-    collectPipelines(braintrust, loadedModule),
+    globalThis.__braintrust_dataset_pipelines ?? [],
     process.env.BT_DATASET_PIPELINE_NAME || undefined,
   );
   const sse = createSseWriter();

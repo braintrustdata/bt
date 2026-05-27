@@ -14,6 +14,7 @@ from typing import Any
 
 try:
     import braintrust
+    from braintrust import dataset_pipeline as braintrust_dataset_pipeline
     from braintrust.framework import call_user_fn
     from braintrust.logger import _internal_get_global_state, login_to_state
     from braintrust.trace import LocalTrace
@@ -192,35 +193,15 @@ def load_pipeline_file(file: str) -> Any:
     return module
 
 
-def is_pipeline(value: Any) -> bool:
-    checker = getattr(braintrust, "is_dataset_pipeline_definition", None)
-    if callable(checker) and checker(value):
-        return True
-    return (
-        object_get(value, "source") is not None
-        and object_get(value, "target") is not None
-        and callable(object_get(value, "transform"))
-    )
-
-
-def collect_pipelines(module: Any) -> list[Any]:
+def collect_pipelines() -> list[Any]:
     pipelines: list[Any] = []
     seen: set[int] = set()
 
-    registered = getattr(braintrust, "get_registered_dataset_pipelines", None)
-    if callable(registered):
-        for pipeline in registered():
-            if id(pipeline) not in seen:
-                seen.add(id(pipeline))
-                pipelines.append(pipeline)
-
-    for value in vars(module).values():
-        if is_pipeline(value) and id(value) not in seen:
-            seen.add(id(value))
-            pipelines.append(value)
-
-    if is_pipeline(module) and id(module) not in seen:
-        pipelines.append(module)
+    registered = getattr(braintrust_dataset_pipeline, "_DATASET_PIPELINES", [])
+    for pipeline in registered:
+        if id(pipeline) not in seen:
+            seen.add(id(pipeline))
+            pipelines.append(pipeline)
 
     return pipelines
 
@@ -406,13 +387,17 @@ async def source_row_for_candidate(candidate: dict[str, Any]) -> Any | None:
 
 async def transform_args_for_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     row = await source_row_for_candidate(candidate)
-    return {
+    args = {
         "input": span_attr(row, "input"),
         "output": span_attr(row, "output"),
         "expected": span_attr(row, "expected"),
         "metadata": span_attr(row, "metadata"),
         "trace": candidate["trace"],
     }
+    row_id = candidate.get("id")
+    if isinstance(row_id, str):
+        args["id"] = row_id
+    return args
 
 
 def normalize_transform_result(result: Any) -> list[Any]:
@@ -442,11 +427,11 @@ def with_pipeline_defaults(
     row = normalize_deferred_attachments(row)
     if not isinstance(row, dict):
         raise RuntimeError("Dataset pipeline transform must return an object row.")
-    output = dict(row)
+    output = {key: value for key, value in row.items() if key != "origin"}
     fallback_id = candidate_fallback_id(candidate)
     if "id" not in output and fallback_id:
         output["id"] = fallback_id if row_index is None else f"{fallback_id}:{row_index}"
-    if "origin" not in output and "origin" in candidate:
+    if "origin" in candidate:
         output["origin"] = candidate["origin"]
     return output
 
@@ -499,9 +484,9 @@ async def main() -> None:
     if stage == "transform":
         install_deferred_attachment_shims()
 
-    module = load_pipeline_file(sys.argv[1])
+    load_pipeline_file(sys.argv[1])
     pipeline = select_pipeline(
-        collect_pipelines(module),
+        collect_pipelines(),
         os.getenv("BT_DATASET_PIPELINE_NAME") or None,
     )
     sse = create_sse_writer()

@@ -266,15 +266,20 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 ),
             );
 
-            let (_, _, source_project) =
+            let (_, source_client, source_project) =
                 resolve_pipeline_source_context(&base, &inspect.source).await?;
+            let source = source_with_resolved_project(
+                &inspect.source,
+                &source_project,
+                source_client.org_name(),
+            );
             let refs = read_jsonl_values(&refs_path)?;
             let attachment_dir = tempdir.path().join("attachments");
             let transform_response = transform_source_refs(
                 &base,
                 &args.runner,
                 &source_project.id,
-                &inspect.source,
+                &source,
                 refs,
                 args.transform.max_concurrency(),
                 Some(&attachment_dir),
@@ -282,8 +287,8 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
             )
             .await?;
             let row_count = transform_response.rows.len();
-            let inserted =
-                upload_dataset_rows(&base, &inspect.target, transform_response.rows).await?;
+            let target = target_with_default_org(&inspect.target, Some(&source));
+            let inserted = upload_dataset_rows(&base, &target, transform_response.rows).await?;
             print_summary(
                 &base,
                 json!({
@@ -596,6 +601,17 @@ fn apply_target_overrides(target: &mut PipelineTargetInspect, args: &PipelineTar
     if let Some(dataset_name) = args.target_dataset.as_deref() {
         target.dataset_name = dataset_name.to_string();
     }
+}
+
+fn target_with_default_org(
+    target: &PipelineTargetInspect,
+    source: Option<&PipelineSourceInspect>,
+) -> PipelineTargetInspect {
+    let mut target = target.clone();
+    if target.org_name.is_none() {
+        target.org_name = source.and_then(|source| source.org_name.clone());
+    }
+    target
 }
 
 async fn build_runner_command<F>(
@@ -1397,14 +1413,21 @@ async fn push_rows(base: &BaseArgs, args: PipelinePushArgs) -> Result<()> {
         &args.runner,
         PipelineArtifactStage::Transform,
     )?;
-    let target_base = base_with_pipeline_target(base, &inspect.target);
-    let input_path =
-        materialize_deferred_attachments_for_push(base, &inspect.target, &input_path).await?;
+    let transform_manifest =
+        read_pipeline_stage_manifest_for_output(&input_path, PipelineArtifactStage::Transform)?;
+    let target = target_with_default_org(
+        &inspect.target,
+        transform_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.spec.source.as_ref()),
+    );
+    let target_base = base_with_pipeline_target(base, &target);
+    let input_path = materialize_deferred_attachments_for_push(base, &target, &input_path).await?;
 
     crate::sync::push_jsonl_file(
         target_base,
         SyncPushFileArgs {
-            object_ref: pipeline_target_dataset_ref(&inspect.target)?,
+            object_ref: pipeline_target_dataset_ref(&target)?,
             input: input_path,
             root: args.artifacts.root,
             fresh: args.fresh,
@@ -2247,6 +2270,46 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_target_inherits_source_org_when_target_org_is_missing() {
+        let source = PipelineSourceInspect {
+            org_name: Some("source-org".to_string()),
+            ..test_source()
+        };
+        let target = PipelineTargetInspect {
+            project_id: None,
+            project_name: Some("Target Project".to_string()),
+            org_name: None,
+            dataset_name: "Dataset".to_string(),
+            description: None,
+            metadata: None,
+        };
+
+        let resolved = target_with_default_org(&target, Some(&source));
+
+        assert_eq!(resolved.org_name.as_deref(), Some("source-org"));
+    }
+
+    #[test]
+    fn pipeline_target_keeps_explicit_target_org() {
+        let source = PipelineSourceInspect {
+            org_name: Some("source-org".to_string()),
+            ..test_source()
+        };
+        let target = PipelineTargetInspect {
+            project_id: None,
+            project_name: Some("Target Project".to_string()),
+            org_name: Some("target-org".to_string()),
+            dataset_name: "Dataset".to_string(),
+            description: None,
+            metadata: None,
+        };
+
+        let resolved = target_with_default_org(&target, Some(&source));
+
+        assert_eq!(resolved.org_name.as_deref(), Some("target-org"));
+    }
+
+    #[test]
     fn deferred_attachment_detection_finds_nested_marker() {
         let row = json!({
             "id": "row-1",
@@ -2351,6 +2414,16 @@ module.exports = {
     getConfiguration() {
       return { root_span_id: this.options.rootSpanId };
     }
+    async getSpans() {
+      return [{
+        id: "source-row",
+        span_id: "source-span",
+        input: { prompt: "hello" },
+        output: { answer: "world" },
+        expected: "ok",
+        metadata: { topic: "smoke" },
+      }];
+    }
   },
   _internalGetGlobalState() {
     return {
@@ -2412,14 +2485,18 @@ import { DatasetPipeline, JSONAttachment } from "braintrust";
 
 export default DatasetPipeline({
   name: "ts-json-attachment-smoke",
-  source: { projectName: "source-project", scope: "trace" },
+  source: { projectName: "source-project", scope: "span" },
   target: { projectName: "target-project", datasetName: "traces" },
   transform: (args) => {
-    if ("input" in args || "output" in args || "expected" in args || "metadata" in args) {
-      throw new Error("trace-scoped transforms should only receive trace");
+    if (args.id !== "source-row") {
+      throw new Error(`expected source row id, got ${args.id}`);
     }
     return {
+      id: undefined,
+      origin: { object_type: "dataset", object_id: "wrong", id: "wrong" },
       input: {
+        source_id: args.id,
+        source_input: args.input,
         full_trace: new JSONAttachment(
           { ok: true, root: args.trace.getConfiguration().root_span_id },
           { filename: "trace.json", pretty: true },
@@ -2436,6 +2513,7 @@ export default DatasetPipeline({
         let request = json!({
             "refs": [{
                 "root_span_id": "root-span",
+                "id": "source-row",
                 "origin": {
                     "object_type": "project_logs",
                     "object_id": "source-project-id",
@@ -2474,6 +2552,15 @@ export default DatasetPipeline({
 
         let response: Value = serde_json::from_slice(&output.stdout).expect("runner JSON response");
         assert_eq!(response["rowCount"], json!(1));
+        assert_eq!(response["rows"][0]["id"], json!("source-row"));
+        assert_eq!(
+            response["rows"][0]["input"]["source_id"],
+            json!("source-row")
+        );
+        assert_eq!(
+            response["rows"][0]["input"]["source_input"],
+            json!({ "prompt": "hello" })
+        );
         let marker = &response["rows"][0]["input"]["full_trace"];
         assert_eq!(marker["type"], "braintrust_deferred_attachment");
         assert_eq!(marker["kind"], "json");
