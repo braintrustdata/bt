@@ -7,6 +7,24 @@ authors = ["Braintrust engineering <eng@braintrust.dev>"]
 description = "The Braintrust command line interface"
 license = "Apache-2.0"
 repository = "https://github.com/braintrustdata/bt"
+homepage = "https://www.braintrust.dev"
+documentation = "https://www.braintrust.dev/docs"
+readme = "README.md"
+keywords = ["braintrust", "cli", "llm", "evals", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "src/**/*",
+    "scripts/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
+
+[[bin]]
+name = "bt"
+path = "src/main.rs"
 
 [package.metadata.wix]
 upgrade-guid = "5B558F98-EEBD-4F5E-A0C8-E7A039445139"
@@ -18,7 +36,7 @@ eula = false
 actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "43ba73edbf5220b57090e049feb094b60a92fcd4" }
+braintrust-sdk-rust = "=0.1.0-alpha.3"
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 futures-util = "0.3.31"
@@ -38,7 +56,7 @@ dotenvy = "0.15"
 open = "5"
 regex = "1"
 urlencoding = "2"
-lingua = { git = "https://github.com/braintrustdata/lingua", rev = "3c79f2c427d12d3e2fe104910ef3c0768ad83770" }
+lingua = { package = "braintrust-lingua", version = "0.1" }
 comfy-table = "7.2.2"
 base64 = "0.22"
 oauth2 = { version = "4.4", default-features = false }
