@@ -187,6 +187,16 @@ pub async fn create_dataset(
     name: &str,
     description: Option<&str>,
 ) -> Result<Dataset> {
+    create_dataset_with_metadata(client, project_id, name, description, None).await
+}
+
+pub async fn create_dataset_with_metadata(
+    client: &ApiClient,
+    project_id: &str,
+    name: &str,
+    description: Option<&str>,
+    metadata: Option<&Value>,
+) -> Result<Dataset> {
     let mut body = serde_json::json!({
         "name": name,
         "project_id": project_id,
@@ -194,6 +204,9 @@ pub async fn create_dataset(
     });
     if let Some(description) = description.filter(|description| !description.is_empty()) {
         body["description"] = serde_json::Value::String(description.to_string());
+    }
+    if let Some(metadata) = metadata {
+        body["metadata"] = metadata.clone();
     }
     client.post("/v1/dataset", &body).await
 }
