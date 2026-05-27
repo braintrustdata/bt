@@ -330,7 +330,8 @@ fn datasets_command_is_read_only(command: Option<&DatasetsCommands>) -> bool {
         Some(DatasetsCommands::Snapshots(args)) => snapshots::command_is_read_only(args),
         Some(DatasetsCommands::Create(_))
         | Some(DatasetsCommands::Update(_))
-        | Some(DatasetsCommands::Delete(_)) => false,
+        | Some(DatasetsCommands::Delete(_))
+        | Some(DatasetsCommands::Pipeline(_)) => false,
     }
 }
 
