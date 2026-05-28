@@ -44,6 +44,8 @@ struct PullFunctionRow {
     #[serde(default)]
     function_data: Option<Value>,
     #[serde(default)]
+    environments: Option<Value>,
+    #[serde(default)]
     created: Option<String>,
     #[serde(default)]
     _xact_id: Option<String>,
@@ -64,6 +66,7 @@ struct NormalizedPrompt {
     tools: Option<Value>,
     raw_tools_json: Option<String>,
     tool_functions: Option<Value>,
+    environments: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -248,6 +251,8 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         }
     }
 
+    hydrate_prompt_environments(&auth_ctx.client, &mut materializable, args.verbose).await;
+
     let output_dir = if args.output_dir.is_absolute() {
         args.output_dir.clone()
     } else {
@@ -421,6 +426,78 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn hydrate_prompt_environments(
+    client: &crate::http::ApiClient,
+    rows: &mut [PullFunctionRow],
+    verbose: bool,
+) {
+    for row in rows {
+        if row.environments.is_some() {
+            continue;
+        }
+
+        let objects = match api::list_environment_objects_for_prompt(client, &row.id).await {
+            Ok(objects) => objects,
+            Err(err) => {
+                if verbose {
+                    eprintln!(
+                        "{} unable to load environments for '{}': {err}",
+                        style("warning:").yellow(),
+                        row.slug
+                    );
+                }
+                continue;
+            }
+        };
+
+        let slugs = collect_environment_slugs_for_version(&objects, row._xact_id.as_deref());
+        if !slugs.is_empty() {
+            row.environments = Some(Value::Array(slugs.into_iter().map(Value::String).collect()));
+        }
+    }
+}
+
+fn collect_environment_slugs_for_version(
+    objects: &[api::EnvironmentObject],
+    version: Option<&str>,
+) -> Vec<String> {
+    let target_version = version.map(str::trim).filter(|value| !value.is_empty());
+    let target_version_num = target_version.and_then(|value| value.parse::<u128>().ok());
+    let mut slugs = BTreeSet::new();
+
+    for object in objects {
+        if let Some(target_version) = target_version {
+            if let Some(object_version) = object
+                .object_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let matches = match (target_version_num, object_version.parse::<u128>().ok()) {
+                    (Some(expected), Some(actual)) => actual == expected,
+                    _ => object_version == target_version,
+                };
+                if !matches {
+                    continue;
+                }
+            }
+        }
+
+        let Some(slug) = object
+            .environment_slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        slugs.insert(slug.to_string());
+    }
+
+    slugs.into_iter().collect()
 }
 
 async fn get_projects_cached<'a>(
@@ -1065,6 +1142,11 @@ fn normalize_prompt_row(row: &PullFunctionRow) -> Result<NormalizedPrompt> {
         .get("tool_functions")
         .filter(|value| !is_empty_render_value(value))
         .cloned();
+    let environments = row
+        .environments
+        .as_ref()
+        .or_else(|| prompt_data.get("environments"))
+        .and_then(normalize_environment_slugs);
     let version = row
         ._xact_id
         .as_deref()
@@ -1086,6 +1168,7 @@ fn normalize_prompt_row(row: &PullFunctionRow) -> Result<NormalizedPrompt> {
         tools,
         raw_tools_json,
         tool_functions,
+        environments,
     })
 }
 
@@ -1169,6 +1252,12 @@ fn render_project_file_ts(
             body_lines.push(format!(
                 "  toolFunctions: {},",
                 format_ts_value(tool_functions, 2)
+            ));
+        }
+        if let Some(environments) = &row.environments {
+            body_lines.push(format!(
+                "  environments: {},",
+                format_ts_value(environments, 2)
             ));
         }
 
@@ -1266,6 +1355,12 @@ fn render_project_file_py(
             out.push_str(&format!(
                 "    tool_functions={},\n",
                 format_py_value(tool_functions, 4)
+            ));
+        }
+        if let Some(environments) = &row.environments {
+            out.push_str(&format!(
+                "    environments={},\n",
+                format_py_value(environments, 4)
             ));
         }
         out.push_str(")\n\n");
@@ -1444,6 +1539,30 @@ fn should_unquote_object_key(key: &str) -> bool {
     chars.all(|ch| ch == '$' || ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn normalize_environment_slugs(value: &Value) -> Option<Value> {
+    let items = value.as_array()?;
+    let mut slugs = Vec::new();
+    for item in items {
+        let slug = item
+            .as_object()
+            .and_then(|object| object.get("slug"))
+            .and_then(Value::as_str)
+            .or_else(|| item.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(slug) = slug {
+            slugs.push(Value::String(slug));
+        }
+    }
+
+    if slugs.is_empty() {
+        None
+    } else {
+        Some(Value::Array(slugs))
+    }
+}
+
 fn is_empty_render_value(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -1600,6 +1719,7 @@ mod tests {
             description: None,
             prompt_data: None,
             function_data: None,
+            environments: None,
             created: None,
             _xact_id: None,
         };
@@ -1630,6 +1750,7 @@ mod tests {
                 description: None,
                 prompt_data: None,
                 function_data: None,
+                environments: None,
                 created: None,
                 _xact_id: None,
             },
@@ -1642,6 +1763,7 @@ mod tests {
                 description: None,
                 prompt_data: None,
                 function_data: None,
+                environments: None,
                 created: None,
                 _xact_id: None,
             },
@@ -1654,6 +1776,7 @@ mod tests {
                 description: None,
                 prompt_data: None,
                 function_data: None,
+                environments: None,
                 created: None,
                 _xact_id: None,
             },
@@ -1687,6 +1810,7 @@ mod tests {
             description: None,
             prompt_data: None,
             function_data: None,
+            environments: None,
             created: None,
             _xact_id: None,
         };
@@ -1713,6 +1837,7 @@ mod tests {
             description: None,
             prompt_data: None,
             function_data: None,
+            environments: None,
             created: None,
             _xact_id: None,
         };
@@ -1785,6 +1910,10 @@ mod tests {
                 ]
             })),
             function_data: Some(serde_json::json!({ "type": "prompt" })),
+            environments: Some(serde_json::json!([
+                { "slug": "staging" },
+                { "slug": "production" }
+            ])),
             created: None,
             _xact_id: Some("123".to_string()),
         };
@@ -1807,6 +1936,9 @@ mod tests {
         assert!(rendered.contains("    version=\"123\","));
         assert!(rendered.contains("messages=["));
         assert!(rendered.contains("model=\"gpt-4o-mini\""));
+        assert!(rendered.contains("environments=["));
+        assert!(rendered.contains("\"staging\""));
+        assert!(rendered.contains("\"production\""));
     }
 
     #[test]
@@ -1830,6 +1962,7 @@ mod tests {
                 }
             })),
             function_data: Some(serde_json::json!({ "type": "prompt" })),
+            environments: Some(serde_json::json!([{ "slug": "test-env" }])),
             created: None,
             _xact_id: Some("123".to_string()),
         };
@@ -1849,6 +1982,55 @@ mod tests {
         assert!(rendered.contains("export const basicMath = project.prompts.create({"));
         assert!(rendered.contains("  id: \"f1\","));
         assert!(rendered.contains("  version: \"123\","));
+        assert!(rendered.contains("environments: ["));
+        assert!(rendered.contains("\"test-env\""));
+    }
+
+    #[test]
+    fn normalize_environment_slugs_supports_objects_and_strings() {
+        let raw = serde_json::json!([
+            { "slug": " staging " },
+            "production",
+            { "slug": "" },
+            { "foo": "bar" }
+        ]);
+
+        assert_eq!(
+            normalize_environment_slugs(&raw),
+            Some(serde_json::json!(["staging", "production"]))
+        );
+    }
+
+    #[test]
+    fn collect_environment_slugs_filters_by_version() {
+        let objects = vec![
+            api::EnvironmentObject {
+                environment_slug: Some("dev".to_string()),
+                object_version: Some("0000000000000001".to_string()),
+            },
+            api::EnvironmentObject {
+                environment_slug: Some("prod".to_string()),
+                object_version: Some("0000000000000002".to_string()),
+            },
+            api::EnvironmentObject {
+                environment_slug: Some("preview".to_string()),
+                object_version: None,
+            },
+        ];
+
+        assert_eq!(
+            collect_environment_slugs_for_version(&objects, Some("0000000000000002")),
+            vec!["preview".to_string(), "prod".to_string()]
+        );
+
+        let padded = vec![api::EnvironmentObject {
+            environment_slug: Some("prod".to_string()),
+            object_version: Some("2".to_string()),
+        }];
+        assert_eq!(
+            collect_environment_slugs_for_version(&padded, Some("0000000000000002")),
+            vec!["prod".to_string()]
+        );
     }
 
     #[test]
