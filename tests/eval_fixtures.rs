@@ -448,6 +448,234 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
 }
 
 #[test]
+fn eval_python_runner_list_mode_uses_sdk_parameter_serializer() {
+    let _guard = test_lock();
+    if !command_exists("python3") {
+        if required_runtimes().contains("python") {
+            panic!("python runtime is required but unavailable for Python list-mode test");
+        }
+        eprintln!(
+            "Skipping eval_python_runner_list_mode_uses_sdk_parameter_serializer (python3 not installed)."
+        );
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root.join("target").join(format!(
+        "python-list-serializer-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ));
+    let package_dir = fixture_dir.join("braintrust");
+    fs::create_dir_all(&package_dir).expect("create fake braintrust package");
+
+    fs::write(
+        package_dir.join("__init__.py"),
+        r#"
+from .framework import EvaluatorInstance, _evals
+from .parameters import RemoteEvalParameters
+
+
+class Evaluator:
+    def __init__(self, name, parameters=None, scores=None):
+        self.eval_name = name
+        self.parameters = parameters
+        self.scores = scores or []
+
+
+def Eval(name, parameters=None, data=None, task=None, scores=None, **kwargs):
+    _evals.evaluators[name] = EvaluatorInstance(Evaluator(name, parameters, scores))
+
+
+def init_dataset(*args, **kwargs):
+    return None
+
+
+def invoke(*args, **kwargs):
+    return None
+
+
+def login(*args, **kwargs):
+    return None
+"#,
+    )
+    .expect("write fake braintrust __init__");
+    fs::write(
+        package_dir.join("framework.py"),
+        r#"
+class BaseExperiment:
+    pass
+
+
+class EvaluatorInstance:
+    def __init__(self, evaluator):
+        self.evaluator = evaluator
+
+
+class Registry:
+    def __init__(self):
+        self.evaluators = {}
+        self.reporters = {}
+
+    def clear(self):
+        self.evaluators.clear()
+        self.reporters.clear()
+
+
+_evals = Registry()
+
+
+class _set_lazy_load:
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+async def run_evaluator(*args, **kwargs):
+    return None
+
+
+def set_thread_pool_max_workers(value):
+    return None
+"#,
+    )
+    .expect("write fake framework");
+    fs::write(
+        package_dir.join("logger.py"),
+        r#"
+class Dataset:
+    pass
+
+
+def init(*args, **kwargs):
+    return None
+
+
+def parent_context(*args, **kwargs):
+    return None
+
+
+def _internal_get_global_state():
+    return None
+"#,
+    )
+    .expect("write fake logger");
+    fs::write(
+        package_dir.join("parameters.py"),
+        r#"
+class RemoteEvalParameters:
+    pass
+
+
+def parameters_to_json_schema(parameters):
+    return {"legacyFallback": True}
+
+
+def serialize_remote_eval_parameters_container(parameters):
+    if isinstance(parameters, RemoteEvalParameters):
+        return {
+            "type": "braintrust.parameters",
+            "schema": {"type": "object", "properties": {}},
+            "source": {"slug": "remote-params", "name": "Remote params"},
+        }
+    return {
+        "type": "braintrust.staticParameters",
+        "schema": {"prefix": {"type": "data", "schema": {"type": "string"}}},
+        "source": None,
+    }
+
+
+def validate_parameters(parameters, schema):
+    return parameters
+"#,
+    )
+    .expect("write fake parameters");
+    fs::write(
+        package_dir.join("util.py"),
+        r#"
+import sys
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+"#,
+    )
+    .expect("write fake util");
+    fs::write(
+        package_dir.join("span_identifier_v4.py"),
+        r#"
+def parse_parent(parent):
+    return parent
+"#,
+    )
+    .expect("write fake span identifier");
+    fs::write(
+        fixture_dir.join("evals.py"),
+        r#"
+from braintrust import Eval, RemoteEvalParameters
+
+Eval("python-static", parameters={"prefix": None}, scores=[])
+Eval("python-remote", parameters=RemoteEvalParameters(), scores=[])
+"#,
+    )
+    .expect("write eval file");
+
+    let output = Command::new("python3")
+        .arg(root.join("scripts").join("eval-runner.py"))
+        .arg("evals.py")
+        .current_dir(&fixture_dir)
+        .env("PYTHONPATH", &fixture_dir)
+        .env("BT_EVAL_DEV_MODE", "list")
+        .env("BT_EVAL_LOCAL", "1")
+        .output()
+        .expect("run Python eval runner in list mode");
+    let _ = fs::remove_dir_all(&fixture_dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Python list-mode runner failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let manifest_line = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("runner should emit manifest JSON");
+    let manifest: Value = serde_json::from_str(manifest_line).expect("parse manifest json");
+
+    let static_params = manifest
+        .get("python-static")
+        .and_then(|eval| eval.get("parameters"))
+        .expect("static eval should include parameters");
+    assert_eq!(
+        static_params.get("type").and_then(Value::as_str),
+        Some("braintrust.staticParameters")
+    );
+    assert!(
+        static_params.get("legacyFallback").is_none(),
+        "runner should prefer the SDK serializer over parameters_to_json_schema"
+    );
+
+    let remote_params = manifest
+        .get("python-remote")
+        .and_then(|eval| eval.get("parameters"))
+        .expect("remote eval should include parameters");
+    assert_eq!(
+        remote_params.get("type").and_then(Value::as_str),
+        Some("braintrust.parameters")
+    );
+}
+
+#[test]
 fn eval_matrix_param_single_runs_all_combinations() {
     let _guard = test_lock();
     if !command_exists("node") {
