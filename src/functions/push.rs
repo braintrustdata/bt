@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use std::io::IsTerminal;
+use std::io::{ErrorKind, IsTerminal};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use dialoguer::console::style;
-use dialoguer::Confirm;
+use dialoguer::{Confirm, Error as DialoguerError};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -137,6 +137,59 @@ fn error_chain(err: &anyhow::Error) -> String {
     format!("{err:#}")
 }
 
+fn insert_functions_slug_conflict_hint(
+    details: &str,
+    function_events: &[Value],
+) -> Option<&'static str> {
+    let normalized = details.to_ascii_lowercase();
+    if !normalized.contains("slugs already exist") && !normalized.contains("slug already exists") {
+        return None;
+    }
+
+    let has_error_mode_entry = function_events.iter().any(|event| {
+        event
+            .get("if_exists")
+            .and_then(Value::as_str)
+            .is_none_or(|mode| mode == "error")
+    });
+    has_error_mode_entry
+        .then_some("Run again with `--if-exists replace` to update existing definitions.")
+}
+
+fn format_insert_functions_failure_message(
+    source_path: &Path,
+    bundle_id: Option<&str>,
+    details: &str,
+    function_events: &[Value],
+) -> String {
+    let mut message = if let Some(id) = bundle_id {
+        format!(
+            "failed to save function definitions for {} (bundle_id={}): {}",
+            source_path.display(),
+            id,
+            details
+        )
+    } else {
+        format!(
+            "failed to save function definitions for {}: {}",
+            source_path.display(),
+            details
+        )
+    };
+
+    if let Some(hint) = insert_functions_slug_conflict_hint(details, function_events) {
+        message.push('\n');
+        message.push_str(hint);
+    } else if bundle_id.is_some() {
+        message.push_str(&format!(
+            ". Retry by re-running `bt functions push --file {}`",
+            source_path.display()
+        ));
+    }
+
+    message
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectSelector {
     Id(String),
@@ -150,6 +203,20 @@ struct ProjectPreflight {
     requires_default_project: bool,
     named_projects: BTreeSet<String>,
     direct_project_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushConfirmationEntry {
+    source_file: String,
+    name: Option<String>,
+    slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushConfirmation {
+    Confirmed,
+    Declined,
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -457,22 +524,16 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         }
     };
 
-    let preflight_source_files: Vec<&str> = manifest
-        .files
-        .iter()
-        .map(|f| f.source_file.as_str())
-        .collect();
+    let preflight_functions = collect_push_confirmation_entries(&manifest);
     let preflight_project_names: Vec<String> = preflight.named_projects.iter().cloned().collect();
 
     if !args.yes && is_interactive() {
         let prompt =
-            build_push_confirm_prompt(&auth_ctx, &preflight_source_files, &preflight_project_names);
-        let confirmed = Confirm::new()
-            .with_prompt(prompt)
-            .default(false)
-            .interact()?;
-        if !confirmed {
-            return cancel_push(&base, &files);
+            build_push_confirm_prompt(&auth_ctx, &preflight_functions, &preflight_project_names);
+        match confirm_push(prompt)? {
+            PushConfirmation::Confirmed => {}
+            PushConfirmation::Declined => return Ok(()),
+            PushConfirmation::Interrupted => return report_cancelled_push(&base, &files),
         }
     }
 
@@ -554,8 +615,12 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         );
     }
 
-    let use_progress =
-        !base.json && std::io::stderr().is_terminal() && animations_enabled() && !is_quiet();
+    let is_verbose = base.verbose_explicit();
+    let use_progress = !is_verbose
+        && !base.json
+        && std::io::stderr().is_terminal()
+        && animations_enabled()
+        && !is_quiet();
 
     let file_parts: Vec<&str> = manifest
         .files
@@ -611,6 +676,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             &classified.allowed_roots,
             &mut project_name_cache,
             &manifest.baseline_dep_versions,
+            is_verbose,
         )
         .await;
 
@@ -725,6 +791,21 @@ fn build_code_function_data(
     })
 }
 
+fn maybe_log_verbose(enabled: bool, args: std::fmt::Arguments<'_>) {
+    if enabled && !is_quiet() {
+        eprintln!("{args}");
+    }
+}
+
+fn maybe_log_verbose_json(enabled: bool, label: &str, value: &Value) {
+    if !enabled || is_quiet() {
+        return;
+    }
+
+    let formatted = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    eprintln!("bt functions push [insert-functions] {label}:\n{formatted}");
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_file(
     auth_ctx: &super::AuthContext,
@@ -739,6 +820,7 @@ async fn push_file(
     allowed_roots: &[PathBuf],
     project_name_cache: &mut BTreeMap<String, String>,
     baseline_dep_versions: &[String],
+    is_verbose: bool,
 ) -> std::result::Result<FileSuccess, FileFailure> {
     let mut code_entries = Vec::new();
     let mut events = Vec::new();
@@ -760,6 +842,16 @@ async fn push_file(
             ManifestEntry::FunctionEvent(event) => events.push((event, project_id)),
         }
     }
+
+    maybe_log_verbose(
+        is_verbose,
+        format_args!(
+            "bt functions push [insert-functions] building payload for {} (code entries: {}, function_event entries: {})",
+            source_path.display(),
+            code_entries.len(),
+            events.len()
+        ),
+    );
 
     let mut bundle_id: Option<String> = None;
 
@@ -863,9 +955,31 @@ async fn push_file(
                 .as_deref()
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| args.if_exists.as_str().to_string());
+            let if_exists_source = if code.if_exists.is_some() {
+                "code"
+            } else {
+                "--if-exists"
+            };
             obj.insert("if_exists".to_string(), Value::String(if_exists));
 
-            function_events.push(Value::Object(obj));
+            let entry = Value::Object(obj);
+            let entry_index = function_events.len();
+            maybe_log_verbose(
+                is_verbose,
+                format_args!(
+                    "bt functions push [insert-functions] entry {entry_index} from code {:?}: project_id={:?}, slug={:?}, if_exists={:?} from {if_exists_source},  bundle_id={:?}",
+                    code.name.as_str(),
+                    project_id.as_str(),
+                    code.slug.as_str(),
+                    entry
+                        .get("if_exists")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    slot.bundle_id.as_str()
+                ),
+            );
+            maybe_log_verbose_json(is_verbose, &format!("entry {entry_index} payload"), &entry);
+            function_events.push(entry);
         }
     }
 
@@ -904,9 +1018,21 @@ async fn push_file(
             resolved_placeholders.insert(project_name, resolved);
         }
 
+        if !resolved_placeholders.is_empty() {
+            maybe_log_verbose(
+                is_verbose,
+                format_args!(
+                    "bt functions push [insert-functions] resolved nested project selectors in function_event entry: {:?}",
+                    resolved_placeholders
+                ),
+            );
+        }
+
         replace_project_name_placeholders(&mut event, &resolved_placeholders);
 
         let fallback_project_id = resolved_project_id.clone();
+        let mut project_id_resolution = "kept from event".to_string();
+        let mut if_exists_resolution = "kept from event".to_string();
 
         if let Some(object) = event.as_object_mut() {
             let needs_project_id = object
@@ -916,19 +1042,36 @@ async fn push_file(
                 .unwrap_or(true);
             if needs_project_id {
                 object.insert("project_id".to_string(), Value::String(fallback_project_id));
+                project_id_resolution = format!("defaulted to {:?}", resolved_project_id);
             }
             if object.get("if_exists").is_none() {
                 object.insert(
                     "if_exists".to_string(),
                     Value::String(args.if_exists.as_str().to_string()),
                 );
+                if_exists_resolution = format!("defaulted to {:?}", args.if_exists.as_str());
             }
         }
 
+        let entry_index = function_events.len();
+        maybe_log_verbose(
+            is_verbose,
+            format_args!(
+                "bt functions push [insert-functions] entry {entry_index} from function_event: project_id {project_id_resolution}, if_exists {if_exists_resolution}"
+            ),
+        );
+        maybe_log_verbose_json(is_verbose, &format!("entry {entry_index} payload"), &event);
         function_events.push(event);
     }
 
     if function_events.is_empty() {
+        maybe_log_verbose(
+            is_verbose,
+            format_args!(
+                "bt functions push [insert-functions] no insert payload created for {} because no function entries were discovered",
+                source_path.display()
+            ),
+        );
         return Ok(FileSuccess {
             uploaded_entries: 0,
             ignored_entries: 0,
@@ -936,28 +1079,32 @@ async fn push_file(
         });
     }
 
+    if is_verbose {
+        let insert_body = api::insert_functions_body(&function_events);
+        maybe_log_verbose_json(
+            is_verbose,
+            "request body for POST /insert-functions",
+            &insert_body,
+        );
+    }
+    maybe_log_verbose(
+        is_verbose,
+        format_args!(
+            "bt functions push [insert-functions] sending {} entries to /insert-functions",
+            function_events.len()
+        ),
+    );
+
     let insert_result = api::insert_functions(&auth_ctx.client, &function_events)
         .await
         .map_err(|err| FileFailure {
             reason: HardFailureReason::InsertFunctionsFailed,
-            message: {
-                let details = format!("{err:#}");
-                if let Some(id) = &bundle_id {
-                    format!(
-                        "failed to save function definitions for {} (bundle_id={}): {}. Retry by re-running `bt functions push --file {}`",
-                        source_path.display(),
-                        id,
-                        details,
-                        source_path.display()
-                    )
-                } else {
-                    format!(
-                        "failed to save function definitions for {}: {}",
-                        source_path.display(),
-                        details
-                    )
-                }
-            },
+            message: format_insert_functions_failure_message(
+                source_path,
+                bundle_id.as_deref(),
+                &error_chain(&err),
+                &function_events,
+            ),
         })?;
 
     let (uploaded_entries, ignored_entries) =
@@ -2194,28 +2341,73 @@ fn ensure_path_within_allowed_roots(
     );
 }
 
+fn collect_push_confirmation_entries(manifest: &RunnerManifest) -> Vec<PushConfirmationEntry> {
+    let mut entries = Vec::new();
+
+    for file in &manifest.files {
+        for entry in &file.entries {
+            let (name, slug) = match entry {
+                ManifestEntry::Code(code) => (Some(code.name.clone()), Some(code.slug.clone())),
+                ManifestEntry::FunctionEvent(event) => (
+                    string_field(&event.event, "name"),
+                    string_field(&event.event, "slug"),
+                ),
+            };
+            entries.push(PushConfirmationEntry {
+                source_file: file.source_file.clone(),
+                name,
+                slug,
+            });
+        }
+    }
+
+    entries
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn build_push_confirm_prompt(
     auth_ctx: &super::AuthContext,
-    source_files: &[&str],
+    functions: &[PushConfirmationEntry],
     project_names: &[String],
 ) -> String {
-    let file_names: Vec<&str> = source_files
-        .iter()
-        .map(|f| {
-            Path::new(f)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(f)
-        })
-        .collect();
-    let files_part = file_names
-        .iter()
-        .map(|f| style(f).green().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     let org_label = current_org_label(auth_ctx);
+    build_push_confirm_prompt_for_org(&org_label, functions, project_names)
+}
+
+fn build_push_confirm_prompt_for_org(
+    org_label: &str,
+    functions: &[PushConfirmationEntry],
+    project_names: &[String],
+) -> String {
+    let function_word = if functions.len() == 1 {
+        "function"
+    } else {
+        "functions"
+    };
+    let functions_part = if functions.is_empty() {
+        "no functions".to_string()
+    } else {
+        let labels = functions
+            .iter()
+            .map(|entry| {
+                style(push_confirmation_entry_label(entry))
+                    .green()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} {function_word}: {labels}", functions.len())
+    };
     let targets_part = if project_names.is_empty() {
-        style(&org_label).green().to_string()
+        style(org_label).green().to_string()
     } else {
         project_names
             .iter()
@@ -2224,42 +2416,77 @@ fn build_push_confirm_prompt(
             .join(", ")
     };
 
-    format!("Push {files_part} to {targets_part}")
+    format!("Push {functions_part} to {targets_part}")
 }
 
-fn cancel_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
+fn push_confirmation_entry_label(entry: &PushConfirmationEntry) -> String {
+    match (entry.name.as_deref(), entry.slug.as_deref()) {
+        (Some(name), Some(slug)) => format!("{name} (slug: {slug})"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(slug)) => format!("slug: {slug}"),
+        (None, None) => {
+            let source_file = Path::new(&entry.source_file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&entry.source_file);
+            format!("entry from {source_file}")
+        }
+    }
+}
+
+fn confirm_push(prompt: String) -> Result<PushConfirmation> {
+    match Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact_opt()
+    {
+        Ok(Some(true)) => Ok(PushConfirmation::Confirmed),
+        Ok(Some(false) | None) => Ok(PushConfirmation::Declined),
+        Err(err) if is_interrupted_prompt_error(&err) => Ok(PushConfirmation::Interrupted),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn is_interrupted_prompt_error(err: &DialoguerError) -> bool {
+    matches!(err, DialoguerError::IO(io_err) if io_err.kind() == ErrorKind::Interrupted)
+}
+
+fn report_cancelled_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
     if base.json {
-        let summary = PushSummary {
-            status: CommandStatus::Failed,
-            total_files: files.len(),
-            uploaded_files: 0,
-            failed_files: 0,
-            skipped_files: files.len(),
-            ignored_entries: 0,
-            files: files
-                .iter()
-                .map(|path| PushFileReport {
-                    source_file: path.display().to_string(),
-                    status: FileStatus::Skipped,
-                    uploaded_entries: 0,
-                    skipped_reason: Some(SoftSkipReason::TerminatedAfterFailure),
-                    error_reason: Some(HardFailureReason::UserCancelled),
-                    bundle_id: None,
-                    message: Some("push cancelled by user".to_string()),
-                })
-                .collect(),
-            warnings: vec![],
-            errors: vec![ReportError {
-                reason: HardFailureReason::UserCancelled,
-                message: "push cancelled by user".to_string(),
-            }],
-        };
-        emit_summary(base, &summary)?;
-    } else {
+        emit_summary(base, &cancelled_push_summary(files))?;
+    } else if !is_quiet() {
         eprintln!("Push cancelled. No changes were made.");
     }
 
-    bail!("push cancelled by user");
+    Ok(())
+}
+
+fn cancelled_push_summary(files: &[PathBuf]) -> PushSummary {
+    PushSummary {
+        status: CommandStatus::Failed,
+        total_files: files.len(),
+        uploaded_files: 0,
+        failed_files: 0,
+        skipped_files: files.len(),
+        ignored_entries: 0,
+        files: files
+            .iter()
+            .map(|path| PushFileReport {
+                source_file: path.display().to_string(),
+                status: FileStatus::Skipped,
+                uploaded_entries: 0,
+                skipped_reason: Some(SoftSkipReason::TerminatedAfterFailure),
+                error_reason: Some(HardFailureReason::UserCancelled),
+                bundle_id: None,
+                message: Some("push cancelled by user".to_string()),
+            })
+            .collect(),
+        warnings: vec![],
+        errors: vec![ReportError {
+            reason: HardFailureReason::UserCancelled,
+            message: "push cancelled by user".to_string(),
+        }],
+    }
 }
 
 fn resolve_default_project_name(
@@ -2975,6 +3202,117 @@ mod tests {
     }
 
     #[test]
+    fn push_confirmation_entries_include_code_and_function_event_names_and_slugs() {
+        let manifest = RunnerManifest {
+            runtime_context: RuntimeContext {
+                runtime: "node".to_string(),
+                version: "20.0.0".to_string(),
+            },
+            files: vec![ManifestFile {
+                source_file: "functions.ts".to_string(),
+                entries: vec![
+                    ManifestEntry::Code(CodeEntry {
+                        project_id: None,
+                        project_name: None,
+                        name: "Code Tool".to_string(),
+                        slug: "code-tool".to_string(),
+                        description: None,
+                        function_type: Some("tool".to_string()),
+                        if_exists: None,
+                        metadata: None,
+                        tags: None,
+                        function_schema: None,
+                        location: None,
+                        preview: None,
+                    }),
+                    ManifestEntry::FunctionEvent(FunctionEventEntry {
+                        project_id: None,
+                        project_name: None,
+                        event: serde_json::json!({
+                            "name": " Prompt Function ",
+                            "slug": " prompt-function "
+                        }),
+                    }),
+                ],
+                python_bundle: None,
+            }],
+            baseline_dep_versions: vec![],
+        };
+
+        let entries = collect_push_confirmation_entries(&manifest);
+
+        assert_eq!(
+            entries,
+            vec![
+                PushConfirmationEntry {
+                    source_file: "functions.ts".to_string(),
+                    name: Some("Code Tool".to_string()),
+                    slug: Some("code-tool".to_string()),
+                },
+                PushConfirmationEntry {
+                    source_file: "functions.ts".to_string(),
+                    name: Some("Prompt Function".to_string()),
+                    slug: Some("prompt-function".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn push_confirm_prompt_lists_all_function_names_and_slugs() {
+        let functions = vec![
+            PushConfirmationEntry {
+                source_file: "functions.ts".to_string(),
+                name: Some("Code Tool".to_string()),
+                slug: Some("code-tool".to_string()),
+            },
+            PushConfirmationEntry {
+                source_file: "prompts.ts".to_string(),
+                name: Some("Prompt Function".to_string()),
+                slug: Some("prompt-function".to_string()),
+            },
+        ];
+        let project_names = vec!["test-project".to_string()];
+
+        let prompt = build_push_confirm_prompt_for_org("test-org", &functions, &project_names);
+
+        assert!(prompt.contains("2 functions"));
+        assert!(prompt.contains("Code Tool (slug: code-tool)"));
+        assert!(prompt.contains("Prompt Function (slug: prompt-function)"));
+        assert!(prompt.contains("test-org/test-project"));
+    }
+
+    #[test]
+    fn interrupted_confirmation_is_treated_as_cancel() {
+        let interrupted = DialoguerError::IO(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        assert!(is_interrupted_prompt_error(&interrupted));
+
+        let other = DialoguerError::IO(std::io::Error::from(std::io::ErrorKind::Other));
+        assert!(!is_interrupted_prompt_error(&other));
+    }
+
+    #[test]
+    fn cancelled_push_summary_reports_user_cancelled_files() {
+        let files = vec![PathBuf::from("functions.ts")];
+
+        let summary = cancelled_push_summary(&files);
+
+        assert_eq!(summary.status, CommandStatus::Failed);
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(summary.skipped_files, 1);
+        assert_eq!(summary.errors[0].reason, HardFailureReason::UserCancelled);
+        assert_eq!(summary.files[0].status, FileStatus::Skipped);
+        assert_eq!(
+            summary.files[0].error_reason,
+            Some(HardFailureReason::UserCancelled)
+        );
+        assert_eq!(
+            summary.files[0].message.as_deref(),
+            Some("push cancelled by user")
+        );
+    }
+
+    #[test]
     fn collect_project_preflight_uses_default_project_when_needed() {
         let mut base = test_base_args();
         base.project = Some("demo-project".to_string());
@@ -3142,6 +3480,64 @@ mod tests {
         assert_eq!(calculate_upload_counts(3, Some(1)), (2, 1));
         assert_eq!(calculate_upload_counts(3, Some(10)), (0, 10));
         assert_eq!(calculate_upload_counts(3, None), (3, 0));
+    }
+
+    #[test]
+    fn insert_failure_message_suggests_if_exists_for_slug_conflicts() {
+        let events = vec![serde_json::json!({
+            "slug": "test-function",
+            "if_exists": "error"
+        })];
+
+        let message = format_insert_functions_failure_message(
+            Path::new("/tmp/test-functions/parameters.py"),
+            None,
+            "failed to insert functions: request failed (400 Bad Request): Slugs already exist: test-function",
+            &events,
+        );
+
+        assert!(message.contains(
+            "failed to save function definitions for /tmp/test-functions/parameters.py: failed to insert functions"
+        ));
+        assert!(message
+            .contains("Run again with `--if-exists replace` to update existing definitions."));
+        assert!(message
+            .contains("Slugs already exist: test-function\nRun again with `--if-exists replace`"));
+    }
+
+    #[test]
+    fn insert_failure_message_skips_if_exists_hint_when_entry_already_updates() {
+        let events = vec![serde_json::json!({
+            "slug": "test-function",
+            "if_exists": "replace"
+        })];
+
+        let message = format_insert_functions_failure_message(
+            Path::new("parameters.py"),
+            None,
+            "failed to insert functions: request failed (400 Bad Request): Slug already exists: test-function",
+            &events,
+        );
+
+        assert!(!message.contains("--if-exists replace"));
+    }
+
+    #[test]
+    fn insert_failure_message_preserves_bundle_retry_for_other_failures() {
+        let events = vec![serde_json::json!({
+            "slug": "test-function",
+            "if_exists": "error"
+        })];
+
+        let message = format_insert_functions_failure_message(
+            Path::new("functions.ts"),
+            Some("bundle-test"),
+            "failed to insert functions: request failed (500 Internal Server Error)",
+            &events,
+        );
+
+        assert!(message.contains("(bundle_id=bundle-test)"));
+        assert!(message.contains("Retry by re-running `bt functions push --file functions.ts`"));
     }
 
     #[test]
