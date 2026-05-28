@@ -1602,3 +1602,87 @@ fn python_can_import_braintrust(python: &str) -> bool {
         .map(|status| status.success())
         .unwrap_or(false)
 }
+
+fn uv_sync(dir: &Path) {
+    let status = Command::new("uv")
+        .arg("sync")
+        .current_dir(dir)
+        .status()
+        .expect("uv sync failed to run");
+    assert!(status.success(), "uv sync failed in {}", dir.display());
+}
+
+/// Two eval files each with their own .venv pinned to distinct Python versions.
+/// Each eval asserts its Python version, so if bt uses the wrong venv the assertion fails.
+/// This proves bt selected the correct Python per file, not just any venv.
+#[test]
+fn eval_python_two_files_two_venvs() {
+    let _guard = test_lock();
+
+    assert!(command_exists("uv"), "uv is required for this test but is not installed");
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bt_path = bt_binary_path(&root);
+    let fixtures_py = root.join("tests").join("evals").join("py");
+
+    let dir_a = fixtures_py.join("multi-venv-a");
+    let dir_b = fixtures_py.join("multi-venv-b");
+
+    // Each fixture has a pyproject.toml pinning a distinct Python version.
+    // uv sync creates the .venv; the eval files assert their respective version.
+    uv_sync(&dir_a);
+    uv_sync(&dir_b);
+
+    let output = Command::new(&bt_path)
+        .args(["eval", "--jsonl"])
+        .arg(dir_a.join("eval_a.py"))
+        .arg(dir_b.join("eval_b.py"))
+        .current_dir(&root)
+        .env_remove("VIRTUAL_ENV")
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_API_KEY", "local")
+        .output()
+        .expect("run bt eval");
+
+    assert!(
+        output.status.success(),
+        "bt should run each file with its own versioned venv.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// bt auto-discovers the .venv adjacent to the eval file without VIRTUAL_ENV being set.
+/// Uses the multi-venv-a fixture (pyproject.toml pins Python 3.11; eval asserts the version)
+/// so the test is self-contained and doesn't depend on the system Python environment.
+#[test]
+fn eval_python_venv_adjacent_auto_discovered() {
+    let _guard = test_lock();
+
+    assert!(command_exists("uv"), "uv is required for this test but is not installed");
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bt_path = bt_binary_path(&root);
+    let dir_a = root.join("tests").join("evals").join("py").join("multi-venv-a");
+
+    // uv sync creates the .venv from pyproject.toml (requires-python = "==3.11.*").
+    // The eval asserts sys.version_info == (3, 11), so if bt picks any other Python the test fails.
+    uv_sync(&dir_a);
+
+    let output = Command::new(&bt_path)
+        .args(["eval", "--jsonl"])
+        .arg(dir_a.join("eval_a.py"))
+        .current_dir(&root)
+        .env_remove("VIRTUAL_ENV")
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_API_KEY", "local")
+        .output()
+        .expect("run bt eval");
+
+    assert!(
+        output.status.success(),
+        "bt should find the .venv adjacent to the eval file without VIRTUAL_ENV being set.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

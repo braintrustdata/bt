@@ -704,29 +704,52 @@ fn build_eval_plans(
     python_runner_override: Option<&str>,
 ) -> Result<Vec<EvalPlan>> {
     let partitions = partition_files_by_language(files)?;
-    partitions
-        .into_iter()
-        .map(|(language, files)| {
-            let plan_runner = match language {
-                EvalLanguage::JavaScript => js_runner_override,
-                EvalLanguage::Python => python_runner_override,
-            };
-            let show_js_hint = language == EvalLanguage::JavaScript && js_runner_override.is_none();
-            let has_ts_files = language == EvalLanguage::JavaScript && has_ts_eval_files(&files);
-            let retry_policy = if show_js_hint && has_ts_files {
-                RetryPolicy::Allow
-            } else {
-                RetryPolicy::Disallow
-            };
-            Ok(EvalPlan {
-                language,
-                files,
-                runner_override: plan_runner.map(ToOwned::to_owned),
-                show_js_hint,
-                retry_policy,
-            })
-        })
-        .collect()
+    let mut plans = Vec::new();
+    for (language, files) in partitions {
+        match language {
+            EvalLanguage::JavaScript => {
+                let show_js_hint = js_runner_override.is_none();
+                let has_ts_files = has_ts_eval_files(&files);
+                let retry_policy = if show_js_hint && has_ts_files {
+                    RetryPolicy::Allow
+                } else {
+                    RetryPolicy::Disallow
+                };
+                plans.push(EvalPlan {
+                    language,
+                    files,
+                    runner_override: js_runner_override.map(ToOwned::to_owned),
+                    show_js_hint,
+                    retry_policy,
+                });
+            }
+            EvalLanguage::Python => {
+                if let Some(override_) = python_runner_override {
+                    // User explicitly specified a runner; one plan for all Python files.
+                    plans.push(EvalPlan {
+                        language,
+                        files,
+                        runner_override: Some(override_.to_owned()),
+                        show_js_hint: false,
+                        retry_policy: RetryPolicy::Disallow,
+                    });
+                } else {
+                    // Group by nearest venv; one plan per group so each file runs with
+                    // the Python interpreter that owns its packages.
+                    for (group_files, venv_python) in group_python_files_by_venv(&files) {
+                        plans.push(EvalPlan {
+                            language: EvalLanguage::Python,
+                            files: group_files,
+                            runner_override: venv_python,
+                            show_js_hint: false,
+                            retry_policy: RetryPolicy::Disallow,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(plans)
 }
 
 async fn run_eval_plan_once(
@@ -2733,6 +2756,48 @@ fn set_node_heap_size_env(command: &mut Command) {
     command.env("NODE_OPTIONS", merged);
 }
 
+fn venv_python_path(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
+}
+
+/// Walk up from `file`'s directory checking common venv directory names.
+fn find_venv_for_file(file: &str) -> Option<PathBuf> {
+    let start = Path::new(file)
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))?;
+
+    const VENV_NAMES: &[&str] = &[".venv", "venv"];
+    let mut current = Some(start.as_path());
+    while let Some(dir) = current {
+        for name in VENV_NAMES {
+            let python = venv_python_path(&dir.join(name));
+            if python.is_file() {
+                return Some(python);
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// Group Python files by their nearest venv, preserving input order.
+/// Files with no discoverable venv are grouped together under `None`.
+fn group_python_files_by_venv(files: &[String]) -> Vec<(Vec<String>, Option<String>)> {
+    let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for file in files {
+        let venv_python = find_venv_for_file(file).map(|p| p.to_string_lossy().to_string());
+        match groups.iter_mut().find(|(k, _)| *k == venv_python) {
+            Some(group) => group.1.push(file.clone()),
+            None => groups.push((venv_python, vec![file.clone()])),
+        }
+    }
+    groups.into_iter().map(|(python, files)| (files, python)).collect()
+}
 fn eval_runner_cache_dir() -> PathBuf {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
