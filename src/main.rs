@@ -24,6 +24,7 @@ mod scorers;
 mod self_update;
 mod setup;
 mod source_language;
+mod spark;
 mod sql;
 mod status;
 mod switch;
@@ -81,6 +82,7 @@ Additional
   docs         Manage workflow docs for coding agents
   self         Self-management commands
   setup        Configure Braintrust setup flows
+  spark        Run the embedded spark wizard
   status       Show current org and project context
 
 Flags
@@ -163,6 +165,8 @@ enum Commands {
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
     Status(CLIArgs<status::StatusArgs>),
+    /// Run the embedded spark wizard
+    Spark(CLIArgs<spark::SparkArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
@@ -191,6 +195,7 @@ impl Commands {
             Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
             Commands::Status(cmd) => &cmd.base,
+            Commands::Spark(cmd) => &cmd.base,
         }
     }
 
@@ -217,6 +222,7 @@ impl Commands {
             Commands::Util(cmd) => &mut cmd.base,
             Commands::Switch(cmd) => &mut cmd.base,
             Commands::Status(cmd) => &mut cmd.base,
+            Commands::Spark(cmd) => &mut cmd.base,
         }
     }
 
@@ -295,6 +301,7 @@ fn try_main() -> Result<()> {
             Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
+            Commands::Spark(cmd) => spark::run(cmd.base, cmd.args).await?,
         }
         Ok(())
     });
