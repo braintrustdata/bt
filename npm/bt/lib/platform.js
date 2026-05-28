@@ -1,13 +1,13 @@
 "use strict";
 
 const PLATFORM_PACKAGES = {
-  "darwin-arm64": "@braintrust/bt-darwin-arm64",
-  "darwin-x64": "@braintrust/bt-darwin-x64",
-  "linux-arm64": "@braintrust/bt-linux-arm64",
-  "linux-x64-glibc": "@braintrust/bt-linux-x64",
-  "linux-x64-musl": "@braintrust/bt-linux-x64-musl",
-  "win32-arm64": "@braintrust/bt-win32-arm64",
-  "win32-x64": "@braintrust/bt-win32-x64",
+  "darwin-arm64": "@braintrust/cli-darwin-arm64",
+  "darwin-x64": "@braintrust/cli-darwin-x64",
+  "linux-arm64": "@braintrust/cli-linux-arm64",
+  "linux-x64-glibc": "@braintrust/cli-linux-x64",
+  "linux-x64-musl": "@braintrust/cli-linux-x64-musl",
+  "win32-arm64": "@braintrust/cli-win32-arm64",
+  "win32-x64": "@braintrust/cli-win32-x64",
 };
 
 function detectLibc() {

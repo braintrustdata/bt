@@ -1,5 +1,5 @@
 {
-  "name": "@braintrust/bt",
+  "name": "@braintrust/cli",
   "version": "0.0.0",
   "description": "The Braintrust command line interface",
   "homepage": "https://github.com/braintrustdata/bt",
@@ -24,12 +24,12 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@braintrust/bt-darwin-arm64": "0.0.0",
-    "@braintrust/bt-darwin-x64": "0.0.0",
-    "@braintrust/bt-linux-arm64": "0.0.0",
-    "@braintrust/bt-linux-x64": "0.0.0",
-    "@braintrust/bt-linux-x64-musl": "0.0.0",
-    "@braintrust/bt-win32-arm64": "0.0.0",
-    "@braintrust/bt-win32-x64": "0.0.0"
+    "@braintrust/cli-darwin-arm64": "0.0.0",
+    "@braintrust/cli-darwin-x64": "0.0.0",
+    "@braintrust/cli-linux-arm64": "0.0.0",
+    "@braintrust/cli-linux-x64": "0.0.0",
+    "@braintrust/cli-linux-x64-musl": "0.0.0",
+    "@braintrust/cli-win32-arm64": "0.0.0",
+    "@braintrust/cli-win32-x64": "0.0.0"
   }
 }

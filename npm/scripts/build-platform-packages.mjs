@@ -104,7 +104,7 @@ for (const [target, spec] of Object.entries(targets)) {
   extract(archive, stagingDir);
   const binPath = findBinary(stagingDir, spec.bin);
 
-  const pkgName = `@braintrust/bt-${spec.pkg}`;
+  const pkgName = `@braintrust/cli-${spec.pkg}`;
   const pkgOut = join(outDir, `bt-${spec.pkg}`);
   const pkgBin = join(pkgOut, "bin");
   mkdirSync(pkgBin, { recursive: true });
@@ -139,7 +139,7 @@ for (const [target, spec] of Object.entries(targets)) {
   );
   writeFileSync(
     join(pkgOut, "README.md"),
-    `# ${pkgName}\n\nPrebuilt \`bt\` binary for ${spec.os}-${spec.cpu}${spec.libc ? ` (${spec.libc})` : ""}.\n\nInstalled automatically as an optional dependency of [\`@braintrust/bt\`](https://www.npmjs.com/package/@braintrust/bt). Install that package instead.\n`,
+    `# ${pkgName}\n\nPrebuilt \`bt\` binary for ${spec.os}-${spec.cpu}${spec.libc ? ` (${spec.libc})` : ""}.\n\nInstalled automatically as an optional dependency of [\`@braintrust/cli\`](https://www.npmjs.com/package/@braintrust/cli). Install that package instead.\n`,
   );
 
   console.log(`Built ${pkgName} -> ${pkgOut}`);

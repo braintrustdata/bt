@@ -1,4 +1,4 @@
-# @braintrust/bt
+# @braintrust/cli
 
 The [Braintrust](https://www.braintrust.dev) command-line interface (`bt`),
 distributed as an npm package.
@@ -6,9 +6,9 @@ distributed as an npm package.
 ## Install
 
 ```bash
-npm install -g @braintrust/bt
+npm install -g @braintrust/cli
 # or
-pnpm add -g @braintrust/bt
+pnpm add -g @braintrust/cli
 ```
 
 Then:
@@ -22,13 +22,13 @@ bt --help
 This package is a thin Node.js launcher. The actual `bt` binary is shipped via
 platform-specific packages declared as `optionalDependencies`:
 
-- `@braintrust/bt-darwin-arm64`
-- `@braintrust/bt-darwin-x64`
-- `@braintrust/bt-linux-arm64`
-- `@braintrust/bt-linux-x64`
-- `@braintrust/bt-linux-x64-musl`
-- `@braintrust/bt-win32-arm64`
-- `@braintrust/bt-win32-x64`
+- `@braintrust/cli-darwin-arm64`
+- `@braintrust/cli-darwin-x64`
+- `@braintrust/cli-linux-arm64`
+- `@braintrust/cli-linux-x64`
+- `@braintrust/cli-linux-x64-musl`
+- `@braintrust/cli-win32-arm64`
+- `@braintrust/cli-win32-x64`
 
 `npm/pnpm/yarn` install only the one matching your OS + CPU (+ libc on Linux).
 
