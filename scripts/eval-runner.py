@@ -26,7 +26,7 @@ try:
         set_thread_pool_max_workers,
     )
     from braintrust.logger import Dataset, init as init_logger_experiment, parent_context, _internal_get_global_state
-    from braintrust.parameters import parameters_to_json_schema, validate_parameters
+    from braintrust.parameters import RemoteEvalParameters, parameters_to_json_schema, validate_parameters
     from braintrust.util import eprint
     from braintrust.span_identifier_v4 import parse_parent
 except Exception as exc:  # pragma: no cover - runtime guard
@@ -566,8 +566,14 @@ def build_eval_definitions(evaluator_instances: list[EvaluatorInstance]) -> dict
     for evaluator_instance in evaluator_instances:
         evaluator = evaluator_instance.evaluator
         scores = [{"name": getattr(score, "__name__", f"scorer_{i}")} for i, score in enumerate(evaluator.scores)]
+        if isinstance(evaluator.parameters, RemoteEvalParameters):
+            parameters_schema: dict[str, Any] = evaluator.parameters.schema or {}
+        elif evaluator.parameters:
+            parameters_schema = parameters_to_json_schema(evaluator.parameters)
+        else:
+            parameters_schema = {}
         definitions[evaluator.eval_name] = {
-            "parameters": parameters_to_json_schema(evaluator.parameters) if evaluator.parameters else {},
+            "parameters": parameters_schema,
             "scores": scores,
         }
     return definitions
