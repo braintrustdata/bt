@@ -153,7 +153,7 @@ fn insert_functions_slug_conflict_hint(
             .is_none_or(|mode| mode == "error")
     });
     has_error_mode_entry
-        .then_some("Run again with `--if-exists replace` to update existing definitions.")
+        .then_some("Run again with `--if-exists replace` to update existing definitions.\n")
 }
 
 fn format_insert_functions_failure_message(
