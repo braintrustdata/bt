@@ -6,8 +6,10 @@
 //                           (bt-<target>.tar.gz / bt-<target>.zip), required
 //   --out-dir <path>        directory to write packages into (default: npm/dist)
 //
-// Emits <out-dir>/bt/ (wrapper) and <out-dir>/bt-<pkg>/ (one per target),
-// each ready to `npm publish`.
+// Emits <out-dir>/bt-<pkg>/ (one per target), each ready to `npm publish`.
+// The `bt` command is exposed via the `braintrust` SDK, which lists these
+// packages as optionalDependencies and ships a launcher that resolves the
+// matching binary.
 
 import { execFileSync } from "node:child_process";
 import {
@@ -78,19 +80,6 @@ function findBinary(rootDir, binName) {
   throw new Error(`Binary ${binName} not found under ${rootDir}`);
 }
 
-// --- Wrapper package ---
-const wrapperSrc = join(NPM_DIR, "bt");
-const wrapperOut = join(outDir, "bt");
-cpSync(wrapperSrc, wrapperOut, { recursive: true });
-const wrapperPkgPath = join(wrapperOut, "package.json");
-const wrapperPkg = JSON.parse(readFileSync(wrapperPkgPath, "utf8"));
-wrapperPkg.version = version;
-for (const key of Object.keys(wrapperPkg.optionalDependencies ?? {})) {
-  wrapperPkg.optionalDependencies[key] = version;
-}
-writeFileSync(wrapperPkgPath, JSON.stringify(wrapperPkg, null, 2) + "\n");
-console.log(`Built wrapper -> ${wrapperOut}`);
-
 // --- Per-platform packages ---
 for (const [target, spec] of Object.entries(targets)) {
   const archiveName = `bt-${target}.${spec.archiveExt}`;
@@ -104,7 +93,7 @@ for (const [target, spec] of Object.entries(targets)) {
   extract(archive, stagingDir);
   const binPath = findBinary(stagingDir, spec.bin);
 
-  const pkgName = `@braintrust/cli-${spec.pkg}`;
+  const pkgName = `@braintrust/bt-${spec.pkg}`;
   const pkgOut = join(outDir, `bt-${spec.pkg}`);
   const pkgBin = join(pkgOut, "bin");
   mkdirSync(pkgBin, { recursive: true });
@@ -139,7 +128,7 @@ for (const [target, spec] of Object.entries(targets)) {
   );
   writeFileSync(
     join(pkgOut, "README.md"),
-    `# ${pkgName}\n\nPrebuilt \`bt\` binary for ${spec.os}-${spec.cpu}${spec.libc ? ` (${spec.libc})` : ""}.\n\nInstalled automatically as an optional dependency of [\`@braintrust/cli\`](https://www.npmjs.com/package/@braintrust/cli). Install that package instead.\n`,
+    `# ${pkgName}\n\nPrebuilt \`bt\` binary for ${spec.os}-${spec.cpu}${spec.libc ? ` (${spec.libc})` : ""}.\n\nInstalled automatically as an optional dependency of [\`braintrust\`](https://www.npmjs.com/package/braintrust), which exposes the \`bt\` command. Install that package instead.\n`,
   );
 
   console.log(`Built ${pkgName} -> ${pkgOut}`);
