@@ -46,6 +46,14 @@ pub(crate) struct ProjectLogRefDiscoveryResult {
     pub(crate) pages: usize,
 }
 
+pub(crate) struct ProjectLogRefDiscoveryOptions<'a> {
+    pub(crate) project_id: &'a str,
+    pub(crate) filter: Option<&'a Value>,
+    pub(crate) scope: ProjectLogRefScope,
+    pub(crate) target: usize,
+    pub(crate) page_size: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct DiscoveryBtqlResponse {
     data: Vec<Map<String, Value>>,
@@ -56,16 +64,19 @@ struct DiscoveryBtqlResponse {
 pub(crate) async fn discover_project_log_refs<F>(
     client: &ApiClient,
     ctx: &LoginContext,
-    project_id: &str,
-    filter: Option<&Value>,
-    scope: ProjectLogRefScope,
-    target: usize,
-    page_size: usize,
+    options: ProjectLogRefDiscoveryOptions<'_>,
     mut on_ref: F,
 ) -> Result<ProjectLogRefDiscoveryResult>
 where
     F: FnMut(ProjectLogRef) -> Result<()>,
 {
+    let ProjectLogRefDiscoveryOptions {
+        project_id,
+        filter,
+        scope,
+        target,
+        page_size,
+    } = options;
     let mut seen = HashSet::new();
     let mut trace_roots = Vec::new();
     let mut trace_refs_by_root_span_id = HashMap::new();
@@ -94,19 +105,19 @@ where
                 }
                 ProjectLogRefScope::Trace => {
                     let root_span_id = reference.root_span_id.clone();
-                    if !trace_refs_by_root_span_id.contains_key(&root_span_id) {
-                        if trace_roots.len() >= target {
-                            continue;
+                    match trace_refs_by_root_span_id.entry(root_span_id) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            if trace_roots.len() >= target {
+                                continue;
+                            }
+                            trace_roots.push(entry.key().clone());
+                            entry.insert(reference);
                         }
-                        trace_roots.push(root_span_id.clone());
-                        trace_refs_by_root_span_id.insert(root_span_id, reference);
-                        continue;
-                    }
-                    let should_replace = trace_refs_by_root_span_id
-                        .get(&root_span_id)
-                        .is_none_or(|current| better_trace_origin_ref(current, &reference));
-                    if should_replace {
-                        trace_refs_by_root_span_id.insert(root_span_id, reference);
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            if better_trace_origin_ref(entry.get(), &reference) {
+                                entry.insert(reference);
+                            }
+                        }
                     }
                 }
             }

@@ -196,7 +196,7 @@ enum TopicMapCommands {
     #[command(alias = "view")]
     Show(TopicMapViewArgs),
     /// Update a configured Topics topic map by name or function ID
-    Set(TopicMapSetArgs),
+    Set(Box<TopicMapSetArgs>),
 }
 
 #[derive(Debug, Clone, Args)]
