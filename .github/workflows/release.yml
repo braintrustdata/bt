@@ -537,6 +537,15 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           for dir in npm/dist/bt-*; do
-            echo "Publishing $dir"
+            name="$(node -p "require('./$dir/package.json').name")"
+            version="$(node -p "require('./$dir/package.json').version")"
+            # Skip already-published versions so a partial publish can be re-run.
+            # Test output, not exit code: npm view is empty for a missing version.
+            published="$(npm view "$name@$version" version 2>/dev/null || true)"
+            if [ -n "$published" ]; then
+              echo "Skipping $name@$version (already published)"
+              continue
+            fi
+            echo "Publishing $name@$version"
             (cd "$dir" && npm publish --access public --provenance)
           done

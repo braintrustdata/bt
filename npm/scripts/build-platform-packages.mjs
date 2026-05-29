@@ -81,12 +81,14 @@ function findBinary(rootDir, binName) {
 }
 
 // --- Per-platform packages ---
+let built = 0;
 for (const [target, spec] of Object.entries(targets)) {
   const archiveName = `bt-${target}.${spec.archiveExt}`;
   const archive = join(archivesDir, archiveName);
   if (!existsSync(archive)) {
-    console.warn(`SKIP ${target}: archive not found (${archive})`);
-    continue;
+    // Fail hard, don't skip: the SDK pins each package at an exact version, so a
+    // missing platform would break installs for that platform at runtime.
+    throw new Error(`Archive not found for ${target}: ${archive}`);
   }
 
   const stagingDir = join(outDir, ".staging", target);
@@ -132,7 +134,13 @@ for (const [target, spec] of Object.entries(targets)) {
   );
 
   console.log(`Built ${pkgName} -> ${pkgOut}`);
+  built++;
 }
 
 rmSync(join(outDir, ".staging"), { recursive: true, force: true });
-console.log(`\nAll packages written to ${outDir}`);
+
+const expected = Object.keys(targets).length;
+if (built !== expected) {
+  throw new Error(`Built ${built} packages but expected ${expected}`);
+}
+console.log(`\nAll ${built} packages written to ${outDir}`);
