@@ -19,8 +19,23 @@ pub struct InitArgs {}
 
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
     let bt_dir = std::env::current_dir()?.join(".bt");
-    if bt_dir.join("config.json").exists() {
-        print_command_status(CommandStatus::Warning, "Already Initialized");
+    let config_path = bt_dir.join("config.json");
+    if config_path.exists() {
+        if base.json {
+            let existing = config::load_file(&config_path);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "initialized": false,
+                    "status": "already-initialized",
+                    "org": existing.org,
+                    "project": existing.project,
+                    "path": config_path.display().to_string(),
+                })
+            );
+        } else {
+            print_command_status(CommandStatus::Warning, "Already Initialized");
+        }
         return Ok(());
     }
 
@@ -61,11 +76,24 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
 
     config::save_local(&cfg, true)?;
 
-    print_command_status(
-        CommandStatus::Success,
-        &format!("Project linked to {org}/{project}"),
-    );
-    print_command_status(CommandStatus::Success, "Created .bt/config.json");
+    if base.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "initialized": true,
+                "status": "created",
+                "org": org,
+                "project": project,
+                "path": config_path.display().to_string(),
+            })
+        );
+    } else {
+        print_command_status(
+            CommandStatus::Success,
+            &format!("Project linked to {org}/{project}"),
+        );
+        print_command_status(CommandStatus::Success, "Created .bt/config.json");
+    }
 
     Ok(())
 }

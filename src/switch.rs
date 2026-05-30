@@ -129,18 +129,27 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    let path = if args.local {
-        config::local_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No local .bt directory found. Use bt init to initialize this directory."
-            )
-        })?
+    let (path, scope) = if args.local {
+        (
+            config::local_path().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No local .bt directory found. Use bt init to initialize this directory."
+                )
+            })?,
+            "local",
+        )
     } else if args.global {
-        config::global_path()?
+        (config::global_path()?, "global")
     } else if interactive && config::local_path().is_some() {
-        select_scope()?
+        let chosen = select_scope()?;
+        let scope = if chosen == config::global_path()? {
+            "global"
+        } else {
+            "local"
+        };
+        (chosen, scope)
     } else {
-        config::global_path()?
+        (config::global_path()?, "global")
     };
 
     let mut cfg = config::load_file(&path);
@@ -150,6 +159,19 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     apply_switch_config(&mut cfg, config_profile.as_deref(), &org_name, &project);
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
+
+    if base.json {
+        let payload = serde_json::json!({
+            "org": org_name,
+            "project": project.name,
+            "project_id": project.id,
+            "profile": config_profile,
+            "scope": scope,
+            "path": path.display().to_string(),
+        });
+        println!("{payload}");
+        return Ok(());
+    }
 
     let display = format!("{org_name}/{}", project.name);
     print_command_status(CommandStatus::Success, &format!("Switched to {display}"));
