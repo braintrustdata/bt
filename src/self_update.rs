@@ -80,6 +80,8 @@ const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+    #[serde(default)]
+    target_commitish: Option<String>,
 }
 
 pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
@@ -104,7 +106,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
             Ok(release) => {
                 let current = env!("CARGO_PKG_VERSION");
                 if stable_is_up_to_date(current, &release.tag_name) {
-                    println!("{}", stable_check_message(current, &release.tag_name));
+                    print_stable_check(base, current, &release.tag_name);
                     return Ok(());
                 }
             }
@@ -140,15 +142,41 @@ async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()>
     let current = env!("CARGO_PKG_VERSION");
 
     match channel {
-        UpdateChannel::Stable => {
-            println!("{}", stable_check_message(current, &release.tag_name));
-        }
-        UpdateChannel::Canary => {
-            println!("{}", canary_check_message(&release.tag_name));
-        }
+        UpdateChannel::Stable => print_stable_check(base, current, &release.tag_name),
+        UpdateChannel::Canary => print_canary_check(base, &release),
     }
 
     Ok(())
+}
+
+fn print_stable_check(base: &BaseArgs, current: &str, release_tag: &str) {
+    if base.json {
+        let payload = serde_json::json!({
+            "channel": "stable",
+            "current": current,
+            "latest": release_tag,
+            "up_to_date": stable_is_up_to_date(current, release_tag),
+        });
+        println!("{payload}");
+    } else {
+        println!("{}", stable_check_message(current, release_tag));
+    }
+}
+
+fn print_canary_check(base: &BaseArgs, release: &GitHubRelease) {
+    if base.json {
+        let payload = serde_json::json!({
+            "channel": "canary",
+            "latest": release.tag_name,
+            "up_to_date": canary_is_up_to_date(
+                crate::CLI_VERSION,
+                release.target_commitish.as_deref(),
+            ),
+        });
+        println!("{payload}");
+    } else {
+        println!("{}", canary_check_message(&release.tag_name));
+    }
 }
 
 async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
@@ -329,6 +357,16 @@ fn stable_check_message(current: &str, release_tag: &str) -> String {
     format!("update available on stable channel: current={current}, latest={release_tag}")
 }
 
+fn canary_is_up_to_date(current_version: &str, target_commitish: Option<&str>) -> bool {
+    let Some((_, local_sha)) = current_version.rsplit_once("-canary.") else {
+        return false;
+    };
+    if local_sha.is_empty() || local_sha == "dev" {
+        return false;
+    }
+    target_commitish.is_some_and(|target| target.starts_with(local_sha))
+}
+
 fn stable_is_up_to_date(current: &str, release_tag: &str) -> bool {
     let latest = release_tag.trim_start_matches('v');
     latest == current
@@ -430,6 +468,28 @@ mod tests {
         assert!(msg.contains("update available"));
         assert!(msg.contains("current=0.1.0"));
         assert!(msg.contains("latest=v0.2.0"));
+    }
+
+    #[test]
+    fn canary_up_to_date_matches_target_commitish() {
+        assert!(canary_is_up_to_date(
+            "0.1.0-canary.abc123def456",
+            Some("abc123def456789012345678901234567890aaaa"),
+        ));
+        assert!(!canary_is_up_to_date(
+            "0.1.0-canary.abc123def456",
+            Some("ffffffffffffffffffffffffffffffffffffffff"),
+        ));
+    }
+
+    #[test]
+    fn canary_up_to_date_false_for_dev_or_stable_builds() {
+        assert!(!canary_is_up_to_date("0.1.0-canary.dev", Some("abc")));
+        assert!(!canary_is_up_to_date(
+            "0.1.0",
+            Some("abc123def456789012345678901234567890aaaa"),
+        ));
+        assert!(!canary_is_up_to_date("0.1.0-canary.abc123def456", None));
     }
 
     #[test]

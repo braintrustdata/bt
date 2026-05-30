@@ -38,7 +38,7 @@ mod utils;
 use crate::args::{has_explicit_profile_arg, ArgValueSource, BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
-const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
+pub(crate) const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
     Some(version) => version,
     None => DEFAULT_CANARY_VERSION,
 };
@@ -247,6 +247,23 @@ fn main() {
     std::process::exit(exit_code as i32);
 }
 
+fn handle_version_json(argv: &[OsString]) -> bool {
+    let mut saw_version = false;
+    let mut saw_json = false;
+    for arg in argv.iter().skip(1).filter_map(|a| a.to_str()) {
+        if arg == "--" {
+            break;
+        }
+        saw_version |= arg == "--version" || arg == "-V";
+        saw_json |= arg == "--json";
+    }
+    if !(saw_version && saw_json) {
+        return false;
+    }
+    println!("{}", serde_json::json!({ "version": CLI_VERSION }));
+    true
+}
+
 fn apply_runtime_env_overrides(base: &BaseArgs) {
     // Apply the CLI-owned override once so reqwest and inherited child
     // commands consistently observe BRAINTRUST_CA_CERT/--ca-cert precedence
@@ -259,6 +276,10 @@ fn apply_runtime_env_overrides(base: &BaseArgs) {
 fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
+
+    if handle_version_json(&argv) {
+        return Ok(());
+    }
 
     let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
@@ -587,5 +608,37 @@ mod tests {
 
         assert!(!cli.command.base().quiet);
         assert!(cli.command.base().verbose);
+    }
+
+    fn argv(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn handle_version_json_detects_long_form() {
+        assert!(handle_version_json(&argv(&["bt", "--version", "--json"])));
+        assert!(handle_version_json(&argv(&["bt", "--json", "--version"])));
+    }
+
+    #[test]
+    fn handle_version_json_detects_short_form() {
+        assert!(handle_version_json(&argv(&["bt", "-V", "--json"])));
+    }
+
+    #[test]
+    fn handle_version_json_requires_both_flags() {
+        assert!(!handle_version_json(&argv(&["bt", "--version"])));
+        assert!(!handle_version_json(&argv(&["bt", "--json", "status"])));
+    }
+
+    #[test]
+    fn handle_version_json_ignores_args_after_double_dash() {
+        assert!(!handle_version_json(&argv(&[
+            "bt",
+            "eval",
+            "--",
+            "--version",
+            "--json",
+        ])));
     }
 }
