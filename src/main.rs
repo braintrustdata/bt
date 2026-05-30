@@ -384,6 +384,10 @@ fn classify_error(err: &anyhow::Error) -> ExitCode {
         return ExitCode::Network;
     }
 
+    if has_response_parse_error(err) {
+        return ExitCode::Error;
+    }
+
     if has_io_error(err) || looks_like_user_error(err) {
         return ExitCode::User;
     }
@@ -424,6 +428,14 @@ fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
 fn has_reqwest_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|source| source.downcast_ref::<reqwest::Error>().is_some())
+}
+
+fn has_response_parse_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .downcast_ref::<crate::http::ResponseParseError>()
+            .is_some()
+    })
 }
 
 fn has_io_error(err: &anyhow::Error) -> bool {
