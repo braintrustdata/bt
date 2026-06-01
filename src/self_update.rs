@@ -104,9 +104,8 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
     if channel == UpdateChannel::Stable {
         match fetch_release(base, channel).await {
             Ok(release) => {
-                let current = env!("CARGO_PKG_VERSION");
-                if stable_is_up_to_date(current, &release.tag_name) {
-                    print_stable_check(base, current, &release.tag_name)?;
+                if stable_is_up_to_date(env!("CARGO_PKG_VERSION"), &release.tag_name) {
+                    print_check(base, channel, &release)?;
                     return Ok(());
                 }
             }
@@ -146,44 +145,41 @@ fn ensure_installer_managed_install() -> Result<()> {
 
 async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     let release = fetch_release(base, channel).await?;
-    let current = env!("CARGO_PKG_VERSION");
-
-    match channel {
-        UpdateChannel::Stable => print_stable_check(base, current, &release.tag_name)?,
-        UpdateChannel::Canary => print_canary_check(base, &release)?,
-    }
-
-    Ok(())
+    print_check(base, channel, &release)
 }
 
-fn print_stable_check(base: &BaseArgs, current: &str, release_tag: &str) -> Result<()> {
+fn print_check(base: &BaseArgs, channel: UpdateChannel, release: &GitHubRelease) -> Result<()> {
+    let (current, latest, up_to_date, message) = match channel {
+        UpdateChannel::Stable => {
+            let current = env!("CARGO_PKG_VERSION").to_string();
+            let latest = release.tag_name.clone();
+            let up_to_date = stable_is_up_to_date(&current, &latest);
+            let message = stable_check_message(&current, &latest);
+            (current, latest, up_to_date, message)
+        }
+        UpdateChannel::Canary => {
+            // `current` is built by build.rs as `{CARGO_PKG_VERSION}-canary.{short_sha}`.
+            // Construct `latest` in the same shape so the two are comparable.
+            // The canary tag itself is always literally "canary"; the meaningful
+            // identifier is the commit it points at (target_commitish).
+            let current = crate::CLI_VERSION.to_string();
+            let latest = format_canary_version(release.target_commitish.as_deref());
+            let up_to_date = current == latest;
+            let message = canary_check_message(&latest);
+            (current, latest, up_to_date, message)
+        }
+    };
+
     if base.json {
         let payload = serde_json::json!({
-            "channel": "stable",
+            "channel": channel.name(),
             "current": current,
-            "latest": release_tag,
-            "up_to_date": stable_is_up_to_date(current, release_tag),
+            "latest": latest,
+            "up_to_date": up_to_date,
         });
         println!("{}", serde_json::to_string(&payload)?);
     } else {
-        println!("{}", stable_check_message(current, release_tag));
-    }
-    Ok(())
-}
-
-fn print_canary_check(base: &BaseArgs, release: &GitHubRelease) -> Result<()> {
-    if base.json {
-        let payload = serde_json::json!({
-            "channel": "canary",
-            "latest": release.tag_name,
-            "up_to_date": canary_is_up_to_date(
-                crate::CLI_VERSION,
-                release.target_commitish.as_deref(),
-            ),
-        });
-        println!("{}", serde_json::to_string(&payload)?);
-    } else {
-        println!("{}", canary_check_message(&release.tag_name));
+        println!("{message}");
     }
     Ok(())
 }
@@ -376,14 +372,15 @@ fn stable_check_message(current: &str, release_tag: &str) -> String {
     format!("update available on stable channel: current={current}, latest={release_tag}")
 }
 
-fn canary_is_up_to_date(current_version: &str, target_commitish: Option<&str>) -> bool {
-    let Some((_, local_sha)) = current_version.rsplit_once("-canary.") else {
-        return false;
-    };
-    if local_sha.is_empty() || local_sha == "dev" {
-        return false;
-    }
-    target_commitish.is_some_and(|target| target.starts_with(local_sha))
+/// Format a canary version string to match the shape that `build.rs` bakes into
+/// `CLI_VERSION`: `{CARGO_PKG_VERSION}-canary.{short_sha}`. Falls back to a
+/// `dev`-style suffix when `target_commitish` is missing so an unparseable
+/// release never accidentally compares equal to a local canary build.
+fn format_canary_version(target_commitish: Option<&str>) -> String {
+    let short_sha = target_commitish
+        .map(|sha| &sha[..sha.len().min(12)])
+        .unwrap_or("unknown");
+    format!("{}-canary.{}", env!("CARGO_PKG_VERSION"), short_sha)
 }
 
 fn stable_is_up_to_date(current: &str, release_tag: &str) -> bool {
@@ -391,10 +388,8 @@ fn stable_is_up_to_date(current: &str, release_tag: &str) -> bool {
     latest == current
 }
 
-fn canary_check_message(release_tag: &str) -> String {
-    format!(
-        "latest canary release tag: {release_tag}\nrun `bt self update --channel canary` to install it"
-    )
+fn canary_check_message(latest: &str) -> String {
+    format!("latest canary release: {latest}\nrun `bt self update --channel canary` to install it")
 }
 
 fn parse_update_channel(raw: Option<&str>) -> Option<UpdateChannel> {
@@ -490,31 +485,22 @@ mod tests {
     }
 
     #[test]
-    fn canary_up_to_date_matches_target_commitish() {
-        assert!(canary_is_up_to_date(
-            "0.1.0-canary.abc123def456",
-            Some("abc123def456789012345678901234567890aaaa"),
-        ));
-        assert!(!canary_is_up_to_date(
-            "0.1.0-canary.abc123def456",
-            Some("ffffffffffffffffffffffffffffffffffffffff"),
-        ));
+    fn format_canary_version_matches_cli_version_shape() {
+        let pkg = env!("CARGO_PKG_VERSION");
+        let formatted = format_canary_version(Some("abc123def456789012345678901234567890aaaa"));
+        assert_eq!(formatted, format!("{pkg}-canary.abc123def456"));
     }
 
     #[test]
-    fn canary_up_to_date_false_for_dev_or_stable_builds() {
-        assert!(!canary_is_up_to_date("0.1.0-canary.dev", Some("abc")));
-        assert!(!canary_is_up_to_date(
-            "0.1.0",
-            Some("abc123def456789012345678901234567890aaaa"),
-        ));
-        assert!(!canary_is_up_to_date("0.1.0-canary.abc123def456", None));
+    fn format_canary_version_falls_back_when_commitish_missing() {
+        let pkg = env!("CARGO_PKG_VERSION");
+        assert_eq!(format_canary_version(None), format!("{pkg}-canary.unknown"));
     }
 
     #[test]
     fn canary_check_message_contains_guidance() {
-        let msg = canary_check_message("canary-deadbeef");
-        assert!(msg.contains("canary-deadbeef"));
+        let msg = canary_check_message("0.10.0-canary.abc123def456");
+        assert!(msg.contains("0.10.0-canary.abc123def456"));
         assert!(msg.contains("bt self update --channel canary"));
     }
 
