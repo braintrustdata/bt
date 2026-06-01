@@ -47,6 +47,8 @@ const RUNNER_COMMON_SOURCE: &str = include_str!("../../scripts/runner-common.ts"
 const PYTHON_RUNNER_COMMON_SOURCE: &str = include_str!("../../scripts/python_runner_common.py");
 const PYTHON_BASELINE_DEPS: &[&str] =
     &["pydantic", "braintrust", "autoevals", "requests", "openai"];
+const PARAMETER_FUNCTION_TYPE: &str = "parameters";
+const PARAMETER_SCHEMA_MERGE_PATH: [&str; 2] = ["function_data", "__schema"];
 // Compatibility shim for existing test harnesses and eval workflows that set
 // Python interpreter via BT_EVAL_* variables. Preferred path is still
 // --runner / BT_FUNCTIONS_PUSH_RUNNER.
@@ -725,6 +727,23 @@ fn build_code_function_data(
     })
 }
 
+fn apply_parameter_function_merge_fields(object: &mut Map<String, Value>) {
+    if object.get("function_type").and_then(Value::as_str) != Some(PARAMETER_FUNCTION_TYPE) {
+        return;
+    }
+
+    object.insert("_is_merge".to_string(), Value::Bool(true));
+    object.insert(
+        "_merge_paths".to_string(),
+        Value::Array(vec![Value::Array(
+            PARAMETER_SCHEMA_MERGE_PATH
+                .iter()
+                .map(|component| Value::String((*component).to_string()))
+                .collect(),
+        )]),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_file(
     auth_ctx: &super::AuthContext,
@@ -846,6 +865,7 @@ async fn push_file(
                     Value::String(function_type.clone()),
                 );
             }
+            apply_parameter_function_merge_fields(&mut obj);
             if let Some(metadata) = &code.metadata {
                 obj.insert("metadata".to_string(), metadata.clone());
             }
@@ -923,6 +943,7 @@ async fn push_file(
                     Value::String(args.if_exists.as_str().to_string()),
                 );
             }
+            apply_parameter_function_merge_fields(object);
         }
 
         function_events.push(event);
@@ -3142,6 +3163,41 @@ mod tests {
         assert_eq!(calculate_upload_counts(3, Some(1)), (2, 1));
         assert_eq!(calculate_upload_counts(3, Some(10)), (0, 10));
         assert_eq!(calculate_upload_counts(3, None), (3, 0));
+    }
+
+    #[test]
+    fn parameter_function_merge_fields_are_applied() {
+        let mut object = serde_json::json!({
+            "function_type": "parameters",
+            "is_merge": false,
+            "_merge_paths": ["old.path"]
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+
+        apply_parameter_function_merge_fields(&mut object);
+
+        assert_eq!(object.get("_is_merge"), Some(&Value::Bool(true)));
+        assert_eq!(
+            object.get("_merge_paths"),
+            Some(&serde_json::json!([["function_data", "__schema"]]))
+        );
+    }
+
+    #[test]
+    fn merge_fields_are_not_applied_to_non_parameter_functions() {
+        let mut object = serde_json::json!({
+            "function_type": "tool"
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+
+        apply_parameter_function_merge_fields(&mut object);
+
+        assert!(object.get("_is_merge").is_none());
+        assert!(object.get("_merge_paths").is_none());
     }
 
     #[test]
