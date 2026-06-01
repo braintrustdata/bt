@@ -273,12 +273,18 @@ pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
     }
 }
 
-pub fn save_local(config: &Config, create_dir: bool) -> Result<()> {
-    let dir = std::env::current_dir()?.join(".bt");
+pub fn local_save_path() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?.join(".bt").join("config.json"))
+}
+
+pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
+    let path = local_save_path()?;
+    let dir = path.parent().expect(".bt parent directory");
     if create_dir && !dir.exists() {
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir)?;
     }
-    save_file(&dir.join("config.json"), config)
+    save_file(&path, config)?;
+    Ok(path)
 }
 
 // --- CLI commands ---

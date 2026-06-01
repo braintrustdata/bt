@@ -2352,7 +2352,7 @@ async fn select_project_for_auth_context(
 }
 
 fn maybe_init(org: &str, project: &crate::projects::api::Project) -> Result<()> {
-    let config_path = std::env::current_dir()?.join(".bt").join("config.json");
+    let config_path = config::local_save_path()?;
     let mut cfg = if config_path.exists() {
         let existing = config::load_file(&config_path);
         let matches = existing.org.as_deref() == Some(org)

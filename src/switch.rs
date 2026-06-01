@@ -141,13 +141,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     } else if args.global {
         (config::global_path()?, "global")
     } else if interactive && config::local_path().is_some() {
-        let chosen = select_scope()?;
-        let scope = if chosen == config::global_path()? {
-            "global"
-        } else {
-            "local"
-        };
-        (chosen, scope)
+        select_scope()?
     } else {
         (config::global_path()?, "global")
     };
@@ -169,7 +163,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
             "scope": scope,
             "path": path.display().to_string(),
         });
-        println!("{payload}");
+        println!("{}", serde_json::to_string(&payload)?);
         return Ok(());
     }
 
@@ -182,7 +176,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     Ok(())
 }
 
-fn select_scope() -> Result<std::path::PathBuf> {
+fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
     let global = config::global_path()?;
     let local = config::local_path().unwrap();
     let options = [
@@ -225,9 +219,9 @@ fn select_scope() -> Result<std::path::PathBuf> {
         .default(1)
         .interact()?;
     if idx == 0 {
-        Ok(global)
+        Ok((global, "global"))
     } else {
-        Ok(local)
+        Ok((local, "local"))
     }
 }
 

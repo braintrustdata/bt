@@ -247,21 +247,28 @@ fn main() {
     std::process::exit(exit_code as i32);
 }
 
-fn handle_version_json(argv: &[OsString]) -> bool {
-    let mut saw_version = false;
-    let mut saw_json = false;
-    for arg in argv.iter().skip(1).filter_map(|a| a.to_str()) {
-        if arg == "--" {
-            break;
-        }
-        saw_version |= arg == "--version" || arg == "-V";
-        saw_json |= arg == "--json";
+fn handle_version_json(argv: &[OsString]) -> Result<bool> {
+    use clap::{Arg, ArgAction, Command};
+    let preflight = Command::new("bt-version-preflight")
+        .ignore_errors(true)
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .arg(
+            Arg::new("version")
+                .long("version")
+                .short('V')
+                .action(ArgAction::Count),
+        )
+        .arg(Arg::new("json").long("json").action(ArgAction::Count));
+    let Ok(matches) = preflight.try_get_matches_from(argv) else {
+        return Ok(false);
+    };
+    if matches.get_count("version") == 0 || matches.get_count("json") == 0 {
+        return Ok(false);
     }
-    if !(saw_version && saw_json) {
-        return false;
-    }
-    println!("{}", serde_json::json!({ "version": CLI_VERSION }));
-    true
+    let payload = serde_json::json!({ "version": CLI_VERSION });
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(true)
 }
 
 fn apply_runtime_env_overrides(base: &BaseArgs) {
@@ -277,7 +284,7 @@ fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     env::bootstrap_from_args(&argv)?;
 
-    if handle_version_json(&argv) {
+    if handle_version_json(&argv)? {
         return Ok(());
     }
 
@@ -616,29 +623,25 @@ mod tests {
 
     #[test]
     fn handle_version_json_detects_long_form() {
-        assert!(handle_version_json(&argv(&["bt", "--version", "--json"])));
-        assert!(handle_version_json(&argv(&["bt", "--json", "--version"])));
+        assert!(handle_version_json(&argv(&["bt", "--version", "--json"])).unwrap());
+        assert!(handle_version_json(&argv(&["bt", "--json", "--version"])).unwrap());
     }
 
     #[test]
     fn handle_version_json_detects_short_form() {
-        assert!(handle_version_json(&argv(&["bt", "-V", "--json"])));
+        assert!(handle_version_json(&argv(&["bt", "-V", "--json"])).unwrap());
     }
 
     #[test]
     fn handle_version_json_requires_both_flags() {
-        assert!(!handle_version_json(&argv(&["bt", "--version"])));
-        assert!(!handle_version_json(&argv(&["bt", "--json", "status"])));
+        assert!(!handle_version_json(&argv(&["bt", "--version"])).unwrap());
+        assert!(!handle_version_json(&argv(&["bt", "--json", "status"])).unwrap());
     }
 
     #[test]
     fn handle_version_json_ignores_args_after_double_dash() {
-        assert!(!handle_version_json(&argv(&[
-            "bt",
-            "eval",
-            "--",
-            "--version",
-            "--json",
-        ])));
+        assert!(
+            !handle_version_json(&argv(&["bt", "eval", "--", "--version", "--json",])).unwrap()
+        );
     }
 }

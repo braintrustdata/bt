@@ -106,7 +106,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
             Ok(release) => {
                 let current = env!("CARGO_PKG_VERSION");
                 if stable_is_up_to_date(current, &release.tag_name) {
-                    print_stable_check(base, current, &release.tag_name);
+                    print_stable_check(base, current, &release.tag_name)?;
                     return Ok(());
                 }
             }
@@ -118,7 +118,14 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(channel)?;
+    run_installer(base, channel)?;
+    if base.json {
+        let payload = serde_json::json!({
+            "channel": channel.name(),
+            "status": "completed",
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+    }
     Ok(())
 }
 
@@ -142,14 +149,14 @@ async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()>
     let current = env!("CARGO_PKG_VERSION");
 
     match channel {
-        UpdateChannel::Stable => print_stable_check(base, current, &release.tag_name),
-        UpdateChannel::Canary => print_canary_check(base, &release),
+        UpdateChannel::Stable => print_stable_check(base, current, &release.tag_name)?,
+        UpdateChannel::Canary => print_canary_check(base, &release)?,
     }
 
     Ok(())
 }
 
-fn print_stable_check(base: &BaseArgs, current: &str, release_tag: &str) {
+fn print_stable_check(base: &BaseArgs, current: &str, release_tag: &str) -> Result<()> {
     if base.json {
         let payload = serde_json::json!({
             "channel": "stable",
@@ -157,13 +164,14 @@ fn print_stable_check(base: &BaseArgs, current: &str, release_tag: &str) {
             "latest": release_tag,
             "up_to_date": stable_is_up_to_date(current, release_tag),
         });
-        println!("{payload}");
+        println!("{}", serde_json::to_string(&payload)?);
     } else {
         println!("{}", stable_check_message(current, release_tag));
     }
+    Ok(())
 }
 
-fn print_canary_check(base: &BaseArgs, release: &GitHubRelease) {
+fn print_canary_check(base: &BaseArgs, release: &GitHubRelease) -> Result<()> {
     if base.json {
         let payload = serde_json::json!({
             "channel": "canary",
@@ -173,10 +181,11 @@ fn print_canary_check(base: &BaseArgs, release: &GitHubRelease) {
                 release.target_commitish.as_deref(),
             ),
         });
-        println!("{payload}");
+        println!("{}", serde_json::to_string(&payload)?);
     } else {
         println!("{}", canary_check_message(&release.tag_name));
     }
+    Ok(())
 }
 
 async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
@@ -213,12 +222,21 @@ async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHu
         .context("failed to parse GitHub release response")
 }
 
-fn run_installer(channel: UpdateChannel) -> Result<()> {
+fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+    let status_line = |msg: &str| {
+        if base.json {
+            eprintln!("{msg}");
+        } else {
+            println!("{msg}");
+        }
+    };
+    let redirect_stdout = if base.json { " 1>&2" } else { "" };
+
     #[cfg(not(windows))]
     {
         let installer_url = channel.installer_url();
-        println!("updating bt from {} channel...", channel.name());
-        let cmd = format!("curl -fsSL '{installer_url}' | sh");
+        status_line(&format!("updating bt from {} channel...", channel.name()));
+        let cmd = format!("curl -fsSL '{installer_url}' | sh{redirect_stdout}");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
         let status = command.status().context("failed to execute installer")?;
@@ -227,7 +245,7 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
             anyhow::bail!("installer exited with status {status}");
         }
 
-        println!("update completed");
+        status_line("update completed");
         Ok(())
     }
 
@@ -241,7 +259,8 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
                 "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1"
             }
         };
-        let script = format!("irm {installer_url} | iex");
+        status_line(&format!("updating bt from {} channel...", channel.name()));
+        let script = format!("irm {installer_url} | iex{redirect_stdout}");
         let status = Command::new("powershell")
             .args([
                 "-NoProfile",
@@ -256,7 +275,7 @@ fn run_installer(channel: UpdateChannel) -> Result<()> {
             anyhow::bail!("installer exited with status {status}");
         }
 
-        println!("update completed");
+        status_line("update completed");
         return Ok(());
     }
 }
