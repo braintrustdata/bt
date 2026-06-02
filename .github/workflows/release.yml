@@ -488,3 +488,71 @@ jobs:
           & $btExe --version
           $env:PATH = "$binDir;$env:PATH"
           & $btExe self update --check --channel stable
+
+  publish-npm:
+    needs:
+      - plan
+      - announce
+    if: ${{ needs.announce.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: npm-publish
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download release archives
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p archives
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'bt-*.tar.gz' \
+            --pattern 'bt-*.zip' \
+            --dir archives
+          ls -la archives
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22.15.0"
+          registry-url: "https://registry.npmjs.org"
+      - name: Use npm 11.12.1
+        run: npm install -g npm@11.12.1
+
+      - name: Build npm packages
+        run: |
+          node npm/scripts/build-platform-packages.mjs \
+            --version "${{ needs.plan.outputs.release-version }}" \
+            --archives-dir archives \
+            --out-dir npm/dist
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          package_dirs=(npm/dist/bt-*)
+          if [ "${#package_dirs[@]}" -eq 0 ]; then
+            echo "No npm platform packages found in npm/dist" >&2
+            exit 1
+          fi
+          for dir in "${package_dirs[@]}"; do
+            name="$(node -p "require('./$dir/package.json').name")"
+            version="$(node -p "require('./$dir/package.json').version")"
+            # Skip already-published versions so a partial publish can be re-run.
+            # Test output, not exit code: npm view is empty for a missing version.
+            published="$(npm view "$name@$version" version 2>/dev/null || true)"
+            if [ -n "$published" ]; then
+              echo "Skipping $name@$version (already published)"
+              continue
+            fi
+            echo "Publishing $name@$version"
+            (cd "$dir" && npm publish --access public --provenance)
+          done
