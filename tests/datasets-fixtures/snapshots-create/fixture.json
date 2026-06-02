@@ -8,11 +8,14 @@
   },
   "steps": [
     {
-      "command": ["datasets", "--json", "--no-input", "create", "snapshot-source"],
-      "stdout_contains": [
-        "\"name\":\"snapshot-source\"",
-        "\"mode\":\"create\""
-      ]
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "snapshot-source"
+      ],
+      "stdout_contains": ["\"name\":\"snapshot-source\"", "\"mode\":\"create\""]
     },
     {
       "command": [
