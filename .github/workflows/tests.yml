@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["20.17.0", "22.15.0"]
+        node-version: ["20", "22"]
     permissions:
       contents: read
     env:
