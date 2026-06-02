@@ -18,9 +18,21 @@ Examples:
 pub struct InitArgs {}
 
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
-    let bt_dir = std::env::current_dir()?.join(".bt");
-    if bt_dir.join("config.json").exists() {
-        print_command_status(CommandStatus::Warning, "Already Initialized");
+    let config_path = config::local_save_path()?;
+    if config_path.exists() {
+        if base.json {
+            let existing = config::load_file(&config_path);
+            let payload = serde_json::json!({
+                "initialized": false,
+                "status": "already-initialized",
+                "org": existing.org,
+                "project": existing.project,
+                "path": config_path.display().to_string(),
+            });
+            println!("{}", serde_json::to_string(&payload)?);
+        } else {
+            print_command_status(CommandStatus::Warning, "Already Initialized");
+        }
         return Ok(());
     }
 
@@ -59,13 +71,24 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         ..Default::default()
     };
 
-    config::save_local(&cfg, true)?;
+    let written_path = config::save_local(&cfg, true)?;
 
-    print_command_status(
-        CommandStatus::Success,
-        &format!("Project linked to {org}/{project}"),
-    );
-    print_command_status(CommandStatus::Success, "Created .bt/config.json");
+    if base.json {
+        let payload = serde_json::json!({
+            "initialized": true,
+            "status": "created",
+            "org": org,
+            "project": project,
+            "path": written_path.display().to_string(),
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        print_command_status(
+            CommandStatus::Success,
+            &format!("Project linked to {org}/{project}"),
+        );
+        print_command_status(CommandStatus::Success, "Created .bt/config.json");
+    }
 
     Ok(())
 }

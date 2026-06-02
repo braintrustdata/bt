@@ -129,18 +129,21 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    let path = if args.local {
-        config::local_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No local .bt directory found. Use bt init to initialize this directory."
-            )
-        })?
+    let (path, scope) = if args.local {
+        (
+            config::local_path().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No local .bt directory found. Use bt init to initialize this directory."
+                )
+            })?,
+            "local",
+        )
     } else if args.global {
-        config::global_path()?
+        (config::global_path()?, "global")
     } else if interactive && config::local_path().is_some() {
         select_scope()?
     } else {
-        config::global_path()?
+        (config::global_path()?, "global")
     };
 
     let mut cfg = config::load_file(&path);
@@ -151,6 +154,19 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 
+    if base.json {
+        let payload = serde_json::json!({
+            "org": org_name,
+            "project": project.name,
+            "project_id": project.id,
+            "profile": config_profile,
+            "scope": scope,
+            "path": path.display().to_string(),
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+
     let display = format!("{org_name}/{}", project.name);
     print_command_status(CommandStatus::Success, &format!("Switched to {display}"));
     if base.verbose {
@@ -160,7 +176,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     Ok(())
 }
 
-fn select_scope() -> Result<std::path::PathBuf> {
+fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
     let global = config::global_path()?;
     let local = config::local_path().unwrap();
     let options = [
@@ -203,9 +219,9 @@ fn select_scope() -> Result<std::path::PathBuf> {
         .default(1)
         .interact()?;
     if idx == 0 {
-        Ok(global)
+        Ok((global, "global"))
     } else {
-        Ok(local)
+        Ok((local, "local"))
     }
 }
 
