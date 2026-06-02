@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use reqwest::header::HeaderValue;
-use reqwest::{Client, ClientBuilder};
+use reqwest::header::{HeaderValue, CONTENT_TYPE};
+use reqwest::{Client, ClientBuilder, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -47,6 +47,101 @@ impl std::fmt::Display for HttpError {
 }
 
 impl std::error::Error for HttpError {}
+
+#[derive(Debug)]
+pub struct ResponseParseError {
+    message: String,
+}
+
+impl std::fmt::Display for ResponseParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ResponseParseError {}
+
+async fn parse_json_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    method: &str,
+    path: &str,
+) -> Result<T> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read response body")?;
+
+    parse_json_body::<T>(&body, method, path, status, content_type.as_deref())
+}
+
+fn parse_json_body<T: DeserializeOwned>(
+    body: &[u8],
+    method: &str,
+    path: &str,
+    status: StatusCode,
+    content_type: Option<&str>,
+) -> Result<T> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let parsed = match serde_path_to_error::deserialize(&mut deserializer) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let json_path = err.path().to_string();
+            let inner = err.into_inner();
+            return Err(parse_response_error::<T>(
+                method,
+                path,
+                status,
+                content_type,
+                &json_path,
+                &inner,
+                body.len(),
+            ));
+        }
+    };
+
+    if let Err(err) = deserializer.end() {
+        return Err(parse_response_error::<T>(
+            method,
+            path,
+            status,
+            content_type,
+            "<root>",
+            &err,
+            body.len(),
+        ));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_response_error<T>(
+    method: &str,
+    path: &str,
+    status: StatusCode,
+    content_type: Option<&str>,
+    json_path: &str,
+    err: &serde_json::Error,
+    body_len: usize,
+) -> anyhow::Error {
+    let json_path = if json_path.is_empty() || json_path == "." {
+        "<root>"
+    } else {
+        json_path
+    };
+    let content_type = content_type.unwrap_or("<missing>");
+    let message = format!(
+        "failed to parse response from {method} {path}\n  target: {}\n  JSON path: {json_path}\n  reason: {err}\n  status: {status}\n  content-type: {content_type}\n  body bytes: {body_len}",
+        std::any::type_name::<T>(),
+    );
+
+    ResponseParseError { message }.into()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct BtqlResponse<T> {
@@ -105,7 +200,7 @@ impl ApiClient {
             return Err(HttpError { status, body }.into());
         }
 
-        response.json().await.context("failed to parse response")
+        parse_json_response(response, "GET", path).await
     }
 
     pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
@@ -125,7 +220,7 @@ impl ApiClient {
             return Err(HttpError { status, body }.into());
         }
 
-        response.json().await.context("failed to parse response")
+        parse_json_response(response, "POST", path).await
     }
 
     pub async fn patch<T: DeserializeOwned, B: Serialize>(
@@ -149,7 +244,7 @@ impl ApiClient {
             return Err(HttpError { status, body }.into());
         }
 
-        response.json().await.context("failed to parse response")
+        parse_json_response(response, "PATCH", path).await
     }
 
     pub async fn post_with_headers<T, B>(
@@ -195,7 +290,7 @@ impl ApiClient {
             return Err(HttpError { status, body }.into());
         }
 
-        response.json().await.context("failed to parse response")
+        parse_json_response(response, "POST", path).await
     }
 
     pub async fn post_with_headers_raw<B>(
@@ -318,6 +413,20 @@ pub async fn put_signed_url_with_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    struct TestResponse {
+        data: Vec<TestRow>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    struct TestRow {
+        id: String,
+    }
 
     #[test]
     fn btql_response_deserializes_optional_cursor() {
@@ -338,5 +447,40 @@ mod tests {
         .expect("btql response");
 
         assert_eq!(response.cursor, None);
+    }
+
+    #[test]
+    fn parse_json_body_reports_path_and_reason() {
+        let err = parse_json_body::<TestResponse>(
+            br#"{"data":[{"id":1}]}"#,
+            "POST",
+            "/btql",
+            StatusCode::OK,
+            Some("application/json"),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("failed to parse response from POST /btql"));
+        assert!(message.contains("JSON path: data[0].id"));
+        assert!(message.contains("invalid type: integer `1`, expected a string"));
+        assert!(message.contains("status: 200 OK"));
+        assert!(message.contains("content-type: application/json"));
+    }
+
+    #[test]
+    fn parse_json_body_rejects_trailing_characters() {
+        let err = parse_json_body::<BtqlResponse<serde_json::Value>>(
+            br#"{"data":[]} trailing"#,
+            "GET",
+            "/btql",
+            StatusCode::OK,
+            Some("application/json"),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("JSON path: <root>"));
+        assert!(message.contains("trailing characters"));
     }
 }

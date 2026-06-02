@@ -27,6 +27,7 @@ ratatui = "0.29.0"
 reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
+serde_path_to_error = "0.1.20"
 toml = "0.8"
 sha2 = "0.10.8"
 strip-ansi-escapes = "0.2.0"

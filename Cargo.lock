@@ -529,6 +529,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json 1.0.149",
+ "serde_path_to_error",
  "sha2",
  "strip-ansi-escapes",
  "tempfile",
