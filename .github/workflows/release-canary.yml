@@ -111,9 +111,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
-    # OIDC token subject must match the AAD federated credential, which is
-    # scoped to the `release` environment — only claim it on main.
-    environment: ${{ github.ref == 'refs/heads/main' && 'release' || '' }}
+    # OIDC token subject must match the AAD federated credential scoped to the
+    # `release-canary` environment. That environment has no required reviewers,
+    # so canary signing runs without an approval gate — only claim it on main.
+    environment: ${{ github.ref == 'refs/heads/main' && 'release-canary' || '' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
