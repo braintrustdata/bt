@@ -238,7 +238,7 @@ pub async fn insert_functions(
     client: &ApiClient,
     functions: &[Value],
 ) -> Result<InsertFunctionsResult> {
-    let body = serde_json::json!({ "functions": functions });
+    let body = insert_functions_body(functions);
     let raw: Value = client
         .post("/insert-functions", &body)
         .await
@@ -247,6 +247,10 @@ pub async fn insert_functions(
     Ok(InsertFunctionsResult {
         ignored_entries: ignored_count(&raw),
     })
+}
+
+pub(crate) fn insert_functions_body(functions: &[Value]) -> Value {
+    serde_json::json!({ "functions": functions })
 }
 
 fn ignored_count(raw: &Value) -> Option<usize> {
@@ -271,6 +275,14 @@ mod tests {
         assert_eq!(ignored_count(&third), None);
 
         assert_eq!(ignored_count(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn insert_functions_body_wraps_functions_array() {
+        let functions = vec![serde_json::json!({ "slug": "demo" })];
+        let body = insert_functions_body(&functions);
+
+        assert_eq!(body, serde_json::json!({ "functions": functions }));
     }
 
     #[test]
