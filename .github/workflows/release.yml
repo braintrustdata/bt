@@ -532,8 +532,6 @@ jobs:
             --out-dir npm/dist
 
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -554,5 +552,5 @@ jobs:
               continue
             fi
             echo "Publishing $name@$version"
-            (cd "$dir" && npm publish --access public --provenance)
+            (cd "$dir" && npm publish --access public)
           done

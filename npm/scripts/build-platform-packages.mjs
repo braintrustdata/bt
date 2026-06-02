@@ -101,10 +101,6 @@ for (const [target, spec] of Object.entries(targets)) {
     files: ["bin/"],
     os: [spec.os],
     cpu: [spec.cpu],
-    publishConfig: {
-      access: "public",
-      provenance: true,
-    },
     preferUnplugged: true,
   };
   if (spec.libc) platformPkg.libc = [spec.libc];
