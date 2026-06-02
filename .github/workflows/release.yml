@@ -488,3 +488,29 @@ jobs:
           & $btExe --version
           $env:PATH = "$binDir;$env:PATH"
           & $btExe self update --check --channel stable
+
+  publish-crate:
+    needs:
+      - plan
+      - host
+      - announce
+    if: ${{ needs.announce.result == 'success' && !fromJson(needs.host.outputs.val).announcement_is_prerelease }}
+    runs-on: ubuntu-22.04
+    environment: release
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      BT_VERSION_STRING: ${{ needs.plan.outputs.release-version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable
+
+      - name: Verify package
+        run: cargo publish --dry-run --locked
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
