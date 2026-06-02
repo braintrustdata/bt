@@ -90,14 +90,22 @@ impl ApiClient {
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get_with_headers(path, &[]).await
+    }
+
+    pub async fn get_with_headers<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<T> {
         let url = self.url(path);
-        let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request failed")?;
+        let mut request = self.http.get(&url).bearer_auth(&self.api_key);
+
+        for (key, value) in headers {
+            request = request.header(*key, *value);
+        }
+
+        let response = request.send().await.context("request failed")?;
 
         if !response.status().is_success() {
             let status = response.status();
