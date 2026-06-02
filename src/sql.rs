@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{builder::BoolishValueParser, Args};
@@ -20,11 +20,13 @@ use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
+use urlencoding::encode;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::http::{ApiClient, HttpError};
 use crate::ui::with_spinner;
+use crate::utils::parse_duration_to_seconds;
 
 const QUERY_SOURCE: &str = "bt_sql_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d";
 
@@ -51,6 +53,54 @@ pub struct SqlArgs {
         default_value_t = false
     )]
     pub force_ignore_linter: bool,
+
+    /// Run through the async SQL API
+    #[arg(
+        long = "async",
+        env = "BRAINTRUST_SQL_ASYNC",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    pub async_query: bool,
+
+    /// Rows to write per async query execution batch
+    #[arg(long, env = "BRAINTRUST_SQL_ASYNC_BATCH_SIZE", value_parser = parse_positive_u64_arg)]
+    pub async_batch_size: Option<u64>,
+
+    /// Submit an async query and print the automation id without waiting for results
+    #[arg(
+        long,
+        env = "BRAINTRUST_SQL_ASYNC_NO_WAIT",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    pub no_wait: bool,
+
+    /// Seconds between async status polls
+    #[arg(
+        long,
+        env = "BRAINTRUST_SQL_ASYNC_POLL_INTERVAL",
+        value_parser = parse_positive_duration_arg,
+        default_value = "2"
+    )]
+    pub poll_interval: Duration,
+
+    /// Maximum time to wait for async query completion, for example 10m, 1h, or 7d
+    #[arg(
+        long,
+        env = "BRAINTRUST_SQL_ASYNC_WAIT_TIMEOUT",
+        value_parser = parse_positive_duration_arg
+    )]
+    pub wait_timeout: Option<Duration>,
+
+    /// Rows to fetch per async result page
+    #[arg(
+        long,
+        env = "BRAINTRUST_SQL_ASYNC_RESULT_LIMIT",
+        value_parser = parse_positive_u64_arg,
+        default_value_t = 1000
+    )]
+    pub async_result_limit: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +148,74 @@ struct RealtimeState {
     pub state_type: String,
 }
 
+#[derive(Debug, Serialize)]
+struct SubmitAsyncQueryRequest<'a> {
+    query: &'a str,
+    format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SubmitAsyncQueryResponse {
+    id: String,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
+    status: AsyncQueryStatus,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AsyncQueryStatus {
+    Queued,
+    Running,
+    Canceled,
+    Succeeded,
+    Failed,
+}
+
+impl AsyncQueryStatus {
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            AsyncQueryStatus::Canceled | AsyncQueryStatus::Succeeded | AsyncQueryStatus::Failed
+        )
+    }
+}
+
+impl std::fmt::Display for AsyncQueryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let status = match self {
+            AsyncQueryStatus::Queued => "queued",
+            AsyncQueryStatus::Running => "running",
+            AsyncQueryStatus::Canceled => "canceled",
+            AsyncQueryStatus::Succeeded => "succeeded",
+            AsyncQueryStatus::Failed => "failed",
+        };
+        write!(f, "{status}")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AsyncQueryStatusResponse {
+    status: AsyncQueryStatus,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AsyncQueryResultPage {
+    status: AsyncQueryStatus,
+    #[serde(default)]
+    rows: Vec<Map<String, Value>>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
@@ -110,6 +228,11 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     };
 
     if let Some(query) = query {
+        if args.async_query {
+            run_async_query(&client, &query, &args, base.json).await?;
+            return Ok(());
+        }
+
         let response = with_spinner(
             "Running query...",
             execute_query(&client, &query, lint_mode),
@@ -117,6 +240,12 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
         .await?;
         print_response(&response, base.json)?;
         return Ok(());
+    }
+
+    if args.async_query {
+        bail!(
+            "query is required with --async. Pass `bt sql --async \"SELECT * FROM project_logs('<PROJECT_ID>') LIMIT 1\"` or pipe SQL via stdin."
+        );
     }
 
     if !interactive {
@@ -309,13 +438,7 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
 
 async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
     let body = query_body(query, lint_mode);
-
-    let org_name = client.org_name();
-    let headers = if !org_name.is_empty() {
-        vec![("x-bt-org-name", org_name)]
-    } else {
-        vec![]
-    };
+    let headers = org_headers(client);
 
     match client.post_with_headers("/btql", &body, &headers).await {
         Ok(response) => Ok(response),
@@ -329,6 +452,153 @@ async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Resu
     }
 }
 
+async fn run_async_query(
+    client: &ApiClient,
+    query: &str,
+    args: &SqlArgs,
+    json_output: bool,
+) -> Result<()> {
+    let submitted = with_spinner(
+        "Submitting async query...",
+        submit_async_query(client, query, args.async_batch_size),
+    )
+    .await?;
+
+    if args.no_wait {
+        println!("{}", serde_json::to_string(&submitted)?);
+        return Ok(());
+    }
+
+    eprintln!("Submitted async query {}", submitted.id);
+    let status = wait_for_async_query(client, &submitted.id, args).await?;
+    if matches!(
+        status.status,
+        AsyncQueryStatus::Failed | AsyncQueryStatus::Canceled
+    ) {
+        bail!(
+            "{}",
+            status
+                .error
+                .unwrap_or_else(|| format!("Async query {} {}", submitted.id, status.status))
+        );
+    }
+
+    let response = collect_async_query_result(client, &submitted.id, args).await?;
+    print_response(&response, json_output)
+}
+
+async fn submit_async_query(
+    client: &ApiClient,
+    query: &str,
+    batch_size: Option<u64>,
+) -> Result<SubmitAsyncQueryResponse> {
+    let body = async_query_submit_body(query, batch_size);
+    let headers = org_headers(client);
+    client
+        .post_with_headers("/btql/async", &body, &headers)
+        .await
+}
+
+async fn wait_for_async_query(
+    client: &ApiClient,
+    automation_id: &str,
+    args: &SqlArgs,
+) -> Result<AsyncQueryStatusResponse> {
+    let started = Instant::now();
+    let headers = org_headers(client);
+    loop {
+        let status: AsyncQueryStatusResponse = client
+            .get_with_headers(&format!("/btql/async/{}", encode(automation_id)), &headers)
+            .await?;
+        if status.status.is_terminal() {
+            return Ok(status);
+        }
+
+        if let Some(timeout) = args.wait_timeout {
+            if started.elapsed() > timeout {
+                bail!("Timed out waiting for async query {automation_id}");
+            }
+        }
+
+        eprintln!("Async query {automation_id} status: {}", status.status);
+        tokio::time::sleep(args.poll_interval).await;
+    }
+}
+
+async fn collect_async_query_result(
+    client: &ApiClient,
+    automation_id: &str,
+    args: &SqlArgs,
+) -> Result<SqlResponse> {
+    let mut cursor = None;
+    let mut rows = Vec::new();
+
+    loop {
+        let page = get_async_query_result_page(
+            client,
+            automation_id,
+            args.async_result_limit,
+            cursor.as_deref(),
+        )
+        .await?;
+
+        if page.status == AsyncQueryStatus::Queued {
+            tokio::time::sleep(args.poll_interval).await;
+            continue;
+        }
+
+        if matches!(
+            page.status,
+            AsyncQueryStatus::Failed | AsyncQueryStatus::Canceled
+        ) {
+            bail!(
+                "{}",
+                page.error
+                    .unwrap_or_else(|| format!("Async query {automation_id} {}", page.status))
+            );
+        }
+
+        rows.extend(page.rows);
+        cursor = page.cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Ok(SqlResponse {
+        data: rows,
+        schema: Value::Null,
+        cursor: None,
+        freshness_state: None,
+        realtime_state: None,
+        warnings: Vec::new(),
+        extra: HashMap::new(),
+    })
+}
+
+async fn get_async_query_result_page(
+    client: &ApiClient,
+    automation_id: &str,
+    limit: u64,
+    cursor: Option<&str>,
+) -> Result<AsyncQueryResultPage> {
+    let headers = org_headers(client);
+    client
+        .get_with_headers(
+            &async_query_result_path(automation_id, limit, cursor),
+            &headers,
+        )
+        .await
+}
+
+fn org_headers(client: &ApiClient) -> Vec<(&'static str, &str)> {
+    let org_name = client.org_name();
+    if org_name.is_empty() {
+        return Vec::new();
+    }
+    vec![("x-bt-org-name", org_name)]
+}
+
 fn query_body(query: &str, lint_mode: &str) -> Value {
     json!({
         "query": query,
@@ -337,6 +607,45 @@ fn query_body(query: &str, lint_mode: &str) -> Value {
         "strict_lint_mode": lint_mode == "strict",
         "query_source": QUERY_SOURCE,
     })
+}
+
+fn async_query_submit_body(query: &str, batch_size: Option<u64>) -> SubmitAsyncQueryRequest<'_> {
+    SubmitAsyncQueryRequest {
+        query,
+        format: "jsonl",
+        batch_size,
+    }
+}
+
+fn async_query_result_path(automation_id: &str, limit: u64, cursor: Option<&str>) -> String {
+    let mut path = format!(
+        "/btql/async/{}/result?limit={}",
+        encode(automation_id),
+        limit
+    );
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=");
+        path.push_str(encode(cursor).as_ref());
+    }
+    path
+}
+
+fn parse_positive_u64_arg(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("expected a positive integer, got '{value}'"))?;
+    if parsed == 0 {
+        return Err(format!("expected a positive integer, got '{value}'"));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_duration_arg(value: &str) -> Result<Duration, String> {
+    let seconds = parse_duration_to_seconds(value).map_err(|err| err.to_string())?;
+    if seconds == 0 {
+        return Err(format!("expected a positive duration, got '{value}'"));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn print_response(response: &SqlResponse, json_output: bool) -> Result<()> {
@@ -669,6 +978,13 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct SqlArgsHarness {
+        #[command(flatten)]
+        args: SqlArgs,
+    }
 
     #[test]
     fn query_body_sets_lint_mode() {
@@ -679,6 +995,58 @@ mod tests {
         assert_eq!(body["lint_mode"], "strict");
         assert_eq!(body["strict_lint_mode"], true);
         assert_eq!(body["query_source"], QUERY_SOURCE);
+    }
+
+    #[test]
+    fn parses_async_query_args() {
+        let parsed = SqlArgsHarness::try_parse_from([
+            "bt-sql",
+            "--async",
+            "--async-batch-size",
+            "250",
+            "--poll-interval",
+            "5s",
+            "--wait-timeout",
+            "1h",
+            "--async-result-limit",
+            "500",
+            "select 1",
+        ])
+        .expect("parse")
+        .args;
+
+        assert!(parsed.async_query);
+        assert_eq!(parsed.async_batch_size, Some(250));
+        assert_eq!(parsed.poll_interval, Duration::from_secs(5));
+        assert_eq!(parsed.wait_timeout, Some(Duration::from_secs(3600)));
+        assert_eq!(parsed.async_result_limit, 500);
+        assert_eq!(parsed.query.as_deref(), Some("select 1"));
+    }
+
+    #[test]
+    fn async_query_submit_body_sets_jsonl_format() {
+        let body = serde_json::to_value(async_query_submit_body("select 1", Some(250))).unwrap();
+
+        assert_eq!(body["query"], "select 1");
+        assert_eq!(body["format"], "jsonl");
+        assert_eq!(body["batch_size"], 250);
+    }
+
+    #[test]
+    fn async_query_submit_body_omits_batch_size_when_unset() {
+        let body = serde_json::to_value(async_query_submit_body("select 1", None)).unwrap();
+
+        assert!(body.get("batch_size").is_none());
+    }
+
+    #[test]
+    fn async_result_path_encodes_cursor() {
+        let path = async_query_result_path("automation/id", 100, Some("cursor/with space"));
+
+        assert_eq!(
+            path,
+            "/btql/async/automation%2Fid/result?limit=100&cursor=cursor%2Fwith%20space"
+        );
     }
 
     #[test]
