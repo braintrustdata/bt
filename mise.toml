@@ -3,6 +3,7 @@
 [tools]
 pre-commit = "latest"
 node = "22.15.0"
+npm = "11.12.1"
 pnpm = "10.28.2"
 
 [env]
