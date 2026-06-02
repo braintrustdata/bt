@@ -23,7 +23,8 @@ use crate::python_runner;
 use crate::runner_sse;
 use crate::source_language::{classify_runtime_extension, SourceLanguage};
 use crate::sync::discovery::{
-    discover_project_log_refs, ProjectLogRefDiscoveryResult, ProjectLogRefScope,
+    discover_project_log_refs, ProjectLogRefDiscoveryOptions, ProjectLogRefDiscoveryResult,
+    ProjectLogRefScope,
 };
 use crate::sync::{
     artifact_base_dir, artifact_spec_dir, create_jsonl_file_writer, epoch_seconds, read_json_file,
@@ -280,10 +281,12 @@ pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
                 &args.runner,
                 &source_project.id,
                 &source,
-                refs,
-                args.transform.max_concurrency(),
-                Some(&attachment_dir),
-                None,
+                TransformInput {
+                    refs,
+                    max_concurrency: args.transform.max_concurrency(),
+                    attachment_dir: Some(&attachment_dir),
+                    row_writer: None,
+                },
             )
             .await?;
             let row_count = transform_response.rows.len();
@@ -1216,10 +1219,12 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
         &args.runner,
         &source_project.id,
         &source,
-        refs,
-        args.transform.max_concurrency(),
-        Some(&attachment_dir),
-        Some(&mut writer as &mut dyn Write),
+        TransformInput {
+            refs,
+            max_concurrency: args.transform.max_concurrency(),
+            attachment_dir: Some(&attachment_dir),
+            row_writer: Some(&mut writer as &mut dyn Write),
+        },
     )
     .await?;
     writer.flush().context("failed to flush transform output")?;
@@ -1256,16 +1261,26 @@ async fn transform_refs(base: &BaseArgs, args: PipelineTransformArgs) -> Result<
     )
 }
 
+struct TransformInput<'a> {
+    refs: Vec<Value>,
+    max_concurrency: usize,
+    attachment_dir: Option<&'a Path>,
+    row_writer: Option<&'a mut dyn Write>,
+}
+
 async fn transform_source_refs(
     base: &BaseArgs,
     runner: &PipelineRunnerArgs,
     source_project_id: &str,
     source: &PipelineSourceInspect,
-    refs: Vec<Value>,
-    max_concurrency: usize,
-    attachment_dir: Option<&Path>,
-    mut row_writer: Option<&mut dyn Write>,
+    input: TransformInput<'_>,
 ) -> Result<PipelineTransformResponse> {
+    let TransformInput {
+        refs,
+        max_concurrency,
+        attachment_dir,
+        mut row_writer,
+    } = input;
     if let Some(attachment_dir) = attachment_dir {
         fs::create_dir_all(attachment_dir)
             .with_context(|| format!("failed to create {}", attachment_dir.display()))?;
@@ -1849,11 +1864,13 @@ async fn discover_refs(
     let result = discover_project_log_refs(
         &client,
         &ctx,
-        &project.id,
-        filter.as_ref(),
-        project_log_ref_scope(scope),
-        limit,
-        options.page_size,
+        ProjectLogRefDiscoveryOptions {
+            project_id: &project.id,
+            filter: filter.as_ref(),
+            scope: project_log_ref_scope(scope),
+            target: limit,
+            page_size: options.page_size,
+        },
         |reference| {
             write_jsonl_value(&mut writer, &reference.to_value())?;
             writer.flush().context("failed to flush discovery output")?;
