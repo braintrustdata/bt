@@ -18,9 +18,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -53,35 +51,7 @@ const targets = JSON.parse(readFileSync(join(NPM_DIR, "targets.json"), "utf8"));
 if (existsSync(outDir)) rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
-function extract(archive, dest) {
-  mkdirSync(dest, { recursive: true });
-  if (archive.endsWith(".tar.gz")) {
-    execFileSync("tar", ["-xzf", archive, "-C", dest], { stdio: "inherit" });
-  } else if (archive.endsWith(".zip")) {
-    execFileSync("unzip", ["-o", "-q", archive, "-d", dest], {
-      stdio: "inherit",
-    });
-  } else {
-    throw new Error(`Unsupported archive: ${archive}`);
-  }
-}
-
-function findBinary(rootDir, binName) {
-  const stack = [rootDir];
-  while (stack.length) {
-    const cur = stack.pop();
-    for (const entry of readdirSync(cur)) {
-      const full = join(cur, entry);
-      const s = statSync(full);
-      if (s.isDirectory()) stack.push(full);
-      else if (entry === binName) return full;
-    }
-  }
-  throw new Error(`Binary ${binName} not found under ${rootDir}`);
-}
-
 // --- Per-platform packages ---
-let built = 0;
 for (const [target, spec] of Object.entries(targets)) {
   const archiveName = `bt-${target}.${spec.archiveExt}`;
   const archive = join(archivesDir, archiveName);
@@ -92,8 +62,23 @@ for (const [target, spec] of Object.entries(targets)) {
   }
 
   const stagingDir = join(outDir, ".staging", target);
-  extract(archive, stagingDir);
-  const binPath = findBinary(stagingDir, spec.bin);
+  mkdirSync(stagingDir, { recursive: true });
+  if (archive.endsWith(".tar.gz")) {
+    execFileSync("tar", ["-xzf", archive, "-C", stagingDir], {
+      stdio: "inherit",
+    });
+  } else if (archive.endsWith(".zip")) {
+    execFileSync("unzip", ["-o", "-q", archive, "-d", stagingDir], {
+      stdio: "inherit",
+    });
+  } else {
+    throw new Error(`Unsupported archive: ${archive}`);
+  }
+
+  const binPath = join(stagingDir, `bt-${target}`, spec.bin);
+  if (!existsSync(binPath)) {
+    throw new Error(`Binary ${spec.bin} not found at ${binPath}`);
+  }
 
   const pkgName = `@braintrust/bt-${spec.pkg}`;
   const pkgOut = join(outDir, `bt-${spec.pkg}`);
@@ -134,13 +119,9 @@ for (const [target, spec] of Object.entries(targets)) {
   );
 
   console.log(`Built ${pkgName} -> ${pkgOut}`);
-  built++;
 }
 
 rmSync(join(outDir, ".staging"), { recursive: true, force: true });
 
 const expected = Object.keys(targets).length;
-if (built !== expected) {
-  throw new Error(`Built ${built} packages but expected ${expected}`);
-}
-console.log(`\nAll ${built} packages written to ${outDir}`);
+console.log(`\nAll ${expected} packages written to ${outDir}`);

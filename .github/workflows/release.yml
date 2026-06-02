@@ -495,7 +495,7 @@ jobs:
       - announce
     if: ${{ needs.announce.result == 'success' }}
     runs-on: ubuntu-22.04
-    environment: release
+    environment: npm-publish
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -538,7 +538,12 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          for dir in npm/dist/bt-*; do
+          package_dirs=(npm/dist/bt-*)
+          if [ "${#package_dirs[@]}" -eq 0 ]; then
+            echo "No npm platform packages found in npm/dist" >&2
+            exit 1
+          fi
+          for dir in "${package_dirs[@]}"; do
             name="$(node -p "require('./$dir/package.json').name")"
             version="$(node -p "require('./$dir/package.json').version")"
             # Skip already-published versions so a partial publish can be re-run.
