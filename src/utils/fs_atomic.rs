@@ -3,6 +3,14 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_inner(path, contents.as_bytes())
+}
+
+pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomic_inner(path, contents)
+}
+
+fn write_atomic_inner(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "cannot atomically write {} because it has no parent directory",
