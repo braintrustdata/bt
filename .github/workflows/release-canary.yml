@@ -429,7 +429,7 @@ jobs:
 
           marker="<!-- bt-pr-canary-install-comment -->"
           run_url="https://github.com/${REPO}/actions/runs/${RUN_ID}"
-          artifacts="$(gh api --method GET "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" | jq -r '.artifacts[] | select(.expired == false) | .name' | sed 's/^/- `&`/' || true)"
+          artifacts="$(gh api --method GET "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" | jq -r '.artifacts[] | select(.expired == false) | .name' | sed 's/.*/- `&`/' || true)"
           if [ -z "$artifacts" ]; then
             artifacts="- (no artifacts found)"
           fi
