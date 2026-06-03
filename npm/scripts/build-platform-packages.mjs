@@ -64,10 +64,17 @@ for (const [target, spec] of Object.entries(targets)) {
   const stagingDir = join(outDir, ".staging", target);
   mkdirSync(stagingDir, { recursive: true });
   if (archive.endsWith(".tar.gz")) {
-    execFileSync("tar", ["-xzf", archive, "-C", stagingDir], {
-      stdio: "inherit",
-    });
+    // cargo-dist tarballs nest contents under a `bt-<target>/` directory; strip
+    // it so the binary lands at the staging root, matching the flat zips.
+    execFileSync(
+      "tar",
+      ["-xzf", archive, "-C", stagingDir, "--strip-components=1"],
+      {
+        stdio: "inherit",
+      },
+    );
   } else if (archive.endsWith(".zip")) {
+    // cargo-dist zips are already flat (binary at the archive root).
     execFileSync("unzip", ["-o", "-q", archive, "-d", stagingDir], {
       stdio: "inherit",
     });
@@ -75,7 +82,7 @@ for (const [target, spec] of Object.entries(targets)) {
     throw new Error(`Unsupported archive: ${archive}`);
   }
 
-  const binPath = join(stagingDir, `bt-${target}`, spec.bin);
+  const binPath = join(stagingDir, spec.bin);
   if (!existsSync(binPath)) {
     throw new Error(`Binary ${spec.bin} not found at ${binPath}`);
   }
