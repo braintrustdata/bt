@@ -736,21 +736,7 @@ fn apply_parameter_function_merge_fields(object: &mut Map<String, Value>) {
     object.insert("_is_merge".to_string(), Value::Bool(true));
     object.insert(
         "_merge_paths".to_string(),
-        Value::Array(
-            [
-                PARAMETER_SCHEMA_MERGE_PATH.as_slice(),
-                PARAMETER_METADATA_MERGE_PATH.as_slice(),
-            ]
-            .into_iter()
-            .map(|path| {
-                Value::Array(
-                    path.iter()
-                        .map(|component| Value::String((*component).to_string()))
-                        .collect(),
-                )
-            })
-            .collect(),
-        ),
+        json!([PARAMETER_SCHEMA_MERGE_PATH, PARAMETER_METADATA_MERGE_PATH]),
     );
 }
 
