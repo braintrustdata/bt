@@ -3179,7 +3179,7 @@ mod tests {
     fn parameter_function_merge_fields_are_applied() {
         let mut object = serde_json::json!({
             "function_type": "parameters",
-            "is_merge": false,
+            "_is_merge": false,
             "_merge_paths": ["old.path"]
         })
         .as_object()
