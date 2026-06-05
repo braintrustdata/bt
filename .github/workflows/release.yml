@@ -13,6 +13,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   id-token: write
@@ -73,11 +77,6 @@ jobs:
             elif git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
               echo "Tag ${tag} already exists; nothing to release."
               should_release=false
-            else
-              git config user.name "github-actions[bot]"
-              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git tag -a "$tag" -m "Release $tag" "$GITHUB_SHA"
-              git push origin "refs/tags/$tag"
             fi
           fi
 

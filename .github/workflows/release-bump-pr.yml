@@ -67,8 +67,24 @@ jobs:
               raise SystemExit("failed to find version in Cargo.toml")
           cargo_toml.write_text("".join(lines))
 
+          cargo_lock = Path("Cargo.lock")
+          lock_lines = cargo_lock.read_text().splitlines(keepends=True)
+          in_bt = False
+          updated = False
+          for i, line in enumerate(lock_lines):
+              stripped = line.strip()
+              if stripped == "[[package]]":
+                  in_bt = False
+              elif stripped == 'name = "bt"':
+                  in_bt = True
+              elif in_bt and line.startswith("version = "):
+                  lock_lines[i] = f'version = "{version}"\n'
+                  updated = True
+                  break
+          if not updated:
+              raise SystemExit("failed to find bt package version in Cargo.lock")
+          cargo_lock.write_text("".join(lock_lines))
           PY
-          cargo update --workspace --offline
 
       - name: Commit and push
         shell: bash
