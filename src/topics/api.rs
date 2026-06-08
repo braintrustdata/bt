@@ -863,6 +863,18 @@ pub async fn fetch_topic_map_report_url(
     client.post("/topic-map-report-url", &request).await
 }
 
+pub async fn fetch_topic_map_btmap_url(
+    client: &ApiClient,
+    function_id: &str,
+    version: Option<&str>,
+) -> Result<TopicMapReportUrl> {
+    let request = TopicMapReportUrlRequest {
+        function_id,
+        version,
+    };
+    client.post("/topic-map-btmap-url", &request).await
+}
+
 fn topic_automation_object_id(project_id: &str, data_scope: Option<&Value>) -> Result<String> {
     let data_scope_mapping = data_scope.and_then(Value::as_object);
     let scope_type = string_value(data_scope_mapping.and_then(|scope| scope.get("type")));

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::{args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode};
 
 pub(crate) mod api;
+mod btmap;
 mod config;
 mod formatting;
 mod open;
@@ -31,6 +32,8 @@ Examples:
   bt topics config topic-map set Task --embedding-model brain-embedding-1
   bt topics report fn_123
   bt topics report fn_123 --version 0000000000000001
+  bt topics btmap fn_123
+  bt topics btmap fn_123 --output topic-map.btmap
   bt topics poke
   bt topics rewind 7d
   bt topics open
@@ -52,6 +55,8 @@ enum TopicsCommands {
     Rewind(RewindArgs),
     /// Download a saved topic map report JSON file
     Report(ReportArgs),
+    /// Download the raw topic map (.btmap) artifact
+    Btmap(BtmapArgs),
     /// Open the Topics page in the browser
     Open,
 }
@@ -318,9 +323,46 @@ impl ReportArgs {
     }
 }
 
+#[derive(Debug, Clone, Args)]
+struct BtmapArgs {
+    /// Topic map function ID
+    #[arg(value_name = "FUNCTION_ID")]
+    function_id_positional: Option<String>,
+
+    /// Topic map function ID
+    #[arg(long = "id", env = "BT_TOPICS_BTMAP_FUNCTION_ID")]
+    id: Option<String>,
+
+    /// Specific topic map version/xact ID
+    #[arg(long, env = "BT_TOPICS_BTMAP_VERSION")]
+    version: Option<String>,
+
+    /// Output file path. Omit to write the .btmap bytes to stdout.
+    #[arg(long, env = "BT_TOPICS_BTMAP_OUTPUT")]
+    output: Option<PathBuf>,
+}
+
+impl BtmapArgs {
+    fn function_id(&self) -> Result<&str> {
+        match (self.function_id_positional.as_deref(), self.id.as_deref()) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("use either --id or a positional function id, not both")
+            }
+            (Some(id), None) | (None, Some(id)) => Ok(id),
+            (None, None) => {
+                anyhow::bail!("topic map function id required. Use: bt topics btmap <function-id>")
+            }
+        }
+    }
+}
+
 pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
     if let Some(TopicsCommands::Report(report_args)) = args.command.as_ref() {
         return report::run(&base, report_args, base.json).await;
+    }
+
+    if let Some(TopicsCommands::Btmap(btmap_args)) = args.command.as_ref() {
+        return btmap::run(&base, btmap_args, base.json).await;
     }
 
     let read_only = match args.command.as_ref() {
@@ -338,7 +380,9 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
             | Some(ConfigCommands::Set(_)) => false,
         },
         Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
-        Some(TopicsCommands::Report(_)) => unreachable!("handled before project resolution"),
+        Some(TopicsCommands::Report(_)) | Some(TopicsCommands::Btmap(_)) => {
+            unreachable!("handled before project resolution")
+        }
     };
     let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
 
@@ -438,7 +482,9 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         Some(TopicsCommands::Rewind(rewind_args)) => {
             rewind::run(&ctx, &rewind_args, base.json).await
         }
-        Some(TopicsCommands::Report(_)) => unreachable!("handled before project resolution"),
+        Some(TopicsCommands::Report(_)) | Some(TopicsCommands::Btmap(_)) => {
+            unreachable!("handled before project resolution")
+        }
         Some(TopicsCommands::Open) => open::run(&ctx).await,
     }
 }
@@ -485,7 +531,7 @@ mod tests {
                 | Some(ConfigCommands::Set(_)) => false,
             },
             Some(TopicsCommands::Poke) | Some(TopicsCommands::Rewind(_)) => false,
-            Some(TopicsCommands::Report(_)) => true,
+            Some(TopicsCommands::Report(_)) | Some(TopicsCommands::Btmap(_)) => true,
         }
     }
 
