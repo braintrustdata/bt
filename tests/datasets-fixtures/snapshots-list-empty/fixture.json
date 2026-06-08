@@ -1,0 +1,25 @@
+{
+  "env": {
+    "BRAINTRUST_API_KEY": "fixture-api-key",
+    "BRAINTRUST_API_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_APP_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_ORG_NAME": "test-org",
+    "BRAINTRUST_DEFAULT_PROJECT": "fixtures-project"
+  },
+  "steps": [
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "list"
+      ],
+      "stdout_contains": [
+        "\"dataset\":null",
+        "\"snapshots\":[]"
+      ]
+    }
+  ],
+  "expected_logs3_requests": 0
+}

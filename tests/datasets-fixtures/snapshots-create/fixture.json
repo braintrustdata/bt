@@ -75,6 +75,36 @@
         "\"xact_id\":\"1000192656880881099\""
       ],
       "stdout_not_contains": ["baseline-again"]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "delete",
+        "snapshot-source",
+        "baseline",
+        "--force"
+      ],
+      "stdout_contains": [
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\"",
+        "\"deleted\":true",
+        "\"mode\":\"snapshot_delete\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "list",
+        "snapshot-source"
+      ],
+      "stdout_contains": ["\"snapshots\":[]"],
+      "stdout_not_contains": ["\"name\":\"baseline\""]
     }
   ],
   "expected_logs3_requests": 0
