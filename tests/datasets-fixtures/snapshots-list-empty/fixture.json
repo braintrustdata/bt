@@ -8,17 +8,8 @@
   },
   "steps": [
     {
-      "command": [
-        "datasets",
-        "--json",
-        "--no-input",
-        "snapshots",
-        "list"
-      ],
-      "stdout_contains": [
-        "\"dataset\":null",
-        "\"snapshots\":[]"
-      ]
+      "command": ["datasets", "--json", "--no-input", "snapshots", "list"],
+      "stdout_contains": ["\"dataset\":null", "\"snapshots\":[]"]
     }
   ],
   "expected_logs3_requests": 0
