@@ -298,6 +298,11 @@ pub async fn create_dataset_snapshot(
     })
 }
 
+pub async fn delete_dataset_snapshot(client: &ApiClient, snapshot_id: &str) -> Result<()> {
+    let path = format!("/v1/dataset_snapshot/{}", encode(snapshot_id));
+    client.delete(&path).await
+}
+
 pub async fn preview_dataset_restore(
     client: &ApiClient,
     dataset_id: &str,
@@ -328,13 +333,11 @@ pub async fn get_dataset_head_xact_id(
     let response = client
         .btql_structured::<DatasetHeadXactRow, _>(&query)
         .await?;
-    let head = response
-        .data
-        .into_iter()
-        .filter_map(|row| row.xact_id)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .max_by(compare_xact_ids);
+    let head = response.data.into_iter().find_map(|row| {
+        row.xact_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
     Ok(head)
 }
 
@@ -413,13 +416,6 @@ fn build_dataset_head_xact_query(dataset_id: &str) -> Value {
         }],
         "limit": 1
     })
-}
-
-fn compare_xact_ids(left: &String, right: &String) -> std::cmp::Ordering {
-    match (left.parse::<u64>(), right.parse::<u64>()) {
-        (Ok(left), Ok(right)) => left.cmp(&right),
-        _ => left.cmp(right),
-    }
 }
 
 fn found_existing_snapshot_header(headers: &HeaderMap) -> bool {
@@ -512,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn dataset_head_query_includes_required_filter_and_limit() {
+    fn dataset_head_query_includes_required_filter_sort_and_limit() {
         let query = build_dataset_head_xact_query("dataset-id");
         assert_eq!(
             query,
@@ -546,18 +542,6 @@ mod tests {
         assert_eq!(
             query.pointer("/from/args/0/value").and_then(Value::as_str),
             Some("dataset'with-quote")
-        );
-    }
-
-    #[test]
-    fn compare_xact_ids_prefers_numeric_order_when_possible() {
-        assert_eq!(
-            compare_xact_ids(&"10".to_string(), &"2".to_string()),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            compare_xact_ids(&"b".to_string(), &"a".to_string()),
-            std::cmp::Ordering::Greater
         );
     }
 

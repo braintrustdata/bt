@@ -172,6 +172,10 @@ impl MockServer {
                     "/v1/dataset_snapshot",
                     web::post().to(mock_create_dataset_snapshot),
                 )
+                .route(
+                    "/v1/dataset_snapshot/{snapshot_id}",
+                    web::delete().to(mock_delete_dataset_snapshot),
+                )
                 .route("/btql", web::post().to(mock_btql))
                 .route("/version", web::get().to(mock_version))
                 .route("/logs3", web::post().to(mock_logs3))
@@ -413,6 +417,28 @@ async fn mock_list_dataset_snapshots(
         .collect::<Vec<_>>();
 
     HttpResponse::Ok().json(serde_json::json!({ "objects": objects }))
+}
+
+async fn mock_delete_dataset_snapshot(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let snapshot_id = path.into_inner();
+    let mut snapshots = state
+        .dataset_snapshots
+        .lock()
+        .expect("dataset snapshots lock");
+    let Some(index) = snapshots
+        .iter()
+        .position(|snapshot| snapshot.id == snapshot_id)
+    else {
+        return HttpResponse::NotFound().body(format!("unknown snapshot id '{snapshot_id}'"));
+    };
+
+    snapshots.remove(index);
+    HttpResponse::Ok().finish()
 }
 
 async fn mock_btql(

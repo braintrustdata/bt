@@ -92,6 +92,8 @@ struct DatasetInputArgs {
   bt datasets snapshots create my-dataset
   bt datasets snapshots create my-dataset baseline
   bt datasets snapshots create my-dataset baseline --xact-id 1000192656880881099
+  bt datasets snapshots delete my-dataset baseline
+  bt datasets snapshots delete my-dataset --snapshot 1000192656880881099 --force
   bt datasets snapshots restore my-dataset
   bt datasets snapshots restore my-dataset --name baseline
   bt datasets snapshots restore my-dataset --snapshot 1000192656880881099 --force
@@ -246,7 +248,7 @@ pub(crate) fn resolve_dataset_name(name: Option<&str>, command: &str) -> Result<
 pub(crate) async fn select_dataset_interactive(
     client: &ApiClient,
     project_id: &str,
-) -> Result<Dataset> {
+) -> Result<Option<Dataset>> {
     let mut datasets = with_spinner(
         "Loading datasets...",
         datasets_api::list_datasets(client, project_id),
@@ -254,7 +256,7 @@ pub(crate) async fn select_dataset_interactive(
     .await?;
 
     if datasets.is_empty() {
-        bail!("no datasets found");
+        return Ok(None);
     }
 
     datasets.sort_by(|a, b| a.name.cmp(&b.name));
@@ -263,7 +265,14 @@ pub(crate) async fn select_dataset_interactive(
         .map(|dataset| dataset.name.as_str())
         .collect();
     let selection = ui::fuzzy_select("Select dataset", &names, 0)?;
-    Ok(datasets[selection].clone())
+    Ok(Some(datasets[selection].clone()))
+}
+
+pub(crate) fn print_no_datasets_found(project_name: &str) {
+    ui::print_command_status(
+        ui::CommandStatus::Warning,
+        &format!("No datasets found in project '{project_name}'."),
+    );
 }
 
 pub async fn run(base: BaseArgs, args: DatasetsArgs) -> Result<()> {
@@ -350,8 +359,8 @@ mod tests {
     use clap::{Parser, Subcommand};
 
     use super::snapshots::{
-        SnapshotCreateArgs, SnapshotDatasetArgs, SnapshotListArgs, SnapshotNameArgs,
-        SnapshotRestoreArgs, SnapshotsArgs, SnapshotsCommands,
+        SnapshotCreateArgs, SnapshotDatasetArgs, SnapshotDeleteArgs, SnapshotDeleteTargetArgs,
+        SnapshotListArgs, SnapshotNameArgs, SnapshotRestoreArgs, SnapshotsArgs, SnapshotsCommands,
     };
     use super::*;
 
@@ -598,7 +607,6 @@ mod tests {
                 command: SnapshotsCommands::List(SnapshotListArgs {
                     dataset: SnapshotDatasetArgs {
                         dataset_positional: Some("dataset".to_string()),
-                        dataset_flag: None,
                     },
                 }),
             })
@@ -648,7 +656,6 @@ mod tests {
                 command: SnapshotsCommands::Create(SnapshotCreateArgs {
                     dataset: SnapshotDatasetArgs {
                         dataset_positional: Some("dataset".to_string()),
-                        dataset_flag: None,
                     },
                     snapshot: SnapshotNameArgs {
                         name_positional: Some("baseline".to_string()),
@@ -661,10 +668,24 @@ mod tests {
         )));
         assert!(!datasets_command_is_read_only(Some(
             &DatasetsCommands::Snapshots(SnapshotsArgs {
+                command: SnapshotsCommands::Delete(SnapshotDeleteArgs {
+                    dataset: SnapshotDatasetArgs {
+                        dataset_positional: Some("dataset".to_string()),
+                    },
+                    target: SnapshotDeleteTargetArgs {
+                        name_positional: Some("baseline".to_string()),
+                        name_flag: None,
+                        snapshot: None,
+                    },
+                    force: false,
+                }),
+            })
+        )));
+        assert!(!datasets_command_is_read_only(Some(
+            &DatasetsCommands::Snapshots(SnapshotsArgs {
                 command: SnapshotsCommands::Restore(SnapshotRestoreArgs {
                     dataset: SnapshotDatasetArgs {
                         dataset_positional: Some("dataset".to_string()),
-                        dataset_flag: None,
                     },
                     name: Some("baseline".to_string()),
                     snapshot: None,
@@ -688,12 +709,11 @@ mod tests {
     }
 
     #[test]
-    fn version_alias_parses_create_flags_for_compatibility() {
+    fn version_alias_parses_create_args_for_compatibility() {
         let parsed = parse(&[
             "datasets",
             "version",
             "create",
-            "--dataset",
             "my-dataset",
             "--name",
             "baseline",
@@ -745,6 +765,72 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_delete_parses_name_target() {
+        let parsed = parse(&[
+            "datasets",
+            "snapshots",
+            "delete",
+            "my-dataset",
+            "baseline",
+            "--force",
+        ])
+        .expect("parse snapshots delete by name");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::Delete(delete) = snapshots.command else {
+            panic!("expected snapshots delete command");
+        };
+        assert_eq!(delete.dataset_name(), Some("my-dataset"));
+        assert_eq!(delete.snapshot_name(), Some("baseline"));
+        assert!(delete.snapshot_xact_id().is_none());
+        assert!(delete.force);
+    }
+
+    #[test]
+    fn snapshots_delete_parses_snapshot_xact_target() {
+        let parsed = parse(&[
+            "datasets",
+            "snapshots",
+            "delete",
+            "my-dataset",
+            "--snapshot",
+            "1000192656880881099",
+            "--force",
+        ])
+        .expect("parse snapshots delete by xact");
+        let DatasetsCommands::Snapshots(snapshots) = parsed.command.expect("subcommand") else {
+            panic!("expected snapshots command");
+        };
+        let SnapshotsCommands::Delete(delete) = snapshots.command else {
+            panic!("expected snapshots delete command");
+        };
+        assert_eq!(delete.dataset_name(), Some("my-dataset"));
+        assert!(delete.snapshot_name().is_none());
+        assert_eq!(delete.snapshot_xact_id(), Some("1000192656880881099"));
+        assert!(delete.force);
+    }
+
+    #[test]
+    fn snapshots_delete_rejects_name_and_snapshot_together() {
+        let err = parse(&[
+            "datasets",
+            "snapshots",
+            "delete",
+            "my-dataset",
+            "baseline",
+            "--snapshot",
+            "1000192656880881099",
+        ])
+        .expect_err("delete target conflict should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("[SNAPSHOT]") && message.contains("--snapshot"),
+            "unexpected clap error: {message}"
+        );
+    }
+
+    #[test]
     fn snapshots_restore_parses_name_target() {
         let parsed = parse(&[
             "datasets",
@@ -773,7 +859,6 @@ mod tests {
             "datasets",
             "version",
             "restore",
-            "--dataset",
             "my-dataset",
             "--version",
             "1000192656880881099",

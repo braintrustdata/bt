@@ -27,6 +27,8 @@ Examples:
   bt datasets snapshots create my-dataset
   bt datasets snapshots create my-dataset baseline
   bt datasets snapshots create my-dataset baseline --xact-id 1000192656880881099
+  bt datasets snapshots delete my-dataset baseline
+  bt datasets snapshots delete my-dataset --snapshot 1000192656880881099 --force
   bt datasets snapshots restore my-dataset
   bt datasets snapshots restore my-dataset --name baseline
   bt datasets snapshots restore my-dataset --snapshot 1000192656880881099 --force
@@ -42,6 +44,8 @@ pub(super) enum SnapshotsCommands {
     List(SnapshotListArgs),
     /// Create a new snapshot for a dataset
     Create(SnapshotCreateArgs),
+    /// Delete a saved dataset snapshot
+    Delete(SnapshotDeleteArgs),
     /// Restore a dataset to a saved snapshot
     Restore(SnapshotRestoreArgs),
 }
@@ -51,17 +55,11 @@ pub(super) struct SnapshotDatasetArgs {
     /// Dataset name (positional)
     #[arg(value_name = "DATASET")]
     pub(super) dataset_positional: Option<String>,
-
-    /// Dataset name (flag)
-    #[arg(long = "dataset", short = 'd')]
-    pub(super) dataset_flag: Option<String>,
 }
 
 impl SnapshotDatasetArgs {
     pub(super) fn dataset_name(&self) -> Option<&str> {
-        self.dataset_positional
-            .as_deref()
-            .or(self.dataset_flag.as_deref())
+        self.dataset_positional.as_deref()
     }
 }
 
@@ -128,6 +126,83 @@ impl SnapshotCreateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub(super) struct SnapshotDeleteTargetArgs {
+    /// Saved snapshot name to delete (positional)
+    #[arg(value_name = "SNAPSHOT", conflicts_with = "snapshot")]
+    pub(super) name_positional: Option<String>,
+
+    /// Saved snapshot name to delete
+    #[arg(
+        long = "name",
+        short = 'n',
+        env = "BT_DATASETS_SNAPSHOT_DELETE_NAME",
+        value_name = "NAME",
+        conflicts_with = "snapshot"
+    )]
+    pub(super) name_flag: Option<String>,
+
+    /// Transaction id to delete
+    #[arg(
+        long = "snapshot",
+        visible_alias = "version",
+        env = "BT_DATASETS_SNAPSHOT_DELETE_XACT_ID",
+        value_name = "XACT_ID",
+        conflicts_with_all = ["name_positional", "name_flag"]
+    )]
+    pub(super) snapshot: Option<String>,
+}
+
+impl SnapshotDeleteTargetArgs {
+    fn snapshot_name(&self) -> Option<&str> {
+        self.name_positional
+            .as_deref()
+            .or(self.name_flag.as_deref())
+    }
+
+    fn snapshot_xact_id(&self) -> Option<&str> {
+        self.snapshot.as_deref()
+    }
+
+    fn has_target(&self) -> bool {
+        normalize_optional_text(self.snapshot_name()).is_some()
+            || normalize_optional_text(self.snapshot_xact_id()).is_some()
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub(super) struct SnapshotDeleteArgs {
+    #[command(flatten)]
+    pub(super) dataset: SnapshotDatasetArgs,
+
+    #[command(flatten)]
+    pub(super) target: SnapshotDeleteTargetArgs,
+
+    /// Skip confirmation
+    #[arg(
+        long,
+        short = 'f',
+        env = "BT_DATASETS_SNAPSHOT_DELETE_FORCE",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    pub(super) force: bool,
+}
+
+impl SnapshotDeleteArgs {
+    pub(super) fn dataset_name(&self) -> Option<&str> {
+        self.dataset.dataset_name()
+    }
+
+    pub(super) fn snapshot_name(&self) -> Option<&str> {
+        self.target.snapshot_name()
+    }
+
+    pub(super) fn snapshot_xact_id(&self) -> Option<&str> {
+        self.target.snapshot_xact_id()
+    }
+}
+
+#[derive(Debug, Clone, Args)]
 pub(super) struct SnapshotRestoreArgs {
     #[command(flatten)]
     pub(super) dataset: SnapshotDatasetArgs,
@@ -187,6 +262,7 @@ pub(super) async fn run(ctx: &ResolvedContext, base: &BaseArgs, args: SnapshotsA
         SnapshotsCommands::Create(create_args) => {
             run_create(ctx, base, &create_args, base.json).await
         }
+        SnapshotsCommands::Delete(delete_args) => run_delete(ctx, &delete_args, base.json).await,
         SnapshotsCommands::Restore(restore_args) => {
             run_restore(ctx, &restore_args, base.json).await
         }
@@ -208,8 +284,36 @@ impl RestoreTarget {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DeleteTarget {
+    id: String,
+    name: String,
+    xact_id: String,
+}
+
+impl DeleteTarget {
+    fn display_target(&self) -> String {
+        format!("snapshot '{}' (xact {})", self.name, self.xact_id)
+    }
+}
+
 async fn run_list(ctx: &ResolvedContext, args: &SnapshotListArgs, json: bool) -> Result<()> {
-    let dataset = resolve_existing_dataset(ctx, args.dataset_name(), "snapshots list").await?;
+    let Some(dataset) = resolve_list_dataset(ctx, args.dataset_name()).await? else {
+        let snapshots: Vec<DatasetSnapshot> = Vec::new();
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "dataset": null,
+                    "snapshots": snapshots,
+                }))?
+            );
+            return Ok(());
+        }
+
+        print_snapshot_list(ctx, None, &snapshots)?;
+        return Ok(());
+    };
 
     let mut snapshots = with_spinner(
         "Loading dataset snapshots...",
@@ -229,22 +333,42 @@ async fn run_list(ctx: &ResolvedContext, args: &SnapshotListArgs, json: bool) ->
         return Ok(());
     }
 
+    print_snapshot_list(ctx, Some(&dataset), &snapshots)?;
+    Ok(())
+}
+
+fn print_snapshot_list(
+    ctx: &ResolvedContext,
+    dataset: Option<&Dataset>,
+    snapshots: &[DatasetSnapshot],
+) -> Result<()> {
     let mut output = String::new();
     let count = format!(
         "{} {}",
         snapshots.len(),
         pluralize(snapshots.len(), "snapshot", None)
     );
-    writeln!(
-        output,
-        "{} found for {} {} {} {} {}\n",
-        console::style(count),
-        console::style(ctx.client.org_name()).bold(),
-        console::style("/").dim().bold(),
-        console::style(&ctx.project.name).bold(),
-        console::style("/").dim().bold(),
-        console::style(&dataset.name).bold()
-    )?;
+    if let Some(dataset) = dataset {
+        writeln!(
+            output,
+            "{} found for {} {} {} {} {}\n",
+            console::style(count),
+            console::style(ctx.client.org_name()).bold(),
+            console::style("/").dim().bold(),
+            console::style(&ctx.project.name).bold(),
+            console::style("/").dim().bold(),
+            console::style(&dataset.name).bold()
+        )?;
+    } else {
+        writeln!(
+            output,
+            "{} found in {} {} {}\n",
+            console::style(count),
+            console::style(ctx.client.org_name()).bold(),
+            console::style("/").dim().bold(),
+            console::style(&ctx.project.name).bold()
+        )?;
+    }
 
     let mut table = styled_table();
     table.set_header(vec![
@@ -255,7 +379,7 @@ async fn run_list(ctx: &ResolvedContext, args: &SnapshotListArgs, json: bool) ->
     ]);
     apply_column_padding(&mut table, (0, 6));
 
-    for snapshot in &snapshots {
+    for snapshot in snapshots {
         let description = snapshot
             .description
             .as_deref()
@@ -282,7 +406,12 @@ async fn run_create(
     args: &SnapshotCreateArgs,
     json_output: bool,
 ) -> Result<()> {
-    let dataset = resolve_existing_dataset(ctx, args.dataset_name(), "snapshots create").await?;
+    let Some(dataset) =
+        resolve_existing_dataset(ctx, args.dataset_name(), "snapshots create").await?
+    else {
+        super::print_no_datasets_found(&ctx.project.name);
+        return Ok(());
+    };
     let snapshot_name = resolve_snapshot_name(base, ctx, args.snapshot_name());
     let xact_id = resolve_snapshot_xact_id(ctx, &dataset, args.xact_id.as_deref()).await?;
     let description = normalize_optional_text(args.description.as_deref());
@@ -349,12 +478,111 @@ async fn run_create(
     Ok(())
 }
 
+async fn run_delete(
+    ctx: &ResolvedContext,
+    args: &SnapshotDeleteArgs,
+    json_output: bool,
+) -> Result<()> {
+    if args.force && args.dataset_name().is_none() {
+        bail!(
+            "dataset name required when using --force. Use: bt datasets snapshots delete <dataset> <snapshot> --force"
+        );
+    }
+    if args.force && !args.target.has_target() {
+        bail!(
+            "snapshot target required when using --force. Use: bt datasets snapshots delete <dataset> <snapshot> --force"
+        );
+    }
+
+    let Some(dataset) =
+        resolve_existing_dataset(ctx, args.dataset_name(), "snapshots delete").await?
+    else {
+        super::print_no_datasets_found(&ctx.project.name);
+        return Ok(());
+    };
+    let target = resolve_delete_target(ctx, &dataset, args).await?;
+
+    if !args.force && is_interactive() {
+        let confirmed = Confirm::new()
+            .with_prompt(format!(
+                "Delete {} from '{}'?",
+                target.display_target(),
+                dataset.name
+            ))
+            .default(false)
+            .interact()?;
+        if !confirmed {
+            print_command_status(
+                CommandStatus::Warning,
+                &format!(
+                    "Cancelled delete for {} (no changes applied).",
+                    target.display_target()
+                ),
+            );
+            return Ok(());
+        }
+    }
+
+    match with_spinner_visible(
+        "Deleting dataset snapshot...",
+        api::delete_dataset_snapshot(&ctx.client, &target.id),
+        Duration::from_millis(300),
+    )
+    .await
+    {
+        Ok(()) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "dataset": dataset,
+                        "snapshot": {
+                            "id": target.id,
+                            "name": target.name,
+                            "xact_id": target.xact_id,
+                        },
+                        "deleted": true,
+                        "mode": "snapshot_delete",
+                    }))?
+                );
+                return Ok(());
+            }
+
+            print_command_status(
+                CommandStatus::Success,
+                &format!(
+                    "Deleted {} from '{}'.",
+                    target.display_target(),
+                    dataset.name
+                ),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            print_command_status(
+                CommandStatus::Error,
+                &format!(
+                    "Failed to delete {} from '{}'",
+                    target.display_target(),
+                    dataset.name
+                ),
+            );
+            Err(error)
+        }
+    }
+}
+
 async fn run_restore(
     ctx: &ResolvedContext,
     args: &SnapshotRestoreArgs,
     json_output: bool,
 ) -> Result<()> {
-    let dataset = resolve_existing_dataset(ctx, args.dataset_name(), "snapshots restore").await?;
+    let Some(dataset) =
+        resolve_existing_dataset(ctx, args.dataset_name(), "snapshots restore").await?
+    else {
+        super::print_no_datasets_found(&ctx.project.name);
+        return Ok(());
+    };
     let target = resolve_restore_target(ctx, &dataset, args).await?;
 
     let preview = match with_spinner_visible(
@@ -506,14 +734,15 @@ async fn resolve_existing_dataset(
     ctx: &ResolvedContext,
     name: Option<&str>,
     command: &str,
-) -> Result<Dataset> {
+) -> Result<Option<Dataset>> {
     match name.map(str::trim).filter(|value| !value.is_empty()) {
         Some(name) => with_spinner(
             "Loading dataset...",
             api::get_dataset_by_name(&ctx.client, &ctx.project.id, name),
         )
         .await?
-        .ok_or_else(|| anyhow!("dataset '{name}' not found")),
+        .ok_or_else(|| anyhow!("dataset '{name}' not found"))
+        .map(Some),
         None => {
             if !is_interactive() {
                 bail!("dataset name required. Use: bt datasets {command} <dataset>");
@@ -521,6 +750,72 @@ async fn resolve_existing_dataset(
             super::select_dataset_interactive(&ctx.client, &ctx.project.id).await
         }
     }
+}
+
+async fn resolve_list_dataset(
+    ctx: &ResolvedContext,
+    name: Option<&str>,
+) -> Result<Option<Dataset>> {
+    match name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(_) => resolve_existing_dataset(ctx, name, "snapshots list").await,
+        None => {
+            let mut datasets = with_spinner(
+                "Loading datasets...",
+                api::list_datasets(&ctx.client, &ctx.project.id),
+            )
+            .await?;
+
+            if datasets.is_empty() {
+                return Ok(None);
+            }
+
+            if !is_interactive() {
+                bail!("dataset name required. Use: bt datasets snapshots list <dataset>");
+            }
+
+            datasets.sort_by(|a, b| a.name.cmp(&b.name));
+            let names: Vec<&str> = datasets
+                .iter()
+                .map(|dataset| dataset.name.as_str())
+                .collect();
+            let selection = crate::ui::fuzzy_select("Select dataset", &names, 0)?;
+            Ok(Some(datasets[selection].clone()))
+        }
+    }
+}
+
+async fn resolve_delete_target(
+    ctx: &ResolvedContext,
+    dataset: &Dataset,
+    args: &SnapshotDeleteArgs,
+) -> Result<DeleteTarget> {
+    let snapshots = with_spinner(
+        "Loading dataset snapshots...",
+        api::list_dataset_snapshots(&ctx.client, &dataset.id),
+    )
+    .await?;
+
+    if let Some(xact_id) = args
+        .snapshot_xact_id()
+        .and_then(|value| normalize_optional_text(Some(value)))
+    {
+        return resolve_delete_target_by_xact_id(&snapshots, &dataset.name, &xact_id);
+    }
+
+    if let Some(snapshot_name) = args
+        .snapshot_name()
+        .and_then(|value| normalize_optional_text(Some(value)))
+    {
+        return resolve_delete_target_by_name(&snapshots, &dataset.name, &snapshot_name);
+    }
+
+    if is_interactive() {
+        return select_delete_target_interactive(&dataset.name, &snapshots);
+    }
+
+    bail!(
+        "snapshot target required. Use: bt datasets snapshots delete <dataset> (<snapshot> | --snapshot <XACT_ID>)"
+    );
 }
 
 fn resolve_snapshot_name(base: &BaseArgs, ctx: &ResolvedContext, name: Option<&str>) -> String {
@@ -655,11 +950,75 @@ fn restore_target_from_snapshot(snapshot: &DatasetSnapshot) -> Result<RestoreTar
     })
 }
 
+fn delete_target_from_snapshot(snapshot: &DatasetSnapshot) -> DeleteTarget {
+    DeleteTarget {
+        id: snapshot.id.clone(),
+        name: snapshot.name.clone(),
+        xact_id: snapshot.xact_id.clone(),
+    }
+}
+
+fn select_delete_target_interactive(
+    dataset_name: &str,
+    snapshots: &[DatasetSnapshot],
+) -> Result<DeleteTarget> {
+    let mut deletable_snapshots: Vec<&DatasetSnapshot> = snapshots.iter().collect();
+
+    if deletable_snapshots.is_empty() {
+        bail!("no dataset snapshots found for '{}'", dataset_name);
+    }
+
+    deletable_snapshots.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.name.cmp(&b.name)));
+
+    let labels: Vec<String> = deletable_snapshots
+        .iter()
+        .map(|snapshot| restore_snapshot_label(snapshot))
+        .collect();
+    let selection = crate::ui::fuzzy_select("Select dataset snapshot", &labels, 0)?;
+    Ok(delete_target_from_snapshot(deletable_snapshots[selection]))
+}
+
+fn resolve_delete_target_by_name(
+    snapshots: &[DatasetSnapshot],
+    dataset_name: &str,
+    snapshot_name: &str,
+) -> Result<DeleteTarget> {
+    let snapshot = unique_snapshot_by_name(snapshots, dataset_name, snapshot_name)?;
+    Ok(delete_target_from_snapshot(snapshot))
+}
+
+fn resolve_delete_target_by_xact_id(
+    snapshots: &[DatasetSnapshot],
+    dataset_name: &str,
+    xact_id: &str,
+) -> Result<DeleteTarget> {
+    let Some(snapshot) = snapshots
+        .iter()
+        .find(|snapshot| snapshot.xact_id == xact_id)
+    else {
+        bail!(
+            "dataset snapshot with xact '{}' was not found for '{}'",
+            xact_id,
+            dataset_name
+        );
+    };
+    Ok(delete_target_from_snapshot(snapshot))
+}
+
 fn resolve_restore_target_by_name(
     snapshots: &[DatasetSnapshot],
     dataset_name: &str,
     snapshot_name: &str,
 ) -> Result<RestoreTarget> {
+    let snapshot = unique_snapshot_by_name(snapshots, dataset_name, snapshot_name)?;
+    restore_target_from_snapshot(snapshot)
+}
+
+fn unique_snapshot_by_name<'a>(
+    snapshots: &'a [DatasetSnapshot],
+    dataset_name: &str,
+    snapshot_name: &str,
+) -> Result<&'a DatasetSnapshot> {
     let mut matches = snapshots
         .iter()
         .filter(|snapshot| snapshot.name == snapshot_name);
@@ -678,7 +1037,7 @@ fn resolve_restore_target_by_name(
         );
     }
 
-    restore_target_from_snapshot(snapshot)
+    Ok(snapshot)
 }
 
 fn normalize_optional_text(value: Option<&str>) -> Option<String> {
@@ -817,6 +1176,47 @@ mod tests {
         let error = resolve_restore_target_by_name(&snapshots, "my-dataset", "baseline")
             .expect_err("duplicate snapshot names should fail");
         assert!(error.to_string().contains("use --snapshot <XACT_ID>"));
+    }
+
+    #[test]
+    fn resolve_delete_target_by_name_keeps_snapshot_id() {
+        let snapshots = vec![dataset_snapshot(
+            "baseline",
+            "1000192656880881099",
+            "2026-04-10T00:00:00Z",
+            None,
+        )];
+
+        let target =
+            resolve_delete_target_by_name(&snapshots, "my-dataset", "baseline").expect("target");
+        assert_eq!(target.id, "snapshot_baseline");
+        assert_eq!(target.name, "baseline");
+        assert_eq!(target.xact_id, "1000192656880881099");
+    }
+
+    #[test]
+    fn resolve_delete_target_by_xact_id_returns_match() {
+        let snapshots = vec![
+            dataset_snapshot(
+                "baseline",
+                "1000192656880881099",
+                "2026-04-10T00:00:00Z",
+                None,
+            ),
+            dataset_snapshot(
+                "release",
+                "1000192656880881100",
+                "2026-04-11T00:00:00Z",
+                None,
+            ),
+        ];
+
+        let target =
+            resolve_delete_target_by_xact_id(&snapshots, "my-dataset", "1000192656880881100")
+                .expect("target");
+        assert_eq!(target.id, "snapshot_release");
+        assert_eq!(target.name, "release");
+        assert_eq!(target.xact_id, "1000192656880881100");
     }
 
     #[test]

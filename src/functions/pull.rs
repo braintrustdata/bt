@@ -1410,7 +1410,7 @@ fn format_py_value_inner(value: &Value, depth: usize) -> String {
             let closing_indent = "    ".repeat(depth);
             let mut out = String::from("{\n");
             let mut entries = object.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             for (index, (key, val)) in entries.into_iter().enumerate() {
                 out.push_str(&indent);
                 out.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));

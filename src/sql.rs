@@ -258,10 +258,11 @@ fn handle_key_event(
         KeyCode::End => app.move_end(),
         KeyCode::Up => app.history_prev(),
         KeyCode::Down => app.history_next(),
-        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if !key.modifiers.contains(KeyModifiers::ALT) {
-                app.insert_char(ch);
-            }
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.insert_char(ch);
         }
         _ => {}
     }
