@@ -502,7 +502,13 @@ async fn run_delete(
     };
     let target = resolve_delete_target(ctx, &dataset, args).await?;
 
-    if !args.force && is_interactive() {
+    if !args.force {
+        if !is_interactive() {
+            bail!(
+                "snapshot delete requires --force in non-interactive mode. Use: bt datasets snapshots delete <dataset> <snapshot> --force"
+            );
+        }
+
         let confirmed = Confirm::new()
             .with_prompt(format!(
                 "Delete {} from '{}'?",

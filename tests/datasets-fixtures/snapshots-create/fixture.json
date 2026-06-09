@@ -84,6 +84,21 @@
         "snapshots",
         "delete",
         "snapshot-source",
+        "baseline"
+      ],
+      "expect_success": false,
+      "stderr_contains": [
+        "snapshot delete requires --force in non-interactive mode"
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "delete",
+        "snapshot-source",
         "baseline",
         "--force"
       ],
