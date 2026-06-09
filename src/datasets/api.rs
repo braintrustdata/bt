@@ -13,6 +13,7 @@ use super::records::DATASET_RECORD_FIELDS;
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
 const MAX_DATASET_ROWS_PAGES: usize = 10_000;
 const DATASET_ROWS_SINCE: &str = "1970-01-01T00:00:00Z";
+const MAX_ERROR_RESPONSE_BODY_CHARS: usize = 4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatasetRowsPreviewLength {
@@ -97,9 +98,16 @@ pub struct DatasetRestorePreview {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetRestoreResult {
-    pub xact_id: String,
+    pub xact_id: Option<String>,
     pub rows_restored: usize,
     pub rows_deleted: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct DatasetRestoreResultResponse {
+    xact_id: Option<String>,
+    rows_restored: usize,
+    rows_deleted: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,9 +328,20 @@ pub async fn restore_dataset(
     xact_id: &str,
 ) -> Result<DatasetRestoreResult> {
     let path = format!("/v1/dataset/{}/restore", encode(dataset_id));
-    client
-        .post(&path, &serde_json::json!({ "version": xact_id }))
+    let response = client
+        .post_with_headers_raw(&path, &serde_json::json!({ "version": xact_id }), &[])
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(HttpError { status, body }.into());
+    }
+
+    let body = response
+        .text()
         .await
+        .context("failed to read dataset restore response")?;
+    parse_dataset_restore_result_response(&body, xact_id)
 }
 
 pub async fn get_dataset_head_xact_id(
@@ -423,6 +442,58 @@ fn found_existing_snapshot_header(headers: &HeaderMap) -> bool {
         .get("x-bt-found-existing")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
+fn parse_dataset_restore_result_response(
+    body: &str,
+    requested_xact_id: &str,
+) -> Result<DatasetRestoreResult> {
+    let response: DatasetRestoreResultResponse = serde_json::from_str(body).with_context(|| {
+        format!(
+            "failed to parse dataset restore response body: {}",
+            format_response_body_for_error(body)
+        )
+    })?;
+    let xact_id = response
+        .xact_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if xact_id.is_none() && (response.rows_restored > 0 || response.rows_deleted > 0) {
+        bail!(
+            "restore to xact '{}' changed rows ({} restored, {} deleted) but the response did not include a result xact",
+            requested_xact_id,
+            response.rows_restored,
+            response.rows_deleted
+        );
+    }
+
+    Ok(DatasetRestoreResult {
+        xact_id,
+        rows_restored: response.rows_restored,
+        rows_deleted: response.rows_deleted,
+    })
+}
+
+fn format_response_body_for_error(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let formatted = serde_json::from_str::<Value>(trimmed)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| trimmed.to_string());
+    truncate_error_response_body(&formatted)
+}
+
+fn truncate_error_response_body(body: &str) -> String {
+    let mut chars = body.chars();
+    let truncated: String = chars.by_ref().take(MAX_ERROR_RESPONSE_BODY_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}... [truncated]")
+    } else {
+        truncated
+    }
 }
 
 #[cfg(test)]
@@ -583,9 +654,59 @@ mod tests {
             "rows_deleted": 2
         }))
         .expect("deserialize result");
-        assert_eq!(result.xact_id, "1000192656880881099");
+        assert_eq!(result.xact_id.as_deref(), Some("1000192656880881099"));
         assert_eq!(result.rows_restored, 7);
         assert_eq!(result.rows_deleted, 2);
+    }
+
+    #[test]
+    fn dataset_restore_result_parse_error_includes_response_body() {
+        let error = parse_dataset_restore_result_response(
+            r#"{"xact_id":"1000192656880881099"}"#,
+            "1000192656880881099",
+        )
+        .expect_err("missing count fields should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                r#"failed to parse dataset restore response body: {"xact_id":"1000192656880881099"}"#
+            ),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn empty_restore_result_parse_error_is_labeled_empty() {
+        let error = parse_dataset_restore_result_response("", "1000192656880881099")
+            .expect_err("empty body should fail");
+        assert!(error
+            .to_string()
+            .contains("failed to parse dataset restore response body: <empty>"));
+    }
+
+    #[test]
+    fn null_restore_result_xact_id_with_no_changes_is_noop_success() {
+        let result = parse_dataset_restore_result_response(
+            r#"{"rows_deleted":0,"rows_restored":0,"xact_id":null}"#,
+            "1000192656880881099",
+        )
+        .expect("null xact id should be ok for no-op restore");
+        assert!(result.xact_id.is_none());
+        assert_eq!(result.rows_restored, 0);
+        assert_eq!(result.rows_deleted, 0);
+    }
+
+    #[test]
+    fn null_restore_result_xact_id_with_changes_is_error() {
+        let error = parse_dataset_restore_result_response(
+            r#"{"rows_deleted":0,"rows_restored":1,"xact_id":null}"#,
+            "1000192656880881099",
+        )
+        .expect_err("changed restore should include a result xact id");
+        assert_eq!(
+            error.to_string(),
+            "restore to xact '1000192656880881099' changed rows (1 restored, 0 deleted) but the response did not include a result xact"
+        );
     }
 
     #[test]

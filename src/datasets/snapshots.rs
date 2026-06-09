@@ -716,17 +716,24 @@ async fn run_restore_execute(
         }
     };
 
-    print_command_status(
-        CommandStatus::Success,
-        &format!(
+    let message = match result.xact_id.as_deref() {
+        Some(xact_id) => format!(
             "Restored dataset '{}' to {} (xact {}; {} restored, {} deleted).",
             dataset.name,
             target.display_target(),
-            result.xact_id.as_str(),
+            xact_id,
             result.rows_restored,
             result.rows_deleted
         ),
-    );
+        None => format!(
+            "Restore completed for dataset '{}' to {} ({} restored, {} deleted).",
+            dataset.name,
+            target.display_target(),
+            result.rows_restored,
+            result.rows_deleted
+        ),
+    };
+    print_command_status(CommandStatus::Success, &message);
     Ok(result)
 }
 
