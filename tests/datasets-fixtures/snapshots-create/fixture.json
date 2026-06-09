@@ -1,0 +1,189 @@
+{
+  "env": {
+    "BRAINTRUST_API_KEY": "fixture-api-key",
+    "BRAINTRUST_API_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_APP_URL": "__MOCK_SERVER_URL__",
+    "BRAINTRUST_ORG_NAME": "test-org",
+    "BRAINTRUST_DEFAULT_PROJECT": "fixtures-project"
+  },
+  "steps": [
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "create",
+        "snapshot-source"
+      ],
+      "stdout_contains": ["\"name\":\"snapshot-source\"", "\"mode\":\"create\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "create",
+        "snapshot-source",
+        "baseline",
+        "--xact-id",
+        "1000192656880881099",
+        "--description",
+        "Initial snapshot"
+      ],
+      "stdout_contains": [
+        "\"dataset_id\":\"dataset_1\"",
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\"",
+        "\"found_existing\":false",
+        "\"mode\":\"snapshot_create\""
+      ],
+      "stdout_not_contains": ["dataset_snapshot_name"]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "create",
+        "snapshot-source",
+        "baseline-again",
+        "--xact-id",
+        "1000192656880881099"
+      ],
+      "stdout_contains": [
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\"",
+        "\"found_existing\":true",
+        "\"mode\":\"snapshot_create\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "list",
+        "snapshot-source"
+      ],
+      "stdout_contains": [
+        "\"snapshots\":[",
+        "\"dataset_id\":\"dataset_1\"",
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\""
+      ],
+      "stdout_not_contains": ["baseline-again"]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "restore",
+        "snapshot-source",
+        "--name",
+        "baseline"
+      ],
+      "stdout_contains": [
+        "\"rows_to_restore\":0",
+        "\"rows_to_delete\":0",
+        "\"restored\":false",
+        "\"mode\":\"snapshot_restore\""
+      ],
+      "stdout_not_contains": ["\"result\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "restore",
+        "snapshot-source",
+        "--name",
+        "baseline",
+        "--force"
+      ],
+      "stdout_contains": [
+        "\"rows_restored\":0",
+        "\"rows_deleted\":0",
+        "\"xact_id\":null",
+        "\"restored\":true",
+        "\"mode\":\"snapshot_restore\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "delete",
+        "snapshot-source",
+        "baseline"
+      ],
+      "expect_success": false,
+      "stderr_contains": [
+        "snapshot delete requires --force in non-interactive mode"
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "delete",
+        "snapshot-source",
+        "baseline",
+        "--force"
+      ],
+      "stdout_contains": [
+        "\"name\":\"baseline\"",
+        "\"xact_id\":\"1000192656880881099\"",
+        "\"deleted\":true",
+        "\"mode\":\"snapshot_delete\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "list",
+        "snapshot-source"
+      ],
+      "stdout_contains": ["\"snapshots\":[]"],
+      "stdout_not_contains": ["\"name\":\"baseline\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "delete",
+        "snapshot-source"
+      ],
+      "expect_success": false,
+      "stderr_contains": [
+        "dataset delete requires --force in non-interactive mode"
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "delete",
+        "snapshot-source",
+        "--force"
+      ],
+      "stderr_contains": ["Deleted 'snapshot-source'"]
+    }
+  ],
+  "expected_logs3_requests": 0
+}

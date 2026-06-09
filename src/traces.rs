@@ -2084,21 +2084,22 @@ fn handle_span_detail_key(
                 }
             }
         }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.detail_pane_focus == DetailPaneFocus::Detail {
-                if detail_message_list_mode {
-                    if app.detail_view == DetailView::Thread {
-                        for _ in 0..10 {
-                            app.move_thread_message_down();
-                        }
-                    } else {
-                        for _ in 0..10 {
-                            app.move_span_detail_message_down();
-                        }
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && app.detail_pane_focus == DetailPaneFocus::Detail =>
+        {
+            if detail_message_list_mode {
+                if app.detail_view == DetailView::Thread {
+                    for _ in 0..10 {
+                        app.move_thread_message_down();
                     }
                 } else {
-                    scroll_detail_down_bounded(app, 10)
+                    for _ in 0..10 {
+                        app.move_span_detail_message_down();
+                    }
                 }
+            } else {
+                scroll_detail_down_bounded(app, 10)
             }
         }
         _ => {}
@@ -5229,10 +5230,8 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
                     parsed.span_id = Some(value.to_string());
                 }
             }
-            "tvt" => {
-                if !value.is_empty() {
-                    parsed.trace_view_type = Some(value.to_string());
-                }
+            "tvt" if !value.is_empty() => {
+                parsed.trace_view_type = Some(value.to_string());
             }
             _ => {}
         }

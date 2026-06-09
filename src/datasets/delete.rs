@@ -21,11 +21,23 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
             if !is_interactive() {
                 bail!("dataset name required. Use: bt datasets delete <name>");
             }
-            super::select_dataset_interactive(&ctx.client, &ctx.project.id).await?
+            let Some(dataset) =
+                super::select_dataset_interactive(&ctx.client, &ctx.project.id).await?
+            else {
+                super::print_no_datasets_found(&ctx.project.name);
+                return Ok(());
+            };
+            dataset
         }
     };
 
-    if !force && is_interactive() {
+    if !force {
+        if !is_interactive() {
+            bail!(
+                "dataset delete requires --force in non-interactive mode. Use: bt datasets delete <name> --force"
+            );
+        }
+
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete dataset '{}' from {}?",
