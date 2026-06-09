@@ -82,6 +82,45 @@
         "--json",
         "--no-input",
         "snapshots",
+        "restore",
+        "snapshot-source",
+        "--name",
+        "baseline"
+      ],
+      "stdout_contains": [
+        "\"rows_to_restore\":0",
+        "\"rows_to_delete\":0",
+        "\"restored\":false",
+        "\"mode\":\"snapshot_restore\""
+      ],
+      "stdout_not_contains": ["\"result\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
+        "restore",
+        "snapshot-source",
+        "--name",
+        "baseline",
+        "--force"
+      ],
+      "stdout_contains": [
+        "\"rows_restored\":0",
+        "\"rows_deleted\":0",
+        "\"xact_id\":null",
+        "\"restored\":true",
+        "\"mode\":\"snapshot_restore\""
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "snapshots",
         "delete",
         "snapshot-source",
         "baseline"
@@ -120,6 +159,30 @@
       ],
       "stdout_contains": ["\"snapshots\":[]"],
       "stdout_not_contains": ["\"name\":\"baseline\""]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "delete",
+        "snapshot-source"
+      ],
+      "expect_success": false,
+      "stderr_contains": [
+        "dataset delete requires --force in non-interactive mode"
+      ]
+    },
+    {
+      "command": [
+        "datasets",
+        "--json",
+        "--no-input",
+        "delete",
+        "snapshot-source",
+        "--force"
+      ],
+      "stderr_contains": ["Deleted 'snapshot-source'"]
     }
   ],
   "expected_logs3_requests": 0

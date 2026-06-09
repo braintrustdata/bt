@@ -10,6 +10,10 @@
     {
       "command": ["datasets", "--json", "--no-input", "snapshots", "list"],
       "stdout_contains": ["\"dataset\":null", "\"snapshots\":[]"]
+    },
+    {
+      "command": ["datasets", "--no-input", "snapshots", "list"],
+      "stderr_contains": ["No datasets found in project 'fixtures-project'."]
     }
   ],
   "expected_logs3_requests": 0

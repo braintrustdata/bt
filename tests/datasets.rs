@@ -165,6 +165,18 @@ impl MockServer {
                 .route("/v1/dataset", web::get().to(mock_list_datasets))
                 .route("/v1/dataset", web::post().to(mock_create_dataset))
                 .route(
+                    "/v1/dataset/{dataset_id}",
+                    web::delete().to(mock_delete_dataset),
+                )
+                .route(
+                    "/v1/dataset/{dataset_id}/restore/preview",
+                    web::post().to(mock_preview_dataset_restore),
+                )
+                .route(
+                    "/v1/dataset/{dataset_id}/restore",
+                    web::post().to(mock_restore_dataset),
+                )
+                .route(
                     "/v1/dataset_snapshot",
                     web::get().to(mock_list_dataset_snapshots),
                 )
@@ -300,6 +312,35 @@ async fn mock_create_dataset(
         "project_id": created.project_id,
         "created": created.created
     }))
+}
+
+async fn mock_delete_dataset(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let dataset_id = path.into_inner();
+
+    let mut datasets = state.datasets.lock().expect("datasets lock");
+    let Some(index) = datasets.iter().position(|dataset| dataset.id == dataset_id) else {
+        return HttpResponse::NotFound().body(format!("unknown dataset id '{dataset_id}'"));
+    };
+    datasets.remove(index);
+    drop(datasets);
+
+    state
+        .dataset_snapshots
+        .lock()
+        .expect("dataset snapshots lock")
+        .retain(|snapshot| snapshot.dataset_id != dataset_id);
+    state
+        .dataset_rows
+        .lock()
+        .expect("dataset rows lock")
+        .remove(&dataset_id);
+
+    HttpResponse::Ok().finish()
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,6 +482,56 @@ async fn mock_delete_dataset_snapshot(
     HttpResponse::Ok().finish()
 }
 
+#[derive(Debug, Deserialize)]
+struct DatasetRestoreRequest {
+    version: String,
+}
+
+async fn mock_preview_dataset_restore(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+    body: web::Json<DatasetRestoreRequest>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let dataset_id = path.into_inner();
+
+    if !dataset_exists(state.get_ref(), &dataset_id) {
+        return HttpResponse::NotFound().body(format!("unknown dataset id '{dataset_id}'"));
+    }
+    if body.version.trim().is_empty() {
+        return HttpResponse::BadRequest().body("restore version is required");
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "rows_to_restore": 0,
+        "rows_to_delete": 0
+    }))
+}
+
+async fn mock_restore_dataset(
+    state: web::Data<Arc<MockServerState>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+    body: web::Json<DatasetRestoreRequest>,
+) -> HttpResponse {
+    log_request(state.get_ref(), &req);
+    let dataset_id = path.into_inner();
+
+    if !dataset_exists(state.get_ref(), &dataset_id) {
+        return HttpResponse::NotFound().body(format!("unknown dataset id '{dataset_id}'"));
+    }
+    if body.version.trim().is_empty() {
+        return HttpResponse::BadRequest().body("restore version is required");
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "xact_id": null,
+        "rows_restored": 0,
+        "rows_deleted": 0
+    }))
+}
+
 async fn mock_btql(
     state: web::Data<Arc<MockServerState>>,
     req: HttpRequest,
@@ -563,6 +654,15 @@ async fn mock_logs3(
     }
 
     HttpResponse::Ok().json(serde_json::json!({}))
+}
+
+fn dataset_exists(state: &Arc<MockServerState>, dataset_id: &str) -> bool {
+    state
+        .datasets
+        .lock()
+        .expect("datasets lock")
+        .iter()
+        .any(|dataset| dataset.id == dataset_id)
 }
 
 fn log_request(state: &Arc<MockServerState>, req: &HttpRequest) {

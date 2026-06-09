@@ -311,7 +311,7 @@ async fn run_list(ctx: &ResolvedContext, args: &SnapshotListArgs, json: bool) ->
             return Ok(());
         }
 
-        print_snapshot_list(ctx, None, &snapshots)?;
+        super::print_no_datasets_found(&ctx.project.name);
         return Ok(());
     };
 

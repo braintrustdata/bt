@@ -31,7 +31,13 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
         }
     };
 
-    if !force && is_interactive() {
+    if !force {
+        if !is_interactive() {
+            bail!(
+                "dataset delete requires --force in non-interactive mode. Use: bt datasets delete <name> --force"
+            );
+        }
+
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete dataset '{}' from {}?",
