@@ -77,6 +77,7 @@ impl UpdateChannel {
 }
 
 const BUILD_UPDATE_CHANNEL: Option<&str> = option_env!("BT_UPDATE_CHANNEL");
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -186,9 +187,7 @@ fn print_check(base: &BaseArgs, channel: UpdateChannel, release: &GitHubRelease)
 
 async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHubRelease> {
     let client = crate::http::build_http_client_from_builder(
-        Client::builder()
-            .user_agent("bt-self-update")
-            .timeout(DEFAULT_HTTP_TIMEOUT),
+        Client::builder().timeout(DEFAULT_HTTP_TIMEOUT),
     )
     .context("failed to initialize HTTP client")?;
 

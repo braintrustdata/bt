@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::auth::LoginContext;
 
 pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const BT_USER_AGENT: &str = concat!("bt-cli/", env!("CARGO_PKG_VERSION"));
 
 pub fn build_http_client(timeout: std::time::Duration) -> Result<Client> {
     build_http_client_from_builder(Client::builder().timeout(timeout))
@@ -19,6 +20,7 @@ pub fn build_http_client_from_builder(mut builder: ClientBuilder) -> Result<Clie
     // Prefer the platform/native root store so standard envs like SSL_CERT_FILE
     // are honored consistently across the CLI.
     builder = builder
+        .user_agent(BT_USER_AGENT)
         .tls_built_in_native_certs(true)
         .tls_built_in_webpki_certs(false);
 
@@ -413,8 +415,14 @@ pub async fn put_signed_url_with_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
     use serde::Deserialize;
     use serde_json::json;
+
+    type RecordedUserAgent = Arc<Mutex<Option<String>>>;
 
     #[allow(dead_code)]
     #[derive(Debug, Deserialize)]
@@ -426,6 +434,56 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct TestRow {
         id: String,
+    }
+
+    async fn record_user_agent(
+        state: web::Data<RecordedUserAgent>,
+        req: HttpRequest,
+    ) -> HttpResponse {
+        let user_agent = req
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        *state.lock().expect("user agent lock") = user_agent;
+        HttpResponse::Ok().finish()
+    }
+
+    async fn captured_user_agent(client: Client) -> Option<String> {
+        let state = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let data = web::Data::new(state.clone());
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(data.clone())
+                .route("/", web::get().to(record_user_agent))
+        })
+        .workers(1)
+        .listen(listener)
+        .expect("listen mock server")
+        .run();
+        let handle = server.handle();
+        tokio::spawn(server);
+
+        let response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("send request");
+        assert!(response.status().is_success());
+        handle.stop(true).await;
+
+        let user_agent = state.lock().expect("user agent lock").clone();
+        user_agent
+    }
+
+    #[tokio::test]
+    async fn build_http_client_sets_default_user_agent() {
+        let client = build_http_client(DEFAULT_HTTP_TIMEOUT).expect("build client");
+        let user_agent = captured_user_agent(client).await;
+
+        assert_eq!(user_agent.as_deref(), Some(BT_USER_AGENT));
     }
 
     #[test]
