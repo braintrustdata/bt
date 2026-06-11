@@ -1748,6 +1748,7 @@ exit 24
         .args([
             "functions",
             "--json",
+            "--verbose",
             "push",
             "--file",
             source
@@ -1782,6 +1783,16 @@ exit 24
     assert_eq!(summary["status"].as_str(), Some("success"));
     assert_eq!(summary["uploaded_files"].as_u64(), Some(1));
     assert_eq!(summary["failed_files"].as_u64(), Some(0));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("building payload"),
+        "expected insert payload construction log, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("request body for POST /insert-functions"),
+        "expected final insert payload log, got:\n{stderr}"
+    );
 
     let inserted = state
         .inserted_functions
