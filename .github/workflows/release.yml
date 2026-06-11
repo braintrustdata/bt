@@ -307,24 +307,12 @@ jobs:
             ${{ steps.dist-files.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
-  release-approval:
-    needs:
-      - plan
-      - build-local-artifacts
-      - build-global-artifacts
-    if: ${{ always() && needs.plan.outputs.should-release == 'true' && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    runs-on: ubuntu-22.04
-    environment: release
-    steps:
-      - run: echo "Approved stable release ${{ needs.plan.outputs.tag }}"
-
   host:
     needs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-      - release-approval
-    if: ${{ always() && needs.plan.outputs.should-release == 'true' && needs.plan.result == 'success' && needs.release-approval.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.outputs.should-release == 'true' && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
