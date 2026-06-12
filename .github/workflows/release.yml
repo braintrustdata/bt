@@ -222,6 +222,7 @@ jobs:
 
       - name: Sign Windows artifacts
         if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
+        continue-on-error: true
         uses: ./.github/actions/sign-windows-artifacts
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
