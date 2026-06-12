@@ -239,8 +239,9 @@ fn main() {
     let exit_code = match try_main() {
         Ok(()) => ExitCode::Success,
         Err(err) => {
-            let code = classify_error(&err);
-            print_error(&err, code);
+            let missing_credential = crate::auth::is_missing_credential_error(&err);
+            let code = classify_error(&err, missing_credential);
+            print_error(&err, code, missing_credential);
             code
         }
     };
@@ -390,7 +391,11 @@ fn configure_output(base: &BaseArgs) {
     }
 }
 
-fn classify_error(err: &anyhow::Error) -> ExitCode {
+fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
+    if missing_credential {
+        return ExitCode::Auth;
+    }
+
     if let Some(http_error) = find_http_error(err) {
         let status = http_error.status.as_u16();
         if status == 401 || status == 403 {
@@ -479,8 +484,11 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
         || message.contains("invalid")
 }
 
-fn print_error(err: &anyhow::Error, code: ExitCode) {
+fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
     eprintln!("error: {err}");
+    if code == ExitCode::Auth && !missing_credential {
+        eprintln!("Your credentials may be expired or invalid. Re-authenticate with `bt auth login`, or run `bt auth profiles` and `bt status` to check profile status.");
+    }
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
     }
