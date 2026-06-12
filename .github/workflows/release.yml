@@ -20,6 +20,7 @@ concurrency:
 permissions:
   contents: write
   id-token: write
+  checks: write
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -221,7 +222,9 @@ jobs:
           echo "dist ran successfully"
 
       - name: Sign Windows artifacts
+        id: sign
         if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
+        continue-on-error: true
         uses: ./.github/actions/sign-windows-artifacts
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -230,6 +233,14 @@ jobs:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
           cert-profile: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
+
+      - name: Verify Windows signature and report
+        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' && always() }}
+        uses: ./.github/actions/verify-windows-signature
+        with:
+          sign-outcome: ${{ steps.sign.outcome }}
+          targets: ${{ join(matrix.targets, ', ') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - id: dist-files
         name: Post-build

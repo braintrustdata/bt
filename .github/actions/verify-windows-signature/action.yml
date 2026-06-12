@@ -1,0 +1,61 @@
+name: Verify Windows signature
+description: Check that bt.exe binaries are validly Authenticode-signed; if not, post a neutral check run so the unsigned build is surfaced without failing the job. Stops being necessary once GitHub supports https://github.com/actions/runner/issues/2347 (opened 1st April 2020, 1500 reactions, still not done so we'll probably have to wait a few more years)
+
+inputs:
+  sign-outcome:
+    required: true
+    description: Outcome of the signing step (e.g. success/failure/skipped).
+  targets:
+    required: true
+    description: Human-readable build targets, used in the check-run name.
+  github-token:
+    required: true
+    description: Token with checks:write used to create the check run.
+
+runs:
+  using: composite
+  steps:
+    - name: Verify signature and report
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SIGN_OUTCOME: ${{ inputs.sign-outcome }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        $exes = Get-ChildItem -Path "target/distrib" -Filter "bt.exe" -Recurse -ErrorAction SilentlyContinue
+        $unsigned = @()
+        foreach ($exe in $exes) {
+          $sig = Get-AuthenticodeSignature $exe.FullName
+          if ($sig.Status -ne 'Valid') {
+            $unsigned += "$($exe.FullName) [$($sig.Status)]"
+          }
+        }
+
+        if ($SIGN_OUTCOME -eq 'success' -and $unsigned.Count -eq 0) {
+          Write-Host "All bt.exe binaries are validly signed."
+          exit 0
+        }
+
+        $summary = if ($unsigned.Count -gt 0) {
+          "Code signing did not produce valid Authenticode signatures. The following binaries are unsigned and were shipped as-is:`n`n" + (($unsigned | ForEach-Object { "- $_" }) -join "`n")
+        } else {
+          "The Windows signing step failed (outcome: $SIGN_OUTCOME). Binaries were shipped unsigned."
+        }
+
+        $body = @{
+          name       = "windows-signing ($env:TARGETS)"
+          head_sha   = $env:GITHUB_SHA
+          status     = "completed"
+          conclusion = "neutral"
+          output     = @{
+            title   = "Windows binaries shipped unsigned"
+            summary = $summary
+          }
+        } | ConvertTo-Json -Depth 5
+
+        $body | gh api "repos/$env:GITHUB_REPOSITORY/check-runs" `
+          --method POST `
+          -H "Accept: application/vnd.github+json" `
+          --input -
+
+        Write-Host "::warning::$summary"
