@@ -289,6 +289,8 @@ Local version and pagination-key conversion helpers:
   - `bt auth login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
   - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
+  - After login, `bt` updates the active profile/org context immediately. If `--project` is set, it also switches that project; otherwise it clears any stale default project for the new login.
+  - Pass `--no-profile-switch` (or set `BRAINTRUST_NO_PROFILE_SWITCH=1`) to keep the old behavior and avoid changing active profile/org/project context.
   - `bt` confirms the resolved API URL before saving.
 - Login with OAuth (browser-based, stores refresh token in secure credential store):
   - `bt auth login --oauth --profile work`
