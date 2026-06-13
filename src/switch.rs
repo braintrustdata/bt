@@ -150,7 +150,12 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let config_profile =
         config::trimmed_option(profile_name.as_deref().or(base.profile.as_deref()))
             .map(str::to_string);
-    apply_switch_config(&mut cfg, config_profile.as_deref(), &org_name, &project);
+    apply_switch_config(
+        &mut cfg,
+        config_profile.as_deref(),
+        Some(&org_name),
+        Some(&project),
+    );
     config::save_file(&path, &cfg)
         .context(format!("Could not save config to {}", path.display()))?;
 
@@ -176,7 +181,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     Ok(())
 }
 
-fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
+pub(crate) fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
     let global = config::global_path()?;
     let local = config::local_path().unwrap();
     let options = [
@@ -225,7 +230,10 @@ fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
     }
 }
 
-async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<api::Project> {
+pub(crate) async fn validate_or_create_project(
+    client: &ApiClient,
+    name: &str,
+) -> Result<api::Project> {
     let exists = with_spinner("Loading project...", api::get_project_by_name(client, name)).await?;
 
     if let Some(project) = exists {
@@ -248,18 +256,26 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<ap
     }
 }
 
-fn apply_switch_config(
+pub(crate) fn apply_switch_config(
     cfg: &mut config::Config,
     profile_name: Option<&str>,
-    org_name: &str,
-    project: &api::Project,
+    org_name: Option<&str>,
+    project: Option<&api::Project>,
 ) {
     if let Some(profile_name) = config::trimmed_option(profile_name) {
         cfg.profile = Some(profile_name.to_string());
     }
-    cfg.org = Some(org_name.to_string());
-    cfg.project = Some(project.name.clone());
-    cfg.project_id = Some(project.id.clone());
+    cfg.org = config::trimmed_option(org_name).map(str::to_string);
+    match project {
+        Some(project) => {
+            cfg.project = Some(project.name.clone());
+            cfg.project_id = Some(project.id.clone());
+        }
+        None => {
+            cfg.project = None;
+            cfg.project_id = None;
+        }
+    }
 }
 
 fn resolve_profile_for_switch<F>(
@@ -530,7 +546,7 @@ mod tests {
             description: None,
         };
 
-        apply_switch_config(&mut cfg, Some("work"), "acme-org", &project);
+        apply_switch_config(&mut cfg, Some("work"), Some("acme-org"), Some(&project));
 
         assert_eq!(cfg.profile.as_deref(), Some("work"));
         assert_eq!(cfg.org.as_deref(), Some("acme-org"));
@@ -551,10 +567,28 @@ mod tests {
             description: None,
         };
 
-        apply_switch_config(&mut cfg, None, "acme-org", &project);
+        apply_switch_config(&mut cfg, None, Some("acme-org"), Some(&project));
 
         assert_eq!(cfg.profile.as_deref(), Some("work"));
         assert_eq!(cfg.project.as_deref(), Some("next-project"));
+    }
+
+    #[test]
+    fn apply_switch_config_clears_project_and_org_when_context_is_org_only() {
+        let mut cfg = config::Config {
+            profile: Some("work".to_string()),
+            org: Some("old-org".to_string()),
+            project: Some("stale-project".to_string()),
+            project_id: Some("proj_stale".to_string()),
+            ..Default::default()
+        };
+
+        apply_switch_config(&mut cfg, Some("next"), None, None);
+
+        assert_eq!(cfg.profile.as_deref(), Some("next"));
+        assert_eq!(cfg.org, None);
+        assert_eq!(cfg.project, None);
+        assert_eq!(cfg.project_id, None);
     }
 
     #[test]
