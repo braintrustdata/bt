@@ -1,22 +1,10 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::Read;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{builder::BoolishValueParser, Args};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::prelude::Frame;
-use ratatui::style::Style;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Terminal;
+use dialoguer::console::style;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
@@ -24,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::http::{ApiClient, HttpError};
-use crate::ui::with_spinner;
+use crate::ui::{with_spinner, LinePrompt};
 
 const QUERY_SOURCE: &str = "bt_sql_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d";
 
@@ -157,145 +145,31 @@ async fn run_interactive(base: BaseArgs, client: ApiClient, lint_mode: String) -
     tokio::task::block_in_place(|| run_interactive_blocking(base.json, client, handle, lint_mode))
 }
 
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        disable_raw_mode().ok();
-        io::stdout().execute(LeaveAlternateScreen).ok();
-    }
-}
-
 fn run_interactive_blocking(
     json_output: bool,
     client: ApiClient,
     handle: tokio::runtime::Handle,
     lint_mode: String,
 ) -> Result<()> {
-    enable_raw_mode()?;
-    let _guard = TerminalGuard;
-    let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let res = run_app(&mut terminal, json_output, client, handle, lint_mode);
-    terminal.show_cursor().ok();
-    res
-}
-
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    json_output: bool,
-    client: ApiClient,
-    handle: tokio::runtime::Handle,
-    lint_mode: String,
-) -> Result<()> {
-    let mut app = App::new(json_output, lint_mode);
+    let mut editor = LinePrompt::new(Vec::new());
+    let prompt = style("SQL> ").bold().to_string();
 
     loop {
-        terminal.draw(|f| ui(f, &app))?;
-
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if handle_key_event(&mut app, key, &client, &handle)? {
-                        break;
-                    }
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
+        let Some(input) = editor.read_line(&prompt, "SQL> ".len())? else {
+            return Ok(());
+        };
+        let query = input.trim();
+        if query.is_empty() {
+            continue;
         }
+
+        match handle.block_on(execute_query(&client, query, lint_mode.as_str())) {
+            Ok(response) => print_response(&response, json_output)?,
+            Err(err) => eprintln!("{} {err}", style("error").red().bold()),
+        }
+
+        editor.add_history(query);
     }
-
-    Ok(())
-}
-
-fn handle_key_event(
-    app: &mut App,
-    key: KeyEvent,
-    client: &ApiClient,
-    handle: &tokio::runtime::Handle,
-) -> Result<bool> {
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.clear_input();
-            app.status = "Cleared input".to_string();
-        }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
-        KeyCode::Esc => return Ok(true),
-        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.output.clear();
-        }
-        KeyCode::Enter => {
-            let query = app.input.trim().to_string();
-            if query.is_empty() {
-                return Ok(false);
-            }
-
-            app.status = "Running query...".to_string();
-            let result = handle.block_on(execute_query(client, &query, app.lint_mode.as_str()));
-            match result {
-                Ok(response) => {
-                    app.output = format_response(&response, app.json_output)?;
-                    app.status = "OK".to_string();
-                }
-                Err(err) => {
-                    app.output = format!("Error: {err}");
-                    app.status = "Error".to_string();
-                }
-            }
-
-            app.push_history(&query);
-            app.clear_input();
-        }
-        KeyCode::Backspace => app.backspace(),
-        KeyCode::Delete => app.delete(),
-        KeyCode::Left => app.move_left(),
-        KeyCode::Right => app.move_right(),
-        KeyCode::Home => app.move_home(),
-        KeyCode::End => app.move_end(),
-        KeyCode::Up => app.history_prev(),
-        KeyCode::Down => app.history_next(),
-        KeyCode::Char(ch)
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT) =>
-        {
-            app.insert_char(ch);
-        }
-        _ => {}
-    }
-
-    Ok(false)
-}
-
-fn ui(frame: &mut Frame<'_>, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-
-    let output = Paragraph::new(app.output.as_str())
-        .block(Block::default().title("Results").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(output, chunks[0]);
-
-    let (input_view, cursor_col) = app.input_view(chunks[1]);
-    let input =
-        Paragraph::new(input_view).block(Block::default().title("SQL").borders(Borders::ALL));
-    frame.render_widget(input, chunks[1]);
-    frame.set_cursor_position((chunks[1].x + 1 + cursor_col, chunks[1].y + 1));
-
-    let status = Paragraph::new(Line::from(app.status.as_str()))
-        .style(Style::default())
-        .block(Block::default().borders(Borders::TOP))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(status, chunks[2]);
 }
 
 fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> {
@@ -512,159 +386,6 @@ fn pad_cell(cell: &str, width: usize) -> String {
     out.push_str(cell);
     out.extend(std::iter::repeat_n(' ', width - current));
     out
-}
-
-struct App {
-    input: String,
-    cursor: usize,
-    output: String,
-    status: String,
-    history: Vec<String>,
-    history_index: Option<usize>,
-    json_output: bool,
-    lint_mode: String,
-}
-
-impl App {
-    fn new(json_output: bool, lint_mode: String) -> Self {
-        Self {
-            input: String::new(),
-            cursor: 0,
-            output: String::new(),
-            status: "Enter SQL and press Enter. Ctrl+C to exit.".to_string(),
-            history: Vec::new(),
-            history_index: None,
-            json_output,
-            lint_mode,
-        }
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        self.input.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
-        self.history_index = None;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let new_cursor = prev_char_boundary(&self.input, self.cursor);
-        self.input.replace_range(new_cursor..self.cursor, "");
-        self.cursor = new_cursor;
-        self.history_index = None;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let next_cursor = next_char_boundary(&self.input, self.cursor);
-        self.input.replace_range(self.cursor..next_cursor, "");
-        self.history_index = None;
-    }
-
-    fn move_left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor = prev_char_boundary(&self.input, self.cursor);
-    }
-
-    fn move_right(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        self.cursor = next_char_boundary(&self.input, self.cursor);
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.input.len();
-    }
-
-    fn clear_input(&mut self) {
-        self.input.clear();
-        self.cursor = 0;
-        self.history_index = None;
-    }
-
-    fn push_history(&mut self, query: &str) {
-        if query.trim().is_empty() {
-            return;
-        }
-        if self.history.last().map(String::as_str) != Some(query) {
-            self.history.push(query.to_string());
-        }
-        self.history_index = None;
-    }
-
-    fn history_prev(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let next_index = match self.history_index {
-            None => self.history.len().saturating_sub(1),
-            Some(0) => 0,
-            Some(idx) => idx - 1,
-        };
-        self.history_index = Some(next_index);
-        self.input = self.history[next_index].clone();
-        self.cursor = self.input.len();
-    }
-
-    fn history_next(&mut self) {
-        let Some(idx) = self.history_index else {
-            return;
-        };
-        let next_index = idx + 1;
-        if next_index >= self.history.len() {
-            self.history_index = None;
-            self.clear_input();
-            return;
-        }
-        self.history_index = Some(next_index);
-        self.input = self.history[next_index].clone();
-        self.cursor = self.input.len();
-    }
-
-    fn input_view(&self, area: Rect) -> (String, u16) {
-        let available_width = area.width.saturating_sub(2) as usize;
-        if available_width == 0 {
-            return (String::new(), 0);
-        }
-
-        let mut start = self.cursor.saturating_sub(available_width);
-
-        while start > 0 && !self.input.is_char_boundary(start) {
-            start -= 1;
-        }
-
-        let mut end = (start + available_width).min(self.input.len());
-        while end < self.input.len() && !self.input.is_char_boundary(end) {
-            end += 1;
-        }
-
-        let visible = self.input[start..end].to_string();
-        let cursor_col = self.cursor.saturating_sub(start) as u16;
-        (visible, cursor_col)
-    }
-}
-
-fn prev_char_boundary(s: &str, idx: usize) -> usize {
-    s[..idx].char_indices().last().map(|(i, _)| i).unwrap_or(0)
-}
-
-fn next_char_boundary(s: &str, idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    let mut iter = s[idx..].char_indices();
-    iter.next();
-    iter.next().map(|(i, _)| idx + i).unwrap_or_else(|| s.len())
 }
 
 #[cfg(test)]
