@@ -18,11 +18,10 @@ use crate::http::{build_http_client, build_http_client_from_builder, DEFAULT_HTT
 use crate::project_context::{resolve_project_command_context_with_auth_mode, ProjectContext};
 use crate::ui::{
     animations_enabled, apply_column_padding, header, is_interactive, is_quiet, print_with_pager,
-    styled_table, truncate,
+    styled_table, truncate, LinePrompt,
 };
 
-const DEFAULT_RUNTIME_URL: &str = "http://localhost:4001";
-const DEFAULT_AGENT_SLUG: &str = "loop";
+const DEFAULT_AGENT_SLUG: &str = "loop-chat";
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -38,14 +37,13 @@ pub struct LoopArgs {
     #[arg(value_name = "MESSAGE")]
     message: Vec<String>,
 
-    /// Agent Runtime base URL
+    /// Loop Runtime base URL. Defaults to the Braintrust API URL plus /loop-runtime.
     #[arg(
         long = "runtime-url",
         env = "BT_LOOP_RUNTIME_URL",
-        default_value = DEFAULT_RUNTIME_URL,
         hide_env_values = true
     )]
-    runtime_url: String,
+    runtime_url: Option<String>,
 
     /// Loop agent slug to use or create
     #[arg(long, env = "BT_LOOP_AGENT", default_value = DEFAULT_AGENT_SLUG)]
@@ -118,7 +116,8 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
     }
 
     let ctx = resolve_project_command_context_with_auth_mode(&base, false).await?;
-    let client = RuntimeClient::new(args.runtime_url.as_str(), ctx.client.api_key())?;
+    let runtime_url = resolve_loop_runtime_url(ctx.client.base_url(), args.runtime_url.as_deref())?;
+    let client = LoopRuntimeClient::new(runtime_url.as_str(), ctx.client.api_key())?;
 
     if args.list {
         let conversations = client.list_conversations(&ctx.project.id, &args).await?;
@@ -148,12 +147,24 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
     run_interactive_chat(&client, &ctx, &args).await
 }
 
+fn resolve_loop_runtime_url(api_url: &str, explicit_runtime_url: Option<&str>) -> Result<String> {
+    if let Some(runtime_url) = explicit_runtime_url {
+        let runtime_url = runtime_url.trim();
+        if runtime_url.is_empty() {
+            bail!("--runtime-url must not be empty");
+        }
+        return Ok(runtime_url.trim_end_matches('/').to_string());
+    }
+
+    Ok(format!("{}/loop-runtime", api_url.trim_end_matches('/')))
+}
+
 async fn run_interactive_chat(
-    client: &RuntimeClient,
+    client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     args: &LoopArgs,
 ) -> Result<()> {
-    let mut input = String::new();
+    let mut initial_history = Vec::new();
     let mut conversation = if args.conversation.is_some() {
         let created = client.create_conversation(ctx, args).await?;
         print_conversation_header(&created, args);
@@ -161,18 +172,17 @@ async fn run_interactive_chat(
             .get_conversation_events(&ctx.project.id, &created.agent.id, &created.conversation.id)
             .await?;
         print_history(&events.events)?;
+        initial_history = user_message_history(&events.events);
         Some(created)
     } else {
         None
     };
+    let mut editor = LinePrompt::new(initial_history);
+    let prompt = style("You: ").bold().to_string();
     loop {
-        print!("{}", style("You: ").bold());
-        io::stdout().flush()?;
-        input.clear();
-        if io::stdin().read_line(&mut input)? == 0 {
-            println!();
+        let Some(input) = editor.read_line(&prompt, "You: ".len())? else {
             return Ok(());
-        }
+        };
         let message = input.trim();
         if message.is_empty() {
             continue;
@@ -189,6 +199,7 @@ async fn run_interactive_chat(
             .as_ref()
             .expect("conversation is created before sending a Loop message");
         send_and_print(client, ctx, conversation, args, message).await?;
+        editor.add_history(message);
     }
 }
 
@@ -229,8 +240,19 @@ fn print_history_messages(event: &RuntimeEvent) -> Result<()> {
     Ok(())
 }
 
+fn user_message_history(events: &[RuntimeEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| event.data.get("messages").and_then(Value::as_array))
+        .flat_map(|messages| messages.iter())
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|message| message_content_text(message.get("content")))
+        .filter(|text| !text.trim().is_empty())
+        .collect()
+}
+
 async fn send_and_print(
-    client: &RuntimeClient,
+    client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
     args: &LoopArgs,
@@ -250,7 +272,7 @@ async fn send_and_print(
 }
 
 async fn send_and_collect(
-    client: &RuntimeClient,
+    client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
     args: &LoopArgs,
@@ -270,7 +292,7 @@ async fn send_and_collect(
 }
 
 async fn send_and_collect_with_callback<F>(
-    client: &RuntimeClient,
+    client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
     args: &LoopArgs,
@@ -429,14 +451,14 @@ fn print_conversation_list(
 }
 
 #[derive(Clone)]
-struct RuntimeClient {
+struct LoopRuntimeClient {
     http: reqwest::Client,
     watch_http: reqwest::Client,
     base_url: String,
     api_key: String,
 }
 
-impl RuntimeClient {
+impl LoopRuntimeClient {
     fn new(base_url: &str, api_key: &str) -> Result<Self> {
         if base_url.trim().is_empty() {
             bail!("--runtime-url must not be empty");
@@ -515,8 +537,8 @@ impl RuntimeClient {
             }),
             response => Err(LoopCommandError::new(
                 "failed to list Loop conversations",
-                RuntimeRequestError::new(format!(
-                    "Agent Runtime returned unexpected Exo response: {}",
+                LoopRuntimeRequestError::new(format!(
+                    "Loop Runtime returned unexpected Exo response: {}",
                     response.response_type()
                 ))
                 .into(),
@@ -556,8 +578,8 @@ impl RuntimeClient {
             }),
             response => Err(LoopCommandError::new(
                 "failed to load Loop conversation",
-                RuntimeRequestError::new(format!(
-                    "Agent Runtime returned unexpected Exo response: {}",
+                LoopRuntimeRequestError::new(format!(
+                    "Loop Runtime returned unexpected Exo response: {}",
                     response.response_type()
                 ))
                 .into(),
@@ -574,7 +596,8 @@ impl RuntimeClient {
         let ExoResponse::Agents { agents } = response else {
             return Err(LoopCommandError::new(
                 "failed to list Loop agents",
-                RuntimeRequestError::new("Agent Runtime returned unexpected Exo response").into(),
+                LoopRuntimeRequestError::new("Loop Runtime returned unexpected Exo response")
+                    .into(),
             )
             .into());
         };
@@ -584,7 +607,7 @@ impl RuntimeClient {
             .ok_or_else(|| {
                 LoopCommandError::new(
                     "failed to list Loop conversations",
-                    RuntimeRequestError::new(format!("Loop agent not found: {slug}")).into(),
+                    LoopRuntimeRequestError::new(format!("Loop agent not found: {slug}")).into(),
                 )
                 .into()
             })
@@ -625,14 +648,15 @@ impl RuntimeClient {
             ..
         } = response;
         if !ok {
-            return Err(RuntimeRequestError::new(format!(
-                "Agent Runtime Exo request failed: {}",
+            return Err(LoopRuntimeRequestError::new(format!(
+                "Loop Runtime Exo request failed: {}",
                 error.unwrap_or_else(|| "unknown error".to_string())
             ))
             .into());
         }
-        response
-            .ok_or_else(|| RuntimeRequestError::new("Agent Runtime Exo response was empty").into())
+        response.ok_or_else(|| {
+            LoopRuntimeRequestError::new("Loop Runtime Exo response was empty").into()
+        })
     }
 
     async fn watch_events<F>(
@@ -667,8 +691,8 @@ impl RuntimeClient {
             .map_err(|err| {
                 LoopCommandError::new(
                     "failed to watch Loop events",
-                    RuntimeRequestError::with_source(
-                        format!("Agent Runtime request failed: GET {url_string}"),
+                    LoopRuntimeRequestError::with_source(
+                        format!("Loop Runtime request failed: GET {url_string}"),
                         err,
                     )
                     .into(),
@@ -679,8 +703,8 @@ impl RuntimeClient {
             let body = response.bytes().await.map_err(|err| {
                 LoopCommandError::new(
                     "failed to watch Loop events",
-                    RuntimeRequestError::with_source(
-                        format!("failed to read Agent Runtime response body from GET {url_string}"),
+                    LoopRuntimeRequestError::with_source(
+                        format!("failed to read Loop Runtime response body from GET {url_string}"),
                         err,
                     )
                     .into(),
@@ -689,8 +713,8 @@ impl RuntimeClient {
             let body_text = String::from_utf8_lossy(&body);
             return Err(LoopCommandError::new(
                 "failed to watch Loop events",
-                RuntimeRequestError::new(format!(
-                    "Agent Runtime request failed: GET {url_string} returned {status}: {body_text}"
+                LoopRuntimeRequestError::new(format!(
+                    "Loop Runtime request failed: GET {url_string} returned {status}: {body_text}"
                 ))
                 .into(),
             )
@@ -702,8 +726,8 @@ impl RuntimeClient {
             let chunk = chunk.map_err(|err| {
                 LoopCommandError::new(
                     "failed to watch Loop events",
-                    RuntimeRequestError::with_source(
-                        format!("Agent Runtime event stream failed: GET {url_string}"),
+                    LoopRuntimeRequestError::with_source(
+                        format!("Loop Runtime event stream failed: GET {url_string}"),
                         err,
                     )
                     .into(),
@@ -718,14 +742,14 @@ impl RuntimeClient {
                         "exo_event" => {
                             let runtime_event = serde_json::from_str::<RuntimeEvent>(&event.data)
                                 .with_context(|| {
-                                format!("failed to parse Agent Runtime event from {url_string}")
+                                format!("failed to parse Loop Runtime event from {url_string}")
                             })?;
                             if !on_event(runtime_event)? {
                                 return Ok(());
                             }
                         }
                         "error" => {
-                            bail!("Agent Runtime event stream failed: {}", event.data);
+                            bail!("Loop Runtime event stream failed: {}", event.data);
                         }
                         _ => {}
                     }
@@ -749,12 +773,12 @@ impl RuntimeClient {
             .send()
             .await
             .map_err(|err| {
-                RuntimeRequestError::with_source(
-                    format!("Agent Runtime request failed: POST {url}"),
+                LoopRuntimeRequestError::with_source(
+                    format!("Loop Runtime request failed: POST {url}"),
                     err,
                 )
             })?;
-        parse_runtime_response(response, "POST", &url).await
+        parse_loop_runtime_response(response, "POST", &url).await
     }
 
     fn url(&self, path: &str) -> String {
@@ -790,12 +814,12 @@ impl Error for LoopCommandError {
 }
 
 #[derive(Debug)]
-struct RuntimeRequestError {
+struct LoopRuntimeRequestError {
     message: String,
     source: Option<reqwest::Error>,
 }
 
-impl RuntimeRequestError {
+impl LoopRuntimeRequestError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -811,7 +835,7 @@ impl RuntimeRequestError {
     }
 }
 
-impl fmt::Display for RuntimeRequestError {
+impl fmt::Display for LoopRuntimeRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.source {
             Some(source) => write!(f, "{}: {source}", self.message),
@@ -820,7 +844,7 @@ impl fmt::Display for RuntimeRequestError {
     }
 }
 
-impl Error for RuntimeRequestError {
+impl Error for LoopRuntimeRequestError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.source
             .as_ref()
@@ -828,7 +852,7 @@ impl Error for RuntimeRequestError {
     }
 }
 
-async fn parse_runtime_response<T>(
+async fn parse_loop_runtime_response<T>(
     response: reqwest::Response,
     method: &str,
     url: &str,
@@ -838,20 +862,20 @@ where
 {
     let status = response.status();
     let body = response.bytes().await.map_err(|err| {
-        RuntimeRequestError::with_source(
-            format!("failed to read Agent Runtime response body from {method} {url}"),
+        LoopRuntimeRequestError::with_source(
+            format!("failed to read Loop Runtime response body from {method} {url}"),
             err,
         )
     })?;
     if !status.is_success() {
         let body_text = String::from_utf8_lossy(&body);
-        return Err(RuntimeRequestError::new(format!(
-            "Agent Runtime request failed: {method} {url} returned {status}: {body_text}"
+        return Err(LoopRuntimeRequestError::new(format!(
+            "Loop Runtime request failed: {method} {url} returned {status}: {body_text}"
         ))
         .into());
     }
     serde_json::from_slice(&body)
-        .with_context(|| format!("failed to parse Agent Runtime response from {method} {url}"))
+        .with_context(|| format!("failed to parse Loop Runtime response from {method} {url}"))
 }
 
 struct SseEvent {
@@ -873,7 +897,7 @@ fn parse_sse_event(raw_event: &[u8]) -> Result<Option<SseEvent>> {
     if raw_event.is_empty() {
         return Ok(None);
     }
-    let text = std::str::from_utf8(raw_event).context("failed to parse Agent Runtime SSE frame")?;
+    let text = std::str::from_utf8(raw_event).context("failed to parse Loop Runtime SSE frame")?;
     let mut name = "message".to_string();
     let mut data = Vec::new();
     for raw_line in text.lines() {
@@ -1339,6 +1363,31 @@ mod tests {
     }
 
     #[test]
+    fn default_agent_slug_matches_loop_chat_runtime_agent() {
+        assert_eq!(DEFAULT_AGENT_SLUG, "loop-chat");
+    }
+
+    #[test]
+    fn loop_runtime_url_defaults_to_api_proxy_path() {
+        assert_eq!(
+            resolve_loop_runtime_url("http://localhost:8000/", None).expect("runtime URL"),
+            "http://localhost:8000/loop-runtime"
+        );
+    }
+
+    #[test]
+    fn loop_runtime_url_uses_explicit_override() {
+        assert_eq!(
+            resolve_loop_runtime_url(
+                "http://localhost:8000",
+                Some(" https://loop-runtime.example.test/ "),
+            )
+            .expect("runtime URL"),
+            "https://loop-runtime.example.test"
+        );
+    }
+
+    #[test]
     fn stream_chunk_text_reads_openai_style_delta_content() {
         let event = RuntimeEvent {
             id: "event-id".to_string(),
@@ -1386,6 +1435,38 @@ mod tests {
                 {"type": "text", "text": " part two"}
             ]))),
             "part one part two"
+        );
+    }
+
+    #[test]
+    fn user_message_history_reads_only_conversation_user_messages() {
+        let events = vec![
+            RuntimeEvent {
+                id: "event-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                data: json!({
+                    "type": "messages",
+                    "messages": [
+                        {"role": "user", "content": "first question"},
+                        {"role": "assistant", "content": "first answer"}
+                    ]
+                }),
+            },
+            RuntimeEvent {
+                id: "event-2".to_string(),
+                turn_id: Some("turn-2".to_string()),
+                data: json!({
+                    "type": "messages",
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "second question"}]}
+                    ]
+                }),
+            },
+        ];
+
+        assert_eq!(
+            user_message_history(&events),
+            vec!["first question".to_string(), "second question".to_string()]
         );
     }
 }

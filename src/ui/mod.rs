@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use dialoguer::console::Term;
 
+mod line_editor;
 mod pager;
 pub mod prompt_render;
 mod select;
@@ -50,6 +51,7 @@ pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && !NO_INPUT.load(Ordering::Relaxed)
 }
 
+pub use line_editor::LinePrompt;
 pub use pager::print_with_pager;
 pub use select::{fuzzy_select, select_project, ProjectSelectMode};
 
