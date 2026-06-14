@@ -31,6 +31,12 @@ Examples:
   bt loop \"Find the most expensive traces from the last day\"
   bt loop --conversation daily-debug \"What changed since yesterday?\"
   bt loop --harness codex --model gpt-5.4 \"Investigate this project\"
+
+Interactive commands:
+  /settings
+  /harness codex
+  /model gpt-5.4
+  /model clear
 ")]
 pub struct LoopArgs {
     /// Message to send. Omit to start an interactive session.
@@ -65,16 +71,16 @@ pub struct LoopArgs {
     #[arg(long = "conversation-name", env = "BT_LOOP_CONVERSATION_NAME")]
     conversation_name: Option<String>,
 
-    /// Backend harness to use
+    /// Initial backend harness to use
     #[arg(long, env = "BT_LOOP_HARNESS", value_enum, default_value_t = HarnessArg::Default)]
     harness: HarnessArg,
 
-    /// Model override for this turn
+    /// Initial model override
     #[arg(long, env = "BT_LOOP_MODEL")]
     model: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum HarnessArg {
     Default,
     Codex,
@@ -95,6 +101,41 @@ impl HarnessArg {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
         }
+    }
+
+    fn valid_values() -> String {
+        Self::value_variants()
+            .iter()
+            .filter_map(|value| value.to_possible_value())
+            .map(|value| value.get_name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TurnSettings {
+    harness: HarnessArg,
+    model: Option<String>,
+}
+
+impl TurnSettings {
+    fn from_args(args: &LoopArgs) -> Self {
+        Self {
+            harness: args.harness,
+            model: args.model.clone(),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self.model.as_deref() {
+            Some(model) => format!("{} | {model}", self.harness),
+            None => self.harness.to_string(),
+        }
+    }
+
+    fn print(&self) {
+        eprintln!("{} {}", style("settings").dim(), style(self.label()).bold());
     }
 }
 
@@ -118,6 +159,7 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
     let ctx = resolve_project_command_context_with_auth_mode(&base, false).await?;
     let runtime_url = resolve_loop_runtime_url(ctx.client.base_url(), args.runtime_url.as_deref())?;
     let client = LoopRuntimeClient::new(runtime_url.as_str(), ctx.client.api_key())?;
+    let settings = TurnSettings::from_args(&args);
 
     if args.list {
         let conversations = client.list_conversations(&ctx.project.id, &args).await?;
@@ -130,16 +172,17 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
     }
 
     if base.json {
-        let conversation = client.create_conversation(&ctx, &args).await?;
-        let report = send_and_collect(&client, &ctx, &conversation, &args, &message, true).await?;
+        let conversation = client.create_conversation(&ctx, &args, &settings).await?;
+        let report =
+            send_and_collect(&client, &ctx, &conversation, &settings, &message, true).await?;
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
 
     if !message.is_empty() {
-        let conversation = client.create_conversation(&ctx, &args).await?;
-        print_chat_header(&ctx, &conversation, &args);
-        send_and_print(&client, &ctx, &conversation, &args, &message).await?;
+        let conversation = client.create_conversation(&ctx, &args, &settings).await?;
+        print_chat_header(&ctx, &conversation, &settings);
+        send_and_print(&client, &ctx, &conversation, &settings, &message).await?;
         return Ok(());
     }
 
@@ -164,10 +207,11 @@ async fn run_interactive_chat(
     ctx: &ProjectContext,
     args: &LoopArgs,
 ) -> Result<()> {
+    let mut settings = TurnSettings::from_args(args);
     let mut initial_history = Vec::new();
     let mut conversation = if args.conversation.is_some() {
-        let created = client.create_conversation(ctx, args).await?;
-        print_conversation_header(&created, args);
+        let created = client.create_conversation(ctx, args, &settings).await?;
+        print_conversation_header(&created, &settings);
         let events = client
             .get_conversation_events(&ctx.project.id, &created.agent.id, &created.conversation.id)
             .await?;
@@ -187,20 +231,104 @@ async fn run_interactive_chat(
         if message.is_empty() {
             continue;
         }
-        if matches!(message, "/exit" | "/quit" | "exit" | "quit") {
-            return Ok(());
+        if let Some(command) = handle_interactive_command(message, &mut settings)? {
+            if command == InteractiveCommand::Exit {
+                return Ok(());
+            }
+            continue;
         }
         if conversation.is_none() {
-            let created = client.create_conversation(ctx, args).await?;
-            print_conversation_header(&created, args);
+            let created = client.create_conversation(ctx, args, &settings).await?;
+            print_conversation_header(&created, &settings);
             conversation = Some(created);
         }
         let conversation = conversation
             .as_ref()
             .expect("conversation is created before sending a Loop message");
-        send_and_print(client, ctx, conversation, args, message).await?;
+        send_and_print(client, ctx, conversation, &settings, message).await?;
         editor.add_history(message);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveCommand {
+    Continue,
+    Exit,
+}
+
+fn handle_interactive_command(
+    message: &str,
+    settings: &mut TurnSettings,
+) -> Result<Option<InteractiveCommand>> {
+    if matches!(message, "/exit" | "/quit" | "exit" | "quit") {
+        return Ok(Some(InteractiveCommand::Exit));
+    }
+
+    let Some(command) = message.strip_prefix('/') else {
+        return Ok(None);
+    };
+    let mut parts = command.split_whitespace();
+    let Some(name) = parts.next() else {
+        return Ok(None);
+    };
+    match name {
+        "settings" => {
+            if parts.next().is_some() {
+                bail!("usage: /settings");
+            }
+            settings.print();
+        }
+        "harness" => {
+            let Some(value) = parts.next() else {
+                eprintln!(
+                    "{} {}",
+                    style("harness").dim(),
+                    style(settings.harness.to_string()).bold()
+                );
+                return Ok(Some(InteractiveCommand::Continue));
+            };
+            if parts.next().is_some() {
+                bail!("usage: /harness <{}>", HarnessArg::valid_values());
+            }
+            settings.harness = HarnessArg::from_str(value, true).map_err(|_| {
+                anyhow::anyhow!(
+                    "unknown harness '{value}'. Use one of: {}",
+                    HarnessArg::valid_values()
+                )
+            })?;
+            settings.print();
+        }
+        "model" => {
+            let Some(value) = parts.next() else {
+                eprintln!(
+                    "{} {}",
+                    style("model").dim(),
+                    style(settings.model.as_deref().unwrap_or("default")).bold()
+                );
+                return Ok(Some(InteractiveCommand::Continue));
+            };
+            if parts.next().is_some() {
+                bail!("usage: /model <model|clear>");
+            }
+            if matches!(value, "clear" | "default" | "none" | "reset") {
+                settings.model = None;
+            } else {
+                settings.model = Some(value.to_string());
+            }
+            settings.print();
+        }
+        "help" => {
+            eprintln!(
+                "{}\n  /settings\n  /harness <{}>\n  /model <model|clear>\n  /exit",
+                style("commands").dim(),
+                HarnessArg::valid_values()
+            );
+        }
+        _ => {
+            bail!("unknown command '/{name}'. Use /help.");
+        }
+    }
+    Ok(Some(InteractiveCommand::Continue))
 }
 
 fn print_history(events: &[RuntimeEvent]) -> Result<()> {
@@ -255,15 +383,20 @@ async fn send_and_print(
     client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
-    args: &LoopArgs,
+    settings: &TurnSettings,
     message: &str,
 ) -> Result<()> {
     let mut renderer = TranscriptRenderer::default();
-    let report =
-        send_and_collect_with_callback(client, ctx, conversation, args, message, false, |event| {
-            renderer.render_event(event)
-        })
-        .await?;
+    let report = send_and_collect_with_callback(
+        client,
+        ctx,
+        conversation,
+        settings,
+        message,
+        false,
+        |event| renderer.render_event(event),
+    )
+    .await?;
     renderer.finish_assistant_line()?;
     if report.ended_with_error {
         bail!("Loop turn failed");
@@ -275,7 +408,7 @@ async fn send_and_collect(
     client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
-    args: &LoopArgs,
+    settings: &TurnSettings,
     message: &str,
     include_events: bool,
 ) -> Result<LoopChatReport> {
@@ -283,7 +416,7 @@ async fn send_and_collect(
         client,
         ctx,
         conversation,
-        args,
+        settings,
         message,
         include_events,
         |_| Ok(()),
@@ -295,7 +428,7 @@ async fn send_and_collect_with_callback<F>(
     client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
-    args: &LoopArgs,
+    settings: &TurnSettings,
     message: &str,
     include_events: bool,
     mut on_event: F,
@@ -313,8 +446,8 @@ where
                     "role": "user",
                     "content": message,
                 })],
-                harness: args.harness.as_wire(),
-                model: args.model.as_deref(),
+                harness: settings.harness.as_wire(),
+                model: settings.model.as_deref(),
             },
         )
         .await?;
@@ -370,10 +503,10 @@ where
 fn print_chat_header(
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
-    args: &LoopArgs,
+    settings: &TurnSettings,
 ) {
     print_project_header(ctx);
-    print_conversation_header(conversation, args);
+    print_conversation_header(conversation, settings);
 }
 
 fn print_project_header(ctx: &ProjectContext) {
@@ -389,7 +522,7 @@ fn print_project_header(ctx: &ProjectContext) {
     );
 }
 
-fn print_conversation_header(conversation: &CreateConversationResponse, args: &LoopArgs) {
+fn print_conversation_header(conversation: &CreateConversationResponse, settings: &TurnSettings) {
     if is_quiet() {
         return;
     }
@@ -397,7 +530,7 @@ fn print_conversation_header(conversation: &CreateConversationResponse, args: &L
         "{} {} {}",
         style("Conversation").dim(),
         style(conversation.conversation.slug.as_str()).bold(),
-        style(format!("[{}]", args.harness)).dim()
+        style(format!("[{}]", settings.label())).dim()
     );
 }
 
@@ -477,6 +610,7 @@ impl LoopRuntimeClient {
         &self,
         ctx: &ProjectContext,
         args: &LoopArgs,
+        settings: &TurnSettings,
     ) -> Result<CreateConversationResponse> {
         let conversation_id = args.conversation.as_deref().filter(|value| is_uuid(value));
         let conversation_slug = args.conversation.as_deref().filter(|value| !is_uuid(value));
@@ -490,7 +624,7 @@ impl LoopRuntimeClient {
                 "conversation_id": conversation_id,
                 "conversation_slug": conversation_slug,
                 "conversation_name": args.conversation_name.as_deref(),
-                "harness": args.harness.as_wire(),
+                "harness": settings.harness.as_wire(),
             }),
         )
         .await
@@ -1384,6 +1518,46 @@ mod tests {
             )
             .expect("runtime URL"),
             "https://loop-runtime.example.test"
+        );
+    }
+
+    #[test]
+    fn interactive_command_switches_harness_and_model() {
+        let mut settings = TurnSettings {
+            harness: HarnessArg::Default,
+            model: None,
+        };
+
+        assert_eq!(
+            handle_interactive_command("/harness codex", &mut settings).expect("harness command"),
+            Some(InteractiveCommand::Continue)
+        );
+        assert_eq!(settings.harness, HarnessArg::Codex);
+
+        assert_eq!(
+            handle_interactive_command("/model gpt-5.4", &mut settings).expect("model command"),
+            Some(InteractiveCommand::Continue)
+        );
+        assert_eq!(settings.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(settings.label(), "codex | gpt-5.4");
+    }
+
+    #[test]
+    fn interactive_command_clears_model_and_detects_exit() {
+        let mut settings = TurnSettings {
+            harness: HarnessArg::ClaudeCode,
+            model: Some("claude-opus-4-5".to_string()),
+        };
+
+        assert_eq!(
+            handle_interactive_command("/model clear", &mut settings).expect("model clear"),
+            Some(InteractiveCommand::Continue)
+        );
+        assert_eq!(settings.model, None);
+
+        assert_eq!(
+            handle_interactive_command("/exit", &mut settings).expect("exit command"),
+            Some(InteractiveCommand::Exit)
         );
     }
 
