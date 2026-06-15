@@ -110,7 +110,7 @@ jobs:
       - name: Install dist
         if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
 
       - name: Cache dist
         if: steps.resolve-tag.outputs.should_release == 'true'
@@ -361,6 +361,60 @@ jobs:
         with:
           name: artifacts-dist-manifest
           path: dist-manifest.json
+
+  publish-homebrew-formula:
+    needs:
+      - plan
+      - host
+    if: ${{ needs.host.result == 'success' && !fromJson(needs.host.outputs.val).announcement_is_prerelease }}
+    runs-on: ubuntu-22.04
+    env:
+      HOST_MANIFEST: ${{ needs.host.outputs.val }}
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ vars.HOMEBREW_TAP_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: braintrustdata
+          repositories: homebrew-tap
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: true
+          repository: braintrustdata/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Fetch homebrew formula artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: artifacts-build-global
+          path: Formula/
+
+      - name: Commit formula files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          user_id=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          git config --global user.name "${APP_SLUG}[bot]"
+          git config --global user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew update
+
+          echo "$HOST_MANIFEST" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)' | while IFS= read -r release; do
+            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
+            name=$(echo "$filename" | sed "s/\.rb$//")
+            version=$(echo "$release" | jq .app_version --raw-output)
+
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
+
+            git add "Formula/${filename}"
+            git diff --quiet --cached -- "Formula/${filename}" || git commit -m "${name} ${version}"
+          done
+          git push
 
   announce:
     needs:
