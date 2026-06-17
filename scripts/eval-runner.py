@@ -32,7 +32,18 @@ try:
         from braintrust.parameters import serialize_remote_eval_parameters_container
     except ImportError:
         serialize_remote_eval_parameters_container = None
-    from braintrust.util import bt_iscoroutinefunction, eprint
+    from braintrust.util import eprint
+
+    try:
+        from braintrust.util import bt_iscoroutinefunction
+    except ImportError:
+        def bt_iscoroutinefunction(f):
+            return (
+                inspect.iscoroutinefunction(f)
+                or inspect.isasyncgenfunction(f)
+                or getattr(f, "_BT_IS_ASYNC", False)
+            )
+
     from braintrust.span_identifier_v4 import parse_parent
 except Exception as exc:  # pragma: no cover - runtime guard
     print(
