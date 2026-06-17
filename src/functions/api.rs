@@ -85,18 +85,32 @@ pub async fn get_function_by_slug(
     client: &ApiClient,
     project_id: &str,
     slug: &str,
+    version: Option<&str>,
 ) -> Result<Option<Function>> {
-    let pid = escape_sql(project_id);
-    let slug = escape_sql(slug);
-    let query = format!("SELECT * FROM project_functions('{pid}') WHERE slug = '{slug}'");
-    let response = client.btql(&query).await?;
+    let query = FunctionListQuery {
+        project_id: Some(project_id.to_string()),
+        slug: Some(slug.to_string()),
+        version: version.map(ToOwned::to_owned),
+        ..Default::default()
+    };
+    let page = list_functions_page(client, &query).await?;
+    let Some(raw) = page.objects.into_iter().next() else {
+        return Ok(None);
+    };
 
-    Ok(response.data.into_iter().next())
+    serde_json::from_value(raw)
+        .map(Some)
+        .context("unexpected function response shape")
 }
 
-pub async fn get_function_by_id(client: &ApiClient, id: &str) -> Result<Option<Function>> {
+pub async fn get_function_by_id(
+    client: &ApiClient,
+    id: &str,
+    version: Option<&str>,
+) -> Result<Option<Function>> {
     let query = FunctionListQuery {
         id: Some(id.to_string()),
+        version: version.map(ToOwned::to_owned),
         ..Default::default()
     };
     let page = list_functions_page(client, &query).await?;
