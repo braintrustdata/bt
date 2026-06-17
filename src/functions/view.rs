@@ -18,6 +18,7 @@ use super::{AuthContext, FunctionTypeFilter, ResolvedContext};
 pub async fn run(
     ctx: &ResolvedContext,
     slug: Option<&str>,
+    version: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
@@ -27,7 +28,7 @@ pub async fn run(
     let function = match slug {
         Some(s) => with_spinner(
             &format!("Loading {}...", label(ft)),
-            api::get_function_by_slug(&ctx.client, project_id, s),
+            api::get_function_by_slug(&ctx.client, project_id, s, version),
         )
         .await?
         .ok_or_else(|| anyhow!("{} with slug '{s}' not found", label(ft)))?,
@@ -39,7 +40,28 @@ pub async fn run(
                     label_plural(ft),
                 );
             }
-            select_function_interactive(&ctx.client, project_id, ft).await?
+            let selected = select_function_interactive(&ctx.client, project_id, ft).await?;
+            if let Some(version) = version {
+                with_spinner(
+                    &format!("Loading {}...", label(ft)),
+                    api::get_function_by_slug(
+                        &ctx.client,
+                        project_id,
+                        &selected.slug,
+                        Some(version),
+                    ),
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{} with slug '{}' not found at version {version}",
+                        label(ft),
+                        selected.slug
+                    )
+                })?
+            } else {
+                selected
+            }
         }
     };
 
@@ -58,6 +80,7 @@ pub async fn run(
 pub async fn run_by_id(
     ctx: &AuthContext,
     id: &str,
+    version: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
@@ -65,7 +88,7 @@ pub async fn run_by_id(
 ) -> Result<()> {
     let function = with_spinner(
         &format!("Loading {}...", label(ft)),
-        api::get_function_by_id(&ctx.client, id),
+        api::get_function_by_id(&ctx.client, id, version),
     )
     .await?
     .ok_or_else(|| anyhow!("{} with id '{id}' not found", label(ft)))?;
