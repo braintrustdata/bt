@@ -433,6 +433,9 @@ pub struct ViewArgs {
     /// Function id
     #[arg(long = "id", env = "BT_FUNCTIONS_VIEW_ID")]
     id: Option<String>,
+    /// Version selector.
+    #[arg(long, env = "BT_FUNCTIONS_VIEW_VERSION")]
+    version: Option<String>,
     /// Open in browser
     #[arg(long)]
     web: bool,
@@ -610,11 +613,29 @@ pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFil
         Some(FunctionCommands::View(v)) => match v.selector()? {
             ViewSelector::Id(id) => {
                 let auth_ctx = resolve_auth_context(&base).await?;
-                view::run_by_id(&auth_ctx, id, base.json, v.web, base.verbose, ft).await
+                view::run_by_id(
+                    &auth_ctx,
+                    id,
+                    v.version.as_deref(),
+                    base.json,
+                    v.web,
+                    base.verbose,
+                    ft,
+                )
+                .await
             }
             ViewSelector::Slug(slug) => {
                 let ctx = resolve_context(&base).await?;
-                view::run(&ctx, slug, base.json, v.web, base.verbose, ft).await
+                view::run(
+                    &ctx,
+                    slug,
+                    v.version.as_deref(),
+                    base.json,
+                    v.web,
+                    base.verbose,
+                    ft,
+                )
+                .await
             }
         },
         command => {
@@ -641,11 +662,29 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
             match v.inner.selector()? {
                 ViewSelector::Id(id) => {
                     let auth_ctx = resolve_auth_context(&base).await?;
-                    view::run_by_id(&auth_ctx, id, base.json, v.inner.web, base.verbose, ft).await
+                    view::run_by_id(
+                        &auth_ctx,
+                        id,
+                        v.inner.version.as_deref(),
+                        base.json,
+                        v.inner.web,
+                        base.verbose,
+                        ft,
+                    )
+                    .await
                 }
                 ViewSelector::Slug(slug) => {
                     let ctx = resolve_context(&base).await?;
-                    view::run(&ctx, slug, base.json, v.inner.web, base.verbose, ft).await
+                    view::run(
+                        &ctx,
+                        slug,
+                        v.inner.version.as_deref(),
+                        base.json,
+                        v.inner.web,
+                        base.verbose,
+                        ft,
+                    )
+                    .await
                 }
             }
         }
