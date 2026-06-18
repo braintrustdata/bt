@@ -33,6 +33,17 @@ try:
     except ImportError:
         serialize_remote_eval_parameters_container = None
     from braintrust.util import eprint
+
+    try:
+        from braintrust.util import bt_iscoroutinefunction
+    except ImportError:
+        def bt_iscoroutinefunction(f):
+            return (
+                inspect.iscoroutinefunction(f)
+                or inspect.isasyncgenfunction(f)
+                or getattr(f, "_BT_IS_ASYNC", False)
+            )
+
     from braintrust.span_identifier_v4 import parse_parent
 except Exception as exc:  # pragma: no cover - runtime guard
     print(
@@ -998,29 +1009,44 @@ def wrap_task(
 
     takes_hooks = task_signature is not None and len(task_signature.parameters) >= 2
 
-    async def wrapped_task(input, hooks):
-        result = None
-        try:
-            if takes_hooks:
-                result = task(input, hooks)
-            else:
-                result = task(input)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
-        finally:
-            if progress_cb is not None:
-                progress_cb("increment", None)
-            if stream_results and result is not None:
-                try:
-                    hooks.report_progress({
-                        "format": "code",
-                        "output_type": "completion",
-                        "event": "json_delta",
-                        "data": json.dumps(result),
-                    })
-                except Exception:
-                    pass
+    def maybe_report(result: Any, hooks: Any) -> None:
+        if progress_cb is not None:
+            progress_cb("increment", None)
+        if stream_results and result is not None:
+            try:
+                hooks.report_progress({
+                    "format": "code",
+                    "output_type": "completion",
+                    "event": "json_delta",
+                    "data": json.dumps(result),
+                })
+            except Exception:
+                pass
+
+    if bt_iscoroutinefunction(task):
+        async def wrapped_task(input, hooks):
+            result = None
+            try:
+                if takes_hooks:
+                    result = task(input, hooks)
+                else:
+                    result = task(input)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            finally:
+                maybe_report(result, hooks)
+    else:
+        def wrapped_task(input, hooks):
+            result = None
+            try:
+                if takes_hooks:
+                    result = task(input, hooks)
+                else:
+                    result = task(input)
+                return result
+            finally:
+                maybe_report(result, hooks)
 
     if hasattr(task, "__name__"):
         setattr(wrapped_task, "__name__", getattr(task, "__name__"))
