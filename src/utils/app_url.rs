@@ -24,31 +24,6 @@ pub(crate) fn app_project_url(
     url
 }
 
-pub(crate) fn app_project_url_with_query(
-    app_url: &str,
-    org_name: &str,
-    project_name: &str,
-    path_segments: &[&str],
-    query: &[(&str, &str)],
-) -> String {
-    let mut url = app_project_url(app_url, org_name, project_name, path_segments);
-    if query.is_empty() {
-        return url;
-    }
-
-    url.push('?');
-    for (idx, (key, value)) in query.iter().enumerate() {
-        if idx > 0 {
-            url.push('&');
-        }
-        url.push_str(&encode(key));
-        url.push('=');
-        url.push_str(&encode(value));
-    }
-
-    url
-}
-
 pub(crate) fn app_project_url_with_encoded_path(
     app_url: &str,
     org_name: &str,
@@ -79,16 +54,6 @@ mod tests {
                     &["datasets", "dataset/name"],
                 ),
                 "https://www.example.test/app/test%20org/p/test%20project/datasets/dataset%2Fname",
-            ),
-            (
-                app_project_url_with_query(
-                    "https://www.example.test",
-                    "test-org",
-                    "test-project",
-                    &["logs"],
-                    &[("r", "root/span"), ("tvt", "thread view")],
-                ),
-                "https://www.example.test/app/test-org/p/test-project/logs?r=root%2Fspan&tvt=thread%20view",
             ),
             (
                 app_project_url_with_encoded_path(
