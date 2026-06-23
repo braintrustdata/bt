@@ -283,14 +283,11 @@ fn is_waterfall_wrapper_span(span: &WaterfallSpan, trace_duration_seconds: Optio
         return true;
     }
 
-    match (span.duration_seconds, trace_duration_seconds) {
+    matches!(
+        (span.duration_seconds, trace_duration_seconds),
         (Some(duration), Some(trace_duration))
-            if span.depth <= 1 && trace_duration > 0.0 && duration >= trace_duration * 0.95 =>
-        {
-            true
-        }
-        _ => false,
-    }
+            if span.depth <= 1 && trace_duration > 0.0 && duration >= trace_duration * 0.95
+    )
 }
 
 fn max_waterfall_span_by<'a, F>(
