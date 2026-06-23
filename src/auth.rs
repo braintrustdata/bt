@@ -827,19 +827,37 @@ fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
     Some(value.to_string())
 }
 
-pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
-    let mut store = load_auth_store()?;
-    let mut auth_base = base.clone();
-    let cfg_org = if crate::config::trimmed_option(base.profile.as_deref()).is_none()
-        && crate::config::trimmed_option(base.org_name.as_deref()).is_none()
-    {
-        let cfg = crate::config::load().unwrap_or_default();
-        auth_base.profile =
-            crate::config::trimmed_option(cfg.profile.as_deref()).map(str::to_string);
-        auth_base.profile.is_none().then_some(cfg.org).flatten()
+fn config_auth_context(base: &BaseArgs) -> (Option<String>, Option<String>) {
+    let cfg = crate::config::load().unwrap_or_default();
+    config_auth_context_from_config(base, &cfg)
+}
+
+fn config_auth_context_from_config(
+    base: &BaseArgs,
+    cfg: &crate::config::Config,
+) -> (Option<String>, Option<String>) {
+    let profile = if crate::config::trimmed_option(base.profile.as_deref()).is_none() {
+        crate::config::trimmed_option(cfg.profile.as_deref()).map(str::to_string)
     } else {
         None
     };
+
+    let org = if crate::config::trimmed_option(base.org_name.as_deref()).is_none() {
+        crate::config::trimmed_option(cfg.org.as_deref()).map(str::to_string)
+    } else {
+        None
+    };
+
+    (profile, org)
+}
+
+pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
+    let mut store = load_auth_store()?;
+    let mut auth_base = base.clone();
+    let (cfg_profile, cfg_org) = config_auth_context(base);
+    if let Some(profile) = cfg_profile {
+        auth_base.profile = Some(profile);
+    }
 
     if let Some(profile_name) =
         maybe_select_profile_for_auth(&auth_base, &store, &cfg_org, ui::can_prompt())?
@@ -1100,7 +1118,7 @@ where
             api_key: Some(api_key),
             api_url: base.api_url.clone(),
             app_url: base.app_url.clone(),
-            org_name: base.org_name.clone(),
+            org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
             is_oauth: false,
         });
     }
@@ -1147,7 +1165,11 @@ where
             api_key,
             api_url: base.api_url.clone().or_else(|| profile.api_url.clone()),
             app_url: base.app_url.clone().or_else(|| profile.app_url.clone()),
-            org_name: base.org_name.clone().or_else(|| profile.org_name.clone()),
+            org_name: base
+                .org_name
+                .clone()
+                .or_else(|| cfg_org.clone())
+                .or_else(|| profile.org_name.clone()),
             is_oauth,
         });
     }
@@ -3291,6 +3313,14 @@ mod tests {
         }
     }
 
+    fn auth_config(profile: Option<&str>, org: Option<&str>) -> crate::config::Config {
+        crate::config::Config {
+            profile: profile.map(str::to_string),
+            org: org.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
     fn dt(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
             .expect("timestamp")
@@ -3782,6 +3812,29 @@ mod tests {
     }
 
     #[test]
+    fn config_auth_context_returns_profile_and_org_independently() {
+        let base = make_base();
+        let cfg = auth_config(Some("default-profile"), Some("local-org"));
+
+        let (profile, org) = config_auth_context_from_config(&base, &cfg);
+
+        assert_eq!(profile.as_deref(), Some("default-profile"));
+        assert_eq!(org.as_deref(), Some("local-org"));
+    }
+
+    #[test]
+    fn config_auth_context_preserves_explicit_profile_and_config_org() {
+        let mut base = make_base();
+        base.profile = Some("explicit-profile".to_string());
+        let cfg = auth_config(Some("config-profile"), Some("local-org"));
+
+        let (profile, org) = config_auth_context_from_config(&base, &cfg);
+
+        assert_eq!(profile, None);
+        assert_eq!(org.as_deref(), Some("local-org"));
+    }
+
+    #[test]
     fn resolve_auth_prefers_explicit_api_key() {
         let mut base = make_base();
         base.api_key = Some("explicit-key".to_string());
@@ -4141,6 +4194,74 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));
+    }
+
+    #[test]
+    fn resolve_auth_uses_config_org_to_find_profile() {
+        let base = make_base();
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".into(),
+            AuthProfile {
+                org_name: Some("acme-corp".into()),
+                api_url: Some("https://api.acme.com".into()),
+                ..Default::default()
+            },
+        );
+        let cfg_org = Some("acme-corp".to_string());
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".into())),
+            &cfg_org,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));
+    }
+
+    #[test]
+    fn resolve_auth_config_org_overrides_profile_org() {
+        let mut base = make_base();
+        base.profile = Some("default-profile".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "default-profile".into(),
+            AuthProfile {
+                org_name: Some("profile-org".into()),
+                ..Default::default()
+            },
+        );
+        let cfg_org = Some("local-org".to_string());
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".into())),
+            &cfg_org,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("local-org"));
+    }
+
+    #[test]
+    fn resolve_auth_api_key_override_keeps_config_org() {
+        let mut base = make_base();
+        base.api_key = Some("explicit-key".into());
+
+        let store = AuthStore::default();
+        let cfg_org = Some("local-org".to_string());
+
+        let resolved =
+            resolve_auth_from_store_with_secret_lookup(&base, &store, |_| Ok(None), &cfg_org)
+                .expect("resolve");
+
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("local-org"));
     }
 
     #[test]
