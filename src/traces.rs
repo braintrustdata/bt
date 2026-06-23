@@ -36,7 +36,7 @@ use crate::args::BaseArgs;
 use crate::auth::{self, login};
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, print_command_status, with_spinner, CommandStatus};
-use crate::utils::parse_duration_to_seconds;
+use crate::utils::{app_project_url_with_query, parse_duration_to_seconds};
 
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
@@ -5101,14 +5101,16 @@ fn trace_app_url(
 ) -> String {
     let project = target.project.name.as_deref().unwrap_or(&target.project.id);
     let selected_span = target.span_id.as_deref().unwrap_or(&target.root_span_id);
-    format!(
-        "{}/app/{}/p/{}/logs?r={}&s={}&tvt={}",
-        app_url.trim_end_matches('/'),
-        encode(org_name),
-        encode(project),
-        encode(&target.root_span_id),
-        encode(selected_span),
-        encode(trace_view_type),
+    app_project_url_with_query(
+        app_url,
+        org_name,
+        project,
+        &["logs"],
+        &[
+            ("r", &target.root_span_id),
+            ("s", selected_span),
+            ("tvt", trace_view_type),
+        ],
     )
 }
 

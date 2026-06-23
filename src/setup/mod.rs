@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::process::Command;
 use toml::Value as TomlValue;
-use urlencoding::encode;
 
 use crate::args::{ArgValueSource, BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
 use crate::auth;
@@ -23,6 +22,7 @@ use crate::auth::LoginContext;
 use crate::config;
 use crate::http::ApiClient;
 use crate::ui::{self, with_spinner};
+use crate::utils::app_project_url;
 
 mod agent_stream;
 mod docs;
@@ -2797,17 +2797,8 @@ fn print_post_agent_followups(base: &BaseArgs) {
 
 fn setup_project_logs_url(base: &BaseArgs) -> Option<String> {
     let (org, project) = setup_project_context(base)?;
-    let app_url = base
-        .app_url
-        .as_deref()
-        .unwrap_or(DEFAULT_APP_URL)
-        .trim_end_matches('/');
-    Some(format!(
-        "{}/app/{}/p/{}/logs",
-        app_url,
-        encode(&org),
-        encode(&project)
-    ))
+    let app_url = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    Some(app_project_url(app_url, &org, &project, &["logs"]))
 }
 
 fn setup_project_context(base: &BaseArgs) -> Option<(String, String)> {

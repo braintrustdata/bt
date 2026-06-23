@@ -2,11 +2,11 @@ use std::fmt::Write as _;
 
 use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
-use urlencoding::encode;
 
 use crate::prompts::delete::select_prompt_interactive;
 use crate::ui::prompt_render::{render_options, render_prompt_block};
 use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
+use crate::utils::app_project_url;
 
 use super::{api, ResolvedContext};
 
@@ -34,12 +34,11 @@ pub async fn run(
     };
 
     if web {
-        let url = format!(
-            "{}/app/{}/p/{}/prompts/{}",
-            ctx.app_url.trim_end_matches('/'),
-            encode(ctx.client.org_name()),
-            encode(project_name),
-            encode(&prompt.id)
+        let url = app_project_url(
+            &ctx.app_url,
+            ctx.client.org_name(),
+            project_name,
+            &["prompts", &prompt.id],
         );
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
