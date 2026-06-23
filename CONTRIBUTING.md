@@ -142,11 +142,16 @@ Notes:
 
 ## Windows Release Signing
 
-Release and canary workflows can Authenticode-sign Windows artifacts when these GitHub Actions repository secrets are configured:
+Release workflows Authenticode-sign Windows artifacts via [Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/) (the `sign-windows-artifacts` composite action). Signing runs when these GitHub Actions repository secrets are configured:
 
-- `SSLDOTCOM_USERNAME`
-- `SSLDOTCOM_PASSWORD`
-- `SSLDOTCOM_CREDENTIAL_ID`
-- `SSLDOTCOM_TOTP_SECRET`
+- `AZURE_CLIENT_ID`
+- `AZURE_TENANT_ID`
+- `AZURE_SUBSCRIPTION_ID`
 
-If those secrets are absent, `cargo-dist` skips Windows signing and the published `bt.exe` remains unsigned.
+The signing account is selected by these repository variables:
+
+- `AZURE_SIGNING_ENDPOINT`
+- `AZURE_SIGNING_ACCOUNT_NAME`
+- `AZURE_SIGNING_CERT_PROFILE`
+
+If the secrets are absent (for example, on forks or PRs without access), the signing step is skipped and published `bt.exe` remains unsigned. The `verify-windows-signature` action surfaces unsigned builds via a neutral check run rather than failing the job.
