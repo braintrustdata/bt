@@ -76,13 +76,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         });
     let profile_info = resolve_profile_info(selected_profile.as_deref(), org.as_deref());
 
-    if selected_profile.is_some()
-        && base
-            .org_name
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-    {
+    if selected_profile.is_some() && org.as_deref().map(str::trim).is_none_or(str::is_empty) {
         if let Some(profile_org) = profile_info.as_ref().and_then(|p| p.org_name.clone()) {
             org = Some(profile_org);
         }
