@@ -35,7 +35,7 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::auth::{self, login};
 use crate::http::ApiClient;
-use crate::ui::{fuzzy_select, is_interactive, with_spinner};
+use crate::ui::{fuzzy_select, is_interactive, print_command_status, with_spinner, CommandStatus};
 use crate::utils::parse_duration_to_seconds;
 
 const MAX_TRACE_SPANS: usize = 5000;
@@ -67,8 +67,9 @@ type FullSpanLoadResult = (String, Result<Option<Map<String, Value>>>);
 #[command(after_help = "\
 Examples:
   bt view logs --limit 25
-  bt view trace <ROOT_SPAN_ID>
-  bt view span <SPAN_ID>
+  bt view trace --trace-id <ROOT_SPAN_ID>
+  bt view span --id <SPAN_ROW_ID>
+  bt view thread --trace-id <ROOT_SPAN_ID>
 ")]
 pub struct ViewArgs {
     #[command(subcommand)]
@@ -83,6 +84,11 @@ enum ViewCommand {
     Trace(TraceArgs),
     /// Fetch a single span by row id (or from a URL)
     Span(SpanArgs),
+    #[command(
+        about = "Render the LLM conversation thread for a trace",
+        long_about = "Render the LLM conversation thread for a trace.\n\nUses Braintrust's trace preprocessor to collapse repeated messages across LLM spans into one ordered transcript, so agents can inspect the conversation without opening each span."
+    )]
+    Thread(ThreadArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,7 +179,7 @@ impl Default for LogsArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct TraceArgs {
+struct TraceSelectorArgs {
     /// Object reference, format: object_type:object_selector (project_logs|experiment|dataset)
     #[arg(long)]
     object_ref: Option<String>,
@@ -198,10 +204,6 @@ struct TraceArgs {
     #[arg(long, default_value_t = 100)]
     limit: usize,
 
-    /// Cursor returned from a previous trace fetch
-    #[arg(long)]
-    cursor: Option<String>,
-
     /// Preview length for span rows
     #[arg(long, default_value_t = 125)]
     preview_length: usize,
@@ -213,6 +215,26 @@ struct TraceArgs {
     /// Force non-interactive mode
     #[arg(long)]
     non_interactive: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TraceArgs {
+    #[command(flatten)]
+    selector: TraceSelectorArgs,
+
+    /// Cursor returned from a previous trace fetch
+    #[arg(long)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ThreadArgs {
+    #[command(flatten)]
+    selector: TraceSelectorArgs,
+
+    /// Open the native Braintrust thread view in a browser
+    #[arg(long)]
+    web: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -279,6 +301,15 @@ struct ParsedTraceUrl {
 
 #[derive(Debug, Clone)]
 struct ResolvedTraceTarget {
+    project: ProjectSelection,
+    root_span_id: String,
+    span_id: Option<String>,
+    detail_view: DetailView,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTraceCommandTarget {
+    object_ref: ObjectRef,
     project: ProjectSelection,
     root_span_id: String,
     span_id: Option<String>,
@@ -884,12 +915,16 @@ pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
 
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
+    let app_url = ctx.app_url.clone();
 
     match args.command {
         None => run_logs_command(base, client, LogsArgs::default()).await,
         Some(ViewCommand::Logs(logs)) => run_logs_command(base, client, logs).await,
         Some(ViewCommand::Trace(trace)) => run_trace_command(base, client, trace).await,
         Some(ViewCommand::Span(span)) => run_span_command(base, client, span).await,
+        Some(ViewCommand::Thread(thread)) => {
+            run_thread_command(base, client, app_url, thread).await
+        }
     }
 }
 
@@ -1049,136 +1084,53 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
 }
 
 async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -> Result<()> {
-    if args.limit == 0 {
-        bail!("--limit must be greater than 0");
-    }
-    if args.preview_length == 0 {
-        bail!("--preview-length must be greater than 0");
-    }
-    if args.object_ref.is_some() && args.project_id.is_some() {
-        bail!("--object-ref and --project-id are mutually exclusive");
-    }
-    let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
-    let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
-    let project_from_url = parsed_startup_url
-        .as_ref()
-        .and_then(|u| u.project.as_deref());
+    let selector = &args.selector;
+    validate_trace_selector_args(selector)?;
+    let target = resolve_trace_command_target(&client, &base, selector).await?;
 
-    let (mut object_ref, project_for_url) = resolve_object_ref_for_view(
-        &client,
-        &base,
-        args.object_ref.as_deref(),
-        args.project_id.as_deref(),
-        project_from_url,
-    )
-    .await?;
-
-    let mut trace_id = args
-        .trace_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-
-    let interactive = !base.json && is_interactive() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !selector.non_interactive;
     if interactive {
-        if object_ref.object_type != "project_logs" {
-            bail!("interactive trace view currently supports only project_logs sources");
+        if args.cursor.is_some() {
+            bail!("--cursor is only available in non-interactive mode");
         }
-
-        let project = project_for_url.unwrap_or(ProjectSelection {
-            id: object_ref.object_name.clone(),
-            name: None,
-        });
-        let startup_target = if let Some(parsed) = parsed_startup_url.clone() {
-            parsed
-        } else {
-            let trace_id = trace_id.clone().context(
-                "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>",
-            )?;
-            ParsedTraceUrl {
-                org: Some(client.org_name().to_string()),
-                project: Some(project.id.clone()),
-                page: Some("logs".to_string()),
-                row_ref: Some(trace_id.clone()),
-                span_id: Some(trace_id),
-                trace_view_type: None,
-            }
-        };
-        let source_expr = btql_source_expr(&object_ref)?;
-        let base_filter = build_base_filter_clause(None, "1h", None)?;
-        return run_interactive(
-            InteractiveRunArgs {
-                init: TraceViewerInit {
-                    project,
-                    source_expr,
-                    list_mode: ListMode::Summary,
-                    base_filter,
-                    traces: Vec::new(),
-                    limit: args.limit,
-                    preview_length: args.preview_length,
-                    print_queries: args.print_queries,
-                },
-                initial_search_query: String::new(),
-                startup_trace_url: Some(startup_target),
-            },
+        return run_interactive_trace_target(
             client,
+            target,
+            None,
+            selector.limit,
+            selector.preview_length,
+            selector.print_queries,
         )
         .await;
     }
 
-    if trace_id.is_none() {
-        let parsed = parsed_startup_url.as_ref().with_context(|| {
-            "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>"
-        })?;
-
-        if object_ref.object_type != "project_logs" {
-            bail!("URL trace resolution currently supports only project_logs sources");
-        }
-        let current_project = project_for_url.clone().unwrap_or(ProjectSelection {
-            id: object_ref.object_name.clone(),
-            name: None,
-        });
-        let target = with_spinner(
-            "Resolving trace URL...",
-            resolve_trace_target_for_url(&client, &current_project, parsed, args.print_queries),
-        )
-        .await?;
-        trace_id = Some(target.root_span_id.clone());
-        object_ref = ObjectRef {
-            object_type: "project_logs".to_string(),
-            object_name: target.project.id.clone(),
-        };
-    }
-
-    let trace_id = trace_id.context("trace id resolution failed")?;
-    let source_expr = btql_source_expr(&object_ref)?;
+    let source_expr = btql_source_expr(&target.object_ref)?;
     let response = with_spinner(
         "Loading trace spans...",
         fetch_trace_spans_page(
             &client,
             &source_expr,
-            &trace_id,
-            args.preview_length,
-            args.limit,
+            &target.root_span_id,
+            selector.preview_length,
+            selector.limit,
             args.cursor.as_deref(),
-            args.print_queries,
+            selector.print_queries,
         ),
     )
     .await?;
     let next_cursor = response.cursor.clone().filter(|c| !c.is_empty());
     let has_more = next_cursor.is_some();
-    let object_ref_arg = format_object_ref_arg(&object_ref);
+    let object_ref_arg = format_object_ref_arg(&target.object_ref);
     let profile_flag = base.profile.as_deref();
 
     if base.json {
         let payload = json!({
             "meta": {
                 "command": "view trace",
-                "source": object_ref,
-                "trace_id": trace_id,
-                "limit": args.limit,
-                "preview_length": args.preview_length,
+                "source": target.object_ref,
+                "trace_id": target.root_span_id,
+                "limit": selector.limit,
+                "preview_length": selector.preview_length,
                 "truncated": true,
             },
             "paging": {
@@ -1190,23 +1142,87 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
             "hints": trace_hints(
                 has_more,
                 &object_ref_arg,
-                &trace_id,
+                &target.root_span_id,
                 next_cursor.as_deref(),
                 profile_flag,
-                args.limit,
+                selector.limit,
             ),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         print_trace_text(
-            &trace_id,
+            &target.root_span_id,
             &response.data,
             &object_ref_arg,
             profile_flag,
-            args.limit,
-            args.preview_length,
+            selector.limit,
+            selector.preview_length,
             next_cursor.as_deref(),
         );
+    }
+
+    Ok(())
+}
+
+async fn run_thread_command(
+    base: BaseArgs,
+    client: ApiClient,
+    app_url: String,
+    args: ThreadArgs,
+) -> Result<()> {
+    let selector = &args.selector;
+    validate_trace_selector_args(selector)?;
+    let mut target = resolve_trace_command_target(&client, &base, selector).await?;
+    target.detail_view = DetailView::Thread;
+
+    if args.web {
+        let url = trace_app_url(&app_url, client.org_name(), &target, "thread");
+        open::that(&url)?;
+        print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
+        return Ok(());
+    }
+
+    let interactive = !base.json && is_interactive() && !selector.non_interactive;
+    if interactive {
+        return run_interactive_trace_target(
+            client,
+            target,
+            Some(DetailView::Thread),
+            selector.limit,
+            selector.preview_length,
+            selector.print_queries,
+        )
+        .await;
+    }
+
+    let messages = with_spinner(
+        "Loading thread...",
+        fetch_thread_messages(
+            &client,
+            &target.project.id,
+            &target.root_span_id,
+            selector.print_queries,
+        ),
+    )
+    .await?;
+
+    if base.json {
+        let payload = json!({
+            "meta": {
+                "command": "view thread",
+                "source": target.object_ref,
+                "project": target.project,
+                "root_span_id": target.root_span_id,
+                "span_id": target.span_id,
+                "view": "thread",
+                "truncated": false,
+            },
+            "messages": messages,
+            "hints": thread_hints(base.profile.as_deref()),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_thread_text(&target, &messages, base.profile.as_deref());
     }
 
     Ok(())
@@ -1346,6 +1362,159 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct TraceSelectorResolution {
+    object_ref: ObjectRef,
+    project: ProjectSelection,
+    trace_id: Option<String>,
+    parsed_startup_url: Option<ParsedTraceUrl>,
+}
+
+fn validate_trace_selector_args(args: &TraceSelectorArgs) -> Result<()> {
+    if args.limit == 0 {
+        bail!("--limit must be greater than 0");
+    }
+    if args.preview_length == 0 {
+        bail!("--preview-length must be greater than 0");
+    }
+    if args.object_ref.is_some() && args.project_id.is_some() {
+        bail!("--object-ref and --project-id are mutually exclusive");
+    }
+    if args.trace_id.is_some() && (args.url.is_some() || args.url_arg.is_some()) {
+        bail!("--trace-id cannot be combined with --url or positional URL");
+    }
+
+    Ok(())
+}
+
+async fn resolve_trace_selector(
+    client: &ApiClient,
+    base: &BaseArgs,
+    args: &TraceSelectorArgs,
+) -> Result<TraceSelectorResolution> {
+    let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
+    let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
+    let project_from_url = parsed_startup_url
+        .as_ref()
+        .and_then(|u| u.project.as_deref());
+
+    let (object_ref, project_for_url) = resolve_object_ref_for_view(
+        client,
+        base,
+        args.object_ref.as_deref(),
+        args.project_id.as_deref(),
+        project_from_url,
+    )
+    .await?;
+
+    let trace_id = args
+        .trace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let project = project_for_url.unwrap_or(ProjectSelection {
+        id: object_ref.object_name.clone(),
+        name: None,
+    });
+
+    Ok(TraceSelectorResolution {
+        object_ref,
+        project,
+        trace_id,
+        parsed_startup_url,
+    })
+}
+
+async fn resolve_trace_command_target(
+    client: &ApiClient,
+    base: &BaseArgs,
+    args: &TraceSelectorArgs,
+) -> Result<ResolvedTraceCommandTarget> {
+    let resolution = resolve_trace_selector(client, base, args).await?;
+
+    if let Some(root_span_id) = resolution.trace_id {
+        return Ok(ResolvedTraceCommandTarget {
+            object_ref: resolution.object_ref,
+            project: resolution.project,
+            root_span_id,
+            span_id: None,
+            detail_view: DetailView::Span,
+        });
+    }
+
+    let parsed = resolution.parsed_startup_url.as_ref().with_context(|| {
+        "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>"
+    })?;
+    if resolution.object_ref.object_type != "project_logs" {
+        bail!("URL trace resolution currently supports only project_logs sources");
+    }
+
+    let target = with_spinner(
+        "Resolving trace URL...",
+        resolve_trace_target_for_url(client, &resolution.project, parsed, args.print_queries),
+    )
+    .await?;
+
+    Ok(ResolvedTraceCommandTarget {
+        object_ref: ObjectRef {
+            object_type: "project_logs".to_string(),
+            object_name: target.project.id.clone(),
+        },
+        project: target.project,
+        root_span_id: target.root_span_id,
+        span_id: target.span_id,
+        detail_view: target.detail_view,
+    })
+}
+
+async fn run_interactive_trace_target(
+    client: ApiClient,
+    target: ResolvedTraceCommandTarget,
+    detail_view: Option<DetailView>,
+    limit: usize,
+    preview_length: usize,
+    print_queries: bool,
+) -> Result<()> {
+    if target.object_ref.object_type != "project_logs" {
+        bail!("interactive trace view currently supports only project_logs sources");
+    }
+
+    let source_expr = btql_source_expr(&target.object_ref)?;
+    let base_filter = build_base_filter_clause(None, "1h", None)?;
+    let detail_view = detail_view.unwrap_or(target.detail_view);
+    let startup_target = ParsedTraceUrl {
+        org: Some(client.org_name().to_string()),
+        project: Some(target.project.id.clone()),
+        page: Some("logs".to_string()),
+        row_ref: Some(target.root_span_id.clone()),
+        span_id: target
+            .span_id
+            .clone()
+            .or_else(|| Some(target.root_span_id.clone())),
+        trace_view_type: detail_view_trace_url_value(detail_view).map(ToString::to_string),
+    };
+
+    run_interactive(
+        InteractiveRunArgs {
+            init: TraceViewerInit {
+                project: target.project,
+                source_expr,
+                list_mode: ListMode::Summary,
+                base_filter,
+                traces: Vec::new(),
+                limit,
+                preview_length,
+                print_queries,
+            },
+            initial_search_query: String::new(),
+            startup_trace_url: Some(startup_target),
+        },
+        client,
+    )
+    .await
 }
 
 async fn resolve_object_ref_for_view(
@@ -4917,6 +5086,43 @@ fn list_mode_label(list_mode: ListMode) -> &'static str {
     }
 }
 
+fn detail_view_trace_url_value(view: DetailView) -> Option<&'static str> {
+    match view {
+        DetailView::Span => None,
+        DetailView::Thread => Some("thread"),
+    }
+}
+
+fn trace_app_url(
+    app_url: &str,
+    org_name: &str,
+    target: &ResolvedTraceCommandTarget,
+    trace_view_type: &str,
+) -> String {
+    let project = target.project.name.as_deref().unwrap_or(&target.project.id);
+    let selected_span = target.span_id.as_deref().unwrap_or(&target.root_span_id);
+    format!(
+        "{}/app/{}/p/{}/logs?r={}&s={}&tvt={}",
+        app_url.trim_end_matches('/'),
+        encode(org_name),
+        encode(project),
+        encode(&target.root_span_id),
+        encode(selected_span),
+        encode(trace_view_type),
+    )
+}
+
+fn thread_hints(profile: Option<&str>) -> Vec<String> {
+    vec![
+        format!(
+            "Open an interactive thread view with `bt view thread{} --trace-id <root-span-id>`.",
+            profile_flag_suffix(profile)
+        ),
+        "Use `--web` to open the native Braintrust thread view in a browser.".to_string(),
+        "Use `--non-interactive` for a compact text transcript.".to_string(),
+    ]
+}
+
 fn print_logs_text(
     rows: &[TraceSummaryRow],
     list_mode: ListMode,
@@ -4963,6 +5169,42 @@ fn print_logs_text(
     } else {
         println!("No additional rows.");
     }
+}
+
+fn print_thread_text(
+    target: &ResolvedTraceCommandTarget,
+    messages: &[Value],
+    profile: Option<&str>,
+) {
+    println!(
+        "bt view thread: project={} root_span_id={} messages={}",
+        project_label(&target.project),
+        target.root_span_id,
+        messages.len(),
+    );
+    if let Some(span_id) = target.span_id.as_deref() {
+        println!("selected_span_id: {span_id}");
+    }
+
+    if messages.is_empty() {
+        println!("\nNo messages returned by preprocessor.");
+    } else {
+        for (idx, message) in messages.iter().enumerate() {
+            let text = render_full_message_text(message);
+            let (preview, truncated) = truncate_for_preview(&text, 18, 180);
+            println!("\n--- message {} ---", idx + 1);
+            println!("{preview}");
+            if truncated {
+                println!("...");
+            }
+        }
+    }
+
+    println!(
+        "\njson: bt view thread --json{} --trace-id {}",
+        profile_flag_suffix(profile),
+        target.root_span_id
+    );
 }
 
 fn print_trace_text(
@@ -5104,12 +5346,17 @@ fn parse_startup_trace_url_from_view_args(args: &ViewArgs) -> Result<Option<Pars
         Some(ViewCommand::Logs(logs_args)) => {
             select_startup_url(logs_args.url.as_deref(), logs_args.url_arg.as_deref())?
         }
-        Some(ViewCommand::Trace(trace_args)) => {
-            select_startup_url(trace_args.url.as_deref(), trace_args.url_arg.as_deref())?
-        }
+        Some(ViewCommand::Trace(trace_args)) => select_startup_url(
+            trace_args.selector.url.as_deref(),
+            trace_args.selector.url_arg.as_deref(),
+        )?,
         Some(ViewCommand::Span(span_args)) => {
             select_startup_url(span_args.url.as_deref(), span_args.url_arg.as_deref())?
         }
+        Some(ViewCommand::Thread(thread_args)) => select_startup_url(
+            thread_args.selector.url.as_deref(),
+            thread_args.selector.url_arg.as_deref(),
+        )?,
     };
     startup_url.as_deref().map(parse_trace_url).transpose()
 }
@@ -6273,18 +6520,21 @@ mod tests {
     fn parse_startup_trace_url_from_trace_subcommand_reads_positional_url() {
         let args = ViewArgs {
             command: Some(ViewCommand::Trace(TraceArgs {
-                object_ref: None,
-                project_id: None,
-                trace_id: None,
-                url: None,
-                url_arg: Some(
-                    "https://www.braintrust.dev/app/Lovable/p/lovable/logs?r=abc&s=def".to_string(),
-                ),
-                limit: 100,
+                selector: TraceSelectorArgs {
+                    object_ref: None,
+                    project_id: None,
+                    trace_id: None,
+                    url: None,
+                    url_arg: Some(
+                        "https://www.braintrust.dev/app/Lovable/p/lovable/logs?r=abc&s=def"
+                            .to_string(),
+                    ),
+                    limit: 100,
+                    preview_length: 125,
+                    print_queries: false,
+                    non_interactive: false,
+                },
                 cursor: None,
-                preview_length: 125,
-                print_queries: false,
-                non_interactive: false,
             })),
         };
 
@@ -6296,5 +6546,38 @@ mod tests {
         assert_eq!(parsed.project.as_deref(), Some("lovable"));
         assert_eq!(parsed.row_ref.as_deref(), Some("abc"));
         assert_eq!(parsed.span_id.as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn parse_startup_trace_url_from_thread_subcommand_reuses_trace_selector_url() {
+        let args = ViewArgs {
+            command: Some(ViewCommand::Thread(ThreadArgs {
+                selector: TraceSelectorArgs {
+                    object_ref: None,
+                    project_id: None,
+                    trace_id: None,
+                    url: Some(
+                        "https://www.braintrust.dev/app/test-org/p/test-project/logs?r=root&s=span&tvt=thread"
+                            .to_string(),
+                    ),
+                    url_arg: None,
+                    limit: 100,
+                    preview_length: 125,
+                    print_queries: false,
+                    non_interactive: false,
+                },
+                web: false,
+            })),
+        };
+
+        let parsed = parse_startup_trace_url_from_view_args(&args)
+            .expect("parse")
+            .expect("url present");
+
+        assert_eq!(parsed.org.as_deref(), Some("test-org"));
+        assert_eq!(parsed.project.as_deref(), Some("test-project"));
+        assert_eq!(parsed.row_ref.as_deref(), Some("root"));
+        assert_eq!(parsed.span_id.as_deref(), Some("span"));
+        assert_eq!(parsed.trace_view_type.as_deref(), Some("thread"));
     }
 }
