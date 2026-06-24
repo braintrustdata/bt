@@ -16,35 +16,28 @@ use actix_web::http::header::{
 use actix_web::{guard, web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
-use crossterm::queue;
-use crossterm::style::{
-    Attribute, Color as CtColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    Stylize,
-};
+use crossterm::style::Stylize;
 use futures_util::future;
 use futures_util::stream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use strip_ansi_escapes::strip;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use unicode_width::UnicodeWidthStr;
 
-use ratatui::backend::TestBackend;
-use ratatui::layout::{Alignment, Constraint};
+use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Row, Table};
-use ratatui::Terminal;
 
 use crate::args::BaseArgs;
 use crate::auth::resolved_runner_env;
 use crate::js_runner;
 use crate::python_runner;
 use crate::runner_sse;
-use crate::ui::{animations_enabled, is_quiet};
+use crate::ui::{
+    animations_enabled, box_with_title, header_line, is_quiet, render_ratatui_table,
+};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -185,9 +178,7 @@ struct ResolvedDatasetEvalData {
 #[derive(Clone)]
 struct DevServerState {
     base: BaseArgs,
-    js_runner_override: Option<String>,
-    python_runner_override: Option<String>,
-    files: Vec<String>,
+    dev_plans: Vec<DevEvalPlan>,
     no_send_logs: bool,
     options: EvalRunOptions,
     host: String,
@@ -546,11 +537,14 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
     if args.dev {
         let app_url = resolve_app_url(&base);
+        let dev_plans = build_dev_eval_plans(
+            &files,
+            js_runner_override.as_deref(),
+            args.runner_python.as_deref(),
+        )?;
         let state = DevServerState {
             base: base.clone(),
-            js_runner_override: js_runner_override.clone(),
-            python_runner_override: args.runner_python.clone(),
-            files,
+            dev_plans,
             no_send_logs: args.no_send_logs,
             options,
             host: args.dev_host.clone(),
@@ -654,12 +648,30 @@ async fn run_eval_files_watch(
     }
 }
 
+#[derive(Clone)]
 struct EvalPlan {
     language: EvalLanguage,
     files: Vec<String>,
     runner_override: Option<String>,
     show_js_hint: bool,
     retry_policy: RetryPolicy,
+}
+
+#[derive(Clone)]
+struct DevEvalPlan {
+    label: String,
+    plan: EvalPlan,
+}
+
+#[derive(Clone)]
+struct DevEvalRoute {
+    plan_index: usize,
+    runner_eval_name: String,
+}
+
+struct DevRoutingTable {
+    manifest: serde_json::Map<String, Value>,
+    routes: HashMap<String, DevEvalRoute>,
 }
 
 struct EvalAttemptOutput {
@@ -752,6 +764,49 @@ fn build_eval_plans(
     Ok(plans)
 }
 
+fn build_dev_eval_plans(
+    files: &[String],
+    js_runner_override: Option<&str>,
+    python_runner_override: Option<&str>,
+) -> Result<Vec<DevEvalPlan>> {
+    let plans = build_eval_plans(files, js_runner_override, python_runner_override)?;
+    let js_total = plans
+        .iter()
+        .filter(|plan| plan.language == EvalLanguage::JavaScript)
+        .count();
+    let python_total = plans
+        .iter()
+        .filter(|plan| plan.language == EvalLanguage::Python)
+        .count();
+    let mut js_seen = 0usize;
+    let mut python_seen = 0usize;
+
+    Ok(plans
+        .into_iter()
+        .map(|plan| {
+            let label = match plan.language {
+                EvalLanguage::JavaScript => {
+                    js_seen += 1;
+                    if js_total == 1 {
+                        "js".to_string()
+                    } else {
+                        format!("js {js_seen}")
+                    }
+                }
+                EvalLanguage::Python => {
+                    python_seen += 1;
+                    if python_total == 1 {
+                        "python".to_string()
+                    } else {
+                        format!("python {python_seen}")
+                    }
+                }
+            };
+            DevEvalPlan { label, plan }
+        })
+        .collect())
+}
+
 async fn run_eval_plan_once(
     base: &BaseArgs,
     plan: &EvalPlan,
@@ -833,12 +888,11 @@ async fn run_eval_files_once(
     collect_dependencies: bool,
 ) -> Result<EvalRunOutput> {
     let plans = build_eval_plans(files, js_runner_override, python_runner_override)?;
-    let plan_outputs = future::try_join_all(
-        plans.iter().map(|plan| {
+    let plan_outputs =
+        future::try_join_all(plans.iter().map(|plan| {
             run_eval_plan_once(base, plan, no_send_logs, options, collect_dependencies)
-        }),
-    )
-    .await?;
+        }))
+        .await?;
 
     // Aggregate: prefer first failing status; merge all dependency sets.
     let mut combined_status: Option<ExitStatus> = None;
@@ -1278,6 +1332,32 @@ fn json_error_response(status: actix_web::http::StatusCode, message: &str) -> Ht
     HttpResponse::build(status).json(json!({ "error": message }))
 }
 
+#[derive(Debug)]
+struct DevHttpError {
+    status: actix_web::http::StatusCode,
+    message: String,
+}
+
+impl DevHttpError {
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn with_status(status: actix_web::http::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn into_response(self) -> HttpResponse {
+        json_error_response(self.status, &self.message)
+    }
+}
+
 fn parse_auth_token(req: &HttpRequest) -> Option<String> {
     if let Some(token) = req.headers().get(HEADER_BT_AUTH_TOKEN) {
         if let Ok(value) = token.to_str() {
@@ -1523,6 +1603,164 @@ fn make_dev_mode_env(
     Ok(env)
 }
 
+async fn load_dev_plan_manifest(
+    state: &DevServerState,
+    dev_plan: &DevEvalPlan,
+    extra_env: &[(String, String)],
+) -> std::result::Result<serde_json::Map<String, Value>, DevHttpError> {
+    let spawned = spawn_eval_runner(
+        &state.base,
+        dev_plan.plan.language,
+        dev_plan.plan.runner_override.as_deref(),
+        &dev_plan.plan.files,
+        state.no_send_logs,
+        &state.options,
+        extra_env,
+        JsMode::Auto,
+    )
+    .await
+    .map_err(|err| DevHttpError::internal(format!("{err:#}")))?;
+
+    let mut stdout_lines: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
+    let output = drive_eval_runner(
+        spawned.process,
+        ConsolePolicy::Forward,
+        |event| match event {
+            EvalEvent::Console { stream, message } if stream == "stdout" => {
+                stdout_lines.push(message);
+            }
+            EvalEvent::Error {
+                message,
+                stack: _,
+                status,
+            } => errors.push((message, status)),
+            _ => {}
+        },
+    )
+    .await
+    .map_err(|err| DevHttpError::internal(format!("{err:#}")))?;
+
+    if let Some((message, status)) = errors.into_iter().next() {
+        let http_status = status
+            .and_then(|code| actix_web::http::StatusCode::from_u16(code).ok())
+            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(DevHttpError::with_status(http_status, message));
+    }
+    if !output.status.success() {
+        return Err(DevHttpError::internal("Eval runner exited with an error."));
+    }
+
+    let mut manifest: Option<serde_json::Map<String, Value>> = None;
+    for line in stdout_lines.iter().rev() {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) {
+            manifest = Some(map);
+            break;
+        }
+    }
+    if manifest.is_none() {
+        let joined = stdout_lines.join("\n");
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&joined) {
+            manifest = Some(map);
+        }
+    }
+
+    manifest.ok_or_else(|| {
+        DevHttpError::internal("Failed to parse evaluator manifest from runner output.")
+    })
+}
+
+fn uniquify_dev_route_name(name: String, counts: &mut HashMap<String, usize>) -> String {
+    let count = counts.entry(name.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        name
+    } else {
+        format!("{name} #{count}")
+    }
+}
+
+fn build_dev_routing_table_from_manifests(
+    dev_plans: &[DevEvalPlan],
+    plan_manifests: Vec<(usize, serde_json::Map<String, Value>)>,
+) -> DevRoutingTable {
+    let mut key_counts: HashMap<String, usize> = HashMap::new();
+    for (_, map) in &plan_manifests {
+        for key in map.keys() {
+            *key_counts.entry(key.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut manifest = serde_json::Map::new();
+    let mut routes = HashMap::new();
+    let mut display_counts: HashMap<String, usize> = HashMap::new();
+    for (plan_index, map) in plan_manifests {
+        for (raw_name, value) in map {
+            let base_display_name = if key_counts.get(&raw_name).copied().unwrap_or(0) > 1 {
+                format!("{raw_name} [{}]", dev_plans[plan_index].label)
+            } else {
+                raw_name.clone()
+            };
+            let display_name = uniquify_dev_route_name(base_display_name, &mut display_counts);
+            let route = DevEvalRoute {
+                plan_index,
+                runner_eval_name: raw_name.clone(),
+            };
+
+            manifest.insert(display_name.clone(), value);
+            routes.insert(display_name, route.clone());
+            if key_counts.get(&raw_name).copied().unwrap_or(0) == 1 {
+                routes.insert(raw_name, route);
+            }
+        }
+    }
+
+    DevRoutingTable { manifest, routes }
+}
+
+async fn build_dev_routing_table(
+    state: &DevServerState,
+    auth: &DevAuthContext,
+) -> std::result::Result<DevRoutingTable, DevHttpError> {
+    let extra_env = make_dev_mode_env(auth, state, None, "list")
+        .map_err(|err| DevHttpError::internal(format!("{err:#}")))?;
+    let plan_manifests = future::try_join_all(state.dev_plans.iter().enumerate().map(
+        |(plan_index, dev_plan)| {
+            let extra_env = extra_env.clone();
+            async move {
+                Ok::<_, DevHttpError>((
+                    plan_index,
+                    load_dev_plan_manifest(state, dev_plan, &extra_env).await?,
+                ))
+            }
+        },
+    ))
+    .await?;
+    Ok(build_dev_routing_table_from_manifests(
+        &state.dev_plans,
+        plan_manifests,
+    ))
+}
+
+async fn resolve_dev_eval_route(
+    state: &DevServerState,
+    auth: &DevAuthContext,
+    requested_name: &str,
+) -> std::result::Result<DevEvalRoute, DevHttpError> {
+    // Always rebuild the routing table from a fresh manifest run. The dev
+    // server exists for iterative editing, so a cached table could route a
+    // request to an evaluator that has since been renamed or removed. We accept
+    // re-running the manifests on each request (matching `/list`) rather than
+    // risk serving a stale route.
+    let table = build_dev_routing_table(state, auth).await?;
+    table.routes.get(requested_name).cloned().ok_or_else(|| {
+        DevHttpError::with_status(
+            actix_web::http::StatusCode::NOT_FOUND,
+            format!("Evaluator '{requested_name}' not found"),
+        )
+    })
+}
+
 fn serialize_sse_event(event: &str, data: &str) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
@@ -1635,158 +1873,11 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         Ok(auth) => auth,
         Err(response) => return response,
     };
-    let extra_env = match make_dev_mode_env(&auth, &state, None, "list") {
-        Ok(extra_env) => extra_env,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
+    let table = match build_dev_routing_table(&state, &auth).await {
+        Ok(table) => table,
+        Err(err) => return err.into_response(),
     };
-
-    let partitions = match partition_files_by_language(&state.files) {
-        Ok(p) => p,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
-
-    // Spawn one runner per language partition and collect their manifests in parallel.
-    let mut handles = Vec::new();
-    for (language, files) in partitions {
-        let state = state.clone();
-        let extra_env = extra_env.clone();
-        handles.push(tokio::spawn(async move {
-            let runner = match language {
-                EvalLanguage::JavaScript => state.js_runner_override.as_deref(),
-                EvalLanguage::Python => state.python_runner_override.as_deref(),
-            };
-            let spawned = spawn_eval_runner(
-                &state.base,
-                language,
-                runner,
-                &files,
-                state.no_send_logs,
-                &state.options,
-                &extra_env,
-                JsMode::Auto,
-            )
-            .await?;
-            let mut stdout_lines: Vec<String> = Vec::new();
-            let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-            let output =
-                drive_eval_runner(
-                    spawned.process,
-                    ConsolePolicy::Forward,
-                    |event| match event {
-                        EvalEvent::Console { stream, message } if stream == "stdout" => {
-                            stdout_lines.push(message);
-                        }
-                        EvalEvent::Error {
-                            message,
-                            stack: _,
-                            status,
-                        } => errors.push((message, status)),
-                        _ => {}
-                    },
-                )
-                .await?;
-            Ok::<_, anyhow::Error>((language, stdout_lines, errors, output.status))
-        }));
-    }
-
-    // Collect each partition's manifest alongside its language.
-    let mut language_manifests: Vec<(EvalLanguage, serde_json::Map<String, Value>)> = Vec::new();
-    let mut first_error: Option<(String, Option<u16>)> = None;
-    let mut any_failure = false;
-    for handle in handles {
-        let (language, stdout_lines, errors, status) = match handle.await {
-            Ok(Ok(r)) => r,
-            Ok(Err(err)) => {
-                return json_error_response(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{err:#}"),
-                );
-            }
-            Err(err) => {
-                return json_error_response(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{err:#}"),
-                );
-            }
-        };
-        if !status.success() {
-            any_failure = true;
-        }
-        if first_error.is_none() {
-            first_error = errors.into_iter().next();
-        }
-        let mut partition_manifest: Option<serde_json::Map<String, Value>> = None;
-        for line in stdout_lines.iter().rev() {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) {
-                partition_manifest = Some(map);
-                break;
-            }
-        }
-        if partition_manifest.is_none() {
-            let joined = stdout_lines.join("\n");
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&joined) {
-                partition_manifest = Some(map);
-            }
-        }
-        if let Some(map) = partition_manifest {
-            language_manifests.push((language, map));
-        }
-    }
-
-    if let Some((message, status)) = first_error {
-        let http_status = status
-            .and_then(|s| actix_web::http::StatusCode::from_u16(s).ok())
-            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
-        return json_error_response(http_status, &message);
-    }
-    if any_failure {
-        return json_error_response(
-            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Eval runner exited with an error.",
-        );
-    }
-    if language_manifests.is_empty() {
-        return json_error_response(
-            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to parse evaluator manifest from runner output.",
-        );
-    }
-
-    // Merge manifests across partitions. If the same evaluator name appears in
-    // multiple language partitions, suffix each with the language name so both
-    // are registered and Braintrust can report them independently.
-    let mut key_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (_, map) in &language_manifests {
-        for key in map.keys() {
-            *key_counts.entry(key.clone()).or_insert(0) += 1;
-        }
-    }
-    let mut merged_manifest = serde_json::Map::new();
-    for (language, map) in language_manifests {
-        let lang_label = match language {
-            EvalLanguage::JavaScript => "js",
-            EvalLanguage::Python => "python",
-        };
-        for (key, value) in map {
-            let final_key = if key_counts.get(&key).copied().unwrap_or(0) > 1 {
-                format!("{key} [{lang_label}]")
-            } else {
-                key
-            };
-            merged_manifest.insert(final_key, value);
-        }
-    }
-    HttpResponse::Ok().json(Value::Object(merged_manifest))
+    HttpResponse::Ok().json(Value::Object(table.manifest.clone()))
 }
 
 async fn dev_server_eval(
@@ -1811,6 +1902,11 @@ async fn dev_server_eval(
         return response;
     }
     let stream_requested = eval_request.stream.unwrap_or(false);
+    let route = match resolve_dev_eval_route(&state, &auth, &eval_request.name).await {
+        Ok(route) => route,
+        Err(err) => return err.into_response(),
+    };
+    eval_request.name = route.runner_eval_name;
     let extra_env = match make_dev_mode_env(&auth, &state, Some(&eval_request), "eval") {
         Ok(extra_env) => extra_env,
         Err(err) => {
@@ -1820,9 +1916,20 @@ async fn dev_server_eval(
             );
         }
     };
-
-    let partitions = match partition_files_by_language(&state.files) {
-        Ok(p) => p,
+    let dev_plan = &state.dev_plans[route.plan_index];
+    let spawned = match spawn_eval_runner(
+        &state.base,
+        dev_plan.plan.language,
+        dev_plan.plan.runner_override.as_deref(),
+        &dev_plan.plan.files,
+        state.no_send_logs,
+        &state.options,
+        &extra_env,
+        JsMode::Auto,
+    )
+    .await
+    {
+        Ok(spawned) => spawned,
         Err(err) => {
             return json_error_response(
                 actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1830,108 +1937,61 @@ async fn dev_server_eval(
             );
         }
     };
-    let mut spawned_list: Vec<EvalSpawned> = Vec::new();
-    for (language, files) in &partitions {
-        let runner = match language {
-            EvalLanguage::JavaScript => state.js_runner_override.as_deref(),
-            EvalLanguage::Python => state.python_runner_override.as_deref(),
-        };
-        match spawn_eval_runner(
-            &state.base,
-            *language,
-            runner,
-            files,
-            state.no_send_logs,
-            &state.options,
-            &extra_env,
-            JsMode::Auto,
-        )
-        .await
-        {
-            Ok(spawned) => spawned_list.push(spawned),
-            Err(err) => {
-                return json_error_response(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{err:#}"),
-                );
-            }
-        }
-    }
 
     if stream_requested {
         let (tx, rx) = mpsc::unbounded_channel::<String>();
-        let mut runner_handles = Vec::new();
-        for spawned in spawned_list {
-            let tx_task = tx.clone();
-            runner_handles.push(tokio::spawn(async move {
-                let mut saw_error = false;
-                let mut saw_404 = false;
-                let mut stderr_lines: Vec<String> = Vec::new();
-                let output = drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
-                    if let EvalEvent::Error {
-                        status: Some(404), ..
-                    } = &event
-                    {
-                        saw_404 = true;
-                        return;
+        let tx_task = tx.clone();
+        tokio::spawn(async move {
+            let mut saw_error = false;
+            let mut stderr_lines: Vec<String> = Vec::new();
+            let output = drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
+                if matches!(event, EvalEvent::Error { .. }) {
+                    saw_error = true;
+                }
+                if matches!(event, EvalEvent::Done) {
+                    return;
+                }
+                if let EvalEvent::Console {
+                    ref stream,
+                    ref message,
+                } = event
+                {
+                    for line in message.lines() {
+                        let _ = tx_task.send(format!(": [{stream}] {line}\n"));
                     }
-                    if matches!(event, EvalEvent::Error { .. }) {
-                        saw_error = true;
+                    if stream == "stderr" {
+                        stderr_lines.push(message.clone());
                     }
-                    if matches!(event, EvalEvent::Done) {
-                        return;
-                    }
-                    if let EvalEvent::Console {
-                        ref stream,
-                        ref message,
-                    } = event
-                    {
-                        for line in message.lines() {
-                            let _ = tx_task.send(format!(": [{stream}] {line}\n"));
-                        }
-                        if stream == "stderr" {
-                            stderr_lines.push(message.clone());
-                        }
-                        return;
-                    }
-                    if let Some(encoded) = encode_eval_event_for_http(&event) {
-                        let _ = tx_task.send(encoded);
-                    }
-                })
-                .await;
+                    return;
+                }
+                if let Some(encoded) = encode_eval_event_for_http(&event) {
+                    let _ = tx_task.send(encoded);
+                }
+            })
+            .await;
 
-                match output {
-                    Ok(output) => {
-                        if !output.status.success() && !saw_error && !saw_404 {
-                            let mut detail = format!("Eval runner exited with {}.", output.status);
-                            for line in stderr_lines.iter() {
-                                detail.push('\n');
-                                detail.push_str(line);
-                            }
-                            let error = serialize_sse_event(
-                                "error",
-                                &json!({ "message": detail }).to_string(),
-                            );
-                            let _ = tx_task.send(error);
+            match output {
+                Ok(output) => {
+                    if !output.status.success() && !saw_error {
+                        let mut detail = format!("Eval runner exited with {}.", output.status);
+                        for line in stderr_lines.iter() {
+                            detail.push('\n');
+                            detail.push_str(line);
                         }
-                    }
-                    Err(err) => {
-                        let error = serialize_sse_event(
-                            "error",
-                            &json!({ "message": format!("{err:#}") }).to_string(),
-                        );
+                        let error =
+                            serialize_sse_event("error", &json!({ "message": detail }).to_string());
                         let _ = tx_task.send(error);
                     }
                 }
-            }));
-        }
-        // Coordination task: wait for all runner tasks, then send the SSE "done" event.
-        let tx_coord = tx.clone();
-        tokio::spawn(async move {
-            for handle in runner_handles {
-                let _ = handle.await;
+                Err(err) => {
+                    let error = serialize_sse_event(
+                        "error",
+                        &json!({ "message": format!("{err:#}") }).to_string(),
+                    );
+                    let _ = tx_task.send(error);
+                }
             }
-            let _ = tx_coord.send(serialize_sse_event("done", ""));
+            let _ = tx_task.send(serialize_sse_event("done", ""));
         });
         drop(tx);
 
@@ -1947,43 +2007,25 @@ async fn dev_server_eval(
             .streaming(response_stream);
     }
 
-    // Non-streaming: drive all runners in parallel and aggregate results.
-    let mut non_streaming_handles = Vec::new();
-    for spawned in spawned_list {
-        non_streaming_handles.push(tokio::spawn(async move {
-            let mut summary: Option<ExperimentSummary> = None;
-            let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-            let output =
-                drive_eval_runner(
-                    spawned.process,
-                    ConsolePolicy::Forward,
-                    |event| match event {
-                        EvalEvent::Summary(current) => summary = Some(current),
-                        EvalEvent::Error {
-                            message,
-                            stack: _,
-                            status,
-                        } => errors.push((message, status)),
-                        _ => {}
-                    },
-                )
-                .await?;
-            Ok::<_, anyhow::Error>((summary, errors, output.status))
-        }));
-    }
-
-    let mut final_summary: Option<ExperimentSummary> = None;
-    let mut first_real_error: Option<(String, Option<u16>)> = None;
-    let mut any_failure = false;
-    for handle in non_streaming_handles {
-        let result = match handle.await {
-            Ok(Ok(r)) => r,
-            Ok(Err(err)) => {
-                return json_error_response(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{err:#}"),
-                );
-            }
+    let mut summary: Option<ExperimentSummary> = None;
+    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
+    let output =
+        match drive_eval_runner(
+            spawned.process,
+            ConsolePolicy::Forward,
+            |event| match event {
+                EvalEvent::Summary(current) => summary = Some(current),
+                EvalEvent::Error {
+                    message,
+                    stack: _,
+                    status,
+                } => errors.push((message, status)),
+                _ => {}
+            },
+        )
+        .await
+        {
+            Ok(output) => output,
             Err(err) => {
                 return json_error_response(
                     actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1991,31 +2033,17 @@ async fn dev_server_eval(
                 );
             }
         };
-        let (summary, errors, status) = result;
-        if !status.success() {
-            any_failure = true;
-        }
-        for (message, error_status) in errors {
-            // Filter 404s: they come from the runner that does not own this evaluator.
-            if error_status != Some(404) && first_real_error.is_none() {
-                first_real_error = Some((message, error_status));
-            }
-        }
-        if final_summary.is_none() {
-            final_summary = summary;
-        }
-    }
 
-    if let Some((message, status)) = first_real_error {
+    if let Some((message, status)) = errors.into_iter().next() {
         let http_status = status
             .and_then(|s| actix_web::http::StatusCode::from_u16(s).ok())
             .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
         return json_error_response(http_status, &message);
     }
-    if let Some(summary) = final_summary {
+    if let Some(summary) = summary {
         return HttpResponse::Ok().json(summary);
     }
-    if any_failure {
+    if !output.status.success() {
         return json_error_response(
             actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Eval runner exited with an error.",
@@ -2796,7 +2824,10 @@ fn group_python_files_by_venv(files: &[String]) -> Vec<(Vec<String>, Option<Stri
             None => groups.push((venv_python, vec![file.clone()])),
         }
     }
-    groups.into_iter().map(|(python, files)| (files, python)).collect()
+    groups
+        .into_iter()
+        .map(|(python, files)| (files, python))
+        .collect()
 }
 fn eval_runner_cache_dir() -> PathBuf {
     let root = std::env::var_os("XDG_CACHE_HOME")
@@ -3526,7 +3557,8 @@ fn format_experiment_summary(summary: &ExperimentSummary) -> String {
             }
         }
 
-        parts.push(render_table_ratatui(header, rows, has_comparison));
+        let columns = if has_comparison { 5 } else { 2 };
+        parts.push(render_ratatui_table(header, rows, columns));
     }
 
     if let Some(url) = &summary.experiment_url {
@@ -3595,75 +3627,6 @@ fn format_metric_value(metric: f64, unit: &str) -> String {
     }
 }
 
-fn render_table_ratatui(
-    header: Option<Vec<Line<'static>>>,
-    rows: Vec<Vec<Line<'static>>>,
-    has_comparison: bool,
-) -> String {
-    if rows.is_empty() {
-        return String::new();
-    }
-
-    let columns = if has_comparison { 5 } else { 2 };
-    let mut widths = vec![0usize; columns];
-
-    if let Some(header_row) = &header {
-        for (idx, line) in header_row.iter().enumerate().take(columns) {
-            widths[idx] = widths[idx].max(line.width());
-        }
-    }
-
-    for row in &rows {
-        for (idx, line) in row.iter().enumerate().take(columns) {
-            widths[idx] = widths[idx].max(line.width());
-        }
-    }
-
-    let column_spacing = 2;
-    let total_width = widths.iter().sum::<usize>() + column_spacing * (columns - 1);
-    let mut height = rows.len();
-    if header.is_some() {
-        height += 1;
-    }
-    let backend = TestBackend::new(total_width as u16, height as u16);
-    let mut terminal = Terminal::new(backend).expect("failed to create table backend");
-
-    let table_rows = rows.into_iter().map(|row| {
-        let cells = row.into_iter().map(Cell::new).collect::<Vec<_>>();
-        Row::new(cells)
-    });
-
-    let mut table = Table::new(
-        table_rows,
-        widths.iter().map(|w| Constraint::Length(*w as u16)),
-    )
-    .column_spacing(column_spacing as u16);
-
-    if let Some(header_row) = header {
-        let header_cells = header_row.into_iter().map(Cell::new).collect::<Vec<_>>();
-        table = table.header(Row::new(header_cells));
-    }
-
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            frame.render_widget(table, area);
-        })
-        .expect("failed to render table");
-
-    let buffer = terminal.backend().buffer();
-    buffer_to_ansi_lines(buffer).join("\n")
-}
-
-fn header_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_string(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    ))
-}
-
 fn truncate_plain(text: &str, max_len: usize) -> String {
     if text.chars().count() <= max_len {
         return text.to_string();
@@ -3673,155 +3636,6 @@ fn truncate_plain(text: &str, max_len: usize) -> String {
     }
     let truncated: String = text.chars().take(max_len - 3).collect();
     format!("{truncated}...")
-}
-
-fn box_with_title(title: &str, content: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let content_width = lines
-        .iter()
-        .map(|line| visible_width(line))
-        .max()
-        .unwrap_or(0);
-    let padding = 1;
-    let inner_width = content_width + padding * 2;
-
-    let title_plain = format!(" {title} ");
-    let title_width = visible_width(&title_plain);
-    let mut top = String::from("╭");
-    top.push_str(&title_plain.dark_grey().to_string());
-    if inner_width > title_width {
-        top.push_str(&"─".repeat(inner_width - title_width));
-    }
-    top.push('╮');
-
-    let mut boxed = vec![top];
-    for line in lines {
-        let line_width = visible_width(line);
-        // Defensive: if width accounting ever drifts (e.g. escape-sequence parsing),
-        // avoid underflow and render without extra trailing padding.
-        let right_padding = inner_width.saturating_sub(line_width + padding);
-        let mut row = String::from("│");
-        row.push_str(&" ".repeat(padding));
-        row.push_str(line);
-        row.push_str(&" ".repeat(right_padding));
-        row.push('│');
-        boxed.push(row);
-    }
-
-    let bottom = format!("╰{}╯", "─".repeat(inner_width));
-    boxed.push(bottom);
-
-    format!("\n{}", boxed.join("\n"))
-}
-
-fn visible_width(text: &str) -> usize {
-    let stripped = strip(text.as_bytes());
-    let stripped = String::from_utf8_lossy(&stripped);
-    UnicodeWidthStr::width(stripped.as_ref())
-}
-
-fn buffer_to_ansi_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
-    let width = buffer.area.width as usize;
-    let height = buffer.area.height as usize;
-    let mut lines = Vec::with_capacity(height);
-    let mut current_style = Style::reset();
-
-    for y in 0..height {
-        let mut line = String::new();
-        let mut skip = 0usize;
-        for x in 0..width {
-            let cell = &buffer[(x as u16, y as u16)];
-            let symbol = cell.symbol();
-            let symbol_width = UnicodeWidthStr::width(symbol);
-            if skip > 0 {
-                skip -= 1;
-                continue;
-            }
-
-            let style = Style {
-                fg: Some(cell.fg),
-                bg: Some(cell.bg),
-                add_modifier: cell.modifier,
-                ..Style::default()
-            };
-
-            if style != current_style {
-                line.push_str(&style_to_ansi(style));
-                current_style = style;
-            }
-
-            line.push_str(symbol);
-            skip = symbol_width.saturating_sub(1);
-        }
-        line.push_str(&style_to_ansi(Style::reset()));
-        lines.push(line.trim_end().to_string());
-    }
-
-    lines
-}
-
-fn style_to_ansi(style: Style) -> String {
-    let mut buf = Vec::new();
-    let _ = queue!(buf, SetAttribute(Attribute::Reset), ResetColor);
-
-    if let Some(fg) = style.fg {
-        let _ = queue!(buf, SetForegroundColor(convert_color(fg)));
-    }
-    if let Some(bg) = style.bg {
-        let _ = queue!(buf, SetBackgroundColor(convert_color(bg)));
-    }
-
-    let mods = style.add_modifier;
-    if mods.contains(Modifier::BOLD) {
-        let _ = queue!(buf, SetAttribute(Attribute::Bold));
-    }
-    if mods.contains(Modifier::DIM) {
-        let _ = queue!(buf, SetAttribute(Attribute::Dim));
-    }
-    if mods.contains(Modifier::ITALIC) {
-        let _ = queue!(buf, SetAttribute(Attribute::Italic));
-    }
-    if mods.contains(Modifier::UNDERLINED) {
-        let _ = queue!(buf, SetAttribute(Attribute::Underlined));
-    }
-    if mods.contains(Modifier::REVERSED) {
-        let _ = queue!(buf, SetAttribute(Attribute::Reverse));
-    }
-    if mods.contains(Modifier::CROSSED_OUT) {
-        let _ = queue!(buf, SetAttribute(Attribute::CrossedOut));
-    }
-    if mods.contains(Modifier::SLOW_BLINK) {
-        let _ = queue!(buf, SetAttribute(Attribute::SlowBlink));
-    }
-    if mods.contains(Modifier::RAPID_BLINK) {
-        let _ = queue!(buf, SetAttribute(Attribute::RapidBlink));
-    }
-
-    String::from_utf8_lossy(&buf).to_string()
-}
-
-fn convert_color(color: Color) -> CtColor {
-    match color {
-        Color::Reset => CtColor::Reset,
-        Color::Black => CtColor::Black,
-        Color::Red => CtColor::Red,
-        Color::Green => CtColor::Green,
-        Color::Yellow => CtColor::Yellow,
-        Color::Blue => CtColor::Blue,
-        Color::Magenta => CtColor::Magenta,
-        Color::Cyan => CtColor::Cyan,
-        Color::Gray => CtColor::Grey,
-        Color::DarkGray => CtColor::DarkGrey,
-        Color::LightRed => CtColor::Red,
-        Color::LightGreen => CtColor::Green,
-        Color::LightYellow => CtColor::Yellow,
-        Color::LightBlue => CtColor::Blue,
-        Color::LightMagenta => CtColor::Magenta,
-        Color::LightCyan => CtColor::Cyan,
-        Color::White => CtColor::White,
-        Color::Indexed(value) => CtColor::AnsiValue(value),
-        Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
-    }
 }
 
 #[cfg(test)]
@@ -5409,5 +5223,117 @@ mod tests {
             .find(|p| p.language == EvalLanguage::Python)
             .expect("Python plan should exist");
         assert_eq!(py_plan.runner_override.as_deref(), Some("my-python"));
+    }
+
+    #[test]
+    fn build_dev_eval_plans_preserves_python_venv_split() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let dir_a = tempdir.path().join("a");
+        let dir_b = tempdir.path().join("b");
+        std::fs::create_dir_all(&dir_a).expect("create dir a");
+        std::fs::create_dir_all(&dir_b).expect("create dir b");
+
+        let file_a = dir_a.join("eval_a.py");
+        let file_b = dir_b.join("eval_b.py");
+        std::fs::write(&file_a, "").expect("write file a");
+        std::fs::write(&file_b, "").expect("write file b");
+
+        let venv_a = venv_python_path(&dir_a.join(".venv"));
+        let venv_b = venv_python_path(&dir_b.join(".venv"));
+        std::fs::create_dir_all(venv_a.parent().expect("venv a parent")).expect("create venv a");
+        std::fs::create_dir_all(venv_b.parent().expect("venv b parent")).expect("create venv b");
+        std::fs::write(&venv_a, "").expect("write venv a");
+        std::fs::write(&venv_b, "").expect("write venv b");
+        let venv_a = venv_a.canonicalize().expect("canonicalize venv a");
+        let venv_b = venv_b.canonicalize().expect("canonicalize venv b");
+
+        let files = vec![
+            file_a.to_string_lossy().to_string(),
+            file_b.to_string_lossy().to_string(),
+        ];
+        let plans = build_dev_eval_plans(&files, None, None).expect("should build dev plans");
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].label, "python 1");
+        assert_eq!(plans[0].plan.files, vec![files[0].clone()]);
+        assert_eq!(
+            plans[0].plan.runner_override.as_deref(),
+            Some(venv_a.to_string_lossy().as_ref())
+        );
+        assert_eq!(plans[1].label, "python 2");
+        assert_eq!(plans[1].plan.files, vec![files[1].clone()]);
+        assert_eq!(
+            plans[1].plan.runner_override.as_deref(),
+            Some(venv_b.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn build_dev_routing_table_disambiguates_duplicate_names() {
+        let dev_plans = vec![
+            DevEvalPlan {
+                label: "js".to_string(),
+                plan: EvalPlan {
+                    language: EvalLanguage::JavaScript,
+                    files: vec!["a.eval.ts".to_string()],
+                    runner_override: None,
+                    show_js_hint: false,
+                    retry_policy: RetryPolicy::Disallow,
+                },
+            },
+            DevEvalPlan {
+                label: "python 1".to_string(),
+                plan: EvalPlan {
+                    language: EvalLanguage::Python,
+                    files: vec!["eval_a.py".to_string()],
+                    runner_override: Some("/tmp/python-a".to_string()),
+                    show_js_hint: false,
+                    retry_policy: RetryPolicy::Disallow,
+                },
+            },
+        ];
+
+        let mut js_manifest = serde_json::Map::new();
+        js_manifest.insert("shared".to_string(), json!({"runtime": "js"}));
+        js_manifest.insert("js-only".to_string(), json!({"runtime": "js"}));
+
+        let mut python_manifest = serde_json::Map::new();
+        python_manifest.insert("shared".to_string(), json!({"runtime": "python"}));
+        python_manifest.insert("py-only".to_string(), json!({"runtime": "python"}));
+
+        let table = build_dev_routing_table_from_manifests(
+            &dev_plans,
+            vec![(0, js_manifest), (1, python_manifest)],
+        );
+
+        assert!(table.manifest.contains_key("shared [js]"));
+        assert!(table.manifest.contains_key("shared [python 1]"));
+        assert!(table.routes.get("shared").is_none());
+
+        let js_route = table
+            .routes
+            .get("shared [js]")
+            .expect("js duplicate should be routed");
+        assert_eq!(js_route.plan_index, 0);
+        assert_eq!(js_route.runner_eval_name, "shared");
+
+        let py_route = table
+            .routes
+            .get("shared [python 1]")
+            .expect("python duplicate should be routed");
+        assert_eq!(py_route.plan_index, 1);
+        assert_eq!(py_route.runner_eval_name, "shared");
+
+        let js_only = table
+            .routes
+            .get("js-only")
+            .expect("unique js name should keep raw alias");
+        assert_eq!(js_only.plan_index, 0);
+
+        let py_only = table
+            .routes
+            .get("py-only")
+            .expect("unique python name should keep raw alias");
+        assert_eq!(py_only.plan_index, 1);
     }
 }

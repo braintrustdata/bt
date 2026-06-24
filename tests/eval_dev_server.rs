@@ -302,6 +302,15 @@ fn ensure_python_env(fixtures_py_root: &std::path::Path) -> Option<PathBuf> {
     Some(python)
 }
 
+fn uv_sync(dir: &Path) {
+    let status = Command::new("uv")
+        .arg("sync")
+        .current_dir(dir)
+        .status()
+        .expect("uv sync");
+    assert!(status.success(), "uv sync failed for {}", dir.display());
+}
+
 fn venv_python_path(venv: &std::path::Path) -> PathBuf {
     if cfg!(windows) {
         venv.join("Scripts").join("python.exe")
@@ -514,6 +523,118 @@ fn eval_dev_server_streams_python_events() {
     );
 
     // 6. Clean up.
+    let _ = child.kill();
+    let _ = child.wait();
+    for handle in threads {
+        let _ = handle.join();
+    }
+}
+
+#[test]
+fn eval_dev_server_runs_multi_venv_python_evals() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let dir_a = fixtures_root.join("py").join("multi-venv-a");
+    let dir_b = fixtures_root.join("py").join("multi-venv-b");
+
+    // The fixtures are committed alongside the test; a missing fixture means
+    // a broken checkout, which should fail loudly rather than silently skip.
+    let file_a = dir_a.join("eval_a.py");
+    let file_b = dir_b.join("eval_b.py");
+    assert!(file_a.exists(), "missing fixture: {}", file_a.display());
+    assert!(file_b.exists(), "missing fixture: {}", file_b.display());
+    if !command_exists("uv") {
+        eprintln!("Skipping eval_dev_server_runs_multi_venv_python_evals (uv not available).");
+        return;
+    }
+
+    uv_sync(&dir_a);
+    uv_sync(&dir_b);
+
+    let bt_path = bt_binary_path(&root);
+    let (mock_auth_port, _mock_handle) = start_mock_auth_server();
+
+    let dev_port = free_port();
+    let mut child = Command::new(&bt_path)
+        .args([
+            "eval",
+            "--dev",
+            "--dev-port",
+            &dev_port.to_string(),
+            "--no-send-logs",
+            file_a.to_string_lossy().as_ref(),
+            file_b.to_string_lossy().as_ref(),
+        ])
+        .current_dir(&root)
+        .env(
+            "BRAINTRUST_APP_URL",
+            format!("http://127.0.0.1:{mock_auth_port}"),
+        )
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env_remove("VIRTUAL_ENV")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bt eval --dev");
+
+    let output = Arc::new(Mutex::new(String::new()));
+    let mut threads = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        threads.push(spawn_output_collector(stdout, Arc::clone(&output)));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        threads.push(spawn_output_collector(stderr, Arc::clone(&output)));
+    }
+
+    wait_for_output(
+        &mut child,
+        &output,
+        "Starting eval dev server",
+        Duration::from_secs(60),
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    let base_url = format!("http://127.0.0.1:{dev_port}");
+    let auth_headers: Vec<(&str, &str)> = vec![
+        ("x-bt-auth-token", "test-key"),
+        ("x-bt-org-name", "test-org"),
+    ];
+
+    let list_body = curl_get(&format!("{base_url}/list"), &auth_headers);
+    let list_json: serde_json::Value =
+        serde_json::from_str(&list_body).expect("parse /list JSON response");
+    assert!(
+        list_json.get("multi-venv-a").is_some(),
+        "/list should include 'multi-venv-a', got: {list_body}"
+    );
+    assert!(
+        list_json.get("multi-venv-b").is_some(),
+        "/list should include 'multi-venv-b', got: {list_body}"
+    );
+
+    let mut post_headers = auth_headers.clone();
+    post_headers.push(("Content-Type", "application/json"));
+    for eval_name in ["multi-venv-a", "multi-venv-b"] {
+        let eval_body = serde_json::json!({
+            "name": eval_name,
+            "data": {
+                "data": [{"input": 1, "expected": 1}]
+            }
+        })
+        .to_string();
+        let response_body = curl_post(&format!("{base_url}/eval"), &post_headers, &eval_body);
+        let summary: serde_json::Value =
+            serde_json::from_str(&response_body).expect("parse /eval JSON response");
+        assert!(
+            summary.get("error").is_none(),
+            "eval {eval_name} should not fail, got: {response_body}"
+        );
+        assert!(
+            summary.get("scores").is_some(),
+            "eval {eval_name} should return a summary, got: {response_body}"
+        );
+    }
+
     let _ = child.kill();
     let _ = child.wait();
     for handle in threads {

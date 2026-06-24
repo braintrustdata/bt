@@ -1619,7 +1619,10 @@ fn uv_sync(dir: &Path) {
 fn eval_python_two_files_two_venvs() {
     let _guard = test_lock();
 
-    assert!(command_exists("uv"), "uv is required for this test but is not installed");
+    assert!(
+        command_exists("uv"),
+        "uv is required for this test but is not installed"
+    );
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let bt_path = bt_binary_path(&root);
@@ -1659,11 +1662,18 @@ fn eval_python_two_files_two_venvs() {
 fn eval_python_venv_adjacent_auto_discovered() {
     let _guard = test_lock();
 
-    assert!(command_exists("uv"), "uv is required for this test but is not installed");
+    assert!(
+        command_exists("uv"),
+        "uv is required for this test but is not installed"
+    );
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let bt_path = bt_binary_path(&root);
-    let dir_a = root.join("tests").join("evals").join("py").join("multi-venv-a");
+    let dir_a = root
+        .join("tests")
+        .join("evals")
+        .join("py")
+        .join("multi-venv-a");
 
     // uv sync creates the .venv from pyproject.toml (requires-python = "==3.11.*").
     // The eval asserts sys.version_info == (3, 11), so if bt picks any other Python the test fails.
