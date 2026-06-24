@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
-use crate::{http::ApiClient, project_context::ProjectContext};
+use crate::{http::ApiClient, project_context::ProjectContext, utils::app_project_url};
 
 const DEFAULT_TOPIC_AUTOMATION_NAME: &str = "Topics";
 const DEFAULT_TOPIC_AUTOMATION_DESCRIPTION: &str =
@@ -843,12 +843,7 @@ pub async fn update_topic_map_config(
 }
 
 pub fn topics_url(app_url: &str, org_name: &str, project_name: &str) -> String {
-    format!(
-        "{}/app/{}/p/{}/topics",
-        app_url.trim_end_matches('/'),
-        encode(org_name),
-        encode(project_name)
-    )
+    app_project_url(app_url, org_name, project_name, &["topics"])
 }
 
 pub async fn fetch_topic_map_report_url(
