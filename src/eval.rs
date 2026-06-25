@@ -35,9 +35,7 @@ use crate::auth::resolved_runner_env;
 use crate::js_runner;
 use crate::python_runner;
 use crate::runner_sse;
-use crate::ui::{
-    animations_enabled, box_with_title, header_line, is_quiet, render_ratatui_table,
-};
+use crate::ui::{animations_enabled, box_with_title, header_line, is_quiet, render_ratatui_table};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -5308,7 +5306,7 @@ mod tests {
 
         assert!(table.manifest.contains_key("shared [js]"));
         assert!(table.manifest.contains_key("shared [python 1]"));
-        assert!(table.routes.get("shared").is_none());
+        assert!(!table.routes.contains_key("shared"));
 
         let js_route = table
             .routes
