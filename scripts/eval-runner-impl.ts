@@ -172,6 +172,8 @@ declare global {
   var _lazy_load: boolean | undefined;
   // eslint-disable-next-line no-var
   var __inherited_braintrust_state: unknown;
+  // eslint-disable-next-line no-var
+  var __bt_eval_sample_rate: number | undefined;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -427,6 +429,11 @@ function readRunnerConfig(): RunnerConfig {
     params: parseParamsJson(process.env.BT_EVAL_PARAMS_JSON),
     matrix: parseMatrixJson(process.env.BT_EVAL_MATRIX_JSON),
   };
+}
+
+// This looks very funny right now because it is only one value but the assumption is that we will inject more values over time
+function injectRuntimeValues(config: RunnerConfig) {
+  globalThis.__bt_eval_sample_rate = config.sample ?? undefined; // Used with `bt eval <...> --sample 5`
 }
 
 const runtimeRequire = createRequire(
@@ -2424,6 +2431,7 @@ export async function main() {
   }
   collectStaticLocalDependencies(normalized);
   ensureBraintrustAvailable();
+  injectRuntimeValues(config);
   const braintrust = await loadBraintrust();
   propagateInheritedBraintrustState(braintrust);
   initRegistry();
