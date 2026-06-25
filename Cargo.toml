@@ -7,6 +7,7 @@ authors = ["Braintrust engineering <eng@braintrust.dev>"]
 description = "The Braintrust command line interface"
 license = "Apache-2.0"
 repository = "https://github.com/braintrustdata/bt"
+homepage = "https://github.com/braintrustdata/bt"
 
 [package.metadata.wix]
 upgrade-guid = "5B558F98-EEBD-4F5E-A0C8-E7A039445139"

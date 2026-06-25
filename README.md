@@ -8,6 +8,14 @@
 
 ### Unix (macOS / Linux)
 
+Using homebrew:
+
+```bash
+brew install braintrustdata/tap/bt
+```
+
+Using our installer script:
+
 ```bash
 curl -fsSL https://bt.dev/cli/install.sh | bash
 ```
@@ -68,6 +76,7 @@ shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 ## Self Update
 
 `bt` can self-update when installed via the official installer.
+If bt was installed via another package manager (Homebrew, cargo, npm...), use that package manager to update instead.
 
 ```bash
 # update on the current build channel (canary for local/dev builds, stable for official releases)
@@ -79,8 +88,6 @@ bt self update --check
 # switch/update to latest mainline canary
 bt self update --channel canary
 ```
-
-If `bt` was installed via another package manager (Homebrew, apt, choco, etc), use that package manager to update instead.
 
 ## Uninstall
 
