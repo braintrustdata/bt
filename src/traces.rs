@@ -30,10 +30,11 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
-use urlencoding::encode;
+use urlencoding::{decode, encode};
 
 use crate::args::BaseArgs;
 use crate::auth::{self, login};
+use crate::experiments::api as experiments_api;
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
 use crate::utils::parse_duration_to_seconds;
@@ -305,6 +306,8 @@ struct ParsedTraceUrl {
     org: Option<String>,
     project: Option<String>,
     page: Option<String>,
+    experiment: Option<String>,
+    comparison_experiment: Option<String>,
     row_ref: Option<String>,
     span_id: Option<String>,
     trace_view_type: Option<String>,
@@ -960,16 +963,12 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
 
     let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
     let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
-    let project_from_url = parsed_startup_url
-        .as_ref()
-        .and_then(|u| u.project.as_deref());
-
     let (object_ref, project_for_ui) = resolve_object_ref_for_view(
         &client,
         &base,
         args.object_ref.as_deref(),
         args.project_id.as_deref(),
-        project_from_url,
+        parsed_startup_url.as_ref(),
     )
     .await?;
     let source_expr = btql_source_expr(&object_ref)?;
@@ -1190,6 +1189,9 @@ async fn run_thread_command(base: BaseArgs, client: ApiClient, args: ThreadArgs)
     validate_trace_selector_args(selector)?;
     let mut target = resolve_trace_command_target(&client, &base, selector).await?;
     target.detail_view = DetailView::Thread;
+    if target.object_ref.object_type != "project_logs" {
+        bail!("thread view currently supports only project_logs sources");
+    }
 
     let interactive = !base.json && is_interactive() && !selector.non_interactive;
     if interactive {
@@ -1307,16 +1309,12 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
     }
     let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
     let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
-    let project_from_url = parsed_startup_url
-        .as_ref()
-        .and_then(|u| u.project.as_deref());
-
-    let (object_ref, _project_for_url) = resolve_object_ref_for_view(
+    let (mut object_ref, project_for_url) = resolve_object_ref_for_view(
         &client,
         &base,
         args.object_ref.as_deref(),
         args.project_id.as_deref(),
-        project_from_url,
+        parsed_startup_url.as_ref(),
     )
     .await?;
 
@@ -1361,6 +1359,8 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
                 org: Some(client.org_name().to_string()),
                 project: Some(project.id.clone()),
                 page: Some("logs".to_string()),
+                experiment: None,
+                comparison_experiment: None,
                 row_ref: row_id.clone(),
                 span_id: row_id.clone().or(span_id_from_url.clone()),
                 trace_view_type: None,
@@ -1388,33 +1388,51 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
         .await;
     }
 
-    let source_expr = btql_source_expr(&object_ref)?;
-    let item = if let Some(id) = row_id.as_deref() {
-        let query = build_full_span_query_by_id(&source_expr, id);
-        maybe_print_query(args.print_queries, "span-full-id", &query);
-        let response = with_spinner("Loading span...", async {
-            execute_query(&client, &query)
-                .await
-                .with_context(|| format!("BTQL query failed: {query}"))
-        })
-        .await?;
-        response.data.into_iter().next()
-    } else {
-        let query = build_full_span_query_by_span_id(
-            &source_expr,
-            span_id_from_url
-                .as_deref()
-                .expect("URL span id should be present when row_id is absent"),
-        );
-        maybe_print_query(args.print_queries, "span-full-span-id", &query);
-        let response = with_spinner("Loading span...", async {
-            execute_query(&client, &query)
-                .await
-                .with_context(|| format!("BTQL query failed: {query}"))
-        })
-        .await?;
-        response.data.into_iter().next()
-    };
+    let mut item = fetch_span_item(
+        &client,
+        &object_ref,
+        row_id.as_deref(),
+        span_id_from_url.as_deref(),
+        args.print_queries,
+    )
+    .await?;
+
+    if item.is_none() && args.object_ref.is_none() {
+        if let (Some(parsed), Some(project)) =
+            (parsed_startup_url.as_ref(), project_for_url.as_ref())
+        {
+            let experiments =
+                experiments_api::list_experiments_by_project_id(&client, &project.id).await?;
+            for selector in trace_url_experiment_selectors(parsed) {
+                let Ok(experiment) = find_experiment_by_selector(&experiments, selector, project)
+                else {
+                    continue;
+                };
+                let fallback_ref = ObjectRef {
+                    object_type: "experiment".to_string(),
+                    object_name: experiment.id.clone(),
+                };
+                if fallback_ref.object_type == object_ref.object_type
+                    && fallback_ref.object_name == object_ref.object_name
+                {
+                    continue;
+                }
+                let fallback_item = fetch_span_item(
+                    &client,
+                    &fallback_ref,
+                    row_id.as_deref(),
+                    span_id_from_url.as_deref(),
+                    args.print_queries,
+                )
+                .await?;
+                if fallback_item.is_some() {
+                    object_ref = fallback_ref;
+                    item = fallback_item;
+                    break;
+                }
+            }
+        }
+    }
 
     if base.json {
         let payload = json!({
@@ -1435,6 +1453,36 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
     }
 
     Ok(())
+}
+
+async fn fetch_span_item(
+    client: &ApiClient,
+    object_ref: &ObjectRef,
+    row_id: Option<&str>,
+    span_id: Option<&str>,
+    print_queries: bool,
+) -> Result<Option<Map<String, Value>>> {
+    let source_expr = btql_source_expr(object_ref)?;
+    let (label, query) = if let Some(id) = row_id {
+        (
+            "span-full-id",
+            build_full_span_query_by_id(&source_expr, id),
+        )
+    } else {
+        let span_id = span_id.expect("span id should be present when row id is absent");
+        (
+            "span-full-span-id",
+            build_full_span_query_by_span_id(&source_expr, span_id),
+        )
+    };
+    maybe_print_query(print_queries, label, &query);
+    let response = with_spinner("Loading span...", async {
+        execute_query(client, &query)
+            .await
+            .with_context(|| format!("BTQL query failed: {query}"))
+    })
+    .await?;
+    Ok(response.data.into_iter().next())
 }
 
 #[derive(Debug)]
@@ -1469,16 +1517,12 @@ async fn resolve_trace_selector(
 ) -> Result<TraceSelectorResolution> {
     let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
     let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
-    let project_from_url = parsed_startup_url
-        .as_ref()
-        .and_then(|u| u.project.as_deref());
-
     let (object_ref, project_for_url) = resolve_object_ref_for_view(
         client,
         base,
         args.object_ref.as_deref(),
         args.project_id.as_deref(),
-        project_from_url,
+        parsed_startup_url.as_ref(),
     )
     .await?;
 
@@ -1521,21 +1565,22 @@ async fn resolve_trace_command_target(
     let parsed = resolution.parsed_startup_url.as_ref().with_context(|| {
         "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>"
     })?;
-    if resolution.object_ref.object_type != "project_logs" {
-        bail!("URL trace resolution currently supports only project_logs sources");
-    }
+    let source_expr = btql_source_expr(&resolution.object_ref)?;
 
     let target = with_spinner(
         "Resolving trace URL...",
-        resolve_trace_target_for_url(client, &resolution.project, parsed, args.print_queries),
+        resolve_trace_target_for_url(
+            client,
+            &resolution.project,
+            &source_expr,
+            parsed,
+            args.print_queries,
+        ),
     )
     .await?;
 
     Ok(ResolvedTraceCommandTarget {
-        object_ref: ObjectRef {
-            object_type: "project_logs".to_string(),
-            object_name: target.project.id.clone(),
-        },
+        object_ref: resolution.object_ref,
         project: target.project,
         root_span_id: target.root_span_id,
         span_id: target.span_id,
@@ -1562,6 +1607,8 @@ async fn run_interactive_trace_target(
         org: Some(client.org_name().to_string()),
         project: Some(target.project.id.clone()),
         page: Some("logs".to_string()),
+        experiment: None,
+        comparison_experiment: None,
         row_ref: Some(target.root_span_id.clone()),
         span_id: target
             .span_id
@@ -1595,7 +1642,7 @@ async fn resolve_object_ref_for_view(
     base: &BaseArgs,
     object_ref: Option<&str>,
     project_id: Option<&str>,
-    project_name_from_url: Option<&str>,
+    parsed_url: Option<&ParsedTraceUrl>,
 ) -> Result<(ObjectRef, Option<ProjectSelection>)> {
     if let Some(raw) = object_ref {
         let parsed = parse_object_ref(raw)?;
@@ -1616,9 +1663,24 @@ async fn resolve_object_ref_for_view(
         base.project.as_deref(),
         cfg_project.as_deref(),
         project_id,
-        project_name_from_url,
+        parsed_url.and_then(|url| url.project.as_deref()),
     )
     .await?;
+
+    if let Some(parsed_url) =
+        parsed_url.filter(|url| !trace_url_experiment_selectors(url).is_empty())
+    {
+        let experiment =
+            resolve_first_experiment_for_trace_url(client, &project, parsed_url).await?;
+        return Ok((
+            ObjectRef {
+                object_type: "experiment".to_string(),
+                object_name: experiment.id,
+            },
+            Some(project),
+        ));
+    }
+
     Ok((
         ObjectRef {
             object_type: "project_logs".to_string(),
@@ -1626,6 +1688,96 @@ async fn resolve_object_ref_for_view(
         },
         Some(project),
     ))
+}
+
+async fn resolve_first_experiment_for_trace_url(
+    client: &ApiClient,
+    project: &ProjectSelection,
+    parsed_url: &ParsedTraceUrl,
+) -> Result<experiments_api::Experiment> {
+    let selectors = trace_url_experiment_selectors(parsed_url);
+    if selectors.is_empty() {
+        bail!("trace URL does not include an experiment selector");
+    }
+
+    let experiments = experiments_api::list_experiments_by_project_id(client, &project.id).await?;
+    let mut last_error = None;
+    for selector in selectors {
+        match find_experiment_by_selector(&experiments, selector, project) {
+            Ok(experiment) => return Ok(experiment.clone()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    Err(last_error.expect("at least one experiment selector should have been tried"))
+}
+
+fn trace_url_experiment_selectors(parsed_url: &ParsedTraceUrl) -> Vec<&str> {
+    let mut selectors = Vec::new();
+    for selector in [
+        parsed_url.experiment.as_deref(),
+        parsed_url.comparison_experiment.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let selector = selector.trim();
+        if !selector.is_empty() && !selectors.contains(&selector) {
+            selectors.push(selector);
+        }
+    }
+    selectors
+}
+
+fn find_experiment_by_selector<'a>(
+    experiments: &'a [experiments_api::Experiment],
+    selector: &str,
+    project: &ProjectSelection,
+) -> Result<&'a experiments_api::Experiment> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("experiment selector cannot be empty");
+    }
+
+    if let Some(experiment) = experiments
+        .iter()
+        .find(|experiment| experiment.id == selector)
+    {
+        return Ok(experiment);
+    }
+
+    let exact_name_matches = experiments
+        .iter()
+        .filter(|experiment| experiment.name == selector)
+        .collect::<Vec<_>>();
+    if exact_name_matches.len() == 1 {
+        return Ok(exact_name_matches[0]);
+    }
+    if exact_name_matches.len() > 1 {
+        if let Some(project_name) = project.name.as_deref() {
+            bail!("experiment name '{selector}' is duplicated in project '{project_name}'; use --object-ref experiment:<id>");
+        }
+        bail!("experiment name '{selector}' is duplicated; use --object-ref experiment:<id>");
+    }
+
+    let casefold_matches = experiments
+        .iter()
+        .filter(|experiment| experiment.name.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    if casefold_matches.len() == 1 {
+        return Ok(casefold_matches[0]);
+    }
+    if casefold_matches.len() > 1 {
+        bail!("experiment selector '{selector}' is ambiguous; use --object-ref experiment:<id>");
+    }
+
+    if let Some(project_name) = project.name.as_deref() {
+        bail!("experiment '{selector}' not found in project '{project_name}'");
+    }
+    bail!(
+        "experiment '{selector}' not found in project {}",
+        project.id
+    );
 }
 
 async fn resolve_project(
@@ -2061,12 +2213,14 @@ fn request_open_trace_for_parsed_url(
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
     let current_project = app.project.clone();
+    let source_expr = app.source_expr.clone();
     let print_queries = app.print_queries;
     let parsed_for_task = parsed.clone();
     handle.spawn(async move {
         let result = resolve_trace_target_for_url(
             &client,
             &current_project,
+            &source_expr,
             &parsed_for_task,
             print_queries,
         )
@@ -5653,19 +5807,27 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
         org: None,
         project: None,
         page: None,
+        experiment: None,
+        comparison_experiment: None,
         row_ref: None,
         span_id: None,
         trace_view_type: None,
     };
 
     if let Some(segments) = parsed_url.path_segments() {
-        let parts: Vec<&str> = segments.filter(|part| !part.is_empty()).collect();
+        let parts: Vec<String> = segments
+            .filter(|part| !part.is_empty())
+            .map(decode_url_segment)
+            .collect();
         if parts.len() >= 2 && parts[0] == "app" {
-            parsed.org = Some(parts[1].to_string());
+            parsed.org = Some(parts[1].clone());
             if parts.len() >= 4 && parts[2] == "p" {
-                parsed.project = Some(parts[3].to_string());
+                parsed.project = Some(parts[3].clone());
                 if parts.len() >= 5 {
-                    parsed.page = Some(parts[4].to_string());
+                    parsed.page = Some(parts[4].clone());
+                }
+                if parts.len() >= 6 && parts[4] == "experiments" {
+                    parsed.experiment = Some(parts[5].clone());
                 }
             }
         }
@@ -5686,6 +5848,9 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
             "tvt" if !value.is_empty() => {
                 parsed.trace_view_type = Some(value.to_string());
             }
+            "c" if !value.is_empty() => {
+                parsed.comparison_experiment = Some(value.to_string());
+            }
             _ => {}
         }
     }
@@ -5695,6 +5860,12 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
     }
 
     Ok(parsed)
+}
+
+fn decode_url_segment(segment: &str) -> String {
+    decode(segment)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| segment.to_string())
 }
 
 fn detail_view_from_tvt(trace_view_type: Option<&str>) -> DetailView {
@@ -5731,18 +5902,18 @@ fn is_uuid_like(value: &str) -> bool {
 async fn resolve_trace_target_for_url(
     client: &ApiClient,
     current_project: &ProjectSelection,
+    source_expr: &str,
     parsed: &ParsedTraceUrl,
     print_queries: bool,
 ) -> Result<ResolvedTraceTarget> {
     let project =
         resolve_project_target_for_url(client, current_project, parsed.project.as_deref()).await?;
-    let project_id = project.id.as_str();
 
     let mut root_span_id: Option<String> = None;
     if let Some(row_ref) = parsed.row_ref.as_deref() {
         root_span_id = lookup_root_span_id_for_query(
             client,
-            &build_url_lookup_by_root_span_id_query(project_id, row_ref),
+            &build_url_lookup_by_root_span_id_query(source_expr, row_ref),
             "url-open-root-span-id",
             print_queries,
         )
@@ -5751,7 +5922,7 @@ async fn resolve_trace_target_for_url(
         if root_span_id.is_none() {
             root_span_id = lookup_root_span_id_for_query(
                 client,
-                &build_url_lookup_by_row_id_query(project_id, row_ref),
+                &build_url_lookup_by_row_id_query(source_expr, row_ref),
                 "url-open-row-id",
                 print_queries,
             )
@@ -5763,7 +5934,7 @@ async fn resolve_trace_target_for_url(
         if let Some(span_id) = parsed.span_id.as_deref() {
             root_span_id = lookup_root_span_id_for_query(
                 client,
-                &build_url_lookup_by_span_id_query(project_id, span_id),
+                &build_url_lookup_by_span_id_query(source_expr, span_id),
                 "url-open-span-id",
                 print_queries,
             )
@@ -5847,26 +6018,23 @@ async fn lookup_root_span_id_for_query(
         .filter(|v| !v.is_empty()))
 }
 
-fn build_url_lookup_by_root_span_id_query(project_id: &str, root_span_id: &str) -> String {
+fn build_url_lookup_by_root_span_id_query(source_expr: &str, root_span_id: &str) -> String {
     format!(
-        "select: root_span_id, span_id | from: project_logs({}) spans | filter: root_span_id = {} | limit: 1",
-        sql_quote(project_id),
+        "select: root_span_id, span_id | from: {source_expr} spans | filter: root_span_id = {} | limit: 1",
         sql_quote(root_span_id),
     )
 }
 
-fn build_url_lookup_by_row_id_query(project_id: &str, row_id: &str) -> String {
+fn build_url_lookup_by_row_id_query(source_expr: &str, row_id: &str) -> String {
     format!(
-        "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: id = {} | limit: 1",
-        sql_quote(project_id),
+        "select: root_span_id, span_id, id | from: {source_expr} spans | filter: id = {} | limit: 1",
         sql_quote(row_id),
     )
 }
 
-fn build_url_lookup_by_span_id_query(project_id: &str, span_id: &str) -> String {
+fn build_url_lookup_by_span_id_query(source_expr: &str, span_id: &str) -> String {
     format!(
-        "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: span_id = {} | limit: 1",
-        sql_quote(project_id),
+        "select: root_span_id, span_id, id | from: {source_expr} spans | filter: span_id = {} | limit: 1",
         sql_quote(span_id),
     )
 }
@@ -6585,6 +6753,8 @@ mod tests {
             org: Some(org.to_string()),
             project: None,
             page: None,
+            experiment: None,
+            comparison_experiment: None,
             row_ref: Some("r1".to_string()),
             span_id: None,
             trace_view_type: None,
@@ -6725,6 +6895,10 @@ mod tests {
         let full_by_span_id = build_full_span_query_by_span_id("project_logs('p1')", "span-1");
         assert!(full_by_span_id.contains("preview_length: -1"));
         assert!(full_by_span_id.contains("filter: span_id = 'span-1'"));
+
+        let url_lookup = build_url_lookup_by_span_id_query("experiment('experiment-id')", "span-1");
+        assert!(url_lookup.contains("from: experiment('experiment-id') spans"));
+        assert!(url_lookup.contains("filter: span_id = 'span-1'"));
     }
 
     #[test]
@@ -6851,6 +7025,42 @@ mod tests {
         assert_eq!(parsed.project.as_deref(), Some("lovable"));
         assert_eq!(parsed.row_ref.as_deref(), Some("abc"));
         assert_eq!(parsed.span_id.as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn parse_trace_url_reads_experiment_source_from_comparison_url() {
+        let parsed = parse_trace_url(
+            "https://www.example.test/app/test-org/p/Test%20Project/experiments/baseline-exp?c=challenger-exp&r=root&s=span",
+        )
+        .expect("parse experiment trace URL");
+
+        assert_eq!(parsed.org.as_deref(), Some("test-org"));
+        assert_eq!(parsed.project.as_deref(), Some("Test Project"));
+        assert_eq!(parsed.page.as_deref(), Some("experiments"));
+        assert_eq!(parsed.experiment.as_deref(), Some("baseline-exp"));
+        assert_eq!(
+            parsed.comparison_experiment.as_deref(),
+            Some("challenger-exp")
+        );
+        assert_eq!(
+            trace_url_experiment_selectors(&parsed),
+            vec!["baseline-exp", "challenger-exp"]
+        );
+        assert_eq!(parsed.row_ref.as_deref(), Some("root"));
+        assert_eq!(parsed.span_id.as_deref(), Some("span"));
+    }
+
+    #[test]
+    fn parse_trace_url_uses_path_experiment_when_no_comparison_is_present() {
+        let parsed = parse_trace_url(
+            "https://www.example.test/app/test-org/p/test-project/experiments/baseline-exp?r=root",
+        )
+        .expect("parse experiment trace URL");
+
+        assert_eq!(
+            trace_url_experiment_selectors(&parsed),
+            vec!["baseline-exp"]
+        );
     }
 
     #[test]
