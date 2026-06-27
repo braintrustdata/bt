@@ -26,7 +26,7 @@ use crate::experiments::api::create_experiment;
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
-use crate::utils::parse_duration_to_seconds;
+use crate::utils::{app_project_url, parse_duration_to_seconds};
 
 pub(crate) mod discovery;
 
@@ -2115,18 +2115,12 @@ fn push_destination_url(
     } else {
         destination.object_name.as_str()
     };
-    let path = match destination.object.object_type {
-        ObjectType::ProjectLogs => "logs".to_string(),
-        ObjectType::Experiment => format!("experiments/{}", encode(object_name)),
-        ObjectType::Dataset => format!("datasets/{}", encode(object_name)),
+    let path_segments: Vec<&str> = match destination.object.object_type {
+        ObjectType::ProjectLogs => vec!["logs"],
+        ObjectType::Experiment => vec!["experiments", object_name],
+        ObjectType::Dataset => vec!["datasets", object_name],
     };
-    format!(
-        "{}/app/{}/p/{}/{}",
-        app_url.trim_end_matches('/'),
-        encode(org_name),
-        encode(project_name),
-        path
-    )
+    app_project_url(app_url, org_name, project_name, &path_segments)
 }
 
 fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {

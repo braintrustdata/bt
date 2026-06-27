@@ -16,6 +16,7 @@ permissions:
   id-token: write
   issues: write
   pull-requests: write
+  checks: write
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -33,7 +34,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -111,19 +112,14 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
-    # OIDC token subject must match the AAD federated credential scoped to the
-    # `release-canary` environment. That environment has no required reviewers,
-    # so canary signing runs without an approval gate — only claim it on main.
-    environment: ${{ github.ref == 'refs/heads/main' && 'release-canary' || '' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' }}
     steps:
       - name: Enable windows longpaths
         run: git config --global core.longpaths true
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -185,17 +181,6 @@ jobs:
           dist build --tag="${{ needs.plan.outputs.dist-tag }}" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
-      - name: Sign Windows artifacts
-        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
-        uses: ./.github/actions/sign-windows-artifacts
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
-          cert-profile: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
-
       - id: dist-files
         name: Post-build
         shell: bash
@@ -222,7 +207,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive

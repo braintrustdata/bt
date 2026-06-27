@@ -22,7 +22,7 @@ pub async fn run(
     let project_id = &ctx.project.id;
 
     let function = match slug {
-        Some(s) => api::get_function_by_slug(&ctx.client, project_id, s)
+        Some(s) => api::get_function_by_slug(&ctx.client, project_id, s, None)
             .await?
             .ok_or_else(|| anyhow!("{} with slug '{s}' not found", label(ft)))?,
         None => {

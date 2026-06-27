@@ -2,11 +2,11 @@ use std::fmt::Write as _;
 
 use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
-use urlencoding::encode;
 
 use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
 };
+use crate::utils::app_project_url;
 
 use super::{api, ResolvedContext};
 
@@ -27,12 +27,11 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, json: bool, web: boo
         }
     };
 
-    let url = format!(
-        "{}/app/{}/p/{}/experiments/{}",
-        ctx.app_url.trim_end_matches('/'),
-        encode(ctx.client.org_name()),
-        encode(project_name),
-        encode(&experiment.name)
+    let url = app_project_url(
+        &ctx.app_url,
+        ctx.client.org_name(),
+        project_name,
+        &["experiments", &experiment.name],
     );
 
     if web {

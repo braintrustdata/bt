@@ -1,11 +1,11 @@
 use anyhow::{bail, Result};
-use urlencoding::encode;
 
 use crate::http::ApiClient;
 use crate::ui::{
     is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
     ProjectSelectMode,
 };
+use crate::utils::app_project_url;
 
 use super::api;
 
@@ -32,12 +32,7 @@ pub async fn run(
         }
     };
 
-    let url = format!(
-        "{}/app/{}/p/{}",
-        app_url.trim_end_matches('/'),
-        encode(org_name),
-        encode(&project_name)
-    );
+    let url = app_project_url(app_url, org_name, &project_name, &[]);
 
     open::that(&url)?;
     print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));

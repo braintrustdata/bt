@@ -2,7 +2,6 @@ use std::fmt::Write as _;
 
 use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
-use urlencoding::encode;
 
 use crate::ui::prompt_render::{
     render_code_lines, render_content_lines, render_options, render_prompt_block,
@@ -10,6 +9,7 @@ use crate::ui::prompt_render::{
 use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
 };
+use crate::utils::app_project_url_with_encoded_path;
 use crate::{http::ApiClient, projects::api as projects_api};
 
 use super::{api, build_web_path, label, label_plural, select_function_interactive};
@@ -18,6 +18,7 @@ use super::{AuthContext, FunctionTypeFilter, ResolvedContext};
 pub async fn run(
     ctx: &ResolvedContext,
     slug: Option<&str>,
+    version: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
@@ -27,7 +28,7 @@ pub async fn run(
     let function = match slug {
         Some(s) => with_spinner(
             &format!("Loading {}...", label(ft)),
-            api::get_function_by_slug(&ctx.client, project_id, s),
+            api::get_function_by_slug(&ctx.client, project_id, s, version),
         )
         .await?
         .ok_or_else(|| anyhow!("{} with slug '{s}' not found", label(ft)))?,
@@ -39,7 +40,28 @@ pub async fn run(
                     label_plural(ft),
                 );
             }
-            select_function_interactive(&ctx.client, project_id, ft).await?
+            let selected = select_function_interactive(&ctx.client, project_id, ft).await?;
+            if let Some(version) = version {
+                with_spinner(
+                    &format!("Loading {}...", label(ft)),
+                    api::get_function_by_slug(
+                        &ctx.client,
+                        project_id,
+                        &selected.slug,
+                        Some(version),
+                    ),
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{} with slug '{}' not found at version {version}",
+                        label(ft),
+                        selected.slug
+                    )
+                })?
+            } else {
+                selected
+            }
         }
     };
 
@@ -58,6 +80,7 @@ pub async fn run(
 pub async fn run_by_id(
     ctx: &AuthContext,
     id: &str,
+    version: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
@@ -65,7 +88,7 @@ pub async fn run_by_id(
 ) -> Result<()> {
     let function = with_spinner(
         &format!("Loading {}...", label(ft)),
-        api::get_function_by_id(&ctx.client, id),
+        api::get_function_by_id(&ctx.client, id, version),
     )
     .await?
     .ok_or_else(|| anyhow!("{} with id '{id}' not found", label(ft)))?;
@@ -97,13 +120,8 @@ async fn render_function(
             Some(project_name) => project_name.to_string(),
             None => resolve_project_name(client, &function.project_id).await?,
         };
-        let url = format!(
-            "{}/app/{}/p/{}/{}",
-            app_url.trim_end_matches('/'),
-            encode(client.org_name()),
-            encode(&project_name),
-            path
-        );
+        let url =
+            app_project_url_with_encoded_path(app_url, client.org_name(), &project_name, &path);
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());
@@ -324,12 +342,11 @@ async fn render_function(
                         Some(project_name) => project_name.to_string(),
                         None => resolve_project_name(client, &function.project_id).await?,
                     };
-                    let url = format!(
-                        "{}/app/{}/p/{}/{}",
-                        app_url.trim_end_matches('/'),
-                        encode(client.org_name()),
-                        encode(&project_name),
-                        path
+                    let url = app_project_url_with_encoded_path(
+                        app_url,
+                        client.org_name(),
+                        &project_name,
+                        &path,
                     );
                     writeln!(
                         output,

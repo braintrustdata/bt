@@ -3,12 +3,12 @@ use std::fmt::Write as _;
 use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
 use serde_json::{Map, Value};
-use urlencoding::encode;
 
 use crate::ui::{
     apply_column_padding, header, is_interactive, print_command_status, print_with_pager,
     styled_table, truncate, with_spinner, CommandStatus,
 };
+use crate::utils::app_project_url;
 
 use super::{api, records::DATASET_RECORD_FIELDS, ResolvedContext};
 
@@ -44,12 +44,11 @@ pub async fn run(
         }
     };
 
-    let url = format!(
-        "{}/app/{}/p/{}/datasets/{}",
-        ctx.app_url.trim_end_matches('/'),
-        encode(ctx.client.org_name()),
-        encode(&ctx.project.name),
-        encode(&dataset.name)
+    let url = app_project_url(
+        &ctx.app_url,
+        ctx.client.org_name(),
+        &ctx.project.name,
+        &["datasets", &dataset.name],
     );
 
     if web {
