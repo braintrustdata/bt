@@ -23,22 +23,14 @@ pub fn print_command_status(status: CommandStatus, message: &str) {
     eprintln!("{indicator} {message}");
 }
 
-/// Serialize `payload` as compact JSON to stdout. This is the single shared
-/// entry point for machine-readable command output so `--json` handling lives
-/// in one place rather than being re-implemented per command.
+/// Serialize `payload` as compact JSON to stdout — the single shared machine-readable entry point.
 pub fn print_json<T: Serialize + ?Sized>(payload: &T) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string(payload)?);
     Ok(())
 }
 
-/// Emit a command result, choosing between machine-readable JSON and the
-/// human-readable status line based on the global `json` flag.
-///
-/// - `json == true`  -> `payload` serialized to stdout
-/// - `json == false` -> a `print_command_status` line on stderr
-///
-/// Both stdout (JSON) and stderr (human status) channels stay separate so
-/// `--json` output is safely pipeable.
+/// Emit a result: JSON payload to stdout when `json`, else a human status line on stderr.
+/// Keep stdout/stderr separate so `--json` output stays safely pipeable.
 pub fn emit_result<T: Serialize>(
     json: bool,
     status: CommandStatus,
@@ -71,7 +63,7 @@ mod tests {
             status: "ok".into(),
             value: 7,
         };
-        // We only assert no error and no stdout leak; the indicator is on stderr.
+        // Assert no error and no stdout leak; the indicator is on stderr.
         let res = emit_result(false, CommandStatus::Success, "done", &payload);
         assert!(res.is_ok());
     }
@@ -82,9 +74,7 @@ mod tests {
             status: "ok".into(),
             value: 7,
         };
-        // Capture the JSON by calling print_json directly (the JSON branch of emit_result).
-        // print_json writes to stdout; in unit tests we only assert it succeeds and
-        // produces a non-empty string via to_string, since stdout capture is env-dependent.
+        // stdout capture is env-dependent, so assert serialization directly rather than via emit_result.
         let json = serde_json::to_string(&payload).expect("serialize");
         assert_eq!(json, r#"{"status":"ok","value":7}"#);
         assert!(emit_result(true, CommandStatus::Success, "done", &payload).is_ok());

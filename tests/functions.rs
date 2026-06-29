@@ -191,19 +191,7 @@ fn sanitized_env_keys() -> &'static [&'static str] {
 }
 
 fn auth_profiles_command(cwd: &Path, config_dir: &Path) -> Command {
-    let mut cmd = Command::new(bt_binary_path());
-    cmd.arg("auth")
-        .arg("profiles")
-        .current_dir(cwd)
-        .env("XDG_CONFIG_HOME", config_dir)
-        .env("APPDATA", config_dir)
-        .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
-        .env_remove("BRAINTRUST_ORG_NAME")
-        .env_remove("BRAINTRUST_API_URL")
-        .env_remove("BRAINTRUST_APP_URL")
-        .env_remove("BRAINTRUST_ENV_FILE");
-    cmd
+    auth_sub_command(cwd, config_dir, &["profiles"])
 }
 
 #[derive(Debug, Clone)]
@@ -786,20 +774,15 @@ fn auth_profiles_profile_not_found_is_actionable() {
 }
 
 #[test]
-fn auth_profiles_with_api_key_profile_does_not_print_jwt_on_stdout() {
-    // An api_key profile has no JWT; --print-jwt-token must leave stdout empty
-    // rather than emitting the api key or an empty line.
+fn auth_profiles_with_api_key_profile_does_not_leak_jwt_or_secret() {
+    // An api_key profile has no JWT; --print-jwt-token prints its line to stdout but must
+    // not append a `jwt:` segment or surface the api-key hint as a token.
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
 
     // Seed an api_key profile with no stored secret so verification reports
     // "missing" without touching the network or keychain.
-    fs::create_dir_all(config_dir.path().join("bt")).expect("create bt config dir");
-    fs::write(
-        config_dir.path().join("bt").join("auth.json"),
-        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
-    )
-    .expect("write auth.json");
+    seed_api_key_profile(config_dir.path());
 
     let output = auth_profiles_command(cwd.path(), config_dir.path())
         .arg("--profile")
@@ -810,9 +793,24 @@ fn auth_profiles_with_api_key_profile_does_not_print_jwt_on_stdout() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.trim().is_empty(),
-        "expected no JWT on stdout for an api_key profile, got: {stdout}"
+        !stdout.contains("jwt:"),
+        "api_key profile must not emit a jwt: segment, got: {stdout}"
     );
+    assert!(
+        !stdout.contains("sk-****test"),
+        "api key hint must not be surfaced as a token, got: {stdout}"
+    );
+}
+
+/// Seed a synthetic api_key `test-profile` so verification reports "missing"
+/// without touching the network or keychain.
+fn seed_api_key_profile(config_dir: &Path) {
+    fs::create_dir_all(config_dir.join("bt")).expect("create bt config dir");
+    fs::write(
+        config_dir.join("bt").join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
+    )
+    .expect("write auth.json");
 }
 
 fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
@@ -854,12 +852,7 @@ fn auth_refresh_errors_for_api_key_profile_even_with_json() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
 
-    fs::create_dir_all(config_dir.path().join("bt")).expect("create bt config dir");
-    fs::write(
-        config_dir.path().join("bt").join("auth.json"),
-        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
-    )
-    .expect("write auth.json");
+    seed_api_key_profile(config_dir.path());
 
     let output = auth_sub_command(
         cwd.path(),
