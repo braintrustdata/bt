@@ -751,6 +751,71 @@ fn auth_profiles_ignores_api_key_from_dotenv() {
 }
 
 #[test]
+fn auth_profiles_json_with_no_profiles_emits_empty_array() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .arg("--json")
+        .output()
+        .expect("run bt auth profiles --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(stdout, "[]");
+}
+
+#[test]
+fn auth_profiles_profile_not_found_is_actionable() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .arg("--profile")
+        .arg("test-profile")
+        .output()
+        .expect("run bt auth profiles --profile test-profile");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("profile 'test-profile' not found"));
+    assert!(
+        stderr.contains("run `bt auth profiles` to see available profiles"),
+        "expected actionable hint, got: {stderr}"
+    );
+}
+
+#[test]
+fn auth_profiles_with_api_key_profile_does_not_print_jwt_on_stdout() {
+    // An api_key profile has no JWT; --print-jwt-token must leave stdout empty
+    // rather than emitting the api key or an empty line.
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    // Seed an api_key profile with no stored secret so verification reports
+    // "missing" without touching the network or keychain.
+    fs::create_dir_all(config_dir.path().join("bt")).expect("create bt config dir");
+    fs::write(
+        config_dir.path().join("bt").join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
+    )
+    .expect("write auth.json");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .arg("--profile")
+        .arg("test-profile")
+        .arg("--print-jwt-token")
+        .output()
+        .expect("run bt auth profiles --profile test-profile --print-jwt-token");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "expected no JWT on stdout for an api_key profile, got: {stdout}"
+    );
+}
+
+#[test]
 fn push_and_pull_help_are_machine_readable() {
     let push_help = Command::new(bt_binary_path())
         .arg("functions")
