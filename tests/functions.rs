@@ -815,6 +815,71 @@ fn auth_profiles_with_api_key_profile_does_not_print_jwt_on_stdout() {
     );
 }
 
+fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
+    // Shared builder for `bt auth <sub>` so each auth subcommand inherits the
+    // same isolated config dir / env scrubbing as `auth profiles`.
+    let mut cmd = Command::new(bt_binary_path());
+    cmd.arg("auth")
+        .args(sub)
+        .current_dir(cwd)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .env("APPDATA", config_dir)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_ORG_NAME")
+        .env_remove("BRAINTRUST_API_URL")
+        .env_remove("BRAINTRUST_APP_URL")
+        .env_remove("BRAINTRUST_ENV_FILE");
+    cmd
+}
+
+#[test]
+fn auth_logout_json_with_no_profiles_emits_empty_status() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_sub_command(cwd.path(), config_dir.path(), &["logout", "--json"])
+        .output()
+        .expect("run bt auth logout --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(stdout, r#"{"status":"empty"}"#);
+}
+
+#[test]
+fn auth_refresh_errors_for_api_key_profile_even_with_json() {
+    // --json must not swallow a real error: an api_key profile cannot be
+    // refreshed, and the command should fail with an actionable message.
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    fs::create_dir_all(config_dir.path().join("bt")).expect("create bt config dir");
+    fs::write(
+        config_dir.path().join("bt").join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
+    )
+    .expect("write auth.json");
+
+    let output = auth_sub_command(
+        cwd.path(),
+        config_dir.path(),
+        &["refresh", "--profile", "test-profile", "--json"],
+    )
+    .output()
+    .expect("run bt auth refresh --profile test-profile --json");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("only applies to oauth profiles"),
+        "expected oauth-only refresh hint, got: {stderr}"
+    );
+    // Errors are not part of the --json contract (they surface via the global
+    // error printer); stdout should not carry a partial result.
+    assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
+}
+
 #[test]
 fn push_and_pull_help_are_machine_readable() {
     let push_help = Command::new(bt_binary_path())

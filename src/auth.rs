@@ -1264,10 +1264,17 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format_login_success(&selected_org, &profile_name, &selected_api_url),
-    );
+    let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    let result = LoginResult {
+        profile: profile_name.clone(),
+        auth_kind: "api_key".to_string(),
+        org: selected_org.as_ref().map(|org| org.name.clone()),
+        api_url: Some(selected_api_url.clone()),
+        app_url: base.app_url.clone(),
+        status: "ok".to_string(),
+        error: None,
+    };
+    ui::emit_result(base.json, ui::CommandStatus::Success, &human, &result)?;
     Ok(())
 }
 
@@ -1379,10 +1386,17 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format_login_success(&selected_org, &profile_name, &selected_api_url),
-    );
+    let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    let result = LoginResult {
+        profile: profile_name.clone(),
+        auth_kind: "oauth".to_string(),
+        org: selected_org.as_ref().map(|org| org.name.clone()),
+        api_url: Some(selected_api_url.clone()),
+        app_url: Some(app_url.clone()),
+        status: "ok".to_string(),
+        error: None,
+    };
+    ui::emit_result(base.json, ui::CommandStatus::Success, &human, &result)?;
 
     Ok(())
 }
@@ -1484,17 +1498,17 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         )
     })?;
 
-    println!(
+    eprintln!(
         "Refreshing OAuth token for profile '{profile_name}' (source: {source}, api_url: {api_url})"
     );
     if let Some(expires_at) = previous_expires_at {
         let now = current_unix_timestamp();
         let remaining = expires_at.saturating_sub(now);
-        println!(
+        eprintln!(
             "Cached access token expiry before refresh: {expires_at} (about {remaining}s remaining)"
         );
     } else {
-        println!("Cached access token expiry before refresh: unknown");
+        eprintln!("Cached access token expiry before refresh: unknown");
     }
 
     let refreshed =
@@ -1518,16 +1532,30 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     if let Some(expires_at) = new_expires_at {
         let now = current_unix_timestamp();
         let remaining = expires_at.saturating_sub(now);
-        println!("New access token expiry: {expires_at} (about {remaining}s remaining)");
+        eprintln!("New access token expiry: {expires_at} (about {remaining}s remaining)");
     } else {
-        println!("New access token expiry: unknown");
+        eprintln!("New access token expiry: unknown");
     }
     if refresh_rotated {
-        println!("Refresh token rotation: yes");
+        eprintln!("Refresh token rotation: yes");
     } else {
-        println!("Refresh token rotation: no");
+        eprintln!("Refresh token rotation: no");
     }
-    println!("OAuth refresh complete.");
+
+    let result = RefreshResult {
+        profile: profile_name.clone(),
+        auth_kind: "oauth".to_string(),
+        access_expires_at: new_expires_at,
+        refresh_token_rotated: refresh_rotated,
+        status: "ok".to_string(),
+        error: None,
+    };
+    ui::emit_result(
+        base.json,
+        ui::CommandStatus::Success,
+        "OAuth refresh complete.",
+        &result,
+    )?;
 
     Ok(())
 }
@@ -1739,10 +1767,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
 
     if filtered.is_empty() {
         if base.json {
-            println!(
-                "{}",
-                serde_json::to_string(&Vec::<ProfileVerification>::new())?
-            );
+            ui::print_json(&Vec::<ProfileVerification>::new())?;
         } else {
             println!("No saved profiles. Run `bt auth login` to create one.");
         }
@@ -1772,7 +1797,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
     }
 
     if base.json {
-        println!("{}", serde_json::to_string(&verifications)?);
+        ui::print_json(&verifications)?;
         return Ok(());
     }
 
@@ -1807,7 +1832,7 @@ async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
+fn run_login_delete(profile_name: &str, force: bool, json: bool) -> Result<()> {
     let profile_name = profile_name.trim();
     if profile_name.is_empty() {
         bail!("profile name cannot be empty");
@@ -1827,7 +1852,12 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
                 .default(false)
                 .interact_on(&term)?;
             if !confirmed {
-                eprintln!("Cancelled");
+                let result = LogoutResult {
+                    profile: Some(profile_name.to_string()),
+                    status: "cancelled".to_string(),
+                    error: None,
+                };
+                ui::emit_result(json, ui::CommandStatus::Warning, "Cancelled", &result)?;
                 return Ok(());
             }
         }
@@ -1845,17 +1875,34 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
         eprintln!("warning: failed to delete oauth access token for '{profile_name}': {err}");
     }
 
-    ui::print_command_status(
+    let result = LogoutResult {
+        profile: Some(profile_name.to_string()),
+        status: "deleted".to_string(),
+        error: None,
+    };
+    ui::emit_result(
+        json,
         ui::CommandStatus::Success,
         &format!("Deleted profile '{profile_name}'"),
-    );
+        &result,
+    )?;
     Ok(())
 }
 
 fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
-        println!("No saved profiles.");
+        let result = LogoutResult {
+            profile: None,
+            status: "empty".to_string(),
+            error: None,
+        };
+        ui::emit_result(
+            base.json,
+            ui::CommandStatus::Warning,
+            "No saved profiles.",
+            &result,
+        )?;
         return Ok(());
     }
 
@@ -1875,7 +1922,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         bail!("multiple profiles exist. Use --profile <NAME> to specify which one.");
     };
 
-    run_login_delete(&profile_name, args.force)
+    run_login_delete(&profile_name, args.force, base.json)
 }
 
 enum ProfileStatus {
@@ -1960,6 +2007,46 @@ fn build_verification(
         error,
         jwt_token: None,
     }
+}
+
+/// Structured result of `bt auth login`, emitted as JSON when `--json` is set.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginResult {
+    pub profile: String,
+    pub auth_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_url: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Structured result of `bt auth refresh`, emitted as JSON when `--json` is set.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshResult {
+    pub profile: String,
+    pub auth_kind: String,
+    /// Unix epoch seconds at which the new access token expires, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_expires_at: Option<u64>,
+    pub refresh_token_rotated: bool,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Structured result of `bt auth logout`, emitted as JSON when `--json` is set.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogoutResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 async fn verify_profile_full(
@@ -4832,5 +4919,51 @@ mod tests {
 
         let result = env.login_read_only_with_base(base).await;
         assert_err_contains(result, "no login credentials found");
+    }
+
+    #[test]
+    fn login_result_serializes_with_optional_fields_skipped() {
+        let r = LoginResult {
+            profile: "test-profile".into(),
+            auth_kind: "api_key".into(),
+            org: None,
+            api_url: Some("https://api.braintrust.dev".into()),
+            app_url: None,
+            status: "ok".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"profile":"test-profile","auth_kind":"api_key","api_url":"https://api.braintrust.dev","status":"ok"}"#
+        );
+    }
+
+    #[test]
+    fn refresh_result_serializes_with_optional_fields_skipped() {
+        let r = RefreshResult {
+            profile: "test-profile".into(),
+            auth_kind: "oauth".into(),
+            access_expires_at: Some(1700000000),
+            refresh_token_rotated: true,
+            status: "ok".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"profile":"test-profile","auth_kind":"oauth","access_expires_at":1700000000,"refresh_token_rotated":true,"status":"ok"}"#
+        );
+    }
+
+    #[test]
+    fn logout_result_serializes_empty_store_case() {
+        let r = LogoutResult {
+            profile: None,
+            status: "empty".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(json, r#"{"status":"empty"}"#);
     }
 }
