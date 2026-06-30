@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import builtins
 import fnmatch
 import importlib.util
 import inspect
@@ -279,6 +280,16 @@ def read_runner_config() -> RunnerConfig:
         params=parse_params_json(os.getenv("BT_EVAL_PARAMS_JSON")),
         matrix=parse_matrix_json(os.getenv("BT_EVAL_MATRIX_JSON")),
     )
+
+
+# Runtime values consumed by SDKs. Currently only --sample sets internal BTQL,
+# but this can carry more _internal_btql options over time.
+def inject_runtime_values(config: RunnerConfig) -> None:
+    if config.sample is None:
+        if hasattr(builtins, "__bt_eval_internal_btql"):
+            delattr(builtins, "__bt_eval_internal_btql")
+        return
+    setattr(builtins, "__bt_eval_internal_btql", {"sample": config.sample})
 
 
 def _to_mapping(value: Any) -> Any:
@@ -1421,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
     config = read_runner_config()
     local = args.local or env_flag("BT_EVAL_LOCAL") or env_flag("BT_EVAL_NO_SEND_LOGS")
     files = args.files or ["."]
+    inject_runtime_values(config)
     if config.num_workers is not None:
         set_thread_pool_max_workers(config.num_workers)
 
