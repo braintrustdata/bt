@@ -392,7 +392,16 @@ enum AuthCommand {
 }
 
 #[derive(Debug, Clone, Args)]
-struct AuthProfilesArgs {}
+struct AuthProfilesArgs {
+    /// Only show the profile with this name
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+
+    /// Print the OAuth access JWT from the keychain in plaintext (prints nothing if expired).
+    /// WARNING: pulls a live bearer token out of the secure store and writes it to stdout in plaintext.
+    #[arg(long = "print-jwt-token")]
+    print_jwt_token: bool,
+}
 
 #[derive(Debug, Clone, Args)]
 struct AuthLoginArgs {
@@ -1254,10 +1263,17 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format_login_success(&selected_org, &profile_name, &selected_api_url),
-    );
+    let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    let result = LoginResult {
+        profile: profile_name.clone(),
+        auth_kind: "api_key".to_string(),
+        org: selected_org.as_ref().map(|org| org.name.clone()),
+        api_url: Some(selected_api_url.clone()),
+        app_url: base.app_url.clone(),
+        status: "ok".to_string(),
+        error: None,
+    };
+    ui::emit_result(base.json, ui::CommandStatus::Success, &human, &result)?;
     Ok(())
 }
 
@@ -1369,10 +1385,17 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
 
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format_login_success(&selected_org, &profile_name, &selected_api_url),
-    );
+    let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    let result = LoginResult {
+        profile: profile_name.clone(),
+        auth_kind: "oauth".to_string(),
+        org: selected_org.as_ref().map(|org| org.name.clone()),
+        api_url: Some(selected_api_url.clone()),
+        app_url: Some(app_url.clone()),
+        status: "ok".to_string(),
+        error: None,
+    };
+    ui::emit_result(base.json, ui::CommandStatus::Success, &human, &result)?;
 
     Ok(())
 }
@@ -1474,17 +1497,17 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         )
     })?;
 
-    println!(
+    eprintln!(
         "Refreshing OAuth token for profile '{profile_name}' (source: {source}, api_url: {api_url})"
     );
     if let Some(expires_at) = previous_expires_at {
         let now = current_unix_timestamp();
         let remaining = expires_at.saturating_sub(now);
-        println!(
+        eprintln!(
             "Cached access token expiry before refresh: {expires_at} (about {remaining}s remaining)"
         );
     } else {
-        println!("Cached access token expiry before refresh: unknown");
+        eprintln!("Cached access token expiry before refresh: unknown");
     }
 
     let refreshed =
@@ -1508,16 +1531,30 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     if let Some(expires_at) = new_expires_at {
         let now = current_unix_timestamp();
         let remaining = expires_at.saturating_sub(now);
-        println!("New access token expiry: {expires_at} (about {remaining}s remaining)");
+        eprintln!("New access token expiry: {expires_at} (about {remaining}s remaining)");
     } else {
-        println!("New access token expiry: unknown");
+        eprintln!("New access token expiry: unknown");
     }
     if refresh_rotated {
-        println!("Refresh token rotation: yes");
+        eprintln!("Refresh token rotation: yes");
     } else {
-        println!("Refresh token rotation: no");
+        eprintln!("Refresh token rotation: no");
     }
-    println!("OAuth refresh complete.");
+
+    let result = RefreshResult {
+        profile: profile_name.clone(),
+        auth_kind: "oauth".to_string(),
+        access_expires_at: new_expires_at,
+        refresh_token_rotated: refresh_rotated,
+        status: "ok".to_string(),
+        error: None,
+    };
+    ui::emit_result(
+        base.json,
+        ui::CommandStatus::Success,
+        "OAuth refresh complete.",
+        &result,
+    )?;
 
     Ok(())
 }
@@ -1702,35 +1739,73 @@ fn format_login_success(
     }
 }
 
-async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
+async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
     let store = load_auth_store()?;
-    if store.profiles.is_empty() {
-        println!("No saved profiles. Run `bt auth login` to create one.");
+
+    // Build a filtered view: only the --profile match if given, else all saved profiles.
+    let mut filtered_store = AuthStore::default();
+    if let Some(name) = &args.profile {
+        let profile = store.profiles.get(name).ok_or_else(|| {
+            let available: Vec<String> = store.profiles.keys().cloned().collect();
+            let suffix = if available.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", available.join(", "))
+            };
+            anyhow::anyhow!(
+                "profile '{name}' not found; run `bt auth profiles` to see available profiles{suffix}"
+            )
+        })?;
+        filtered_store
+            .profiles
+            .insert(name.clone(), profile.clone());
+    } else {
+        for (n, p) in store.profiles.iter() {
+            filtered_store.profiles.insert(n.clone(), p.clone());
+        }
+    }
+
+    if filtered_store.profiles.is_empty() {
+        if base.json {
+            ui::print_json(&Vec::<ProfileVerification>::new())?;
+        } else {
+            println!("No saved profiles. Run `bt auth login` to create one.");
+        }
         return Ok(());
     }
 
-    let verifications = verify_all_profiles_from_store(&store).await;
+    let verifications = verify_all_profiles_from_store(&filtered_store, args.print_jwt_token).await;
+
+    // When the API is unreachable, fall back to saved profile info. Skip this under
+    // --print-jwt-token: the token comes from the keychain and is available offline.
     let all_network_errors = verifications
         .iter()
         .all(|v| v.status == "error" && !v.error.as_deref().unwrap_or("").contains("invalid"));
-    if all_network_errors {
+    if all_network_errors && !args.print_jwt_token {
         eprintln!("Could not reach Braintrust API. Showing saved profiles:");
-        print_saved_profiles(&store, base.json)?;
+        print_saved_profiles(&filtered_store, base.json)?;
         return Ok(());
     }
 
     if base.json {
-        println!("{}", serde_json::to_string(&verifications)?);
+        ui::print_json(&verifications)?;
         return Ok(());
     }
 
+    // With --print-jwt-token, the whole profile line (including `jwt: <token>`) goes to
+    // stdout. Use --json for a parseable `jwt_token` field; without the flag, status stays on stderr.
     for v in &verifications {
-        let cmd_status = match v.status.as_str() {
-            "ok" => crate::ui::CommandStatus::Success,
-            "expired" => crate::ui::CommandStatus::Warning,
-            _ => crate::ui::CommandStatus::Error,
-        };
-        crate::ui::print_command_status(cmd_status, &format_verification_line(v));
+        let line = format_verification_line(v, args.print_jwt_token);
+        if args.print_jwt_token {
+            println!("{line}");
+        } else {
+            let cmd_status = match v.status.as_str() {
+                "ok" => crate::ui::CommandStatus::Success,
+                "expired" => crate::ui::CommandStatus::Warning,
+                _ => crate::ui::CommandStatus::Error,
+            };
+            crate::ui::print_command_status(cmd_status, &line);
+        }
     }
 
     if base.verbose {
@@ -1742,7 +1817,7 @@ async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
+fn run_login_delete(profile_name: &str, force: bool, json: bool) -> Result<()> {
     let profile_name = profile_name.trim();
     if profile_name.is_empty() {
         bail!("profile name cannot be empty");
@@ -1762,7 +1837,12 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
                 .default(false)
                 .interact_on(&term)?;
             if !confirmed {
-                eprintln!("Cancelled");
+                let result = LogoutResult {
+                    profile: Some(profile_name.to_string()),
+                    status: "cancelled".to_string(),
+                    error: None,
+                };
+                ui::emit_result(json, ui::CommandStatus::Warning, "Cancelled", &result)?;
                 return Ok(());
             }
         }
@@ -1780,17 +1860,34 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
         eprintln!("warning: failed to delete oauth access token for '{profile_name}': {err}");
     }
 
-    ui::print_command_status(
+    let result = LogoutResult {
+        profile: Some(profile_name.to_string()),
+        status: "deleted".to_string(),
+        error: None,
+    };
+    ui::emit_result(
+        json,
         ui::CommandStatus::Success,
         &format!("Deleted profile '{profile_name}'"),
-    );
+        &result,
+    )?;
     Ok(())
 }
 
 fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
-        println!("No saved profiles.");
+        let result = LogoutResult {
+            profile: None,
+            status: "empty".to_string(),
+            error: None,
+        };
+        ui::emit_result(
+            base.json,
+            ui::CommandStatus::Warning,
+            "No saved profiles.",
+            &result,
+        )?;
         return Ok(());
     }
 
@@ -1810,7 +1907,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         bail!("multiple profiles exist. Use --profile <NAME> to specify which one.");
     };
 
-    run_login_delete(&profile_name, args.force)
+    run_login_delete(&profile_name, args.force, base.json)
 }
 
 enum ProfileStatus {
@@ -1864,6 +1961,10 @@ pub struct ProfileVerification {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Live OAuth access JWT, populated only when `--print-jwt-token` is set and
+    /// the profile has a current, readable OAuth access token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwt_token: Option<String>,
 }
 
 fn build_verification(
@@ -1889,10 +1990,55 @@ fn build_verification(
         api_key_hint,
         status: status_str.to_string(),
         error,
+        jwt_token: None,
     }
 }
 
-async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerification {
+/// Structured result of `bt auth login`, emitted as JSON when `--json` is set.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginResult {
+    pub profile: String,
+    pub auth_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_url: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Structured result of `bt auth refresh`, emitted as JSON when `--json` is set.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshResult {
+    pub profile: String,
+    pub auth_kind: String,
+    /// Unix epoch seconds at which the new access token expires, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_expires_at: Option<u64>,
+    pub refresh_token_rotated: bool,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Structured result of `bt auth logout`, emitted as JSON when `--json` is set.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogoutResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+async fn verify_profile_full(
+    name: &str,
+    profile: &AuthProfile,
+    print_jwt_token: bool,
+) -> ProfileVerification {
     let app_url = profile.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
     let auth_kind = match profile.auth_kind {
         AuthKind::ApiKey => "api_key",
@@ -1909,11 +2055,21 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
         )
     };
 
+    let want_jwt = print_jwt_token && profile.auth_kind == AuthKind::Oauth;
+
+    // Surface the live OAuth access token for --print-jwt-token before any network validation.
+    // Load the credential once and reuse it for verification and the jwt_token field.
     let credential = match load_credential_for_profile(name, profile) {
         CredentialLoad::Found(k) => k,
-        CredentialLoad::Missing => return mk(ProfileStatus::Missing, None, None),
-        CredentialLoad::Expired => return mk(ProfileStatus::Expired, None, None),
-        CredentialLoad::Error(e) => return mk(ProfileStatus::Error(e), None, None),
+        CredentialLoad::Missing => {
+            return mk(ProfileStatus::Missing, None, None);
+        }
+        CredentialLoad::Expired => {
+            return mk(ProfileStatus::Expired, None, None);
+        }
+        CredentialLoad::Error(e) => {
+            return mk(ProfileStatus::Error(e), None, None);
+        }
     };
 
     let (jwt_id, hint) = match profile.auth_kind {
@@ -1921,7 +2077,7 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
         AuthKind::ApiKey => (None, profile.api_key_hint.clone()),
     };
 
-    match fetch_login_orgs(&credential, app_url).await {
+    let mut v = match fetch_login_orgs(&credential, app_url).await {
         Ok(_) => mk(ProfileStatus::Ok, jwt_id, hint),
         Err(e) => {
             let msg = e.to_string();
@@ -1936,15 +2092,24 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
             };
             mk(status, None, None)
         }
+    };
+
+    // Set jwt_token after the network call so it's surfaced regardless of ok/expired/error.
+    if want_jwt {
+        v.jwt_token = Some(credential);
     }
+    v
 }
 
-async fn verify_all_profiles_from_store(store: &AuthStore) -> Vec<ProfileVerification> {
+async fn verify_all_profiles_from_store(
+    store: &AuthStore,
+    print_jwt_token: bool,
+) -> Vec<ProfileVerification> {
     let mut set = tokio::task::JoinSet::new();
     for (name, profile) in store.profiles.iter() {
         let name = name.clone();
         let profile = profile.clone();
-        set.spawn(async move { verify_profile_full(&name, &profile).await });
+        set.spawn(async move { verify_profile_full(&name, &profile, print_jwt_token).await });
     }
 
     let mut results = Vec::new();
@@ -1957,7 +2122,7 @@ async fn verify_all_profiles_from_store(store: &AuthStore) -> Vec<ProfileVerific
     results
 }
 
-fn format_verification_line(v: &ProfileVerification) -> String {
+fn format_verification_line(v: &ProfileVerification, include_jwt: bool) -> String {
     let mut parts = vec![v.name.clone(), v.auth.clone()];
     if let Some(ref org) = v.org {
         parts.push(format!("org: {org}"));
@@ -1981,6 +2146,11 @@ fn format_verification_line(v: &ProfileVerification) -> String {
             }
         }
     }
+    if include_jwt {
+        if let Some(ref token) = v.jwt_token {
+            parts.push(format!("jwt: {token}"));
+        }
+    }
     parts.join(" — ")
 }
 
@@ -2001,7 +2171,7 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string(&output)?);
+        crate::ui::print_json(&output)?;
     } else {
         for (name, profile) in &store.profiles {
             let kind = match profile.auth_kind {
@@ -4504,9 +4674,10 @@ mod tests {
             api_key_hint: None,
             status: "ok".into(),
             error: None,
+            jwt_token: None,
         };
         assert_eq!(
-            format_verification_line(&v),
+            format_verification_line(&v, true),
             "work — oauth — org: acme — Alice (alice@example.com)"
         );
     }
@@ -4522,9 +4693,10 @@ mod tests {
             api_key_hint: Some("sk-****zhJwO".into()),
             status: "ok".into(),
             error: None,
+            jwt_token: None,
         };
         assert_eq!(
-            format_verification_line(&v),
+            format_verification_line(&v, true),
             "work — api_key — org: acme — sk-****zhJwO"
         );
     }
@@ -4540,8 +4712,12 @@ mod tests {
             api_key_hint: None,
             status: "expired".into(),
             error: None,
+            jwt_token: None,
         };
-        assert_eq!(format_verification_line(&v), "old — oauth — token expired");
+        assert_eq!(
+            format_verification_line(&v, true),
+            "old — oauth — token expired"
+        );
     }
 
     #[test]
@@ -4555,10 +4731,70 @@ mod tests {
             api_key_hint: None,
             status: "error".into(),
             error: Some("invalid API key".into()),
+            jwt_token: None,
         };
         assert_eq!(
-            format_verification_line(&v),
+            format_verification_line(&v, true),
             "bad — api_key — org: corp — invalid API key"
+        );
+    }
+
+    #[test]
+    fn format_verification_line_includes_jwt_token_when_present() {
+        let v = ProfileVerification {
+            name: "work".into(),
+            auth: "oauth".into(),
+            org: Some("acme".into()),
+            user_name: Some("Alice".into()),
+            user_email: Some("alice@example.com".into()),
+            api_key_hint: None,
+            status: "ok".into(),
+            error: None,
+            jwt_token: Some("eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhYmMifQ.sig".into()),
+        };
+        assert_eq!(
+            format_verification_line(&v, true),
+            "work — oauth — org: acme — Alice (alice@example.com) — jwt: eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhYmMifQ.sig"
+        );
+    }
+
+    #[test]
+    fn format_verification_line_suppresses_jwt_token_when_redacted() {
+        // Without --print-jwt-token (include_jwt = false) the jwt: segment is omitted so a plain
+        // `bt auth profiles` listing never leaks a live token.
+        let v = ProfileVerification {
+            name: "work".into(),
+            auth: "oauth".into(),
+            org: Some("acme".into()),
+            user_name: Some("Alice".into()),
+            user_email: Some("alice@example.com".into()),
+            api_key_hint: None,
+            status: "ok".into(),
+            error: None,
+            jwt_token: Some("eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhYmMifQ.sig".into()),
+        };
+        assert_eq!(
+            format_verification_line(&v, false),
+            "work — oauth — org: acme — Alice (alice@example.com)"
+        );
+    }
+
+    #[test]
+    fn format_verification_line_omits_jwt_token_when_none() {
+        let v = ProfileVerification {
+            name: "work".into(),
+            auth: "api_key".into(),
+            org: Some("acme".into()),
+            user_name: None,
+            user_email: None,
+            api_key_hint: Some("sk-****zhJwO".into()),
+            status: "ok".into(),
+            error: None,
+            jwt_token: None,
+        };
+        assert_eq!(
+            format_verification_line(&v, true),
+            "work — api_key — org: acme — sk-****zhJwO"
         );
     }
 
@@ -4680,5 +4916,51 @@ mod tests {
 
         let result = env.login_read_only_with_base(base).await;
         assert_err_contains(result, "no login credentials found");
+    }
+
+    #[test]
+    fn login_result_serializes_with_optional_fields_skipped() {
+        let r = LoginResult {
+            profile: "test-profile".into(),
+            auth_kind: "api_key".into(),
+            org: None,
+            api_url: Some("https://api.braintrust.dev".into()),
+            app_url: None,
+            status: "ok".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"profile":"test-profile","auth_kind":"api_key","api_url":"https://api.braintrust.dev","status":"ok"}"#
+        );
+    }
+
+    #[test]
+    fn refresh_result_serializes_with_optional_fields_skipped() {
+        let r = RefreshResult {
+            profile: "test-profile".into(),
+            auth_kind: "oauth".into(),
+            access_expires_at: Some(1700000000),
+            refresh_token_rotated: true,
+            status: "ok".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"profile":"test-profile","auth_kind":"oauth","access_expires_at":1700000000,"refresh_token_rotated":true,"status":"ok"}"#
+        );
+    }
+
+    #[test]
+    fn logout_result_serializes_empty_store_case() {
+        let r = LogoutResult {
+            profile: None,
+            status: "empty".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(json, r#"{"status":"empty"}"#);
     }
 }

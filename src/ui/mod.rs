@@ -59,5 +59,5 @@ pub use ratatui_table::{
 pub use select::{fuzzy_select, select_project, ProjectSelectMode};
 
 pub use spinner::{with_spinner, with_spinner_visible};
-pub use status::{print_command_status, CommandStatus};
+pub use status::{emit_result, print_command_status, print_json, CommandStatus};
 pub use table::{apply_column_padding, header, styled_table, truncate};
