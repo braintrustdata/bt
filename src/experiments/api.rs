@@ -48,6 +48,19 @@ pub async fn list_experiments(client: &ApiClient, project: &str) -> Result<Vec<E
     Ok(list.objects)
 }
 
+pub async fn list_experiments_by_project_id(
+    client: &ApiClient,
+    project_id: &str,
+) -> Result<Vec<Experiment>> {
+    let path = format!(
+        "/v1/experiment?org_name={}&project_id={}",
+        encode(client.org_name()),
+        encode(project_id)
+    );
+    let list: ListResponse = client.get(&path).await?;
+    Ok(list.objects)
+}
+
 pub async fn get_experiment_by_name(
     client: &ApiClient,
     project: &str,
