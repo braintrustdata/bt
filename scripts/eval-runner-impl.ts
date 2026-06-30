@@ -173,7 +173,7 @@ declare global {
   // eslint-disable-next-line no-var
   var __inherited_braintrust_state: unknown;
   // eslint-disable-next-line no-var
-  var __bt_eval_sample_rate: number | undefined;
+  var __bt_eval_internal_btql: Record<string, unknown> | undefined;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -431,9 +431,11 @@ function readRunnerConfig(): RunnerConfig {
   };
 }
 
-// This looks very funny right now because it is only one value but the assumption is that we will inject more values over time
+// Runtime values consumed by SDKs. Currently only --sample sets internal BTQL,
+// but this can carry more _internal_btql options over time.
 function injectRuntimeValues(config: RunnerConfig) {
-  globalThis.__bt_eval_sample_rate = config.sample ?? undefined; // Used with `bt eval <...> --sample 5`
+  globalThis.__bt_eval_internal_btql =
+    config.sample === null ? undefined : { sample: config.sample };
 }
 
 const runtimeRequire = createRequire(

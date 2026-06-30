@@ -18,12 +18,12 @@ function datasetArgs(projectOrOptions, options) {
 }
 
 function internalBtqlWithDefaultSample(value) {
-  const sample = globalThis.__bt_eval_sample_rate;
-  if (sample === undefined) {
+  const cliBtql = globalThis.__bt_eval_internal_btql;
+  if (cliBtql === undefined) {
     return value;
   }
   if (value === undefined) {
-    return { sample };
+    return cliBtql;
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return value;
@@ -31,7 +31,7 @@ function internalBtqlWithDefaultSample(value) {
   if (Object.prototype.hasOwnProperty.call(value, "sample")) {
     return value;
   }
-  return { ...value, sample };
+  return { ...value, ...cliBtql };
 }
 
 async function Eval(projectName, evaluator) {

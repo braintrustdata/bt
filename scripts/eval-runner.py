@@ -282,15 +282,14 @@ def read_runner_config() -> RunnerConfig:
     )
 
 
-# This looks very funny right now because it is only one value, but the
-# assumption is that we will inject more values over time.
+# Runtime values consumed by SDKs. Currently only --sample sets internal BTQL,
+# but this can carry more _internal_btql options over time.
 def inject_runtime_values(config: RunnerConfig) -> None:
     if config.sample is None:
-        if hasattr(builtins, "__bt_eval_sample_rate"):
-            delattr(builtins, "__bt_eval_sample_rate")
+        if hasattr(builtins, "__bt_eval_internal_btql"):
+            delattr(builtins, "__bt_eval_internal_btql")
         return
-    # Used with `bt eval <...> --sample 5`.
-    setattr(builtins, "__bt_eval_sample_rate", config.sample)
+    setattr(builtins, "__bt_eval_internal_btql", {"sample": config.sample})
 
 
 def _to_mapping(value: Any) -> Any:

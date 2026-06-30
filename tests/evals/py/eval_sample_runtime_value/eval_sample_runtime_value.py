@@ -3,9 +3,11 @@ import builtins
 from braintrust import Eval
 
 
-sample = getattr(builtins, "__bt_eval_sample_rate", None)
-if sample != 5:
-    raise RuntimeError(f"expected sample runtime value 5, received {sample!r}")
+internal_btql = getattr(builtins, "__bt_eval_internal_btql", None)
+if internal_btql != {"sample": 5}:
+    raise RuntimeError(
+        f"expected internal BTQL runtime value {{'sample': 5}}, received {internal_btql!r}"
+    )
 
 
 def data():
