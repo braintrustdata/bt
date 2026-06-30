@@ -15,6 +15,7 @@ mod functions;
 mod http;
 mod init;
 mod js_runner;
+mod playgrounds;
 mod project_context;
 mod projects;
 mod prompts;
@@ -70,6 +71,7 @@ Projects & resources
   tools        Manage tools
   scorers      Manage scorers
   experiments  Manage experiments
+  playgrounds  Manage playgrounds
 
 Data & evaluation
   datasets     Manage datasets
@@ -144,6 +146,8 @@ enum Commands {
     Datasets(CLIArgs<datasets::DatasetsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
+    /// Manage playgrounds
+    Playgrounds(CLIArgs<playgrounds::PlaygroundsArgs>),
     #[command(name = "self")]
     /// Self-management commands
     SelfCommand(CLIArgs<self_update::SelfArgs>),
@@ -182,6 +186,7 @@ impl Commands {
             Commands::Topics(cmd) => &cmd.base,
             Commands::Datasets(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
+            Commands::Playgrounds(cmd) => &cmd.base,
             Commands::SelfCommand(cmd) => &cmd.base,
             Commands::Tools(cmd) => &cmd.base,
             Commands::Scorers(cmd) => &cmd.base,
@@ -208,6 +213,7 @@ impl Commands {
             Commands::Datasets(cmd) => &mut cmd.base,
             Commands::Topics(cmd) => &mut cmd.base,
             Commands::Prompts(cmd) => &mut cmd.base,
+            Commands::Playgrounds(cmd) => &mut cmd.base,
             Commands::SelfCommand(cmd) => &mut cmd.base,
             Commands::Tools(cmd) => &mut cmd.base,
             Commands::Scorers(cmd) => &mut cmd.base,
@@ -315,6 +321,7 @@ fn try_main() -> Result<()> {
             Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
             Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
             Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
+            Commands::Playgrounds(cmd) => playgrounds::run(cmd.base, cmd.args).await?,
             Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
             Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
             Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
