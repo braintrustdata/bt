@@ -25,8 +25,10 @@ use tokio::net::TcpListener;
 
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
-    http::{build_http_client, build_http_client_from_builder},
-    ui,
+    config,
+    http::{build_http_client, build_http_client_from_builder, ApiClient},
+    projects::api,
+    switch, ui,
 };
 
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
@@ -407,6 +409,15 @@ struct AuthLoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
+
+    /// Log in without updating active profile/org/project context
+    #[arg(
+        long,
+        env = "BRAINTRUST_NO_PROFILE_SWITCH",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    no_profile_switch: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -418,6 +429,11 @@ struct AuthLogoutArgs {
     /// Skip confirmation prompt
     #[arg(long, short = 'f')]
     force: bool,
+}
+
+struct PostLoginContextUpdate {
+    display: String,
+    path: PathBuf,
 }
 
 pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
@@ -1253,11 +1269,31 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         base.app_url.clone(),
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
+    let context_update = maybe_persist_post_login_context(
+        base,
+        &args,
+        &profile_name,
+        &api_key,
+        &selected_api_url,
+        &login_app_url,
+        selected_org.as_ref(),
+    )
+    .await
+    .context("login succeeded, but failed to update active context")?;
 
     ui::print_command_status(
         ui::CommandStatus::Success,
         &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
+    if let Some(context_update) = context_update {
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!("Switched to {}", context_update.display),
+        );
+        if base.verbose {
+            eprintln!("Wrote to {}", context_update.path.display());
+        }
+    }
     Ok(())
 }
 
@@ -1368,11 +1404,31 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         client_id.clone(),
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
+    let context_update = maybe_persist_post_login_context(
+        base,
+        &args,
+        &profile_name,
+        &oauth_tokens.access_token,
+        &selected_api_url,
+        &app_url,
+        selected_org.as_ref(),
+    )
+    .await
+    .context("login succeeded, but failed to update active context")?;
 
     ui::print_command_status(
         ui::CommandStatus::Success,
         &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
+    if let Some(context_update) = context_update {
+        ui::print_command_status(
+            ui::CommandStatus::Success,
+            &format!("Switched to {}", context_update.display),
+        );
+        if base.verbose {
+            eprintln!("Wrote to {}", context_update.path.display());
+        }
+    }
 
     Ok(())
 }
@@ -1700,6 +1756,119 @@ fn format_login_success(
         ),
         None => format!("Logged in (cross-org, profile: {profile_name}, api: {api_url})"),
     }
+}
+
+fn build_login_context_for_selected_org(
+    credential: &str,
+    api_url: &str,
+    app_url: &str,
+    selected_org: Option<&LoginOrgInfo>,
+) -> LoginContext {
+    let login = LoginState::new();
+    let _ = login.set(
+        credential.to_string(),
+        selected_org.map(|org| org.id.clone()).unwrap_or_default(),
+        selected_org.map(|org| org.name.clone()).unwrap_or_default(),
+        api_url.to_string(),
+        app_url.to_string(),
+    );
+    LoginContext {
+        login,
+        api_url: api_url.to_string(),
+        app_url: app_url.to_string(),
+    }
+}
+
+fn format_post_login_context(
+    selected_org: Option<&LoginOrgInfo>,
+    project: Option<&api::Project>,
+) -> String {
+    match (selected_org, project) {
+        (Some(org), Some(project)) => format!("{}/{}", org.name, project.name),
+        (Some(org), None) => org.name.clone(),
+        (None, _) => "cross-org mode".to_string(),
+    }
+}
+
+async fn resolve_post_login_project(
+    base: &BaseArgs,
+    credential: &str,
+    api_url: &str,
+    app_url: &str,
+    selected_org: Option<&LoginOrgInfo>,
+) -> Result<Option<api::Project>> {
+    let Some(project_name) = config::trimmed_option(base.project.as_deref()) else {
+        return Ok(None);
+    };
+
+    let selected_org = selected_org.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot set a default project in cross-org mode; rerun `bt auth login --org <ORG> --project <PROJECT>`"
+        )
+    })?;
+    let ctx =
+        build_login_context_for_selected_org(credential, api_url, app_url, Some(selected_org));
+    let client = ApiClient::new(&ctx)?;
+    switch::validate_or_create_project(&client, project_name)
+        .await
+        .map(Some)
+}
+
+async fn persist_post_login_context(
+    base: &BaseArgs,
+    profile_name: &str,
+    credential: &str,
+    api_url: &str,
+    app_url: &str,
+    selected_org: Option<&LoginOrgInfo>,
+) -> Result<PostLoginContextUpdate> {
+    let project =
+        resolve_post_login_project(base, credential, api_url, app_url, selected_org).await?;
+    let path = if ui::can_prompt() && config::local_path().is_some() {
+        switch::select_scope()?.0
+    } else {
+        config::global_path()?
+    };
+
+    let mut cfg = config::load_file(&path);
+    switch::apply_switch_config(
+        &mut cfg,
+        Some(profile_name),
+        selected_org.map(|org| org.name.as_str()),
+        project.as_ref(),
+    );
+    config::save_file(&path, &cfg)
+        .context(format!("Could not save config to {}", path.display()))?;
+
+    Ok(PostLoginContextUpdate {
+        display: format_post_login_context(selected_org, project.as_ref()),
+        path,
+    })
+}
+
+async fn maybe_persist_post_login_context(
+    base: &BaseArgs,
+    args: &AuthLoginArgs,
+    profile_name: &str,
+    credential: &str,
+    api_url: &str,
+    app_url: &str,
+    selected_org: Option<&LoginOrgInfo>,
+) -> Result<Option<PostLoginContextUpdate>> {
+    if args.no_profile_switch {
+        return Ok(None);
+    }
+
+    persist_post_login_context(
+        base,
+        profile_name,
+        credential,
+        api_url,
+        app_url,
+        selected_org,
+    )
+    .await
+    .map(Some)
 }
 
 async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
@@ -4377,6 +4546,93 @@ mod tests {
             name: name.to_string(),
             api_url: None,
         }
+    }
+
+    #[tokio::test]
+    async fn persist_post_login_context_clears_stale_project_for_org_only_login() {
+        let _env = TestEnv::new(None, None).await;
+        crate::config::save_global(&crate::config::Config {
+            profile: Some("old-profile".to_string()),
+            org: Some("old-org".to_string()),
+            project: Some("stale-project".to_string()),
+            project_id: Some("proj_stale".to_string()),
+            ..Default::default()
+        })
+        .expect("save initial config");
+
+        let update = persist_post_login_context(
+            &make_base(),
+            "work",
+            "test-api-key",
+            "https://api.example.test",
+            "https://www.example.test",
+            Some(&login_org("org_123", "acme")),
+        )
+        .await
+        .expect("persist context");
+        let cfg = crate::config::load_global().expect("load global config");
+
+        assert_eq!(update.display, "acme");
+        assert_eq!(cfg.profile.as_deref(), Some("work"));
+        assert_eq!(cfg.org.as_deref(), Some("acme"));
+        assert_eq!(cfg.project, None);
+        assert_eq!(cfg.project_id, None);
+    }
+
+    #[tokio::test]
+    async fn maybe_persist_post_login_context_skips_config_write_when_no_profile_switch_is_set() {
+        let _env = TestEnv::new(None, None).await;
+        let original = crate::config::Config {
+            profile: Some("old-profile".to_string()),
+            org: Some("old-org".to_string()),
+            project: Some("stale-project".to_string()),
+            project_id: Some("proj_stale".to_string()),
+            ..Default::default()
+        };
+        crate::config::save_global(&original).expect("save initial config");
+
+        let args = AuthLoginArgs {
+            oauth: false,
+            client_id: None,
+            no_browser: false,
+            no_profile_switch: true,
+        };
+
+        let update = maybe_persist_post_login_context(
+            &make_base(),
+            &args,
+            "work",
+            "test-api-key",
+            "https://api.example.test",
+            "https://www.example.test",
+            Some(&login_org("org_123", "acme")),
+        )
+        .await
+        .expect("skip context update");
+        let cfg = crate::config::load_global().expect("load global config");
+
+        assert!(update.is_none());
+        assert_eq!(cfg, original);
+    }
+
+    #[tokio::test]
+    async fn resolve_post_login_project_rejects_cross_org_default_project() {
+        let mut base = make_base();
+        base.project = Some("demo-project".to_string());
+
+        let err = resolve_post_login_project(
+            &base,
+            "test-api-key",
+            "https://api.example.test",
+            "https://www.example.test",
+            None,
+        )
+        .await
+        .expect_err("cross-org project selection should fail");
+
+        assert!(err
+            .to_string()
+            .contains("cannot set a default project in cross-org mode"));
     }
 
     #[test]
