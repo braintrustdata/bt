@@ -17,6 +17,7 @@ use actix_web::{guard, web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use crossterm::style::Stylize;
+use futures_util::future;
 use futures_util::stream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
@@ -25,16 +26,16 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use ratatui::layout::Alignment;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
 use crate::args::BaseArgs;
 use crate::auth::resolved_runner_env;
 use crate::js_runner;
 use crate::python_runner;
 use crate::runner_sse;
-use crate::ui::{
-    animations_enabled, box_with_title, is_quiet, render_experiment_summary_table,
-    summary_metric_unit, SummaryExperimentColumn, SummaryMetricCell, SummaryMetricKind,
-    SummaryMetricRow, SummaryTableOptions,
-};
+use crate::ui::{animations_enabled, box_with_title, header_line, is_quiet, render_ratatui_table};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -175,9 +176,7 @@ struct ResolvedDatasetEvalData {
 #[derive(Clone)]
 struct DevServerState {
     base: BaseArgs,
-    language_override: Option<EvalLanguage>,
-    runner_override: Option<String>,
-    files: Vec<String>,
+    dev_plans: Vec<DevEvalPlan>,
     no_send_logs: bool,
     options: EvalRunOptions,
     host: String,
@@ -263,17 +262,41 @@ pub struct EvalArgs {
     #[arg(value_name = "FILE")]
     pub files: Vec<String>,
 
-    /// Eval runner binary (e.g. tsx, bun, ts-node, deno, python). Defaults to tsx for JS files.
-    #[arg(long, short = 'r', env = "BT_EVAL_RUNNER", value_name = "RUNNER")]
-    pub runner: Option<String>,
+    /// Runner command for JavaScript/TypeScript eval files (e.g. tsx, "pnpm exec tsx", "node --import tsx/esm"). Defaults to tsx.
+    #[arg(
+        long = "runner-js",
+        alias = "runner",
+        short = 'r',
+        env = "BT_EVAL_JS_RUNNER",
+        value_name = "RUNNER"
+    )]
+    pub runner_js: Option<String>,
 
-    /// Force eval language instead of inferring from file extensions.
+    // Backward-compat env alias for --runner-js.
+    #[arg(
+        long = "runner-js-legacy-env",
+        env = "BT_EVAL_RUNNER",
+        value_name = "RUNNER",
+        hide = true
+    )]
+    runner_js_legacy_env: Option<String>,
+
+    /// Runner command for Python eval files (e.g. python3, "uv run python", "poetry run python").
+    #[arg(
+        long = "runner-python",
+        env = "BT_EVAL_PYTHON_RUNNER",
+        value_name = "RUNNER"
+    )]
+    pub runner_python: Option<String>,
+
+    /// Deprecated: language is now inferred from file extensions. This flag is ignored.
     #[arg(
         long,
         short = 'l',
         env = "BT_EVAL_LANGUAGE",
         value_enum,
-        value_name = "LANGUAGE"
+        value_name = "LANGUAGE",
+        hide = true
     )]
     pub language: Option<EvalLanguage>,
 
@@ -433,6 +456,14 @@ enum EvalSamplingMode {
     Sample { count: usize, seed: u64 },
 }
 
+impl EvalArgs {
+    fn effective_js_runner(&self) -> Option<&str> {
+        self.runner_js
+            .as_deref()
+            .or(self.runner_js_legacy_env.as_deref())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EvalRunOptions {
     jsonl: bool,
@@ -448,6 +479,9 @@ struct EvalRunOptions {
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
+    if args.language.is_some() {
+        eprintln!("warning: --language / BT_EVAL_LANGUAGE is deprecated and will be removed in a future release. Language is now inferred from file extensions.");
+    }
     if args.dev && args.watch {
         anyhow::bail!("--watch is not supported with --dev.");
     }
@@ -464,6 +498,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         }
     }
     validate_eval_input_files(&files)?;
+    let js_runner_override = args.effective_js_runner().map(ToOwned::to_owned);
 
     let sampling = if let Some(first) = args.first {
         EvalSamplingMode::First { count: first }
@@ -499,13 +534,15 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     };
 
     if args.dev {
-        let language = detect_eval_language(&files, args.language)?;
         let app_url = resolve_app_url(&base);
+        let dev_plans = build_dev_eval_plans(
+            &files,
+            js_runner_override.as_deref(),
+            args.runner_python.as_deref(),
+        )?;
         let state = DevServerState {
             base: base.clone(),
-            language_override: Some(language),
-            runner_override: args.runner.clone(),
-            files,
+            dev_plans,
             no_send_logs: args.no_send_logs,
             options,
             host: args.dev_host.clone(),
@@ -522,8 +559,8 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     if args.watch {
         run_eval_files_watch(
             &base,
-            args.language,
-            args.runner.as_deref(),
+            js_runner_override.as_deref(),
+            args.runner_python.as_deref(),
             &files,
             args.no_send_logs,
             &options,
@@ -532,8 +569,8 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     } else {
         let output = run_eval_files_once(
             &base,
-            args.language,
-            args.runner.as_deref(),
+            js_runner_override.as_deref(),
+            args.runner_python.as_deref(),
             &files,
             args.no_send_logs,
             &options,
@@ -549,8 +586,8 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
 async fn run_eval_files_watch(
     base: &BaseArgs,
-    language_override: Option<EvalLanguage>,
-    runner_override: Option<&str>,
+    js_runner_override: Option<&str>,
+    python_runner_override: Option<&str>,
     files: &[String],
     no_send_logs: bool,
     options: &EvalRunOptions,
@@ -567,8 +604,8 @@ async fn run_eval_files_watch(
     loop {
         match run_eval_files_once(
             base,
-            language_override,
-            runner_override,
+            js_runner_override,
+            python_runner_override,
             files,
             no_send_logs,
             options,
@@ -609,12 +646,30 @@ async fn run_eval_files_watch(
     }
 }
 
-struct EvalPlan<'a> {
+#[derive(Clone)]
+struct EvalPlan {
     language: EvalLanguage,
-    files: &'a [String],
-    runner_override: Option<&'a str>,
+    files: Vec<String>,
+    runner_override: Option<String>,
     show_js_hint: bool,
     retry_policy: RetryPolicy,
+}
+
+#[derive(Clone)]
+struct DevEvalPlan {
+    label: String,
+    plan: EvalPlan,
+}
+
+#[derive(Clone)]
+struct DevEvalRoute {
+    plan_index: usize,
+    runner_eval_name: String,
+}
+
+struct DevRoutingTable {
+    manifest: serde_json::Map<String, Value>,
+    routes: HashMap<String, DevEvalRoute>,
 }
 
 struct EvalAttemptOutput {
@@ -625,39 +680,138 @@ struct EvalAttemptOutput {
     runner_kind: RunnerKind,
 }
 
-fn build_eval_plan<'a>(
-    files: &'a [String],
-    language_override: Option<EvalLanguage>,
-    runner_override: Option<&'a str>,
-) -> Result<EvalPlan<'a>> {
-    let language = detect_eval_language(files, language_override)?;
-    let show_js_hint = language == EvalLanguage::JavaScript && runner_override.is_none();
-    let has_ts_files = language == EvalLanguage::JavaScript && has_ts_eval_files(files);
-    let retry_policy = if show_js_hint && has_ts_files {
-        RetryPolicy::Allow
-    } else {
-        RetryPolicy::Disallow
-    };
-
-    Ok(EvalPlan {
-        language,
-        files,
-        runner_override,
-        show_js_hint,
-        retry_policy,
-    })
+fn partition_files_by_language(files: &[String]) -> Result<Vec<(EvalLanguage, Vec<String>)>> {
+    let mut js_files: Vec<String> = Vec::new();
+    let mut py_files: Vec<String> = Vec::new();
+    for file in files {
+        let ext = PathBuf::from(file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "py" => py_files.push(file.clone()),
+            "ts" | "tsx" | "js" | "mjs" | "cjs" => js_files.push(file.clone()),
+            _ => anyhow::bail!("Unsupported eval file extension: {ext}"),
+        }
+    }
+    let mut result = Vec::new();
+    if !js_files.is_empty() {
+        result.push((EvalLanguage::JavaScript, js_files));
+    }
+    if !py_files.is_empty() {
+        result.push((EvalLanguage::Python, py_files));
+    }
+    if result.is_empty() {
+        anyhow::bail!("No eval files provided");
+    }
+    Ok(result)
 }
 
-async fn run_eval_files_once(
-    base: &BaseArgs,
-    language_override: Option<EvalLanguage>,
-    runner_override: Option<&str>,
+fn build_eval_plans(
     files: &[String],
+    js_runner_override: Option<&str>,
+    python_runner_override: Option<&str>,
+) -> Result<Vec<EvalPlan>> {
+    let partitions = partition_files_by_language(files)?;
+    let mut plans = Vec::new();
+    for (language, files) in partitions {
+        match language {
+            EvalLanguage::JavaScript => {
+                let show_js_hint = js_runner_override.is_none();
+                let has_ts_files = has_ts_eval_files(&files);
+                let retry_policy = if show_js_hint && has_ts_files {
+                    RetryPolicy::Allow
+                } else {
+                    RetryPolicy::Disallow
+                };
+                plans.push(EvalPlan {
+                    language,
+                    files,
+                    runner_override: js_runner_override.map(ToOwned::to_owned),
+                    show_js_hint,
+                    retry_policy,
+                });
+            }
+            EvalLanguage::Python => {
+                if let Some(override_) = python_runner_override {
+                    // User explicitly specified a runner; one plan for all Python files.
+                    plans.push(EvalPlan {
+                        language,
+                        files,
+                        runner_override: Some(override_.to_owned()),
+                        show_js_hint: false,
+                        retry_policy: RetryPolicy::Disallow,
+                    });
+                } else {
+                    // Group by nearest venv; one plan per group so each file runs with
+                    // the Python interpreter that owns its packages.
+                    for (group_files, venv_python) in group_python_files_by_venv(&files) {
+                        plans.push(EvalPlan {
+                            language: EvalLanguage::Python,
+                            files: group_files,
+                            runner_override: venv_python,
+                            show_js_hint: false,
+                            retry_policy: RetryPolicy::Disallow,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(plans)
+}
+
+fn build_dev_eval_plans(
+    files: &[String],
+    js_runner_override: Option<&str>,
+    python_runner_override: Option<&str>,
+) -> Result<Vec<DevEvalPlan>> {
+    let plans = build_eval_plans(files, js_runner_override, python_runner_override)?;
+    let js_total = plans
+        .iter()
+        .filter(|plan| plan.language == EvalLanguage::JavaScript)
+        .count();
+    let python_total = plans
+        .iter()
+        .filter(|plan| plan.language == EvalLanguage::Python)
+        .count();
+    let mut js_seen = 0usize;
+    let mut python_seen = 0usize;
+
+    Ok(plans
+        .into_iter()
+        .map(|plan| {
+            let label = match plan.language {
+                EvalLanguage::JavaScript => {
+                    js_seen += 1;
+                    if js_total == 1 {
+                        "js".to_string()
+                    } else {
+                        format!("js {js_seen}")
+                    }
+                }
+                EvalLanguage::Python => {
+                    python_seen += 1;
+                    if python_total == 1 {
+                        "python".to_string()
+                    } else {
+                        format!("python {python_seen}")
+                    }
+                }
+            };
+            DevEvalPlan { label, plan }
+        })
+        .collect())
+}
+
+async fn run_eval_plan_once(
+    base: &BaseArgs,
+    plan: &EvalPlan,
     no_send_logs: bool,
     options: &EvalRunOptions,
     collect_dependencies: bool,
 ) -> Result<EvalRunOutput> {
-    let plan = build_eval_plan(files, language_override, runner_override)?;
     let console_policy = match plan.retry_policy {
         RetryPolicy::Allow => ConsolePolicy::BufferStderr,
         RetryPolicy::Disallow => ConsolePolicy::Forward,
@@ -665,7 +819,7 @@ async fn run_eval_files_once(
 
     let mut output = run_eval_attempt(
         base,
-        &plan,
+        plan,
         no_send_logs,
         options,
         &[],
@@ -674,12 +828,12 @@ async fn run_eval_files_once(
     )
     .await?;
 
-    if !output.status.success() && should_retry_esm(&plan, &output) {
+    if !output.status.success() && should_retry_esm(plan, &output) {
         let first_attempt_stderr = std::mem::take(&mut output.stderr_lines);
         eprintln!("Eval failed with ESM/CJS interop error. Retrying in ESM mode...");
         output = run_eval_attempt(
             base,
-            &plan,
+            plan,
             no_send_logs,
             options,
             &[],
@@ -696,7 +850,7 @@ async fn run_eval_files_once(
         report_buffered_stderr(&output.stderr_lines, options.verbose);
     }
 
-    if !output.status.success() && plan.show_js_hint && should_retry_esm(&plan, &output) {
+    if !output.status.success() && plan.show_js_hint && should_retry_esm(plan, &output) {
         eprintln!("Hint: If this eval uses ESM features (like top-level await), try `--runner vite-node`.");
     }
 
@@ -708,7 +862,7 @@ async fn run_eval_files_once(
         let mut dependencies =
             normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
         if plan.language == EvalLanguage::JavaScript {
-            let static_dependencies = collect_js_static_dependencies(files)?;
+            let static_dependencies = collect_js_static_dependencies(&plan.files)?;
             dependencies = merge_watch_paths(&dependencies, &static_dependencies);
         }
         dependencies
@@ -722,9 +876,43 @@ async fn run_eval_files_once(
     })
 }
 
+async fn run_eval_files_once(
+    base: &BaseArgs,
+    js_runner_override: Option<&str>,
+    python_runner_override: Option<&str>,
+    files: &[String],
+    no_send_logs: bool,
+    options: &EvalRunOptions,
+    collect_dependencies: bool,
+) -> Result<EvalRunOutput> {
+    let plans = build_eval_plans(files, js_runner_override, python_runner_override)?;
+    let plan_outputs =
+        future::try_join_all(plans.iter().map(|plan| {
+            run_eval_plan_once(base, plan, no_send_logs, options, collect_dependencies)
+        }))
+        .await?;
+
+    // Aggregate: prefer first failing status; merge all dependency sets.
+    let mut combined_status: Option<ExitStatus> = None;
+    let mut combined_deps: Vec<PathBuf> = Vec::new();
+    for output in plan_outputs {
+        combined_deps = merge_watch_paths(&combined_deps, &output.dependencies);
+        combined_status = Some(match combined_status {
+            None => output.status,
+            Some(existing) if existing.success() && !output.status.success() => output.status,
+            Some(existing) => existing,
+        });
+    }
+
+    Ok(EvalRunOutput {
+        status: combined_status.expect("build_eval_plans guarantees at least one plan"),
+        dependencies: combined_deps,
+    })
+}
+
 async fn run_eval_attempt(
     base: &BaseArgs,
-    plan: &EvalPlan<'_>,
+    plan: &EvalPlan,
     no_send_logs: bool,
     options: &EvalRunOptions,
     extra_env: &[(String, String)],
@@ -734,20 +922,15 @@ async fn run_eval_attempt(
     let spawned = spawn_eval_runner(
         base,
         plan.language,
-        plan.runner_override,
-        plan.files,
+        plan.runner_override.as_deref(),
+        &plan.files,
         no_send_logs,
         options,
         extra_env,
         js_mode,
     )
     .await?;
-    let mut ui = EvalUi::new(
-        options.jsonl,
-        options.list,
-        options.verbose,
-        base.profile.clone(),
-    );
+    let mut ui = EvalUi::new(options.jsonl, options.list, options.verbose);
     let output =
         drive_eval_runner(spawned.process, console_policy, |event| ui.handle(event)).await?;
     ui.finish();
@@ -1046,7 +1229,7 @@ fn report_buffered_stderr(lines: &[String], verbose: bool) {
     }
 }
 
-fn should_retry_esm(plan: &EvalPlan<'_>, output: &EvalAttemptOutput) -> bool {
+fn should_retry_esm(plan: &EvalPlan, output: &EvalAttemptOutput) -> bool {
     if matches!(plan.retry_policy, RetryPolicy::Disallow) {
         return false;
     }
@@ -1145,6 +1328,32 @@ fn join_app_url(app_url: &str, path: &str) -> Result<String> {
 
 fn json_error_response(status: actix_web::http::StatusCode, message: &str) -> HttpResponse {
     HttpResponse::build(status).json(json!({ "error": message }))
+}
+
+#[derive(Debug)]
+struct DevHttpError {
+    status: actix_web::http::StatusCode,
+    message: String,
+}
+
+impl DevHttpError {
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn with_status(status: actix_web::http::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn into_response(self) -> HttpResponse {
+        json_error_response(self.status, &self.message)
+    }
 }
 
 fn parse_auth_token(req: &HttpRequest) -> Option<String> {
@@ -1392,6 +1601,164 @@ fn make_dev_mode_env(
     Ok(env)
 }
 
+async fn load_dev_plan_manifest(
+    state: &DevServerState,
+    dev_plan: &DevEvalPlan,
+    extra_env: &[(String, String)],
+) -> std::result::Result<serde_json::Map<String, Value>, DevHttpError> {
+    let spawned = spawn_eval_runner(
+        &state.base,
+        dev_plan.plan.language,
+        dev_plan.plan.runner_override.as_deref(),
+        &dev_plan.plan.files,
+        state.no_send_logs,
+        &state.options,
+        extra_env,
+        JsMode::Auto,
+    )
+    .await
+    .map_err(|err| DevHttpError::internal(format!("{err:#}")))?;
+
+    let mut stdout_lines: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
+    let output = drive_eval_runner(
+        spawned.process,
+        ConsolePolicy::Forward,
+        |event| match event {
+            EvalEvent::Console { stream, message } if stream == "stdout" => {
+                stdout_lines.push(message);
+            }
+            EvalEvent::Error {
+                message,
+                stack: _,
+                status,
+            } => errors.push((message, status)),
+            _ => {}
+        },
+    )
+    .await
+    .map_err(|err| DevHttpError::internal(format!("{err:#}")))?;
+
+    if let Some((message, status)) = errors.into_iter().next() {
+        let http_status = status
+            .and_then(|code| actix_web::http::StatusCode::from_u16(code).ok())
+            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(DevHttpError::with_status(http_status, message));
+    }
+    if !output.status.success() {
+        return Err(DevHttpError::internal("Eval runner exited with an error."));
+    }
+
+    let mut manifest: Option<serde_json::Map<String, Value>> = None;
+    for line in stdout_lines.iter().rev() {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) {
+            manifest = Some(map);
+            break;
+        }
+    }
+    if manifest.is_none() {
+        let joined = stdout_lines.join("\n");
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&joined) {
+            manifest = Some(map);
+        }
+    }
+
+    manifest.ok_or_else(|| {
+        DevHttpError::internal("Failed to parse evaluator manifest from runner output.")
+    })
+}
+
+fn uniquify_dev_route_name(name: String, counts: &mut HashMap<String, usize>) -> String {
+    let count = counts.entry(name.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        name
+    } else {
+        format!("{name} #{count}")
+    }
+}
+
+fn build_dev_routing_table_from_manifests(
+    dev_plans: &[DevEvalPlan],
+    plan_manifests: Vec<(usize, serde_json::Map<String, Value>)>,
+) -> DevRoutingTable {
+    let mut key_counts: HashMap<String, usize> = HashMap::new();
+    for (_, map) in &plan_manifests {
+        for key in map.keys() {
+            *key_counts.entry(key.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut manifest = serde_json::Map::new();
+    let mut routes = HashMap::new();
+    let mut display_counts: HashMap<String, usize> = HashMap::new();
+    for (plan_index, map) in plan_manifests {
+        for (raw_name, value) in map {
+            let base_display_name = if key_counts.get(&raw_name).copied().unwrap_or(0) > 1 {
+                format!("{raw_name} [{}]", dev_plans[plan_index].label)
+            } else {
+                raw_name.clone()
+            };
+            let display_name = uniquify_dev_route_name(base_display_name, &mut display_counts);
+            let route = DevEvalRoute {
+                plan_index,
+                runner_eval_name: raw_name.clone(),
+            };
+
+            manifest.insert(display_name.clone(), value);
+            routes.insert(display_name, route.clone());
+            if key_counts.get(&raw_name).copied().unwrap_or(0) == 1 {
+                routes.insert(raw_name, route);
+            }
+        }
+    }
+
+    DevRoutingTable { manifest, routes }
+}
+
+async fn build_dev_routing_table(
+    state: &DevServerState,
+    auth: &DevAuthContext,
+) -> std::result::Result<DevRoutingTable, DevHttpError> {
+    let extra_env = make_dev_mode_env(auth, state, None, "list")
+        .map_err(|err| DevHttpError::internal(format!("{err:#}")))?;
+    let plan_manifests = future::try_join_all(state.dev_plans.iter().enumerate().map(
+        |(plan_index, dev_plan)| {
+            let extra_env = extra_env.clone();
+            async move {
+                Ok::<_, DevHttpError>((
+                    plan_index,
+                    load_dev_plan_manifest(state, dev_plan, &extra_env).await?,
+                ))
+            }
+        },
+    ))
+    .await?;
+    Ok(build_dev_routing_table_from_manifests(
+        &state.dev_plans,
+        plan_manifests,
+    ))
+}
+
+async fn resolve_dev_eval_route(
+    state: &DevServerState,
+    auth: &DevAuthContext,
+    requested_name: &str,
+) -> std::result::Result<DevEvalRoute, DevHttpError> {
+    // Always rebuild the routing table from a fresh manifest run. The dev
+    // server exists for iterative editing, so a cached table could route a
+    // request to an evaluator that has since been renamed or removed. We accept
+    // re-running the manifests on each request (matching `/list`) rather than
+    // risk serving a stale route.
+    let table = build_dev_routing_table(state, auth).await?;
+    table.routes.get(requested_name).cloned().ok_or_else(|| {
+        DevHttpError::with_status(
+            actix_web::http::StatusCode::NOT_FOUND,
+            format!("Evaluator '{requested_name}' not found"),
+        )
+    })
+}
+
 fn serialize_sse_event(event: &str, data: &str) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
@@ -1504,109 +1871,11 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         Ok(auth) => auth,
         Err(response) => return response,
     };
-    let extra_env = match make_dev_mode_env(&auth, &state, None, "list") {
-        Ok(extra_env) => extra_env,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
+    let table = match build_dev_routing_table(&state, &auth).await {
+        Ok(table) => table,
+        Err(err) => return err.into_response(),
     };
-
-    let language = match detect_eval_language(&state.files, state.language_override) {
-        Ok(language) => language,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
-    let spawned = match spawn_eval_runner(
-        &state.base,
-        language,
-        state.runner_override.as_deref(),
-        &state.files,
-        state.no_send_logs,
-        &state.options,
-        &extra_env,
-        JsMode::Auto,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
-
-    let mut stdout_lines = Vec::new();
-    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-    let output =
-        match drive_eval_runner(
-            spawned.process,
-            ConsolePolicy::Forward,
-            |event| match event {
-                EvalEvent::Console { stream, message } if stream == "stdout" => {
-                    stdout_lines.push(message);
-                }
-                EvalEvent::Error {
-                    message,
-                    stack: _,
-                    status,
-                } => errors.push((message, status)),
-                _ => {}
-            },
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                return json_error_response(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{err:#}"),
-                );
-            }
-        };
-
-    if let Some((message, status)) = errors.first() {
-        let status = status
-            .and_then(|status| actix_web::http::StatusCode::from_u16(status).ok())
-            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
-        return json_error_response(status, message);
-    }
-    if !output.status.success() {
-        return json_error_response(
-            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Eval runner exited with an error.",
-        );
-    }
-
-    let mut parsed_manifest: Option<Value> = None;
-    for line in stdout_lines.iter().rev() {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            parsed_manifest = Some(value);
-            break;
-        }
-    }
-    if parsed_manifest.is_none() {
-        let joined = stdout_lines.join("\n");
-        if let Ok(value) = serde_json::from_str::<Value>(&joined) {
-            parsed_manifest = Some(value);
-        }
-    }
-
-    match parsed_manifest {
-        Some(manifest) => HttpResponse::Ok().json(manifest),
-        None => json_error_response(
-            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to parse evaluator manifest from runner output.",
-        ),
-    }
+    HttpResponse::Ok().json(Value::Object(table.manifest.clone()))
 }
 
 async fn dev_server_eval(
@@ -1631,6 +1900,11 @@ async fn dev_server_eval(
         return response;
     }
     let stream_requested = eval_request.stream.unwrap_or(false);
+    let route = match resolve_dev_eval_route(&state, &auth, &eval_request.name).await {
+        Ok(route) => route,
+        Err(err) => return err.into_response(),
+    };
+    eval_request.name = route.runner_eval_name;
     let extra_env = match make_dev_mode_env(&auth, &state, Some(&eval_request), "eval") {
         Ok(extra_env) => extra_env,
         Err(err) => {
@@ -1640,21 +1914,12 @@ async fn dev_server_eval(
             );
         }
     };
-
-    let language = match detect_eval_language(&state.files, state.language_override) {
-        Ok(language) => language,
-        Err(err) => {
-            return json_error_response(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("{err:#}"),
-            );
-        }
-    };
+    let dev_plan = &state.dev_plans[route.plan_index];
     let spawned = match spawn_eval_runner(
         &state.base,
-        language,
-        state.runner_override.as_deref(),
-        &state.files,
+        dev_plan.plan.language,
+        dev_plan.plan.runner_override.as_deref(),
+        &dev_plan.plan.files,
         state.no_send_logs,
         &state.options,
         &extra_env,
@@ -1662,7 +1927,7 @@ async fn dev_server_eval(
     )
     .await
     {
-        Ok(value) => value,
+        Ok(spawned) => spawned,
         Err(err) => {
             return json_error_response(
                 actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1673,6 +1938,7 @@ async fn dev_server_eval(
 
     if stream_requested {
         let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let tx_task = tx.clone();
         tokio::spawn(async move {
             let mut saw_error = false;
             let mut stderr_lines: Vec<String> = Vec::new();
@@ -1689,7 +1955,7 @@ async fn dev_server_eval(
                 } = event
                 {
                     for line in message.lines() {
-                        let _ = tx.send(format!(": [{stream}] {line}\n"));
+                        let _ = tx_task.send(format!(": [{stream}] {line}\n"));
                     }
                     if stream == "stderr" {
                         stderr_lines.push(message.clone());
@@ -1697,7 +1963,7 @@ async fn dev_server_eval(
                     return;
                 }
                 if let Some(encoded) = encode_eval_event_for_http(&event) {
-                    let _ = tx.send(encoded);
+                    let _ = tx_task.send(encoded);
                 }
             })
             .await;
@@ -1712,7 +1978,7 @@ async fn dev_server_eval(
                         }
                         let error =
                             serialize_sse_event("error", &json!({ "message": detail }).to_string());
-                        let _ = tx.send(error);
+                        let _ = tx_task.send(error);
                     }
                 }
                 Err(err) => {
@@ -1720,12 +1986,12 @@ async fn dev_server_eval(
                         "error",
                         &json!({ "message": format!("{err:#}") }).to_string(),
                     );
-                    let _ = tx.send(error);
+                    let _ = tx_task.send(error);
                 }
             }
-
-            let _ = tx.send(serialize_sse_event("done", ""));
+            let _ = tx_task.send(serialize_sse_event("done", ""));
         });
+        drop(tx);
 
         let response_stream = stream::unfold(rx, |mut rx| async {
             rx.recv()
@@ -1766,11 +2032,11 @@ async fn dev_server_eval(
             }
         };
 
-    if let Some((message, status)) = errors.first() {
-        let status = status
-            .and_then(|status| actix_web::http::StatusCode::from_u16(status).ok())
+    if let Some((message, status)) = errors.into_iter().next() {
+        let http_status = status
+            .and_then(|s| actix_web::http::StatusCode::from_u16(s).ok())
             .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
-        return json_error_response(status, message);
+        return json_error_response(http_status, &message);
     }
     if let Some(summary) = summary {
         return HttpResponse::Ok().json(summary);
@@ -2149,42 +2415,6 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-fn detect_eval_language(
-    files: &[String],
-    language_override: Option<EvalLanguage>,
-) -> Result<EvalLanguage> {
-    if let Some(language) = language_override {
-        return Ok(language);
-    }
-
-    let mut detected: Option<EvalLanguage> = None;
-    for file in files {
-        let ext = PathBuf::from(file)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let current = match ext.as_str() {
-            "py" => EvalLanguage::Python,
-            "ts" | "tsx" | "js" | "mjs" | "cjs" => EvalLanguage::JavaScript,
-            _ => {
-                anyhow::bail!("Unsupported eval file extension: {ext}");
-            }
-        };
-        if let Some(existing) = detected {
-            if existing != current {
-                anyhow::bail!(
-                    "Mixed eval file types are not supported yet (found {existing:?} and {current:?})."
-                );
-            }
-        } else {
-            detected = Some(current);
-        }
-    }
-
-    detected.ok_or_else(|| anyhow::anyhow!("No eval files provided"))
-}
-
 const DEFAULT_EVAL_GLOBS: &[&str] = &[
     "**/*.eval.ts",
     "**/*.eval.js",
@@ -2552,6 +2782,51 @@ fn set_node_heap_size_env(command: &mut Command) {
     command.env("NODE_OPTIONS", merged);
 }
 
+fn venv_python_path(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
+}
+
+/// Walk up from `file`'s directory checking common venv directory names.
+fn find_venv_for_file(file: &str) -> Option<PathBuf> {
+    let start = Path::new(file)
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))?;
+
+    const VENV_NAMES: &[&str] = &[".venv", "venv"];
+    let mut current = Some(start.as_path());
+    while let Some(dir) = current {
+        for name in VENV_NAMES {
+            let python = venv_python_path(&dir.join(name));
+            if python.is_file() {
+                return Some(python);
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// Group Python files by their nearest venv, preserving input order.
+/// Files with no discoverable venv are grouped together under `None`.
+fn group_python_files_by_venv(files: &[String]) -> Vec<(Vec<String>, Option<String>)> {
+    let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for file in files {
+        let venv_python = find_venv_for_file(file).map(|p| p.to_string_lossy().to_string());
+        match groups.iter_mut().find(|(k, _)| *k == venv_python) {
+            Some(group) => group.1.push(file.clone()),
+            None => groups.push((venv_python, vec![file.clone()])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(python, files)| (files, python))
+        .collect()
+}
 fn eval_runner_cache_dir() -> PathBuf {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -2665,10 +2940,6 @@ struct ExperimentSummary {
     sample_count: Option<u64>,
     #[serde(default)]
     sample_seed: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    compare_command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    compare_more: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2805,7 +3076,6 @@ struct EvalUi {
     deferred_errors: Vec<String>,
     suppressed_stderr_lines: usize,
     finished: bool,
-    profile: Option<String>,
 }
 
 struct EvalBarState {
@@ -2815,7 +3085,7 @@ struct EvalBarState {
 }
 
 impl EvalUi {
-    fn new(jsonl: bool, list: bool, verbose: bool, profile: Option<String>) -> Self {
+    fn new(jsonl: bool, list: bool, verbose: bool) -> Self {
         let draw_target = if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet()
         {
             ProgressDrawTarget::stderr_with_hz(10)
@@ -2841,7 +3111,6 @@ impl EvalUi {
             deferred_errors: Vec::new(),
             suppressed_stderr_lines: 0,
             finished: false,
-            profile,
         }
     }
 
@@ -2869,7 +3138,6 @@ impl EvalUi {
                 }
             }
             EvalEvent::Summary(summary) => {
-                let summary = enrich_experiment_summary(summary, self.profile.as_deref());
                 if self.jsonl {
                     if let Ok(line) = serde_json::to_string(&summary) {
                         println!("{line}");
@@ -3229,187 +3497,143 @@ fn format_experiment_summary(summary: &ExperimentSummary) -> String {
 
     if has_scores || has_metrics {
         let has_comparison = summary.comparison_experiment_name.is_some();
-        let columns = experiment_summary_columns(summary);
-        let mut rows: Vec<SummaryMetricRow> = Vec::new();
+        let mut rows: Vec<Vec<Line>> = Vec::new();
+
+        let header = if has_comparison {
+            Some(vec![
+                header_line("Name"),
+                header_line("Value"),
+                header_line("Change"),
+                header_line("Improvements"),
+                header_line("Regressions"),
+            ])
+        } else {
+            None
+        };
 
         let mut score_values: Vec<_> = summary.scores.values().collect();
         score_values.sort_by(|a, b| a.name.cmp(&b.name));
         for score in score_values {
-            rows.push(score_summary_row(score, has_comparison));
+            let score_percent =
+                Line::from(format!("{:.2}%", score.score * 100.0)).alignment(Alignment::Right);
+            let diff = format_diff_line(score.diff);
+            let improvements = format_improvements_line(score.improvements);
+            let regressions = format_regressions_line(score.regressions);
+            let name = truncate_plain(&score.name, MAX_NAME_LENGTH);
+            let name = Line::from(vec![
+                Span::styled("◯", Style::default().fg(Color::Blue)),
+                Span::raw(" "),
+                Span::raw(name),
+            ]);
+            if has_comparison {
+                rows.push(vec![name, score_percent, diff, improvements, regressions]);
+            } else {
+                rows.push(vec![name, score_percent]);
+            }
         }
 
         if let Some(metrics) = &summary.metrics {
             let mut metric_values: Vec<_> = metrics.values().collect();
             metric_values.sort_by(|a, b| a.name.cmp(&b.name));
             for metric in metric_values {
-                rows.push(metric_summary_row(metric, has_comparison));
+                let formatted_value = Line::from(format_metric_value(metric.metric, &metric.unit))
+                    .alignment(Alignment::Right);
+                let diff = format_diff_line(metric.diff);
+                let improvements = format_improvements_line(metric.improvements);
+                let regressions = format_regressions_line(metric.regressions);
+                let name = truncate_plain(&metric.name, MAX_NAME_LENGTH);
+                let name = Line::from(vec![
+                    Span::styled("◯", Style::default().fg(Color::Magenta)),
+                    Span::raw(" "),
+                    Span::raw(name),
+                ]);
+                if has_comparison {
+                    rows.push(vec![name, formatted_value, diff, improvements, regressions]);
+                } else {
+                    rows.push(vec![name, formatted_value]);
+                }
             }
         }
 
-        parts.push(render_experiment_summary_table(
-            &columns,
-            &rows,
-            &SummaryTableOptions {
-                show_all_rows: false,
-                hidden_rows_message: Some("zero/no-change rows omitted".to_string()),
-            },
-        ));
+        let columns = if has_comparison { 5 } else { 2 };
+        parts.push(render_ratatui_table(header, rows, columns));
     }
 
     if let Some(url) = &summary.experiment_url {
         parts.push(format!("See results at {url}"));
     }
 
-    if let Some(command) = format_experiment_compare_command(summary) {
-        parts.push(command);
-    }
-
     let content = parts.join("\n\n");
     box_with_title("Experiment summary", &content)
 }
 
-fn experiment_summary_columns(summary: &ExperimentSummary) -> Vec<SummaryExperimentColumn> {
-    if let Some(baseline) = summary.comparison_experiment_name.as_deref() {
-        vec![
-            SummaryExperimentColumn {
-                name: baseline.to_string(),
-                role: Some("baseline".to_string()),
-            },
-            SummaryExperimentColumn {
-                name: summary.experiment_name.clone(),
-                role: Some("comparison".to_string()),
-            },
-        ]
-    } else {
-        vec![SummaryExperimentColumn {
-            name: summary.experiment_name.clone(),
-            role: None,
-        }]
+fn format_diff_line(diff: Option<f64>) -> Line<'static> {
+    match diff {
+        Some(value) => {
+            let sign = if value > 0.0 { "+" } else { "" };
+            let percent = format!("{sign}{:.2}%", value * 100.0);
+            let style = if value > 0.0 {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            Line::from(Span::styled(percent, style)).alignment(Alignment::Right)
+        }
+        None => Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Right),
     }
 }
 
-fn score_summary_row(score: &ScoreSummary, has_comparison: bool) -> SummaryMetricRow {
-    let comparison_cell = SummaryMetricCell {
-        value: Some(score.score),
-        delta: score.diff,
-        improvements: score.improvements,
-        regressions: score.regressions,
+fn format_improvements_line(value: i64) -> Line<'static> {
+    if value > 0 {
+        Line::from(Span::styled(
+            value.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Right)
+    } else {
+        Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Right)
+    }
+}
+
+fn format_regressions_line(value: i64) -> Line<'static> {
+    if value > 0 {
+        Line::from(Span::styled(
+            value.to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Right)
+    } else {
+        Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Right)
+    }
+}
+
+fn format_metric_value(metric: f64, unit: &str) -> String {
+    let formatted = if metric.fract() == 0.0 {
+        format!("{metric:.0}")
+    } else {
+        format!("{metric:.2}")
     };
-    SummaryMetricRow {
-        name: score.name.clone(),
-        kind: SummaryMetricKind::Score,
-        unit: Some("%".to_string()),
-        cells: summary_cells(comparison_cell, has_comparison),
-    }
-}
-
-fn metric_summary_row(metric: &MetricSummary, has_comparison: bool) -> SummaryMetricRow {
-    let comparison_cell = SummaryMetricCell {
-        value: Some(metric.metric),
-        delta: metric.diff,
-        improvements: metric.improvements,
-        regressions: metric.regressions,
-    };
-    SummaryMetricRow {
-        name: metric.name.clone(),
-        kind: SummaryMetricKind::Metric,
-        unit: summary_metric_unit(&metric.name, Some(&metric.unit)),
-        cells: summary_cells(comparison_cell, has_comparison),
-    }
-}
-
-fn summary_cells(
-    comparison_cell: SummaryMetricCell,
-    has_comparison: bool,
-) -> Vec<SummaryMetricCell> {
-    if has_comparison {
-        let baseline_value = comparison_cell
-            .value
-            .zip(comparison_cell.delta)
-            .map(|(value, delta)| value - delta);
-        vec![
-            SummaryMetricCell {
-                value: baseline_value,
-                delta: None,
-                improvements: 0,
-                regressions: 0,
-            },
-            comparison_cell,
-        ]
+    if unit == "$" {
+        format!("{unit}{formatted}")
     } else {
-        vec![SummaryMetricCell {
-            delta: None,
-            improvements: 0,
-            regressions: 0,
-            ..comparison_cell
-        }]
+        format!("{formatted}{unit}")
     }
 }
 
-const COMPARE_MORE_HINT: &str = "append more experiment names at the end; max 7 comparisons";
-
-fn enrich_experiment_summary(
-    mut summary: ExperimentSummary,
-    profile: Option<&str>,
-) -> ExperimentSummary {
-    if summary.compare_command.is_none() {
-        summary.compare_command = build_experiment_compare_command(&summary, profile);
+fn truncate_plain(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        return text.to_string();
     }
-    if summary.compare_command.is_some() && summary.compare_more.is_none() {
-        summary.compare_more = Some(COMPARE_MORE_HINT.to_string());
+    if max_len <= 3 {
+        return text.chars().take(max_len).collect();
     }
-    summary
-}
-
-fn format_experiment_compare_command(summary: &ExperimentSummary) -> Option<String> {
-    let command = summary
-        .compare_command
-        .clone()
-        .or_else(|| build_experiment_compare_command(summary, None))?;
-    let compare_more = summary.compare_more.as_deref().unwrap_or(COMPARE_MORE_HINT);
-
-    Some(format!(
-        "compare_command: {command}\ncompare_more: {compare_more}"
-    ))
-}
-
-fn build_experiment_compare_command(
-    summary: &ExperimentSummary,
-    profile: Option<&str>,
-) -> Option<String> {
-    let baseline = summary.comparison_experiment_name.as_deref()?.trim();
-    if baseline.is_empty() {
-        return None;
-    }
-    let project = summary.project_name.trim();
-    let experiment = summary.experiment_name.trim();
-    if project.is_empty() || experiment.is_empty() {
-        return None;
-    }
-
-    let profile_args = profile
-        .map(str::trim)
-        .filter(|profile| !profile.is_empty())
-        .map(|profile| format!(" --profile {}", shell_quote_arg(profile)))
-        .unwrap_or_default();
-
-    Some(format!(
-        "bt experiments compare{profile_args} -p {} {} {}",
-        shell_quote_arg(project),
-        shell_quote_arg(baseline),
-        shell_quote_arg(experiment),
-    ))
-}
-
-fn shell_quote_arg(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
+    let truncated: String = text.chars().take(max_len - 3).collect();
+    format!("{truncated}...")
 }
 
 #[cfg(test)]
@@ -4216,7 +4440,7 @@ mod tests {
 
     #[test]
     fn eval_ui_preserves_spinner_increments_before_set_total() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = EvalUi::new(false, false, false);
         let eval_name = "My evaluation";
 
         ui.handle_progress(eval_progress_event(eval_name, "start", None));
@@ -4236,7 +4460,7 @@ mod tests {
 
     #[test]
     fn eval_ui_never_sets_total_below_position() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = EvalUi::new(false, false, false);
         let eval_name = "My evaluation";
 
         ui.handle_progress(eval_progress_event(eval_name, "start", Some(1)));
@@ -4260,7 +4484,7 @@ mod tests {
 
     #[test]
     fn eval_ui_keeps_spinner_until_total_exceeds_one() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = EvalUi::new(false, false, false);
         let eval_name = "My evaluation";
 
         ui.handle_progress(eval_progress_event(eval_name, "start", None));
@@ -4433,143 +4657,10 @@ mod tests {
             run_label: Some("Run mode: first 20 examples (non-final smoke run)".to_string()),
             sample_count: Some(20),
             sample_seed: None,
-            compare_command: None,
-            compare_more: None,
         };
 
         let rendered = format_experiment_summary(&summary);
         assert!(rendered.contains("Run mode: first 20 examples (non-final smoke run)"));
-    }
-
-    #[test]
-    fn format_experiment_summary_includes_compare_command_for_comparison() {
-        let summary = ExperimentSummary {
-            project_name: "test-project".to_string(),
-            experiment_name: "challenger-a".to_string(),
-            project_id: None,
-            experiment_id: None,
-            project_url: None,
-            experiment_url: Some(
-                "https://www.example.test/app/test-org/p/test-project/experiments/challenger-a"
-                    .to_string(),
-            ),
-            comparison_experiment_name: Some("baseline".to_string()),
-            scores: HashMap::new(),
-            metrics: None,
-            run_mode: None,
-            is_final: None,
-            run_label: None,
-            sample_count: None,
-            sample_seed: None,
-            compare_command: None,
-            compare_more: None,
-        };
-
-        let rendered = format_experiment_summary(&summary);
-
-        assert!(rendered.contains(
-            "compare_command: bt experiments compare -p test-project baseline challenger-a"
-        ));
-        assert!(rendered.contains("compare_more: append more experiment names at the end"));
-    }
-
-    #[test]
-    fn format_experiment_summary_treats_time_to_first_token_as_seconds() {
-        let mut metrics = HashMap::new();
-        metrics.insert(
-            "time_to_first_token".to_string(),
-            MetricSummary {
-                name: "time_to_first_token".to_string(),
-                metric: 1.23,
-                unit: "tok".to_string(),
-                diff: None,
-                improvements: 0,
-                regressions: 0,
-            },
-        );
-
-        let summary = ExperimentSummary {
-            project_name: "test-project".to_string(),
-            experiment_name: "challenger-a".to_string(),
-            project_id: None,
-            experiment_id: None,
-            project_url: None,
-            experiment_url: None,
-            comparison_experiment_name: None,
-            scores: HashMap::new(),
-            metrics: Some(metrics),
-            run_mode: None,
-            is_final: None,
-            run_label: None,
-            sample_count: None,
-            sample_seed: None,
-            compare_command: None,
-            compare_more: None,
-        };
-
-        let rendered = format_experiment_summary(&summary);
-
-        assert!(rendered.contains("1.23s"));
-        assert!(!rendered.contains("1.23tok"));
-    }
-
-    #[test]
-    fn enrich_experiment_summary_adds_compare_command_for_jsonl() {
-        let summary = ExperimentSummary {
-            project_name: "test-project".to_string(),
-            experiment_name: "challenger-a".to_string(),
-            project_id: None,
-            experiment_id: None,
-            project_url: None,
-            experiment_url: None,
-            comparison_experiment_name: Some("baseline".to_string()),
-            scores: HashMap::new(),
-            metrics: None,
-            run_mode: None,
-            is_final: None,
-            run_label: None,
-            sample_count: None,
-            sample_seed: None,
-            compare_command: None,
-            compare_more: None,
-        };
-
-        let summary = enrich_experiment_summary(summary, None);
-
-        assert_eq!(
-            summary.compare_command.as_deref(),
-            Some("bt experiments compare -p test-project baseline challenger-a")
-        );
-        assert_eq!(summary.compare_more.as_deref(), Some(COMPARE_MORE_HINT));
-    }
-
-    #[test]
-    fn enrich_experiment_summary_preserves_profile_in_compare_command() {
-        let summary = ExperimentSummary {
-            project_name: "test-project".to_string(),
-            experiment_name: "challenger-a".to_string(),
-            project_id: None,
-            experiment_id: None,
-            project_url: None,
-            experiment_url: None,
-            comparison_experiment_name: Some("baseline".to_string()),
-            scores: HashMap::new(),
-            metrics: None,
-            run_mode: None,
-            is_final: None,
-            run_label: None,
-            sample_count: None,
-            sample_seed: None,
-            compare_command: None,
-            compare_more: None,
-        };
-
-        let summary = enrich_experiment_summary(summary, Some("test-profile"));
-
-        assert_eq!(
-            summary.compare_command.as_deref(),
-            Some("bt experiments compare --profile test-profile -p test-project baseline challenger-a")
-        );
     }
 
     #[test]
@@ -4842,7 +4933,7 @@ mod tests {
             "BT_EVAL_DEV_HOST",
             "BT_EVAL_DEV_PORT",
             "BT_EVAL_DEV_ORG_NAME",
-        ];
+        ]; // BT_EVAL_LANGUAGE intentionally omitted — deprecated, accepted but ignored
         let previous: Vec<(&str, Option<String>)> =
             keys.iter().map(|key| (*key, clear_env_var(key))).collect();
         set_env_var("BT_EVAL_JSONL", "true");
@@ -4878,5 +4969,369 @@ mod tests {
         for (key, value) in previous {
             restore_env_var(key, value);
         }
+    }
+
+    #[test]
+    fn eval_args_accepts_bt_eval_js_runner_env() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_JS_RUNNER", "BT_EVAL_RUNNER"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+        set_env_var("BT_EVAL_JS_RUNNER", "vite-node");
+
+        let parsed = EvalArgsHarness::try_parse_from(["bt", "sample.eval.ts"])
+            .expect("env vars should parse into eval args");
+        assert_eq!(parsed.eval.effective_js_runner(), Some("vite-node"));
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
+    fn eval_args_accepts_legacy_bt_eval_runner_env() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_JS_RUNNER", "BT_EVAL_RUNNER"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+        set_env_var("BT_EVAL_RUNNER", "tsx");
+
+        let parsed = EvalArgsHarness::try_parse_from(["bt", "sample.eval.ts"])
+            .expect("env vars should parse into eval args");
+        assert_eq!(parsed.eval.effective_js_runner(), Some("tsx"));
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
+    fn eval_args_prefers_bt_eval_js_runner_over_legacy_env() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_JS_RUNNER", "BT_EVAL_RUNNER"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+        set_env_var("BT_EVAL_JS_RUNNER", "vite-node");
+        set_env_var("BT_EVAL_RUNNER", "tsx");
+
+        let parsed = EvalArgsHarness::try_parse_from(["bt", "sample.eval.ts"])
+            .expect("env vars should parse into eval args");
+        assert_eq!(parsed.eval.effective_js_runner(), Some("vite-node"));
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
+    fn partition_files_by_language_all_js() {
+        let files = vec![
+            "a.eval.ts".to_string(),
+            "b.eval.js".to_string(),
+            "c.eval.mjs".to_string(),
+        ];
+        let partitions = partition_files_by_language(&files).expect("should partition");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].0, EvalLanguage::JavaScript);
+        assert_eq!(partitions[0].1, files);
+    }
+
+    #[test]
+    fn partition_files_by_language_all_python() {
+        let files = vec!["eval_foo.py".to_string(), "eval_bar.py".to_string()];
+        let partitions = partition_files_by_language(&files).expect("should partition");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].0, EvalLanguage::Python);
+        assert_eq!(partitions[0].1, files);
+    }
+
+    #[test]
+    fn partition_files_by_language_mixed_produces_two_partitions() {
+        let files = vec![
+            "a.eval.ts".to_string(),
+            "eval_foo.py".to_string(),
+            "b.eval.js".to_string(),
+            "eval_bar.py".to_string(),
+        ];
+        let partitions = partition_files_by_language(&files).expect("should partition");
+        assert_eq!(partitions.len(), 2);
+
+        let js = partitions
+            .iter()
+            .find(|(l, _)| *l == EvalLanguage::JavaScript)
+            .expect("JS partition should exist");
+        assert_eq!(js.1, vec!["a.eval.ts", "b.eval.js"]);
+
+        let py = partitions
+            .iter()
+            .find(|(l, _)| *l == EvalLanguage::Python)
+            .expect("Python partition should exist");
+        assert_eq!(py.1, vec!["eval_foo.py", "eval_bar.py"]);
+    }
+
+    #[test]
+    fn partition_files_by_language_errors_on_empty_input() {
+        let err = partition_files_by_language(&[]).expect_err("empty input should fail");
+        assert!(err.to_string().contains("No eval files provided"));
+    }
+
+    #[test]
+    fn partition_files_by_language_errors_on_unsupported_extension() {
+        let files = vec!["a.eval.rb".to_string()];
+        let err = partition_files_by_language(&files).expect_err("unsupported ext should fail");
+        assert!(err.to_string().contains("Unsupported eval file extension"));
+        assert!(err.to_string().contains("rb"));
+    }
+
+    #[test]
+    fn partition_files_by_language_js_partition_comes_before_python() {
+        let files = vec!["eval_foo.py".to_string(), "a.eval.ts".to_string()];
+        let partitions = partition_files_by_language(&files).expect("should partition");
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0].0, EvalLanguage::JavaScript);
+        assert_eq!(partitions[1].0, EvalLanguage::Python);
+    }
+
+    #[test]
+    fn build_eval_plans_single_js_file_no_runner_override() {
+        let files = vec!["a.eval.ts".to_string()];
+        let plans = build_eval_plans(&files, None, None).expect("should build plans");
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!(plan.language, EvalLanguage::JavaScript);
+        assert_eq!(plan.files, files);
+        assert!(plan.runner_override.is_none());
+        assert!(plan.show_js_hint);
+        assert!(matches!(plan.retry_policy, RetryPolicy::Allow));
+    }
+
+    #[test]
+    fn build_eval_plans_js_only_non_ts_disables_retry() {
+        let files = vec!["a.eval.js".to_string()];
+        let plans = build_eval_plans(&files, None, None).expect("should build plans");
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].show_js_hint, "hint should still show for plain JS");
+        assert!(
+            matches!(plans[0].retry_policy, RetryPolicy::Disallow),
+            "no TS files means no ESM retry"
+        );
+    }
+
+    #[test]
+    fn build_eval_plans_runner_override_clears_js_hint() {
+        let files = vec!["a.eval.ts".to_string()];
+        let plans = build_eval_plans(&files, Some("vite-node"), None).expect("should build plans");
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert!(!plan.show_js_hint);
+        assert_eq!(plan.runner_override.as_deref(), Some("vite-node"));
+    }
+
+    #[test]
+    fn build_eval_plans_single_python_file() {
+        let files = vec!["eval_foo.py".to_string()];
+        let plans = build_eval_plans(&files, None, None).expect("should build plans");
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!(plan.language, EvalLanguage::Python);
+        assert!(!plan.show_js_hint);
+        assert!(matches!(plan.retry_policy, RetryPolicy::Disallow));
+    }
+
+    #[test]
+    fn build_eval_plans_mixed_produces_two_plans() {
+        let files = vec!["a.eval.ts".to_string(), "eval_foo.py".to_string()];
+        let plans = build_eval_plans(&files, None, None).expect("should build plans");
+        assert_eq!(plans.len(), 2);
+
+        let js_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::JavaScript)
+            .expect("JS plan should exist");
+        assert_eq!(js_plan.files, vec!["a.eval.ts"]);
+        assert!(js_plan.show_js_hint);
+
+        let py_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::Python)
+            .expect("Python plan should exist");
+        assert_eq!(py_plan.files, vec!["eval_foo.py"]);
+        assert!(!py_plan.show_js_hint);
+    }
+
+    #[test]
+    fn build_eval_plans_runner_override_routes_by_language() {
+        let files = vec!["a.eval.ts".to_string(), "eval_foo.py".to_string()];
+        let plans = build_eval_plans(&files, Some("my-js-runner"), Some("my-py-runner"))
+            .expect("should build plans");
+        assert_eq!(plans.len(), 2);
+
+        let js_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::JavaScript)
+            .expect("JS plan should exist");
+        assert_eq!(js_plan.runner_override.as_deref(), Some("my-js-runner"));
+
+        let py_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::Python)
+            .expect("Python plan should exist");
+        assert_eq!(py_plan.runner_override.as_deref(), Some("my-py-runner"));
+    }
+
+    #[test]
+    fn build_eval_plans_js_runner_override_does_not_affect_python_plan() {
+        let files = vec!["a.eval.ts".to_string(), "eval_foo.py".to_string()];
+        let plans = build_eval_plans(&files, Some("my-runner"), None).expect("should build plans");
+        assert_eq!(plans.len(), 2);
+
+        let js_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::JavaScript)
+            .expect("JS plan should exist");
+        assert_eq!(js_plan.runner_override.as_deref(), Some("my-runner"));
+
+        let py_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::Python)
+            .expect("Python plan should exist");
+        assert!(py_plan.runner_override.is_none());
+    }
+
+    #[test]
+    fn build_eval_plans_python_runner_override_does_not_affect_js_plan() {
+        let files = vec!["a.eval.ts".to_string(), "eval_foo.py".to_string()];
+        let plans = build_eval_plans(&files, None, Some("my-python")).expect("should build plans");
+        assert_eq!(plans.len(), 2);
+
+        let js_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::JavaScript)
+            .expect("JS plan should exist");
+        assert!(js_plan.runner_override.is_none());
+
+        let py_plan = plans
+            .iter()
+            .find(|p| p.language == EvalLanguage::Python)
+            .expect("Python plan should exist");
+        assert_eq!(py_plan.runner_override.as_deref(), Some("my-python"));
+    }
+
+    #[test]
+    fn build_dev_eval_plans_preserves_python_venv_split() {
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let dir_a = tempdir.path().join("a");
+        let dir_b = tempdir.path().join("b");
+        std::fs::create_dir_all(&dir_a).expect("create dir a");
+        std::fs::create_dir_all(&dir_b).expect("create dir b");
+
+        let file_a = dir_a.join("eval_a.py");
+        let file_b = dir_b.join("eval_b.py");
+        std::fs::write(&file_a, "").expect("write file a");
+        std::fs::write(&file_b, "").expect("write file b");
+
+        let venv_a = venv_python_path(&dir_a.join(".venv"));
+        let venv_b = venv_python_path(&dir_b.join(".venv"));
+        std::fs::create_dir_all(venv_a.parent().expect("venv a parent")).expect("create venv a");
+        std::fs::create_dir_all(venv_b.parent().expect("venv b parent")).expect("create venv b");
+        std::fs::write(&venv_a, "").expect("write venv a");
+        std::fs::write(&venv_b, "").expect("write venv b");
+        let venv_a = venv_a.canonicalize().expect("canonicalize venv a");
+        let venv_b = venv_b.canonicalize().expect("canonicalize venv b");
+
+        let files = vec![
+            file_a.to_string_lossy().to_string(),
+            file_b.to_string_lossy().to_string(),
+        ];
+        let plans = build_dev_eval_plans(&files, None, None).expect("should build dev plans");
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].label, "python 1");
+        assert_eq!(plans[0].plan.files, vec![files[0].clone()]);
+        assert_eq!(
+            plans[0].plan.runner_override.as_deref(),
+            Some(venv_a.to_string_lossy().as_ref())
+        );
+        assert_eq!(plans[1].label, "python 2");
+        assert_eq!(plans[1].plan.files, vec![files[1].clone()]);
+        assert_eq!(
+            plans[1].plan.runner_override.as_deref(),
+            Some(venv_b.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn build_dev_routing_table_disambiguates_duplicate_names() {
+        let dev_plans = vec![
+            DevEvalPlan {
+                label: "js".to_string(),
+                plan: EvalPlan {
+                    language: EvalLanguage::JavaScript,
+                    files: vec!["a.eval.ts".to_string()],
+                    runner_override: None,
+                    show_js_hint: false,
+                    retry_policy: RetryPolicy::Disallow,
+                },
+            },
+            DevEvalPlan {
+                label: "python 1".to_string(),
+                plan: EvalPlan {
+                    language: EvalLanguage::Python,
+                    files: vec!["eval_a.py".to_string()],
+                    runner_override: Some("/tmp/python-a".to_string()),
+                    show_js_hint: false,
+                    retry_policy: RetryPolicy::Disallow,
+                },
+            },
+        ];
+
+        let mut js_manifest = serde_json::Map::new();
+        js_manifest.insert("shared".to_string(), json!({"runtime": "js"}));
+        js_manifest.insert("js-only".to_string(), json!({"runtime": "js"}));
+
+        let mut python_manifest = serde_json::Map::new();
+        python_manifest.insert("shared".to_string(), json!({"runtime": "python"}));
+        python_manifest.insert("py-only".to_string(), json!({"runtime": "python"}));
+
+        let table = build_dev_routing_table_from_manifests(
+            &dev_plans,
+            vec![(0, js_manifest), (1, python_manifest)],
+        );
+
+        assert!(table.manifest.contains_key("shared [js]"));
+        assert!(table.manifest.contains_key("shared [python 1]"));
+        assert!(!table.routes.contains_key("shared"));
+
+        let js_route = table
+            .routes
+            .get("shared [js]")
+            .expect("js duplicate should be routed");
+        assert_eq!(js_route.plan_index, 0);
+        assert_eq!(js_route.runner_eval_name, "shared");
+
+        let py_route = table
+            .routes
+            .get("shared [python 1]")
+            .expect("python duplicate should be routed");
+        assert_eq!(py_route.plan_index, 1);
+        assert_eq!(py_route.runner_eval_name, "shared");
+
+        let js_only = table
+            .routes
+            .get("js-only")
+            .expect("unique js name should keep raw alias");
+        assert_eq!(js_only.plan_index, 0);
+
+        let py_only = table
+            .routes
+            .get("py-only")
+            .expect("unique python name should keep raw alias");
+        assert_eq!(py_only.plan_index, 1);
     }
 }

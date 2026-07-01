@@ -1,4 +1,4 @@
 {
   "files": ["tests/basic.eval.ts"],
-  "runners": ["vite-node"]
+  "runners_js": ["vite-node"]
 }

@@ -1,1 +1,3 @@
-{ "runtime": "python", "files": ["eval_atexit.py"] }
+{
+  "files": ["eval_atexit.py"]
+}

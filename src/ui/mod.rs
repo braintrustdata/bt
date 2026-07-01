@@ -53,8 +53,9 @@ pub fn is_interactive() -> bool {
 
 pub use pager::print_with_pager;
 pub use ratatui_table::{
-    box_with_title, render_experiment_summary_table, summary_metric_unit, SummaryExperimentColumn,
-    SummaryMetricCell, SummaryMetricKind, SummaryMetricRow, SummaryTableOptions,
+    box_with_title, header_line, render_experiment_summary_table, render_ratatui_table,
+    summary_metric_unit, SummaryExperimentColumn, SummaryMetricCell, SummaryMetricKind,
+    SummaryMetricRow, SummaryTableOptions,
 };
 pub use select::{fuzzy_select, select_project, ProjectSelectMode};
 
