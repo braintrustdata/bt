@@ -3,6 +3,8 @@ use std::fmt::Write as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use anyhow::{anyhow, bail, Context, Result};
@@ -18,7 +20,7 @@ use crate::datasets::api as datasets_api;
 use crate::functions::{self, api as functions_api, IfExistsMode};
 use crate::http::ApiClient;
 use crate::js_runner;
-use crate::project_context::resolve_required_project;
+use crate::project_context::{resolve_project_optional, resolve_required_project};
 use crate::projects::api::{get_project_by_name, list_projects, Project};
 use crate::ui::{self, with_spinner};
 use crate::utils::{app_project_url, app_project_url_with_encoded_path};
@@ -28,17 +30,22 @@ const VIEWS_JS_SDK_FILE: &str = "views-sdk.ts";
 const VIEWS_JS_RUNNER_SOURCE: &str = include_str!("../scripts/views-runner.ts");
 const VIEWS_JS_SDK_SOURCE: &str = include_str!("../scripts/views-sdk.ts");
 const DEFAULT_TRACE_PREVIEW_LIMIT: usize = 1000;
+const DEFAULT_CUSTOM_VIEWS_DIR: &str = "braintrust-custom-views";
+const CUSTOM_VIEW_TSCONFIG_FILE: &str = "tsconfig.json";
+const CUSTOM_VIEW_TYPES_FILE: &str = "custom-view-env.d.ts";
+const VIEW_FILE_PATTERN_HELP: &str =
+    "*.view.tsx, *.view.ts, *.view.jsx, *.view.js, *-view.tsx, *-view.ts, *-view.jsx, or *-view.js";
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
   bt views push ./views
   bt views push ./conversation.view.tsx --if-exists replace
-  bt views trace bootstrap
-  bt views dataset bootstrap --dataset test-dataset
-  bt views trace preview ./conversation.view.tsx --url <BRAINTRUST_TRACE_URL>
-  bt views trace preview ./conversation.view.tsx --trace-id <ROOT_SPAN_ID>
-  bt views dataset preview ./dataset.view.tsx --dataset test-dataset --row-index 0
+  bt views trace bootstrap 'Trace Review'
+  bt views dataset bootstrap 'Dataset Review' --dataset test-dataset
+  bt views trace preview ./conversation.trace-view.tsx --url <BRAINTRUST_TRACE_URL>
+  bt views trace preview ./conversation.trace-view.tsx --trace-id <ROOT_SPAN_ID>
+  bt views dataset preview ./dataset.dataset-view.tsx --dataset test-dataset --row-index 0
 ")]
 pub struct ViewsArgs {
     #[command(subcommand)]
@@ -145,11 +152,11 @@ enum DatasetViewsCommands {
 
 #[derive(Debug, Clone, Args)]
 struct BootstrapCommonArgs {
-    /// Output file path. Defaults to views/<type>.view.tsx.
-    #[arg(value_name = "PATH", conflicts_with = "file_flag")]
-    path: Option<PathBuf>,
+    /// Custom view name.
+    #[arg(value_name = "NAME")]
+    name: String,
 
-    /// Output file path. Defaults to views/<type>.view.tsx.
+    /// Output file or directory path. Defaults to braintrust-custom-views/<name>.<type>-view.tsx.
     #[arg(long = "file", env = "BT_VIEWS_BOOTSTRAP_FILE", value_name = "PATH")]
     file_flag: Option<PathBuf>,
 
@@ -197,6 +204,10 @@ struct DatasetViewBootstrapArgs {
 #[derive(Debug, Serialize)]
 struct BootstrapResult {
     path: String,
+    tsconfig_path: String,
+    tsconfig_created: bool,
+    types_path: String,
+    types_created: bool,
     view_type: ViewType,
 }
 
@@ -206,7 +217,7 @@ struct PreviewCommonArgs {
     #[arg(value_name = "PATH")]
     path: PathBuf,
 
-    /// View slug or name when the file registers multiple views.
+    /// View slug or name to preview.
     #[arg(long, env = "BT_VIEWS_PREVIEW_VIEW")]
     view: Option<String>,
 
@@ -339,6 +350,8 @@ struct ViewsRuntimeContext {
 struct ViewsManifestFile {
     source_file: String,
     #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
     entries: Vec<ViewManifestEntry>,
 }
 
@@ -349,8 +362,6 @@ struct ViewManifestEntry {
     slug: String,
     code: String,
     #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
     project_id: Option<String>,
     #[serde(default)]
     project_name: Option<String>,
@@ -358,10 +369,6 @@ struct ViewManifestEntry {
     dataset_id: Option<String>,
     #[serde(default)]
     dataset_name: Option<String>,
-    #[serde(default)]
-    metadata: Option<Value>,
-    #[serde(default)]
-    tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -406,22 +413,34 @@ struct BtqlResponse {
     data: Vec<Map<String, Value>>,
 }
 
-#[derive(Clone)]
 struct PreviewServerState {
     client: ApiClient,
     project_id: Option<String>,
     data: Value,
+    source: PreviewSource,
+    title: String,
+    dependency_paths: Mutex<Vec<PathBuf>>,
 }
 
 struct PreviewContext {
     client: ApiClient,
-    project: Project,
+    project: Option<Project>,
     entry: ViewManifestEntry,
+    dependency_paths: Vec<PathBuf>,
 }
 
 struct TracePreviewData {
     project_id: String,
     data: Value,
+}
+
+#[derive(Clone)]
+struct PreviewSource {
+    path: PathBuf,
+    view: Option<String>,
+    view_type: Option<ViewType>,
+    runner: Option<String>,
+    tsconfig: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,11 +470,15 @@ pub async fn run(base: BaseArgs, args: ViewsArgs) -> Result<()> {
 }
 
 fn bootstrap_trace(base: BaseArgs, args: TraceViewBootstrapArgs) -> Result<()> {
-    let path = write_bootstrap_file(args.common, "trace.view.tsx", TRACE_VIEW_BOOTSTRAP_TEMPLATE)?;
-    print_bootstrap_result(base.json, ViewType::Trace, &path)
+    let slug = bootstrap_slug(&args.common.name)?;
+    let default_file_name = format!("{slug}.trace-view.tsx");
+    let content = trace_view_bootstrap_template(&args.common.name, &slug);
+    let result = write_bootstrap_scaffold(args.common, &default_file_name, &content)?;
+    print_bootstrap_result(base.json, ViewType::Trace, &result)
 }
 
 fn bootstrap_dataset(base: BaseArgs, args: DatasetViewBootstrapArgs) -> Result<()> {
+    let slug = bootstrap_slug(&args.common.name)?;
     let dataset_ref = match (
         args.dataset_id.as_deref().map(str::trim),
         args.dataset.as_deref().map(str::trim),
@@ -466,53 +489,183 @@ fn bootstrap_dataset(base: BaseArgs, args: DatasetViewBootstrapArgs) -> Result<(
         (_, Some(dataset)) if !dataset.is_empty() => format!("{{ name: {dataset:?} }}"),
         _ => "{ name: \"test-dataset\" }".to_string(),
     };
-    let content = dataset_view_bootstrap_template(&dataset_ref);
-    let path = write_bootstrap_file(args.common, "dataset.view.tsx", &content)?;
-    print_bootstrap_result(base.json, ViewType::Dataset, &path)
+    let default_file_name = format!("{slug}.dataset-view.tsx");
+    let content = dataset_view_bootstrap_template(&args.common.name, &slug, &dataset_ref);
+    let result = write_bootstrap_scaffold(args.common, &default_file_name, &content)?;
+    print_bootstrap_result(base.json, ViewType::Dataset, &result)
 }
 
-fn write_bootstrap_file(
+fn bootstrap_slug(name: &str) -> Result<String> {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch.to_ascii_lowercase());
+            pending_separator = false;
+        } else if !slug.is_empty() {
+            pending_separator = true;
+        }
+    }
+
+    if slug.is_empty() {
+        bail!("custom view name must contain at least one ASCII letter or number");
+    }
+    Ok(slug)
+}
+
+struct BootstrapWriteResult {
+    view_path: PathBuf,
+    tsconfig_path: PathBuf,
+    tsconfig_status: BootstrapSupportFileStatus,
+    types_path: PathBuf,
+    types_status: BootstrapSupportFileStatus,
+}
+
+impl BootstrapWriteResult {
+    fn tsconfig_created(&self) -> bool {
+        matches!(self.tsconfig_status, BootstrapSupportFileStatus::Created)
+    }
+
+    fn types_created(&self) -> bool {
+        matches!(self.types_status, BootstrapSupportFileStatus::Created)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BootstrapSupportFileStatus {
+    Created,
+    Reused,
+    Updated,
+}
+
+impl BootstrapSupportFileStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Created => "Created",
+            Self::Reused => "Reused",
+            Self::Updated => "Updated",
+        }
+    }
+}
+
+fn write_bootstrap_scaffold(
     args: BootstrapCommonArgs,
     default_file_name: &str,
     content: &str,
-) -> Result<PathBuf> {
+) -> Result<BootstrapWriteResult> {
     let selected_path = args
-        .path
-        .or(args.file_flag)
-        .unwrap_or_else(|| PathBuf::from("views"));
-    let path = if selected_path.is_dir() || selected_path.extension().is_none() {
-        selected_path.join(default_file_name)
+        .file_flag
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CUSTOM_VIEWS_DIR));
+    let (view_path, config_dir) = if selected_path.is_dir() || selected_path.extension().is_none() {
+        (selected_path.join(default_file_name), Some(selected_path))
     } else {
-        selected_path
+        let config_dir = selected_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        (selected_path, config_dir)
     };
-    let is_tsx_view_file = path
+    let tsconfig_path = config_dir
+        .as_ref()
+        .map(|dir| dir.join(CUSTOM_VIEW_TSCONFIG_FILE))
+        .unwrap_or_else(|| PathBuf::from(CUSTOM_VIEW_TSCONFIG_FILE));
+    let types_path = config_dir
+        .as_ref()
+        .map(|dir| dir.join(CUSTOM_VIEW_TYPES_FILE))
+        .unwrap_or_else(|| PathBuf::from(CUSTOM_VIEW_TYPES_FILE));
+
+    let is_tsx_view_file = view_path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".view.tsx"));
+        .is_some_and(|name| name.ends_with(".view.tsx") || name.ends_with("-view.tsx"));
     if !is_tsx_view_file {
-        bail!("custom view bootstrap path must end with .view.tsx");
+        bail!("custom view bootstrap path must end with .view.tsx or -view.tsx");
     }
-    if path.exists() && !args.force {
+    if view_path.exists() && !args.force {
         bail!(
             "custom view file already exists: {}. Use --force to overwrite.",
-            path.display()
+            view_path.display()
         );
     }
-    if let Some(parent) = path
+    if let Some(parent) = view_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
-    std::fs::write(&path, content)
-        .with_context(|| format!("failed to write custom view file {}", path.display()))?;
-    Ok(path)
+    let tsconfig_exists = tsconfig_path.exists();
+    if tsconfig_exists && !tsconfig_path.is_file() {
+        bail!(
+            "custom view tsconfig path already exists and is not a file: {}",
+            tsconfig_path.display()
+        );
+    }
+    let types_exists = types_path.exists();
+    if types_exists && !types_path.is_file() {
+        bail!(
+            "custom view types path already exists and is not a file: {}",
+            types_path.display()
+        );
+    }
+    std::fs::write(&view_path, content)
+        .with_context(|| format!("failed to write custom view file {}", view_path.display()))?;
+
+    let tsconfig_status = if !tsconfig_exists || args.force {
+        std::fs::write(&tsconfig_path, CUSTOM_VIEW_TSCONFIG_TEMPLATE).with_context(|| {
+            format!(
+                "failed to write custom view tsconfig {}",
+                tsconfig_path.display()
+            )
+        })?;
+        if tsconfig_exists {
+            BootstrapSupportFileStatus::Updated
+        } else {
+            BootstrapSupportFileStatus::Created
+        }
+    } else {
+        BootstrapSupportFileStatus::Reused
+    };
+
+    let types_status = if !types_exists || args.force {
+        std::fs::write(&types_path, CUSTOM_VIEW_TYPES_TEMPLATE).with_context(|| {
+            format!("failed to write custom view types {}", types_path.display())
+        })?;
+        if types_exists {
+            BootstrapSupportFileStatus::Updated
+        } else {
+            BootstrapSupportFileStatus::Created
+        }
+    } else {
+        BootstrapSupportFileStatus::Reused
+    };
+
+    Ok(BootstrapWriteResult {
+        view_path,
+        tsconfig_path,
+        tsconfig_status,
+        types_path,
+        types_status,
+    })
 }
 
-fn print_bootstrap_result(json_output: bool, view_type: ViewType, path: &Path) -> Result<()> {
+fn print_bootstrap_result(
+    json_output: bool,
+    view_type: ViewType,
+    result: &BootstrapWriteResult,
+) -> Result<()> {
+    let tsconfig_action = result.tsconfig_status.label();
+    let types_action = result.types_status.label();
     let result = BootstrapResult {
-        path: path.display().to_string(),
+        path: result.view_path.display().to_string(),
+        tsconfig_path: result.tsconfig_path.display().to_string(),
+        tsconfig_created: result.tsconfig_created(),
+        types_path: result.types_path.display().to_string(),
+        types_created: result.types_created(),
         view_type,
     };
     if json_output {
@@ -521,119 +674,253 @@ fn print_bootstrap_result(json_output: bool, view_type: ViewType, path: &Path) -
         println!(
             "Created {} custom view starter at {}",
             view_type.label(),
-            path.display()
+            result.path
+        );
+        println!(
+            "{tsconfig_action} TypeScript config at {}",
+            result.tsconfig_path
+        );
+        println!(
+            "{types_action} custom view type declarations at {}",
+            result.types_path
         );
         println!(
             "Preview it with: bt views {} preview {}",
             view_type.label(),
-            path.display()
+            result.path
         );
     }
     Ok(())
 }
 
-const TRACE_VIEW_BOOTSTRAP_TEMPLATE: &str = r##"import React from "react";
-import {
-  customTraceView,
-  formatJson,
-  type TraceViewProps,
-} from "braintrust/custom-views";
+const CUSTOM_VIEW_TSCONFIG_TEMPLATE: &str = r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "allowJs": true,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": [
+    "**/*.view.ts",
+    "**/*.view.tsx",
+    "**/*.view.js",
+    "**/*.view.jsx",
+    "**/*-view.ts",
+    "**/*-view.tsx",
+    "**/*-view.js",
+    "**/*-view.jsx",
+    "**/*.d.ts"
+  ]
+}
+"#;
+
+const CUSTOM_VIEW_TYPES_TEMPLATE: &str = r#"type CustomViewElementProps = {
+  [propName: string]: unknown;
+};
+
+type CustomViewSelectChangeEvent = {
+  target: { value: string };
+  currentTarget: { value: string };
+  preventDefault: () => void;
+  stopPropagation: () => void;
+};
+
+interface CustomViewSelectProps extends CustomViewElementProps {
+  value?: string | number | readonly string[];
+  defaultValue?: string | number | readonly string[];
+  onChange?: (event: CustomViewSelectChangeEvent) => void;
+}
+
+interface CustomViewOptionProps extends CustomViewElementProps {
+  value?: string | number;
+}
+
+interface CustomViewIntrinsicElements {
+  select: CustomViewSelectProps;
+  option: CustomViewOptionProps;
+  [elementName: string]: CustomViewElementProps;
+}
+
+declare namespace JSX {
+  interface IntrinsicElements extends CustomViewIntrinsicElements {}
+}
+
+declare module "react" {
+  type ReactNode = any;
+  type ComponentType<Props = any> = (props: Props) => ReactNode;
+  type Dispatch<Value> = (value: Value) => void;
+  type SetStateAction<Value> = Value | ((previous: Value) => Value);
+
+  const React: {
+    createElement: (...args: any[]) => ReactNode;
+    Fragment: any;
+  };
+
+  export default React;
+  export const Children: any;
+  export const Component: any;
+  export const Fragment: any;
+  export const Profiler: any;
+  export const PureComponent: any;
+  export const StrictMode: any;
+  export const Suspense: any;
+  export const cloneElement: (...args: any[]) => ReactNode;
+  export const createContext: (...args: any[]) => any;
+  export const createElement: (...args: any[]) => ReactNode;
+  export const createRef: (...args: any[]) => any;
+  export const forwardRef: (component: any) => any;
+  export const isValidElement: (value: any) => boolean;
+  export const lazy: (loader: any) => any;
+  export const memo: <Props = any>(component: ComponentType<Props>) => ComponentType<Props>;
+  export const startTransition: (callback: () => void) => void;
+  export const useCallback: <Value extends (...args: any[]) => any>(callback: Value, deps?: any[]) => Value;
+  export const useContext: (context: any) => any;
+  export const useDebugValue: (...args: any[]) => void;
+  export const useDeferredValue: <Value>(value: Value) => Value;
+  export const useEffect: (effect: () => void | (() => void), deps?: any[]) => void;
+  export const useId: () => string;
+  export const useImperativeHandle: (...args: any[]) => void;
+  export const useInsertionEffect: (effect: () => void | (() => void), deps?: any[]) => void;
+  export const useLayoutEffect: (effect: () => void | (() => void), deps?: any[]) => void;
+  export const useMemo: <Value>(factory: () => Value, deps?: any[]) => Value;
+  export const useReducer: (...args: any[]) => any;
+  export const useRef: <Value>(initialValue: Value) => { current: Value };
+  export const useState: <Value>(initialValue: Value | (() => Value)) => [Value, Dispatch<SetStateAction<Value>>];
+  export const useSyncExternalStore: (...args: any[]) => any;
+  export const useTransition: () => [boolean, (callback: () => void) => void];
+}
+
+declare module "react/jsx-runtime" {
+  export namespace JSX {
+    interface IntrinsicElements extends CustomViewIntrinsicElements {}
+  }
+
+  export const Fragment: any;
+  export const jsx: (...args: any[]) => any;
+  export const jsxs: (...args: any[]) => any;
+}
+
+declare module "react/jsx-dev-runtime" {
+  export namespace JSX {
+    interface IntrinsicElements extends CustomViewIntrinsicElements {}
+  }
+
+  export const Fragment: any;
+  export const jsxDEV: (...args: any[]) => any;
+}
+"#;
+
+const TRACE_VIEW_BOOTSTRAP_TEMPLATE: &str = r##"import { customTraceView } from "braintrust/custom-views";
 
 function pretty(value: unknown) {
-  return value === undefined ? "" : formatJson(value);
+  return value === undefined ? "" : JSON.stringify(value, null, 2);
 }
 
-function StarterTraceView({ trace, span, selectSpan }: TraceViewProps) {
-  const spanIds = trace.spanOrder.slice(0, 100);
+export default customTraceView(
+  {
+    name: __VIEW_NAME__,
+    slug: __VIEW_SLUG__,
+  },
+  ({ trace, span, selectSpan }) => {
+    const spanIds = trace.spanOrder.slice(0, 100);
 
-  return (
-    <div style={{ fontFamily: "Inter, system-ui, sans-serif", padding: 16, color: "#111827" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
-        <strong>Trace starter view</strong>
-        <select value={span.span_id} onChange={(event) => selectSpan(event.target.value)}>
-          {spanIds.map((spanId) => (
-            <option key={spanId} value={spanId}>
-              {spanId}
-            </option>
-          ))}
-        </select>
+    return (
+      <div style={{ fontFamily: "Inter, system-ui, sans-serif", padding: 16, color: "#111827" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+          <strong>Trace starter view</strong>
+          <select value={span.span_id} onChange={(event) => selectSpan?.(event.target.value)}>
+            {spanIds.map((spanId) => (
+              <option key={spanId} value={spanId}>
+                {spanId}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <section style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 4 }}>Selected span</div>
+          <div><strong>row id:</strong> {span.id}</div>
+          <div><strong>span id:</strong> {span.span_id}</div>
+          <div><strong>children:</strong> {span.children.length}</div>
+        </section>
+
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
+          <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
+            {pretty(span.data.input)}
+          </pre>
+          <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
+            {pretty(span.data.output)}
+          </pre>
+        </section>
       </div>
-
-      <section style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, marginBottom: 12 }}>
-        <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 4 }}>Selected span</div>
-        <div><strong>row id:</strong> {span.id}</div>
-        <div><strong>span id:</strong> {span.span_id}</div>
-        <div><strong>children:</strong> {span.children.length}</div>
-      </section>
-
-      <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
-        <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
-          {pretty(span.data.input)}
-        </pre>
-        <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
-          {pretty(span.data.output)}
-        </pre>
-      </section>
-    </div>
-  );
-}
-
-customTraceView({
-  name: "Starter Trace View",
-  slug: "starter-trace-view",
-  description: "Starter trace custom view generated by bt.",
-  component: StarterTraceView,
-});
+    );
+  },
+);
 "##;
 
-const DATASET_VIEW_BOOTSTRAP_TEMPLATE: &str = r##"import React from "react";
-import {
-  customDatasetView,
-  formatJson,
-  type DatasetViewProps,
-} from "braintrust/custom-views";
+const DATASET_VIEW_BOOTSTRAP_TEMPLATE: &str = r##"import { customDatasetView } from "braintrust/custom-views";
 
 function pretty(value: unknown) {
-  return value === undefined ? "" : formatJson(value);
+  return value === undefined ? "" : JSON.stringify(value, null, 2);
 }
 
-function StarterDatasetView({ id, input, expected, metadata, tags }: DatasetViewProps) {
-  return (
-    <div style={{ fontFamily: "Inter, system-ui, sans-serif", padding: 16, color: "#111827" }}>
-      <div style={{ marginBottom: 16 }}>
-        <strong>Dataset starter view</strong>
-        <div style={{ color: "#6b7280", fontSize: 12 }}>row id: {id}</div>
-        {tags.length > 0 ? (
-          <div style={{ color: "#6b7280", fontSize: 12 }}>tags: {tags.join(", ")}</div>
-        ) : null}
+export default customDatasetView(
+  {
+    name: __VIEW_NAME__,
+    slug: __VIEW_SLUG__,
+    dataset: __DATASET_REF__,
+  },
+  ({ id, input, expected, metadata, tags = [] }) => {
+    return (
+      <div style={{ fontFamily: "Inter, system-ui, sans-serif", padding: 16, color: "#111827" }}>
+        <div style={{ marginBottom: 16 }}>
+          <strong>Dataset starter view</strong>
+          <div style={{ color: "#6b7280", fontSize: 12 }}>row id: {id}</div>
+          {tags.length > 0 ? (
+            <div style={{ color: "#6b7280", fontSize: 12 }}>tags: {tags.join(", ")}</div>
+          ) : null}
+        </div>
+
+        <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
+          <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
+            {pretty(input)}
+          </pre>
+          <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
+            {pretty(expected)}
+          </pre>
+          <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
+            {pretty(metadata)}
+          </pre>
+        </section>
       </div>
-
-      <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
-        <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
-          {pretty(input)}
-        </pre>
-        <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
-          {pretty(expected)}
-        </pre>
-        <pre style={{ margin: 0, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, whiteSpace: "pre-wrap" }}>
-          {pretty(metadata)}
-        </pre>
-      </section>
-    </div>
-  );
-}
-
-customDatasetView({
-  name: "Starter Dataset View",
-  slug: "starter-dataset-view",
-  description: "Starter dataset custom view generated by bt.",
-  dataset: __DATASET_REF__,
-  component: StarterDatasetView,
-});
+    );
+  },
+);
 "##;
 
-fn dataset_view_bootstrap_template(dataset_ref: &str) -> String {
-    DATASET_VIEW_BOOTSTRAP_TEMPLATE.replace("__DATASET_REF__", dataset_ref)
+fn js_string_literal(value: &str) -> String {
+    serde_json::to_string(value).expect("strings serialize to JSON")
+}
+
+fn trace_view_bootstrap_template(name: &str, slug: &str) -> String {
+    TRACE_VIEW_BOOTSTRAP_TEMPLATE
+        .replace("__VIEW_NAME__", &js_string_literal(name))
+        .replace("__VIEW_SLUG__", &js_string_literal(slug))
+}
+
+fn dataset_view_bootstrap_template(name: &str, slug: &str, dataset_ref: &str) -> String {
+    DATASET_VIEW_BOOTSTRAP_TEMPLATE
+        .replace("__VIEW_NAME__", &js_string_literal(name))
+        .replace("__VIEW_SLUG__", &js_string_literal(slug))
+        .replace("__DATASET_REF__", dataset_ref)
 }
 
 async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
@@ -641,7 +928,7 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
     let default_project = resolve_required_project(&base, &auth_ctx.client, true).await?;
     let files = collect_view_files(&args.resolved_paths())?;
     if files.is_empty() {
-        bail!("no custom view files found; expected files matching *.view.tsx, *.view.ts, *.view.jsx, or *.view.js");
+        bail!("no custom view files found; expected files matching {VIEW_FILE_PATTERN_HELP}");
     }
 
     let manifest = run_views_runner(args.runner.as_deref(), args.tsconfig.as_deref(), &files)?;
@@ -703,12 +990,13 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
 }
 
 async fn preview(base: BaseArgs, args: ViewsPreviewArgs) -> Result<()> {
-    let context = resolve_preview_context(&base, &args.common, None).await?;
+    let context =
+        resolve_preview_context(&base, &args.common, None, args.trace.url.as_deref()).await?;
     match context.entry.view_type {
         ViewType::Trace => {
             let trace_data = build_trace_preview_data(
                 &context.client,
-                &context.project,
+                context.project.as_ref(),
                 &args.trace,
                 args.print_queries,
             )
@@ -719,24 +1007,26 @@ async fn preview(base: BaseArgs, args: ViewsPreviewArgs) -> Result<()> {
                 context.client,
                 Some(trace_data.project_id),
                 context.entry,
+                context.dependency_paths,
                 trace_data.data,
             )
             .await
         }
         ViewType::Dataset => {
-            let preview_data = build_dataset_preview_data(
-                &context.client,
-                &context.project,
-                &context.entry,
-                &args.dataset,
-            )
-            .await?;
+            let project = context
+                .project
+                .as_ref()
+                .ok_or_else(|| anyhow!("dataset preview requires a project"))?;
+            let preview_data =
+                build_dataset_preview_data(&context.client, project, &context.entry, &args.dataset)
+                    .await?;
             serve_preview(
                 base,
                 &args.common,
                 context.client,
                 None,
                 context.entry,
+                context.dependency_paths,
                 preview_data,
             )
             .await
@@ -745,10 +1035,16 @@ async fn preview(base: BaseArgs, args: ViewsPreviewArgs) -> Result<()> {
 }
 
 async fn preview_trace(base: BaseArgs, args: TraceViewPreviewArgs) -> Result<()> {
-    let context = resolve_preview_context(&base, &args.common, Some(ViewType::Trace)).await?;
+    let context = resolve_preview_context(
+        &base,
+        &args.common,
+        Some(ViewType::Trace),
+        args.target.url.as_deref(),
+    )
+    .await?;
     let trace_data = build_trace_preview_data(
         &context.client,
-        &context.project,
+        context.project.as_ref(),
         &args.target,
         args.print_queries,
     )
@@ -759,26 +1055,28 @@ async fn preview_trace(base: BaseArgs, args: TraceViewPreviewArgs) -> Result<()>
         context.client,
         Some(trace_data.project_id),
         context.entry,
+        context.dependency_paths,
         trace_data.data,
     )
     .await
 }
 
 async fn preview_dataset(base: BaseArgs, args: DatasetViewPreviewArgs) -> Result<()> {
-    let context = resolve_preview_context(&base, &args.common, Some(ViewType::Dataset)).await?;
-    let preview_data = build_dataset_preview_data(
-        &context.client,
-        &context.project,
-        &context.entry,
-        &args.target,
-    )
-    .await?;
+    let context =
+        resolve_preview_context(&base, &args.common, Some(ViewType::Dataset), None).await?;
+    let project = context
+        .project
+        .as_ref()
+        .ok_or_else(|| anyhow!("dataset preview requires a project"))?;
+    let preview_data =
+        build_dataset_preview_data(&context.client, project, &context.entry, &args.target).await?;
     serve_preview(
         base,
         &args.common,
         context.client,
         None,
         context.entry,
+        context.dependency_paths,
         preview_data,
     )
     .await
@@ -788,20 +1086,46 @@ async fn resolve_preview_context(
     base: &BaseArgs,
     args: &PreviewCommonArgs,
     view_type: Option<ViewType>,
+    trace_url: Option<&str>,
 ) -> Result<PreviewContext> {
+    if !args.path.exists() {
+        bail!("custom view file not found: {}", args.path.display());
+    }
+    if !args.path.is_file() {
+        bail!(
+            "custom view preview requires a single view file; got {}",
+            args.path.display()
+        );
+    }
+    if !is_view_file(&args.path) {
+        bail!("custom view preview path must match {VIEW_FILE_PATTERN_HELP}");
+    }
     let files = vec![args.path.clone()];
     let manifest = run_views_runner(args.runner.as_deref(), args.tsconfig.as_deref(), &files)?;
     validate_manifest_runtime(&manifest)?;
     let entry = select_preview_entry(&manifest, args.view.as_deref(), view_type)?.clone();
+    let dependency_paths = preview_dependency_paths(&manifest);
 
     let auth_ctx = auth::login_read_only(&base).await?;
     let client = ApiClient::new(&auth_ctx)?;
-    let default_project = resolve_required_project(&base, &client, true).await?;
-    let project = resolve_project_for_entry(&client, &default_project, &entry).await?;
+    let project = if trace_url_supplies_project(entry.view_type, trace_url) {
+        None
+    } else if entry.view_type == ViewType::Trace && trace_url.is_some() {
+        match resolve_project_optional(&base, &client, true).await? {
+            Some(default_project) => {
+                Some(resolve_project_for_entry(&client, &default_project, &entry).await?)
+            }
+            None => None,
+        }
+    } else {
+        let default_project = resolve_required_project(&base, &client, true).await?;
+        Some(resolve_project_for_entry(&client, &default_project, &entry).await?)
+    };
     Ok(PreviewContext {
         client,
         project,
         entry,
+        dependency_paths,
     })
 }
 
@@ -811,6 +1135,7 @@ async fn serve_preview(
     client: ApiClient,
     trace_project_id: Option<String>,
     entry: ViewManifestEntry,
+    dependency_paths: Vec<PathBuf>,
     preview_data: Value,
 ) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", args.port))
@@ -823,17 +1148,21 @@ async fn serve_preview(
         client,
         project_id: trace_project_id,
         data: preview_data,
+        source: PreviewSource {
+            path: args.path.clone(),
+            view: args.view.clone(),
+            view_type: Some(entry.view_type),
+            runner: args.runner.clone(),
+            tsconfig: args.tsconfig.clone(),
+        },
+        title: entry.name.clone(),
+        dependency_paths: Mutex::new(dependency_paths),
     });
-    let code = entry.code.clone();
-    let name = entry.name.clone();
     let server = HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
-            .app_data(web::Data::new(PreviewPage {
-                title: name.clone(),
-                code: code.clone(),
-            }))
             .route("/", web::get().to(preview_index))
+            .route("/preview-version", web::get().to(preview_version))
             .route("/span-fields", web::post().to(preview_span_fields))
     })
     .workers(1)
@@ -869,20 +1198,42 @@ async fn serve_preview(
     Ok(())
 }
 
-#[derive(Clone)]
 struct PreviewPage {
     title: String,
     code: String,
+    dependency_paths: Vec<PathBuf>,
 }
 
-async fn preview_index(
-    state: web::Data<PreviewServerState>,
-    page: web::Data<PreviewPage>,
-) -> HttpResponse {
-    let html = render_preview_html(&page.title, &page.code, &state.data);
+async fn preview_index(state: web::Data<PreviewServerState>) -> HttpResponse {
+    let dependency_paths = state
+        .dependency_paths
+        .lock()
+        .map(|paths| paths.clone())
+        .unwrap_or_default();
+    let version = preview_source_version(&state.source, &dependency_paths);
+    let html = match load_preview_page(&state.source) {
+        Ok(page) => {
+            if let Ok(mut dependency_paths) = state.dependency_paths.lock() {
+                *dependency_paths = page.dependency_paths.clone();
+            }
+            render_preview_html(&page.title, &page.code, &state.data, &version)
+        }
+        Err(err) => render_preview_error_html(&state.title, &format!("{err:#}"), &version),
+    };
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(html)
+}
+
+async fn preview_version(state: web::Data<PreviewServerState>) -> HttpResponse {
+    let dependency_paths = state
+        .dependency_paths
+        .lock()
+        .map(|paths| paths.clone())
+        .unwrap_or_default();
+    HttpResponse::Ok().json(json!({
+        "version": preview_source_version(&state.source, &dependency_paths),
+    }))
 }
 
 async fn preview_span_fields(
@@ -927,10 +1278,66 @@ async fn preview_span_fields(
     HttpResponse::Ok().json(Value::Object(response))
 }
 
-fn render_preview_html(title: &str, code: &str, data: &Value) -> String {
+fn load_preview_page(source: &PreviewSource) -> Result<PreviewPage> {
+    let files = vec![source.path.clone()];
+    let manifest = run_views_runner(source.runner.as_deref(), source.tsconfig.as_deref(), &files)?;
+    validate_manifest_runtime(&manifest)?;
+    let entry = select_preview_entry(&manifest, source.view.as_deref(), source.view_type)?;
+    let dependency_paths = preview_dependency_paths(&manifest);
+    Ok(PreviewPage {
+        title: entry.name.clone(),
+        code: entry.code.clone(),
+        dependency_paths,
+    })
+}
+
+fn preview_dependency_paths(manifest: &ViewsManifest) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    for file in &manifest.files {
+        paths.insert(file.source_file.clone());
+        for dependency in &file.dependencies {
+            paths.insert(dependency.clone());
+        }
+    }
+    paths.into_iter().map(PathBuf::from).collect()
+}
+
+fn preview_source_version(source: &PreviewSource, dependency_paths: &[PathBuf]) -> String {
+    let mut parts = Vec::new();
+    push_preview_file_version(&mut parts, &source.path);
+    for dependency in dependency_paths {
+        if dependency != &source.path {
+            push_preview_file_version(&mut parts, dependency);
+        }
+    }
+    if let Some(tsconfig) = &source.tsconfig {
+        push_preview_file_version(&mut parts, tsconfig);
+    }
+    parts.join("|")
+}
+
+fn push_preview_file_version(parts: &mut Vec<String>, path: &Path) {
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            parts.push(format!("{}:{modified}:{}", path.display(), metadata.len()));
+        }
+        Err(err) => {
+            parts.push(format!("{}:error:{err}", path.display()));
+        }
+    }
+}
+
+fn render_preview_html(title: &str, code: &str, data: &Value, version: &str) -> String {
     let data_json = script_json(data);
     let code_json = script_json(&Value::String(code.to_string()));
     let title_json = script_json(&Value::String(title.to_string()));
+    let version_json = script_json(&Value::String(version.to_string()));
     format!(
         r##"<!doctype html>
 <html>
@@ -950,6 +1357,7 @@ fn render_preview_html(title: &str, code: &str, data: &Value) -> String {
   <div id="root"></div>
   <script>
     const previewTitle = {title_json};
+    const previewVersion = {version_json};
     const initialData = {data_json};
     const customViewCode = {code_json};
     const root = ReactDOM.createRoot(document.getElementById("root"));
@@ -1052,6 +1460,56 @@ fn render_preview_html(title: &str, code: &str, data: &Value) -> String {
     }}
 
     render();
+    setInterval(async () => {{
+      try {{
+        const response = await fetch("/preview-version", {{ cache: "no-store" }});
+        if (!response.ok) return;
+        const payload = await response.json();
+        if (payload.version && payload.version !== previewVersion) {{
+          window.location.reload();
+        }}
+      }} catch (_error) {{}}
+    }}, 1000);
+  </script>
+</body>
+</html>"##,
+        html_escape(title),
+    )
+}
+
+fn render_preview_error_html(title: &str, error: &str, version: &str) -> String {
+    let title_json = script_json(&Value::String(title.to_string()));
+    let error_json = script_json(&Value::String(error.to_string()));
+    let version_json = script_json(&Value::String(version.to_string()));
+    format!(
+        r##"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{}</title>
+  <style>
+    html, body {{ min-height: 100%; margin: 0; }}
+    body {{ font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+  </style>
+</head>
+<body>
+  <pre id="root" style="padding: 16px; color: #b91c1c; white-space: pre-wrap"></pre>
+  <script>
+    const previewTitle = {title_json};
+    const previewError = {error_json};
+    const previewVersion = {version_json};
+    document.getElementById("root").textContent = `${{previewTitle}}\n\n${{previewError}}`;
+    setInterval(async () => {{
+      try {{
+        const response = await fetch("/preview-version", {{ cache: "no-store" }});
+        if (!response.ok) return;
+        const payload = await response.json();
+        if (payload.version && payload.version !== previewVersion) {{
+          window.location.reload();
+        }}
+      }} catch (_error) {{}}
+    }}, 1000);
   </script>
 </body>
 </html>"##,
@@ -1126,9 +1584,18 @@ fn is_view_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    [".view.tsx", ".view.ts", ".view.jsx", ".view.js"]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
+    [
+        ".view.tsx",
+        ".view.ts",
+        ".view.jsx",
+        ".view.js",
+        "-view.tsx",
+        "-view.ts",
+        "-view.jsx",
+        "-view.js",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
 }
 
 fn run_views_runner(
@@ -1339,10 +1806,6 @@ fn build_insert_event(view: &PreparedView, if_exists: IfExistsMode) -> Value {
     object.insert("name".to_string(), Value::String(view.entry.name.clone()));
     object.insert("slug".to_string(), Value::String(view.entry.slug.clone()));
     object.insert(
-        "description".to_string(),
-        Value::String(view.entry.description.clone().unwrap_or_default()),
-    );
-    object.insert(
         "function_type".to_string(),
         Value::String("custom_view".to_string()),
     );
@@ -1365,15 +1828,6 @@ fn build_insert_event(view: &PreparedView, if_exists: IfExistsMode) -> Value {
         }),
     );
 
-    if let Some(metadata) = &view.entry.metadata {
-        object.insert("metadata".to_string(), metadata.clone());
-    }
-    if let Some(tags) = &view.entry.tags {
-        object.insert(
-            "tags".to_string(),
-            Value::Array(tags.iter().cloned().map(Value::String).collect()),
-        );
-    }
     if let Some(dataset) = &view.dataset {
         object.insert(
             "origin".to_string(),
@@ -1564,7 +2018,7 @@ async fn resolve_dataset_by_selector(
 
 async fn build_trace_preview_data(
     client: &ApiClient,
-    project: &Project,
+    project: Option<&Project>,
     args: &TracePreviewTargetArgs,
     print_queries: bool,
 ) -> Result<TracePreviewData> {
@@ -1600,14 +2054,20 @@ struct TracePreviewTarget {
 
 async fn resolve_trace_preview_target(
     client: &ApiClient,
-    default_project: &Project,
+    default_project: Option<&Project>,
     args: &TracePreviewTargetArgs,
 ) -> Result<TracePreviewTarget> {
     if let Some(url) = args.url.as_deref() {
         let parsed = parse_trace_url(url)?;
         let project_id = match parsed.project.as_deref() {
-            Some(project) if project == default_project.id || project == default_project.name => {
-                default_project.id.clone()
+            Some(project)
+                if default_project
+                    .map(|default_project| {
+                        project == default_project.id || project == default_project.name
+                    })
+                    .unwrap_or(false) =>
+            {
+                default_project.expect("checked above").id.clone()
             }
             Some(project) if is_uuid_like(project) => project.to_string(),
             Some(project) => {
@@ -1616,7 +2076,13 @@ async fn resolve_trace_preview_target(
                     .ok_or_else(|| anyhow!("project '{project}' from trace URL not found"))?
                     .id
             }
-            None => default_project.id.clone(),
+            None => default_project
+                .map(|project| project.id.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "trace URL must include a project path like /app/<org>/p/<project>/... or a project must be supplied"
+                    )
+                })?,
         };
         let root_span_id = parsed
             .row_ref
@@ -1640,7 +2106,10 @@ async fn resolve_trace_preview_target(
     } else {
         args.project_id
             .clone()
-            .unwrap_or_else(|| default_project.id.clone())
+            .or_else(|| default_project.map(|project| project.id.clone()))
+            .ok_or_else(|| {
+                anyhow!("trace preview requires --project-id or --project when --trace-id is used")
+            })?
     };
     let root_span_id = args
         .trace_id
@@ -1683,6 +2152,14 @@ fn parse_trace_url(input: &str) -> Result<ParsedPreviewTraceUrl> {
         }
     }
     Ok(parsed)
+}
+
+fn trace_url_supplies_project(view_type: ViewType, trace_url: Option<&str>) -> bool {
+    view_type == ViewType::Trace
+        && trace_url
+            .and_then(|url| parse_trace_url(url).ok())
+            .and_then(|parsed| parsed.project)
+            .is_some()
 }
 
 fn is_uuid_like(value: &str) -> bool {
@@ -1921,11 +2398,222 @@ fn fields_from_row(row: Map<String, Value>, fields: Option<&[String]>) -> Value 
 mod tests {
     use super::*;
 
+    fn test_client() -> ApiClient {
+        let login = braintrust_sdk_rust::LoginState::new();
+        login.set(
+            "sk-test".to_string(),
+            "org_test".to_string(),
+            "test-org".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        );
+        ApiClient::new(&crate::auth::LoginContext {
+            login,
+            api_url: "http://127.0.0.1:1".to_string(),
+            app_url: "http://127.0.0.1:1".to_string(),
+        })
+        .expect("test client")
+    }
+
+    fn test_project() -> Project {
+        Project {
+            id: "proj_test".to_string(),
+            name: "test-project".to_string(),
+            org_id: "org_test".to_string(),
+            description: None,
+        }
+    }
+
     #[test]
     fn detects_view_files() {
         assert!(is_view_file(Path::new("conversation.view.tsx")));
         assert!(is_view_file(Path::new("dataset.view.js")));
+        assert!(is_view_file(Path::new("conversation.trace-view.tsx")));
+        assert!(is_view_file(Path::new("dataset.dataset-view.js")));
         assert!(!is_view_file(Path::new("regular.tsx")));
+    }
+
+    #[test]
+    fn preview_html_includes_hot_reload_polling() {
+        let html = render_preview_html(
+            "Preview",
+            "module.exports = function View() {}",
+            &json!({}),
+            "v1",
+        );
+
+        assert!(html.contains("previewVersion"));
+        assert!(html.contains("/preview-version"));
+        assert!(html.contains("window.location.reload()"));
+    }
+
+    #[test]
+    fn preview_error_html_includes_hot_reload_polling() {
+        let html = render_preview_error_html("Preview", "bundle failed", "v1");
+
+        assert!(html.contains("bundle failed"));
+        assert!(html.contains("/preview-version"));
+        assert!(html.contains("window.location.reload()"));
+    }
+
+    #[test]
+    fn preview_source_version_changes_when_source_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.trace-view.tsx");
+        std::fs::write(&path, "export default null;\n").expect("write view");
+        let source = PreviewSource {
+            path: path.clone(),
+            view: None,
+            view_type: Some(ViewType::Trace),
+            runner: None,
+            tsconfig: None,
+        };
+
+        let before = preview_source_version(&source, &[]);
+        std::fs::write(&path, "export default function View() { return null; }\n")
+            .expect("rewrite view");
+        let after = preview_source_version(&source, &[]);
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn preview_source_version_changes_when_dependency_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.trace-view.tsx");
+        let dependency = dir.path().join("component.tsx");
+        std::fs::write(&path, "export { default } from './component';\n").expect("write view");
+        std::fs::write(
+            &dependency,
+            "export default function View() { return null; }\n",
+        )
+        .expect("write dependency");
+        let source = PreviewSource {
+            path,
+            view: None,
+            view_type: Some(ViewType::Trace),
+            runner: None,
+            tsconfig: None,
+        };
+
+        let dependency_paths = vec![dependency.clone()];
+        let before = preview_source_version(&source, &dependency_paths);
+        std::fs::write(
+            &dependency,
+            "export default function View() { return 'changed'; }\n",
+        )
+        .expect("rewrite dependency");
+        let after = preview_source_version(&source, &dependency_paths);
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn parses_trace_preview_url_project_and_span_selectors() {
+        let parsed = parse_trace_url(
+            "https://www.braintrust.dev/app/test-org/p/test-project/logs?r=root-span&s=selected-span",
+        )
+        .expect("parse URL");
+
+        assert_eq!(parsed.project.as_deref(), Some("test-project"));
+        assert_eq!(parsed.row_ref.as_deref(), Some("root-span"));
+        assert_eq!(parsed.span_id.as_deref(), Some("selected-span"));
+    }
+
+    #[test]
+    fn trace_url_project_only_skips_project_resolution_for_trace_views() {
+        let url = Some("https://www.braintrust.dev/app/test-org/p/test-project/logs?r=root-span");
+
+        assert!(trace_url_supplies_project(ViewType::Trace, url));
+        assert!(!trace_url_supplies_project(ViewType::Dataset, url));
+        assert!(!trace_url_supplies_project(
+            ViewType::Trace,
+            Some("https://www.braintrust.dev/app/test-org/logs?r=root-span")
+        ));
+        assert!(!trace_url_supplies_project(ViewType::Trace, None));
+    }
+
+    #[tokio::test]
+    async fn trace_preview_url_project_id_does_not_require_default_project() {
+        let client = test_client();
+        let project_id = "00000000-0000-4000-8000-000000000001";
+        let target = resolve_trace_preview_target(
+            &client,
+            None,
+            &TracePreviewTargetArgs {
+                url: Some(format!(
+                    "https://www.braintrust.dev/app/test-org/p/{project_id}/logs?r=root-span&s=selected-span"
+                )),
+                object_ref: None,
+                project_id: None,
+                trace_id: None,
+                span_id: None,
+            },
+        )
+        .await
+        .expect("resolve target");
+
+        assert_eq!(target.project_id, project_id);
+        assert_eq!(target.root_span_id, "root-span");
+        assert_eq!(target.span_id.as_deref(), Some("selected-span"));
+    }
+
+    #[tokio::test]
+    async fn trace_preview_url_without_project_uses_default_project() {
+        let client = test_client();
+        let project = test_project();
+        let target = resolve_trace_preview_target(
+            &client,
+            Some(&project),
+            &TracePreviewTargetArgs {
+                url: Some("https://www.braintrust.dev/app/test-org/logs?r=root-span".to_string()),
+                object_ref: None,
+                project_id: None,
+                trace_id: None,
+                span_id: Some("selected-span".to_string()),
+            },
+        )
+        .await
+        .expect("resolve target");
+
+        assert_eq!(target.project_id, "proj_test");
+        assert_eq!(target.root_span_id, "root-span");
+        assert_eq!(target.span_id.as_deref(), Some("selected-span"));
+    }
+
+    #[tokio::test]
+    async fn trace_preview_url_without_project_errors_without_default_project() {
+        let client = test_client();
+        let err = resolve_trace_preview_target(
+            &client,
+            None,
+            &TracePreviewTargetArgs {
+                url: Some("https://www.braintrust.dev/app/test-org/logs?r=root-span".to_string()),
+                object_ref: None,
+                project_id: None,
+                trace_id: None,
+                span_id: None,
+            },
+        )
+        .await
+        .expect_err("missing project should fail");
+
+        assert!(err
+            .to_string()
+            .contains("trace URL must include a project path"));
+    }
+
+    #[test]
+    fn normalizes_bootstrap_name_to_slug() {
+        assert_eq!(
+            bootstrap_slug("Trace Review 2026").unwrap(),
+            "trace-review-2026"
+        );
+        assert_eq!(
+            bootstrap_slug("  Dataset__Review!! ").unwrap(),
+            "dataset-review"
+        );
+        assert!(bootstrap_slug("!!!").is_err());
     }
 
     #[test]
@@ -1937,20 +2625,12 @@ mod tests {
                 name: "Test View".to_string(),
                 slug: "test-view".to_string(),
                 code: "module.exports = function View() {}".to_string(),
-                description: Some("desc".to_string()),
                 project_id: None,
                 project_name: None,
                 dataset_id: None,
                 dataset_name: None,
-                metadata: Some(json!({ "kind": "test" })),
-                tags: Some(vec!["review".to_string()]),
             },
-            project: Project {
-                id: "proj_test".to_string(),
-                name: "test-project".to_string(),
-                org_id: "org_test".to_string(),
-                description: None,
-            },
+            project: test_project(),
             dataset: None,
         };
 
@@ -1964,6 +2644,9 @@ mod tests {
             "browser"
         );
         assert!(event.get("origin").is_none());
+        assert!(event.get("description").is_none());
+        assert!(event.get("metadata").is_none());
+        assert!(event.get("tags").is_none());
     }
 
     #[test]
@@ -1975,20 +2658,12 @@ mod tests {
                 name: "Dataset View".to_string(),
                 slug: "dataset-view".to_string(),
                 code: "module.exports = function View() {}".to_string(),
-                description: None,
                 project_id: None,
                 project_name: None,
                 dataset_id: Some("dataset_test".to_string()),
                 dataset_name: None,
-                metadata: None,
-                tags: None,
             },
-            project: Project {
-                id: "proj_test".to_string(),
-                name: "test-project".to_string(),
-                org_id: "org_test".to_string(),
-                description: None,
-            },
+            project: test_project(),
             dataset: Some(datasets_api::Dataset {
                 id: "dataset_test".to_string(),
                 name: "test-dataset".to_string(),

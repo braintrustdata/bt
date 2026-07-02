@@ -5,26 +5,22 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 type EsbuildModule = {
-  build: (options: Record<string, unknown>) => Promise<unknown>;
+  build: (options: Record<string, unknown>) => Promise<EsbuildBuildResult>;
 };
 
-type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JsonValue[]
-  | { [key: string]: JsonValue };
+type EsbuildBuildResult = {
+  metafile?: {
+    inputs?: Record<string, unknown>;
+  };
+};
 
-type RegisteredCustomView = {
-  kind?: string;
-  name?: string;
-  slug?: string;
-  description?: string;
+type CustomViewDefinition = {
+  kind: "trace" | "dataset";
+  name: string;
+  slug: string;
+  component: unknown;
   project?: string | { id?: string; name?: string };
   dataset?: { id?: string; name?: string };
-  tags?: unknown;
-  metadata?: unknown;
 };
 
 type ManifestEntry = {
@@ -33,13 +29,10 @@ type ManifestEntry = {
   name: string;
   slug: string;
   code: string;
-  description?: string;
   project_id?: string;
   project_name?: string;
   dataset_id?: string;
   dataset_name?: string;
-  tags?: string[];
-  metadata?: JsonValue;
 };
 
 type Manifest = {
@@ -49,6 +42,7 @@ type Manifest = {
   };
   files: Array<{
     source_file: string;
+    dependencies: string[];
     entries: ManifestEntry[];
   }>;
 };
@@ -276,29 +270,8 @@ function braintrustViewPlugin() {
   };
 }
 
-function validateJson(value: unknown, label: string): JsonValue | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  try {
-    return JSON.parse(JSON.stringify(value)) as JsonValue;
-  } catch {
-    throw new Error(`${label} must be JSON-serializable`);
-  }
-}
-
-function normalizeTags(value: unknown, slug: string): string[] | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (!Array.isArray(value) || !value.every((tag) => typeof tag === "string")) {
-    throw new Error(`custom view '${slug}' tags must be an array of strings`);
-  }
-  return value;
-}
-
 function projectFields(
-  project: RegisteredCustomView["project"],
+  project: CustomViewDefinition["project"],
 ): Pick<ManifestEntry, "project_id" | "project_name"> {
   if (project === undefined) {
     return {};
@@ -316,7 +289,7 @@ function projectFields(
 }
 
 function datasetFields(
-  view: RegisteredCustomView,
+  view: CustomViewDefinition,
 ): Pick<ManifestEntry, "dataset_id" | "dataset_name"> {
   if (view.kind !== "dataset") {
     return {};
@@ -336,16 +309,48 @@ function datasetFields(
   );
 }
 
-function validateRegisteredView(view: RegisteredCustomView): void {
-  if (view.kind !== "trace" && view.kind !== "dataset") {
-    throw new Error("custom view kind must be 'trace' or 'dataset'");
+function validateCustomView(
+  value: unknown,
+  sourceFile: string,
+): asserts value is CustomViewDefinition {
+  if (!isObject(value)) {
+    throw new Error(
+      `${sourceFile} must default-export customTraceView(...) or customDatasetView(...)`,
+    );
   }
-  if (typeof view.name !== "string" || !view.name.trim()) {
-    throw new Error("custom view name is required");
+  if (value.kind !== "trace" && value.kind !== "dataset") {
+    throw new Error(
+      `${sourceFile} default export must be a trace or dataset custom view`,
+    );
   }
-  if (typeof view.slug !== "string" || !view.slug.trim()) {
-    throw new Error(`custom view '${view.name}' slug is required`);
+  if (typeof value.name !== "string" || !value.name.trim()) {
+    throw new Error(`${sourceFile} custom view name is required`);
   }
+  if (typeof value.slug !== "string" || !value.slug.trim()) {
+    throw new Error(`${sourceFile} custom view '${value.name}' slug is required`);
+  }
+  if (typeof value.component !== "function") {
+    throw new Error(
+      `${sourceFile} custom view '${value.slug}' component must be a function`,
+    );
+  }
+}
+
+function defaultExportFromModule(loaded: unknown): unknown {
+  if (
+    !isObject(loaded) ||
+    !Object.prototype.hasOwnProperty.call(loaded, "default")
+  ) {
+    return undefined;
+  }
+  const value = loaded.default;
+  if (
+    isObject(value) &&
+    Object.prototype.hasOwnProperty.call(value, "default")
+  ) {
+    return value.default;
+  }
+  return value;
 }
 
 async function bundleForDiscovery(
@@ -353,8 +358,8 @@ async function bundleForDiscovery(
   sourceFile: string,
   outputFile: string,
   tsconfig: string | undefined,
-): Promise<void> {
-  await esbuild.build({
+): Promise<EsbuildBuildResult> {
+  return await esbuild.build({
     entryPoints: [sourceFile],
     outfile: outputFile,
     bundle: true,
@@ -363,46 +368,41 @@ async function bundleForDiscovery(
     format: "cjs",
     tsconfig,
     write: true,
+    metafile: true,
     plugins: [braintrustViewPlugin()],
   });
 }
 
-async function collectViews(
+async function collectView(
   esbuild: EsbuildModule,
   sourceFile: string,
   tempDir: string,
   tsconfig: string | undefined,
-): Promise<RegisteredCustomView[]> {
-  (globalThis as { __braintrust_custom_views?: RegisteredCustomView[] }).__braintrust_custom_views = [];
+): Promise<{ view: CustomViewDefinition; dependencies: string[] }> {
   installDiscoveryReactStub();
   const outputFile = path.join(
     tempDir,
     `${path.basename(sourceFile).replace(/[^\w.-]/g, "_")}.collector.cjs`,
   );
-  await bundleForDiscovery(esbuild, sourceFile, outputFile, tsconfig);
-  await import(`${pathToFileURL(outputFile).href}?bt_view_nonce=${Date.now()}`);
-  const views =
-    (globalThis as { __braintrust_custom_views?: RegisteredCustomView[] })
-      .__braintrust_custom_views ?? [];
-  const seen = new Set<string>();
-  for (const view of views) {
-    validateRegisteredView(view);
-    const key = `${view.kind}:${view.slug}`;
-    if (seen.has(key)) {
-      throw new Error(`duplicate custom view slug '${view.slug}' in ${sourceFile}`);
-    }
-    seen.add(key);
-  }
-  return [...views];
+  const buildResult = await bundleForDiscovery(
+    esbuild,
+    sourceFile,
+    outputFile,
+    tsconfig,
+  );
+  const loaded = await import(
+    `${pathToFileURL(outputFile).href}?bt_view_nonce=${Date.now()}`
+  );
+  const view = defaultExportFromModule(loaded);
+  validateCustomView(view, sourceFile);
+  return { view, dependencies: dependencyFiles(buildResult, tempDir) };
 }
 
-function virtualEntrySource(sourceFile: string, slug: string): string {
+function virtualEntrySource(sourceFile: string): string {
   return `
-import ${JSON.stringify(sourceFile)};
-import { __getCustomViews } from "braintrust/custom-views";
-const view = [...__getCustomViews()].reverse().find((candidate) => candidate.slug === ${JSON.stringify(slug)});
-if (!view) {
-  throw new Error("Custom view not registered: ${slug.replaceAll('"', '\\"')}");
+import view from ${JSON.stringify(sourceFile)};
+if (!view || (view.kind !== "trace" && view.kind !== "dataset") || !view.component) {
+  throw new Error("Custom view file must default-export customTraceView(...) or customDatasetView(...)");
 }
 export default view.component;
 `;
@@ -411,10 +411,10 @@ export default view.component;
 async function bundleBrowserCode(
   esbuild: EsbuildModule,
   sourceFile: string,
-  view: RegisteredCustomView,
+  view: CustomViewDefinition,
   tempDir: string,
   tsconfig: string | undefined,
-): Promise<string> {
+): Promise<{ code: string; dependencies: string[] }> {
   const entryFile = path.join(
     tempDir,
     `${view.slug?.replace(/[^\w.-]/g, "_") || "view"}.entry.ts`,
@@ -423,9 +423,9 @@ async function bundleBrowserCode(
     tempDir,
     `${view.slug?.replace(/[^\w.-]/g, "_") || "view"}.browser.js`,
   );
-  fs.writeFileSync(entryFile, virtualEntrySource(sourceFile, view.slug!), "utf8");
+  fs.writeFileSync(entryFile, virtualEntrySource(sourceFile), "utf8");
 
-  await esbuild.build({
+  const buildResult = await esbuild.build({
     entryPoints: [entryFile],
     outfile: outputFile,
     bundle: true,
@@ -435,6 +435,7 @@ async function bundleBrowserCode(
     globalName: "__BraintrustCustomView",
     tsconfig,
     write: true,
+    metafile: true,
     treeShaking: true,
     jsxFactory: "React.createElement",
     jsxFragment: "React.Fragment",
@@ -444,7 +445,39 @@ async function bundleBrowserCode(
     plugins: [braintrustViewPlugin()],
   });
 
-  return fs.readFileSync(outputFile, "utf8");
+  return {
+    code: fs.readFileSync(outputFile, "utf8"),
+    dependencies: dependencyFiles(buildResult, tempDir),
+  };
+}
+
+function dependencyFiles(
+  buildResult: EsbuildBuildResult,
+  tempDir: string,
+): string[] {
+  const inputs = Object.keys(buildResult.metafile?.inputs ?? {});
+  const dependencies = new Set<string>();
+  const tempRoot = fs.realpathSync.native(tempDir);
+  for (const input of inputs) {
+    if (input.includes(":") && !path.isAbsolute(input)) {
+      continue;
+    }
+    let file = path.isAbsolute(input)
+      ? path.normalize(input)
+      : path.resolve(process.cwd(), input);
+    if (fs.existsSync(file)) {
+      file = fs.realpathSync.native(file);
+    }
+    const relativeToTemp = path.relative(tempRoot, file);
+    if (
+      relativeToTemp === "" ||
+      (!relativeToTemp.startsWith("..") && !path.isAbsolute(relativeToTemp))
+    ) {
+      continue;
+    }
+    dependencies.add(file);
+  }
+  return [...dependencies].sort();
 }
 
 async function buildManifest(files: string[]): Promise<Manifest> {
@@ -466,30 +499,29 @@ async function buildManifest(files: string[]): Promise<Manifest> {
       if (!fs.existsSync(sourceFile)) {
         throw new Error(`custom view file not found: ${sourceFile}`);
       }
-      const views = await collectViews(esbuild, sourceFile, tempDir, tsconfig);
-      const entries: ManifestEntry[] = [];
-      for (const view of views) {
-        const code = await bundleBrowserCode(
-          esbuild,
-          sourceFile,
-          view,
-          tempDir,
-          tsconfig,
-        );
-        entries.push({
+      const collected = await collectView(esbuild, sourceFile, tempDir, tsconfig);
+      const bundled = await bundleBrowserCode(
+        esbuild,
+        sourceFile,
+        collected.view,
+        tempDir,
+        tsconfig,
+      );
+      const dependencies = [
+        ...new Set([...collected.dependencies, ...bundled.dependencies]),
+      ].sort();
+      const entries: ManifestEntry[] = [
+        {
           kind: "view",
-          view_type: view.kind as "trace" | "dataset",
-          name: view.name!,
-          slug: view.slug!,
-          description: view.description,
-          code,
-          ...projectFields(view.project),
-          ...datasetFields(view),
-          tags: normalizeTags(view.tags, view.slug!),
-          metadata: validateJson(view.metadata, `custom view '${view.slug}' metadata`),
-        });
-      }
-      manifest.files.push({ source_file: sourceFile, entries });
+          view_type: collected.view.kind,
+          name: collected.view.name,
+          slug: collected.view.slug,
+          code: bundled.code,
+          ...projectFields(collected.view.project),
+          ...datasetFields(collected.view),
+        },
+      ];
+      manifest.files.push({ source_file: sourceFile, dependencies, entries });
     }
 
     return manifest;
