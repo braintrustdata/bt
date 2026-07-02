@@ -98,6 +98,113 @@ fn topics_report_help_accepts_global_org_short_conflict_free() {
 }
 
 #[test]
+fn views_help_accepts_push_trace_and_dataset_subcommands() {
+    bt_command()
+        .args(["views", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("push"))
+        .stdout(predicate::str::contains("trace"))
+        .stdout(predicate::str::contains("dataset"));
+}
+
+#[test]
+fn views_trace_help_lists_bootstrap_and_preview() {
+    bt_command()
+        .args(["views", "trace", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bootstrap"))
+        .stdout(predicate::str::contains("preview"));
+}
+
+#[test]
+fn views_dataset_help_lists_bootstrap_and_preview() {
+    bt_command()
+        .args(["views", "dataset", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bootstrap"))
+        .stdout(predicate::str::contains("preview"));
+}
+
+#[test]
+fn views_push_help_lists_custom_view_flags() {
+    bt_command()
+        .args(["views", "push", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--if-exists"))
+        .stdout(predicate::str::contains("--tsconfig"));
+}
+
+#[test]
+fn views_trace_preview_help_lists_trace_selectors() {
+    bt_command()
+        .args(["views", "trace", "preview", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--url"))
+        .stdout(predicate::str::contains("--dataset").not())
+        .stdout(predicate::str::contains("--row-index").not());
+}
+
+#[test]
+fn views_dataset_preview_help_lists_dataset_selectors() {
+    bt_command()
+        .args(["views", "dataset", "preview", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dataset"))
+        .stdout(predicate::str::contains("--trace-id").not())
+        .stdout(predicate::str::contains("--url").not())
+        .stdout(predicate::str::contains("--row-index"));
+}
+
+#[test]
+fn views_trace_bootstrap_creates_starter_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args(["views", "trace", "bootstrap"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("views/trace.view.tsx"));
+
+    let contents =
+        fs::read_to_string(dir.path().join("views/trace.view.tsx")).expect("read starter view");
+    assert!(contents.contains("customTraceView"));
+    assert!(contents.contains("Starter Trace View"));
+}
+
+#[test]
+fn views_dataset_bootstrap_creates_starter_file_with_dataset_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args([
+            "views",
+            "dataset",
+            "bootstrap",
+            "--dataset",
+            "test-dataset",
+            "--file",
+            "custom.dataset.view.tsx",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("custom.dataset.view.tsx"));
+
+    let contents =
+        fs::read_to_string(dir.path().join("custom.dataset.view.tsx")).expect("read starter view");
+    assert!(contents.contains("customDatasetView"));
+    assert!(contents.contains(r#"dataset: { name: "test-dataset" }"#));
+}
+
+#[test]
 fn status_quiet_and_verbose_conflict() {
     bt_command()
         .args(["status", "--quiet", "--verbose"])
