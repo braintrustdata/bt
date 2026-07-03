@@ -487,7 +487,7 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
 fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
     eprintln!("error: {err}");
     if code == ExitCode::Auth && !missing_credential {
-        eprintln!("Your credentials may be expired or invalid. Re-authenticate with `bt auth login`, or run `bt auth profiles` and `bt status` to check profile status.");
+        eprintln!("Your credentials may be expired or invalid. For OAuth profiles, try `bt auth refresh --profile <NAME>`; if refresh fails, re-run `bt auth login --oauth --profile <NAME>`. Run `bt auth profiles` and `bt status` to inspect profile status.");
     }
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
