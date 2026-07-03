@@ -1628,10 +1628,10 @@ fn resolve_api_key_login_profile_name(
 ) -> Result<(String, bool)> {
     if let Some(profile_name) = explicit_profile {
         let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
-        return Ok((
-            profile_name.clone(),
-            store.profiles.contains_key(&profile_name),
-        ));
+        let should_confirm_overwrite = store.profiles.get(&profile_name).is_some_and(|profile| {
+            !profile_matches_api_key_login_target(profile, selected_api_url, suggested_org_name)
+        });
+        return Ok((profile_name.clone(), should_confirm_overwrite));
     }
 
     let default_name = default_profile_name(suggested_org_name);
@@ -1661,22 +1661,29 @@ fn resolve_oauth_login_profile_name(
 ) -> Result<(String, bool)> {
     if let Some(profile_name) = explicit_profile {
         let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
-        return Ok((
-            profile_name.clone(),
-            store.profiles.contains_key(&profile_name),
-        ));
+        let should_confirm_overwrite = store.profiles.get(&profile_name).is_some_and(|profile| {
+            !profile_matches_oauth_login_target(
+                profile,
+                selected_api_url,
+                app_url,
+                suggested_org_name,
+                jwt_id,
+            )
+        });
+        return Ok((profile_name.clone(), should_confirm_overwrite));
     }
 
     let matched_profile = store
         .profiles
         .iter()
         .filter(|(_, profile)| {
-            profile.auth_kind == AuthKind::Oauth
-                && profile.api_url.as_deref() == Some(selected_api_url)
-                && profile.app_url.as_deref() == Some(app_url)
-                && profile.org_name.as_deref() == suggested_org_name
-                && profile.user_name == jwt_id.name
-                && profile.email == jwt_id.email
+            profile_matches_oauth_login_target(
+                profile,
+                selected_api_url,
+                app_url,
+                suggested_org_name,
+                jwt_id,
+            )
         })
         .max_by(|(left_name, left), (right_name, right)| {
             left.oauth_access_expires_at
@@ -1695,6 +1702,31 @@ fn resolve_oauth_login_profile_name(
         default_name.clone(),
         store.profiles.contains_key(&default_name),
     ))
+}
+
+fn profile_matches_api_key_login_target(
+    profile: &AuthProfile,
+    selected_api_url: &str,
+    suggested_org_name: Option<&str>,
+) -> bool {
+    profile.auth_kind == AuthKind::ApiKey
+        && profile.api_url.as_deref() == Some(selected_api_url)
+        && profile.org_name.as_deref() == suggested_org_name
+}
+
+fn profile_matches_oauth_login_target(
+    profile: &AuthProfile,
+    selected_api_url: &str,
+    app_url: &str,
+    suggested_org_name: Option<&str>,
+    jwt_id: &JwtIdentity,
+) -> bool {
+    profile.auth_kind == AuthKind::Oauth
+        && profile.api_url.as_deref() == Some(selected_api_url)
+        && profile.app_url.as_deref() == Some(app_url)
+        && profile.org_name.as_deref() == suggested_org_name
+        && profile.user_name == jwt_id.name
+        && profile.email == jwt_id.email
 }
 
 fn confirm_profile_overwrite(profile_name: &str) -> Result<()> {
@@ -4453,6 +4485,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_api_key_login_profile_name_updates_explicit_matching_profile_without_confirm() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".into(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.test.example".into()),
+                org_name: Some("test-org".into()),
+                ..Default::default()
+            },
+        );
+
+        let (profile_name, should_confirm) = resolve_api_key_login_profile_name(
+            Some("work"),
+            Some("test-org"),
+            "https://api.test.example",
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "work");
+        assert!(!should_confirm);
+    }
+
+    #[test]
+    fn resolve_api_key_login_profile_name_confirms_explicit_different_target() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".into(),
+            AuthProfile {
+                auth_kind: AuthKind::ApiKey,
+                api_url: Some("https://api.test.example".into()),
+                org_name: Some("test-org".into()),
+                ..Default::default()
+            },
+        );
+
+        let (profile_name, should_confirm) = resolve_api_key_login_profile_name(
+            Some("work"),
+            Some("other-org"),
+            "https://api.test.example",
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "work");
+        assert!(should_confirm);
+    }
+
+    #[test]
     fn default_login_org_name_uses_profile_org_when_org_not_requested() {
         let mut store = AuthStore::default();
         store.profiles.insert(
@@ -4564,6 +4646,74 @@ mod tests {
 
         assert_eq!(profile_name, "newer");
         assert!(!should_confirm);
+    }
+
+    #[test]
+    fn resolve_oauth_login_profile_name_updates_explicit_matching_profile_without_confirm() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                api_url: Some("https://api.test.example".into()),
+                app_url: Some("https://app.test.example".into()),
+                org_name: Some("test-org".into()),
+                user_name: Some("Test User".into()),
+                email: Some("user@test.example".into()),
+                ..Default::default()
+            },
+        );
+        let jwt_id = JwtIdentity {
+            name: Some("Test User".into()),
+            email: Some("user@test.example".into()),
+        };
+
+        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
+            Some("work"),
+            Some("test-org"),
+            "https://api.test.example",
+            "https://app.test.example",
+            &jwt_id,
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "work");
+        assert!(!should_confirm);
+    }
+
+    #[test]
+    fn resolve_oauth_login_profile_name_confirms_explicit_different_target() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                api_url: Some("https://api.test.example".into()),
+                app_url: Some("https://app.test.example".into()),
+                org_name: Some("test-org".into()),
+                user_name: Some("Test User".into()),
+                email: Some("user@test.example".into()),
+                ..Default::default()
+            },
+        );
+        let jwt_id = JwtIdentity {
+            name: Some("Test User".into()),
+            email: Some("user@test.example".into()),
+        };
+
+        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
+            Some("work"),
+            Some("other-org"),
+            "https://api.test.example",
+            "https://app.test.example",
+            &jwt_id,
+            &store,
+        )
+        .expect("resolve");
+
+        assert_eq!(profile_name, "work");
+        assert!(should_confirm);
     }
 
     fn login_org(id: &str, name: &str) -> LoginOrgInfo {
