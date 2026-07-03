@@ -1,0 +1,4 @@
+{
+  "files": ["sample-init-dataset.eval.cjs"],
+  "args": ["--sample", "5"]
+}

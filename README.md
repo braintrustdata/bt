@@ -80,7 +80,7 @@ bt self update --check
 bt self update --channel canary
 ```
 
-If `bt` was installed via another package manager (Homebrew, apt, choco, etc), use that package manager to update instead.
+If `bt` was installed via npm, use that to update instead.
 
 ## Uninstall
 
@@ -103,7 +103,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 ## Troubleshooting
 
 - If `bt` is not found after install, start a new shell or add `${XDG_BIN_HOME:-$HOME/.local/bin}` to your `PATH`.
-- If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
+- If `bt self update --check --json` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 
 ## Commands
