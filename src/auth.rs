@@ -2,11 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fs;
 use std::io::{IsTerminal, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use std::time::Duration;
 
+use actix_web::{dev::ServerHandle, web, App, HttpResponse, HttpServer};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use braintrust_sdk_rust::{BraintrustClient, LoginState};
@@ -20,8 +25,7 @@ use oauth2::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
@@ -1210,6 +1214,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
     let login_orgs = fetch_login_orgs(&api_key, &login_app_url).await?;
+    let store = load_auth_store()?;
     let requested_org_resolution = resolve_requested_org_for_api_key_login(
         &login_orgs,
         base.org_name.as_deref(),
@@ -1219,6 +1224,8 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if requested_org_resolution == RequestedOrgResolution::SwitchToOauth {
         return run_login_oauth(base, args).await;
     }
+    let default_org_name =
+        default_login_org_name(&store, base.profile.as_deref(), base.org_name.as_deref());
     let selected_org = select_login_org(
         login_orgs.clone(),
         match requested_org_resolution {
@@ -1228,6 +1235,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
             }
             RequestedOrgResolution::SwitchToOauth => unreachable!("handled above"),
         },
+        default_org_name.as_deref(),
         interactive,
         base.verbose,
         true,
@@ -1235,7 +1243,6 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let store = load_auth_store()?;
     let (profile_name, should_confirm_overwrite) = resolve_api_key_login_profile_name(
         base.profile.as_deref(),
         selected_org.as_ref().map(|org| org.name.as_str()),
@@ -1284,14 +1291,8 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let state = generate_random_token(32)?;
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .context("failed to bind oauth callback listener")?;
-    let callback_port = listener
-        .local_addr()
-        .context("failed to read callback listener address")?
-        .port();
-    let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
+    let callback_server = bind_oauth_callback_server()?;
+    let redirect_uri = callback_server.redirect_uri();
     let oauth_client = build_oauth_client(&api_url, &client_id, Some(&redirect_uri))?;
     let (authorize_url, _) = oauth_client
         .authorize_url(|| CsrfToken::new(state.clone()))
@@ -1309,7 +1310,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     }
 
     let callback = collect_oauth_callback(
-        listener,
+        callback_server,
         args.no_browser || is_ssh_session(),
         explicitly_quiet(base),
     )
@@ -1336,9 +1337,13 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )
     .await?;
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
+    let store = load_auth_store()?;
+    let default_org_name =
+        default_login_org_name(&store, base.profile.as_deref(), base.org_name.as_deref());
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
+        default_org_name.as_deref(),
         ui::can_prompt(),
         base.verbose,
         true,
@@ -1346,7 +1351,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )?;
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let store = load_auth_store()?;
     let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
     let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
         base.profile.as_deref(),
@@ -1570,6 +1574,31 @@ fn resolve_profile_name(
         .filter(|name| !name.is_empty())
         .unwrap_or("profile")
         .to_string())
+}
+
+fn default_login_org_name(
+    store: &AuthStore,
+    profile_name: Option<&str>,
+    requested_org_name: Option<&str>,
+) -> Option<String> {
+    if requested_org_name
+        .map(str::trim)
+        .is_some_and(|name| !name.is_empty())
+    {
+        return None;
+    }
+
+    let profile_name = profile_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?;
+    let stored_org_name = store
+        .profiles
+        .get(profile_name)
+        .and_then(|profile| profile.org_name.as_deref())
+        .map(str::trim)
+        .filter(|org_name| !org_name.is_empty());
+
+    Some(stored_org_name.unwrap_or(profile_name).to_string())
 }
 
 fn default_profile_name(suggested_org_name: Option<&str>) -> String {
@@ -2060,6 +2089,7 @@ async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgIn
 fn select_login_org(
     mut orgs: Vec<LoginOrgInfo>,
     requested_org_name: Option<&str>,
+    default_org_name: Option<&str>,
     interactive: bool,
     verbose: bool,
     allow_cross_org: bool,
@@ -2090,6 +2120,7 @@ fn select_login_org(
         return Ok(None);
     }
 
+    let default_org_matched = move_default_login_org_first(&mut orgs, default_org_name);
     let offset = if allow_cross_org { 1 } else { 0 };
     let mut labels: Vec<String> = Vec::new();
     if allow_cross_org {
@@ -2110,7 +2141,8 @@ fn select_login_org(
     if !quiet_requested {
         eprintln!("\n\nA Braintrust organization is usually a team or a company.");
     }
-    let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
+    let default = if default_org_matched { offset } else { 0 };
+    let selection = ui::fuzzy_select("Select organization", &label_refs, default)?;
     if allow_cross_org && selection == 0 {
         return Ok(None);
     }
@@ -2122,16 +2154,34 @@ fn select_login_org(
     ))
 }
 
+fn move_default_login_org_first(
+    orgs: &mut Vec<LoginOrgInfo>,
+    default_org_name: Option<&str>,
+) -> bool {
+    let Some(idx) = default_org_name.and_then(|name| find_login_org_index(orgs, name)) else {
+        return false;
+    };
+    if idx != 0 {
+        let org = orgs.remove(idx);
+        orgs.insert(0, org);
+    }
+    true
+}
+
 fn find_login_org<'a>(
     orgs: &'a [LoginOrgInfo],
     requested_org_name: &str,
 ) -> Option<&'a LoginOrgInfo> {
+    find_login_org_index(orgs, requested_org_name).map(|idx| &orgs[idx])
+}
+
+fn find_login_org_index(orgs: &[LoginOrgInfo], requested_org_name: &str) -> Option<usize> {
     orgs.iter()
-        .find(|org| org.name == requested_org_name)
+        .position(|org| org.name == requested_org_name)
         .or_else(|| {
             let lowered = requested_org_name.to_ascii_lowercase();
             orgs.iter()
-                .find(|org| org.name.to_ascii_lowercase() == lowered)
+                .position(|org| org.name.to_ascii_lowercase() == lowered)
         })
 }
 
@@ -2251,11 +2301,38 @@ fn generate_random_token(num_bytes: usize) -> Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OAuthCallbackParams {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+struct OAuthCallbackState {
+    sender: Mutex<Option<oneshot::Sender<OAuthCallbackParams>>>,
+}
+
+struct OAuthCallbackServer {
+    port: u16,
+    handle: ServerHandle,
+    callback_rx: oneshot::Receiver<OAuthCallbackParams>,
+}
+
+impl OAuthCallbackServer {
+    fn redirect_uri(&self) -> String {
+        format!("http://127.0.0.1:{}/callback", self.port)
+    }
+
+    async fn stop(self) {
+        self.handle.stop(false).await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2281,61 +2358,101 @@ fn oauth_callback_mode(prefer_manual: bool) -> OAuthCallbackMode {
     }
 }
 
-async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallbackParams> {
-    let (mut stream, _) = tokio::time::timeout(OAUTH_CALLBACK_TIMEOUT, listener.accept())
-        .await
-        .context("timed out waiting for oauth callback")?
-        .context("failed to accept oauth callback connection")?;
+fn bind_oauth_callback_server() -> Result<OAuthCallbackServer> {
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).context("failed to bind oauth callback listener")?;
+    let port = listener
+        .local_addr()
+        .context("failed to read callback listener address")?
+        .port();
+    let (sender, callback_rx) = oneshot::channel();
+    let state = web::Data::new(OAuthCallbackState {
+        sender: Mutex::new(Some(sender)),
+    });
 
-    let mut buffer = vec![0u8; 16 * 1024];
-    let bytes_read = stream
-        .read(&mut buffer)
-        .await
-        .context("failed reading oauth callback request")?;
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let first_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("oauth callback request was empty"))?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
-    if method != "GET" {
-        bail!("unexpected oauth callback method: {method}");
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(state.clone())
+            .route("/callback", web::get().to(oauth_callback_handler))
+    })
+    .workers(1)
+    .listen(listener)
+    .context("failed to listen on oauth callback server")?
+    .run();
+    let handle = server.handle();
+    tokio::spawn(server);
+
+    Ok(OAuthCallbackServer {
+        port,
+        handle,
+        callback_rx,
+    })
+}
+
+async fn oauth_callback_handler(
+    state: web::Data<OAuthCallbackState>,
+    query: web::Query<OAuthCallbackQuery>,
+) -> HttpResponse {
+    let query = query.into_inner();
+    let params = OAuthCallbackParams {
+        code: query.code,
+        state: query.state,
+        error: query.error,
+    };
+
+    if let Some(sender) = state.sender.lock().expect("callback sender lock").take() {
+        let _ = sender.send(params.clone());
     }
 
-    let query = path.split_once('?').map(|(_, query)| query).unwrap_or("");
-    let params = parse_oauth_callback_query(query);
+    oauth_callback_response(&params)
+}
 
+fn oauth_callback_response(params: &OAuthCallbackParams) -> HttpResponse {
     let body = if params.error.is_some() {
         "<html><body><h1>Authorization Failed</h1><p>You can close this window.</p></body></html>"
     } else {
         "<html><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>"
     };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .context("failed writing oauth callback response")?;
 
-    Ok(params)
+    HttpResponse::Ok()
+        .insert_header(("Connection", "close"))
+        .content_type("text/html; charset=utf-8")
+        .body(body)
+}
+
+async fn wait_for_oauth_callback_result(
+    callback_rx: oneshot::Receiver<OAuthCallbackParams>,
+) -> Result<OAuthCallbackParams> {
+    tokio::time::timeout(OAUTH_CALLBACK_TIMEOUT, callback_rx)
+        .await
+        .context("timed out waiting for oauth callback")?
+        .context("oauth callback server stopped before receiving callback")
+}
+
+async fn wait_for_oauth_callback(server: OAuthCallbackServer) -> Result<OAuthCallbackParams> {
+    let OAuthCallbackServer {
+        handle,
+        callback_rx,
+        ..
+    } = server;
+    let result = wait_for_oauth_callback_result(callback_rx).await;
+    handle.stop(false).await;
+    result
 }
 
 async fn collect_oauth_callback(
-    listener: TcpListener,
+    callback_server: OAuthCallbackServer,
     prefer_manual: bool,
     quiet_requested: bool,
 ) -> Result<OAuthCallbackParams> {
     match oauth_callback_mode(prefer_manual) {
         OAuthCallbackMode::ListenerOnly => {
             eprintln!("Waiting for browser authorization...");
-            wait_for_oauth_callback(listener).await
+            wait_for_oauth_callback(callback_server).await
         }
-        OAuthCallbackMode::ListenerOrStdin => wait_for_oauth_callback_or_stdin(listener).await,
+        OAuthCallbackMode::ListenerOrStdin => {
+            wait_for_oauth_callback_or_stdin(callback_server).await
+        }
         OAuthCallbackMode::PromptThenListener => {
             let term = ui::prompt_term()
                 .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?;
@@ -2355,8 +2472,9 @@ async fn collect_oauth_callback(
                 .interact_text_on(&term)
                 .context("failed to read callback URL")?;
             if pasted.trim().is_empty() {
-                return wait_for_oauth_callback(listener).await;
+                return wait_for_oauth_callback(callback_server).await;
             }
+            callback_server.stop().await;
             parse_oauth_callback_input(&pasted)
         }
     }
@@ -2366,22 +2484,33 @@ fn explicitly_quiet(base: &BaseArgs) -> bool {
     base.quiet && base.quiet_source.is_some()
 }
 
-async fn wait_for_oauth_callback_or_stdin(listener: TcpListener) -> Result<OAuthCallbackParams> {
+async fn wait_for_oauth_callback_or_stdin(
+    callback_server: OAuthCallbackServer,
+) -> Result<OAuthCallbackParams> {
     eprintln!("Waiting for browser authorization...");
     eprintln!(
         "{}",
         dialoguer::console::style("Paste code=...&state=... if callback doesn't complete").dim()
     );
 
-    let callback_fut = wait_for_oauth_callback(listener);
+    let OAuthCallbackServer {
+        handle,
+        callback_rx,
+        ..
+    } = callback_server;
+    let callback_fut = wait_for_oauth_callback_result(callback_rx);
     tokio::pin!(callback_fut);
     let mut manual_buffer = String::new();
 
     loop {
         tokio::select! {
-            callback = &mut callback_fut => return callback,
+            callback = &mut callback_fut => {
+                handle.stop(false).await;
+                return callback;
+            }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 if let Some(input) = poll_manual_oauth_input(&mut manual_buffer)? {
+                    handle.stop(false).await;
                     return parse_oauth_callback_input(&input);
                 }
             }
@@ -4324,6 +4453,72 @@ mod tests {
     }
 
     #[test]
+    fn default_login_org_name_uses_profile_org_when_org_not_requested() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".into(),
+            AuthProfile {
+                org_name: Some("acme".into()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            default_login_org_name(&store, Some(" work "), None).as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn default_login_org_name_falls_back_to_profile_name() {
+        let store = AuthStore::default();
+
+        assert_eq!(
+            default_login_org_name(&store, Some(" acme "), None).as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn default_login_org_name_ignores_profile_when_org_requested() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "work".into(),
+            AuthProfile {
+                org_name: Some("acme".into()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            default_login_org_name(&store, Some("work"), Some("other")),
+            None
+        );
+    }
+
+    #[test]
+    fn move_default_login_org_first_moves_matching_org() {
+        let mut orgs = vec![
+            login_org("org_1", "acme"),
+            login_org("org_2", "beta"),
+            login_org("org_3", "gamma"),
+        ];
+
+        assert!(move_default_login_org_first(&mut orgs, Some("beta")));
+        assert_eq!(orgs[0].name, "beta");
+        assert_eq!(orgs[1].name, "acme");
+    }
+
+    #[test]
+    fn move_default_login_org_first_keeps_order_without_match() {
+        let mut orgs = vec![login_org("org_1", "acme"), login_org("org_2", "beta")];
+
+        assert!(!move_default_login_org_first(&mut orgs, Some("missing")));
+        assert_eq!(orgs[0].name, "acme");
+        assert_eq!(orgs[1].name, "beta");
+    }
+
+    #[test]
     fn resolve_oauth_login_profile_name_reuses_most_recent_matching_profile() {
         let mut store = AuthStore::default();
         store.profiles.insert(
@@ -4585,6 +4780,82 @@ mod tests {
                 OAuthCallbackMode::ListenerOrStdin
             );
         }
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_listener_responds_to_http_request() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpStream;
+
+        let callback_server = bind_oauth_callback_server().expect("bind callback server");
+        let addr = format!("127.0.0.1:{}", callback_server.port);
+        let callback = tokio::spawn(wait_for_oauth_callback(callback_server));
+
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect to callback listener");
+        stream
+            .write_all(
+                b"GET /callback?code=test-code&state=test-state HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: test\r\n\r\n",
+            )
+            .await
+            .expect("write callback request");
+
+        let mut response = vec![0u8; 4096];
+        let bytes_read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut response))
+            .await
+            .expect("callback response timed out")
+            .expect("read callback response");
+        let response = String::from_utf8_lossy(&response[..bytes_read]);
+
+        let params = callback
+            .await
+            .expect("callback task")
+            .expect("callback params");
+        assert_eq!(params.code.as_deref(), Some("test-code"));
+        assert_eq!(params.state.as_deref(), Some("test-state"));
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("Authorization Successful"));
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_listener_ignores_empty_connection() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpStream;
+
+        let callback_server = bind_oauth_callback_server().expect("bind callback server");
+        let addr = format!("127.0.0.1:{}", callback_server.port);
+        let callback = tokio::spawn(wait_for_oauth_callback(callback_server));
+
+        let stale = TcpStream::connect(&addr)
+            .await
+            .expect("connect stale callback socket");
+        drop(stale);
+
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("connect to callback listener");
+        stream
+            .write_all(
+                b"GET /callback?code=next-code&state=next-state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            .await
+            .expect("write callback request");
+
+        let mut response = vec![0u8; 4096];
+        let bytes_read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut response))
+            .await
+            .expect("callback response timed out")
+            .expect("read callback response");
+        let response = String::from_utf8_lossy(&response[..bytes_read]);
+
+        let params = callback
+            .await
+            .expect("callback task")
+            .expect("callback params");
+        assert_eq!(params.code.as_deref(), Some("next-code"));
+        assert_eq!(params.state.as_deref(), Some("next-state"));
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
     }
 
     #[tokio::test]
