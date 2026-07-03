@@ -57,10 +57,8 @@ enum ViewsCommands {
     /// Push local custom view definitions
     Push(ViewsPushArgs),
     /// Work with trace custom views
-    #[command(visible_alias = "traces")]
     Trace(TraceViewsArgs),
     /// Work with dataset custom views
-    #[command(visible_alias = "datasets")]
     Dataset(DatasetViewsArgs),
     /// Preview one custom view locally
     #[command(hide = true)]

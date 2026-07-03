@@ -109,6 +109,16 @@ fn views_help_accepts_push_trace_and_dataset_subcommands() {
 }
 
 #[test]
+fn views_rejects_trace_and_dataset_aliases() {
+    for alias in ["traces", "datasets"] {
+        bt_command()
+            .args(["views", alias, "--help"])
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
 fn views_trace_help_lists_bootstrap_and_preview() {
     bt_command()
         .args(["views", "trace", "--help"])
