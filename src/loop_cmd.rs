@@ -30,11 +30,7 @@ const OPTIMIZATION_PROJECT_ID: &str = "d341311b-2103-4065-a607-34f2263dd548";
 const LOOP_LOG_ID: &str = "g";
 const LOOP_ROOT_SPAN_NAME: &str = "executor_session";
 const IS_MERGE_FIELD: &str = "_is_merge";
-const BRAINTRUST_HOSTED_API_URLS: &[&str] = &[
-    "https://api.braintrust.dev",
-    "https://api-eu.braintrust.dev",
-    "https://staging-api.braintrust.dev",
-];
+const BRAINTRUST_PROD_API_URL: &str = "https://api.braintrust.dev";
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -92,30 +88,13 @@ pub struct LoopArgs {
     #[arg(long, env = "BT_LOOP_MODEL")]
     model: Option<String>,
 
-    /// Braintrust parent passed to Loop Runtime for provider tracing
+    /// Braintrust trace parent passed through to Loop Runtime for provider tracing
     #[arg(
         long = "trace-parent",
         env = "BT_LOOP_TRACE_PARENT",
         hide_env_values = true
     )]
     trace_parent: Option<String>,
-
-    /// Controls whether bt loop attaches a Braintrust parent for provider tracing
-    #[arg(
-        long = "trace-parent-mode",
-        env = "BT_LOOP_TRACE_PARENT_MODE",
-        value_enum,
-        default_value_t = TraceParentModeArg::Auto
-    )]
-    trace_parent_mode: TraceParentModeArg,
-
-    /// Project id to use for bt loop's UI-style root logging span
-    #[arg(
-        long = "trace-project-id",
-        env = "BT_LOOP_TRACE_PROJECT_ID",
-        hide_env_values = true
-    )]
-    trace_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -148,23 +127,6 @@ impl HarnessArg {
             .map(|value| value.get_name().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum TraceParentModeArg {
-    Auto,
-    Always,
-    Never,
-}
-
-impl std::fmt::Display for TraceParentModeArg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Auto => "auto",
-            Self::Always => "always",
-            Self::Never => "never",
-        })
     }
 }
 
@@ -213,12 +175,8 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
 
     let ctx = resolve_project_command_context_with_auth_mode(&base, false).await?;
     let runtime_url = resolve_loop_runtime_url(ctx.client.base_url(), args.runtime_url.as_deref())?;
-    let trace_parent_config = resolve_loop_trace_parent_config(
-        ctx.client.base_url(),
-        args.trace_parent_mode,
-        args.trace_parent.as_deref(),
-        args.trace_project_id.as_deref(),
-    )?;
+    let trace_parent_config =
+        resolve_loop_trace_parent_config(ctx.client.base_url(), args.trace_parent.as_deref())?;
     let client = LoopRuntimeClient::new(runtime_url.as_str(), ctx.client.api_key())?;
     let settings = TurnSettings::from_args(&args);
 
@@ -341,9 +299,7 @@ impl TraceParentState {
 
 fn resolve_loop_trace_parent_config(
     api_url: &str,
-    mode: TraceParentModeArg,
     explicit_trace_parent: Option<&str>,
-    trace_project_id: Option<&str>,
 ) -> Result<TraceParentConfig> {
     if let Some(trace_parent) = explicit_trace_parent {
         let trace_parent = trace_parent.trim();
@@ -353,31 +309,18 @@ fn resolve_loop_trace_parent_config(
         return Ok(TraceParentConfig::Explicit(trace_parent.to_string()));
     }
 
-    let project_id = match trace_project_id {
-        Some(project_id) => {
-            let project_id = project_id.trim();
-            if project_id.is_empty() {
-                bail!("--trace-project-id must not be empty");
-            }
-            project_id.to_string()
-        }
-        None => OPTIMIZATION_PROJECT_ID.to_string(),
-    };
-
-    match mode {
-        TraceParentModeArg::Auto if is_braintrust_hosted_api_url(api_url) => {
-            Ok(TraceParentConfig::UiLogging { project_id })
-        }
-        TraceParentModeArg::Always => Ok(TraceParentConfig::UiLogging { project_id }),
-        TraceParentModeArg::Auto | TraceParentModeArg::Never => Ok(TraceParentConfig::None),
+    if should_auto_trace_loop(api_url) {
+        Ok(TraceParentConfig::UiLogging {
+            project_id: OPTIMIZATION_PROJECT_ID.to_string(),
+        })
+    } else {
+        Ok(TraceParentConfig::None)
     }
 }
 
-fn is_braintrust_hosted_api_url(api_url: &str) -> bool {
+fn should_auto_trace_loop(api_url: &str) -> bool {
     let normalized = api_url.trim().trim_end_matches('/');
-    BRAINTRUST_HOSTED_API_URLS
-        .iter()
-        .any(|hosted_url| normalized.eq_ignore_ascii_case(hosted_url))
+    normalized.eq_ignore_ascii_case(BRAINTRUST_PROD_API_URL)
 }
 
 async fn run_interactive_chat(
@@ -1686,27 +1629,10 @@ mod tests {
     }
 
     #[test]
-    fn loop_trace_parent_auto_matches_braintrust_data_planes() {
+    fn loop_trace_parent_auto_matches_braintrust_prod_api_url() {
         assert_eq!(
-            resolve_loop_trace_parent_config(
-                "https://api.braintrust.dev/",
-                TraceParentModeArg::Auto,
-                None,
-                None,
-            )
-            .expect("trace parent"),
-            TraceParentConfig::UiLogging {
-                project_id: OPTIMIZATION_PROJECT_ID.to_string()
-            }
-        );
-        assert_eq!(
-            resolve_loop_trace_parent_config(
-                "https://api-eu.braintrust.dev",
-                TraceParentModeArg::Auto,
-                None,
-                None,
-            )
-            .expect("trace parent"),
+            resolve_loop_trace_parent_config("https://api.braintrust.dev/", None)
+                .expect("trace parent"),
             TraceParentConfig::UiLogging {
                 project_id: OPTIMIZATION_PROJECT_ID.to_string()
             }
@@ -1714,41 +1640,20 @@ mod tests {
     }
 
     #[test]
-    fn loop_trace_parent_auto_omits_unknown_data_planes() {
+    fn loop_trace_parent_auto_omits_non_prod_api_urls() {
         assert_eq!(
-            resolve_loop_trace_parent_config(
-                "https://runtime.example.test",
-                TraceParentModeArg::Auto,
-                None,
-                None,
-            )
-            .expect("trace parent"),
+            resolve_loop_trace_parent_config("https://api-eu.braintrust.dev", None)
+                .expect("trace parent"),
             TraceParentConfig::None
         );
-    }
-
-    #[test]
-    fn loop_trace_parent_can_be_forced_or_disabled() {
         assert_eq!(
-            resolve_loop_trace_parent_config(
-                "https://runtime.example.test",
-                TraceParentModeArg::Always,
-                None,
-                None,
-            )
-            .expect("trace parent"),
-            TraceParentConfig::UiLogging {
-                project_id: OPTIMIZATION_PROJECT_ID.to_string()
-            }
+            resolve_loop_trace_parent_config("https://staging-api.braintrust.dev", None)
+                .expect("trace parent"),
+            TraceParentConfig::None
         );
         assert_eq!(
-            resolve_loop_trace_parent_config(
-                "https://api.braintrust.dev",
-                TraceParentModeArg::Never,
-                None,
-                None,
-            )
-            .expect("trace parent"),
+            resolve_loop_trace_parent_config("https://runtime.example.test", None)
+                .expect("trace parent"),
             TraceParentConfig::None
         );
     }
@@ -1758,9 +1663,7 @@ mod tests {
         assert_eq!(
             resolve_loop_trace_parent_config(
                 "https://runtime.example.test",
-                TraceParentModeArg::Never,
                 Some(" project_name:test-project "),
-                Some("custom-project-id"),
             )
             .expect("trace parent"),
             TraceParentConfig::Explicit("project_name:test-project".to_string())
@@ -1768,18 +1671,18 @@ mod tests {
     }
 
     #[test]
-    fn loop_trace_project_id_customizes_ui_logging_destination() {
+    fn loop_trace_parent_explicit_override_accepts_span_components() {
+        let parent = loop_logging_parent(
+            "custom-project-id",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "root-span-id",
+            "span-id",
+        );
+        let padded_parent = format!(" {parent} ");
         assert_eq!(
-            resolve_loop_trace_parent_config(
-                "https://runtime.example.test",
-                TraceParentModeArg::Always,
-                None,
-                Some(" custom-project-id "),
-            )
-            .expect("trace parent"),
-            TraceParentConfig::UiLogging {
-                project_id: "custom-project-id".to_string()
-            }
+            resolve_loop_trace_parent_config("https://runtime.example.test", Some(&padded_parent))
+                .expect("trace parent"),
+            TraceParentConfig::Explicit(parent)
         );
     }
 
