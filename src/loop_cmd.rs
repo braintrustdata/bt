@@ -1,27 +1,40 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use braintrust_sdk_rust::{Logs3BatchUploader, SpanComponents, SpanObjectType};
 use clap::{Args, ValueEnum};
 use dialoguer::console::style;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::{ACCEPT, ACCEPT_ENCODING};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
-use crate::http::{build_http_client, build_http_client_from_builder, DEFAULT_HTTP_TIMEOUT};
+use crate::http::{
+    build_http_client, build_http_client_from_builder, ApiClient, DEFAULT_HTTP_TIMEOUT,
+};
 use crate::project_context::{resolve_project_command_context_with_auth_mode, ProjectContext};
 use crate::ui::{
     animations_enabled, apply_column_padding, header, is_interactive, is_quiet, print_with_pager,
     styled_table, truncate, LinePrompt,
 };
+use crate::utils::new_uuid_id;
 
 const DEFAULT_AGENT_SLUG: &str = "loop-chat";
+const OPTIMIZATION_PROJECT_ID: &str = "d341311b-2103-4065-a607-34f2263dd548";
+const LOOP_LOG_ID: &str = "g";
+const LOOP_ROOT_SPAN_NAME: &str = "executor_session";
+const IS_MERGE_FIELD: &str = "_is_merge";
+const BRAINTRUST_HOSTED_API_URLS: &[&str] = &[
+    "https://api.braintrust.dev",
+    "https://api-eu.braintrust.dev",
+    "https://staging-api.braintrust.dev",
+];
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -43,7 +56,7 @@ pub struct LoopArgs {
     #[arg(value_name = "MESSAGE")]
     message: Vec<String>,
 
-    /// Loop Runtime base URL. Defaults to the Braintrust API URL plus /loop-runtime.
+    /// Loop Runtime base URL. Defaults to the Braintrust API URL plus /loop/runtime.
     #[arg(
         long = "runtime-url",
         env = "BT_LOOP_RUNTIME_URL",
@@ -78,6 +91,31 @@ pub struct LoopArgs {
     /// Initial model override
     #[arg(long, env = "BT_LOOP_MODEL")]
     model: Option<String>,
+
+    /// Braintrust parent passed to Loop Runtime for provider tracing
+    #[arg(
+        long = "trace-parent",
+        env = "BT_LOOP_TRACE_PARENT",
+        hide_env_values = true
+    )]
+    trace_parent: Option<String>,
+
+    /// Controls whether bt loop attaches a Braintrust parent for provider tracing
+    #[arg(
+        long = "trace-parent-mode",
+        env = "BT_LOOP_TRACE_PARENT_MODE",
+        value_enum,
+        default_value_t = TraceParentModeArg::Auto
+    )]
+    trace_parent_mode: TraceParentModeArg,
+
+    /// Project id to use for bt loop's UI-style root logging span
+    #[arg(
+        long = "trace-project-id",
+        env = "BT_LOOP_TRACE_PROJECT_ID",
+        hide_env_values = true
+    )]
+    trace_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -110,6 +148,23 @@ impl HarnessArg {
             .map(|value| value.get_name().to_string())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TraceParentModeArg {
+    Auto,
+    Always,
+    Never,
+}
+
+impl std::fmt::Display for TraceParentModeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        })
     }
 }
 
@@ -158,6 +213,12 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
 
     let ctx = resolve_project_command_context_with_auth_mode(&base, false).await?;
     let runtime_url = resolve_loop_runtime_url(ctx.client.base_url(), args.runtime_url.as_deref())?;
+    let trace_parent_config = resolve_loop_trace_parent_config(
+        ctx.client.base_url(),
+        args.trace_parent_mode,
+        args.trace_parent.as_deref(),
+        args.trace_project_id.as_deref(),
+    )?;
     let client = LoopRuntimeClient::new(runtime_url.as_str(), ctx.client.api_key())?;
     let settings = TurnSettings::from_args(&args);
 
@@ -171,10 +232,20 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
         return Ok(());
     }
 
+    let mut trace_parent = TraceParentState::new(trace_parent_config);
+
     if base.json {
         let conversation = client.create_conversation(&ctx, &args, &settings).await?;
-        let report =
-            send_and_collect(&client, &ctx, &conversation, &settings, &message, true).await?;
+        let report = send_and_collect(
+            &client,
+            &ctx,
+            &conversation,
+            &settings,
+            &mut trace_parent,
+            &message,
+            true,
+        )
+        .await?;
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
@@ -182,12 +253,20 @@ pub async fn run(base: BaseArgs, args: LoopArgs) -> Result<()> {
     if !message.is_empty() {
         let conversation = client.create_conversation(&ctx, &args, &settings).await?;
         print_chat_header(&ctx, &conversation, &settings);
-        send_and_print(&client, &ctx, &conversation, &settings, &message).await?;
+        send_and_print(
+            &client,
+            &ctx,
+            &conversation,
+            &settings,
+            &mut trace_parent,
+            &message,
+        )
+        .await?;
         return Ok(());
     }
 
     print_project_header(&ctx);
-    run_interactive_chat(&client, &ctx, &args).await
+    run_interactive_chat(&client, &ctx, &args, &mut trace_parent).await
 }
 
 fn resolve_loop_runtime_url(api_url: &str, explicit_runtime_url: Option<&str>) -> Result<String> {
@@ -199,13 +278,113 @@ fn resolve_loop_runtime_url(api_url: &str, explicit_runtime_url: Option<&str>) -
         return Ok(runtime_url.trim_end_matches('/').to_string());
     }
 
-    Ok(format!("{}/loop-runtime", api_url.trim_end_matches('/')))
+    Ok(format!("{}/loop/runtime", api_url.trim_end_matches('/')))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraceParentConfig {
+    None,
+    Explicit(String),
+    UiLogging { project_id: String },
+}
+
+#[derive(Debug)]
+struct TraceParentState {
+    config: TraceParentConfig,
+    logging_session: Option<LoopLoggingSession>,
+    logging_failed: bool,
+}
+
+impl TraceParentState {
+    fn new(config: TraceParentConfig) -> Self {
+        Self {
+            config,
+            logging_session: None,
+            logging_failed: false,
+        }
+    }
+
+    async fn parent_for_turn(&mut self, ctx: &ProjectContext, input: &[Value]) -> Option<String> {
+        match &self.config {
+            TraceParentConfig::Explicit(parent) => Some(parent.clone()),
+            TraceParentConfig::None => None,
+            TraceParentConfig::UiLogging { project_id } => {
+                if self.logging_session.is_none() && !self.logging_failed {
+                    match LoopLoggingSession::start(&ctx.client, ctx, project_id, input).await {
+                        Ok(session) => {
+                            self.logging_session = Some(session);
+                        }
+                        Err(err) => {
+                            self.logging_failed = true;
+                            warn_loop_logging_failure(&err, "continuing without a trace parent");
+                        }
+                    }
+                }
+                self.logging_session
+                    .as_ref()
+                    .map(|session| session.parent.clone())
+            }
+        }
+    }
+
+    async fn update_turn_end(&self, client: &ApiClient) {
+        if let Some(logging_session) = &self.logging_session {
+            if let Err(err) = logging_session.update_end_time(client).await {
+                warn_loop_logging_failure(
+                    &err,
+                    "the Loop turn completed, but the root trace span end time may be stale",
+                );
+            }
+        }
+    }
+}
+
+fn resolve_loop_trace_parent_config(
+    api_url: &str,
+    mode: TraceParentModeArg,
+    explicit_trace_parent: Option<&str>,
+    trace_project_id: Option<&str>,
+) -> Result<TraceParentConfig> {
+    if let Some(trace_parent) = explicit_trace_parent {
+        let trace_parent = trace_parent.trim();
+        if trace_parent.is_empty() {
+            bail!("--trace-parent must not be empty");
+        }
+        return Ok(TraceParentConfig::Explicit(trace_parent.to_string()));
+    }
+
+    let project_id = match trace_project_id {
+        Some(project_id) => {
+            let project_id = project_id.trim();
+            if project_id.is_empty() {
+                bail!("--trace-project-id must not be empty");
+            }
+            project_id.to_string()
+        }
+        None => OPTIMIZATION_PROJECT_ID.to_string(),
+    };
+
+    match mode {
+        TraceParentModeArg::Auto if is_braintrust_hosted_api_url(api_url) => {
+            Ok(TraceParentConfig::UiLogging { project_id })
+        }
+        TraceParentModeArg::Always => Ok(TraceParentConfig::UiLogging { project_id }),
+        TraceParentModeArg::Auto | TraceParentModeArg::Never => Ok(TraceParentConfig::None),
+    }
+}
+
+fn is_braintrust_hosted_api_url(api_url: &str) -> bool {
+    let normalized = api_url.trim().trim_end_matches('/');
+    BRAINTRUST_HOSTED_API_URLS
+        .iter()
+        .any(|hosted_url| normalized.eq_ignore_ascii_case(hosted_url))
 }
 
 async fn run_interactive_chat(
     client: &LoopRuntimeClient,
     ctx: &ProjectContext,
     args: &LoopArgs,
+    trace_parent: &mut TraceParentState,
 ) -> Result<()> {
     let mut settings = TurnSettings::from_args(args);
     let mut initial_history = Vec::new();
@@ -213,7 +392,7 @@ async fn run_interactive_chat(
         let created = client.create_conversation(ctx, args, &settings).await?;
         print_conversation_header(&created, &settings);
         let events = client
-            .get_conversation_events(&ctx.project.id, &created.agent.id, &created.conversation.id)
+            .get_conversation_events(&created.agent.id, &created.conversation.id)
             .await?;
         print_history(&events.events)?;
         initial_history = user_message_history(&events.events);
@@ -245,7 +424,7 @@ async fn run_interactive_chat(
         let conversation = conversation
             .as_ref()
             .expect("conversation is created before sending a Loop message");
-        send_and_print(client, ctx, conversation, &settings, message).await?;
+        send_and_print(client, ctx, conversation, &settings, trace_parent, message).await?;
         editor.add_history(message);
     }
 }
@@ -384,6 +563,7 @@ async fn send_and_print(
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
     settings: &TurnSettings,
+    trace_parent: &mut TraceParentState,
     message: &str,
 ) -> Result<()> {
     let mut renderer = TranscriptRenderer::default();
@@ -392,6 +572,7 @@ async fn send_and_print(
         ctx,
         conversation,
         settings,
+        trace_parent,
         message,
         false,
         |event| renderer.render_event(event),
@@ -409,6 +590,7 @@ async fn send_and_collect(
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
     settings: &TurnSettings,
+    trace_parent: &mut TraceParentState,
     message: &str,
     include_events: bool,
 ) -> Result<LoopChatReport> {
@@ -417,6 +599,7 @@ async fn send_and_collect(
         ctx,
         conversation,
         settings,
+        trace_parent,
         message,
         include_events,
         |_| Ok(()),
@@ -429,6 +612,7 @@ async fn send_and_collect_with_callback<F>(
     ctx: &ProjectContext,
     conversation: &CreateConversationResponse,
     settings: &TurnSettings,
+    trace_parent: &mut TraceParentState,
     message: &str,
     include_events: bool,
     mut on_event: F,
@@ -436,28 +620,37 @@ async fn send_and_collect_with_callback<F>(
 where
     F: FnMut(&RuntimeEvent) -> Result<()>,
 {
+    let input = vec![json!({
+        "role": "user",
+        "content": message,
+    })];
+    let parent = trace_parent.parent_for_turn(ctx, &input).await;
+
     let submission = client
         .submit_turn(
-            &ctx.project.id,
             &conversation.agent.id,
             &conversation.conversation.id,
+            parent.as_deref(),
             SubmitTurnBody {
-                input: vec![json!({
-                    "role": "user",
-                    "content": message,
-                })],
+                input,
                 harness: settings.harness.as_wire(),
                 model: settings.model.as_deref(),
             },
         )
-        .await?;
+        .await;
+    let submission = match submission {
+        Ok(submission) => submission,
+        Err(error) => {
+            trace_parent.update_turn_end(&ctx.client).await;
+            return Err(error);
+        }
+    };
 
     let mut status = TurnStatus::new(!include_events, "Waiting for Loop...");
     let mut collected = Vec::new();
     let mut ended_with_error = false;
-    client
+    let watch_result = client
         .watch_events(
-            &ctx.project.id,
             &submission.agent.id,
             &submission.conversation.id,
             conversation.conversation.latest_event_id.as_deref(),
@@ -490,14 +683,135 @@ where
                 Ok(true)
             },
         )
-        .await?;
+        .await;
     status.clear();
+    trace_parent.update_turn_end(&ctx.client).await;
+    watch_result?;
 
     Ok(LoopChatReport {
         submission,
         events: collected,
         ended_with_error,
     })
+}
+
+#[derive(Debug, Clone)]
+struct LoopLoggingSession {
+    id: String,
+    project_id: String,
+    root_span_id: String,
+    span_id: String,
+    parent: String,
+}
+
+impl LoopLoggingSession {
+    async fn start(
+        client: &ApiClient,
+        ctx: &ProjectContext,
+        project_id: &str,
+        input: &[Value],
+    ) -> Result<Self> {
+        let id = new_uuid_id();
+        let span_id = new_uuid_id();
+        let root_span_id = span_id.clone();
+        let parent = loop_logging_parent(project_id, &id, &root_span_id, &span_id);
+        let mut event = json!({
+            "id": id,
+            "root_span_id": root_span_id,
+            "span_id": span_id,
+            "span_parents": [],
+            "span_attributes": {
+                "name": LOOP_ROOT_SPAN_NAME,
+                "type": "task",
+            },
+            "input": input,
+            "metadata": {
+                "project_id": ctx.project.id,
+                "org_id": ctx.project.org_id,
+                "page": "bt_loop",
+            },
+            "metrics": {
+                "start": unix_timestamp_seconds(),
+            },
+            "project_id": project_id,
+            "log_id": LOOP_LOG_ID,
+        });
+        event[IS_MERGE_FIELD] = Value::Bool(false);
+        insert_loop_logging_event(client, event).await.map_err(|err| {
+            anyhow!("failed to initialize Loop logging span for trace project '{project_id}': {err}")
+        })?;
+
+        Ok(Self {
+            id,
+            project_id: project_id.to_string(),
+            root_span_id,
+            span_id,
+            parent,
+        })
+    }
+
+    async fn update_end_time(&self, client: &ApiClient) -> Result<()> {
+        let mut event = json!({
+            "id": self.id,
+            "root_span_id": self.root_span_id,
+            "span_id": self.span_id,
+            "span_parents": [],
+            "metrics": {
+                "end": unix_timestamp_seconds(),
+            },
+            "project_id": self.project_id,
+            "log_id": LOOP_LOG_ID,
+        });
+        event[IS_MERGE_FIELD] = Value::Bool(true);
+        insert_loop_logging_event(client, event)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "failed to update Loop logging span end time for trace project '{}': {err}",
+                    self.project_id
+                )
+            })
+    }
+}
+
+fn warn_loop_logging_failure(err: &anyhow::Error, consequence: &str) {
+    if is_quiet() {
+        return;
+    }
+    eprintln!("{} {err}; {consequence}.", style("warning:").yellow());
+}
+
+fn loop_logging_parent(project_id: &str, id: &str, root_span_id: &str, span_id: &str) -> String {
+    let mut parent = SpanComponents::new(SpanObjectType::ProjectLogs);
+    parent.object_id = Some(project_id.to_string());
+    parent.row_id = Some(id.to_string());
+    parent.root_span_id = Some(root_span_id.to_string());
+    parent.span_id = Some(span_id.to_string());
+    parent.to_str()
+}
+
+async fn insert_loop_logging_event(client: &ApiClient, event: Value) -> Result<()> {
+    let Value::Object(row) = event else {
+        bail!("Loop logging event must be a JSON object");
+    };
+    insert_loop_logging_rows(client, &[row]).await
+}
+
+async fn insert_loop_logging_rows(client: &ApiClient, rows: &[Map<String, Value>]) -> Result<()> {
+    let mut uploader = Logs3BatchUploader::new(
+        client.base_url(),
+        client.api_key().to_string(),
+        Some(client.org_name().to_string()),
+    )?;
+    uploader.upload_rows(rows, 100).await?;
+    Ok(())
+}
+
+fn unix_timestamp_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_default()
 }
 
 fn print_chat_header(
@@ -612,14 +926,11 @@ impl LoopRuntimeClient {
         args: &LoopArgs,
         settings: &TurnSettings,
     ) -> Result<CreateConversationResponse> {
+        let agent = self.agent_by_slug(&ctx.project.id, &args.agent).await?;
         let conversation_id = args.conversation.as_deref().filter(|value| is_uuid(value));
         let conversation_slug = args.conversation.as_deref().filter(|value| !is_uuid(value));
         self.post(
-            &format!(
-                "/project/{}/runtime/agents/{}/conversations",
-                encode(&ctx.project.id),
-                encode(&args.agent)
-            ),
+            &format!("/agent/{}/conversation", encode(&agent.id)),
             &json!({
                 "conversation_id": conversation_id,
                 "conversation_slug": conversation_slug,
@@ -646,96 +957,44 @@ impl LoopRuntimeClient {
         args: &LoopArgs,
     ) -> Result<ListConversationsResponse> {
         let agent = self.agent_by_slug(project_id, &args.agent).await?;
-        let response = self
-            .exo_request(
-                project_id,
-                ExoRequest::ListConversations {
-                    agent_id: agent.id.clone(),
-                    request: ListConversationsRequest {
-                        cursor: None,
-                        limit: Some(args.limit),
-                    },
-                },
-            )
+        let response: ListConversationsResponse = self
+            .get(&format!(
+                "/agent/{}/conversation?limit={}",
+                encode(&agent.id),
+                args.limit,
+            ))
             .await
             .map_err(|err| LoopCommandError::new("failed to list Loop conversations", err))?;
-        match response {
-            ExoResponse::Conversations { result } => Ok(ListConversationsResponse {
-                agent,
-                conversations: result
-                    .conversations
-                    .into_iter()
-                    .map(|conversation| conversation.record)
-                    .collect(),
-                next_cursor: result.next_cursor,
-            }),
-            response => Err(LoopCommandError::new(
-                "failed to list Loop conversations",
-                LoopRuntimeRequestError::new(format!(
-                    "Loop Runtime returned unexpected Exo response: {}",
-                    response.response_type()
-                ))
-                .into(),
-            )
-            .into()),
-        }
+        Ok(response)
     }
 
     async fn get_conversation_events(
         &self,
-        project_id: &str,
         agent_id: &str,
         conversation_id: &str,
     ) -> Result<GetConversationEventsResponse> {
         let response = self
-            .exo_request(
-                project_id,
-                ExoRequest::ConversationGetEvents {
-                    agent_id: agent_id.to_string(),
-                    conversation_id: conversation_id.to_string(),
-                    query: Some(EventQuery {
-                        cursor: None,
-                        direction: Some(EventQueryDirection::Asc),
-                        limit: None,
-                        session_id: None,
-                        turn_id: None,
-                        types: None,
-                    }),
-                },
-            )
+            .get(&format!(
+                "/agent/{}/conversation/{}/event",
+                encode(agent_id),
+                encode(conversation_id),
+            ))
             .await
             .map_err(|err| LoopCommandError::new("failed to load Loop conversation", err))?;
-        match response {
-            ExoResponse::Events { result } => Ok(GetConversationEventsResponse {
-                events: result.events,
-                cursor: result.cursor,
-            }),
-            response => Err(LoopCommandError::new(
-                "failed to load Loop conversation",
-                LoopRuntimeRequestError::new(format!(
-                    "Loop Runtime returned unexpected Exo response: {}",
-                    response.response_type()
-                ))
-                .into(),
-            )
-            .into()),
-        }
+        Ok(response)
     }
 
     async fn agent_by_slug(&self, project_id: &str, slug: &str) -> Result<AgentRecord> {
-        let response = self
-            .exo_request(project_id, ExoRequest::ListAgents)
+        let response: ListAgentsResponse = self
+            .get(&format!(
+                "/agent?project_id={}&slug={}",
+                encode(project_id),
+                encode(slug),
+            ))
             .await
             .map_err(|err| LoopCommandError::new("failed to list Loop agents", err))?;
-        let ExoResponse::Agents { agents } = response else {
-            return Err(LoopCommandError::new(
-                "failed to list Loop agents",
-                LoopRuntimeRequestError::new("Loop Runtime returned unexpected Exo response")
-                    .into(),
-            )
-            .into());
-        };
-        agents
+        response
+            .agents
             .into_iter()
             .find(|agent| agent.slug == slug)
             .ok_or_else(|| {
@@ -749,53 +1008,25 @@ impl LoopRuntimeClient {
 
     async fn submit_turn(
         &self,
-        project_id: &str,
         agent_id: &str,
         conversation_id: &str,
+        parent: Option<&str>,
         body: SubmitTurnBody<'_>,
     ) -> Result<SubmitTurnResponse> {
         self.post(
             &format!(
-                "/project/{}/runtime/agents/{}/conversations/{}/turns",
-                encode(project_id),
+                "/agent/{}/conversation/{}/turn",
                 encode(agent_id),
                 encode(conversation_id)
             ),
-            &body,
+            &SubmitTurnBodyWithParent { parent, body },
         )
         .await
         .map_err(|err| LoopCommandError::new("failed to submit Loop turn", err).into())
     }
 
-    async fn exo_request(&self, project_id: &str, request: ExoRequest) -> Result<ExoResponse> {
-        let message = ExoClientMessage::Request { id: 1, request };
-        let response: ExoServerMessage = self
-            .post(
-                &format!("/project/{}/exo/request", encode(project_id)),
-                &message,
-            )
-            .await?;
-        let ExoServerMessage::Response {
-            ok,
-            response,
-            error,
-            ..
-        } = response;
-        if !ok {
-            return Err(LoopRuntimeRequestError::new(format!(
-                "Loop Runtime Exo request failed: {}",
-                error.unwrap_or_else(|| "unknown error".to_string())
-            ))
-            .into());
-        }
-        response.ok_or_else(|| {
-            LoopRuntimeRequestError::new("Loop Runtime Exo response was empty").into()
-        })
-    }
-
     async fn watch_events<F>(
         &self,
-        project_id: &str,
         agent_id: &str,
         conversation_id: &str,
         after: Option<&str>,
@@ -805,8 +1036,7 @@ impl LoopRuntimeClient {
         F: FnMut(RuntimeEvent) -> Result<bool>,
     {
         let mut url = reqwest::Url::parse(&self.url(&format!(
-            "/project/{}/runtime/agents/{}/conversations/{}/events/watch",
-            encode(project_id),
+            "/agent/{}/conversation/{}/event/watch",
             encode(agent_id),
             encode(conversation_id)
         )))?;
@@ -913,6 +1143,26 @@ impl LoopRuntimeClient {
                 )
             })?;
         parse_loop_runtime_response(response, "POST", &url).await
+    }
+
+    async fn get<T>(&self, path: &str) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let url = self.url(path);
+        let response = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|err| {
+                LoopRuntimeRequestError::with_source(
+                    format!("Loop Runtime request failed: GET {url}"),
+                    err,
+                )
+            })?;
+        parse_loop_runtime_response(response, "GET", &url).await
     }
 
     fn url(&self, path: &str) -> String {
@@ -1097,114 +1347,20 @@ struct LoopChatReport {
     ended_with_error: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize)]
+struct ListAgentsResponse {
+    agents: Vec<AgentRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ListConversationsResponse {
     agent: AgentRecord,
     conversations: Vec<ConversationRecord>,
     next_cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct GetConversationEventsResponse {
-    events: Vec<RuntimeEvent>,
-    cursor: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ExoClientMessage {
-    Request { id: u64, request: ExoRequest },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ExoRequest {
-    ListAgents,
-    ListConversations {
-        agent_id: String,
-        request: ListConversationsRequest,
-    },
-    ConversationGetEvents {
-        agent_id: String,
-        conversation_id: String,
-        query: Option<EventQuery>,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct ListConversationsRequest {
-    cursor: Option<String>,
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct EventQuery {
-    cursor: Option<String>,
-    direction: Option<EventQueryDirection>,
-    limit: Option<u32>,
-    session_id: Option<String>,
-    turn_id: Option<String>,
-    types: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum EventQueryDirection {
-    Asc,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ExoServerMessage {
-    Response {
-        #[serde(rename = "id")]
-        _id: u64,
-        ok: bool,
-        response: Option<ExoResponse>,
-        error: Option<String>,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ExoResponse {
-    Agents {
-        agents: Vec<AgentRecord>,
-    },
-    Conversations {
-        result: ExoListConversationsResult,
-    },
-    Events {
-        result: ExoEventsResult,
-    },
-    #[serde(other)]
-    Unknown,
-}
-
-impl ExoResponse {
-    fn response_type(&self) -> &'static str {
-        match self {
-            Self::Agents { .. } => "agents",
-            Self::Conversations { .. } => "conversations",
-            Self::Events { .. } => "events",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ExoListConversationsResult {
-    conversations: Vec<ConversationHandleInfo>,
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConversationHandleInfo {
-    record: ConversationRecord,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExoEventsResult {
     events: Vec<RuntimeEvent>,
     cursor: Option<String>,
 }
@@ -1307,6 +1463,14 @@ struct SubmitTurnBody<'a> {
     harness: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitTurnBodyWithParent<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<&'a str>,
+    #[serde(flatten)]
+    body: SubmitTurnBody<'a>,
 }
 
 #[derive(Default)]
@@ -1505,7 +1669,7 @@ mod tests {
     fn loop_runtime_url_defaults_to_api_proxy_path() {
         assert_eq!(
             resolve_loop_runtime_url("http://localhost:8000/", None).expect("runtime URL"),
-            "http://localhost:8000/loop-runtime"
+            "http://localhost:8000/loop/runtime"
         );
     }
 
@@ -1519,6 +1683,123 @@ mod tests {
             .expect("runtime URL"),
             "https://loop-runtime.example.test"
         );
+    }
+
+    #[test]
+    fn loop_trace_parent_auto_matches_braintrust_data_planes() {
+        assert_eq!(
+            resolve_loop_trace_parent_config(
+                "https://api.braintrust.dev/",
+                TraceParentModeArg::Auto,
+                None,
+                None,
+            )
+            .expect("trace parent"),
+            TraceParentConfig::UiLogging {
+                project_id: OPTIMIZATION_PROJECT_ID.to_string()
+            }
+        );
+        assert_eq!(
+            resolve_loop_trace_parent_config(
+                "https://api-eu.braintrust.dev",
+                TraceParentModeArg::Auto,
+                None,
+                None,
+            )
+            .expect("trace parent"),
+            TraceParentConfig::UiLogging {
+                project_id: OPTIMIZATION_PROJECT_ID.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn loop_trace_parent_auto_omits_unknown_data_planes() {
+        assert_eq!(
+            resolve_loop_trace_parent_config(
+                "https://runtime.example.test",
+                TraceParentModeArg::Auto,
+                None,
+                None,
+            )
+            .expect("trace parent"),
+            TraceParentConfig::None
+        );
+    }
+
+    #[test]
+    fn loop_trace_parent_can_be_forced_or_disabled() {
+        assert_eq!(
+            resolve_loop_trace_parent_config(
+                "https://runtime.example.test",
+                TraceParentModeArg::Always,
+                None,
+                None,
+            )
+            .expect("trace parent"),
+            TraceParentConfig::UiLogging {
+                project_id: OPTIMIZATION_PROJECT_ID.to_string()
+            }
+        );
+        assert_eq!(
+            resolve_loop_trace_parent_config(
+                "https://api.braintrust.dev",
+                TraceParentModeArg::Never,
+                None,
+                None,
+            )
+            .expect("trace parent"),
+            TraceParentConfig::None
+        );
+    }
+
+    #[test]
+    fn loop_trace_parent_explicit_override_wins() {
+        assert_eq!(
+            resolve_loop_trace_parent_config(
+                "https://runtime.example.test",
+                TraceParentModeArg::Never,
+                Some(" project_name:test-project "),
+                Some("custom-project-id"),
+            )
+            .expect("trace parent"),
+            TraceParentConfig::Explicit("project_name:test-project".to_string())
+        );
+    }
+
+    #[test]
+    fn loop_trace_project_id_customizes_ui_logging_destination() {
+        assert_eq!(
+            resolve_loop_trace_parent_config(
+                "https://runtime.example.test",
+                TraceParentModeArg::Always,
+                None,
+                Some(" custom-project-id "),
+            )
+            .expect("trace parent"),
+            TraceParentConfig::UiLogging {
+                project_id: "custom-project-id".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn loop_logging_parent_round_trips_as_project_logs_span() {
+        let parent = loop_logging_parent(
+            "custom-project-id",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "root-span-id",
+            "span-id",
+        );
+        let parsed = SpanComponents::parse(&parent).expect("span parent");
+        assert_eq!(parsed.object_type, SpanObjectType::ProjectLogs);
+        assert_eq!(parsed.object_id.as_deref(), Some("custom-project-id"));
+        assert_eq!(
+            parsed.row_id.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert_eq!(parsed.root_span_id.as_deref(), Some("root-span-id"));
+        assert_eq!(parsed.span_id.as_deref(), Some("span-id"));
     }
 
     #[test]
