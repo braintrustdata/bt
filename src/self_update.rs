@@ -13,9 +13,9 @@ use crate::http::DEFAULT_HTTP_TIMEOUT;
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
-  bt self update
-  bt self update --check
-  bt self update --channel canary
+  bt update
+  bt update --check
+  bt update --channel canary
 ")]
 pub struct SelfArgs {
     #[command(subcommand)]
@@ -388,7 +388,7 @@ fn stable_is_up_to_date(current: &str, release_tag: &str) -> bool {
 }
 
 fn canary_check_message(latest: &str) -> String {
-    format!("latest canary release: {latest}\nrun `bt self update --channel canary` to install it")
+    format!("latest canary release: {latest}\nrun `bt update --channel canary` to install it")
 }
 
 fn parse_update_channel(raw: Option<&str>) -> Option<UpdateChannel> {
@@ -500,7 +500,7 @@ mod tests {
     fn canary_check_message_contains_guidance() {
         let msg = canary_check_message("0.10.0-canary.abc123def456");
         assert!(msg.contains("0.10.0-canary.abc123def456"));
-        assert!(msg.contains("bt self update --channel canary"));
+        assert!(msg.contains("bt update --channel canary"));
     }
 
     #[test]

@@ -143,5 +143,5 @@ jobs:
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
           bt --version
           bt --help >/dev/null
-          bt self update --check --channel stable
-          bt self update --check --channel canary
+          bt update --check --channel stable
+          bt update --check --channel canary
