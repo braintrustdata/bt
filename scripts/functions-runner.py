@@ -14,6 +14,7 @@ from python_runner_common import (
     purge_local_modules,
     python_version,
     resolve_module_info,
+    strip_extended_length_prefix,
 )
 
 
@@ -286,7 +287,7 @@ async def collect_function_event_entries(prompts_registry: Any) -> list[dict[str
 
 
 async def process_file(file_path: str) -> dict[str, Any]:
-    abs_path = os.path.abspath(file_path)
+    abs_path = os.path.abspath(strip_extended_length_prefix(file_path))
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)

@@ -5,15 +5,28 @@ import sys
 from types import ModuleType
 
 
+def strip_extended_length_prefix(path: str) -> str:
+    r"""Strip a Windows ``\\?\`` extended-length (verbatim) prefix.
+
+    Verbatim drives (``\\?\C:``) read as different from ``C:`` under
+    ``os.path.commonpath``, so cwd comparisons drop every source.
+    """
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[len("\\\\?\\UNC\\") :]
+    if path.startswith("\\\\?\\"):
+        return path[len("\\\\?\\") :]
+    return path
+
+
 def normalize_file_list(files: list[str]) -> list[str]:
     unique: set[str] = set()
     for file_path in files:
-        unique.add(os.path.abspath(file_path))
+        unique.add(os.path.abspath(strip_extended_length_prefix(file_path)))
     return sorted(unique)
 
 
 def resolve_module_info(in_file: str) -> tuple[str, list[str]]:
-    in_file = os.path.abspath(in_file)
+    in_file = os.path.abspath(strip_extended_length_prefix(in_file))
     module_dir = os.path.dirname(in_file)
     module_name = os.path.splitext(os.path.basename(in_file))[0]
 
@@ -71,7 +84,8 @@ def purge_local_modules(cwd: str, preserve_modules: set[str] | None = None) -> N
 
 def collect_python_sources(cwd: str, input_file: str) -> list[str]:
     sources: set[str] = set()
-    input_abs = os.path.abspath(input_file)
+    cwd = strip_extended_length_prefix(cwd)
+    input_abs = os.path.abspath(strip_extended_length_prefix(input_file))
     sources.add(input_abs)
 
     for module in list(sys.modules.values()):

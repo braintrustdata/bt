@@ -1159,7 +1159,7 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     let mut python = BTreeSet::new();
     let mut allowed_roots = BTreeSet::new();
     if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(canonical_cwd) = cwd.canonicalize() {
+        if let Ok(canonical_cwd) = dunce::canonicalize(&cwd) {
             allowed_roots.insert(canonical_cwd);
         }
     }
@@ -1183,8 +1183,7 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
 
         if path.is_file() {
             explicit_file_inputs += 1;
-            let canonical = path
-                .canonicalize()
+            let canonical = dunce::canonicalize(&path)
                 .with_context(|| format!("failed to canonicalize file {}", path.display()))?;
             let parent = canonical
                 .parent()
@@ -1207,8 +1206,7 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
             continue;
         }
 
-        let canonical_dir = path
-            .canonicalize()
+        let canonical_dir = dunce::canonicalize(&path)
             .with_context(|| format!("failed to canonicalize directory {}", path.display()))?;
         allowed_roots.insert(canonical_dir.clone());
         collect_from_dir(&canonical_dir, &mut js_like, &mut python)?;
@@ -1259,8 +1257,7 @@ fn collect_from_dir_inner(
         if file_type.is_dir() && !file_type.is_symlink() {
             collect_from_dir_inner(&path, js_like, python, depth + 1)?;
         } else if file_type.is_file() {
-            let canonical = path
-                .canonicalize()
+            let canonical = dunce::canonicalize(&path)
                 .with_context(|| format!("failed to canonicalize file {}", path.display()))?;
             match classify_source_file(&canonical) {
                 Some(SourceLanguage::JsLike) => {
@@ -1337,9 +1334,8 @@ fn validate_manifest_paths(
     let mut seen = BTreeSet::new();
 
     for file in &manifest.files {
-        let path = PathBuf::from(&file.source_file)
-            .canonicalize()
-            .map_err(|err| FileFailure {
+        let path =
+            dunce::canonicalize(PathBuf::from(&file.source_file)).map_err(|err| FileFailure {
                 reason: HardFailureReason::ManifestPathMissing,
                 message: format!("manifest source file missing: {} ({err})", file.source_file),
             })?;
@@ -1424,7 +1420,7 @@ fn validate_python_bundle(
 
     let mut sources = BTreeSet::new();
     for raw_source in &python_bundle.sources {
-        let canonical = PathBuf::from(raw_source).canonicalize().with_context(|| {
+        let canonical = dunce::canonicalize(PathBuf::from(raw_source)).with_context(|| {
             format!(
                 "manifest file '{}' referenced missing python source {}",
                 manifest_file.source_file, raw_source
@@ -2030,8 +2026,7 @@ fn collect_regular_files_recursive_impl(
 }
 
 fn validate_requirements_path(path: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
-    let canonical = path
-        .canonicalize()
+    let canonical = dunce::canonicalize(path)
         .with_context(|| format!("requirements file not found: {}", path.display()))?;
     if !canonical.is_file() {
         bail!("requirements path is not a file: {}", canonical.display());
@@ -2172,8 +2167,7 @@ fn resolve_requirement_path(reference: &str, parent: &Path) -> Result<PathBuf> {
     } else {
         parent.join(candidate)
     };
-    absolute
-        .canonicalize()
+    dunce::canonicalize(&absolute)
         .with_context(|| format!("failed to resolve requirements reference {}", normalized))
 }
 
@@ -3164,8 +3158,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.js");
         std::fs::write(&source, "export const x = 1;\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3201,8 +3195,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.py");
         std::fs::write(&source, "VALUE = 1\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3246,8 +3240,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.py");
         std::fs::write(&source, "VALUE = 1\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3292,8 +3286,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.py");
         std::fs::write(&source, "VALUE = 1\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3341,8 +3335,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join(filename);
         std::fs::write(&source, "VALUE = 1\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3545,8 +3539,8 @@ mod tests {
         let mut python = BTreeSet::new();
         collect_from_dir(&root, &mut js_like, &mut python).expect("collect sources");
 
-        let inside = inside.canonicalize().expect("canonicalize inside");
-        let outside = outside.canonicalize().expect("canonicalize outside");
+        let inside = dunce::canonicalize(&inside).expect("canonicalize inside");
+        let outside = dunce::canonicalize(&outside).expect("canonicalize outside");
         assert!(js_like.contains(&inside));
         assert!(
             !js_like.contains(&outside),
@@ -3583,6 +3577,37 @@ mod tests {
                 .is_none_or(|value| value != "outside-link.txt")),
             "collector must skip symlink file entries"
         );
+    }
+
+    #[test]
+    fn collect_classified_files_yields_non_verbatim_paths() {
+        // On Windows `Path::canonicalize` emits `\\?\` verbatim paths the Python
+        // runner can't reconcile against a clean cwd; `dunce` must strip them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("scorer.py");
+        std::fs::write(&source, "x = 1\n").expect("write source");
+
+        let classified =
+            collect_classified_files(std::slice::from_ref(&source)).expect("collect classified");
+        assert_eq!(classified.python.len(), 1, "expected the python source");
+
+        let collected = &classified.python[0];
+        assert!(collected.is_file(), "collected path must resolve to a file");
+        assert!(
+            !collected.to_string_lossy().starts_with(r"\\?\"),
+            "collected path must not carry a verbatim prefix, got {}",
+            collected.display()
+        );
+
+        // Allowed roots must be verbatim-free too, so the runner's clean
+        // cwd-based comparisons keep matching.
+        for root in &classified.allowed_roots {
+            assert!(
+                !root.to_string_lossy().starts_with(r"\\?\"),
+                "allowed root must not carry a verbatim prefix, got {}",
+                root.display()
+            );
+        }
     }
 
     fn test_base_args() -> BaseArgs {
