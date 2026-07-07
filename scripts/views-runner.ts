@@ -105,18 +105,6 @@ async function loadEsbuild(sourceFiles: string[]): Promise<EsbuildModule> {
   );
 }
 
-function loadTsconfigPath(): string | undefined {
-  const tsNode = process.env.TS_NODE_PROJECT?.trim();
-  if (tsNode) {
-    return tsNode;
-  }
-  const tsx = process.env.TSX_TSCONFIG_PATH?.trim();
-  if (tsx) {
-    return tsx;
-  }
-  return undefined;
-}
-
 function sdkPath(): string {
   return process.env.BT_VIEWS_SDK_PATH || path.join(__dirname, "views-sdk.ts");
 }
@@ -357,7 +345,6 @@ async function bundleForDiscovery(
   esbuild: EsbuildModule,
   sourceFile: string,
   outputFile: string,
-  tsconfig: string | undefined,
 ): Promise<EsbuildBuildResult> {
   return await esbuild.build({
     entryPoints: [sourceFile],
@@ -366,7 +353,6 @@ async function bundleForDiscovery(
     platform: "node",
     target: "node18",
     format: "cjs",
-    tsconfig,
     write: true,
     metafile: true,
     plugins: [braintrustViewPlugin()],
@@ -377,7 +363,6 @@ async function collectView(
   esbuild: EsbuildModule,
   sourceFile: string,
   tempDir: string,
-  tsconfig: string | undefined,
 ): Promise<{ view: CustomViewDefinition; dependencies: string[] }> {
   installDiscoveryReactStub();
   const outputFile = path.join(
@@ -388,7 +373,6 @@ async function collectView(
     esbuild,
     sourceFile,
     outputFile,
-    tsconfig,
   );
   const loaded = await import(
     `${pathToFileURL(outputFile).href}?bt_view_nonce=${Date.now()}`
@@ -413,7 +397,6 @@ async function bundleBrowserCode(
   sourceFile: string,
   view: CustomViewDefinition,
   tempDir: string,
-  tsconfig: string | undefined,
 ): Promise<{ code: string; dependencies: string[] }> {
   const entryFile = path.join(
     tempDir,
@@ -433,7 +416,6 @@ async function bundleBrowserCode(
     target: "es2019",
     format: "iife",
     globalName: "__BraintrustCustomView",
-    tsconfig,
     write: true,
     metafile: true,
     treeShaking: true,
@@ -483,7 +465,6 @@ function dependencyFiles(
 async function buildManifest(files: string[]): Promise<Manifest> {
   const sourceFiles = files.map((file) => path.resolve(file));
   const esbuild = await loadEsbuild(sourceFiles);
-  const tsconfig = loadTsconfigPath();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "bt-views-"));
 
   try {
@@ -499,13 +480,12 @@ async function buildManifest(files: string[]): Promise<Manifest> {
       if (!fs.existsSync(sourceFile)) {
         throw new Error(`custom view file not found: ${sourceFile}`);
       }
-      const collected = await collectView(esbuild, sourceFile, tempDir, tsconfig);
+      const collected = await collectView(esbuild, sourceFile, tempDir);
       const bundled = await bundleBrowserCode(
         esbuild,
         sourceFile,
         collected.view,
         tempDir,
-        tsconfig,
       );
       const dependencies = [
         ...new Set([...collected.dependencies, ...bundled.dependencies]),

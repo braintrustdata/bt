@@ -60,9 +60,6 @@ enum ViewsCommands {
     Trace(TraceViewsArgs),
     /// Work with dataset custom views
     Dataset(DatasetViewsArgs),
-    /// Preview one custom view locally
-    #[command(hide = true)]
-    Preview(ViewsPreviewArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -88,14 +85,6 @@ struct ViewsPushArgs {
         default_value = "error"
     )]
     if_exists: IfExistsMode,
-
-    /// Override JS runner binary (e.g. tsx, vite-node, deno).
-    #[arg(long, env = "BT_VIEWS_PUSH_RUNNER", value_name = "RUNNER")]
-    runner: Option<String>,
-
-    /// Optional tsconfig path for JS runner and browser bundling.
-    #[arg(long, env = "BT_VIEWS_PUSH_TSCONFIG", value_name = "PATH")]
-    tsconfig: Option<PathBuf>,
 
     /// Skip confirmation prompt.
     #[arg(
@@ -231,14 +220,6 @@ struct PreviewCommonArgs {
         default_value_t = false
     )]
     no_open: bool,
-
-    /// Override JS runner binary (e.g. tsx, vite-node, deno).
-    #[arg(long, env = "BT_VIEWS_PREVIEW_RUNNER", value_name = "RUNNER")]
-    runner: Option<String>,
-
-    /// Optional tsconfig path for JS runner and browser bundling.
-    #[arg(long, env = "BT_VIEWS_PREVIEW_TSCONFIG", value_name = "PATH")]
-    tsconfig: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -248,15 +229,6 @@ struct TraceViewPreviewArgs {
 
     #[command(flatten)]
     target: TracePreviewTargetArgs,
-
-    /// Print BTQL queries used for preview data.
-    #[arg(
-        long,
-        env = "BT_VIEWS_PREVIEW_PRINT_QUERIES",
-        value_parser = BoolishValueParser::new(),
-        default_value_t = false
-    )]
-    print_queries: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -264,10 +236,6 @@ struct TracePreviewTargetArgs {
     /// Braintrust app URL to resolve trace preview data from.
     #[arg(long, env = "BT_VIEWS_PREVIEW_URL")]
     url: Option<String>,
-
-    /// Object reference, format: project_logs:<project_id>.
-    #[arg(long, env = "BT_VIEWS_PREVIEW_OBJECT_REF")]
-    object_ref: Option<String>,
 
     /// Project ID to query for trace preview data.
     #[arg(long, env = "BT_VIEWS_PREVIEW_PROJECT_ID")]
@@ -308,27 +276,6 @@ struct DatasetPreviewTargetArgs {
     /// Dataset row index for dataset preview data.
     #[arg(long, env = "BT_VIEWS_PREVIEW_ROW_INDEX")]
     row_index: Option<usize>,
-}
-
-#[derive(Debug, Clone, Args)]
-struct ViewsPreviewArgs {
-    #[command(flatten)]
-    common: PreviewCommonArgs,
-
-    #[command(flatten)]
-    trace: TracePreviewTargetArgs,
-
-    #[command(flatten)]
-    dataset: DatasetPreviewTargetArgs,
-
-    /// Print BTQL queries used for preview data.
-    #[arg(
-        long,
-        env = "BT_VIEWS_PREVIEW_PRINT_QUERIES",
-        value_parser = BoolishValueParser::new(),
-        default_value_t = false
-    )]
-    print_queries: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,8 +384,6 @@ struct PreviewSource {
     path: PathBuf,
     view: Option<String>,
     view_type: Option<ViewType>,
-    runner: Option<String>,
-    tsconfig: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,7 +408,6 @@ pub async fn run(base: BaseArgs, args: ViewsArgs) -> Result<()> {
                 preview_dataset(base, preview_args).await
             }
         },
-        ViewsCommands::Preview(preview_args) => preview(base, preview_args).await,
     }
 }
 
@@ -929,7 +873,7 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
         bail!("no custom view files found; expected files matching {VIEW_FILE_PATTERN_HELP}");
     }
 
-    let manifest = run_views_runner(args.runner.as_deref(), args.tsconfig.as_deref(), &files)?;
+    let manifest = run_views_runner(&files)?;
     validate_manifest_runtime(&manifest)?;
     let prepared = prepare_views(&auth_ctx.client, &default_project, &manifest).await?;
     if prepared.is_empty() {
@@ -987,51 +931,6 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
     Ok(())
 }
 
-async fn preview(base: BaseArgs, args: ViewsPreviewArgs) -> Result<()> {
-    let context =
-        resolve_preview_context(&base, &args.common, None, args.trace.url.as_deref()).await?;
-    match context.entry.view_type {
-        ViewType::Trace => {
-            let trace_data = build_trace_preview_data(
-                &context.client,
-                context.project.as_ref(),
-                &args.trace,
-                args.print_queries,
-            )
-            .await?;
-            serve_preview(
-                base,
-                &args.common,
-                context.client,
-                Some(trace_data.project_id),
-                context.entry,
-                context.dependency_paths,
-                trace_data.data,
-            )
-            .await
-        }
-        ViewType::Dataset => {
-            let project = context
-                .project
-                .as_ref()
-                .ok_or_else(|| anyhow!("dataset preview requires a project"))?;
-            let preview_data =
-                build_dataset_preview_data(&context.client, project, &context.entry, &args.dataset)
-                    .await?;
-            serve_preview(
-                base,
-                &args.common,
-                context.client,
-                None,
-                context.entry,
-                context.dependency_paths,
-                preview_data,
-            )
-            .await
-        }
-    }
-}
-
 async fn preview_trace(base: BaseArgs, args: TraceViewPreviewArgs) -> Result<()> {
     let context = resolve_preview_context(
         &base,
@@ -1040,13 +939,8 @@ async fn preview_trace(base: BaseArgs, args: TraceViewPreviewArgs) -> Result<()>
         args.target.url.as_deref(),
     )
     .await?;
-    let trace_data = build_trace_preview_data(
-        &context.client,
-        context.project.as_ref(),
-        &args.target,
-        args.print_queries,
-    )
-    .await?;
+    let trace_data =
+        build_trace_preview_data(&context.client, context.project.as_ref(), &args.target).await?;
     serve_preview(
         base,
         &args.common,
@@ -1099,7 +993,7 @@ async fn resolve_preview_context(
         bail!("custom view preview path must match {VIEW_FILE_PATTERN_HELP}");
     }
     let files = vec![args.path.clone()];
-    let manifest = run_views_runner(args.runner.as_deref(), args.tsconfig.as_deref(), &files)?;
+    let manifest = run_views_runner(&files)?;
     validate_manifest_runtime(&manifest)?;
     let entry = select_preview_entry(&manifest, args.view.as_deref(), view_type)?.clone();
     let dependency_paths = preview_dependency_paths(&manifest);
@@ -1150,8 +1044,6 @@ async fn serve_preview(
             path: args.path.clone(),
             view: args.view.clone(),
             view_type: Some(entry.view_type),
-            runner: args.runner.clone(),
-            tsconfig: args.tsconfig.clone(),
         },
         title: entry.name.clone(),
         dependency_paths: Mutex::new(dependency_paths),
@@ -1255,7 +1147,7 @@ async fn preview_span_fields(
 
     for span_id in &body.span_ids {
         let row_id = resolve_preview_row_id(&spans, span_id).unwrap_or_else(|| span_id.clone());
-        match fetch_full_span_row(&state.client, project_id, &row_id, false).await {
+        match fetch_full_span_row(&state.client, project_id, &row_id).await {
             Ok(Some(row)) => {
                 response.insert(
                     span_id.clone(),
@@ -1278,7 +1170,7 @@ async fn preview_span_fields(
 
 fn load_preview_page(source: &PreviewSource) -> Result<PreviewPage> {
     let files = vec![source.path.clone()];
-    let manifest = run_views_runner(source.runner.as_deref(), source.tsconfig.as_deref(), &files)?;
+    let manifest = run_views_runner(&files)?;
     validate_manifest_runtime(&manifest)?;
     let entry = select_preview_entry(&manifest, source.view.as_deref(), source.view_type)?;
     let dependency_paths = preview_dependency_paths(&manifest);
@@ -1307,9 +1199,6 @@ fn preview_source_version(source: &PreviewSource, dependency_paths: &[PathBuf]) 
         if dependency != &source.path {
             push_preview_file_version(&mut parts, dependency);
         }
-    }
-    if let Some(tsconfig) = &source.tsconfig {
-        push_preview_file_version(&mut parts, tsconfig);
     }
     parts.join("|")
 }
@@ -1596,11 +1485,7 @@ fn is_view_file(path: &Path) -> bool {
     .any(|suffix| name.ends_with(suffix))
 }
 
-fn run_views_runner(
-    runner: Option<&str>,
-    tsconfig: Option<&Path>,
-    files: &[PathBuf],
-) -> Result<ViewsManifest> {
+fn run_views_runner(files: &[PathBuf]) -> Result<ViewsManifest> {
     let sdk_script = js_runner::materialize_runner_script_in_cwd(
         "views-runners",
         VIEWS_JS_SDK_FILE,
@@ -1613,12 +1498,8 @@ fn run_views_runner(
         VIEWS_JS_RUNNER_SOURCE,
     )
     .context("failed to materialize custom views runner")?;
-    let mut command = js_runner::build_js_runner_command(runner, &runner_script, files);
+    let mut command = js_runner::build_js_runner_command(None, &runner_script, files);
     command.env("BT_VIEWS_SDK_PATH", &sdk_script);
-    if let Some(tsconfig) = tsconfig {
-        command.env("TS_NODE_PROJECT", tsconfig);
-        command.env("TSX_TSCONFIG_PATH", tsconfig);
-    }
 
     let output = command.output().with_context(|| {
         format!(
@@ -2018,7 +1899,6 @@ async fn build_trace_preview_data(
     client: &ApiClient,
     project: Option<&Project>,
     args: &TracePreviewTargetArgs,
-    print_queries: bool,
 ) -> Result<TracePreviewData> {
     let target = resolve_trace_preview_target(client, project, args).await?;
     let rows = fetch_trace_rows(
@@ -2026,7 +1906,6 @@ async fn build_trace_preview_data(
         &target.project_id,
         &target.root_span_id,
         DEFAULT_TRACE_PREVIEW_LIMIT,
-        print_queries,
     )
     .await?;
     if rows.is_empty() {
@@ -2093,22 +1972,13 @@ async fn resolve_trace_preview_target(
         });
     }
 
-    let project_id = if let Some(object_ref) = args.object_ref.as_deref() {
-        let (object_type, object_name) = object_ref.split_once(':').ok_or_else(|| {
-            anyhow!("invalid --object-ref '{object_ref}', expected project_logs:<project_id>")
+    let project_id = args
+        .project_id
+        .clone()
+        .or_else(|| default_project.map(|project| project.id.clone()))
+        .ok_or_else(|| {
+            anyhow!("trace preview requires --project-id or --project when --trace-id is used")
         })?;
-        if object_type != "project_logs" {
-            bail!("bt views preview currently supports project_logs object refs");
-        }
-        object_name.to_string()
-    } else {
-        args.project_id
-            .clone()
-            .or_else(|| default_project.map(|project| project.id.clone()))
-            .ok_or_else(|| {
-                anyhow!("trace preview requires --project-id or --project when --trace-id is used")
-            })?
-    };
     let root_span_id = args
         .trace_id
         .clone()
@@ -2183,7 +2053,6 @@ async fn fetch_trace_rows(
     project_id: &str,
     root_span_id: &str,
     limit: usize,
-    print_queries: bool,
 ) -> Result<Vec<Map<String, Value>>> {
     let query = format!(
         "select: * | from: project_logs({}) spans | filter: root_span_id = {} | preview_length: 125 | sort: _pagination_key ASC | limit: {}",
@@ -2191,7 +2060,6 @@ async fn fetch_trace_rows(
         sql_quote(root_span_id),
         limit,
     );
-    maybe_print_query(print_queries, "custom-view-preview-trace", &query);
     execute_query(client, &query)
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
@@ -2202,14 +2070,12 @@ async fn fetch_full_span_row(
     client: &ApiClient,
     project_id: &str,
     row_id: &str,
-    print_queries: bool,
 ) -> Result<Option<Map<String, Value>>> {
     let query = format!(
         "select: * | from: project_logs({}) spans | filter: id = {} | preview_length: -1 | limit: 1",
         sql_quote(project_id),
         sql_quote(row_id),
     );
-    maybe_print_query(print_queries, "custom-view-preview-span-fields", &query);
     execute_query(client, &query)
         .await
         .with_context(|| format!("BTQL query failed: {query}"))
@@ -2229,12 +2095,6 @@ async fn execute_query(client: &ApiClient, query: &str) -> Result<BtqlResponse> 
         vec![("x-bt-org-name", org_name)]
     };
     client.post_with_headers("/btql", &body, &headers).await
-}
-
-fn maybe_print_query(enabled: bool, label: &str, query: &str) {
-    if enabled {
-        eprintln!("bt views [{label}] BTQL:\n{query}\n");
-    }
 }
 
 fn sql_quote(value: &str) -> String {
@@ -2463,8 +2323,6 @@ mod tests {
             path: path.clone(),
             view: None,
             view_type: Some(ViewType::Trace),
-            runner: None,
-            tsconfig: None,
         };
 
         let before = preview_source_version(&source, &[]);
@@ -2490,8 +2348,6 @@ mod tests {
             path,
             view: None,
             view_type: Some(ViewType::Trace),
-            runner: None,
-            tsconfig: None,
         };
 
         let dependency_paths = vec![dependency.clone()];
@@ -2542,7 +2398,6 @@ mod tests {
                 url: Some(format!(
                     "https://www.braintrust.dev/app/test-org/p/{project_id}/logs?r=root-span&s=selected-span"
                 )),
-                object_ref: None,
                 project_id: None,
                 trace_id: None,
                 span_id: None,
@@ -2565,7 +2420,6 @@ mod tests {
             Some(&project),
             &TracePreviewTargetArgs {
                 url: Some("https://www.braintrust.dev/app/test-org/logs?r=root-span".to_string()),
-                object_ref: None,
                 project_id: None,
                 trace_id: None,
                 span_id: Some("selected-span".to_string()),
@@ -2587,7 +2441,6 @@ mod tests {
             None,
             &TracePreviewTargetArgs {
                 url: Some("https://www.braintrust.dev/app/test-org/logs?r=root-span".to_string()),
-                object_ref: None,
                 project_id: None,
                 trace_id: None,
                 span_id: None,

@@ -144,8 +144,7 @@ fn views_push_help_lists_custom_view_flags() {
         .args(["views", "push", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--if-exists"))
-        .stdout(predicate::str::contains("--tsconfig"));
+        .stdout(predicate::str::contains("--if-exists"));
 }
 
 #[test]
@@ -170,6 +169,14 @@ fn views_dataset_preview_help_lists_dataset_selectors() {
         .stdout(predicate::str::contains("--trace-id").not())
         .stdout(predicate::str::contains("--url").not())
         .stdout(predicate::str::contains("--row-index"));
+}
+
+#[test]
+fn views_preview_hidden_aggregate_command_is_removed() {
+    bt_command()
+        .args(["views", "preview", "--help"])
+        .assert()
+        .failure();
 }
 
 #[test]
