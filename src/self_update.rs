@@ -139,7 +139,7 @@ fn ensure_installer_managed_install() -> Result<()> {
     }
 
     anyhow::bail!(
-        "self-update is only supported for installer-based installs.\ncurrent executable: {}\nif this was installed with Homebrew/apt/choco/etc, update with that package manager",
+        "update is only supported for official installer installs.\ncurrent executable: {}\nif this was installed with npm, update with npm; otherwise reinstall with the official installer",
         exe.display()
     );
 }

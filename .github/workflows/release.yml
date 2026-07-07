@@ -432,7 +432,7 @@ jobs:
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version
 
-      - name: Verify self-update check
+      - name: Verify update check
         shell: bash
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
