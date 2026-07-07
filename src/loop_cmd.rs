@@ -19,6 +19,7 @@ use crate::http::{
     build_http_client, build_http_client_from_builder, ApiClient, DEFAULT_HTTP_TIMEOUT,
 };
 use crate::project_context::{resolve_project_command_context_with_auth_mode, ProjectContext};
+use crate::projects::api::get_project_by_name;
 use crate::ui::{
     animations_enabled, apply_column_padding, header, is_interactive, is_quiet, print_with_pager,
     styled_table, truncate, LinePrompt,
@@ -243,10 +244,10 @@ fn resolve_loop_runtime_url(api_url: &str, explicit_runtime_url: Option<&str>) -
 enum TraceParentConfig {
     None,
     Explicit(String),
+    ExplicitProjectName(String),
     UiLogging { project_id: String },
 }
 
-#[derive(Debug)]
 struct TraceParentState {
     config: TraceParentConfig,
     logging_session: Option<LoopLoggingSession>,
@@ -262,10 +263,33 @@ impl TraceParentState {
         }
     }
 
-    async fn parent_for_turn(&mut self, ctx: &ProjectContext, input: &[Value]) -> Option<String> {
+    async fn parent_for_turn(
+        &mut self,
+        ctx: &ProjectContext,
+        input: &[Value],
+    ) -> Result<Option<String>> {
         match &self.config {
-            TraceParentConfig::Explicit(parent) => Some(parent.clone()),
-            TraceParentConfig::None => None,
+            TraceParentConfig::None => Ok(None),
+            TraceParentConfig::Explicit(parent) => Ok(Some(parent.clone())),
+            TraceParentConfig::ExplicitProjectName(project_name) => {
+                if self.logging_session.is_none() {
+                    let project = get_project_by_name(&ctx.client, project_name)
+                        .await
+                        .with_context(|| {
+                            format!("failed to load trace parent project '{project_name}'")
+                        })?
+                        .ok_or_else(|| {
+                            anyhow!("trace parent project '{project_name}' not found")
+                        })?;
+                    let session =
+                        LoopLoggingSession::start(&ctx.client, ctx, &project.id, input).await?;
+                    self.logging_session = Some(session);
+                }
+                Ok(self
+                    .logging_session
+                    .as_ref()
+                    .map(|session| session.parent().to_string()))
+            }
             TraceParentConfig::UiLogging { project_id } => {
                 if self.logging_session.is_none() && !self.logging_failed {
                     match LoopLoggingSession::start(&ctx.client, ctx, project_id, input).await {
@@ -278,9 +302,10 @@ impl TraceParentState {
                         }
                     }
                 }
-                self.logging_session
+                Ok(self
+                    .logging_session
                     .as_ref()
-                    .map(|session| session.parent.clone())
+                    .map(|session| session.parent().to_string()))
             }
         }
     }
@@ -305,6 +330,9 @@ fn resolve_loop_trace_parent_config(
         let trace_parent = trace_parent.trim();
         if trace_parent.is_empty() {
             bail!("--trace-parent must not be empty");
+        }
+        if let Some(project_name) = parse_loop_trace_parent_project_name(trace_parent)? {
+            return Ok(TraceParentConfig::ExplicitProjectName(project_name));
         }
         return Ok(TraceParentConfig::Explicit(trace_parent.to_string()));
     }
@@ -550,6 +578,7 @@ async fn send_and_collect(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_and_collect_with_callback<F>(
     client: &LoopRuntimeClient,
     ctx: &ProjectContext,
@@ -567,7 +596,7 @@ where
         "role": "user",
         "content": message,
     })];
-    let parent = trace_parent.parent_for_turn(ctx, &input).await;
+    let parent = trace_parent.parent_for_turn(ctx, &input).await?;
 
     let submission = client
         .submit_turn(
@@ -693,6 +722,10 @@ impl LoopLoggingSession {
         })
     }
 
+    fn parent(&self) -> &str {
+        &self.parent
+    }
+
     async fn update_end_time(&self, client: &ApiClient) -> Result<()> {
         let mut event = json!({
             "id": self.id,
@@ -722,6 +755,24 @@ fn warn_loop_logging_failure(err: &anyhow::Error, consequence: &str) {
         return;
     }
     eprintln!("{} {err}; {consequence}.", style("warning:").yellow());
+}
+
+fn parse_loop_trace_parent_project_name(parent: &str) -> Result<Option<String>> {
+    let parent = parent.trim();
+    let Some((kind, value)) = parent.split_once(':') else {
+        return Ok(None);
+    };
+    let kind = kind.trim().to_ascii_lowercase();
+    let value = value.trim();
+    match kind.as_str() {
+        "project_name" => {
+            if value.is_empty() {
+                bail!("--trace-parent project_name: value must not be empty");
+            }
+            Ok(Some(value.to_string()))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn loop_logging_parent(project_id: &str, id: &str, root_span_id: &str, span_id: &str) -> String {
@@ -1640,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_trace_parent_auto_omits_non_prod_api_urls() {
+    fn loop_trace_parent_auto_omits_non_prod_remote_api_urls() {
         assert_eq!(
             resolve_loop_trace_parent_config("https://api-eu.braintrust.dev", None)
                 .expect("trace parent"),
@@ -1656,6 +1707,10 @@ mod tests {
                 .expect("trace parent"),
             TraceParentConfig::None
         );
+        assert_eq!(
+            resolve_loop_trace_parent_config("http://localhost:8000", None).expect("trace parent"),
+            TraceParentConfig::None
+        );
     }
 
     #[test]
@@ -1666,7 +1721,7 @@ mod tests {
                 Some(" project_name:test-project "),
             )
             .expect("trace parent"),
-            TraceParentConfig::Explicit("project_name:test-project".to_string())
+            TraceParentConfig::ExplicitProjectName("test-project".to_string())
         );
     }
 
