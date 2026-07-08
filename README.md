@@ -1,5 +1,6 @@
 # Braintrust CLI (`bt`)
 test
+o
 
 ## Current Limitations
 
