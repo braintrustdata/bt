@@ -1,17 +1,41 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::BoolishValueParser, Args, Subcommand};
+use oxc_allocator::Allocator;
+use oxc_codegen::{Codegen, CodegenOptions};
+use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::SourceType;
+use oxc_transformer::{TransformOptions, Transformer};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use swc_bundler::{
+    Bundle, BundleKind, Bundler, Config as SwcBundlerConfig, Hook, Load, ModuleData, ModuleRecord,
+    ModuleType,
+};
+use swc_common::{comments::NoopComments, sync::Lrc, FileName, Globals, Mark, SourceMap, Span};
+use swc_ecma_ast::{EsVersion, KeyValueProp, Program};
+use swc_ecma_codegen::to_code_default;
+use swc_ecma_loader::{
+    resolve::{Resolution, Resolve},
+    resolvers::node::NodeModulesResolver,
+    TargetEnv as SwcTargetEnv,
+};
+use swc_ecma_parser::{parse_file_as_module, EsSyntax, Syntax, TsSyntax};
+use swc_ecma_transforms_base::helpers::Helpers;
+use swc_ecma_transforms_base::{fixer::fixer, resolver};
+use swc_ecma_transforms_react::{react, Options as ReactOptions, Runtime as ReactRuntime};
+use swc_ecma_transforms_typescript::strip as strip_typescript;
 use urlencoding::encode;
 
 use crate::args::BaseArgs;
@@ -19,16 +43,22 @@ use crate::auth;
 use crate::datasets::api as datasets_api;
 use crate::functions::{self, api as functions_api, IfExistsMode};
 use crate::http::ApiClient;
-use crate::js_runner;
 use crate::project_context::{resolve_project_optional, resolve_required_project};
 use crate::projects::api::{get_project_by_name, list_projects, Project};
 use crate::ui::{self, with_spinner};
 use crate::utils::{app_project_url, app_project_url_with_encoded_path};
 
-const VIEWS_JS_RUNNER_FILE: &str = "views-runner.ts";
-const VIEWS_JS_SDK_FILE: &str = "views-sdk.ts";
-const VIEWS_JS_RUNNER_SOURCE: &str = include_str!("../scripts/views-runner.ts");
+const VIEWS_JS_RUNNER_SOURCE: &str = include_str!("../scripts/views-runner.mjs");
 const VIEWS_JS_SDK_SOURCE: &str = include_str!("../scripts/views-sdk.ts");
+const VIEWS_PREVIEW_HTML_TEMPLATE: &str = include_str!("../scripts/views-preview.html");
+const VIEWS_PREVIEW_REACT_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/views-preview-react.js"));
+const VIEWS_PREVIEW_REACT_DOM_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/views-preview-react-dom.js"));
+const VIEWS_PREVIEW_TAILWIND_SOURCE: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/views-preview-tailwindcss-browser.js"
+));
 const DEFAULT_TRACE_PREVIEW_LIMIT: usize = 1000;
 const DEFAULT_CUSTOM_VIEWS_DIR: &str = "braintrust-custom-views";
 const CUSTOM_VIEW_TSCONFIG_FILE: &str = "tsconfig.json";
@@ -285,6 +315,17 @@ struct ViewsManifest {
     files: Vec<ViewsManifestFile>,
 }
 
+#[derive(Debug, Serialize)]
+struct ViewsDiscoveryInput {
+    files: Vec<ViewsDiscoveryInputFile>,
+}
+
+#[derive(Debug, Serialize)]
+struct ViewsDiscoveryInputFile {
+    source_file: String,
+    bundle_file: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ViewsRuntimeContext {
     runtime: String,
@@ -294,6 +335,7 @@ struct ViewsRuntimeContext {
 #[derive(Debug, Deserialize)]
 struct ViewsManifestFile {
     source_file: String,
+    #[allow(dead_code)]
     #[serde(default)]
     dependencies: Vec<String>,
     #[serde(default)]
@@ -360,18 +402,19 @@ struct BtqlResponse {
 
 struct PreviewServerState {
     client: ApiClient,
-    project_id: Option<String>,
-    data: Value,
+    project: Option<Project>,
+    target: PreviewTarget,
     source: PreviewSource,
     title: String,
     dependency_paths: Mutex<Vec<PathBuf>>,
+    trace_project_id: Mutex<Option<String>>,
+    trace_data: Mutex<Option<Value>>,
 }
 
 struct PreviewContext {
     client: ApiClient,
     project: Option<Project>,
-    entry: ViewManifestEntry,
-    dependency_paths: Vec<PathBuf>,
+    source: PreviewSource,
 }
 
 struct TracePreviewData {
@@ -382,8 +425,15 @@ struct TracePreviewData {
 #[derive(Clone)]
 struct PreviewSource {
     path: PathBuf,
+    root: PathBuf,
     view: Option<String>,
-    view_type: Option<ViewType>,
+    view_type: ViewType,
+}
+
+#[derive(Clone)]
+enum PreviewTarget {
+    Trace(TracePreviewTargetArgs),
+    Dataset(DatasetPreviewTargetArgs),
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,6 +441,17 @@ struct SpanFieldsRequest {
     #[serde(rename = "spanIds")]
     span_ids: Vec<String>,
     fields: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewDataRequest {
+    view_type: ViewType,
+    name: String,
+    slug: String,
+    project_id: Option<String>,
+    project_name: Option<String>,
+    dataset_id: Option<String>,
+    dataset_name: Option<String>,
 }
 
 pub async fn run(base: BaseArgs, args: ViewsArgs) -> Result<()> {
@@ -935,41 +996,30 @@ async fn preview_trace(base: BaseArgs, args: TraceViewPreviewArgs) -> Result<()>
     let context = resolve_preview_context(
         &base,
         &args.common,
-        Some(ViewType::Trace),
+        ViewType::Trace,
         args.target.url.as_deref(),
     )
     .await?;
-    let trace_data =
-        build_trace_preview_data(&context.client, context.project.as_ref(), &args.target).await?;
     serve_preview(
         base,
         &args.common,
         context.client,
-        Some(trace_data.project_id),
-        context.entry,
-        context.dependency_paths,
-        trace_data.data,
+        context.project,
+        PreviewTarget::Trace(args.target),
+        context.source,
     )
     .await
 }
 
 async fn preview_dataset(base: BaseArgs, args: DatasetViewPreviewArgs) -> Result<()> {
-    let context =
-        resolve_preview_context(&base, &args.common, Some(ViewType::Dataset), None).await?;
-    let project = context
-        .project
-        .as_ref()
-        .ok_or_else(|| anyhow!("dataset preview requires a project"))?;
-    let preview_data =
-        build_dataset_preview_data(&context.client, project, &context.entry, &args.target).await?;
+    let context = resolve_preview_context(&base, &args.common, ViewType::Dataset, None).await?;
     serve_preview(
         base,
         &args.common,
         context.client,
-        None,
-        context.entry,
-        context.dependency_paths,
-        preview_data,
+        context.project,
+        PreviewTarget::Dataset(args.target),
+        context.source,
     )
     .await
 }
@@ -977,47 +1027,24 @@ async fn preview_dataset(base: BaseArgs, args: DatasetViewPreviewArgs) -> Result
 async fn resolve_preview_context(
     base: &BaseArgs,
     args: &PreviewCommonArgs,
-    view_type: Option<ViewType>,
+    view_type: ViewType,
     trace_url: Option<&str>,
 ) -> Result<PreviewContext> {
-    if !args.path.exists() {
-        bail!("custom view file not found: {}", args.path.display());
-    }
-    if !args.path.is_file() {
-        bail!(
-            "custom view preview requires a single view file; got {}",
-            args.path.display()
-        );
-    }
-    if !is_view_file(&args.path) {
-        bail!("custom view preview path must match {VIEW_FILE_PATTERN_HELP}");
-    }
-    let files = vec![args.path.clone()];
-    let manifest = run_views_runner(&files)?;
-    validate_manifest_runtime(&manifest)?;
-    let entry = select_preview_entry(&manifest, args.view.as_deref(), view_type)?.clone();
-    let dependency_paths = preview_dependency_paths(&manifest);
+    let source = prepare_preview_source(&args.path, args.view.clone(), view_type)?;
 
     let auth_ctx = auth::login_read_only(&base).await?;
     let client = ApiClient::new(&auth_ctx)?;
-    let project = if trace_url_supplies_project(entry.view_type, trace_url) {
+    let project = if trace_url_supplies_project(view_type, trace_url) {
         None
-    } else if entry.view_type == ViewType::Trace && trace_url.is_some() {
-        match resolve_project_optional(&base, &client, true).await? {
-            Some(default_project) => {
-                Some(resolve_project_for_entry(&client, &default_project, &entry).await?)
-            }
-            None => None,
-        }
+    } else if view_type == ViewType::Trace && trace_url.is_some() {
+        resolve_project_optional(&base, &client, true).await?
     } else {
-        let default_project = resolve_required_project(&base, &client, true).await?;
-        Some(resolve_project_for_entry(&client, &default_project, &entry).await?)
+        Some(resolve_required_project(&base, &client, true).await?)
     };
     Ok(PreviewContext {
         client,
         project,
-        entry,
-        dependency_paths,
+        source,
     })
 }
 
@@ -1025,10 +1052,9 @@ async fn serve_preview(
     base: BaseArgs,
     args: &PreviewCommonArgs,
     client: ApiClient,
-    trace_project_id: Option<String>,
-    entry: ViewManifestEntry,
-    dependency_paths: Vec<PathBuf>,
-    preview_data: Value,
+    project: Option<Project>,
+    target: PreviewTarget,
+    source: PreviewSource,
 ) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", args.port))
         .with_context(|| format!("failed to bind preview server on port {}", args.port))?;
@@ -1036,23 +1062,29 @@ async fn serve_preview(
         .local_addr()
         .context("failed to read preview address")?;
     let url = format!("http://{addr}");
+    let title = preview_title(&source);
     let state = web::Data::new(PreviewServerState {
         client,
-        project_id: trace_project_id,
-        data: preview_data,
-        source: PreviewSource {
-            path: args.path.clone(),
-            view: args.view.clone(),
-            view_type: Some(entry.view_type),
-        },
-        title: entry.name.clone(),
-        dependency_paths: Mutex::new(dependency_paths),
+        project,
+        target,
+        source,
+        title,
+        dependency_paths: Mutex::new(Vec::new()),
+        trace_project_id: Mutex::new(None),
+        trace_data: Mutex::new(None),
     });
     let server = HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .route("/", web::get().to(preview_index))
+            .route("/preview-assets/{asset}.js", web::get().to(preview_asset))
+            .route("/preview-module/{tail:.*}", web::get().to(preview_module))
+            .route(
+                "/preview-virtual/{module}.js",
+                web::get().to(preview_virtual_module),
+            )
             .route("/preview-version", web::get().to(preview_version))
+            .route("/preview-data", web::post().to(preview_data))
             .route("/span-fields", web::post().to(preview_span_fields))
     })
     .workers(1)
@@ -1067,14 +1099,13 @@ async fn serve_preview(
             serde_json::to_string_pretty(&json!({
                 "url": url,
                 "view": {
-                    "name": entry.name,
-                    "slug": entry.slug,
-                    "type": entry.view_type,
+                    "path": args.path.display().to_string(),
+                    "selector": args.view,
                 },
             }))?
         );
     } else {
-        println!("Previewing {} at {}", entry.name, url);
+        println!("Previewing {} at {}", args.path.display(), url);
     }
 
     if !args.no_open {
@@ -1088,12 +1119,6 @@ async fn serve_preview(
     Ok(())
 }
 
-struct PreviewPage {
-    title: String,
-    code: String,
-    dependency_paths: Vec<PathBuf>,
-}
-
 async fn preview_index(state: web::Data<PreviewServerState>) -> HttpResponse {
     let dependency_paths = state
         .dependency_paths
@@ -1101,18 +1126,46 @@ async fn preview_index(state: web::Data<PreviewServerState>) -> HttpResponse {
         .map(|paths| paths.clone())
         .unwrap_or_default();
     let version = preview_source_version(&state.source, &dependency_paths);
-    let html = match load_preview_page(&state.source) {
-        Ok(page) => {
-            if let Ok(mut dependency_paths) = state.dependency_paths.lock() {
-                *dependency_paths = page.dependency_paths.clone();
-            }
-            render_preview_html(&page.title, &page.code, &state.data, &version)
-        }
-        Err(err) => render_preview_error_html(&state.title, &format!("{err:#}"), &version),
-    };
+    let html = render_preview_html(&state.title, &state.source, &version);
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(html)
+}
+
+async fn preview_asset(asset: web::Path<String>) -> HttpResponse {
+    match preview_asset_source(&asset) {
+        Some(code) => HttpResponse::Ok()
+            .content_type("application/javascript; charset=utf-8")
+            .body(code),
+        None => HttpResponse::NotFound().json(json!({
+            "error": format!("unknown preview asset '{}'", asset.as_str()),
+        })),
+    }
+}
+
+async fn preview_module(
+    state: web::Data<PreviewServerState>,
+    tail: web::Path<String>,
+) -> HttpResponse {
+    match preview_module_result(&state, &tail.into_inner()) {
+        Ok(code) => HttpResponse::Ok()
+            .content_type("application/javascript; charset=utf-8")
+            .body(code),
+        Err(err) => HttpResponse::BadRequest().json(json!({
+            "error": format!("{err:#}"),
+        })),
+    }
+}
+
+async fn preview_virtual_module(module: web::Path<String>) -> HttpResponse {
+    match preview_virtual_module_source(&module) {
+        Some(code) => HttpResponse::Ok()
+            .content_type("application/javascript; charset=utf-8")
+            .body(code),
+        None => HttpResponse::NotFound().json(json!({
+            "error": format!("unknown preview virtual module '{}'", module.as_str()),
+        })),
+    }
 }
 
 async fn preview_version(state: web::Data<PreviewServerState>) -> HttpResponse {
@@ -1126,20 +1179,40 @@ async fn preview_version(state: web::Data<PreviewServerState>) -> HttpResponse {
     }))
 }
 
+async fn preview_data(
+    state: web::Data<PreviewServerState>,
+    body: web::Json<PreviewDataRequest>,
+) -> HttpResponse {
+    match preview_data_result(&state, body.into_inner()).await {
+        Ok(data) => HttpResponse::Ok().json(data),
+        Err(err) => HttpResponse::BadRequest().json(json!({
+            "error": format!("{err:#}"),
+        })),
+    }
+}
+
 async fn preview_span_fields(
     state: web::Data<PreviewServerState>,
     body: web::Json<SpanFieldsRequest>,
 ) -> HttpResponse {
-    let Some(project_id) = state.project_id.as_deref() else {
+    let project_id = match state.trace_project_id.lock() {
+        Ok(project_id) => project_id.clone(),
+        Err(_) => None,
+    };
+    let Some(project_id) = project_id else {
         return HttpResponse::BadRequest().json(json!({
             "error": "fetchSpanFields is only available for trace previews"
         }));
     };
 
     let mut response = Map::new();
-    let spans = state
-        .data
-        .get("trace")
+    let trace_data = match state.trace_data.lock() {
+        Ok(trace_data) => trace_data.clone(),
+        Err(_) => None,
+    };
+    let spans = trace_data
+        .as_ref()
+        .and_then(|data| data.get("trace"))
         .and_then(|trace| trace.get("spans"))
         .and_then(Value::as_object)
         .cloned()
@@ -1147,7 +1220,7 @@ async fn preview_span_fields(
 
     for span_id in &body.span_ids {
         let row_id = resolve_preview_row_id(&spans, span_id).unwrap_or_else(|| span_id.clone());
-        match fetch_full_span_row(&state.client, project_id, &row_id).await {
+        match fetch_full_span_row(&state.client, &project_id, &row_id).await {
             Ok(Some(row)) => {
                 response.insert(
                     span_id.clone(),
@@ -1168,28 +1241,379 @@ async fn preview_span_fields(
     HttpResponse::Ok().json(Value::Object(response))
 }
 
-fn load_preview_page(source: &PreviewSource) -> Result<PreviewPage> {
-    let files = vec![source.path.clone()];
-    let manifest = run_views_runner(&files)?;
-    validate_manifest_runtime(&manifest)?;
-    let entry = select_preview_entry(&manifest, source.view.as_deref(), source.view_type)?;
-    let dependency_paths = preview_dependency_paths(&manifest);
-    Ok(PreviewPage {
-        title: entry.name.clone(),
-        code: entry.code.clone(),
-        dependency_paths,
+fn prepare_preview_source(
+    path: &Path,
+    view: Option<String>,
+    view_type: ViewType,
+) -> Result<PreviewSource> {
+    if !path.exists() {
+        bail!("custom view file not found: {}", path.display());
+    }
+    if !path.is_file() {
+        bail!(
+            "custom view preview requires a single view file; got {}",
+            path.display()
+        );
+    }
+    if !is_view_file(path) {
+        bail!("custom view preview path must match {VIEW_FILE_PATTERN_HELP}");
+    }
+    let path = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve custom view file {}", path.display()))?;
+    let root = path
+        .parent()
+        .ok_or_else(|| {
+            anyhow!(
+                "custom view file has no parent directory: {}",
+                path.display()
+            )
+        })?
+        .to_path_buf();
+    Ok(PreviewSource {
+        path,
+        root,
+        view,
+        view_type,
     })
 }
 
-fn preview_dependency_paths(manifest: &ViewsManifest) -> Vec<PathBuf> {
-    let mut paths = BTreeSet::new();
-    for file in &manifest.files {
-        paths.insert(file.source_file.clone());
-        for dependency in &file.dependencies {
-            paths.insert(dependency.clone());
+fn preview_title(source: &PreviewSource) -> String {
+    source
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| source.view_type.label().to_string())
+}
+
+async fn preview_data_result(
+    state: &PreviewServerState,
+    request: PreviewDataRequest,
+) -> Result<Value> {
+    if request.view_type != state.source.view_type {
+        bail!(
+            "selected view is {}, but this preview expects {}",
+            request.view_type.label(),
+            state.source.view_type.label()
+        );
+    }
+    if let Some(selector) = state.source.view.as_deref() {
+        if request.slug != selector && request.name != selector {
+            bail!(
+                "{} custom view '{selector}' not found in selected file",
+                state.source.view_type.label()
+            );
         }
     }
-    paths.into_iter().map(PathBuf::from).collect()
+
+    let entry = ViewManifestEntry {
+        view_type: request.view_type,
+        name: request.name,
+        slug: request.slug,
+        code: String::new(),
+        project_id: request.project_id,
+        project_name: request.project_name,
+        dataset_id: request.dataset_id,
+        dataset_name: request.dataset_name,
+    };
+
+    match &state.target {
+        PreviewTarget::Trace(args) => {
+            let project = match state.project.as_ref() {
+                Some(default_project) => {
+                    Some(resolve_project_for_entry(&state.client, default_project, &entry).await?)
+                }
+                None => None,
+            };
+            let trace_data =
+                build_trace_preview_data(&state.client, project.as_ref(), args).await?;
+            if let Ok(mut project_id) = state.trace_project_id.lock() {
+                *project_id = Some(trace_data.project_id.clone());
+            }
+            if let Ok(mut data) = state.trace_data.lock() {
+                *data = Some(trace_data.data.clone());
+            }
+            Ok(trace_data.data)
+        }
+        PreviewTarget::Dataset(args) => {
+            let default_project = state
+                .project
+                .as_ref()
+                .ok_or_else(|| anyhow!("dataset preview requires a project"))?;
+            let project = resolve_project_for_entry(&state.client, default_project, &entry).await?;
+            build_dataset_preview_data(&state.client, &project, &entry, args).await
+        }
+    }
+}
+
+fn preview_module_result(state: &PreviewServerState, tail: &str) -> Result<String> {
+    let path = preview_module_path_from_route(&state.source, tail)?;
+    let code = compile_preview_module(&path)?;
+    if let Ok(mut dependency_paths) = state.dependency_paths.lock() {
+        dependency_paths.push(path);
+        dependency_paths.sort();
+        dependency_paths.dedup();
+    }
+    Ok(code)
+}
+
+fn preview_asset_source(asset: &str) -> Option<&'static str> {
+    match asset {
+        "react" => Some(VIEWS_PREVIEW_REACT_SOURCE),
+        "react-dom" => Some(VIEWS_PREVIEW_REACT_DOM_SOURCE),
+        "tailwindcss-browser" => Some(VIEWS_PREVIEW_TAILWIND_SOURCE),
+        _ => None,
+    }
+}
+
+fn preview_virtual_module_source(module: &str) -> Option<&'static str> {
+    match module {
+        "custom-views" => Some(
+            r#"export function customTraceView(definition, component) {
+  return { ...definition, component, kind: "trace" };
+}
+export function customDatasetView(definition, component) {
+  return { ...definition, component, kind: "dataset" };
+}
+"#,
+        ),
+        "react" => Some(
+            r#"const ReactValue = globalThis.React;
+export default ReactValue;
+export const Children = ReactValue.Children;
+export const Component = ReactValue.Component;
+export const Fragment = ReactValue.Fragment;
+export const Profiler = ReactValue.Profiler;
+export const PureComponent = ReactValue.PureComponent;
+export const StrictMode = ReactValue.StrictMode;
+export const Suspense = ReactValue.Suspense;
+export const cloneElement = ReactValue.cloneElement;
+export const createContext = ReactValue.createContext;
+export const createElement = ReactValue.createElement;
+export const createRef = ReactValue.createRef;
+export const forwardRef = ReactValue.forwardRef;
+export const isValidElement = ReactValue.isValidElement;
+export const lazy = ReactValue.lazy;
+export const memo = ReactValue.memo;
+export const startTransition = ReactValue.startTransition;
+export const useCallback = ReactValue.useCallback;
+export const useContext = ReactValue.useContext;
+export const useDebugValue = ReactValue.useDebugValue;
+export const useDeferredValue = ReactValue.useDeferredValue;
+export const useEffect = ReactValue.useEffect;
+export const useId = ReactValue.useId;
+export const useImperativeHandle = ReactValue.useImperativeHandle;
+export const useInsertionEffect = ReactValue.useInsertionEffect;
+export const useLayoutEffect = ReactValue.useLayoutEffect;
+export const useMemo = ReactValue.useMemo;
+export const useReducer = ReactValue.useReducer;
+export const useRef = ReactValue.useRef;
+export const useState = ReactValue.useState;
+export const useSyncExternalStore = ReactValue.useSyncExternalStore;
+export const useTransition = ReactValue.useTransition;
+"#,
+        ),
+        "react-jsx-runtime" => Some(
+            r#"const ReactValue = globalThis.React;
+export const Fragment = ReactValue.Fragment;
+export function jsx(type, props, key) {
+  return ReactValue.createElement(type, key === undefined ? props : { ...props, key });
+}
+export const jsxs = jsx;
+export const jsxDEV = jsx;
+"#,
+        ),
+        _ => None,
+    }
+}
+
+fn compile_preview_module(path: &Path) -> Result<String> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read preview module {}", path.display()))?;
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        let json: Value = serde_json::from_str(&source)
+            .with_context(|| format!("failed to parse preview JSON module {}", path.display()))?;
+        return Ok(format!("export default {};\n", script_json(&json)));
+    }
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).map_err(|err| {
+        anyhow!(
+            "failed to infer preview module type for {}: {err}",
+            path.display()
+        )
+    })?;
+    let mut parsed = Parser::new(&allocator, &source, source_type).parse();
+    if !parsed.errors.is_empty() {
+        bail!(
+            "failed to parse preview module {}:\n{}",
+            path.display(),
+            parsed
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    let scoping = {
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        if !semantic.errors.is_empty() {
+            bail!(
+                "failed to analyze preview module {}:\n{}",
+                path.display(),
+                semantic
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        semantic.semantic.into_scoping()
+    };
+
+    let transform_options = TransformOptions::default();
+    let transformed = Transformer::new(&allocator, path, &transform_options)
+        .build_with_scoping(scoping, &mut parsed.program);
+    if !transformed.errors.is_empty() {
+        bail!(
+            "failed to transform preview module {}:\n{}",
+            path.display(),
+            transformed
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    Ok(Codegen::new()
+        .with_options(CodegenOptions {
+            comments: oxc_codegen::CommentOptions::disabled(),
+            ..CodegenOptions::default()
+        })
+        .build(&parsed.program)
+        .code)
+}
+
+fn preview_module_path_from_route(source: &PreviewSource, tail: &str) -> Result<PathBuf> {
+    if tail.trim().is_empty() {
+        bail!("preview module path is empty");
+    }
+    let decoded = urlencoding::decode(tail)
+        .with_context(|| format!("failed to decode preview module path '{tail}'"))?;
+    let raw = preview_route_tail_to_path(&decoded);
+    preview_source_path_from_raw(source, &raw)
+}
+
+fn preview_route_tail_to_path(tail: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(tail.replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new("/").join(tail.trim_start_matches('/'))
+    }
+}
+
+fn preview_module_url(path: &Path) -> String {
+    let mut url = String::from("/preview-module");
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                url.push('/');
+                url.push_str(&encode(&prefix.as_os_str().to_string_lossy()));
+            }
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                url.push('/');
+                url.push_str(&encode(&part.to_string_lossy()));
+            }
+            std::path::Component::ParentDir => {}
+        }
+    }
+    url
+}
+
+#[cfg(test)]
+fn preview_source_path_from_request(source: &PreviewSource, requested: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(requested);
+    preview_source_path_from_raw(source, &path)
+}
+
+fn preview_source_path_from_raw(source: &PreviewSource, path: &Path) -> Result<PathBuf> {
+    for candidate in preview_resolution_candidates(path) {
+        if candidate.is_file() {
+            let candidate = std::fs::canonicalize(&candidate).with_context(|| {
+                format!("failed to resolve preview source {}", candidate.display())
+            })?;
+            ensure_preview_path_allowed(source, &candidate)?;
+            return Ok(candidate);
+        }
+    }
+
+    bail!("preview source not found: {}", path.display());
+}
+
+fn ensure_preview_path_allowed(source: &PreviewSource, path: &Path) -> Result<()> {
+    if !path.starts_with(&source.root) {
+        bail!(
+            "preview source must be inside {}: {}",
+            source.root.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn resolve_preview_source_path(
+    source: &PreviewSource,
+    importer: Option<&str>,
+    specifier: &str,
+) -> Result<PathBuf> {
+    let raw = if Path::new(specifier).is_absolute() {
+        PathBuf::from(specifier)
+    } else if specifier.starts_with('.') {
+        let importer = importer
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source.path.clone());
+        let importer = preview_source_path_from_request(source, &importer.display().to_string())?;
+        importer
+            .parent()
+            .ok_or_else(|| anyhow!("preview importer has no parent: {}", importer.display()))?
+            .join(specifier)
+    } else {
+        bail!("preview only supports relative local imports; unsupported import '{specifier}'");
+    };
+
+    preview_source_path_from_raw(source, &raw)
+        .with_context(|| format!("preview import '{specifier}' not found"))
+}
+
+fn preview_resolution_candidates(raw: &Path) -> Vec<PathBuf> {
+    const EXTENSIONS: &[&str] = &["tsx", "ts", "jsx", "js", "mjs", "cjs", "json"];
+    let mut candidates = Vec::new();
+    candidates.push(raw.to_path_buf());
+    if raw.extension().is_none() {
+        for extension in EXTENSIONS {
+            candidates.push(raw.with_extension(extension));
+        }
+    }
+    for extension in EXTENSIONS {
+        candidates.push(raw.join(format!("index.{extension}")));
+    }
+    candidates
 }
 
 fn preview_source_version(source: &PreviewSource, dependency_paths: &[PathBuf]) -> String {
@@ -1220,188 +1644,18 @@ fn push_preview_file_version(parts: &mut Vec<String>, path: &Path) {
     }
 }
 
-fn render_preview_html(title: &str, code: &str, data: &Value, version: &str) -> String {
-    let data_json = script_json(data);
-    let code_json = script_json(&Value::String(code.to_string()));
-    let title_json = script_json(&Value::String(title.to_string()));
-    let version_json = script_json(&Value::String(version.to_string()));
-    format!(
-        r##"<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{}</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <style>
-    html, body, #root {{ min-height: 100%; margin: 0; }}
-    body {{ font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script>
-    const previewTitle = {title_json};
-    const previewVersion = {version_json};
-    const initialData = {data_json};
-    const customViewCode = {code_json};
-    const root = ReactDOM.createRoot(document.getElementById("root"));
-    let selectedSpanId = initialData.trace?.selectedSpanId;
-    let trace = initialData.trace;
-    let span = initialData.span;
-    const datasetProps = initialData.props;
-
-    function resolveSpan(id) {{
-      if (!trace?.spans) return null;
-      if (trace.spans[id]) return trace.spans[id];
-      return Object.values(trace.spans).find((candidate) => candidate.id === id) || null;
-    }}
-
-    async function fetchSpanFields(spanIds, fields) {{
-      const ids = Array.isArray(spanIds) ? spanIds : [spanIds];
-      const response = await fetch("/span-fields", {{
-        method: "POST",
-        headers: {{ "content-type": "application/json" }},
-        body: JSON.stringify({{ spanIds: ids, fields }}),
-      }});
-      if (!response.ok) {{
-        const text = await response.text();
-        throw new Error(text || "fetchSpanFields failed");
-      }}
-      return response.json();
-    }}
-
-    function update(fieldOrPatch, value) {{
-      if (typeof fieldOrPatch === "string") {{
-        if (span) {{
-          span = {{
-            ...span,
-            data: {{
-              ...span.data,
-              metadata: {{ ...(span.data?.metadata || {{}}), [fieldOrPatch]: value }},
-            }},
-          }};
-          if (trace?.spans?.[span.span_id]) {{
-            trace = {{
-              ...trace,
-              spans: {{ ...trace.spans, [span.span_id]: span }},
-            }};
-          }}
-        }}
-        console.info("Preview update only:", fieldOrPatch, value);
-      }} else {{
-        const patch = fieldOrPatch || {{}};
-        if (patch.metadata && span) {{
-          span = {{
-            ...span,
-            data: {{
-              ...span.data,
-              metadata: {{ ...(span.data?.metadata || {{}}), ...patch.metadata }},
-            }},
-          }};
-          if (trace?.spans?.[span.span_id]) {{
-            trace = {{
-              ...trace,
-              spans: {{ ...trace.spans, [span.span_id]: span }},
-            }};
-          }}
-        }}
-        console.info("Preview update only:", patch);
-      }}
-      render();
-    }}
-
-    function selectSpan(spanId) {{
-      const next = resolveSpan(spanId);
-      if (!next) {{
-        console.warn("Span not found:", spanId);
-        return;
-      }}
-      selectedSpanId = next.span_id;
-      trace = {{ ...trace, selectedSpanId }};
-      span = next;
-      render();
-    }}
-
-    function componentFromCode() {{
-      const module = {{ exports: {{}} }};
-      const wrapper = new Function("module", "exports", "React", customViewCode);
-      wrapper(module, module.exports, React);
-      return module.exports.default || module.exports.CustomTraceRenderer || module.exports;
-    }}
-
-    function render() {{
-      try {{
-        const Component = componentFromCode();
-        const props = trace && span
-          ? {{ trace: {{ ...trace, fetchSpanFields }}, span, update, selectSpan }}
-          : datasetProps;
-        root.render(React.createElement(Component, props));
-      }} catch (error) {{
-        root.render(React.createElement("pre", {{
-          style: {{ padding: "16px", color: "#b91c1c", whiteSpace: "pre-wrap" }}
-        }}, `${{previewTitle}}\n\n${{error?.stack || error}}`));
-      }}
-    }}
-
-    render();
-    setInterval(async () => {{
-      try {{
-        const response = await fetch("/preview-version", {{ cache: "no-store" }});
-        if (!response.ok) return;
-        const payload = await response.json();
-        if (payload.version && payload.version !== previewVersion) {{
-          window.location.reload();
-        }}
-      }} catch (_error) {{}}
-    }}, 1000);
-  </script>
-</body>
-</html>"##,
-        html_escape(title),
-    )
-}
-
-fn render_preview_error_html(title: &str, error: &str, version: &str) -> String {
-    let title_json = script_json(&Value::String(title.to_string()));
-    let error_json = script_json(&Value::String(error.to_string()));
-    let version_json = script_json(&Value::String(version.to_string()));
-    format!(
-        r##"<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{}</title>
-  <style>
-    html, body {{ min-height: 100%; margin: 0; }}
-    body {{ font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-  </style>
-</head>
-<body>
-  <pre id="root" style="padding: 16px; color: #b91c1c; white-space: pre-wrap"></pre>
-  <script>
-    const previewTitle = {title_json};
-    const previewError = {error_json};
-    const previewVersion = {version_json};
-    document.getElementById("root").textContent = `${{previewTitle}}\n\n${{previewError}}`;
-    setInterval(async () => {{
-      try {{
-        const response = await fetch("/preview-version", {{ cache: "no-store" }});
-        if (!response.ok) return;
-        const payload = await response.json();
-        if (payload.version && payload.version !== previewVersion) {{
-          window.location.reload();
-        }}
-      }} catch (_error) {{}}
-    }}, 1000);
-  </script>
-</body>
-</html>"##,
-        html_escape(title),
-    )
+fn render_preview_html(title: &str, source: &PreviewSource, version: &str) -> String {
+    let config_json = script_json(&json!({
+        "title": title,
+        "version": version,
+        "sourcePath": source.path.display().to_string(),
+        "sourceModuleUrl": preview_module_url(&source.path),
+        "viewType": source.view_type.label(),
+        "viewSelector": source.view,
+    }));
+    VIEWS_PREVIEW_HTML_TEMPLATE
+        .replace("__HTML_TITLE__", &html_escape(title))
+        .replace("__PREVIEW_CONFIG__", &config_json)
 }
 
 fn script_json(value: &Value) -> String {
@@ -1486,27 +1740,107 @@ fn is_view_file(path: &Path) -> bool {
 }
 
 fn run_views_runner(files: &[PathBuf]) -> Result<ViewsManifest> {
-    let sdk_script = js_runner::materialize_runner_script_in_cwd(
-        "views-runners",
-        VIEWS_JS_SDK_FILE,
-        VIEWS_JS_SDK_SOURCE,
-    )
-    .context("failed to materialize custom views SDK helper")?;
-    let runner_script = js_runner::materialize_runner_script_in_cwd(
-        "views-runners",
-        VIEWS_JS_RUNNER_FILE,
-        VIEWS_JS_RUNNER_SOURCE,
-    )
-    .context("failed to materialize custom views runner")?;
-    let mut command = js_runner::build_js_runner_command(None, &runner_script, files);
-    command.env("BT_VIEWS_SDK_PATH", &sdk_script);
+    let temp_dir = tempfile::tempdir().context("failed to create custom views temp directory")?;
+    let mut input_files = Vec::new();
+    let mut bundled_files = BTreeMap::new();
+    for file in files {
+        let source_file = std::fs::canonicalize(file)
+            .with_context(|| format!("failed to resolve custom view file {}", file.display()))?;
+        let source_key = source_file.display().to_string();
+        let safe_name = source_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("view")
+            .replace(|character: char| !character.is_ascii_alphanumeric(), "_");
 
-    let output = command.output().with_context(|| {
+        let discovery =
+            swc_bundle_custom_view(&source_file, temp_dir.path(), SwcBundleTarget::Discovery)?;
+        let discovery_bundle = temp_dir.path().join(format!("{safe_name}.discovery.cjs"));
+        std::fs::write(
+            &discovery_bundle,
+            module_exports_from_swc_iife(&discovery.code),
+        )
+        .with_context(|| {
+            format!(
+                "failed to write custom view discovery bundle {}",
+                discovery_bundle.display()
+            )
+        })?;
+
+        let browser_entry = temp_dir
+            .path()
+            .join(format!("{safe_name}.browser-entry.ts"));
+        std::fs::write(
+            &browser_entry,
+            format!(
+                "import view from {};\nexport default view.component;\n",
+                serde_json::to_string(&source_key)?
+            ),
+        )
+        .with_context(|| {
+            format!(
+                "failed to write custom view browser entry {}",
+                browser_entry.display()
+            )
+        })?;
+        let browser =
+            swc_bundle_custom_view(&browser_entry, temp_dir.path(), SwcBundleTarget::Browser)?;
+
+        let dependencies = discovery
+            .dependencies
+            .into_iter()
+            .chain(browser.dependencies)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        bundled_files.insert(
+            source_key.clone(),
+            SwcBundledViewFile {
+                code: module_exports_from_swc_iife(&browser.code),
+                dependencies,
+            },
+        );
+        input_files.push(ViewsDiscoveryInputFile {
+            source_file: source_key,
+            bundle_file: discovery_bundle.display().to_string(),
+        });
+    }
+    let input_path = temp_dir.path().join("views-discovery-input.json");
+    std::fs::write(
+        &input_path,
+        serde_json::to_vec(&ViewsDiscoveryInput { files: input_files })?,
+    )
+    .with_context(|| {
         format!(
-            "failed to spawn custom views runner: {}",
+            "failed to write custom views discovery input {}",
+            input_path.display()
+        )
+    })?;
+
+    let mut command = Command::new("node");
+    command
+        .arg("--input-type=module")
+        .arg("-")
+        .arg(&input_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn custom views metadata runner: {}",
             command_display(&command)
         )
     })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open custom views metadata runner stdin"))?
+        .write_all(VIEWS_JS_RUNNER_SOURCE.as_bytes())
+        .context("failed to write custom views metadata runner source")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for custom views metadata runner")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1517,20 +1851,356 @@ fn run_views_runner(files: &[PathBuf]) -> Result<ViewsManifest> {
             details
         };
         bail!(
-            "custom views runner exited with status {}: {}",
+            "custom views metadata runner exited with status {}: {}",
             output.status,
             details
         );
     }
 
-    let stdout =
-        String::from_utf8(output.stdout).context("custom views runner output was not UTF-8")?;
-    serde_json::from_str(&stdout).with_context(|| {
+    let stdout = String::from_utf8(output.stdout)
+        .context("custom views metadata runner output was not UTF-8")?;
+    let mut manifest: ViewsManifest = serde_json::from_str(&stdout).with_context(|| {
         format!(
-            "failed to parse custom views runner output as JSON: {}",
+            "failed to parse custom views metadata runner output as JSON: {}",
             stdout.trim()
         )
+    })?;
+    for file in &mut manifest.files {
+        if let Some(bundled) = bundled_files.get(&file.source_file) {
+            file.dependencies.clone_from(&bundled.dependencies);
+            for entry in &mut file.entries {
+                entry.code.clone_from(&bundled.code);
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SwcBundleTarget {
+    Discovery,
+    Browser,
+}
+
+#[derive(Debug)]
+struct SwcBundledViewFile {
+    code: String,
+    dependencies: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SwcBundleOutput {
+    code: String,
+    dependencies: Vec<PathBuf>,
+}
+
+struct ViewsSwcResolver {
+    node: NodeModulesResolver,
+}
+
+impl ViewsSwcResolver {
+    fn new(target: SwcBundleTarget) -> Self {
+        let target_env = match target {
+            SwcBundleTarget::Discovery => SwcTargetEnv::Node,
+            SwcBundleTarget::Browser => SwcTargetEnv::Browser,
+        };
+        Self {
+            node: NodeModulesResolver::new(target_env, Default::default(), false),
+        }
+    }
+}
+
+impl Resolve for ViewsSwcResolver {
+    fn resolve(&self, base: &FileName, module_specifier: &str) -> Result<Resolution> {
+        if is_views_virtual_module(module_specifier) {
+            return Ok(Resolution {
+                filename: FileName::Custom(module_specifier.to_string()),
+                slug: None,
+            });
+        }
+        self.node.resolve(base, module_specifier)
+    }
+}
+
+struct ViewsSwcLoader {
+    cm: Lrc<SourceMap>,
+    temp_dir: PathBuf,
+    dependencies: Arc<Mutex<BTreeSet<PathBuf>>>,
+}
+
+impl Load for ViewsSwcLoader {
+    fn load(&self, file: &FileName) -> Result<ModuleData> {
+        let (fm, syntax) = match file {
+            FileName::Real(path) => {
+                let source = std::fs::read_to_string(path).with_context(|| {
+                    format!("failed to read custom view module {}", path.display())
+                })?;
+                let resolved = std::fs::canonicalize(path).with_context(|| {
+                    format!("failed to resolve custom view module {}", path.display())
+                })?;
+                if !resolved.starts_with(&self.temp_dir) {
+                    self.dependencies
+                        .lock()
+                        .expect("custom view dependency lock")
+                        .insert(resolved);
+                }
+                (
+                    self.cm
+                        .new_source_file(Lrc::new(FileName::Real(path.clone())), source),
+                    swc_syntax_for_path(path),
+                )
+            }
+            FileName::Custom(name) if name == "braintrust/custom-views" => (
+                self.cm
+                    .new_source_file(Lrc::new(file.clone()), VIEWS_JS_SDK_SOURCE.to_string()),
+                Syntax::Typescript(TsSyntax::default()),
+            ),
+            FileName::Custom(name) if name == "@braintrust/local/custom-views" => (
+                self.cm
+                    .new_source_file(Lrc::new(file.clone()), VIEWS_JS_SDK_SOURCE.to_string()),
+                Syntax::Typescript(TsSyntax::default()),
+            ),
+            FileName::Custom(name) if name == "react" => (
+                self.cm
+                    .new_source_file(Lrc::new(file.clone()), react_module_source()),
+                Syntax::Es(EsSyntax::default()),
+            ),
+            FileName::Custom(name)
+                if name == "react/jsx-runtime" || name == "react/jsx-dev-runtime" =>
+            {
+                (
+                    self.cm
+                        .new_source_file(Lrc::new(file.clone()), jsx_runtime_module_source()),
+                    Syntax::Es(EsSyntax::default()),
+                )
+            }
+            FileName::Custom(name) => bail!("unsupported custom view virtual module '{name}'"),
+            _ => bail!("unsupported custom view module {}", file),
+        };
+
+        let mut errors = Vec::new();
+        let module = parse_file_as_module(&fm, syntax, EsVersion::Es2022, None, &mut errors)
+            .map_err(|err| anyhow!("{err:?}"))
+            .with_context(|| format!("failed to parse custom view module {}", file))?;
+        if !errors.is_empty() {
+            let details = errors
+                .iter()
+                .map(|err| format!("{err:?}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("failed to parse custom view module {}: {details}", file);
+        }
+
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+        let mut program = Program::Module(module);
+        program.mutate(resolver(
+            unresolved_mark,
+            top_level_mark,
+            syntax_is_typescript(syntax),
+        ));
+        if syntax_is_typescript(syntax) {
+            program.mutate(strip_typescript(unresolved_mark, top_level_mark));
+        }
+        program.mutate(react(
+            self.cm.clone(),
+            None::<NoopComments>,
+            ReactOptions {
+                runtime: Some(ReactRuntime::Classic),
+                pragma: Some("React.createElement".into()),
+                pragma_frag: Some("React.Fragment".into()),
+                development: Some(false),
+                ..Default::default()
+            },
+            top_level_mark,
+            unresolved_mark,
+        ));
+        program.mutate(fixer(None));
+
+        let Program::Module(module) = program else {
+            bail!("custom view module {} did not parse as an ES module", file);
+        };
+        Ok(ModuleData {
+            fm,
+            module,
+            helpers: Helpers::new(false),
+        })
+    }
+}
+
+struct ViewsSwcHook;
+
+impl Hook for ViewsSwcHook {
+    fn get_import_meta_props(
+        &self,
+        _span: Span,
+        _module_record: &ModuleRecord,
+    ) -> Result<Vec<KeyValueProp>> {
+        Ok(Vec::new())
+    }
+}
+
+fn swc_bundle_custom_view(
+    entry: &Path,
+    temp_dir: &Path,
+    target: SwcBundleTarget,
+) -> Result<SwcBundleOutput> {
+    let entry = std::fs::canonicalize(entry)
+        .with_context(|| format!("failed to resolve custom view entry {}", entry.display()))?;
+    let temp_dir = std::fs::canonicalize(temp_dir).with_context(|| {
+        format!(
+            "failed to resolve custom view temp directory {}",
+            temp_dir.display()
+        )
+    })?;
+    let cm = Lrc::new(SourceMap::default());
+    let globals = Globals::new();
+    let dependencies = Arc::new(Mutex::new(BTreeSet::new()));
+    let loader = ViewsSwcLoader {
+        cm: cm.clone(),
+        temp_dir,
+        dependencies: dependencies.clone(),
+    };
+    let resolver = ViewsSwcResolver::new(target);
+    let mut bundler = Bundler::new(
+        &globals,
+        cm.clone(),
+        loader,
+        resolver,
+        SwcBundlerConfig {
+            module: ModuleType::Iife,
+            ..Default::default()
+        },
+        Box::new(ViewsSwcHook),
+    );
+    let bundles = bundler
+        .bundle(HashMap::from([(
+            "custom-view".to_string(),
+            FileName::Real(entry.clone()),
+        )]))
+        .with_context(|| format!("failed to bundle custom view {}", entry.display()))?;
+    let bundle = single_swc_bundle(bundles, &entry)?;
+    Ok(SwcBundleOutput {
+        code: to_code_default(cm, None, &bundle.module),
+        dependencies: Arc::try_unwrap(dependencies)
+            .unwrap_or_else(|dependencies| {
+                Mutex::new(
+                    dependencies
+                        .lock()
+                        .expect("custom view dependency lock")
+                        .clone(),
+                )
+            })
+            .into_inner()
+            .expect("custom view dependency lock")
+            .into_iter()
+            .collect(),
     })
+}
+
+fn single_swc_bundle(mut bundles: Vec<Bundle>, entry: &Path) -> Result<Bundle> {
+    if bundles.len() != 1 {
+        bail!(
+            "expected one custom view bundle for {}, got {}",
+            entry.display(),
+            bundles.len()
+        );
+    }
+    let bundle = bundles.remove(0);
+    if !matches!(bundle.kind, BundleKind::Named { .. }) {
+        bail!(
+            "custom view bundle for {} was not an entry bundle",
+            entry.display()
+        );
+    }
+    Ok(bundle)
+}
+
+fn module_exports_from_swc_iife(code: &str) -> String {
+    let expression = code.trim().trim_end_matches(';');
+    format!(
+        "var __BraintrustCustomView = {expression};\nmodule.exports = __BraintrustCustomView;\n"
+    )
+}
+
+fn is_views_virtual_module(module_specifier: &str) -> bool {
+    matches!(
+        module_specifier,
+        "braintrust/custom-views"
+            | "@braintrust/local/custom-views"
+            | "react"
+            | "react/jsx-runtime"
+            | "react/jsx-dev-runtime"
+    )
+}
+
+fn swc_syntax_for_path(path: &Path) -> Syntax {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("ts") | Some("mts") | Some("cts") => Syntax::Typescript(TsSyntax::default()),
+        Some("tsx") => Syntax::Typescript(TsSyntax {
+            tsx: true,
+            ..Default::default()
+        }),
+        Some("jsx") => Syntax::Es(EsSyntax {
+            jsx: true,
+            ..Default::default()
+        }),
+        _ => Syntax::Es(EsSyntax::default()),
+    }
+}
+
+fn syntax_is_typescript(syntax: Syntax) -> bool {
+    matches!(syntax, Syntax::Typescript(_))
+}
+
+fn react_module_source() -> String {
+    r#"
+const ReactValue = globalThis.React || React;
+export default ReactValue;
+export const Children = ReactValue.Children;
+export const Component = ReactValue.Component;
+export const Fragment = ReactValue.Fragment;
+export const Profiler = ReactValue.Profiler;
+export const PureComponent = ReactValue.PureComponent;
+export const StrictMode = ReactValue.StrictMode;
+export const Suspense = ReactValue.Suspense;
+export const cloneElement = ReactValue.cloneElement;
+export const createContext = ReactValue.createContext;
+export const createElement = ReactValue.createElement;
+export const createRef = ReactValue.createRef;
+export const forwardRef = ReactValue.forwardRef;
+export const isValidElement = ReactValue.isValidElement;
+export const lazy = ReactValue.lazy;
+export const memo = ReactValue.memo;
+export const startTransition = ReactValue.startTransition;
+export const useCallback = ReactValue.useCallback;
+export const useContext = ReactValue.useContext;
+export const useDebugValue = ReactValue.useDebugValue;
+export const useDeferredValue = ReactValue.useDeferredValue;
+export const useEffect = ReactValue.useEffect;
+export const useId = ReactValue.useId;
+export const useImperativeHandle = ReactValue.useImperativeHandle;
+export const useInsertionEffect = ReactValue.useInsertionEffect;
+export const useLayoutEffect = ReactValue.useLayoutEffect;
+export const useMemo = ReactValue.useMemo;
+export const useReducer = ReactValue.useReducer;
+export const useRef = ReactValue.useRef;
+export const useState = ReactValue.useState;
+export const useSyncExternalStore = ReactValue.useSyncExternalStore;
+export const useTransition = ReactValue.useTransition;
+"#
+    .to_string()
+}
+
+fn jsx_runtime_module_source() -> String {
+    r#"
+const ReactValue = globalThis.React || React;
+export const Fragment = ReactValue.Fragment;
+export const jsx = ReactValue.createElement;
+export const jsxs = ReactValue.createElement;
+export const jsxDEV = ReactValue.createElement;
+"#
+    .to_string()
 }
 
 fn command_display(command: &Command) -> String {
@@ -1774,61 +2444,6 @@ fn custom_view_url(
             &view.project.name,
             &format!("logs?tvt=custom&tv={}", encode(function_id)),
         ),
-    }
-}
-
-fn select_preview_entry<'a>(
-    manifest: &'a ViewsManifest,
-    selector: Option<&str>,
-    view_type: Option<ViewType>,
-) -> Result<&'a ViewManifestEntry> {
-    let entries = manifest
-        .files
-        .iter()
-        .flat_map(|file| file.entries.iter())
-        .filter(|entry| view_type.is_none_or(|view_type| entry.view_type == view_type))
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
-        match view_type {
-            Some(view_type) => bail!(
-                "selected file did not register any {} custom views",
-                view_type.label()
-            ),
-            None => bail!("selected file did not register any custom views"),
-        }
-    }
-    if let Some(selector) = selector {
-        let matches = entries
-            .into_iter()
-            .filter(|entry| entry.slug == selector || entry.name == selector)
-            .collect::<Vec<_>>();
-        return match matches.as_slice() {
-            [entry] => Ok(*entry),
-            [] => match view_type {
-                Some(view_type) => bail!(
-                    "{} custom view '{selector}' not found in selected file",
-                    view_type.label()
-                ),
-                None => bail!("custom view '{selector}' not found in selected file"),
-            },
-            _ => match view_type {
-                Some(view_type) => bail!(
-                    "{} custom view selector '{selector}' matched multiple views",
-                    view_type.label()
-                ),
-                None => bail!("custom view selector '{selector}' matched multiple views"),
-            },
-        };
-    }
-    if entries.len() == 1 {
-        return Ok(entries[0]);
-    }
-    match view_type {
-        Some(view_type) => bail!(
-            "selected file registers multiple {} custom views; pass --view <slug-or-name>",
-            view_type.label()
-        ),
-        None => bail!("selected file registers multiple custom views; pass --view <slug-or-name>"),
     }
 }
 
@@ -2292,26 +2907,183 @@ mod tests {
     }
 
     #[test]
-    fn preview_html_includes_hot_reload_polling() {
-        let html = render_preview_html(
-            "Preview",
-            "module.exports = function View() {}",
-            &json!({}),
-            "v1",
+    fn push_runner_bundles_tsx_with_swc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dependency = dir.path().join("label.ts");
+        let path = dir.path().join("swc.trace-view.tsx");
+        std::fs::write(&dependency, "export const label = 'SWC bundled';\n")
+            .expect("write dependency");
+        std::fs::write(
+            &path,
+            r#"
+import { customTraceView } from "braintrust/custom-views";
+import { label } from "./label";
+
+export default customTraceView(
+  { name: "SWC Trace", slug: "swc-trace", project: { id: "proj_test" } },
+  function SwcTraceView() {
+    return <section>{label}</section>;
+  },
+);
+"#,
+        )
+        .expect("write view");
+
+        let manifest = run_views_runner(&[path.clone()]).expect("views manifest");
+
+        assert_eq!(manifest.runtime_context.runtime, "browser");
+        assert_eq!(manifest.files.len(), 1);
+        let file = &manifest.files[0];
+        assert_eq!(
+            file.source_file,
+            path.canonicalize()
+                .expect("canonical view")
+                .display()
+                .to_string()
         );
+        assert!(file.dependencies.iter().any(|item| item
+            == &dependency
+                .canonicalize()
+                .expect("canonical dependency")
+                .display()
+                .to_string()));
+        assert_eq!(file.entries.len(), 1);
+        let entry = &file.entries[0];
+        assert_eq!(entry.view_type, ViewType::Trace);
+        assert_eq!(entry.name, "SWC Trace");
+        assert_eq!(entry.slug, "swc-trace");
+        assert_eq!(entry.project_id.as_deref(), Some("proj_test"));
+        assert!(entry
+            .code
+            .contains("module.exports = __BraintrustCustomView"));
+        assert!(entry.code.contains("React.createElement"));
+        assert!(!entry.code.contains("esbuild"));
+        assert!(!entry.code.contains(": string"));
+    }
+
+    fn test_preview_source(path: PathBuf, root: PathBuf) -> PreviewSource {
+        PreviewSource {
+            path,
+            root,
+            view: None,
+            view_type: ViewType::Trace,
+        }
+    }
+
+    #[test]
+    fn preview_html_includes_hot_reload_polling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.trace-view.tsx");
+        std::fs::write(&path, "export default null;\n").expect("write view");
+        let source = test_preview_source(path, dir.path().to_path_buf());
+        let html = render_preview_html("Preview", &source, "v1");
 
         assert!(html.contains("previewVersion"));
         assert!(html.contains("/preview-version"));
         assert!(html.contains("window.location.reload()"));
+        assert!(html.contains("sourceModuleUrl"));
+        assert!(html.contains("/preview-module/"));
+        assert!(html.contains("/preview-assets/tailwindcss-browser.js"));
+        assert!(html.contains("/preview-assets/react.js"));
+        assert!(html.contains("/preview-assets/react-dom.js"));
+        assert!(!html.contains("https://cdn.tailwindcss.com"));
+        assert!(!html.contains("https://unpkg.com"));
     }
 
     #[test]
-    fn preview_error_html_includes_hot_reload_polling() {
-        let html = render_preview_error_html("Preview", "bundle failed", "v1");
+    fn preview_assets_are_embedded_from_npm() {
+        let react = preview_asset_source("react").expect("react preview asset");
+        let react_dom = preview_asset_source("react-dom").expect("react-dom preview asset");
+        let tailwind = preview_asset_source("tailwindcss-browser").expect("tailwind preview asset");
 
-        assert!(html.contains("bundle failed"));
-        assert!(html.contains("/preview-version"));
-        assert!(html.contains("window.location.reload()"));
+        assert!(react.contains("React"));
+        assert!(react_dom.contains("ReactDOM"));
+        assert!(tailwind.contains("tailwind"));
+        assert!(preview_asset_source("missing").is_none());
+    }
+
+    #[test]
+    fn preview_source_path_allows_files_inside_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.trace-view.tsx");
+        let dependency = dir.path().join("component.tsx");
+        std::fs::write(&path, "export { default } from './component';\n").expect("write view");
+        std::fs::write(&dependency, "export default null;\n").expect("write dependency");
+        let source = test_preview_source(path, dir.path().canonicalize().expect("root"));
+
+        let resolved = preview_source_path_from_request(&source, &dependency.display().to_string())
+            .expect("dependency should be allowed");
+
+        assert_eq!(
+            resolved,
+            dependency.canonicalize().expect("canonical dependency")
+        );
+    }
+
+    #[test]
+    fn preview_source_path_rejects_files_outside_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside_dir = tempfile::tempdir().expect("outside tempdir");
+        let path = dir.path().join("test.trace-view.tsx");
+        let outside = outside_dir.path().join("component.tsx");
+        std::fs::write(&path, "export default null;\n").expect("write view");
+        std::fs::write(&outside, "export default null;\n").expect("write outside dependency");
+        let source = test_preview_source(path, dir.path().canonicalize().expect("root"));
+
+        let error = preview_source_path_from_request(&source, &outside.display().to_string())
+            .expect_err("outside dependency should be rejected");
+
+        assert!(format!("{error:#}").contains("preview source must be inside"));
+    }
+
+    #[test]
+    fn preview_relative_import_resolution_stays_inside_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.trace-view.tsx");
+        let dependency = dir.path().join("component.tsx");
+        std::fs::write(&path, "export { default } from './component';\n").expect("write view");
+        std::fs::write(&dependency, "export default null;\n").expect("write dependency");
+        let source = test_preview_source(
+            path.canonicalize().expect("canonical view"),
+            dir.path().canonicalize().expect("root"),
+        );
+
+        let resolved = resolve_preview_source_path(
+            &source,
+            Some(&source.path.display().to_string()),
+            "./component",
+        )
+        .expect("relative import should resolve");
+
+        assert_eq!(
+            resolved,
+            dependency.canonicalize().expect("canonical dependency")
+        );
+    }
+
+    #[test]
+    fn preview_module_compiles_tsx_with_oxc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.trace-view.tsx");
+        std::fs::write(
+            &path,
+            r#"import { customTraceView } from "braintrust/custom-views";
+
+type Props = { span: { id: string } };
+
+export default customTraceView({ name: "Test View", slug: "test-view" }, ({ span }: Props) => {
+  return <div>{span.id}</div>;
+});
+"#,
+        )
+        .expect("write view");
+
+        let code = compile_preview_module(&path).expect("compile TSX preview module");
+
+        assert!(code.contains("react/jsx-runtime"));
+        assert!(code.contains("customTraceView"));
+        assert!(!code.contains("type Props"));
+        assert!(!code.contains("<div>"));
     }
 
     #[test]
@@ -2319,11 +3091,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.trace-view.tsx");
         std::fs::write(&path, "export default null;\n").expect("write view");
-        let source = PreviewSource {
-            path: path.clone(),
-            view: None,
-            view_type: Some(ViewType::Trace),
-        };
+        let source = test_preview_source(path.clone(), dir.path().to_path_buf());
 
         let before = preview_source_version(&source, &[]);
         std::fs::write(&path, "export default function View() { return null; }\n")
@@ -2344,11 +3112,7 @@ mod tests {
             "export default function View() { return null; }\n",
         )
         .expect("write dependency");
-        let source = PreviewSource {
-            path,
-            view: None,
-            view_type: Some(ViewType::Trace),
-        };
+        let source = test_preview_source(path, dir.path().to_path_buf());
 
         let dependency_paths = vec![dependency.clone()];
         let before = preview_source_version(&source, &dependency_paths);
