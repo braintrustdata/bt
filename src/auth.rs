@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use base64::Engine as _;
-use braintrust_sdk_rust::{BraintrustClient, LoginState};
 use chrono::{DateTime, Months, Utc};
 use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
