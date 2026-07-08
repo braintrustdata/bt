@@ -1,5 +1,7 @@
 # Braintrust CLI (`bt`)
 
+ test
+
 ## Current Limitations
 
 - `bt eval` is currently Unix-only (Linux/macOS). Windows support is planned.
