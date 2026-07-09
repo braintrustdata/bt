@@ -212,6 +212,8 @@ jobs:
       - name: Install dependencies
         run: ${{ matrix.packages_install }}
 
+        # https://github.com/azure/artifact-signing-action
+        # As of 2026-06-23, windows arm runners are not supported so the compilation and signing of bt.exe for aarch64 windows needs to happend on x64 windows
       - name: Set up MSVC cross-compilation for Windows ARM64
         if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -454,11 +456,11 @@ jobs:
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version
 
-      - name: Verify self-update check
+      - name: Verify update check
         shell: bash
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
-          bt self update --check --channel stable
+          bt update --check --channel stable
 
   smoke-install-macos:
     needs:
@@ -481,7 +483,7 @@ jobs:
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version
-          bt self update --check --channel stable
+          bt update --check --channel stable
 
   smoke-install-windows:
     needs:
@@ -509,7 +511,7 @@ jobs:
           }
           & $btExe --version
           $env:PATH = "$binDir;$env:PATH"
-          & $btExe self update --check --channel stable
+          & $btExe update --check --channel stable
 
   publish-npm:
     needs:

@@ -65,22 +65,22 @@ curl -fsSL -O "https://github.com/braintrustdata/bt/releases/download/<tag>/bt-<
 shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 ```
 
-## Self Update
+## Update
 
-`bt` can self-update when installed via the official installer.
+`bt` can update itself when installed via the official installer.
 
 ```bash
 # update on the current build channel (canary for local/dev builds, stable for official releases)
-bt self update
+bt update
 
 # check without installing
-bt self update --check
+bt update --check
 
 # switch/update to latest mainline canary
-bt self update --channel canary
+bt update --channel canary
 ```
 
-If `bt` was installed via another package manager (Homebrew, apt, choco, etc), use that package manager to update instead.
+If `bt` was installed via npm, use that to update instead.
 
 ## Uninstall
 
@@ -103,26 +103,26 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 ## Troubleshooting
 
 - If `bt` is not found after install, start a new shell or add `${XDG_BIN_HOME:-$HOME/.local/bin}` to your `PATH`.
-- If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
+- If `bt update --check --json` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 
 ## Commands
 
-| Command          | Description                                                        |
-| ---------------- | ------------------------------------------------------------------ |
-| `bt init`        | Initialize `.bt/` config directory and link to a project           |
-| `bt auth`        | Authenticate with Braintrust                                       |
-| `bt switch`      | Switch org and project context                                     |
-| `bt status`      | Show current org and project context                               |
-| `bt datasets`    | Manage datasets and dataset pipelines                              |
-| `bt eval`        | Run eval files (Unix only)                                         |
-| `bt sql`         | Run SQL queries against Braintrust                                 |
-| `bt view`        | View logs, traces, and spans                                       |
-| `bt projects`    | Manage projects (list, create, view, delete)                       |
-| `bt datasets`    | Manage remote datasets (list, create, update, view, delete)        |
-| `bt prompts`     | Manage prompts (list, view, delete)                                |
-| `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
-| `bt self update` | Update bt in-place                                                 |
+| Command       | Description                                                        |
+| ------------- | ------------------------------------------------------------------ |
+| `bt init`     | Initialize `.bt/` config directory and link to a project           |
+| `bt auth`     | Authenticate with Braintrust                                       |
+| `bt switch`   | Switch org and project context                                     |
+| `bt status`   | Show current org and project context                               |
+| `bt datasets` | Manage datasets and dataset pipelines                              |
+| `bt eval`     | Run eval files (Unix only)                                         |
+| `bt sql`      | Run SQL queries against Braintrust                                 |
+| `bt view`     | View logs, traces, and spans                                       |
+| `bt projects` | Manage projects (list, create, view, delete)                       |
+| `bt datasets` | Manage remote datasets (list, create, update, view, delete)        |
+| `bt prompts`  | Manage prompts (list, view, delete)                                |
+| `bt sync`     | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt update`   | Update bt in-place                                                 |
 
 ## `bt eval`
 
@@ -395,7 +395,7 @@ Skill smoke-test harness:
 
 ## Roadmap / TODO
 
-- Add richer channel controls for self-update (for example pinned/branch canary selection).
+- Add richer channel controls for `bt update` (for example pinned/branch canary selection).
 - Expand release verification and smoke tests for installer flows across more architectures/environments.
 - Add `bt eval` support on Windows (today, `bt eval` is Unix-only due to Unix socket usage).
 - Add signed artifact verification guidance (signature flow) in install and upgrade docs.

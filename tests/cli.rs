@@ -80,6 +80,36 @@ fn setup_verbose_is_accepted_after_subcommand() {
 }
 
 #[test]
+fn update_help_exposes_self_update_flags() {
+    bt_command()
+        .args(["update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--check"))
+        .stdout(predicate::str::contains("--channel"));
+}
+
+#[test]
+fn self_update_remains_as_hidden_compatibility_path() {
+    bt_command()
+        .args(["self", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--check"))
+        .stdout(predicate::str::contains("--channel"));
+}
+
+#[test]
+fn top_level_help_shows_update_not_self() {
+    bt_command()
+        .args(["--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update       Update bt in-place"))
+        .stdout(predicate::str::contains("self         Self-management commands").not());
+}
+
+#[test]
 fn topics_report_help_accepts_global_org_short_conflict_free() {
     bt_command()
         .args([
