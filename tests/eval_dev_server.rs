@@ -461,6 +461,19 @@ fn eval_dev_server_fake_runner_byte_contracts() {
     );
     assert_devserver_golden("stream-error.sse", &error_stream);
 
+    let canonical_headers = [
+        ("x-bt-auth-token", "test-key"),
+        ("x-bt-org-name", "test-org"),
+        ("Content-Type", "application/json"),
+        ("x-bt-stream-fmt", "canonical"),
+    ];
+    let canonical_stream = curl_post(
+        &format!("{base_url}/eval"),
+        &canonical_headers,
+        &request("canonical-eval", true),
+    );
+    assert_devserver_golden("stream-canonical.sse", &canonical_stream);
+
     let (status, response) = curl_post_with_status(
         &format!("{base_url}/eval"),
         &post_headers,
@@ -468,6 +481,14 @@ fn eval_dev_server_fake_runner_byte_contracts() {
     );
     assert_eq!(status, 200);
     assert_devserver_golden("response-happy.json", &response);
+
+    let (status, response) = curl_post_with_status(
+        &format!("{base_url}/eval"),
+        &post_headers,
+        &request("canonical-eval", false),
+    );
+    assert_eq!(status, 200);
+    assert_devserver_golden("response-canonical.json", &response);
 
     let (status, response) = curl_post_with_status(
         &format!("{base_url}/eval"),

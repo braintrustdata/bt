@@ -165,6 +165,8 @@ pub(super) struct CaseDelta {
     pub case_id: String,
     pub kind: DeltaKind,
     pub data: String,
+    #[serde(skip, default)]
+    pub legacy_progress: Option<super::SseProgressEventData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,7 +247,7 @@ pub(super) struct EvalReporterContext {
     pub output_file: Option<std::path::PathBuf>,
 }
 
-pub(super) trait EvalReporter {
+pub(super) trait EvalReporter: Send {
     fn name(&self) -> &'static str {
         "reporter"
     }
@@ -360,7 +362,7 @@ impl ReporterManager {
     }
 
     pub fn dispatch(&mut self, event: &EvalReporterEvent) {
-        if self.finished || (self.run_ended && !matches!(event, EvalReporterEvent::RunEnd { .. })) {
+        if self.finished {
             return;
         }
         if let EvalReporterEvent::Error { error } = event {
@@ -559,7 +561,24 @@ impl LegacyEventAdapter {
                 },
             }),
             EvalEvent::Progress(progress) => {
-                let payload = serde_json::from_str::<EvalProgressData>(&progress.data).ok()?;
+                let Ok(payload) = serde_json::from_str::<EvalProgressData>(&progress.data) else {
+                    let kind = if progress.event.contains("json") {
+                        DeltaKind::Json
+                    } else if progress.event.contains("reason") {
+                        DeltaKind::Reasoning
+                    } else {
+                        DeltaKind::Text
+                    };
+                    return Some(EvalReporterEvent::CaseDelta {
+                        delta: CaseDelta {
+                            eval_id: progress.name.clone(),
+                            case_id: progress.id.clone(),
+                            kind,
+                            data: progress.data.clone(),
+                            legacy_progress: Some(progress.clone()),
+                        },
+                    });
+                };
                 if payload.kind_type != "eval_progress" {
                     return None;
                 }

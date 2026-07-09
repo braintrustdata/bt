@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use actix_web::dev::Service;
@@ -313,7 +313,7 @@ pub struct EvalArgs {
     )]
     pub jsonl: bool,
 
-    /// Reporter used to render eval results. Repeat to compose reporters.
+    /// Reporter used to render eval results. Repeat to compose reporters. Ignored with --dev.
     #[arg(
         long = "reporter",
         env = "BRAINTRUST_EVAL_REPORTER",
@@ -323,7 +323,7 @@ pub struct EvalArgs {
     )]
     pub reporters: Vec<EvalReporterName>,
 
-    /// Output path for artifact reporters such as junit.
+    /// Output path for artifact reporters such as junit. Ignored with --dev.
     #[arg(
         long = "output-file",
         env = "BRAINTRUST_EVAL_OUTPUT_FILE",
@@ -1522,6 +1522,8 @@ fn make_dev_mode_env(
         ("BRAINTRUST_ORG_NAME".to_string(), auth.org_name.clone()),
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
+        // Process-internal reporter interest negotiation, not user configuration.
+        ("BT_EVAL_REPORTER_CASE_DELTA".to_string(), "1".to_string()),
     ];
     if let Some(api_url) = auth.api_url.as_ref() {
         env.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
@@ -1538,12 +1540,14 @@ fn serialize_sse_event(event: &str, data: &str) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+#[cfg(test)]
 fn is_eval_progress_payload(progress: &SseProgressEventData) -> bool {
     serde_json::from_str::<EvalProgressData>(&progress.data)
         .map(|payload| payload.kind_type == "eval_progress")
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
     match event {
         EvalEvent::Reporter(_) => None,
@@ -1642,6 +1646,21 @@ fn apply_cors_headers(
     }
 }
 
+fn dispatch_reporter_event(
+    manager: &mut ReporterManager,
+    adapter: &mut LegacyEventAdapter,
+    event: EvalEvent,
+) {
+    match event {
+        EvalEvent::Reporter(event) => manager.dispatch(&event),
+        legacy => {
+            if let Some(event) = adapter.translate(&legacy) {
+                manager.dispatch(&event);
+            }
+        }
+    }
+}
+
 async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> HttpResponse {
     let auth = match authenticate_dev_request(&req, &state).await {
         Ok(auth) => auth,
@@ -1687,36 +1706,42 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         }
     };
 
-    let mut stdout_lines = Vec::new();
-    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-    let output =
-        match drive_eval_runner(
-            spawned.process,
-            ConsolePolicy::Forward,
-            |event| match event {
-                EvalEvent::Console { stream, message } if stream == "stdout" => {
-                    stdout_lines.push(message);
-                }
-                EvalEvent::Error {
-                    message,
-                    stack: _,
-                    status,
-                } => errors.push((message, status)),
-                _ => {}
-            },
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                return json_error_response(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{err:#}"),
-                );
-            }
-        };
+    let collected = Arc::new(Mutex::new(DevCollectorState::default()));
+    let collector: Box<dyn EvalReporter> = Box::new(DevCollectorReporter {
+        state: Arc::clone(&collected),
+    });
+    let mut manager = match ReporterManager::new(vec![collector], state.base.profile.clone(), None)
+    {
+        Ok(manager) => manager,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    let mut adapter = LegacyEventAdapter::new(manager.run_id().to_string());
+    let output = match drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
+        dispatch_reporter_event(&mut manager, &mut adapter, event);
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    manager.finish(if output.status.success() {
+        EvalStatus::Completed
+    } else {
+        EvalStatus::Errored
+    });
+    let collected = collected.lock().unwrap();
 
-    if let Some((message, status)) = errors.first() {
+    if let Some((message, status)) = collected.errors.first() {
         let status = status
             .and_then(|status| actix_web::http::StatusCode::from_u16(status).ok())
             .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -1730,14 +1755,14 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
     }
 
     let mut parsed_manifest: Option<Value> = None;
-    for line in stdout_lines.iter().rev() {
+    for line in collected.stdout_lines.iter().rev() {
         if let Ok(value) = serde_json::from_str::<Value>(line) {
             parsed_manifest = Some(value);
             break;
         }
     }
     if parsed_manifest.is_none() {
-        let joined = stdout_lines.join("\n");
+        let joined = collected.stdout_lines.join("\n");
         if let Ok(value) = serde_json::from_str::<Value>(&joined) {
             parsed_manifest = Some(value);
         }
@@ -1774,6 +1799,11 @@ async fn dev_server_eval(
         return response;
     }
     let stream_requested = eval_request.stream.unwrap_or(false);
+    let stream_format = if req.headers().contains_key("x-bt-stream-fmt") {
+        DevStreamFormat::Canonical
+    } else {
+        DevStreamFormat::Legacy
+    };
     let extra_env = match make_dev_mode_env(&auth, &state, Some(&eval_request), "eval") {
         Ok(extra_env) => extra_env,
         Err(err) => {
@@ -1817,57 +1847,71 @@ async fn dev_server_eval(
     if stream_requested {
         let (tx, rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
-            let mut saw_error = false;
-            let mut stderr_lines: Vec<String> = Vec::new();
+            let collected = Arc::new(Mutex::new(DevCollectorState::default()));
+            let bridge: Box<dyn EvalReporter> = Box::new(HttpBridgeReporter {
+                tx,
+                format: stream_format,
+                pending_run_end: None,
+            });
+            let collector: Box<dyn EvalReporter> = Box::new(DevCollectorReporter {
+                state: Arc::clone(&collected),
+            });
+            let mut manager = match ReporterManager::new(vec![bridge, collector], None, None) {
+                Ok(manager) => manager,
+                Err(_) => return,
+            };
+            let mut adapter = LegacyEventAdapter::new(manager.run_id().to_string());
             let output = drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
-                if matches!(event, EvalEvent::Error { .. }) {
-                    saw_error = true;
-                }
-                if matches!(event, EvalEvent::Done) {
-                    return;
-                }
-                if let EvalEvent::Console {
-                    ref stream,
-                    ref message,
-                } = event
-                {
-                    for line in message.lines() {
-                        let _ = tx.send(format!(": [{stream}] {line}\n"));
-                    }
-                    if stream == "stderr" {
-                        stderr_lines.push(message.clone());
-                    }
-                    return;
-                }
-                if let Some(encoded) = encode_eval_event_for_http(&event) {
-                    let _ = tx.send(encoded);
-                }
+                dispatch_reporter_event(&mut manager, &mut adapter, event);
             })
             .await;
 
-            match output {
+            let status = match output {
                 Ok(output) => {
-                    if !output.status.success() && !saw_error {
+                    let state = collected.lock().unwrap();
+                    if !output.status.success() && state.errors.is_empty() {
                         let mut detail = format!("Eval runner exited with {}.", output.status);
-                        for line in stderr_lines.iter() {
+                        for line in &state.stderr_lines {
                             detail.push('\n');
                             detail.push_str(line);
                         }
-                        let error =
-                            serialize_sse_event("error", &json!({ "message": detail }).to_string());
-                        let _ = tx.send(error);
+                        drop(state);
+                        manager.dispatch(&EvalReporterEvent::Error {
+                            error: reporter::ReporterError {
+                                scope: reporter::ErrorScope {
+                                    run_id: manager.run_id().to_string(),
+                                    eval_id: None,
+                                    case_id: None,
+                                },
+                                message: detail,
+                                stack: None,
+                                status: None,
+                            },
+                        });
+                    }
+                    if output.status.success() {
+                        EvalStatus::Completed
+                    } else {
+                        EvalStatus::Errored
                     }
                 }
                 Err(err) => {
-                    let error = serialize_sse_event(
-                        "error",
-                        &json!({ "message": format!("{err:#}") }).to_string(),
-                    );
-                    let _ = tx.send(error);
+                    manager.dispatch(&EvalReporterEvent::Error {
+                        error: reporter::ReporterError {
+                            scope: reporter::ErrorScope {
+                                run_id: manager.run_id().to_string(),
+                                eval_id: None,
+                                case_id: None,
+                            },
+                            message: format!("{err:#}"),
+                            stack: None,
+                            status: None,
+                        },
+                    });
+                    EvalStatus::Errored
                 }
-            }
-
-            let _ = tx.send(serialize_sse_event("done", ""));
+            };
+            manager.finish(status);
         });
 
         let response_stream = stream::unfold(rx, |mut rx| async {
@@ -1882,40 +1926,48 @@ async fn dev_server_eval(
             .streaming(response_stream);
     }
 
-    let mut summary: Option<ExperimentSummary> = None;
-    let mut errors: Vec<(String, Option<u16>)> = Vec::new();
-    let output =
-        match drive_eval_runner(
-            spawned.process,
-            ConsolePolicy::Forward,
-            |event| match event {
-                EvalEvent::Summary(current) => summary = Some(current),
-                EvalEvent::Error {
-                    message,
-                    stack: _,
-                    status,
-                } => errors.push((message, status)),
-                _ => {}
-            },
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                return json_error_response(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("{err:#}"),
-                );
-            }
-        };
+    let collected = Arc::new(Mutex::new(DevCollectorState::default()));
+    let collector: Box<dyn EvalReporter> = Box::new(DevCollectorReporter {
+        state: Arc::clone(&collected),
+    });
+    let mut manager = match ReporterManager::new(vec![collector], state.base.profile.clone(), None)
+    {
+        Ok(manager) => manager,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    let mut adapter = LegacyEventAdapter::new(manager.run_id().to_string());
+    let output = match drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
+        dispatch_reporter_event(&mut manager, &mut adapter, event);
+    })
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return json_error_response(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    manager.finish(if output.status.success() {
+        EvalStatus::Completed
+    } else {
+        EvalStatus::Errored
+    });
+    let collected = collected.lock().unwrap();
 
-    if let Some((message, status)) = errors.first() {
+    if let Some((message, status)) = collected.errors.first() {
         let status = status
             .and_then(|status| actix_web::http::StatusCode::from_u16(status).ok())
             .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
         return json_error_response(status, message);
     }
-    if let Some(summary) = summary {
+    if let Some(summary) = collected.summary.as_ref() {
         return HttpResponse::Ok().json(summary);
     }
     if !output.status.success() {
@@ -2847,7 +2899,7 @@ struct MetricSummary {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct SseProgressEventData {
     id: String,
     object_type: String,
@@ -2941,6 +2993,217 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
             let _ = tx.send(EvalEvent::Done);
         }
         _ => {}
+    }
+}
+
+#[derive(Default)]
+struct DevCollectorState {
+    stdout_lines: Vec<String>,
+    stderr_lines: Vec<String>,
+    summary: Option<ExperimentSummary>,
+    errors: Vec<(String, Option<u16>)>,
+}
+
+struct DevCollectorReporter {
+    state: Arc<Mutex<DevCollectorState>>,
+}
+
+impl EvalReporter for DevCollectorReporter {
+    fn name(&self) -> &'static str {
+        "dev-collector"
+    }
+
+    fn on_console(&mut self, log: &reporter::ConsoleEvent) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        match log.stream {
+            ConsoleStream::Stdout => state.stdout_lines.push(log.message.clone()),
+            ConsoleStream::Stderr => state.stderr_lines.push(log.message.clone()),
+        }
+        Ok(())
+    }
+
+    fn on_eval_end(&mut self, eval: &reporter::EvalEnd) -> Result<()> {
+        if let Some(summary) = eval.summary.clone() {
+            self.state.lock().unwrap().summary = Some(summary);
+        }
+        Ok(())
+    }
+
+    fn on_error(&mut self, error: &reporter::ReporterError) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .errors
+            .push((error.message.clone(), error.status));
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DevStreamFormat {
+    Legacy,
+    Canonical,
+}
+
+struct HttpBridgeReporter {
+    tx: mpsc::UnboundedSender<String>,
+    format: DevStreamFormat,
+    pending_run_end: Option<reporter::EvalRunEnd>,
+}
+
+impl HttpBridgeReporter {
+    fn send<T: Serialize>(&self, event: &str, payload: &T) {
+        if let Ok(data) = serde_json::to_string(payload) {
+            let _ = self.tx.send(serialize_sse_event(event, &data));
+        }
+    }
+}
+
+impl EvalReporter for HttpBridgeReporter {
+    fn name(&self) -> &'static str {
+        "http-bridge"
+    }
+
+    fn wants_case_delta(&self) -> bool {
+        true
+    }
+
+    fn on_run_start(&mut self, run: &reporter::EvalRun) -> Result<()> {
+        match self.format {
+            DevStreamFormat::Canonical => self.send("run:start", run),
+            DevStreamFormat::Legacy => {
+                self.send(
+                    "processing",
+                    &ProcessingEventData {
+                        evaluators: run.evaluator_count,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn on_eval_start(&mut self, eval: &reporter::EvalInfo) -> Result<()> {
+        match self.format {
+            DevStreamFormat::Canonical => self.send("eval:start", eval),
+            DevStreamFormat::Legacy => {
+                if let Some(experiment) = eval.experiment.as_ref() {
+                    self.send("start", experiment);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_case_start(&mut self, case: &reporter::EvalCaseInfo) -> Result<()> {
+        if self.format == DevStreamFormat::Canonical {
+            self.send("case:start", case);
+        }
+        Ok(())
+    }
+
+    fn on_case_end(&mut self, case: &reporter::EvalCaseResult) -> Result<()> {
+        if self.format == DevStreamFormat::Canonical {
+            self.send("case:end", case);
+        }
+        Ok(())
+    }
+
+    fn on_eval_end(&mut self, eval: &reporter::EvalEnd) -> Result<()> {
+        match self.format {
+            DevStreamFormat::Canonical => self.send("eval:end", eval),
+            DevStreamFormat::Legacy => {
+                if let Some(summary) = eval.summary.as_ref() {
+                    self.send("summary", summary);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_error(&mut self, error: &reporter::ReporterError) -> Result<()> {
+        match self.format {
+            DevStreamFormat::Canonical => self.send("error", error),
+            DevStreamFormat::Legacy => self.send(
+                "error",
+                &json!({
+                    "message": error.message,
+                    "stack": error.stack,
+                    "status": error.status,
+                }),
+            ),
+        }
+        Ok(())
+    }
+
+    fn on_console(&mut self, log: &reporter::ConsoleEvent) -> Result<()> {
+        if self.format == DevStreamFormat::Canonical {
+            self.send("console", log);
+        } else {
+            for line in log.message.lines() {
+                let stream = match log.stream {
+                    ConsoleStream::Stdout => "stdout",
+                    ConsoleStream::Stderr => "stderr",
+                };
+                let _ = self.tx.send(format!(": [{stream}] {line}\n"));
+            }
+        }
+        Ok(())
+    }
+
+    fn on_progress(&mut self, progress: &reporter::ProgressEvent) -> Result<()> {
+        if self.format == DevStreamFormat::Canonical {
+            self.send("eval:progress", progress);
+        }
+        Ok(())
+    }
+
+    fn on_case_delta(&mut self, delta: &reporter::CaseDelta) -> Result<()> {
+        match self.format {
+            DevStreamFormat::Canonical => self.send("case:delta", delta),
+            DevStreamFormat::Legacy => {
+                if let Some(progress) = delta.legacy_progress.as_ref() {
+                    self.send("progress", progress);
+                } else {
+                    let event = match delta.kind {
+                        reporter::DeltaKind::Text => "text_delta",
+                        reporter::DeltaKind::Json => "json_delta",
+                        reporter::DeltaKind::Reasoning => "reasoning_delta",
+                    };
+                    self.send(
+                        "progress",
+                        &SseProgressEventData {
+                            id: delta.case_id.clone(),
+                            object_type: "task".to_string(),
+                            origin: None,
+                            format: "code".to_string(),
+                            output_type: "completion".to_string(),
+                            name: delta.eval_id.clone(),
+                            event: event.to_string(),
+                            data: delta.data.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_run_end(&mut self, run: &reporter::EvalRunEnd) -> Result<Option<bool>> {
+        self.pending_run_end = Some(run.clone());
+        Ok(None)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(run) = self.pending_run_end.take() {
+            match self.format {
+                DevStreamFormat::Canonical => self.send("run:end", &run),
+                DevStreamFormat::Legacy => {
+                    let _ = self.tx.send(serialize_sse_event("done", ""));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

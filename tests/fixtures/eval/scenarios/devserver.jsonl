@@ -10,3 +10,11 @@
 {"mode":"eval","request":"error-eval","exit":0}
 {"mode":"eval","request":"fallback-eval","process_stderr":"scripted runner crash"}
 {"mode":"eval","request":"fallback-eval","exit":3}
+{"mode":"eval","request":"canonical-eval","event":"run:start","data":{"runId":"run-dev-canonical","evaluatorCount":1,"protocolVersion":1}}
+{"mode":"eval","request":"canonical-eval","event":"eval:start","data":{"runId":"run-dev-canonical","evalId":"eval-dev-canonical","name":"canonical-eval","experiment":{"projectName":"test-project","experimentName":"canonical-experiment","projectId":"project-test-id","experimentId":"canonical-experiment-id"}}}
+{"mode":"eval","request":"canonical-eval","event":"case:delta","data":{"evalId":"eval-dev-canonical","caseId":"span-dev-case","kind":"json","data":"{\"answer\":\"ok\"}"}}
+{"mode":"eval","request":"canonical-eval","event":"case:start","data":{"evalId":"eval-dev-canonical","caseId":"span-dev-case","index":0,"name":"dev case"}}
+{"mode":"eval","request":"canonical-eval","event":"case:end","data":{"evalId":"eval-dev-canonical","caseId":"span-dev-case","index":0,"name":"dev case","status":"completed","durationMs":10,"scores":{}}}
+{"mode":"eval","request":"canonical-eval","event":"eval:end","data":{"evalId":"eval-dev-canonical","status":"completed","durationMs":10,"caseCounts":{"completed":1,"errored":0,"skipped":0},"summary":{"projectName":"test-project","experimentName":"canonical-experiment","projectId":"project-test-id","experimentId":"canonical-experiment-id","projectUrl":"https://example.test/project","experimentUrl":"https://example.test/experiment","comparisonExperimentName":null,"scores":{},"metrics":null},"errors":[]}}
+{"mode":"eval","request":"canonical-eval","event":"run:end","data":{"runId":"run-dev-canonical","status":"completed","durationMs":10,"errors":[]}}
+{"mode":"eval","request":"canonical-eval","exit":0}
