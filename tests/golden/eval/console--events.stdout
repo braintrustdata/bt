@@ -1,0 +1,6 @@
+{"type":"run:start","run":{"runId":"legacy-run","evaluatorCount":1,"protocolVersion":1}}
+{"type":"console","log":{"stream":"stdout","message":"user stdout one"}}
+{"type":"console","log":{"stream":"stderr","message":"user stderr one"}}
+{"type":"console","log":{"stream":"stdout","message":"user stdout two"}}
+{"type":"console","log":{"stream":"stderr","message":"user stderr two"}}
+{"type":"run:end","run":{"runId":"legacy-run","status":"completed","durationMs":0,"errors":[]}}

@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import sys
+import time
 from pathlib import Path
 
 
@@ -74,6 +75,9 @@ def main() -> int:
                 stream.write(f"data: {line}\n")
             stream.write("\n")
             stream.flush()
+    # Keep the process alive briefly after closing SSE so the CLI drains every
+    # queued frame before observing process exit.
+    time.sleep(0.05)
     return exit_code
 
 

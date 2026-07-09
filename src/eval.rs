@@ -37,7 +37,9 @@ use crate::ui::{
 };
 
 mod reporter;
-use reporter::{ConsoleStream, EvalReporter, EvalStatus, LegacyEventAdapter, ReporterManager};
+use reporter::{
+    ConsoleStream, EvalReporter, EvalReporterEvent, EvalStatus, LegacyEventAdapter, ReporterManager,
+};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -253,6 +255,18 @@ pub enum EvalLanguage {
     Python,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
+pub enum EvalReporterName {
+    Fancy,
+    Verbose,
+    Jsonl,
+    Silent,
+    Events,
+    Dot,
+    Junit,
+    GithubActions,
+}
+
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
@@ -297,6 +311,24 @@ pub struct EvalArgs {
         default_value_t = false
     )]
     pub jsonl: bool,
+
+    /// Reporter used to render eval results. Repeat to compose reporters.
+    #[arg(
+        long = "reporter",
+        env = "BRAINTRUST_EVAL_REPORTER",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "REPORTER"
+    )]
+    pub reporters: Vec<EvalReporterName>,
+
+    /// Output path for artifact reporters such as junit.
+    #[arg(
+        long = "output-file",
+        env = "BRAINTRUST_EVAL_OUTPUT_FILE",
+        value_name = "PATH"
+    )]
+    pub output_file: Option<PathBuf>,
 
     /// Stop after the first failing evaluator.
     #[arg(
@@ -439,6 +471,8 @@ enum EvalSamplingMode {
 #[derive(Debug, Clone)]
 struct EvalRunOptions {
     jsonl: bool,
+    reporters: Vec<EvalReporterName>,
+    output_file: Option<PathBuf>,
     terminate_on_failure: bool,
     num_workers: Option<usize>,
     list: bool,
@@ -490,6 +524,8 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
     let options = EvalRunOptions {
         jsonl: args.jsonl,
+        reporters: args.reporters,
+        output_file: args.output_file,
         terminate_on_failure: args.terminate_on_failure,
         num_workers: args.num_workers,
         list: args.list,
@@ -622,6 +658,7 @@ struct EvalPlan<'a> {
 
 struct EvalAttemptOutput {
     status: ExitStatus,
+    reporter_vetoed: bool,
     dependency_files: Vec<String>,
     error_messages: Vec<String>,
     stderr_lines: Vec<String>,
@@ -706,6 +743,9 @@ async fn run_eval_files_once(
     if let Some(message) = missing_vite_node_retry_message(&output) {
         anyhow::bail!(message);
     }
+    if output.reporter_vetoed {
+        anyhow::bail!("an eval reporter vetoed the successful run");
+    }
 
     let dependencies = if collect_dependencies {
         let mut dependencies =
@@ -725,6 +765,62 @@ async fn run_eval_files_once(
     })
 }
 
+fn build_eval_reporters(
+    options: &EvalRunOptions,
+    profile: Option<String>,
+) -> Result<Vec<Box<dyn EvalReporter>>> {
+    let mut reporters: Vec<Box<dyn EvalReporter>> = Vec::new();
+    if options.reporters.is_empty() {
+        if options.jsonl {
+            reporters.push(Box::new(JsonlReporter::default()));
+            reporters.push(Box::new(FancyReporter::new(false, false, false, profile)));
+        } else {
+            reporters.push(Box::new(FancyReporter::new(
+                true,
+                options.list,
+                options.verbose,
+                profile,
+            )));
+        }
+    } else {
+        for reporter in &options.reporters {
+            match reporter {
+                EvalReporterName::Fancy => reporters.push(Box::new(FancyReporter::new(
+                    true,
+                    options.list,
+                    false,
+                    profile.clone(),
+                ))),
+                EvalReporterName::Verbose => reporters.push(Box::new(FancyReporter::new(
+                    true,
+                    options.list,
+                    true,
+                    profile.clone(),
+                ))),
+                EvalReporterName::Jsonl => reporters.push(Box::new(JsonlReporter::default())),
+                EvalReporterName::Silent => reporters.push(Box::new(SilentReporter)),
+                EvalReporterName::Events => reporters.push(Box::new(EventsReporter)),
+                EvalReporterName::Dot
+                | EvalReporterName::Junit
+                | EvalReporterName::GithubActions => anyhow::bail!(
+                    "reporter '{}' requires real per-case results, which are not yet supported by this runner",
+                    reporter.to_possible_value().expect("value enum").get_name()
+                ),
+            }
+        }
+    }
+
+    if options.output_file.is_some()
+        && !options
+            .reporters
+            .iter()
+            .any(|reporter| *reporter == EvalReporterName::Junit)
+    {
+        anyhow::bail!("--output-file requires a file-producing reporter such as --reporter=junit");
+    }
+    Ok(reporters)
+}
+
 async fn run_eval_attempt(
     base: &BaseArgs,
     plan: &EvalPlan<'_>,
@@ -734,6 +830,14 @@ async fn run_eval_attempt(
     js_mode: JsMode,
     console_policy: ConsolePolicy,
 ) -> Result<EvalAttemptOutput> {
+    let selected_reporters = build_eval_reporters(options, base.profile.clone())?;
+    let mut reporters = ReporterManager::new(
+        selected_reporters,
+        base.profile.clone(),
+        options.output_file.clone(),
+    )?;
+    let mut adapter = LegacyEventAdapter::new(reporters.run_id().to_string());
+
     let spawned = spawn_eval_runner(
         base,
         plan.language,
@@ -745,25 +849,13 @@ async fn run_eval_attempt(
         js_mode,
     )
     .await?;
-    let mut selected_reporters: Vec<Box<dyn EvalReporter>> = Vec::new();
-    if options.jsonl {
-        selected_reporters.push(Box::new(JsonlReporter::default()));
-    }
-    selected_reporters.push(Box::new(FancyReporter::new(
-        !options.jsonl,
-        options.list || options.jsonl,
-        options.verbose,
-        base.profile.clone(),
-    )));
-    let mut reporters = ReporterManager::new(selected_reporters, base.profile.clone(), None)?;
-    let mut adapter = LegacyEventAdapter::new(reporters.run_id().to_string());
     let output = drive_eval_runner(spawned.process, console_policy, |event| {
         if let Some(event) = adapter.translate(&event) {
             reporters.dispatch(&event);
         }
     })
     .await?;
-    reporters.finish(if output.status.success() {
+    let reporter_vetoed = reporters.finish(if output.status.success() {
         EvalStatus::Completed
     } else {
         EvalStatus::Errored
@@ -771,6 +863,7 @@ async fn run_eval_attempt(
 
     Ok(EvalAttemptOutput {
         status: output.status,
+        reporter_vetoed,
         dependency_files: output.dependency_files,
         error_messages: output.error_messages,
         stderr_lines: output.stderr_lines,
@@ -2811,6 +2904,31 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
     }
 }
 
+struct SilentReporter;
+
+impl EvalReporter for SilentReporter {
+    fn name(&self) -> &'static str {
+        "silent"
+    }
+}
+
+struct EventsReporter;
+
+impl EvalReporter for EventsReporter {
+    fn name(&self) -> &'static str {
+        "events"
+    }
+
+    fn claims_stdout(&self) -> bool {
+        true
+    }
+
+    fn on_event(&mut self, event: &EvalReporterEvent) -> Result<()> {
+        println!("{}", serde_json::to_string(event)?);
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct JsonlReporter {
     profile: Option<String>,
@@ -4305,6 +4423,7 @@ mod tests {
     fn missing_vite_node_retry_message_is_user_facing() {
         let output = EvalAttemptOutput {
             status: success_status(),
+            reporter_vetoed: false,
             dependency_files: Vec::new(),
             error_messages: Vec::new(),
             stderr_lines: vec!["sh: vite-node: command not found".to_string()],
@@ -4321,6 +4440,7 @@ mod tests {
     fn missing_vite_node_retry_message_uses_exit_code_127_fallback() {
         let output = EvalAttemptOutput {
             status: exit_status(127),
+            reporter_vetoed: false,
             dependency_files: Vec::new(),
             error_messages: Vec::new(),
             stderr_lines: Vec::new(),
@@ -5060,6 +5180,8 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let keys = [
             "BT_EVAL_JSONL",
+            "BRAINTRUST_EVAL_REPORTER",
+            "BRAINTRUST_EVAL_OUTPUT_FILE",
             "BT_EVAL_TERMINATE_ON_FAILURE",
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
@@ -5076,6 +5198,8 @@ mod tests {
         let previous: Vec<(&str, Option<String>)> =
             keys.iter().map(|key| (*key, clear_env_var(key))).collect();
         set_env_var("BT_EVAL_JSONL", "true");
+        set_env_var("BRAINTRUST_EVAL_REPORTER", "fancy,events");
+        set_env_var("BRAINTRUST_EVAL_OUTPUT_FILE", "results.xml");
         set_env_var("BT_EVAL_TERMINATE_ON_FAILURE", "1");
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
@@ -5089,6 +5213,11 @@ mod tests {
         let parsed = EvalArgsHarness::try_parse_from(["bt", "sample.eval.ts"])
             .expect("env vars should parse into eval args");
         assert!(parsed.eval.jsonl);
+        assert_eq!(
+            parsed.eval.reporters,
+            vec![EvalReporterName::Fancy, EvalReporterName::Events]
+        );
+        assert_eq!(parsed.eval.output_file, Some(PathBuf::from("results.xml")));
         assert!(parsed.eval.terminate_on_failure);
         assert_eq!(parsed.eval.num_workers, Some(4));
         assert!(parsed.eval.list);

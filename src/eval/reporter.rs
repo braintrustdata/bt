@@ -255,6 +255,9 @@ pub(super) trait EvalReporter {
     fn wants_case_delta(&self) -> bool {
         false
     }
+    fn on_event(&mut self, _event: &EvalReporterEvent) -> Result<()> {
+        Ok(())
+    }
     fn on_init(&mut self, _ctx: &EvalReporterContext) -> Result<()> {
         Ok(())
     }
@@ -316,11 +319,24 @@ impl ReporterManager {
             profile,
             output_file,
         };
+        let stdout_reporters: Vec<&str> = reporters
+            .iter()
+            .filter(|reporter| reporter.claims_stdout())
+            .map(|reporter| reporter.name())
+            .collect();
+        if stdout_reporters.len() > 1 {
+            anyhow::bail!(
+                "reporters {} all claim stdout; select only one machine-output reporter",
+                stdout_reporters.join(", ")
+            );
+        }
         let mut manager = Self {
             reporters,
             terminal,
             failed_reporters: HashSet::new(),
-            run_id: format!("run-{}", uuid::Uuid::new_v4()),
+            // Legacy streams carry no run identity. A stable synthetic ID keeps
+            // machine event output deterministic while remaining unique within this run.
+            run_id: "legacy-run".to_string(),
             run_ended: false,
             finished: false,
             vetoed: false,
@@ -361,6 +377,11 @@ impl ReporterManager {
 
         for index in 0..self.reporters.len() {
             if self.failed_reporters.contains(&index) {
+                continue;
+            }
+            let result = self.reporters[index].on_event(event);
+            if result.is_err() {
+                self.record_failure(index, result);
                 continue;
             }
             let result = match event {

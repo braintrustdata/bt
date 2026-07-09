@@ -1,0 +1,2 @@
+error: reporter 'dot' requires real per-case results, which are not yet supported by this runner
+If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.
