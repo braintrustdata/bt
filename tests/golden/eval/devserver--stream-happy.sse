@@ -1,0 +1,15 @@
+event: processing
+data: {"evaluators":1}
+
+event: start
+data: {"projectName":"test-project","experimentName":"test-experiment","projectId":"project-test-id","experimentId":"experiment-test-id","projectUrl":null,"experimentUrl":null}
+
+event: progress
+data: {"id":"case-test-id","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"test-eval","event":"json_delta","data":"{\"answer\":\"ok\"}"}
+
+event: summary
+data: {"projectName":"test-project","experimentName":"test-experiment","projectId":"project-test-id","experimentId":"experiment-test-id","projectUrl":"https://example.test/project","experimentUrl":"https://example.test/experiment","comparisonExperimentName":null,"scores":{},"metrics":null,"runMode":null,"isFinal":null,"runLabel":null,"sampleCount":null,"sampleSeed":null}
+
+event: done
+data: 
+

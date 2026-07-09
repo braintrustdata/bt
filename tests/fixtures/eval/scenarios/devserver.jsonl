@@ -1,0 +1,12 @@
+{"mode":"list","process_stdout":"{\"test-eval\":{\"name\":\"test-eval\",\"parameters\":[]}}"}
+{"mode":"list","exit":0}
+{"mode":"eval","request":"test-eval","event":"processing","data":{"evaluators":1}}
+{"mode":"eval","request":"test-eval","event":"start","data":{"projectName":"test-project","experimentName":"test-experiment","projectId":"project-test-id","experimentId":"experiment-test-id"}}
+{"mode":"eval","request":"test-eval","event":"progress","data":{"id":"case-test-id","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"test-eval","event":"json_delta","data":"{\"answer\":\"ok\"}"}}
+{"mode":"eval","request":"test-eval","event":"summary","data":{"projectName":"test-project","experimentName":"test-experiment","projectId":"project-test-id","experimentId":"experiment-test-id","projectUrl":"https://example.test/project","experimentUrl":"https://example.test/experiment","comparisonExperimentName":null,"scores":{},"metrics":null}}
+{"mode":"eval","request":"test-eval","event":"done","data":""}
+{"mode":"eval","request":"test-eval","exit":0}
+{"mode":"eval","request":"error-eval","event":"error","data":{"message":"scripted request failed","stack":"scripted stack","status":429}}
+{"mode":"eval","request":"error-eval","exit":0}
+{"mode":"eval","request":"fallback-eval","process_stderr":"scripted runner crash"}
+{"mode":"eval","request":"fallback-eval","exit":3}

@@ -1,0 +1,34 @@
+Processing 1 evaluator...
+[m▶[m Experiment [1mexp-1[0m is running at https://example.test/experiment/exp-1
+[m evaluator error 1 [m
+[mstack line 1[m
+[mstack detail 1[m
+[m evaluator error 2 [m
+[mstack line 2[m
+[mstack detail 2[m
+[mevaluator error 1[m
+[mduplicate stack[m
+[m evaluator error 3 [m
+[mstack line 3[m
+[mstack detail 3[m
+[m evaluator error 4 [m
+[mstack line 4[m
+[mstack detail 4[m
+[m evaluator error 5 [m
+[mstack line 5[m
+[mstack detail 5[m
+[m evaluator error 6 [m
+[mstack line 6[m
+[mstack detail 6[m
+[m evaluator error 7 [m
+[mstack line 7[m
+[mstack detail 7[m
+[m evaluator error 8 [m
+[mstack line 8[m
+[mstack detail 8[m
+[m evaluator error 9 [m
+[mstack line 9[m
+[mstack detail 9[m
+[m evaluator error 10 [m
+[mstack line 10[m
+[mstack detail 10[m

@@ -1,0 +1,5 @@
+Processing 1 evaluator...
+[merror before crash[m
+[mcrash stack[m
+error: eval runner exited with status exit status: 3
+If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.

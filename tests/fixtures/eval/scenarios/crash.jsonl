@@ -1,0 +1,3 @@
+{"event":"processing","data":{"evaluators":1}}
+{"event":"error","data":{"message":"error before crash","stack":"crash stack"}}
+{"exit":3}

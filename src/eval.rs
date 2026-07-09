@@ -4215,6 +4215,63 @@ mod tests {
     }
 
     #[test]
+    fn eval_ui_record_deferred_error_trims_deduplicates_and_caps() {
+        let mut ui = EvalUi::new(false, false, false, None);
+        ui.record_deferred_error("  repeated error  ".to_string());
+        ui.record_deferred_error("repeated error".to_string());
+        ui.record_deferred_error("   ".to_string());
+        for index in 0..MAX_DEFERRED_EVAL_ERRORS + 2 {
+            ui.record_deferred_error(format!("error {index}"));
+        }
+
+        assert_eq!(ui.deferred_errors.len(), MAX_DEFERRED_EVAL_ERRORS);
+        assert_eq!(ui.deferred_errors[0], "repeated error");
+        assert_eq!(ui.deferred_errors[1], "error 0");
+        ui.finish();
+    }
+
+    #[test]
+    fn eval_ui_total_helpers_apply_force_paths_and_clamp_position() {
+        let progress = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let bar = progress.add(ProgressBar::new(2));
+        let style = ProgressStyle::default_bar();
+        bar.set_position(3);
+        let mut state = EvalBarState {
+            bar,
+            pending_total: Some(1),
+            last_total_update: Some(std::time::Instant::now()),
+        };
+
+        EvalUi::ensure_total_not_below_position(&mut state, &style);
+        assert_eq!(state.bar.length(), Some(3));
+        assert_eq!(state.pending_total, Some(3));
+
+        state.pending_total = Some(4);
+        EvalUi::maybe_apply_pending_total(&mut state, &style, true);
+        assert_eq!(state.bar.length(), Some(4));
+        assert_eq!(state.pending_total, None);
+
+        let spinner = progress.add(ProgressBar::new_spinner());
+        let spinner_state = EvalBarState {
+            bar: spinner,
+            pending_total: None,
+            last_total_update: None,
+        };
+        assert!(EvalUi::should_apply_total_update(&spinner_state, 2));
+    }
+
+    #[test]
+    fn eval_ui_finish_is_idempotent_and_drop_finishes() {
+        let mut ui = EvalUi::new(false, false, false, None);
+        ui.finish();
+        ui.finish();
+        assert!(ui.finished);
+
+        let dropped = EvalUi::new(false, false, false, None);
+        drop(dropped);
+    }
+
+    #[test]
     fn eval_ui_preserves_spinner_increments_before_set_total() {
         let mut ui = EvalUi::new(false, false, false, None);
         let eval_name = "My evaluation";
@@ -4319,6 +4376,19 @@ mod tests {
     fn fit_name_to_spaces_pads_short_names() {
         let rendered = fit_name_to_spaces("short", 10);
         assert_eq!(rendered, "short     ");
+    }
+
+    #[test]
+    fn handle_sse_event_drops_malformed_and_unknown_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(Some("processing".to_string()), "not-json".to_string(), &tx);
+        handle_sse_event(
+            Some("future:event".to_string()),
+            r#"{"valid":"but unknown"}"#.to_string(),
+            &tx,
+        );
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

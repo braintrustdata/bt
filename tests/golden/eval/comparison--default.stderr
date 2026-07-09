@@ -1,0 +1,21 @@
+Processing 1 evaluator...
+[m▶[m Experiment [1mchallenger[0m is running at https://example.test/experiment/challenger
+
+╭[m Experiment summary [m────────────────────────────────────────────────────────────────────────────────╮
+│ baseline [m(baseline)[m ← challenger [m(comparison)[m                                                      │
+│                                                                                                    │
+│ experiments:                                                                                       │
+│   baseline (baseline) = baseline                                                                   │
+│   challenger (comparison) = challenger                                                             │
+│                                                                                                    │
+│ counts: ↑n/↓m = improvements/regressions                                                           │
+│                                                                                                    │
+│ [0m[0m[m[m[1mScores and metrics[0m[0m[m[m  [0m[0m[m[m[1mbaseline (baseline)[0m[0m[m[m  [0m[0m[m[m[1mchallenger (comparison)[0m[0m[m[m                                   │
+│ [0m[0m[m[m◯[0m[0m[m[m Accuracy          75.00%               87.50% (+12.50%; ↑3/↓1)[0m[0m[m[m                                   │
+│ [0m[0m[m[m◯[0m[0m[m[m duration          1.45s                1.25s (-0.20s; ↑2)     [0m[0m[m[m                                   │
+│                                                                                                    │
+│ See results at https://example.test/experiment/challenger                                          │
+│                                                                                                    │
+│ compare_command: bt experiments compare --profile test-profile -p test-project baseline challenger │
+│ compare_more: append more experiment names at the end; max 7 comparisons                           │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────╯

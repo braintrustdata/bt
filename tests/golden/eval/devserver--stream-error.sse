@@ -1,0 +1,6 @@
+event: error
+data: {"message":"scripted request failed","stack":"scripted stack","status":429}
+
+event: done
+data: 
+

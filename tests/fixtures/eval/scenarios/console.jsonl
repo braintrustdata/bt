@@ -1,0 +1,7 @@
+{"event":"processing","data":{"evaluators":1}}
+{"event":"console","data":{"stream":"stdout","message":"user stdout one"}}
+{"event":"console","data":{"stream":"stderr","message":"user stderr one"}}
+{"event":"console","data":{"stream":"stdout","message":"user stdout two"}}
+{"event":"console","data":{"stream":"stderr","message":"user stderr two"}}
+{"event":"done","data":""}
+{"exit":0}

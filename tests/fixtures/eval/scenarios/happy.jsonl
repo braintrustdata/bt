@@ -1,0 +1,10 @@
+{"event":"processing","data":{"evaluators":1}}
+{"event":"start","data":{"projectName":"test-project","experimentName":"exp-1","projectId":"project-test-id","experimentId":"exp-1-id","projectUrl":"https://example.test/project/test-project","experimentUrl":"https://example.test/experiment/exp-1"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"eval-one","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"start\",\"total\":3}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"eval-one","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"set_total\",\"total\":4}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"eval-one","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"increment\"}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"eval-one","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"increment\"}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"eval-one","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"stop\"}"}}
+{"event":"summary","data":{"projectName":"test-project","experimentName":"exp-1","projectId":"project-test-id","experimentId":"exp-1-id","projectUrl":"https://example.test/project/test-project","experimentUrl":"https://example.test/experiment/exp-1","scores":{"Accuracy":{"name":"Accuracy","score":0.875,"diff":0.125,"improvements":3,"regressions":1}},"metrics":{"duration":{"name":"duration","metric":1.25,"unit":"s","diff":-0.2,"improvements":2,"regressions":0}}}}
+{"event":"done","data":""}
+{"exit":0}

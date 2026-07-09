@@ -1,0 +1,8 @@
+{"event":"processing","data":{"evaluators":1}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"edge","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"start\",\"total\":1}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"edge","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"increment\"}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"edge","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"increment\"}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"edge","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"set_total\",\"total\":1}"}}
+{"event":"progress","data":{"id":"p1","object_type":"task","origin":null,"format":"code","output_type":"completion","name":"edge","event":"progress","data":"{\"type\":\"eval_progress\",\"kind\":\"stop\"}"}}
+{"event":"done","data":""}
+{"exit":0}

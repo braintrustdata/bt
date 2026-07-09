@@ -1,0 +1,11 @@
+Processing 2 evaluators...
+[m▶[m Experiment [1mexp-a[0m is running at https://example.test/experiment/exp-a
+[m▶[m Experiment [1mexp-b[0m is running at https://example.test/experiment/exp-b
+
+╭[m Experiment summary [m──────────────────────────────────╮
+│ [0m[0m[m[m[1mScores and metrics[0m[0m[m[m  [0m[0m[m[m[1mexp-a[0m[0m[m[m [0m[0m[m[m                           │
+│ [0m[0m[m[m◯[0m[0m[m[m Accuracy          87.50%[0m[0m[m[m                           │
+│ [0m[0m[m[m◯[0m[0m[m[m duration          1.25s [0m[0m[m[m                           │
+│                                                      │
+│ See results at https://example.test/experiment/exp-a │
+╰──────────────────────────────────────────────────────╯
