@@ -961,7 +961,8 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
         "Pushing custom views...",
         functions_api::insert_functions(&auth_ctx.client, &events),
     )
-    .await?
+    .await
+    .map_err(|err| anyhow!(format_views_insert_error(&prepared, args.if_exists, &err)))?
     .ignored_entries
     .unwrap_or(0);
 
@@ -979,16 +980,27 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
 
     eprintln!(
         "{} Pushed {} custom view(s)",
-        dialoguer::console::style("✓").green(),
-        prepared.len().saturating_sub(ignored)
+        dialoguer::console::style("Success:").green(),
+        pushed.len()
     );
-    for view in pushed {
-        match view.url {
-            Some(url) => println!("{} ({}) {}", view.name, view.slug, url),
-            None => println!("{} ({})", view.name, view.slug),
+    for view in &pushed {
+        let mut details = format!(
+            "{} {} ({})",
+            view.view_type.label(),
+            view.name,
+            view.project_name
+        );
+        if let Some(dataset_id) = &view.dataset_id {
+            write!(details, ", dataset {dataset_id}").ok();
         }
+        if let Some(url) = &view.url {
+            write!(details, ": {url}").ok();
+        }
+        eprintln!("  {}", details);
     }
-
+    if ignored > 0 {
+        eprintln!("  Ignored {} existing custom view(s)", ignored);
+    }
     Ok(())
 }
 
@@ -2390,6 +2402,41 @@ fn build_insert_event(view: &PreparedView, if_exists: IfExistsMode) -> Value {
     Value::Object(object)
 }
 
+fn format_views_insert_error(
+    views: &[PreparedView],
+    if_exists: IfExistsMode,
+    err: &anyhow::Error,
+) -> String {
+    let view_list = views
+        .iter()
+        .map(|view| {
+            format!(
+                "{} '{}' in project '{}'",
+                view.entry.view_type.label(),
+                view.entry.slug,
+                view.project.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let view_list = if view_list.is_empty() {
+        "selected custom views".to_string()
+    } else {
+        view_list
+    };
+    let details = format!("{err:#}");
+    let retry_hint = if if_exists == IfExistsMode::Error {
+        " If you are updating an existing custom view, rerun with `bt views push --if-exists replace`."
+    } else {
+        ""
+    };
+
+    format!(
+        "failed to push custom views ({view_list}) with --if-exists {}.{retry_hint} Server response: {details}",
+        if_exists.as_str()
+    )
+}
+
 async fn resolve_pushed_views(
     client: &ApiClient,
     app_url: &str,
@@ -3262,6 +3309,33 @@ export default customTraceView({ name: "Test View", slug: "test-view" }, ({ span
         assert!(event.get("description").is_none());
         assert!(event.get("metadata").is_none());
         assert!(event.get("tags").is_none());
+    }
+
+    #[test]
+    fn formats_actionable_custom_view_insert_error() {
+        let view = PreparedView {
+            source_file: "test.view.tsx".to_string(),
+            entry: ViewManifestEntry {
+                view_type: ViewType::Trace,
+                name: "Test View".to_string(),
+                slug: "test-view".to_string(),
+                code: "module.exports = function View() {}".to_string(),
+                project_id: None,
+                project_name: None,
+                dataset_id: None,
+                dataset_name: None,
+            },
+            project: test_project(),
+            dataset: None,
+        };
+        let err = anyhow!("request failed (400 Bad Request): slug already exists");
+
+        let message = format_views_insert_error(&[view], IfExistsMode::Error, &err);
+
+        assert!(message.contains("trace 'test-view' in project 'test-project'"));
+        assert!(message.contains("--if-exists error"));
+        assert!(message.contains("bt views push --if-exists replace"));
+        assert!(message.contains("slug already exists"));
     }
 
     #[test]
