@@ -38,7 +38,8 @@ use crate::ui::{
 
 mod reporter;
 use reporter::{
-    ConsoleStream, EvalReporter, EvalReporterEvent, EvalStatus, LegacyEventAdapter, ReporterManager,
+    decode_canonical_sse_event, CaseStatus, ConsoleStream, EvalReporter, EvalReporterEvent,
+    EvalStatus, LegacyEventAdapter, ReporterManager,
 };
 
 const MAX_NAME_LENGTH: usize = 40;
@@ -800,12 +801,19 @@ fn build_eval_reporters(
                 EvalReporterName::Jsonl => reporters.push(Box::new(JsonlReporter::default())),
                 EvalReporterName::Silent => reporters.push(Box::new(SilentReporter)),
                 EvalReporterName::Events => reporters.push(Box::new(EventsReporter)),
-                EvalReporterName::Dot
-                | EvalReporterName::Junit
-                | EvalReporterName::GithubActions => anyhow::bail!(
-                    "reporter '{}' requires real per-case results, which are not yet supported by this runner",
-                    reporter.to_possible_value().expect("value enum").get_name()
-                ),
+                EvalReporterName::Dot => reporters.push(Box::new(DotReporter::new())),
+                EvalReporterName::Junit => {
+                    if options.output_file.is_none() {
+                        anyhow::bail!("--reporter=junit requires --output-file <PATH>");
+                    }
+                    reporters.push(Box::new(JunitReporter::new()));
+                }
+                EvalReporterName::GithubActions => {
+                    reporters.push(Box::new(GithubActionsReporter {
+                        terminal: None,
+                        degraded: false,
+                    }));
+                }
             }
         }
     }
@@ -816,7 +824,7 @@ fn build_eval_reporters(
             .iter()
             .any(|reporter| *reporter == EvalReporterName::Junit)
     {
-        anyhow::bail!("--output-file requires a file-producing reporter such as --reporter=junit");
+        anyhow::bail!("--output-file requires --reporter=junit");
     }
     Ok(reporters)
 }
@@ -837,6 +845,11 @@ async fn run_eval_attempt(
         options.output_file.clone(),
     )?;
     let mut adapter = LegacyEventAdapter::new(reporters.run_id().to_string());
+    let mut runner_env = extra_env.to_vec();
+    if reporters.wants_case_delta() {
+        // Process-internal protocol negotiation; this is not user configuration.
+        runner_env.push(("BT_EVAL_REPORTER_CASE_DELTA".to_string(), "1".to_string()));
+    }
 
     let spawned = spawn_eval_runner(
         base,
@@ -845,13 +858,16 @@ async fn run_eval_attempt(
         plan.files,
         no_send_logs,
         options,
-        extra_env,
+        &runner_env,
         js_mode,
     )
     .await?;
-    let output = drive_eval_runner(spawned.process, console_policy, |event| {
-        if let Some(event) = adapter.translate(&event) {
-            reporters.dispatch(&event);
+    let output = drive_eval_runner(spawned.process, console_policy, |event| match event {
+        EvalEvent::Reporter(event) => reporters.dispatch(&event),
+        legacy => {
+            if let Some(event) = adapter.translate(&legacy) {
+                reporters.dispatch(&event);
+            }
         }
     })
     .await?;
@@ -1097,6 +1113,22 @@ where
         &sse_connected,
         "eval runner process exited without a status",
         |event| match event {
+            EvalEvent::Reporter(EvalReporterEvent::Error { ref error }) => {
+                error_messages.push(error.message.clone());
+                if let Some(stack) = error.stack.as_ref() {
+                    error_messages.push(stack.clone());
+                }
+                on_event(event);
+            }
+            EvalEvent::Reporter(EvalReporterEvent::Console { ref log }) => {
+                if log.stream == ConsoleStream::Stderr
+                    && matches!(console_policy, ConsolePolicy::BufferStderr)
+                {
+                    stderr_lines.push(log.message.clone());
+                } else {
+                    on_event(event);
+                }
+            }
             EvalEvent::Dependencies { files } => {
                 dependency_files.extend(files.clone());
                 on_event(EvalEvent::Dependencies { files });
@@ -1514,6 +1546,7 @@ fn is_eval_progress_payload(progress: &SseProgressEventData) -> bool {
 
 fn encode_eval_event_for_http(event: &EvalEvent) -> Option<String> {
     match event {
+        EvalEvent::Reporter(_) => None,
         EvalEvent::Processing(payload) => serde_json::to_string(payload)
             .ok()
             .map(|data| serialize_sse_event("processing", &data)),
@@ -2710,6 +2743,7 @@ fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) ->
 
 #[derive(Debug)]
 enum EvalEvent {
+    Reporter(EvalReporterEvent),
     Processing(ProcessingEventData),
     Start(ExperimentStart),
     Summary(ExperimentSummary),
@@ -2846,6 +2880,12 @@ struct SseDependenciesEventData {
 
 fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSender<EvalEvent>) {
     let event_name = event.unwrap_or_default();
+    if event_name.contains(':') {
+        if let Some(event) = decode_canonical_sse_event(&event_name, &data) {
+            let _ = tx.send(EvalEvent::Reporter(event));
+        }
+        return;
+    }
     match event_name.as_str() {
         "processing" => {
             if let Ok(payload) = serde_json::from_str::<ProcessingEventData>(&data) {
@@ -2929,6 +2969,295 @@ impl EvalReporter for EventsReporter {
     }
 }
 
+struct DotReporter {
+    terminal: Option<reporter::Terminal>,
+    glyphs: HashMap<String, String>,
+    degraded: bool,
+}
+
+impl DotReporter {
+    fn new() -> Self {
+        Self {
+            terminal: None,
+            glyphs: HashMap::new(),
+            degraded: false,
+        }
+    }
+}
+
+impl EvalReporter for DotReporter {
+    fn name(&self) -> &'static str {
+        "dot"
+    }
+
+    fn on_init(&mut self, ctx: &reporter::EvalReporterContext) -> Result<()> {
+        self.terminal = Some(ctx.terminal.clone());
+        Ok(())
+    }
+
+    fn on_run_start(&mut self, run: &reporter::EvalRun) -> Result<()> {
+        self.degraded = run.protocol_version < reporter::REPORTER_PROTOCOL_VERSION;
+        Ok(())
+    }
+
+    fn on_case_end(&mut self, case: &reporter::EvalCaseResult) -> Result<()> {
+        if case.info.synthetic {
+            self.degraded = true;
+            return Ok(());
+        }
+        let glyph = match case.status {
+            CaseStatus::Completed => '.',
+            CaseStatus::Errored => 'E',
+            CaseStatus::Skipped => 's',
+        };
+        self.glyphs
+            .entry(case.info.eval_id.clone())
+            .or_default()
+            .push(glyph);
+        Ok(())
+    }
+
+    fn on_eval_end(&mut self, eval: &reporter::EvalEnd) -> Result<()> {
+        if self.degraded {
+            return Ok(());
+        }
+        if let Some(glyphs) = self.glyphs.remove(&eval.eval_id) {
+            if !glyphs.is_empty() {
+                self.terminal.as_ref().unwrap().println(glyphs);
+            }
+        }
+        if let Some(summary) = eval.summary.as_ref() {
+            self.terminal
+                .as_ref()
+                .unwrap()
+                .multiline(format_experiment_summary(summary));
+        }
+        Ok(())
+    }
+
+    fn on_run_end(&mut self, _run: &reporter::EvalRunEnd) -> Result<Option<bool>> {
+        if self.degraded {
+            self.terminal.as_ref().unwrap().println(
+                "Reporter 'dot' requires real per-case results; upgrade the installed braintrust SDK.",
+            );
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+}
+
+struct JunitReporter {
+    terminal: Option<reporter::Terminal>,
+    output_file: Option<PathBuf>,
+    eval_names: HashMap<String, String>,
+    cases: HashMap<String, Vec<reporter::EvalCaseResult>>,
+    degraded: bool,
+}
+
+impl JunitReporter {
+    fn new() -> Self {
+        Self {
+            terminal: None,
+            output_file: None,
+            eval_names: HashMap::new(),
+            cases: HashMap::new(),
+            degraded: false,
+        }
+    }
+}
+
+impl EvalReporter for JunitReporter {
+    fn name(&self) -> &'static str {
+        "junit"
+    }
+
+    fn on_init(&mut self, ctx: &reporter::EvalReporterContext) -> Result<()> {
+        self.terminal = Some(ctx.terminal.clone());
+        self.output_file = ctx.output_file.clone();
+        Ok(())
+    }
+
+    fn on_run_start(&mut self, run: &reporter::EvalRun) -> Result<()> {
+        self.degraded = run.protocol_version < reporter::REPORTER_PROTOCOL_VERSION;
+        Ok(())
+    }
+
+    fn on_eval_start(&mut self, eval: &reporter::EvalInfo) -> Result<()> {
+        self.eval_names
+            .insert(eval.eval_id.clone(), eval.name.clone());
+        Ok(())
+    }
+
+    fn on_case_end(&mut self, case: &reporter::EvalCaseResult) -> Result<()> {
+        if case.info.synthetic {
+            self.degraded = true;
+        } else {
+            self.cases
+                .entry(case.info.eval_id.clone())
+                .or_default()
+                .push(case.clone());
+        }
+        Ok(())
+    }
+
+    fn on_run_end(&mut self, _run: &reporter::EvalRunEnd) -> Result<Option<bool>> {
+        let terminal = self.terminal.as_ref().unwrap();
+        if self.degraded {
+            terminal.println(
+                "Reporter 'junit' requires real per-case results; upgrade the installed braintrust SDK.",
+            );
+            return Ok(Some(false));
+        }
+        let Some(path) = self.output_file.as_ref() else {
+            terminal.println("Reporter 'junit' requires --output-file <PATH>.");
+            return Ok(Some(false));
+        };
+        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n");
+        let mut eval_ids: Vec<&String> = self.cases.keys().collect();
+        eval_ids.sort();
+        for eval_id in eval_ids {
+            let cases = &self.cases[eval_id];
+            let failures = cases
+                .iter()
+                .filter(|case| case.status == CaseStatus::Errored)
+                .count();
+            let suite_name = self.eval_names.get(eval_id).unwrap_or(eval_id);
+            xml.push_str(&format!(
+                "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\">\n",
+                xml_escape(suite_name),
+                cases.len(),
+                failures
+            ));
+            for case in cases {
+                let name = case
+                    .info
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| case.info.index.to_string());
+                xml.push_str(&format!(
+                    "    <testcase name=\"{}\" time=\"{:.3}\">",
+                    xml_escape(&name),
+                    case.duration_ms as f64 / 1000.0
+                ));
+                match case.status {
+                    CaseStatus::Errored => {
+                        let error = case.error.as_ref();
+                        xml.push_str(&format!(
+                            "<failure message=\"{}\">{}</failure>",
+                            xml_escape(
+                                error
+                                    .map(|error| error.message.as_str())
+                                    .unwrap_or("case errored")
+                            ),
+                            xml_escape(
+                                error.and_then(|error| error.stack.as_deref()).unwrap_or("")
+                            )
+                        ));
+                    }
+                    CaseStatus::Skipped => xml.push_str("<skipped/>"),
+                    CaseStatus::Completed => {}
+                }
+                xml.push_str("</testcase>\n");
+            }
+            xml.push_str("  </testsuite>\n");
+        }
+        xml.push_str("</testsuites>\n");
+        if let Err(error) = std::fs::write(path, xml) {
+            terminal.println(format!(
+                "Reporter 'junit' could not write {}: {error}",
+                path.display()
+            ));
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+struct GithubActionsReporter {
+    terminal: Option<reporter::Terminal>,
+    degraded: bool,
+}
+
+impl GithubActionsReporter {
+    fn annotate(&self, kind: &str, title: &str, message: &str) {
+        let property = |value: &str| github_escape(value).replace(':', "%3A").replace(',', "%2C");
+        self.terminal.as_ref().unwrap().println(format!(
+            "::{kind} title={}::{}",
+            property(title),
+            github_escape(message)
+        ));
+    }
+}
+
+impl EvalReporter for GithubActionsReporter {
+    fn name(&self) -> &'static str {
+        "github-actions"
+    }
+
+    fn on_init(&mut self, ctx: &reporter::EvalReporterContext) -> Result<()> {
+        self.terminal = Some(ctx.terminal.clone());
+        Ok(())
+    }
+
+    fn on_run_start(&mut self, run: &reporter::EvalRun) -> Result<()> {
+        self.degraded = run.protocol_version < reporter::REPORTER_PROTOCOL_VERSION;
+        Ok(())
+    }
+
+    fn on_case_end(&mut self, case: &reporter::EvalCaseResult) -> Result<()> {
+        if case.info.synthetic {
+            self.degraded = true;
+        } else if case.status == CaseStatus::Errored {
+            self.annotate(
+                "error",
+                &format!(
+                    "case {} errored",
+                    case.info
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| case.info.index.to_string())
+                ),
+                case.error
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("case errored"),
+            );
+        }
+        Ok(())
+    }
+
+    fn on_error(&mut self, error: &reporter::ReporterError) -> Result<()> {
+        self.annotate("error", "eval run error", &error.message);
+        Ok(())
+    }
+
+    fn on_run_end(&mut self, _run: &reporter::EvalRunEnd) -> Result<Option<bool>> {
+        if self.degraded {
+            self.terminal.as_ref().unwrap().println(
+                "Reporter 'github-actions' requires real per-case results; upgrade the installed braintrust SDK.",
+            );
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+}
+
+fn github_escape(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
 #[derive(Default)]
 struct JsonlReporter {
     profile: Option<String>,
@@ -2967,6 +3296,7 @@ struct FancyReporter {
     verbose: bool,
     deferred_errors: Vec<String>,
     suppressed_stderr_lines: usize,
+    interactive: bool,
     finished: bool,
     profile: Option<String>,
 }
@@ -3003,6 +3333,7 @@ impl FancyReporter {
             verbose,
             deferred_errors: Vec::new(),
             suppressed_stderr_lines: 0,
+            interactive: std::io::stderr().is_terminal() && animations_enabled() && !is_quiet(),
             finished: false,
             profile,
         }
@@ -3023,6 +3354,7 @@ impl FancyReporter {
 
     fn handle(&mut self, event: EvalEvent) {
         match event {
+            EvalEvent::Reporter(_) => {}
             EvalEvent::Processing(payload) => {
                 self.print_persistent_line(format_processing_line(payload.evaluators));
             }
@@ -3094,7 +3426,7 @@ impl FancyReporter {
                     } else {
                         let bar = self.progress.add(ProgressBar::new_spinner());
                         bar.set_style(self.spinner_style.clone());
-                        if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                        if self.interactive {
                             bar.enable_steady_tick(Duration::from_millis(80));
                         }
                         bar
@@ -3102,7 +3434,7 @@ impl FancyReporter {
                 } else {
                     let bar = self.progress.add(ProgressBar::new_spinner());
                     bar.set_style(self.spinner_style.clone());
-                    if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                    if self.interactive {
                         bar.enable_steady_tick(Duration::from_millis(80));
                     }
                     bar
@@ -3289,8 +3621,13 @@ impl EvalReporter for FancyReporter {
         }
     }
 
+    fn wants_case_delta(&self) -> bool {
+        self.verbose
+    }
+
     fn on_init(&mut self, ctx: &reporter::EvalReporterContext) -> Result<()> {
         self.progress = ctx.terminal.live_region();
+        self.interactive = ctx.terminal.is_interactive();
         self.profile = ctx.profile.clone();
         Ok(())
     }
@@ -3322,6 +3659,19 @@ impl EvalReporter for FancyReporter {
             "increment",
             None,
         ));
+        if self.verbose && !case.info.synthetic {
+            let name = case
+                .info
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("case {}", case.info.index));
+            let status = match case.status {
+                CaseStatus::Completed => "completed",
+                CaseStatus::Errored => "errored",
+                CaseStatus::Skipped => "skipped",
+            };
+            self.print_persistent_line(format!("{name}: {status}"));
+        }
         Ok(())
     }
 
@@ -3792,6 +4142,61 @@ mod tests {
             })
             .to_string(),
         }
+    }
+
+    #[test]
+    fn junit_reporter_writes_real_case_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("results.xml");
+        let mut reporter = JunitReporter::new();
+        reporter
+            .on_init(&reporter::EvalReporterContext {
+                terminal: reporter::Terminal::new(),
+                profile: None,
+                output_file: Some(output.clone()),
+            })
+            .unwrap();
+        reporter
+            .on_eval_start(&reporter::EvalInfo {
+                run_id: "run-test".into(),
+                eval_id: "eval-test".into(),
+                name: "test suite".into(),
+                experiment: None,
+            })
+            .unwrap();
+        reporter
+            .on_case_end(&reporter::EvalCaseResult {
+                info: reporter::EvalCaseInfo {
+                    eval_id: "eval-test".into(),
+                    case_id: "span-test".into(),
+                    index: 0,
+                    name: Some("case <one>".into()),
+                    synthetic: false,
+                },
+                status: CaseStatus::Errored,
+                duration_ms: 125,
+                scores: HashMap::new(),
+                error: Some(reporter::CaseError {
+                    message: "expected & actual differ".into(),
+                    stack: Some("stack".into()),
+                }),
+            })
+            .unwrap();
+        assert_eq!(
+            reporter
+                .on_run_end(&reporter::EvalRunEnd {
+                    run_id: "run-test".into(),
+                    status: EvalStatus::Errored,
+                    duration_ms: 125,
+                    errors: Vec::new(),
+                })
+                .unwrap(),
+            None
+        );
+        let xml = std::fs::read_to_string(output).unwrap();
+        assert!(xml.contains("<testsuite name=\"test suite\" tests=\"1\" failures=\"1\">"));
+        assert!(xml.contains("case &lt;one&gt;"));
+        assert!(xml.contains("expected &amp; actual differ"));
     }
 
     #[test]

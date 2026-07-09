@@ -1,4 +1,4 @@
-{"type":"run:start","run":{"runId":"legacy-run","evaluatorCount":1,"protocolVersion":1}}
+{"type":"run:start","run":{"runId":"legacy-run","evaluatorCount":1,"protocolVersion":0}}
 {"type":"console","log":{"stream":"stdout","message":"user stdout one"}}
 {"type":"console","log":{"stream":"stderr","message":"user stderr one"}}
 {"type":"console","log":{"stream":"stdout","message":"user stdout two"}}

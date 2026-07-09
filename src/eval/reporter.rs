@@ -460,6 +460,62 @@ pub(super) struct LegacyEventAdapter {
     next_case: usize,
 }
 
+pub(super) fn decode_canonical_sse_event(
+    event_name: &str,
+    data: &str,
+) -> Option<EvalReporterEvent> {
+    if let Ok(event) = serde_json::from_str::<EvalReporterEvent>(data) {
+        return Some(mark_synthetic_case(event));
+    }
+    let event = match event_name {
+        "run:start" => serde_json::from_str(data)
+            .ok()
+            .map(|run| EvalReporterEvent::RunStart { run }),
+        "eval:start" => serde_json::from_str(data)
+            .ok()
+            .map(|eval| EvalReporterEvent::EvalStart { eval }),
+        "case:start" => serde_json::from_str(data)
+            .ok()
+            .map(|case| EvalReporterEvent::CaseStart { case }),
+        "case:end" => serde_json::from_str(data)
+            .ok()
+            .map(|case| EvalReporterEvent::CaseEnd { case }),
+        "eval:end" => serde_json::from_str(data)
+            .ok()
+            .map(|eval| EvalReporterEvent::EvalEnd { eval }),
+        "run:end" => serde_json::from_str(data)
+            .ok()
+            .map(|run| EvalReporterEvent::RunEnd { run }),
+        "error" => serde_json::from_str(data)
+            .ok()
+            .map(|error| EvalReporterEvent::Error { error }),
+        "console" => serde_json::from_str(data)
+            .ok()
+            .map(|log| EvalReporterEvent::Console { log }),
+        "eval:progress" => serde_json::from_str(data)
+            .ok()
+            .map(|progress| EvalReporterEvent::Progress { progress }),
+        "case:delta" => serde_json::from_str(data)
+            .ok()
+            .map(|delta| EvalReporterEvent::CaseDelta { delta }),
+        _ => None,
+    }?;
+    Some(mark_synthetic_case(event))
+}
+
+fn mark_synthetic_case(mut event: EvalReporterEvent) -> EvalReporterEvent {
+    match &mut event {
+        EvalReporterEvent::CaseStart { case } if case.case_id.starts_with("synthetic-") => {
+            case.synthetic = true;
+        }
+        EvalReporterEvent::CaseEnd { case } if case.info.case_id.starts_with("synthetic-") => {
+            case.info.synthetic = true;
+        }
+        _ => {}
+    }
+    event
+}
+
 impl LegacyEventAdapter {
     pub fn new(run_id: String) -> Self {
         Self {
@@ -470,11 +526,12 @@ impl LegacyEventAdapter {
 
     pub fn translate(&mut self, event: &EvalEvent) -> Option<EvalReporterEvent> {
         match event {
+            EvalEvent::Reporter(event) => Some(event.clone()),
             EvalEvent::Processing(payload) => Some(EvalReporterEvent::RunStart {
                 run: EvalRun {
                     run_id: self.run_id.clone(),
                     evaluator_count: payload.evaluators,
-                    protocol_version: REPORTER_PROTOCOL_VERSION,
+                    protocol_version: 0,
                 },
             }),
             EvalEvent::Start(start) => {

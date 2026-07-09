@@ -63,6 +63,8 @@ WATCH_EXCLUDE_SEGMENTS = (
     "/venv/",
 )
 _DATASET_TOTAL_CACHE: dict[str, int] = {}
+REPORTER_PROTOCOL_VERSION = 1
+REPORTER_RUN_ID = f"run-{os.getpid()}-{int(__import__('time').time() * 1000)}"
 
 
 @dataclass(frozen=True)
@@ -370,22 +372,9 @@ def format_summary(summary: dict[str, Any], config: RunnerConfig) -> dict[str, A
 
 
 def send_eval_progress(sse: SseWriter | None, evaluator_name: str, kind: str, total: int | None = None) -> None:
-    if not sse:
+    if not sse or kind in {"increment", "stop"} or total is None:
         return
-    payload = {
-        "id": f"eval-progress:{evaluator_name}",
-        "object_type": "task",
-        "format": "global",
-        "output_type": "any",
-        "name": evaluator_name,
-        "event": "progress",
-        "data": json.dumps({
-            "type": "eval_progress",
-            "kind": kind,
-            **({"total": total} if total is not None else {}),
-        }),
-    }
-    sse.send("progress", payload)
+    sse.send("eval:progress", {"evalId": evaluator_name, "totalCases": total})
 
 
 def create_progress_reporter(sse: SseWriter | None, evaluator_name: str) -> Callable[[str, int | None], None] | None:
@@ -403,12 +392,72 @@ def serialize_error(
     stack: str | None = None,
     status: int | None = None,
 ) -> dict[str, Any]:
-    data = {"message": message}
+    data = {"scope": {"runId": REPORTER_RUN_ID}, "message": message}
     if stack:
         data["stack"] = stack
     if status is not None:
         data["status"] = status
     return data
+
+
+def send_canonical_eval_result(
+    sse: SseWriter,
+    evaluator_name: str,
+    result: Any,
+    summary: dict[str, Any],
+) -> None:
+    counts = {"completed": 0, "errored": 0, "skipped": 0}
+    for index, row in enumerate(result.results):
+        real_case_id = (
+            getattr(row, "root_span_id", None)
+            or getattr(row, "rootSpanId", None)
+            or getattr(row, "span_id", None)
+        )
+        case_id = str(real_case_id) if real_case_id else f"synthetic-{evaluator_name}-{index}"
+        name = getattr(row, "name", None)
+        case_info = {
+            "evalId": evaluator_name,
+            "caseId": case_id,
+            "index": index,
+            **({"name": name} if isinstance(name, str) else {}),
+        }
+        sse.send("case:start", case_info)
+        error = getattr(row, "error", None)
+        status = "errored" if error else "completed"
+        counts[status] += 1
+        raw_scores = getattr(row, "scores", None)
+        scores = {
+            str(key): float(value)
+            for key, value in (raw_scores.items() if isinstance(raw_scores, dict) else [])
+            if isinstance(value, (int, float))
+        }
+        error_payload = None
+        if error:
+            error_payload = {
+                "message": str(error),
+                **({"stack": row.exc_info} if getattr(row, "exc_info", None) else {}),
+            }
+        sse.send(
+            "case:end",
+            {
+                **case_info,
+                "status": status,
+                "durationMs": int(getattr(row, "duration_ms", 0) or 0),
+                "scores": scores,
+                **({"error": error_payload} if error_payload else {}),
+            },
+        )
+    sse.send(
+        "eval:end",
+        {
+            "evalId": evaluator_name,
+            "status": "errored" if counts["errored"] else "completed",
+            "durationMs": 0,
+            "caseCounts": counts,
+            "summary": summary,
+            "errors": [],
+        },
+    )
 
 
 def infer_eval_error_status(message: str) -> int:
@@ -777,14 +826,19 @@ def send_experiment_start(
         try:
             summary = experiment.summarize(summarize_scores=False)
             sse.send(
-                "start",
+                "eval:start",
                 {
-                    "projectName": getattr(summary, "project_name", None),
-                    "experimentName": getattr(summary, "experiment_name", None),
-                    "projectId": getattr(summary, "project_id", None),
-                    "experimentId": getattr(summary, "experiment_id", None),
-                    "projectUrl": getattr(summary, "project_url", None),
-                    "experimentUrl": getattr(summary, "experiment_url", None),
+                    "runId": REPORTER_RUN_ID,
+                    "evalId": evaluator.eval_name,
+                    "name": evaluator.eval_name,
+                    "experiment": {
+                        "projectName": getattr(summary, "project_name", None),
+                        "experimentName": getattr(summary, "experiment_name", None),
+                        "projectId": getattr(summary, "project_id", None),
+                        "experimentId": getattr(summary, "experiment_id", None),
+                        "projectUrl": getattr(summary, "project_url", None),
+                        "experimentUrl": getattr(summary, "experiment_url", None),
+                    },
                 },
             )
             return
@@ -795,7 +849,15 @@ def send_experiment_start(
         evaluator, "eval_name", None
     )
     if experiment_name:
-        sse.send("start", {"experimentName": experiment_name})
+        sse.send(
+            "eval:start",
+            {
+                "runId": REPORTER_RUN_ID,
+                "evalId": evaluator.eval_name,
+                "name": evaluator.eval_name,
+                "experiment": {"experimentName": experiment_name},
+            },
+        )
 
 
 def run_evaluator_progress_mode() -> str:
@@ -1117,8 +1179,20 @@ async def run_evaluator_task(
         kwargs = {}
         if progress_cb and progress_mode == "progress":
             kwargs["progress"] = progress_cb
-        if sse and supports_stream:
-            kwargs["stream"] = lambda event: sse.send("progress", event if isinstance(event, dict) else event.__dict__)
+        if sse and supports_stream and env_flag("BT_EVAL_REPORTER_CASE_DELTA"):
+            def stream_event(event):
+                payload = event if isinstance(event, dict) else event.__dict__
+                event_name = str(payload.get("event", "text_delta"))
+                sse.send(
+                    "case:delta",
+                    {
+                        "evalId": evaluator.eval_name,
+                        "caseId": str(payload.get("id") or payload.get("caseId") or "unknown-case"),
+                        "kind": "json" if "json" in event_name else "reasoning" if "reason" in event_name else "text",
+                        "data": payload.get("data") if isinstance(payload.get("data"), str) else json.dumps(payload.get("data", payload)),
+                    },
+                )
+            kwargs["stream"] = stream_event
 
         if parent:
             with parent_context(parent):
@@ -1234,7 +1308,7 @@ async def run_requested_eval(
         return False
 
     if sse:
-        sse.send("summary", format_summary(result.summary.as_dict(), config))
+        send_canonical_eval_result(sse, evaluator.eval_name, result, format_summary(result.summary.as_dict(), config))
     elif config.jsonl:
         print(json.dumps(format_summary(result.summary.as_dict(), config)))
     else:
@@ -1266,6 +1340,15 @@ async def run_once(
         return True
 
     evaluators = filter_evaluators(evaluators, config.filters)
+    if sse and not config.list_only and config.dev_mode != "list":
+        sse.send(
+            "run:start",
+            {
+                "runId": REPORTER_RUN_ID,
+                "evaluatorCount": len(evaluators),
+                "protocolVersion": REPORTER_PROTOCOL_VERSION,
+            },
+        )
     if config.dev_mode == "list":
         print(json.dumps(build_eval_definitions(evaluators)))
         return True
@@ -1319,9 +1402,6 @@ async def run_once(
             setattr(cloned_instance, "_bt_matrix_params_override", overlay)
             expanded.append(cloned_instance)
         evaluators = expanded
-
-    if sse:
-        sse.send("processing", {"evaluators": len(evaluators)})
 
     progress_mode = run_evaluator_progress_mode()
 
@@ -1391,7 +1471,12 @@ async def run_once(
             continue
 
         if sse:
-            sse.send("summary", format_summary(result.summary.as_dict(), config))
+            send_canonical_eval_result(
+                sse,
+                evaluator_instance.evaluator.eval_name,
+                result,
+                format_summary(result.summary.as_dict(), config),
+            )
         elif config.jsonl:
             print(json.dumps(format_summary(result.summary.as_dict(), config)))
         else:
@@ -1454,7 +1539,15 @@ def main(argv: list[str] | None = None) -> int:
 
         if sse:
             sse.send("dependencies", {"files": collect_dependency_files(cwd, files)})
-            sse.send("done", {"success": success})
+            sse.send(
+                "run:end",
+                {
+                    "runId": REPORTER_RUN_ID,
+                    "status": "completed" if success else "errored",
+                    "durationMs": 0,
+                    "errors": [],
+                },
+            )
         return 0 if success else 1
     finally:
         if sse:

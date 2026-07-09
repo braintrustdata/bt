@@ -1,0 +1,4 @@
+{"event":"run:start","data":{"runId":"run-old","evaluatorCount":1,"protocolVersion":1}}
+{"event":"case:end","data":{"evalId":"eval-old","caseId":"synthetic-eval-old-0","index":0,"status":"completed","durationMs":0,"scores":{}}}
+{"event":"run:end","data":{"runId":"run-old","status":"completed","durationMs":0,"errors":[]}}
+{"exit":0}

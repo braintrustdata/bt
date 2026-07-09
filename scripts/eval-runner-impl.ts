@@ -17,9 +17,12 @@ type MatrixAxis = {
 };
 
 type EvalResult = {
-  results: Array<{ error?: unknown }>;
+  results: Array<Record<string, unknown> & { error?: unknown }>;
   summary: unknown;
 };
+
+const REPORTER_PROTOCOL_VERSION = 1;
+const REPORTER_RUN_ID = `run-${process.pid}-${Date.now()}`;
 
 type ProgressReporter = {
   start: (name: string, total: number) => void;
@@ -1349,21 +1352,12 @@ function sendEvalProgress(
   kind: "start" | "increment" | "set_total" | "stop",
   total?: number,
 ) {
-  if (!sse) {
+  if (!sse || kind === "increment" || kind === "stop" || total === undefined) {
     return;
   }
-  sse.send("progress", {
-    id: `eval-progress:${evaluatorName}`,
-    object_type: "task",
-    format: "global",
-    output_type: "any",
-    name: evaluatorName,
-    event: "progress",
-    data: JSON.stringify({
-      type: "eval_progress",
-      kind,
-      ...(total !== undefined ? { total } : {}),
-    }),
+  sse.send("eval:progress", {
+    evalId: evaluatorName,
+    totalCases: total,
   });
 }
 
@@ -1991,7 +1985,7 @@ function sendEvalError(sse: SseWriter | null, err: unknown, status?: number) {
           ...(status !== undefined ? { status } : {}),
         };
   if (sse) {
-    sse.send("error", payload);
+    sse.send("error", { scope: { runId: REPORTER_RUN_ID }, ...payload });
   } else {
     console.error(payload.message);
   }
@@ -2257,6 +2251,17 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   const noSendLogs = shouldDisableSendLogs();
   const parseParent = loadBraintrustUtilParseParent();
   const getState = extractGlobalStateGetter(braintrust);
+  let runStarted = false;
+  const ensureRunStart = (evaluatorCount: number) => {
+    if (sse && !runStarted) {
+      runStarted = true;
+      sse.send("run:start", {
+        runId: REPORTER_RUN_ID,
+        evaluatorCount,
+        protocolVersion: REPORTER_PROTOCOL_VERSION,
+      });
+    }
+  };
 
   const makeEvalOptions = (
     evaluatorName: string,
@@ -2276,10 +2281,25 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
         },
         progress: createEvalProgressReporter(sse, evaluatorName),
         stream: (data: unknown) => {
-          sse.send("progress", data);
+          if (!envFlag("BT_EVAL_REPORTER_CASE_DELTA") || !isObject(data)) {
+            return;
+          }
+          const event = typeof data.event === "string" ? data.event : "text_delta";
+          sse.send("case:delta", {
+            evalId: evaluatorName,
+            caseId: String(data.id ?? data.caseId ?? "unknown-case"),
+            kind: event.includes("json") ? "json" : event.includes("reason") ? "reasoning" : "text",
+            data: typeof data.data === "string" ? data.data : JSON.stringify(data.data ?? data),
+          });
         },
         onStart: (metadata: unknown) => {
-          sse.send("start", metadata);
+          const experiment = isObject(metadata) ? metadata : {};
+          sse.send("eval:start", {
+            runId: REPORTER_RUN_ID,
+            evalId: evaluatorName,
+            name: evaluatorName,
+            experiment,
+          });
         },
       };
     }
@@ -2297,6 +2317,7 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     paramsOverride?: Record<string, unknown>,
   ) => {
     globalThis._lazy_load = false;
+    ensureRunStart(1);
     const evaluatorName = getEvaluatorName(evaluator, projectName);
     // Only inject CLI params when the evaluator declares a parameters schema.
     // Drop any --param keys the evaluator doesn't declare so a single command
@@ -2333,7 +2354,44 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
       );
     }
     if (sse) {
-      sse.send("summary", summary);
+      result.results.forEach((caseResult, index) => {
+        const realCaseId = caseResult.rootSpanId ?? caseResult.root_span_id ?? caseResult.spanId;
+        const caseId = realCaseId ? String(realCaseId) : `synthetic-${evaluatorName}-${index}`;
+        const name = typeof caseResult.name === "string" ? caseResult.name : undefined;
+        sse.send("case:start", {
+          evalId: evaluatorName,
+          caseId,
+          index,
+          ...(name ? { name } : {}),
+        });
+        const error = caseResult.error;
+        const rawScores = isObject(caseResult.scores) ? caseResult.scores : {};
+        const scores = Object.fromEntries(
+          Object.entries(rawScores).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
+        );
+        sse.send("case:end", {
+          evalId: evaluatorName,
+          caseId,
+          index,
+          ...(name ? { name } : {}),
+          status: error === undefined ? "completed" : "errored",
+          durationMs: Number(caseResult.durationMs ?? caseResult.duration_ms ?? 0),
+          scores,
+          ...(error === undefined ? {} : { error: serializeError(error) }),
+        });
+      });
+      sse.send("eval:end", {
+        evalId: evaluatorName,
+        status: failingResults.length === 0 ? "completed" : "errored",
+        durationMs: 0,
+        caseCounts: {
+          completed: result.results.length - failingResults.length,
+          errored: failingResults.length,
+          skipped: 0,
+        },
+        summary,
+        errors: [],
+      });
     } else if (config.jsonl) {
       console.log(JSON.stringify(summary));
     }
@@ -2341,9 +2399,7 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   };
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
-    if (sse) {
-      sse.send("processing", { evaluators: evaluators.length });
-    }
+    ensureRunStart(evaluators.length);
     const reporters = getReporters();
     const runEntry = async (entry: EvaluatorEntry): Promise<boolean> => {
       try {
@@ -2367,7 +2423,10 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
         return true;
       } catch (err) {
         if (sse) {
-          sse.send("error", serializeError(err));
+          sse.send("error", {
+            scope: { runId: REPORTER_RUN_ID },
+            ...serializeError(err),
+          });
         } else {
           console.error(err);
         }
@@ -2394,7 +2453,12 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   const finish = (ok: boolean) => {
     if (sse) {
       sse.send("dependencies", { files: collectDependencyFiles() });
-      sse.send("done", "");
+      sse.send("run:end", {
+        runId: REPORTER_RUN_ID,
+        status: ok ? "completed" : "errored",
+        durationMs: 0,
+        errors: [],
+      });
       sse.close();
     }
     if (!ok) {
@@ -2453,7 +2517,7 @@ export async function main() {
       await runner.login({});
     } catch (err) {
       if (runner.sse) {
-        runner.sse.send("error", serializeError(err));
+        sendEvalError(runner.sse, err);
       } else {
         console.error(err);
       }
@@ -2510,7 +2574,7 @@ export async function main() {
         const message =
           "--matrix-param is not supported for eval files that export btEvalMain. Remove the btEvalMain export or drop --matrix-param.";
         if (runner.sse) {
-          runner.sse.send("error", serializeError(new Error(message)));
+          sendEvalError(runner.sse, new Error(message));
         } else {
           console.error(message);
         }
@@ -2524,7 +2588,7 @@ export async function main() {
         } catch (err) {
           ok = false;
           if (runner.sse) {
-            runner.sse.send("error", serializeError(err));
+            sendEvalError(runner.sse, err);
           } else {
             console.error(err);
           }
@@ -2540,7 +2604,7 @@ export async function main() {
               : names.map((n) => `  - ${n}`).join("\n");
           const message = `--matrix-param is not supported when running multiple evals.\nMatched evals:\n${listed}\nUse --filter to select exactly one eval.`;
           if (runner.sse) {
-            runner.sse.send("error", serializeError(new Error(message)));
+            sendEvalError(runner.sse, new Error(message));
           } else {
             console.error(message);
           }
