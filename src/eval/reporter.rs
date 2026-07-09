@@ -169,6 +169,8 @@ pub(super) struct CaseDelta {
     pub legacy_progress: Option<super::SseProgressEventData>,
 }
 
+// Canonical payloads intentionally vary from tiny progress updates to full summaries.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub(super) enum EvalReporterEvent {

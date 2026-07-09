@@ -2284,12 +2284,20 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
           if (!envFlag("BT_EVAL_REPORTER_CASE_DELTA") || !isObject(data)) {
             return;
           }
-          const event = typeof data.event === "string" ? data.event : "text_delta";
+          const event =
+            typeof data.event === "string" ? data.event : "text_delta";
           sse.send("case:delta", {
             evalId: evaluatorName,
             caseId: String(data.id ?? data.caseId ?? "unknown-case"),
-            kind: event.includes("json") ? "json" : event.includes("reason") ? "reasoning" : "text",
-            data: typeof data.data === "string" ? data.data : JSON.stringify(data.data ?? data),
+            kind: event.includes("json")
+              ? "json"
+              : event.includes("reason")
+                ? "reasoning"
+                : "text",
+            data:
+              typeof data.data === "string"
+                ? data.data
+                : JSON.stringify(data.data ?? data),
           });
         },
         onStart: (metadata: unknown) => {
@@ -2355,9 +2363,13 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     }
     if (sse) {
       result.results.forEach((caseResult, index) => {
-        const realCaseId = caseResult.rootSpanId ?? caseResult.root_span_id ?? caseResult.spanId;
-        const caseId = realCaseId ? String(realCaseId) : `synthetic-${evaluatorName}-${index}`;
-        const name = typeof caseResult.name === "string" ? caseResult.name : undefined;
+        const realCaseId =
+          caseResult.rootSpanId ?? caseResult.root_span_id ?? caseResult.spanId;
+        const caseId = realCaseId
+          ? String(realCaseId)
+          : `synthetic-${evaluatorName}-${index}`;
+        const name =
+          typeof caseResult.name === "string" ? caseResult.name : undefined;
         sse.send("case:start", {
           evalId: evaluatorName,
           caseId,
@@ -2367,7 +2379,9 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
         const error = caseResult.error;
         const rawScores = isObject(caseResult.scores) ? caseResult.scores : {};
         const scores = Object.fromEntries(
-          Object.entries(rawScores).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
+          Object.entries(rawScores).filter(
+            (entry): entry is [string, number] => typeof entry[1] === "number",
+          ),
         );
         sse.send("case:end", {
           evalId: evaluatorName,
@@ -2375,7 +2389,9 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
           index,
           ...(name ? { name } : {}),
           status: error === undefined ? "completed" : "errored",
-          durationMs: Number(caseResult.durationMs ?? caseResult.duration_ms ?? 0),
+          durationMs: Number(
+            caseResult.durationMs ?? caseResult.duration_ms ?? 0,
+          ),
           scores,
           ...(error === undefined ? {} : { error: serializeError(error) }),
         });

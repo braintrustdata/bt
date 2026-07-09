@@ -818,12 +818,7 @@ fn build_eval_reporters(
         }
     }
 
-    if options.output_file.is_some()
-        && !options
-            .reporters
-            .iter()
-            .any(|reporter| *reporter == EvalReporterName::Junit)
-    {
+    if options.output_file.is_some() && !options.reporters.contains(&EvalReporterName::Junit) {
         anyhow::bail!("--output-file requires --reporter=junit");
     }
     Ok(reporters)
