@@ -36,6 +36,9 @@ use crate::ui::{
     SummaryMetricRow, SummaryTableOptions,
 };
 
+mod reporter;
+use reporter::{ConsoleStream, EvalReporter, EvalStatus, LegacyEventAdapter, ReporterManager};
+
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAIN_ORIGIN: &str = "https://www.braintrust.dev";
@@ -742,15 +745,29 @@ async fn run_eval_attempt(
         js_mode,
     )
     .await?;
-    let mut ui = EvalUi::new(
-        options.jsonl,
-        options.list,
+    let mut selected_reporters: Vec<Box<dyn EvalReporter>> = Vec::new();
+    if options.jsonl {
+        selected_reporters.push(Box::new(JsonlReporter::default()));
+    }
+    selected_reporters.push(Box::new(FancyReporter::new(
+        !options.jsonl,
+        options.list || options.jsonl,
         options.verbose,
         base.profile.clone(),
-    );
-    let output =
-        drive_eval_runner(spawned.process, console_policy, |event| ui.handle(event)).await?;
-    ui.finish();
+    )));
+    let mut reporters = ReporterManager::new(selected_reporters, base.profile.clone(), None)?;
+    let mut adapter = LegacyEventAdapter::new(reporters.run_id().to_string());
+    let output = drive_eval_runner(spawned.process, console_policy, |event| {
+        if let Some(event) = adapter.translate(&event) {
+            reporters.dispatch(&event);
+        }
+    })
+    .await?;
+    reporters.finish(if output.status.success() {
+        EvalStatus::Completed
+    } else {
+        EvalStatus::Errored
+    });
 
     Ok(EvalAttemptOutput {
         status: output.status,
@@ -2625,7 +2642,7 @@ struct ProcessingEventData {
     evaluators: usize,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ExperimentStart {
     #[serde(default, alias = "project_name")]
@@ -2643,7 +2660,7 @@ struct ExperimentStart {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExperimentSummary {
     project_name: String,
@@ -2671,7 +2688,7 @@ struct ExperimentSummary {
     compare_more: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ScoreSummary {
     name: String,
     score: f64,
@@ -2689,7 +2706,7 @@ struct EvalErrorPayload {
     status: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct MetricSummary {
     name: String,
     metric: f64,
@@ -2794,13 +2811,41 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
     }
 }
 
-struct EvalUi {
-    progress: MultiProgress,
+#[derive(Default)]
+struct JsonlReporter {
+    profile: Option<String>,
+}
+
+impl EvalReporter for JsonlReporter {
+    fn name(&self) -> &'static str {
+        "jsonl"
+    }
+
+    fn claims_stdout(&self) -> bool {
+        true
+    }
+
+    fn on_init(&mut self, ctx: &reporter::EvalReporterContext) -> Result<()> {
+        self.profile = ctx.profile.clone();
+        Ok(())
+    }
+
+    fn on_eval_end(&mut self, eval: &reporter::EvalEnd) -> Result<()> {
+        if let Some(summary) = eval.summary.clone() {
+            let summary = enrich_experiment_summary(summary, self.profile.as_deref());
+            println!("{}", serde_json::to_string(&summary)?);
+        }
+        Ok(())
+    }
+}
+
+struct FancyReporter {
+    progress: Arc<MultiProgress>,
     bars: HashMap<String, EvalBarState>,
     bar_style: ProgressStyle,
     spinner_style: ProgressStyle,
-    jsonl: bool,
-    list: bool,
+    summaries: bool,
+    stdout_console: bool,
     verbose: bool,
     deferred_errors: Vec<String>,
     suppressed_stderr_lines: usize,
@@ -2814,15 +2859,15 @@ struct EvalBarState {
     last_total_update: Option<std::time::Instant>,
 }
 
-impl EvalUi {
-    fn new(jsonl: bool, list: bool, verbose: bool, profile: Option<String>) -> Self {
+impl FancyReporter {
+    fn new(summaries: bool, stdout_console: bool, verbose: bool, profile: Option<String>) -> Self {
         let draw_target = if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet()
         {
             ProgressDrawTarget::stderr_with_hz(10)
         } else {
             ProgressDrawTarget::stderr()
         };
-        let progress = MultiProgress::with_draw_target(draw_target);
+        let progress = Arc::new(MultiProgress::with_draw_target(draw_target));
         let bar_style =
             ProgressStyle::with_template("{bar:10.blue} {msg} {percent}% {pos}/{len} {eta}")
                 .unwrap();
@@ -2835,8 +2880,8 @@ impl EvalUi {
             bars: HashMap::new(),
             bar_style,
             spinner_style,
-            jsonl,
-            list,
+            summaries,
+            stdout_console,
             verbose,
             deferred_errors: Vec::new(),
             suppressed_stderr_lines: 0,
@@ -2869,12 +2914,8 @@ impl EvalUi {
                 }
             }
             EvalEvent::Summary(summary) => {
-                let summary = enrich_experiment_summary(summary, self.profile.as_deref());
-                if self.jsonl {
-                    if let Ok(line) = serde_json::to_string(&summary) {
-                        println!("{line}");
-                    }
-                } else {
+                if self.summaries {
+                    let summary = enrich_experiment_summary(summary, self.profile.as_deref());
                     let rendered = format_experiment_summary(&summary);
                     self.print_persistent_multiline(rendered);
                 }
@@ -2884,7 +2925,7 @@ impl EvalUi {
             }
             EvalEvent::Dependencies { .. } => {}
             EvalEvent::Console { stream, message } => {
-                if stream == "stdout" && (self.list || self.jsonl) {
+                if stream == "stdout" && self.stdout_console {
                     println!("{message}");
                 } else if stream == "stderr" && !self.verbose {
                     self.suppressed_stderr_lines += 1;
@@ -3121,7 +3162,126 @@ impl EvalUi {
     }
 }
 
-impl Drop for EvalUi {
+impl EvalReporter for FancyReporter {
+    fn name(&self) -> &'static str {
+        if self.verbose {
+            "verbose"
+        } else {
+            "fancy"
+        }
+    }
+
+    fn on_init(&mut self, ctx: &reporter::EvalReporterContext) -> Result<()> {
+        self.progress = ctx.terminal.live_region();
+        self.profile = ctx.profile.clone();
+        Ok(())
+    }
+
+    fn on_run_start(&mut self, run: &reporter::EvalRun) -> Result<()> {
+        self.handle(EvalEvent::Processing(ProcessingEventData {
+            evaluators: run.evaluator_count,
+        }));
+        Ok(())
+    }
+
+    fn on_eval_start(&mut self, eval: &reporter::EvalInfo) -> Result<()> {
+        if let Some(experiment) = eval.experiment.clone() {
+            self.handle(EvalEvent::Start(experiment));
+        }
+        Ok(())
+    }
+
+    fn on_case_end(&mut self, case: &reporter::EvalCaseResult) -> Result<()> {
+        if !self.bars.contains_key(&case.info.eval_id) {
+            self.handle_progress(eval_progress_event_for_reporter(
+                &case.info.eval_id,
+                "start",
+                None,
+            ));
+        }
+        self.handle_progress(eval_progress_event_for_reporter(
+            &case.info.eval_id,
+            "increment",
+            None,
+        ));
+        Ok(())
+    }
+
+    fn on_eval_end(&mut self, eval: &reporter::EvalEnd) -> Result<()> {
+        if let Some(summary) = eval.summary.clone() {
+            self.handle(EvalEvent::Summary(summary));
+        }
+        Ok(())
+    }
+
+    fn on_run_end(&mut self, _run: &reporter::EvalRunEnd) -> Result<Option<bool>> {
+        FancyReporter::finish(self);
+        Ok(None)
+    }
+
+    fn on_error(&mut self, error: &reporter::ReporterError) -> Result<()> {
+        self.handle(EvalEvent::Error {
+            message: error.message.clone(),
+            stack: error.stack.clone(),
+            status: error.status,
+        });
+        Ok(())
+    }
+
+    fn on_console(&mut self, log: &reporter::ConsoleEvent) -> Result<()> {
+        self.handle(EvalEvent::Console {
+            stream: match log.stream {
+                ConsoleStream::Stdout => "stdout",
+                ConsoleStream::Stderr => "stderr",
+            }
+            .to_string(),
+            message: log.message.clone(),
+        });
+        Ok(())
+    }
+
+    fn on_progress(&mut self, progress: &reporter::ProgressEvent) -> Result<()> {
+        let kind = if self.bars.contains_key(&progress.eval_id) {
+            "set_total"
+        } else {
+            "start"
+        };
+        self.handle_progress(eval_progress_event_for_reporter(
+            &progress.eval_id,
+            kind,
+            Some(progress.total_cases),
+        ));
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        FancyReporter::finish(self);
+        Ok(())
+    }
+}
+
+fn eval_progress_event_for_reporter(
+    eval_id: &str,
+    kind: &str,
+    total: Option<u64>,
+) -> SseProgressEventData {
+    let mut data = json!({"type": "eval_progress", "kind": kind});
+    if let Some(total) = total {
+        data["total"] = json!(total);
+    }
+    SseProgressEventData {
+        id: eval_id.to_string(),
+        object_type: "task".to_string(),
+        origin: None,
+        format: "code".to_string(),
+        output_type: "completion".to_string(),
+        name: eval_id.to_string(),
+        event: "progress".to_string(),
+        data: data.to_string(),
+    }
+}
+
+impl Drop for FancyReporter {
     fn drop(&mut self) {
         self.finish();
     }
@@ -4216,7 +4376,7 @@ mod tests {
 
     #[test]
     fn eval_ui_record_deferred_error_trims_deduplicates_and_caps() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = FancyReporter::new(false, false, false, None);
         ui.record_deferred_error("  repeated error  ".to_string());
         ui.record_deferred_error("repeated error".to_string());
         ui.record_deferred_error("   ".to_string());
@@ -4242,12 +4402,12 @@ mod tests {
             last_total_update: Some(std::time::Instant::now()),
         };
 
-        EvalUi::ensure_total_not_below_position(&mut state, &style);
+        FancyReporter::ensure_total_not_below_position(&mut state, &style);
         assert_eq!(state.bar.length(), Some(3));
         assert_eq!(state.pending_total, Some(3));
 
         state.pending_total = Some(4);
-        EvalUi::maybe_apply_pending_total(&mut state, &style, true);
+        FancyReporter::maybe_apply_pending_total(&mut state, &style, true);
         assert_eq!(state.bar.length(), Some(4));
         assert_eq!(state.pending_total, None);
 
@@ -4257,23 +4417,23 @@ mod tests {
             pending_total: None,
             last_total_update: None,
         };
-        assert!(EvalUi::should_apply_total_update(&spinner_state, 2));
+        assert!(FancyReporter::should_apply_total_update(&spinner_state, 2));
     }
 
     #[test]
     fn eval_ui_finish_is_idempotent_and_drop_finishes() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = FancyReporter::new(false, false, false, None);
         ui.finish();
         ui.finish();
         assert!(ui.finished);
 
-        let dropped = EvalUi::new(false, false, false, None);
+        let dropped = FancyReporter::new(false, false, false, None);
         drop(dropped);
     }
 
     #[test]
     fn eval_ui_preserves_spinner_increments_before_set_total() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = FancyReporter::new(false, false, false, None);
         let eval_name = "My evaluation";
 
         ui.handle_progress(eval_progress_event(eval_name, "start", None));
@@ -4293,7 +4453,7 @@ mod tests {
 
     #[test]
     fn eval_ui_never_sets_total_below_position() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = FancyReporter::new(false, false, false, None);
         let eval_name = "My evaluation";
 
         ui.handle_progress(eval_progress_event(eval_name, "start", Some(1)));
@@ -4317,7 +4477,7 @@ mod tests {
 
     #[test]
     fn eval_ui_keeps_spinner_until_total_exceeds_one() {
-        let mut ui = EvalUi::new(false, false, false, None);
+        let mut ui = FancyReporter::new(false, false, false, None);
         let eval_name = "My evaluation";
 
         ui.handle_progress(eval_progress_event(eval_name, "start", None));
