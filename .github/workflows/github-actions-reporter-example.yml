@@ -48,5 +48,5 @@ jobs:
           set -e
 
           printf '%s\n' "$output"
-          grep -Eq '^::error title=case [0-9]+ errored::intentional error from the GitHub Actions reporter example$' <<<"$output"
+          grep -Eq '^::error title=case [0-9]+ errored,file=.*examples/eval-reporters/github-actions\.eval\.ts,line=22,col=13::intentional error from the GitHub Actions reporter example$' <<<"$output"
           test "$status" -ne 0

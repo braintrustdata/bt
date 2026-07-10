@@ -1369,9 +1369,44 @@ function sendEvalProgress(
   });
 }
 
+function sourceLocationFromStack(stack: string | undefined) {
+  if (!stack) {
+    return undefined;
+  }
+  for (const line of stack.split("\n")) {
+    const match =
+      line.match(/\((.+):(\d+):(\d+)\)$/) ??
+      line.match(/\bat (.+):(\d+):(\d+)$/);
+    if (!match) {
+      continue;
+    }
+    let file = match[1];
+    if (file.startsWith("file://")) {
+      try {
+        file = fileURLToPath(file);
+      } catch {
+        continue;
+      }
+    }
+    if (file.includes("node_modules") || file.includes("eval-runner")) {
+      continue;
+    }
+    return {
+      file,
+      line: Number(match[2]),
+      column: Number(match[3]),
+    };
+  }
+  return undefined;
+}
+
 function serializeError(err: unknown) {
   if (err instanceof Error) {
-    return { message: err.message, stack: err.stack };
+    return {
+      message: err.message,
+      stack: err.stack,
+      location: sourceLocationFromStack(err.stack),
+    };
   }
   return { message: String(err) };
 }

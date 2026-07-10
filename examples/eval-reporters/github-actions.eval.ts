@@ -19,7 +19,9 @@ Eval("reporter-example", {
   ],
   task: ({ message, shouldError }: Input): string => {
     if (shouldError) {
-      throw new Error("intentional error from the GitHub Actions reporter example");
+      throw new Error(
+        "intentional error from the GitHub Actions reporter example",
+      );
     }
     return message;
   },

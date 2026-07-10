@@ -52,10 +52,21 @@ pub(super) enum CaseStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(super) struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct CaseError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<SourceLocation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

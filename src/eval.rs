@@ -3446,11 +3446,25 @@ struct GithubActionsReporter {
 }
 
 impl GithubActionsReporter {
-    fn annotate(&self, kind: &str, title: &str, message: &str) {
+    fn annotate(
+        &self,
+        kind: &str,
+        title: &str,
+        message: &str,
+        location: Option<&reporter::SourceLocation>,
+    ) {
         let property = |value: &str| github_escape(value).replace(':', "%3A").replace(',', "%2C");
+        let mut properties = vec![format!("title={}", property(title))];
+        if let Some(location) = location {
+            properties.push(format!("file={}", property(&location.file)));
+            properties.push(format!("line={}", location.line));
+            if let Some(column) = location.column {
+                properties.push(format!("col={column}"));
+            }
+        }
         self.terminal.as_ref().unwrap().println(format!(
-            "::{kind} title={}::{}",
-            property(title),
+            "::{kind} {}::{}",
+            properties.join(","),
             github_escape(message)
         ));
     }
@@ -3475,6 +3489,7 @@ impl EvalReporter for GithubActionsReporter {
         if case.info.synthetic {
             self.degraded = true;
         } else if case.status == CaseStatus::Errored {
+            let error = case.error.as_ref();
             self.annotate(
                 "error",
                 &format!(
@@ -3484,17 +3499,17 @@ impl EvalReporter for GithubActionsReporter {
                         .clone()
                         .unwrap_or_else(|| case.info.index.to_string())
                 ),
-                case.error
-                    .as_ref()
+                error
                     .map(|error| error.message.as_str())
                     .unwrap_or("case errored"),
+                error.and_then(|error| error.location.as_ref()),
             );
         }
         Ok(())
     }
 
     fn on_error(&mut self, error: &reporter::ReporterError) -> Result<()> {
-        self.annotate("error", "eval run error", &error.message);
+        self.annotate("error", "eval run error", &error.message, None);
         Ok(())
     }
 
@@ -4437,6 +4452,7 @@ mod tests {
                 error: Some(reporter::CaseError {
                     message: "expected & actual differ".into(),
                     stack: Some("stack".into()),
+                    location: None,
                 }),
             })
             .unwrap();

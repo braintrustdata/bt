@@ -4,7 +4,7 @@
 {"type":"case:start","case":{"evalId":"eval-canonical","caseId":"span-case-1","index":0,"name":"first case"}}
 {"type":"case:end","case":{"evalId":"eval-canonical","caseId":"span-case-1","index":0,"name":"first case","status":"completed","durationMs":120,"scores":{"Accuracy":1.0}}}
 {"type":"case:start","case":{"evalId":"eval-canonical","caseId":"span-case-2","index":1,"name":"second case"}}
-{"type":"case:end","case":{"evalId":"eval-canonical","caseId":"span-case-2","index":1,"name":"second case","status":"errored","durationMs":250,"scores":{},"error":{"message":"case failed","stack":"case stack"}}}
+{"type":"case:end","case":{"evalId":"eval-canonical","caseId":"span-case-2","index":1,"name":"second case","status":"errored","durationMs":250,"scores":{},"error":{"message":"case failed","stack":"case stack","location":{"file":"examples/eval-reporters/github-actions.eval.ts","line":22,"column":13}}}}
 {"type":"case:start","case":{"evalId":"eval-canonical","caseId":"span-case-3","index":2,"name":"third case"}}
 {"type":"case:end","case":{"evalId":"eval-canonical","caseId":"span-case-3","index":2,"name":"third case","status":"skipped","durationMs":0,"scores":{}}}
 {"type":"eval:end","eval":{"evalId":"eval-canonical","status":"errored","durationMs":370,"caseCounts":{"completed":1,"errored":1,"skipped":1},"summary":{"projectName":"test-project","experimentName":"canonical-exp","projectId":"project-test-id","experimentId":"canonical-exp-id","projectUrl":"https://example.test/project/test-project","experimentUrl":"https://example.test/experiment/canonical-exp","comparisonExperimentName":null,"scores":{},"metrics":null,"runMode":null,"isFinal":null,"runLabel":null,"sampleCount":null,"sampleSeed":null},"errors":[]}}
