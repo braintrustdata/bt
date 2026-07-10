@@ -1,0 +1,53 @@
+name: GitHub Actions reporter example
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reporter-example:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure git auth for private dependencies
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: 1.92.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Install example dependencies
+        run: pnpm install --dir examples/eval-reporters --frozen-lockfile
+      - name: Build bt
+        run: cargo build --bin bt
+      - name: Exercise the GitHub Actions reporter
+        shell: bash
+        run: |
+          set +e
+          output=$(cd examples/eval-reporters && ../../target/debug/bt eval \
+            --no-send-logs \
+            --reporter=github-actions \
+            github-actions.eval.ts 2>&1)
+          status=$?
+          set -e
+
+          printf '%s\n' "$output"
+          grep -F "::error title=case " <<<"$output" \
+            | grep -F "errored::intentional error from the GitHub Actions reporter example"
+          test "$status" -ne 0

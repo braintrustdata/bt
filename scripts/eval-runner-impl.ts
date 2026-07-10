@@ -217,6 +217,14 @@ function serializeJSONWithPlainString(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function caseInputKey(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function parseSerializedFilters(serialized: string | undefined): EvalFilter[] {
   if (!serialized) {
     return [];
@@ -2122,23 +2130,35 @@ function wrapTaskForStreamingProgress(
   }
 
   const wrappedTask = async (input: unknown, hooks: unknown) => {
-    const result = await task(input, hooks);
-    if (isObject(hooks)) {
-      const reportProgress = Reflect.get(hooks, "reportProgress");
-      if (typeof reportProgress === "function") {
-        try {
-          reportProgress({
-            format: "code",
-            output_type: "completion",
-            event: "json_delta",
-            data: JSON.stringify(result),
-          });
-        } catch {
-          // Progress updates should not fail the evaluator run.
+    let result: unknown;
+    try {
+      result = await task(input, hooks);
+      return result;
+    } finally {
+      if (isObject(hooks)) {
+        const reportProgress = Reflect.get(hooks, "reportProgress");
+        if (typeof reportProgress === "function") {
+          try {
+            reportProgress({
+              format: "code",
+              output_type: "completion",
+              event: "progress",
+              data: JSON.stringify({ type: "bt_case_identity", input }),
+            });
+            if (result !== undefined) {
+              reportProgress({
+                format: "code",
+                output_type: "completion",
+                event: "json_delta",
+                data: JSON.stringify(result),
+              });
+            }
+          } catch {
+            // Progress updates should not fail the evaluator run.
+          }
         }
       }
     }
-    return result;
   };
 
   return {
@@ -2251,6 +2271,8 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   const noSendLogs = shouldDisableSendLogs();
   const parseParent = loadBraintrustUtilParseParent();
   const getState = extractGlobalStateGetter(braintrust);
+  const caseIdsByInput = new Map<string, string[]>();
+  let nextLocalCaseId = 0;
   let runStarted = false;
   const ensureRunStart = (evaluatorCount: number) => {
     if (sse && !runStarted) {
@@ -2281,11 +2303,31 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
         },
         progress: createEvalProgressReporter(sse, evaluatorName),
         stream: (data: unknown) => {
-          if (!envFlag("BT_EVAL_REPORTER_CASE_DELTA") || !isObject(data)) {
+          if (!isObject(data)) {
             return;
           }
           const event =
             typeof data.event === "string" ? data.event : "text_delta";
+          if (event === "progress" && typeof data.data === "string") {
+            try {
+              const marker = JSON.parse(data.data) as unknown;
+              if (isObject(marker) && marker.type === "bt_case_identity") {
+                const key = caseInputKey(marker.input);
+                const ids = caseIdsByInput.get(key) ?? [];
+                const caseId = data.id
+                  ? String(data.id)
+                  : `case-${REPORTER_RUN_ID}-${++nextLocalCaseId}`;
+                ids.push(caseId);
+                caseIdsByInput.set(key, ids);
+                return;
+              }
+            } catch {
+              // Non-JSON progress payloads are ordinary case deltas.
+            }
+          }
+          if (!envFlag("BT_EVAL_REPORTER_CASE_DELTA")) {
+            return;
+          }
           sse.send("case:delta", {
             evalId: evaluatorName,
             caseId: String(data.id ?? data.caseId ?? "unknown-case"),
@@ -2363,8 +2405,13 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
     }
     if (sse) {
       result.results.forEach((caseResult, index) => {
+        const inputIds = caseIdsByInput.get(caseInputKey(caseResult.input));
+        const capturedCaseId = inputIds?.shift();
         const realCaseId =
-          caseResult.rootSpanId ?? caseResult.root_span_id ?? caseResult.spanId;
+          caseResult.rootSpanId ??
+          caseResult.root_span_id ??
+          caseResult.spanId ??
+          capturedCaseId;
         const caseId = realCaseId
           ? String(realCaseId)
           : `synthetic-${evaluatorName}-${index}`;
