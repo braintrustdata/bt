@@ -48,6 +48,5 @@ jobs:
           set -e
 
           printf '%s\n' "$output"
-          grep -F "::error title=case " <<<"$output" \
-            | grep -F "errored::intentional error from the GitHub Actions reporter example"
+          grep -Eq '^::error title=case [0-9]+ errored::intentional error from the GitHub Actions reporter example$' <<<"$output"
           test "$status" -ne 0
