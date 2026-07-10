@@ -437,6 +437,19 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
     }
 }
 
+/// Run a read-only BTQL/SQL query and return just the result rows.
+///
+/// Thin wrapper over [`execute_query`] so other commands (for example
+/// `bt cost`) can reuse the `/btql` request body and headers without
+/// duplicating them.
+pub(crate) async fn run_btql_rows(
+    client: &ApiClient,
+    query: &str,
+    lint_mode: &str,
+) -> Result<Vec<Map<String, Value>>> {
+    Ok(execute_query(client, query, lint_mode).await?.data)
+}
+
 async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
     let body = query_body(query, lint_mode);
     let headers = org_headers(client);
