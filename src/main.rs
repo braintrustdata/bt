@@ -6,6 +6,7 @@ mod args;
 mod auth;
 #[allow(dead_code)]
 mod config;
+mod cost;
 mod datasets;
 mod env;
 #[cfg(unix)]
@@ -77,6 +78,7 @@ Data & evaluation
   datasets     Manage datasets
   eval         Run eval files
   sql          Run SQL queries against Braintrust
+  cost         Estimate LLM cost for Braintrust resources
   sync         Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
@@ -136,6 +138,8 @@ enum Commands {
     Login(CLIArgs<auth::LoginArgs, LoginBaseArgs>),
     /// Remove a saved Braintrust login
     Logout(CLIArgs<auth::LogoutArgs>),
+    /// Estimate LLM cost for Braintrust resources
+    Cost(CLIArgs<cost::CostArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
@@ -185,6 +189,7 @@ impl Commands {
             Commands::Sql(cmd) => &cmd.base,
             Commands::Login(cmd) => &cmd.base,
             Commands::Logout(cmd) => &cmd.base,
+            Commands::Cost(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
@@ -214,6 +219,7 @@ impl Commands {
             Commands::Sql(cmd) => &mut cmd.base,
             Commands::Login(cmd) => &mut cmd.base,
             Commands::Logout(cmd) => &mut cmd.base,
+            Commands::Cost(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
@@ -323,6 +329,7 @@ fn try_main() -> Result<()> {
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
+            Commands::Cost(cmd) => cost::run(cmd.base, cmd.args).await?,
             Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
             Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
             #[cfg(unix)]
