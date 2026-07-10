@@ -3,6 +3,8 @@ use std::cmp::Ordering;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::utils::format_cost;
+
 use super::{
     build_span_entries, extract_duration_seconds, extract_model_name, extract_parent_span_id,
     extract_span_end_seconds, extract_span_name_and_type, extract_start_time,
@@ -602,16 +604,6 @@ fn format_waterfall_metrics(metrics: &WaterfallMetrics) -> String {
 
 fn format_percent(value: f64) -> String {
     format!("{value:.1}%")
-}
-
-fn format_cost(cost: f64) -> String {
-    if cost > 0.0 && cost < 0.001 {
-        "<$0.001".to_string()
-    } else if cost < 1.0 {
-        format!("${cost:.3}")
-    } else {
-        format!("${cost:.2}")
-    }
 }
 
 #[cfg(test)]
