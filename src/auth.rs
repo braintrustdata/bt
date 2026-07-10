@@ -1161,6 +1161,11 @@ where
             })?)
         };
 
+        // Once a profile is selected, the profile's own org_name wins over the config-file
+        // `org` (cfg_org). cfg_org may be a stale/legacy value authored for a *different*
+        // profile (e.g. global config still has the previous profile's org), and letting it
+        // override the selected profile's org produces a JWT/org-name mismatch and makes
+        // `bt switch --org <x>` switch to the wrong org. An explicit --org flag still wins.
         return Ok(ResolvedAuth {
             api_key,
             api_url: base.api_url.clone().or_else(|| profile.api_url.clone()),
@@ -1168,8 +1173,8 @@ where
             org_name: base
                 .org_name
                 .clone()
-                .or_else(|| cfg_org.clone())
-                .or_else(|| profile.org_name.clone()),
+                .or_else(|| profile.org_name.clone())
+                .or_else(|| cfg_org.clone()),
             is_oauth,
         });
     }
@@ -1262,9 +1267,15 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
 }
 
 async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
-    let api_url = base
+    // Resolve the deployment to authenticate against using exactly one OAuth browser flow.
+    // Priority: explicit --api-url, then the existing profile's api_url (so re-logging into a
+    // staging profile re-authenticates against staging and gets a staging-issued JWT), then
+    // the default (prod). This must match the deployment the selected org lives on; a JWT is
+    // only valid for the deployment that issued it.
+    let exchange_api_url = base
         .api_url
         .clone()
+        .or_else(|| existing_profile_api_url(base.profile.as_deref()))
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let app_url = base
         .app_url
@@ -1281,6 +1292,105 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_oauth_client_id(provisional_profile));
 
+    // Run the browser OAuth authorize + token exchange against `exchange_api_url`, returning
+    // the issued tokens. This is the only browser prompt. The deployment that issues the JWT
+    // is the only deployment the JWT is valid against, so the profile's stored `api_url` must
+    // match.
+    let oauth_tokens =
+        oauth_authorize_and_exchange(&exchange_api_url, &client_id, base, &args).await?;
+
+    // List the orgs available to this token and let the user pick one.
+    let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
+    let selected_org = select_login_org(
+        login_orgs.clone(),
+        base.org_name.as_deref(),
+        ui::can_prompt(),
+        base.verbose,
+        true,
+        explicitly_quiet(base),
+    )?;
+    let selected_api_url =
+        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
+
+    // A JWT is only valid for the deployment that issued it. If the user picked an org that
+    // lives on a *different* deployment than the one we just authenticated against, the
+    // token cannot serve that org — we cannot fix this with another browser flow (that would
+    // be a second login and still wouldn't change which deployment issued the JWT we keep).
+    // Surface an actionable error telling the user how to authenticate against that org's
+    // deployment instead. Never re-open the browser here.
+    if let Some(org) = selected_org.as_ref() {
+        let org_api_url = org
+            .api_url
+            .as_deref()
+            .unwrap_or(&selected_api_url)
+            .trim_end_matches('/');
+        if !same_deployment(org_api_url, &exchange_api_url) {
+            bail!(
+                "org '{}' lives on a different deployment ({}) than the one used for login ({}).\n\
+                 Re-run with `--api-url {}` to authenticate against that deployment.",
+                org.name,
+                org_api_url,
+                exchange_api_url,
+                org_api_url,
+            );
+        }
+    }
+
+    let store = load_auth_store()?;
+    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
+    let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
+        base.profile.as_deref(),
+        selected_org.as_ref().map(|org| org.name.as_str()),
+        &selected_api_url,
+        &app_url,
+        &jwt_id,
+        &store,
+    )?;
+    if should_confirm_overwrite {
+        confirm_profile_overwrite(&profile_name)?;
+    }
+
+    commit_oauth_profile(
+        &profile_name,
+        &oauth_tokens,
+        selected_api_url.clone(),
+        app_url.clone(),
+        client_id.clone(),
+        selected_org.as_ref().map(|org| org.name.clone()),
+    )?;
+
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format_login_success(&selected_org, &profile_name, &selected_api_url),
+    );
+
+    Ok(())
+}
+
+/// Look up the stored `api_url` for an existing profile, so re-logging into a profile (e.g.
+/// `bt auth login --profile "BT Staging"` where that profile already points at staging)
+/// authenticates against the same deployment and gets a JWT issued by that deployment.
+fn existing_profile_api_url(profile: Option<&str>) -> Option<String> {
+    let name = profile?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let store = load_auth_store().ok()?;
+    store
+        .profiles
+        .get(name)
+        .and_then(|profile| profile.api_url.clone())
+}
+
+/// Run the browser-based OAuth authorize + PKCE token exchange against `api_url`.
+/// Returns the issued `OAuthTokenResponse`. This is the sole browser prompt during
+/// `bt auth login --oauth`; it must never be called twice in one invocation.
+async fn oauth_authorize_and_exchange(
+    api_url: &str,
+    client_id: &str,
+    base: &BaseArgs,
+    args: &AuthLoginArgs,
+) -> Result<OAuthTokenResponse> {
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let state = generate_random_token(32)?;
 
@@ -1292,7 +1402,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .context("failed to read callback listener address")?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
-    let oauth_client = build_oauth_client(&api_url, &client_id, Some(&redirect_uri))?;
+    let oauth_client = build_oauth_client(api_url, client_id, Some(&redirect_uri))?;
     let (authorize_url, _) = oauth_client
         .authorize_url(|| CsrfToken::new(state.clone()))
         .add_scope(Scope::new(OAUTH_SCOPE.to_string()))
@@ -1327,54 +1437,24 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         bail!("oauth state mismatch; please try again");
     }
 
-    let oauth_tokens = exchange_oauth_authorization_code(
-        &api_url,
-        &client_id,
-        &redirect_uri,
-        &auth_code,
-        pkce_verifier,
-    )
-    .await?;
-    let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let selected_org = select_login_org(
-        login_orgs.clone(),
-        base.org_name.as_deref(),
-        ui::can_prompt(),
-        base.verbose,
-        true,
-        explicitly_quiet(base),
-    )?;
-    let selected_api_url =
-        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
-    let store = load_auth_store()?;
-    let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
-    let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
-        base.profile.as_deref(),
-        selected_org.as_ref().map(|org| org.name.as_str()),
-        &selected_api_url,
-        &app_url,
-        &jwt_id,
-        &store,
-    )?;
-    if should_confirm_overwrite {
-        confirm_profile_overwrite(&profile_name)?;
-    }
+    exchange_oauth_authorization_code(api_url, client_id, &redirect_uri, &auth_code, pkce_verifier)
+        .await
+}
 
-    commit_oauth_profile(
-        &profile_name,
-        &oauth_tokens,
-        selected_api_url.clone(),
-        app_url.clone(),
-        client_id.clone(),
-        selected_org.as_ref().map(|org| org.name.clone()),
-    )?;
-
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format_login_success(&selected_org, &profile_name, &selected_api_url),
-    );
-
-    Ok(())
+/// Compare two API URLs by host (ignoring trailing slashes), used to decide whether a
+/// selected org's `api_url` matches the deployment that issued the current JWT.
+fn same_deployment(a: &str, b: &str) -> bool {
+    let host_of = |url: &str| {
+        url.trim_end_matches('/')
+            .split("//")
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    !a.is_empty() && !b.is_empty() && host_of(a) == host_of(b)
 }
 
 pub(crate) fn commit_api_key_profile(
@@ -4223,7 +4303,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_config_org_overrides_profile_org() {
+    fn resolve_auth_selected_profile_org_wins_over_stale_config_org() {
+        // A selected profile owns its org. The config-file `org` (cfg_org) may be a stale
+        // value left over from a different profile (e.g. global config still has the previous
+        // profile's org). Letting it override the selected profile's org produces a JWT/org
+        // mismatch, so the profile's org_name must win once a profile is selected.
         let mut base = make_base();
         base.profile = Some("default-profile".to_string());
 
@@ -4245,6 +4329,60 @@ mod tests {
         )
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("profile-org"));
+    }
+
+    #[test]
+    fn resolve_auth_explicit_org_flag_overrides_profile_org() {
+        // An explicit --org flag must still win over the selected profile's org_name.
+        let mut base = make_base();
+        base.profile = Some("default-profile".to_string());
+        base.org_name = Some("flag-org".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "default-profile".into(),
+            AuthProfile {
+                org_name: Some("profile-org".into()),
+                ..Default::default()
+            },
+        );
+        let cfg_org = Some("local-org".to_string());
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".into())),
+            &cfg_org,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.org_name.as_deref(), Some("flag-org"));
+    }
+
+    #[test]
+    fn resolve_auth_profile_without_org_falls_back_to_config_org() {
+        // If the selected profile has no org_name, keep using cfg_org so behavior is
+        // unchanged for legacy/api-key profiles that rely on the config org.
+        let mut base = make_base();
+        base.profile = Some("default-profile".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "default-profile".into(),
+            AuthProfile {
+                org_name: None,
+                ..Default::default()
+            },
+        );
+        let cfg_org = Some("local-org".to_string());
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("profile-key".into())),
+            &cfg_org,
+        )
+        .expect("resolve");
         assert_eq!(resolved.org_name.as_deref(), Some("local-org"));
     }
 
@@ -4680,5 +4818,37 @@ mod tests {
 
         let result = env.login_read_only_with_base(base).await;
         assert_err_contains(result, "no login credentials found");
+    }
+
+    #[test]
+    fn same_deployment_compares_hosts_ignoring_trailing_slash() {
+        assert!(same_deployment(
+            "https://staging-api.braintrust.dev",
+            "https://staging-api.braintrust.dev/",
+        ));
+        assert!(same_deployment(
+            "https://api.braintrust.dev",
+            "https://api.braintrust.dev",
+        ));
+    }
+
+    #[test]
+    fn same_deployment_detects_cross_deployment_orgs() {
+        // A prod-issued JWT vs a staging org's api_url must be detected as a mismatch so
+        // `run_login_oauth` re-runs OAuth against the staging deployment.
+        assert!(!same_deployment(
+            "https://staging-api.braintrust.dev",
+            "https://api.braintrust.dev",
+        ));
+    }
+
+    #[test]
+    fn same_deployment_is_case_insensitive_and_handles_empty() {
+        assert!(same_deployment(
+            "https://API.Braintrust.dev",
+            "https://api.braintrust.dev",
+        ));
+        assert!(!same_deployment("", "https://api.braintrust.dev"));
+        assert!(!same_deployment("https://api.braintrust.dev", ""));
     }
 }

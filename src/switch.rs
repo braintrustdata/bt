@@ -110,7 +110,25 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let ctx = login(&login_base).await?;
     let client = ApiClient::new(&ctx)?;
-    let org_name = client.org_name().to_string();
+    // Source the org we write from the resolved profile so the written config always reflects
+    // the active profile's org. The API client's org_name can be empty when the login state
+    // doesn't echo an org name, so fall back to the profile's stored org_name.
+    let mut org_name = client.org_name().to_string();
+    if org_name.trim().is_empty() {
+        let effective_profile =
+            config::trimmed_option(profile_name.as_deref().or(base.profile.as_deref()))
+                .map(str::to_string);
+        if let Some(profile_name) = effective_profile {
+            if let Some(info) = auth::list_profiles()?
+                .into_iter()
+                .find(|p| p.name == profile_name)
+            {
+                if let Some(profile_org) = info.org_name {
+                    org_name = profile_org;
+                }
+            }
+        }
+    }
 
     let project = match resolved_project {
         Some(p) => validate_or_create_project(&client, &p).await?,

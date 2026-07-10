@@ -30,7 +30,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
-use urlencoding::encode;
+use urlencoding::{decode, encode};
 
 use crate::args::BaseArgs;
 use crate::auth::{self, login};
@@ -931,7 +931,12 @@ impl TraceViewerApp {
 
 pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
     let parsed_startup_url = parse_startup_trace_url_from_view_args(&args)?;
-    let base = apply_url_hints_to_base(base, parsed_startup_url.as_ref());
+    let (base, hints) =
+        apply_url_hints_with_profile_resolver(base, parsed_startup_url.as_ref(), |org| {
+            let profiles = auth::list_profiles().ok()?;
+            auth::resolve_org_to_profile(org, &profiles).ok()
+        });
+    maybe_surface_url_profile_override(&base, &hints);
 
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
@@ -5567,23 +5572,26 @@ fn parse_startup_trace_url_from_view_args(args: &ViewArgs) -> Result<Option<Pars
     startup_url.as_deref().map(parse_trace_url).transpose()
 }
 
-fn apply_url_hints_to_base(base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
-    apply_url_hints_with_profile_resolver(base, parsed_url, |org| {
-        let profiles = auth::list_profiles().ok()?;
-        auth::resolve_org_to_profile(org, &profiles).ok()
-    })
+/// Result of applying a trace URL's org/profile hints to the base args.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UrlHints {
+    /// Profile name the URL resolved to (if any), regardless of whether `base.profile` was
+    /// already set. `None` means the URL did not resolve a profile.
+    resolved_profile: Option<String>,
+    /// Org name the URL contributed (if any).
+    resolved_org: Option<String>,
 }
 
 fn apply_url_hints_with_profile_resolver<F>(
     mut base: BaseArgs,
     parsed_url: Option<&ParsedTraceUrl>,
     resolve_profile_for_org: F,
-) -> BaseArgs
+) -> (BaseArgs, UrlHints)
 where
     F: Fn(&str) -> Option<String>,
 {
     let Some(parsed) = parsed_url else {
-        return base;
+        return (base, UrlHints::default());
     };
     let Some(url_org) = parsed
         .org
@@ -5591,7 +5599,7 @@ where
         .map(str::trim)
         .filter(|v| !v.is_empty())
     else {
-        return base;
+        return (base, UrlHints::default());
     };
 
     let has_profile_override = base
@@ -5605,15 +5613,65 @@ where
         .map(str::trim)
         .is_some_and(|v| !v.is_empty());
 
+    let mut hints = UrlHints {
+        resolved_org: Some(url_org.to_string()),
+        ..Default::default()
+    };
+
     if !has_org_override && !has_profile_override {
         base.org_name = Some(url_org.to_string());
     }
     if !has_profile_override && !has_org_override {
         if let Some(profile_name) = resolve_profile_for_org(url_org) {
-            base.profile = Some(profile_name);
+            base.profile = Some(profile_name.clone());
+            hints.resolved_profile = Some(profile_name);
         }
     }
-    base
+
+    (base, hints)
+}
+
+/// Whether a URL-driven profile/org overrides the currently active config profile/org.
+/// Used to surface a non-surprising info note so users know which credentials a trace URL
+/// actually used (e.g. viewing a staging trace while switched to a prod org).
+fn url_hints_override_active(
+    hints: &UrlHints,
+    active_profile: Option<&str>,
+    active_org: Option<&str>,
+) -> bool {
+    hints.resolved_profile.is_some() && hints.resolved_profile.as_deref() != active_profile
+        || hints.resolved_org.is_some() && hints.resolved_org.as_deref() != active_org
+}
+
+/// Surface a non-surprising note when a trace URL causes `bt view` to use a profile/org
+/// different from the currently active config. A trace URL is self-describing (it encodes
+/// the org/project), so `bt view` intentionally follows the URL; this just makes that
+/// override visible instead of silently crossing deployments.
+fn maybe_surface_url_profile_override(base: &BaseArgs, hints: &UrlHints) {
+    if base.json || crate::ui::is_quiet() {
+        return;
+    }
+    if hints.resolved_profile.is_none() && hints.resolved_org.is_none() {
+        return;
+    }
+    let active = crate::config::load().unwrap_or_default();
+    let active_profile = crate::config::trimmed_option(active.profile.as_deref());
+    let active_org = crate::config::trimmed_option(active.org.as_deref());
+    if !url_hints_override_active(hints, active_profile, active_org) {
+        return;
+    }
+
+    let resolved_profile = hints.resolved_profile.as_deref().unwrap_or("(none)");
+    let resolved_org = hints.resolved_org.as_deref().unwrap_or("(none)");
+    let current = match (active_profile, active_org) {
+        (Some(p), Some(o)) => format!("{p} (org: {o})"),
+        (Some(p), None) => p.to_string(),
+        (None, Some(o)) => format!("(profile: none, org: {o})"),
+        (None, None) => "(none)".to_string(),
+    };
+    eprintln!(
+        "info: trace URL resolves to profile '{resolved_profile}' (org: {resolved_org}); using it instead of the active profile '{current}'."
+    );
 }
 
 fn select_startup_url(
@@ -5659,13 +5717,23 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
     };
 
     if let Some(segments) = parsed_url.path_segments() {
-        let parts: Vec<&str> = segments.filter(|part| !part.is_empty()).collect();
+        // `Url::path_segments` returns percent-encoded segments (e.g. a space becomes
+        // `%20`), so decode the org/project/page path segments before using them as
+        // identifiers. Query-pair values are already decoded by `query_pairs`.
+        let parts: Vec<String> = segments
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                decode(part)
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| part.to_string())
+            })
+            .collect();
         if parts.len() >= 2 && parts[0] == "app" {
-            parsed.org = Some(parts[1].to_string());
+            parsed.org = Some(parts[1].clone());
             if parts.len() >= 4 && parts[2] == "p" {
-                parsed.project = Some(parts[3].to_string());
+                parsed.project = Some(parts[3].clone());
                 if parts.len() >= 5 {
-                    parsed.page = Some(parts[4].to_string());
+                    parsed.page = Some(parts[4].clone());
                 }
             }
         }
@@ -6799,12 +6867,14 @@ mod tests {
         let base = base_args();
         let parsed = parsed_url_with_org("Lovable");
 
-        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |org| {
+        let (updated, hints) = apply_url_hints_with_profile_resolver(base, Some(&parsed), |org| {
             (org == "Lovable").then(|| "lovable-profile".to_string())
         });
 
         assert_eq!(updated.org_name.as_deref(), Some("Lovable"));
         assert_eq!(updated.profile.as_deref(), Some("lovable-profile"));
+        assert_eq!(hints.resolved_org.as_deref(), Some("Lovable"));
+        assert_eq!(hints.resolved_profile.as_deref(), Some("lovable-profile"));
     }
 
     #[test]
@@ -6813,12 +6883,15 @@ mod tests {
         base.profile = Some("explicit-profile".to_string());
         let parsed = parsed_url_with_org("Lovable");
 
-        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |_| {
+        let (updated, hints) = apply_url_hints_with_profile_resolver(base, Some(&parsed), |_| {
             Some("other".to_string())
         });
 
         assert_eq!(updated.profile.as_deref(), Some("explicit-profile"));
         assert!(updated.org_name.is_none());
+        // URL org is still reported even when it didn't override an explicit profile.
+        assert_eq!(hints.resolved_org.as_deref(), Some("Lovable"));
+        assert!(hints.resolved_profile.is_none());
     }
 
     #[test]
@@ -6915,5 +6988,91 @@ mod tests {
         assert_eq!(parsed.row_ref.as_deref(), Some("root"));
         assert_eq!(parsed.span_id.as_deref(), Some("span"));
         assert_eq!(parsed.trace_view_type.as_deref(), Some("timeline"));
+    }
+
+    #[test]
+    fn parse_trace_url_decodes_percent_encoded_org_and_project() {
+        // Org/project path segments arrive percent-encoded from `Url::path_segments` (spaces
+        // become `%20`); they must be decoded so downstream org resolution gets "BT Staging",
+        // not "BT%20Staging".
+        let parsed =
+            parse_trace_url("https://www.braintrust.dev/app/BT%20Staging/p/cedric-traces/logs?r=aa1a6fd0-e1b1-46e4-a176-082350262954")
+                .expect("parse");
+        assert_eq!(parsed.org.as_deref(), Some("BT Staging"));
+        assert_eq!(parsed.project.as_deref(), Some("cedric-traces"));
+        assert_eq!(
+            parsed.row_ref.as_deref(),
+            Some("aa1a6fd0-e1b1-46e4-a176-082350262954")
+        );
+    }
+
+    #[test]
+    fn parse_trace_url_decodes_other_percent_encoded_segments() {
+        let parsed = parse_trace_url(
+            "https://www.braintrust.dev/app/A%26B%20Corp/p/my%20project/logs?r=root",
+        )
+        .expect("parse");
+        assert_eq!(parsed.org.as_deref(), Some("A&B Corp"));
+        assert_eq!(parsed.project.as_deref(), Some("my project"));
+    }
+
+    #[test]
+    fn parse_trace_url_decodes_project_with_no_page() {
+        let parsed =
+            parse_trace_url("https://www.braintrust.dev/app/BT%20Staging/p/cedric-traces?r=root")
+                .expect("parse");
+        assert_eq!(parsed.org.as_deref(), Some("BT Staging"));
+        assert_eq!(parsed.project.as_deref(), Some("cedric-traces"));
+        assert_eq!(parsed.page.as_deref(), None);
+    }
+
+    #[test]
+    fn url_hints_override_active_detects_profile_change() {
+        let hints = UrlHints {
+            resolved_profile: Some("BT Staging".to_string()),
+            resolved_org: Some("BT Staging".to_string()),
+        };
+        // Active config is ced-test-1; URL resolved to BT Staging => override.
+        assert!(url_hints_override_active(
+            &hints,
+            Some("ced-test-1"),
+            Some("ced-test-1")
+        ));
+    }
+
+    #[test]
+    fn url_hints_override_active_no_change_when_same_profile() {
+        let hints = UrlHints {
+            resolved_profile: Some("ced-test-1".to_string()),
+            resolved_org: Some("ced-test-1".to_string()),
+        };
+        assert!(!url_hints_override_active(
+            &hints,
+            Some("ced-test-1"),
+            Some("ced-test-1")
+        ));
+    }
+
+    #[test]
+    fn url_hints_override_active_no_change_when_no_hints() {
+        let hints = UrlHints::default();
+        assert!(!url_hints_override_active(
+            &hints,
+            Some("ced-test-1"),
+            Some("ced-test-1")
+        ));
+    }
+
+    #[test]
+    fn url_hints_override_active_detects_org_only_change() {
+        let hints = UrlHints {
+            resolved_profile: None,
+            resolved_org: Some("BT Staging".to_string()),
+        };
+        assert!(url_hints_override_active(
+            &hints,
+            Some("ced-test-1"),
+            Some("ced-test-1")
+        ));
     }
 }

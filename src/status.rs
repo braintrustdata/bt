@@ -76,8 +76,18 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         });
     let profile_info = resolve_profile_info(selected_profile.as_deref(), org.as_deref());
 
-    if selected_profile.is_some() && org.as_deref().map(str::trim).is_none_or(str::is_empty) {
-        if let Some(profile_org) = profile_info.as_ref().and_then(|p| p.org_name.clone()) {
+    // A selected profile owns its org: if the profile has an org_name, it wins over a stale
+    // config-file `org` that may have been authored for a different profile. An explicit
+    // --org flag already won during `resolve_config` and is preserved here.
+    if let Some(profile_org) = profile_info.as_ref().and_then(|p| p.org_name.clone()) {
+        let cli_or_profile_explicit = base
+            .org_name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if selected_profile.is_some()
+            && (org.as_deref().map(str::trim).is_none_or(str::is_empty) || !cli_or_profile_explicit)
+        {
             org = Some(profile_org);
         }
     }
