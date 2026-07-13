@@ -8,8 +8,7 @@ use std::io::{ErrorKind, IsTerminal};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use dialoguer::console::style;
-use dialoguer::{Confirm, Error as DialoguerError};
+use dialoguer::console::{style, Key};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -27,7 +26,7 @@ use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
 use crate::source_language::{classify_runtime_extension, SourceLanguage};
-use crate::ui::{animations_enabled, is_interactive, is_quiet};
+use crate::ui::{animations_enabled, is_interactive, is_quiet, prompt_term};
 
 use super::api;
 use super::{
@@ -2429,20 +2428,62 @@ fn push_confirmation_entry_label(entry: &PushConfirmationEntry) -> String {
 }
 
 fn confirm_push(prompt: String) -> Result<PushConfirmation> {
-    match Confirm::new()
-        .with_prompt(prompt)
-        .default(false)
-        .interact_opt()
-    {
-        Ok(Some(true)) => Ok(PushConfirmation::Confirmed),
-        Ok(Some(false) | None) => Ok(PushConfirmation::Declined),
-        Err(err) if is_interrupted_prompt_error(&err) => Ok(PushConfirmation::Interrupted),
-        Err(err) => Err(err.into()),
+    let term = prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+    term.write_str(&format_push_confirm_prompt(&prompt))?;
+    term.hide_cursor()?;
+    term.flush()?;
+
+    struct ShowCursorOnDrop<'a>(&'a dialoguer::console::Term);
+    impl Drop for ShowCursorOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.show_cursor();
+        }
+    }
+    let _cursor_guard = ShowCursorOnDrop(&term);
+
+    loop {
+        let key = match term.read_key_raw() {
+            Ok(key) => key,
+            Err(err) if err.kind() == ErrorKind::Interrupted => {
+                return Ok(PushConfirmation::Interrupted);
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let Some(confirmation) = push_confirmation_from_key(key) else {
+            continue;
+        };
+
+        // Raw mode doesn't echo the keypress, so append the answer to the
+        // already-visible "... [y/N] " line before returning.
+        if confirmation != PushConfirmation::Interrupted {
+            term.write_line(match confirmation {
+                PushConfirmation::Confirmed => "yes",
+                _ => "no",
+            })?;
+            term.flush()?;
+        }
+        return Ok(confirmation);
     }
 }
 
-fn is_interrupted_prompt_error(err: &DialoguerError) -> bool {
-    matches!(err, DialoguerError::IO(io_err) if io_err.kind() == ErrorKind::Interrupted)
+fn push_confirmation_from_key(key: Key) -> Option<PushConfirmation> {
+    match key {
+        Key::Char('y') | Key::Char('Y') => Some(PushConfirmation::Confirmed),
+        Key::Char('n') | Key::Char('N') | Key::Enter | Key::Escape | Key::Char('q') => {
+            Some(PushConfirmation::Declined)
+        }
+        Key::CtrlC => Some(PushConfirmation::Interrupted),
+        _ => None,
+    }
+}
+
+fn format_push_confirm_prompt(prompt: &str) -> String {
+    if prompt.is_empty() {
+        "[y/N] ".to_string()
+    } else {
+        format!("{prompt} [y/N] ")
+    }
 }
 
 fn report_cancelled_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
@@ -3277,12 +3318,19 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_confirmation_is_treated_as_cancel() {
-        let interrupted = DialoguerError::IO(std::io::Error::from(std::io::ErrorKind::Interrupted));
-        assert!(is_interrupted_prompt_error(&interrupted));
-
-        let other = DialoguerError::IO(std::io::Error::from(std::io::ErrorKind::Other));
-        assert!(!is_interrupted_prompt_error(&other));
+    fn ctrl_c_confirmation_key_is_treated_as_interruption() {
+        assert_eq!(
+            push_confirmation_from_key(Key::CtrlC),
+            Some(PushConfirmation::Interrupted)
+        );
+        assert_eq!(
+            push_confirmation_from_key(Key::Char('y')),
+            Some(PushConfirmation::Confirmed)
+        );
+        assert_eq!(
+            push_confirmation_from_key(Key::Enter),
+            Some(PushConfirmation::Declined)
+        );
     }
 
     #[test]
