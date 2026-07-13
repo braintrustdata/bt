@@ -10,12 +10,6 @@ use std::time::UNIX_EPOCH;
 use actix_web::{web, App, HttpResponse, HttpServer};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::BoolishValueParser, Args, Subcommand};
-use oxc_allocator::Allocator;
-use oxc_codegen::{Codegen, CodegenOptions};
-use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
-use oxc_span::SourceType;
-use oxc_transformer::{TransformOptions, Transformer};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -24,7 +18,7 @@ use swc_bundler::{
     ModuleType,
 };
 use swc_common::{comments::NoopComments, sync::Lrc, FileName, Globals, Mark, SourceMap, Span};
-use swc_ecma_ast::{EsVersion, KeyValueProp, Program};
+use swc_ecma_ast::{EsVersion, KeyValueProp, Module, Program};
 use swc_ecma_codegen::to_code_default;
 use swc_ecma_loader::{
     resolve::{Resolution, Resolve},
@@ -1452,69 +1446,15 @@ fn compile_preview_module(path: &Path) -> Result<String> {
         return Ok(format!("export default {};\n", script_json(&json)));
     }
 
-    let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path).map_err(|err| {
-        anyhow!(
-            "failed to infer preview module type for {}: {err}",
-            path.display()
-        )
-    })?;
-    let mut parsed = Parser::new(&allocator, &source, source_type).parse();
-    if !parsed.errors.is_empty() {
-        bail!(
-            "failed to parse preview module {}:\n{}",
-            path.display(),
-            parsed
-                .errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    let scoping = {
-        let semantic = SemanticBuilder::new()
-            .with_check_syntax_error(true)
-            .build(&parsed.program);
-        if !semantic.errors.is_empty() {
-            bail!(
-                "failed to analyze preview module {}:\n{}",
-                path.display(),
-                semantic
-                    .errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-        }
-        semantic.semantic.into_scoping()
-    };
-
-    let transform_options = TransformOptions::default();
-    let transformed = Transformer::new(&allocator, path, &transform_options)
-        .build_with_scoping(scoping, &mut parsed.program);
-    if !transformed.errors.is_empty() {
-        bail!(
-            "failed to transform preview module {}:\n{}",
-            path.display(),
-            transformed
-                .errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    Ok(Codegen::new()
-        .with_options(CodegenOptions {
-            comments: oxc_codegen::CommentOptions::disabled(),
-            ..CodegenOptions::default()
+    let cm = Lrc::new(SourceMap::default());
+    let fm = cm.new_source_file(Lrc::new(FileName::Real(path.to_path_buf())), source);
+    let globals = Globals::new();
+    let module = swc_common::GLOBALS
+        .set(&globals, || {
+            parse_and_transform_swc_module(&cm, &fm, swc_syntax_for_path(path))
         })
-        .build(&parsed.program)
-        .code)
+        .with_context(|| format!("failed to compile preview module {}", path.display()))?;
+    Ok(to_code_default(cm, None, &module))
 }
 
 fn preview_module_path_from_route(source: &PreviewSource, tail: &str) -> Result<PathBuf> {
@@ -1990,54 +1930,64 @@ impl Load for ViewsSwcLoader {
             _ => bail!("unsupported custom view module {}", file),
         };
 
-        let mut errors = Vec::new();
-        let module = parse_file_as_module(&fm, syntax, EsVersion::Es2022, None, &mut errors)
-            .map_err(|err| anyhow!("{err:?}"))
-            .with_context(|| format!("failed to parse custom view module {}", file))?;
-        if !errors.is_empty() {
-            let details = errors
-                .iter()
-                .map(|err| format!("{err:?}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            bail!("failed to parse custom view module {}: {details}", file);
-        }
-
-        let unresolved_mark = Mark::new();
-        let top_level_mark = Mark::new();
-        let mut program = Program::Module(module);
-        program.mutate(resolver(
-            unresolved_mark,
-            top_level_mark,
-            syntax_is_typescript(syntax),
-        ));
-        if syntax_is_typescript(syntax) {
-            program.mutate(strip_typescript(unresolved_mark, top_level_mark));
-        }
-        program.mutate(react(
-            self.cm.clone(),
-            None::<NoopComments>,
-            ReactOptions {
-                runtime: Some(ReactRuntime::Classic),
-                pragma: Some("React.createElement".into()),
-                pragma_frag: Some("React.Fragment".into()),
-                development: Some(false),
-                ..Default::default()
-            },
-            top_level_mark,
-            unresolved_mark,
-        ));
-        program.mutate(fixer(None));
-
-        let Program::Module(module) = program else {
-            bail!("custom view module {} did not parse as an ES module", file);
-        };
+        let module = parse_and_transform_swc_module(&self.cm, &fm, syntax)
+            .with_context(|| format!("failed to compile custom view module {}", file))?;
         Ok(ModuleData {
             fm,
             module,
             helpers: Helpers::new(false),
         })
     }
+}
+
+fn parse_and_transform_swc_module(
+    cm: &Lrc<SourceMap>,
+    fm: &swc_common::SourceFile,
+    syntax: Syntax,
+) -> Result<Module> {
+    let mut errors = Vec::new();
+    let module = parse_file_as_module(fm, syntax, EsVersion::Es2022, None, &mut errors)
+        .map_err(|err| anyhow!("{err:?}"))
+        .with_context(|| format!("failed to parse module {}", fm.name))?;
+    if !errors.is_empty() {
+        let details = errors
+            .iter()
+            .map(|err| format!("{err:?}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("failed to parse module {}: {details}", fm.name);
+    }
+
+    let unresolved_mark = Mark::new();
+    let top_level_mark = Mark::new();
+    let mut program = Program::Module(module);
+    program.mutate(resolver(
+        unresolved_mark,
+        top_level_mark,
+        syntax_is_typescript(syntax),
+    ));
+    if syntax_is_typescript(syntax) {
+        program.mutate(strip_typescript(unresolved_mark, top_level_mark));
+    }
+    program.mutate(react(
+        cm.clone(),
+        None::<NoopComments>,
+        ReactOptions {
+            runtime: Some(ReactRuntime::Classic),
+            pragma: Some("React.createElement".into()),
+            pragma_frag: Some("React.Fragment".into()),
+            development: Some(false),
+            ..Default::default()
+        },
+        top_level_mark,
+        unresolved_mark,
+    ));
+    program.mutate(fixer(None));
+
+    let Program::Module(module) = program else {
+        bail!("module {} did not parse as an ES module", fm.name);
+    };
+    Ok(module)
 }
 
 struct ViewsSwcHook;
@@ -3109,7 +3059,7 @@ export default customTraceView(
     }
 
     #[test]
-    fn preview_module_compiles_tsx_with_oxc() {
+    fn preview_module_compiles_tsx_with_swc() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.trace-view.tsx");
         std::fs::write(
@@ -3127,7 +3077,7 @@ export default customTraceView({ name: "Test View", slug: "test-view" }, ({ span
 
         let code = compile_preview_module(&path).expect("compile TSX preview module");
 
-        assert!(code.contains("react/jsx-runtime"));
+        assert!(code.contains("React.createElement"));
         assert!(code.contains("customTraceView"));
         assert!(!code.contains("type Props"));
         assert!(!code.contains("<div>"));
