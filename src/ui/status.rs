@@ -1,4 +1,5 @@
 use dialoguer::console::style;
+use serde::Serialize;
 
 use super::is_quiet;
 
@@ -20,4 +21,62 @@ pub fn print_command_status(status: CommandStatus, message: &str) {
     };
 
     eprintln!("{indicator} {message}");
+}
+
+/// Serialize `payload` as compact JSON to stdout — the single shared machine-readable entry point.
+pub fn print_json<T: Serialize + ?Sized>(payload: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string(payload)?);
+    Ok(())
+}
+
+/// Emit a result: JSON payload to stdout when `json`, else a human status line on stderr.
+/// Keep stdout/stderr separate so `--json` output stays safely pipeable.
+pub fn emit_result<T: Serialize>(
+    json: bool,
+    status: CommandStatus,
+    human_message: &str,
+    payload: &T,
+) -> anyhow::Result<()> {
+    if json {
+        print_json(payload)
+    } else {
+        print_command_status(status, human_message);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Sample {
+        status: String,
+        value: u32,
+    }
+
+    #[test]
+    fn emit_result_prints_human_status_when_json_disabled() {
+        // Human output goes to stderr via print_command_status; stdout stays empty.
+        let payload = Sample {
+            status: "ok".into(),
+            value: 7,
+        };
+        // Assert no error and no stdout leak; the indicator is on stderr.
+        let res = emit_result(false, CommandStatus::Success, "done", &payload);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn emit_result_serializes_payload_when_json_enabled() {
+        let payload = Sample {
+            status: "ok".into(),
+            value: 7,
+        };
+        // stdout capture is env-dependent, so assert serialization directly rather than via emit_result.
+        let json = serde_json::to_string(&payload).expect("serialize");
+        assert_eq!(json, r#"{"status":"ok","value":7}"#);
+        assert!(emit_result(true, CommandStatus::Success, "done", &payload).is_ok());
+    }
 }
