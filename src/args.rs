@@ -110,7 +110,7 @@ pub struct BaseArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CLIArgs<T: Args> {
-    #[command(flatten)]
+    #[command(flatten, next_help_heading = "Global options")]
     pub base: BaseArgs,
 
     #[command(flatten)]
