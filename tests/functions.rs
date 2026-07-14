@@ -191,19 +191,7 @@ fn sanitized_env_keys() -> &'static [&'static str] {
 }
 
 fn auth_profiles_command(cwd: &Path, config_dir: &Path) -> Command {
-    let mut cmd = Command::new(bt_binary_path());
-    cmd.arg("auth")
-        .arg("profiles")
-        .current_dir(cwd)
-        .env("XDG_CONFIG_HOME", config_dir)
-        .env("APPDATA", config_dir)
-        .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
-        .env_remove("BRAINTRUST_ORG_NAME")
-        .env_remove("BRAINTRUST_API_URL")
-        .env_remove("BRAINTRUST_APP_URL")
-        .env_remove("BRAINTRUST_ENV_FILE");
-    cmd
+    auth_sub_command(cwd, config_dir, &["profiles"])
 }
 
 #[derive(Debug, Clone)]
@@ -748,6 +736,110 @@ fn auth_profiles_ignores_api_key_from_dotenv() {
     assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
     assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
     assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
+}
+
+#[test]
+fn auth_profiles_json_with_no_profiles_emits_empty_array() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .arg("--json")
+        .output()
+        .expect("run bt auth profiles --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(stdout, "[]");
+}
+
+#[test]
+fn auth_profiles_profile_not_found_is_actionable() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .arg("--profile")
+        .arg("test-profile")
+        .output()
+        .expect("run bt auth profiles --profile test-profile");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("profile 'test-profile' not found"));
+    assert!(
+        stderr.contains("run `bt auth profiles` to see available profiles"),
+        "expected actionable hint, got: {stderr}"
+    );
+}
+
+/// Seed a synthetic api_key `test-profile` so verification reports "missing"
+/// without touching the network or keychain.
+fn seed_api_key_profile(config_dir: &Path) {
+    fs::create_dir_all(config_dir.join("bt")).expect("create bt config dir");
+    fs::write(
+        config_dir.join("bt").join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
+    )
+    .expect("write auth.json");
+}
+
+fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
+    // Shared builder for `bt auth <sub>` so each auth subcommand inherits the
+    // same isolated config dir / env scrubbing as `auth profiles`.
+    let mut cmd = Command::new(bt_binary_path());
+    cmd.arg("auth")
+        .args(sub)
+        .current_dir(cwd)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .env("APPDATA", config_dir)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_ORG_NAME")
+        .env_remove("BRAINTRUST_API_URL")
+        .env_remove("BRAINTRUST_APP_URL")
+        .env_remove("BRAINTRUST_ENV_FILE");
+    cmd
+}
+
+#[test]
+fn auth_logout_json_with_no_profiles_emits_empty_status() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_sub_command(cwd.path(), config_dir.path(), &["logout", "--json"])
+        .output()
+        .expect("run bt auth logout --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(stdout, r#"{"status":"empty"}"#);
+}
+
+#[test]
+fn auth_refresh_errors_for_api_key_profile_even_with_json() {
+    // --json must not swallow a real error: an api_key profile cannot be
+    // refreshed, and the command should fail with an actionable message.
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    seed_api_key_profile(config_dir.path());
+
+    let output = auth_sub_command(
+        cwd.path(),
+        config_dir.path(),
+        &["refresh", "--profile", "test-profile", "--json"],
+    )
+    .output()
+    .expect("run bt auth refresh --profile test-profile --json");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("only applies to oauth profiles"),
+        "expected oauth-only refresh hint, got: {stderr}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
 }
 
 #[test]
