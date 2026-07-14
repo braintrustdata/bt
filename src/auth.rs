@@ -409,15 +409,6 @@ struct AuthLoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
-
-    /// Log in without updating active profile/org/project context
-    #[arg(
-        long,
-        env = "BRAINTRUST_NO_PROFILE_SWITCH",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        default_value_t = false
-    )]
-    no_profile_switch: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1247,9 +1238,8 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         base.app_url.clone(),
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
-    let context_update = maybe_persist_post_login_context(
+    let context_update = persist_post_login_context(
         base,
-        &args,
         &profile_name,
         &api_key,
         &selected_api_url,
@@ -1263,14 +1253,12 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         ui::CommandStatus::Success,
         &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
-    if let Some(context_update) = context_update {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Switched to {}", context_update.display),
-        );
-        if base.verbose {
-            eprintln!("Wrote to {}", context_update.path.display());
-        }
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format!("Switched to {}", context_update.display),
+    );
+    if base.verbose {
+        eprintln!("Wrote to {}", context_update.path.display());
     }
     Ok(())
 }
@@ -1382,9 +1370,8 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         client_id.clone(),
         selected_org.as_ref().map(|org| org.name.clone()),
     )?;
-    let context_update = maybe_persist_post_login_context(
+    let context_update = persist_post_login_context(
         base,
-        &args,
         &profile_name,
         &oauth_tokens.access_token,
         &selected_api_url,
@@ -1398,14 +1385,12 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         ui::CommandStatus::Success,
         &format_login_success(&selected_org, &profile_name, &selected_api_url),
     );
-    if let Some(context_update) = context_update {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Switched to {}", context_update.display),
-        );
-        if base.verbose {
-            eprintln!("Wrote to {}", context_update.path.display());
-        }
+    ui::print_command_status(
+        ui::CommandStatus::Success,
+        &format!("Switched to {}", context_update.display),
+    );
+    if base.verbose {
+        eprintln!("Wrote to {}", context_update.path.display());
     }
 
     Ok(())
@@ -1822,31 +1807,6 @@ async fn persist_post_login_context(
         display: format_post_login_context(selected_org, project.as_ref()),
         path,
     })
-}
-
-async fn maybe_persist_post_login_context(
-    base: &BaseArgs,
-    args: &AuthLoginArgs,
-    profile_name: &str,
-    credential: &str,
-    api_url: &str,
-    app_url: &str,
-    selected_org: Option<&LoginOrgInfo>,
-) -> Result<Option<PostLoginContextUpdate>> {
-    if args.no_profile_switch {
-        return Ok(None);
-    }
-
-    persist_post_login_context(
-        base,
-        profile_name,
-        credential,
-        api_url,
-        app_url,
-        selected_org,
-    )
-    .await
-    .map(Some)
 }
 
 async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
@@ -4456,42 +4416,6 @@ mod tests {
         assert_eq!(cfg.org.as_deref(), Some("acme"));
         assert_eq!(cfg.project, None);
         assert_eq!(cfg.project_id, None);
-    }
-
-    #[tokio::test]
-    async fn maybe_persist_post_login_context_skips_config_write_when_no_profile_switch_is_set() {
-        let _env = TestEnv::new(None, None).await;
-        let original = crate::config::Config {
-            profile: Some("old-profile".to_string()),
-            org: Some("old-org".to_string()),
-            project: Some("stale-project".to_string()),
-            project_id: Some("proj_stale".to_string()),
-            ..Default::default()
-        };
-        crate::config::save_global(&original).expect("save initial config");
-
-        let args = AuthLoginArgs {
-            oauth: false,
-            client_id: None,
-            no_browser: false,
-            no_profile_switch: true,
-        };
-
-        let update = maybe_persist_post_login_context(
-            &make_base(),
-            &args,
-            "work",
-            "test-api-key",
-            "https://api.example.test",
-            "https://www.example.test",
-            Some(&login_org("org_123", "acme")),
-        )
-        .await
-        .expect("skip context update");
-        let cfg = crate::config::load_global().expect("load global config");
-
-        assert!(update.is_none());
-        assert_eq!(cfg, original);
     }
 
     #[tokio::test]
