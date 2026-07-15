@@ -1176,11 +1176,17 @@ where
             api_key,
             api_url: base.api_url.clone().or_else(|| profile.api_url.clone()),
             app_url: base.app_url.clone().or_else(|| profile.app_url.clone()),
-            org_name: base
-                .org_name
-                .clone()
-                .or_else(|| cfg_org.clone())
-                .or_else(|| profile.org_name.clone()),
+            org_name: if is_oauth {
+                base.org_name
+                    .clone()
+                    .or_else(|| profile.org_name.clone())
+                    .or_else(|| cfg_org.clone())
+            } else {
+                base.org_name
+                    .clone()
+                    .or_else(|| cfg_org.clone())
+                    .or_else(|| profile.org_name.clone())
+            },
             is_oauth,
         });
     }
@@ -4536,6 +4542,34 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("local-org"));
+    }
+
+    #[test]
+    fn resolve_auth_oauth_profile_org_overrides_stale_config_org() {
+        let mut base = make_base();
+        base.profile = Some("default-profile".to_string());
+
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "default-profile".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                org_name: Some("profile-org".into()),
+                oauth_client_id: Some("bt_cli_default".to_string()),
+                ..Default::default()
+            },
+        );
+        let cfg_org = Some("local-org".to_string());
+
+        let resolved = resolve_auth_from_store_with_secret_lookup(
+            &base,
+            &store,
+            |_| Ok(Some("unused-profile-key".into())),
+            &cfg_org,
+        )
+        .expect("resolve");
+        assert!(resolved.is_oauth);
+        assert_eq!(resolved.org_name.as_deref(), Some("profile-org"));
     }
 
     #[test]
