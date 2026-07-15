@@ -204,7 +204,7 @@ Useful flags:
 - `--root <path>` controls where staged artifacts are written; it defaults to `bt-sync`. A staged run writes `pulled.jsonl` and `transformed.jsonl` in the same managed directory.
 - `--out` can override the managed output path for `pull` and `transform`.
 - `--in` can override the latest pull artifact for `transform`, or the latest transform artifact for `push`.
-- `push` reads the target from the pipeline and delegates to `bt sync push`; pass `--fresh` to restart an already completed push spec.
+- `push` reads the target from the pipeline and delegates to `bt sync push`; pass `--force` to restart an already completed push spec.
 - `--project <name>` supplies the active source project when the pipeline source omits a project.
 - `--source-project`, `--source-project-id`, `--source-org`, and `--source-filter` explicitly override source fields on `pull`, `transform`, and `run`.
 - `--target-project`, `--target-project-id`, `--target-org`, and `--target-dataset` override target fields on `run` and `push`.
