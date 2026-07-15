@@ -243,7 +243,7 @@ struct PipelinePushArgs {
 
     /// Ignore previous sync push state and upload from the beginning.
     #[arg(long)]
-    fresh: bool,
+    force: bool,
 }
 
 pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
@@ -1445,7 +1445,7 @@ async fn push_rows(base: &BaseArgs, args: PipelinePushArgs) -> Result<()> {
             object_ref: pipeline_target_dataset_ref(&target)?,
             input: input_path,
             root: args.artifacts.root,
-            fresh: args.fresh,
+            force: args.force,
         },
     )
     .await

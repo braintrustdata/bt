@@ -56,7 +56,7 @@ pub(crate) struct SyncPushFileArgs {
     pub object_ref: String,
     pub input: PathBuf,
     pub root: PathBuf,
-    pub fresh: bool,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -110,13 +110,13 @@ struct PullArgs {
     #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
     page_size: usize,
 
-    /// Initial cursor for spans mode. Implies a fresh run.
+    /// Initial cursor for spans mode. Implies a forced restart.
     #[arg(long)]
     cursor: Option<String>,
 
     /// Ignore previous state and start over for this spec.
     #[arg(long)]
-    fresh: bool,
+    force: bool,
 
     /// Root directory for sync artifacts.
     #[arg(long, default_value = "bt-sync")]
@@ -160,9 +160,9 @@ struct PushArgs {
     #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
     page_size: usize,
 
-    /// Ignore previous state and start over for this spec.
+    /// Ignore previous state and upload this input again from the beginning.
     #[arg(long)]
-    fresh: bool,
+    force: bool,
 
     /// Root directory for sync artifacts.
     #[arg(long, default_value = "bt-sync")]
@@ -217,6 +217,10 @@ struct StatusArgs {
     /// Root directory for sync artifacts.
     #[arg(long, default_value = "bt-sync")]
     root: PathBuf,
+
+    /// Input path used by this push spec. Required with --direction push.
+    #[arg(long = "in")]
+    input: Option<PathBuf>,
 
     /// Include vector-aware pull specs when resolving status (pull direction only).
     #[arg(long)]
@@ -319,6 +323,8 @@ struct SyncSpec {
     page_size: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     include_vectors: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,7 +619,7 @@ pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> R
             traces: None,
             spans: None,
             page_size: DEFAULT_PAGE_SIZE,
-            fresh: args.fresh,
+            force: args.force,
             root: args.root,
             workers: default_workers(),
             max_batch_bytes: PUSH_BATCH_MAX_INPUT_BYTES,
@@ -636,7 +642,7 @@ async fn run_pull(
     let object = parse_object_ref(&resolved_object_ref)?;
     let source_expr = btql_source_expr(&object)?;
     let (scope, limit) = resolve_pull_scope_and_limit(args.traces, args.spans)?;
-    let fresh = args.fresh || args.cursor.is_some();
+    let fresh = args.force || args.cursor.is_some();
 
     let user_filter = trim_optional(args.filter.clone());
     let window = args.window.clone();
@@ -654,6 +660,7 @@ async fn run_pull(
         limit: Some(limit),
         page_size: args.page_size,
         include_vectors: args.include_vectors,
+        input_path: None,
     };
 
     let spec_hash = spec_hash(&spec)?;
@@ -1649,6 +1656,16 @@ async fn run_push(
     let object = destination.object.clone();
     let (scope, limit) = resolve_push_scope_and_limit(args.traces, args.spans)?;
 
+    let input_path = if let Some(path) = args.input {
+        path
+    } else {
+        resolve_default_push_input(&args.root, &object)?
+    };
+    if !input_path.exists() {
+        bail!("input path does not exist: {}", input_path.display());
+    }
+    let input_identity = canonical_input_path(&input_path)?;
+
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
         object_ref: destination.object_ref.clone(),
@@ -1661,6 +1678,7 @@ async fn run_push(
         limit,
         page_size: args.page_size,
         include_vectors: false,
+        input_path: Some(input_identity),
     };
     let spec_hash = spec_hash(&spec)?;
     let spec_dir = resolve_spec_dir(
@@ -1669,7 +1687,7 @@ async fn run_push(
         DirectionArg::Push,
         &scope,
         &spec_hash,
-        !args.fresh,
+        !args.force,
     )?;
     fs::create_dir_all(&spec_dir)
         .with_context(|| format!("failed to create {}", spec_dir.display()))?;
@@ -1679,16 +1697,7 @@ async fn run_push(
     let manifest_path = spec_dir.join("manifest.json");
     write_json_atomic(&spec_path, &spec)?;
 
-    let input_path = if let Some(path) = args.input {
-        path
-    } else {
-        resolve_default_push_input(&args.root, &object)?
-    };
-    if !input_path.exists() {
-        bail!("input path does not exist: {}", input_path.display());
-    }
-
-    let mut state = if args.fresh || !state_path.exists() {
+    let mut state = if args.force || !state_path.exists() {
         let mut state = new_push_state(
             scope.as_str().to_string(),
             limit,
@@ -1705,21 +1714,23 @@ async fn run_push(
     if let Some(run_id) = destination.run_id.as_deref() {
         if state.run_id != run_id {
             bail!(
-                "existing push state run_id '{}' does not match destination experiment id '{}'; rerun with --fresh",
+                "existing push state run_id '{}' does not match destination experiment id '{}'; rerun with --force",
                 state.run_id,
                 run_id
             );
         }
     }
 
-    if state.status == RunStatus::Completed && !args.fresh {
+    if state.status == RunStatus::Completed && !args.force {
+        update_manifest_from_push_state(&manifest_path, &spec_hash, &spec, &state, None)?;
         if json_output {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "completed",
-                    "message": "already completed for this spec",
+                    "message": "already completed for this spec; use --force to upload again",
                     "source_path": state.source_path,
+                    "checkpoint_path": state_path,
                     "object_url": object_url,
                     "items_done": state.items_done,
                     "pages_done": state.pages_done
@@ -1730,6 +1741,8 @@ async fn run_push(
                 "Sync already completed for this spec. input={} items={} pages={}",
                 state.source_path, state.items_done, state.pages_done
             );
+            println!("  Use --force to upload this input again from the beginning.");
+            println!("  Checkpoint: {}", state_path.display());
             println!("  URL: {object_url}");
         }
         return Ok(());
@@ -2028,7 +2041,7 @@ async fn run_push(
                     "rows_uploaded": state.items_done,
                     "pages_done": state.pages_done,
                     "bytes_sent": state.bytes_sent,
-                    "message": "resume by rerunning the same command; use --fresh to restart"
+                    "message": "resume by rerunning the same command; use --force to restart"
                 }))?
             );
         } else {
@@ -2039,7 +2052,7 @@ async fn run_push(
                 format_usize_commas(state.pages_done),
                 format_u64_commas(state.bytes_sent)
             );
-            println!("  Resume: rerun the same command (use --fresh to restart)");
+            println!("  Resume: rerun the same command (use --force to restart)");
             println!("  URL: {object_url}");
         }
         return Ok(());
@@ -2126,6 +2139,21 @@ fn push_destination_url(
 fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
     let object = parse_object_ref(&args.object_ref)?;
     let (scope, limit) = resolve_status_scope_and_limit(args.traces, args.spans)?;
+    let input_path = match args.direction {
+        DirectionArg::Pull => {
+            if args.input.is_some() {
+                bail!("--in can only be used with --direction push");
+            }
+            None
+        }
+        DirectionArg::Push => {
+            let input = args
+                .input
+                .as_deref()
+                .context("--in is required with --direction push")?;
+            Some(canonical_input_path(input)?)
+        }
+    };
 
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
@@ -2139,6 +2167,7 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
         limit,
         page_size: args.page_size,
         include_vectors: matches!(args.direction, DirectionArg::Pull) && args.include_vectors,
+        input_path,
     };
     let spec_hash = spec_hash(&spec)?;
     let spec_dir = resolve_spec_dir(
@@ -2155,6 +2184,12 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
 
     if !spec_dir.exists() {
         bail!("no sync state found for spec at {}", spec_dir.display());
+    }
+
+    if matches!(args.direction, DirectionArg::Push) && state_path.exists() {
+        let state = read_json_file::<PushState>(&state_path)?;
+        write_json_atomic(&spec_path, &spec)?;
+        update_manifest_from_push_state(&manifest_path, &spec_hash, &spec, &state, None)?;
     }
 
     let mut output = BTreeMap::<String, Value>::new();
@@ -3768,6 +3803,12 @@ fn resolve_spec_dir(
     }
 }
 
+fn canonical_input_path(path: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve input path {}", path.display()))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 pub(crate) fn stable_spec_hash<T: Serialize + ?Sized>(spec: &T) -> Result<String> {
     let canonical = serde_json::to_vec(spec).context("failed to serialize spec")?;
     let mut hasher = Sha256::new();
@@ -4605,7 +4646,7 @@ fn sql_quote(value: &str) -> String {
 
 fn show_checkpoint_hint_line(pb: &ProgressBar) {
     if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
-        pb.println("  Ctrl+C safely checkpoints; rerun same command to resume (--fresh restarts).");
+        pb.println("  Ctrl+C safely checkpoints; rerun same command to resume (--force restarts).");
     }
 }
 
@@ -4653,7 +4694,7 @@ fn pull_status_line(show_checkpoint_hint: bool, retry_summary: Option<&str>) -> 
     let mut parts = Vec::new();
     if show_checkpoint_hint {
         parts.push(
-            "Ctrl+C checkpoints; rerun same command to resume (--fresh restarts).".to_string(),
+            "Ctrl+C checkpoints; rerun same command to resume (--force restarts).".to_string(),
         );
     }
     if let Some(summary) = retry_summary.filter(|s| !s.is_empty()) {
@@ -4697,6 +4738,26 @@ fn spinner_bar(message: &str) -> ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, clap::Parser)]
+    struct PushArgsHarness {
+        #[command(flatten)]
+        args: PushArgs,
+    }
+
+    #[test]
+    fn push_force_starts_from_the_beginning() -> Result<()> {
+        let parsed = <PushArgsHarness as clap::Parser>::try_parse_from([
+            "bt-sync-push",
+            "project_logs:test-project",
+            "--in",
+            "input.jsonl",
+            "--force",
+        ])?;
+
+        assert!(parsed.args.force);
+        Ok(())
+    }
 
     #[test]
     fn write_jsonl_value_serializes_one_line_and_reports_bytes() -> Result<()> {
@@ -4796,6 +4857,46 @@ mod tests {
         assert_eq!(state.bytes_sent, 128);
         assert_eq!(state.line_offset, 2);
         assert_eq!(state.distinct_roots_done, 1);
+    }
+
+    #[test]
+    fn push_checkpoint_hash_includes_canonical_input_path() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!(
+            "bt-sync-push-input-hash-{}-{unique}",
+            std::process::id()
+        ));
+        let input_a = root.join("input-a");
+        let input_b = root.join("input-b");
+        fs::create_dir_all(&input_a)?;
+        fs::create_dir_all(&input_b)?;
+
+        let mut spec = SyncSpec {
+            schema_version: STATE_SCHEMA_VERSION,
+            object_ref: "project_logs:test-project".to_string(),
+            object_type: ObjectType::ProjectLogs,
+            object_name: "test-project".to_string(),
+            direction: DirectionArg::Push.as_str().to_string(),
+            scope: ScopeArg::All.as_str().to_string(),
+            filter: None,
+            window: None,
+            limit: None,
+            page_size: DEFAULT_PAGE_SIZE,
+            include_vectors: false,
+            input_path: Some(canonical_input_path(&input_a)?),
+        };
+        let input_a_hash = spec_hash(&spec)?;
+
+        spec.input_path = Some(canonical_input_path(&input_b)?);
+        let input_b_hash = spec_hash(&spec)?;
+
+        assert_ne!(input_a_hash, input_b_hash);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     #[test]
@@ -5079,6 +5180,7 @@ mod tests {
             limit: Some(10),
             page_size: 200,
             include_vectors: false,
+            input_path: None,
         };
         let serialized = serde_json::to_value(&spec)?;
         let obj = serialized
@@ -5102,6 +5204,7 @@ mod tests {
             limit: Some(10),
             page_size: 200,
             include_vectors: true,
+            input_path: None,
         };
         let serialized = serde_json::to_value(&spec)?;
         let obj = serialized
