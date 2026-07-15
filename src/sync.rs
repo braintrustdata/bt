@@ -2170,24 +2170,14 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
         input_path,
     };
     let spec_hash = spec_hash(&spec)?;
-    let spec_dir = match args.direction {
-        DirectionArg::Pull => resolve_spec_dir(
-            &args.root,
-            &object,
-            args.direction,
-            &scope,
-            &spec_hash,
-            true,
-        )?,
-        DirectionArg::Push => resolve_spec_dir(
-            &args.root,
-            &object,
-            args.direction,
-            &scope,
-            &spec_hash,
-            true,
-        )?,
-    };
+    let spec_dir = resolve_spec_dir(
+        &args.root,
+        &object,
+        args.direction,
+        &scope,
+        &spec_hash,
+        true,
+    )?;
     let state_path = spec_dir.join("state.json");
     let manifest_path = spec_dir.join("manifest.json");
     let spec_path = spec_dir.join("spec.json");
