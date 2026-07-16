@@ -1,13 +1,6 @@
-use crate::auth::{self, ProfileInfo};
+use crate::auth::ProfileInfo;
 
-pub(crate) fn resolve_profile_info(
-    profile: Option<&str>,
-    org: Option<&str>,
-) -> Option<ProfileInfo> {
-    let profiles = auth::list_profiles().ok()?;
-    resolve_profile_info_from_profiles(profile, org, profiles)
-}
-
+#[cfg(test)]
 fn resolve_profile_info_from_profiles(
     profile: Option<&str>,
     org: Option<&str>,
@@ -40,6 +33,17 @@ fn resolve_profile_info_from_profiles(
                 .into_iter()
                 .find(|profile| profile.name == profile_name);
         }
+        let oauth_matches: Vec<&ProfileInfo> = org_matches
+            .iter()
+            .copied()
+            .filter(|profile| profile.email.is_some() || profile.user_name.is_some())
+            .collect();
+        if oauth_matches.len() == 1 {
+            let profile_name = oauth_matches[0].name.clone();
+            return profiles
+                .into_iter()
+                .find(|profile| profile.name == profile_name);
+        }
         return None;
     }
 
@@ -54,7 +58,7 @@ pub(crate) fn profile_author_slug(profile: &ProfileInfo) -> Option<String> {
     [
         profile.user_name.as_deref(),
         profile.email.as_deref().and_then(email_local_part),
-        Some(profile.name.as_str()),
+        profile.org_name.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -105,6 +109,12 @@ mod tests {
     ) -> ProfileInfo {
         ProfileInfo {
             name: name.to_string(),
+            auth_method: if email.is_some() || user_name.is_some() {
+                "oauth"
+            } else {
+                "api_key"
+            }
+            .to_string(),
             org_name: org_name.map(ToOwned::to_owned),
             user_name: user_name.map(ToOwned::to_owned),
             email: email.map(ToOwned::to_owned),
@@ -155,12 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_author_slug_falls_back_to_profile_name() {
+    fn profile_author_slug_ignores_internal_profile_name() {
         let profile = profile_info("Work Profile", None, None, None);
-        assert_eq!(
-            profile_author_slug(&profile).as_deref(),
-            Some("work-profile")
-        );
+        assert_eq!(profile_author_slug(&profile), None);
     }
 
     #[test]

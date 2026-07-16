@@ -746,7 +746,7 @@ async fn run_eval_attempt(
         options.jsonl,
         options.list,
         options.verbose,
-        base.profile.clone(),
+        base.org_name.clone(),
     );
     let output =
         drive_eval_runner(spawned.process, console_policy, |event| ui.handle(event)).await?;
@@ -2805,7 +2805,7 @@ struct EvalUi {
     deferred_errors: Vec<String>,
     suppressed_stderr_lines: usize,
     finished: bool,
-    profile: Option<String>,
+    org: Option<String>,
 }
 
 struct EvalBarState {
@@ -2815,7 +2815,7 @@ struct EvalBarState {
 }
 
 impl EvalUi {
-    fn new(jsonl: bool, list: bool, verbose: bool, profile: Option<String>) -> Self {
+    fn new(jsonl: bool, list: bool, verbose: bool, org: Option<String>) -> Self {
         let draw_target = if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet()
         {
             ProgressDrawTarget::stderr_with_hz(10)
@@ -2841,7 +2841,7 @@ impl EvalUi {
             deferred_errors: Vec::new(),
             suppressed_stderr_lines: 0,
             finished: false,
-            profile,
+            org,
         }
     }
 
@@ -2869,7 +2869,7 @@ impl EvalUi {
                 }
             }
             EvalEvent::Summary(summary) => {
-                let summary = enrich_experiment_summary(summary, self.profile.as_deref());
+                let summary = enrich_experiment_summary(summary, self.org.as_deref());
                 if self.jsonl {
                     if let Ok(line) = serde_json::to_string(&summary) {
                         println!("{line}");
@@ -3350,10 +3350,10 @@ const COMPARE_MORE_HINT: &str = "append more experiment names at the end; max 7 
 
 fn enrich_experiment_summary(
     mut summary: ExperimentSummary,
-    profile: Option<&str>,
+    org: Option<&str>,
 ) -> ExperimentSummary {
     if summary.compare_command.is_none() {
-        summary.compare_command = build_experiment_compare_command(&summary, profile);
+        summary.compare_command = build_experiment_compare_command(&summary, org);
     }
     if summary.compare_command.is_some() && summary.compare_more.is_none() {
         summary.compare_more = Some(COMPARE_MORE_HINT.to_string());
@@ -3375,7 +3375,7 @@ fn format_experiment_compare_command(summary: &ExperimentSummary) -> Option<Stri
 
 fn build_experiment_compare_command(
     summary: &ExperimentSummary,
-    profile: Option<&str>,
+    org: Option<&str>,
 ) -> Option<String> {
     let baseline = summary.comparison_experiment_name.as_deref()?.trim();
     if baseline.is_empty() {
@@ -3387,14 +3387,14 @@ fn build_experiment_compare_command(
         return None;
     }
 
-    let profile_args = profile
+    let org_args = org
         .map(str::trim)
-        .filter(|profile| !profile.is_empty())
-        .map(|profile| format!(" --profile {}", shell_quote_arg(profile)))
+        .filter(|org| !org.is_empty())
+        .map(|org| format!(" --org {}", shell_quote_arg(org)))
         .unwrap_or_default();
 
     Some(format!(
-        "bt experiments compare{profile_args} -p {} {} {}",
+        "bt experiments compare{org_args} -p {} {} {}",
         shell_quote_arg(project),
         shell_quote_arg(baseline),
         shell_quote_arg(experiment),
@@ -4544,7 +4544,7 @@ mod tests {
     }
 
     #[test]
-    fn enrich_experiment_summary_preserves_profile_in_compare_command() {
+    fn enrich_experiment_summary_preserves_org_in_compare_command() {
         let summary = ExperimentSummary {
             project_name: "test-project".to_string(),
             experiment_name: "challenger-a".to_string(),
@@ -4564,11 +4564,11 @@ mod tests {
             compare_more: None,
         };
 
-        let summary = enrich_experiment_summary(summary, Some("test-profile"));
+        let summary = enrich_experiment_summary(summary, Some("test-org"));
 
         assert_eq!(
             summary.compare_command.as_deref(),
-            Some("bt experiments compare --profile test-profile -p test-project baseline challenger-a")
+            Some("bt experiments compare --org test-org -p test-project baseline challenger-a")
         );
     }
 
