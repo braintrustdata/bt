@@ -862,19 +862,13 @@ fn config_auth_context_from_config(
     base: &BaseArgs,
     cfg: &crate::config::Config,
 ) -> (Option<String>, Option<String>) {
-    let selected_profile = crate::config::trimmed_option(base.profile.as_deref());
-    let configured_profile = crate::config::trimmed_option(cfg.profile.as_deref());
-    let profile = if selected_profile.is_none() {
-        configured_profile.map(str::to_string)
+    let profile = if crate::config::trimmed_option(base.profile.as_deref()).is_none() {
+        crate::config::trimmed_option(cfg.profile.as_deref()).map(str::to_string)
     } else {
         None
     };
 
-    let config_matches_selected_profile =
-        selected_profile.is_none_or(|profile| Some(profile) == configured_profile);
-    let org = if crate::config::trimmed_option(base.org_name.as_deref()).is_none()
-        && config_matches_selected_profile
-    {
+    let org = if crate::config::trimmed_option(base.org_name.as_deref()).is_none() {
         crate::config::trimmed_option(cfg.org.as_deref()).map(str::to_string)
     } else {
         None
@@ -4224,21 +4218,9 @@ mod tests {
     }
 
     #[test]
-    fn config_auth_context_ignores_org_for_different_selected_profile() {
+    fn config_auth_context_preserves_explicit_profile_and_config_org() {
         let mut base = make_base();
         base.profile = Some("explicit-profile".to_string());
-        let cfg = auth_config(Some("config-profile"), Some("local-org"));
-
-        let (profile, org) = config_auth_context_from_config(&base, &cfg);
-
-        assert_eq!(profile, None);
-        assert_eq!(org, None);
-    }
-
-    #[test]
-    fn config_auth_context_keeps_org_for_matching_selected_profile() {
-        let mut base = make_base();
-        base.profile = Some("config-profile".to_string());
         let cfg = auth_config(Some("config-profile"), Some("local-org"));
 
         let (profile, org) = config_auth_context_from_config(&base, &cfg);
@@ -4662,34 +4644,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_selected_profile_ignores_other_profiles_config_org() {
-        let mut base = make_base();
-        base.profile = Some("test-profile".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "test-profile".into(),
-            AuthProfile {
-                org_name: Some("profile-org".into()),
-                ..Default::default()
-            },
-        );
-        let cfg = auth_config(Some("other-profile"), Some("local-org"));
-        let (_, cfg_org) = config_auth_context_from_config(&base, &cfg);
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".into())),
-            &cfg_org,
-        )
-        .expect("resolve");
-
-        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
-        assert_eq!(resolved.org_name.as_deref(), Some("profile-org"));
-    }
-
-    #[test]
     fn resolve_auth_api_key_override_keeps_config_org() {
         let mut base = make_base();
         base.api_key = Some("explicit-key".into());
@@ -4706,10 +4660,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_explicit_org_overrides_explicit_profile_org() {
+    fn resolve_auth_explicit_profile_overrides_org_resolution() {
         let mut base = make_base();
         base.profile = Some("other".into());
-        base.profile_explicit = true;
         base.org_name = Some("acme-corp".into());
 
         let mut store = AuthStore::default();
