@@ -1467,21 +1467,18 @@ async fn run_setup_browser_auth(
         org_id: completed.org_id.clone(),
         description: None,
     };
-    let stored_profiles = auth::list_profiles()?;
-    let profile_name = setup_browser_profile_name(profile_name, &org.name, &stored_profiles);
-
+    let _ = profile_name;
     auth::commit_api_key_profile(
-        &profile_name,
         &completed.api_key,
         login.api_url.clone(),
         Some(login.app_url.clone()),
-        Some(org.name.clone()),
+        org.id.clone(),
+        org.name.clone(),
     )
-    .context("failed to save Braintrust auth profile after browser setup")?;
+    .context("failed to save Braintrust auth login after browser setup")?;
 
     base.api_key = Some(completed.api_key);
     base.api_key_source = None;
-    base.profile = Some(profile_name);
     base.org_name = Some(org.name);
     base.project = Some(selected_project.name.clone());
 
@@ -1492,6 +1489,7 @@ async fn run_setup_browser_auth(
     })
 }
 
+#[cfg(test)]
 fn setup_browser_profile_name(
     selected_profile_name: Option<&str>,
     org_name: &str,
@@ -1534,7 +1532,7 @@ fn resolve_profile_name_for_setup(
             return Ok(Some(profile_name.to_string()));
         }
         bail!(
-            "profile '{profile_name}' not found; run `bt auth profiles` to see available profiles"
+            "auth login '{profile_name}' not found; run `bt auth profiles` to see available logins"
         );
     }
 
@@ -1550,20 +1548,25 @@ fn resolve_profile_name_for_setup(
         let mut matches = profiles
             .iter()
             .filter(|profile| profile.org_name.as_deref() == Some(org_name))
-            .map(|profile| profile.name.clone())
             .collect::<Vec<_>>();
-        matches.sort();
+        matches.sort_by(|left, right| left.name.cmp(&right.name));
 
         return match matches.len() {
             0 => Ok(None),
-            1 => Ok(Some(matches.remove(0))),
+            1 => Ok(Some(matches[0].name.clone())),
             _ if prompt_for_choice => auth::select_profile_interactive(Some(org_name))?
                 .map(Some)
-                .ok_or_else(|| anyhow!("no profile selected")),
-            _ => bail!(
-                "multiple profiles for org '{org_name}': {}. Use --profile to disambiguate.",
-                matches.join(", ")
-            ),
+                .ok_or_else(|| anyhow!("no auth login selected")),
+            _ => {
+                let labels = matches
+                    .iter()
+                    .map(|profile| auth::profile_info_label(profile))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "multiple auth logins for org '{org_name}': {labels}. Rerun interactively or remove one with `bt auth logout`."
+                )
+            }
         };
     }
 
@@ -1574,7 +1577,7 @@ fn resolve_profile_name_for_setup(
     if prompt_for_choice && !profiles.is_empty() {
         auth::select_profile_interactive(None)?
             .map(Some)
-            .ok_or_else(|| anyhow!("no profile selected"))
+            .ok_or_else(|| anyhow!("no auth login selected"))
     } else {
         Ok(None)
     }
@@ -1612,11 +1615,13 @@ fn find_available_org<'a>(
     orgs: &'a [auth::AvailableOrg],
     org_name: &str,
 ) -> Option<&'a auth::AvailableOrg> {
-    orgs.iter().find(|org| org.name == org_name).or_else(|| {
-        let lowered = org_name.to_ascii_lowercase();
-        orgs.iter()
-            .find(|org| org.name.to_ascii_lowercase() == lowered)
-    })
+    orgs.iter()
+        .find(|org| org.id == org_name || org.name == org_name)
+        .or_else(|| {
+            let lowered = org_name.to_ascii_lowercase();
+            orgs.iter()
+                .find(|org| org.name.to_ascii_lowercase() == lowered)
+        })
 }
 
 fn build_api_key_login_context(
@@ -1724,24 +1729,6 @@ fn select_api_key_org_for_setup(
     bail!("organization choice required in non-interactive mode; pass --org <NAME>")
 }
 
-fn matching_profile_org_names(
-    profiles: &[auth::StoredProfileInfo],
-    only_oauth: Option<bool>,
-) -> Vec<String> {
-    let mut org_names = profiles
-        .iter()
-        .filter(|profile| {
-            only_oauth
-                .map(|expected| profile.is_oauth == expected)
-                .unwrap_or(true)
-        })
-        .filter_map(|profile| profile.org_name.clone())
-        .collect::<Vec<_>>();
-    org_names.sort();
-    org_names.dedup();
-    org_names
-}
-
 async fn ensure_profile_or_setup_browser_auth(
     base: &mut BaseArgs,
     prompt_for_profile_choice: bool,
@@ -1760,10 +1747,17 @@ async fn ensure_profile_or_setup_browser_auth(
 
     if let Some(profile_name) = selected_profile {
         auth_base.profile = Some(profile_name.clone());
+        if auth_base.org_name.is_none() {
+            auth_base.org_name = profiles
+                .iter()
+                .find(|profile| profile.name == profile_name)
+                .and_then(|profile| profile.org_name.clone());
+        }
 
         match auth::login(&auth_base).await {
             Ok(ctx) => {
                 base.profile = auth_base.profile.clone();
+                base.org_name = auth_base.org_name.clone();
                 let is_oauth = auth::resolve_auth(&auth_base).await?.is_oauth;
                 return Ok(SetupAuthLogin {
                     login: ctx,
@@ -1774,7 +1768,7 @@ async fn ensure_profile_or_setup_browser_auth(
             Err(err) if auth::is_missing_credential_error(&err) => {
                 if base.verbose {
                     eprintln!(
-                        "   Profile '{}' credentials inaccessible ({}). Re-authenticating in the browser...",
+                        "   Auth login '{}' credentials inaccessible ({}). Re-authenticating in the browser...",
                         profile_name, err
                     );
                 }
@@ -1799,10 +1793,10 @@ async fn ensure_profile_or_setup_browser_auth(
     if !can_prompt {
         if profiles.is_empty() {
             bail!(
-                "setup needs interactive browser authentication; rerun without --no-input/--json or pass a valid API key/profile"
+                "setup needs interactive browser authentication; rerun without --no-input/--json or pass a valid API key or org login"
             );
         }
-        bail!("profile selection required in non-interactive mode; pass --profile <NAME>");
+        bail!("auth org selection required in non-interactive mode; pass --org <ORG>");
     }
 
     if base.verbose {
@@ -1903,12 +1897,12 @@ async fn ensure_setup_auth(
             let profile = stored_profiles
                 .iter()
                 .find(|profile| profile.name == profile_name)
-                .ok_or_else(|| anyhow!("profile '{profile_name}' not found"))?;
+                .ok_or_else(|| anyhow!("auth login '{profile_name}' not found"))?;
             let target_org = match org_name.as_deref() {
                 Some(org_name) => {
                     if profile.org_name.as_deref() != Some(org_name) {
                         bail!(
-                            "profile '{profile_name}' belongs to org '{}' but '{}' was requested",
+                            "auth login '{profile_name}' belongs to org '{}' but '{}' was requested",
                             profile.org_name.as_deref().unwrap_or("(none)"),
                             org_name
                         );
@@ -1916,7 +1910,7 @@ async fn ensure_setup_auth(
                     org_name
                 }
                 None => profile.org_name.as_deref().ok_or_else(|| {
-                    anyhow!("profile '{profile_name}' does not have a default org")
+                    anyhow!("auth login '{profile_name}' does not have a default org")
                 })?,
             };
 
@@ -1969,9 +1963,7 @@ async fn ensure_setup_auth(
                 .iter()
                 .filter(|profile| profile.org_name.as_deref() == Some(org_name))
                 .count();
-            if base.prefer_profile && matching_profile_count == 0 {
-                bail!("no profile found for org '{org_name}'");
-            }
+            let _ = matching_profile_count;
 
             if let Some(org) = find_available_org(&available_orgs, org_name) {
                 let client = build_api_key_client(base, api_key, org).await?;
@@ -2015,92 +2007,6 @@ async fn ensure_setup_auth(
                 selected_project,
             )
             .await;
-        }
-
-        if base.prefer_profile {
-            if stored_profiles.is_empty() {
-                let matched_orgs = match project_name.as_deref() {
-                    Some(project_name) => {
-                        orgs_with_project(base, api_key, &available_orgs, project_name).await?
-                    }
-                    None => available_orgs.clone(),
-                };
-                if matched_orgs.is_empty() {
-                    return ensure_profile_or_setup_browser_auth_context(
-                        base,
-                        prompt_for_profile_choice,
-                        needs_api_key,
-                        project_name.as_deref(),
-                        project_was_explicit,
-                        org_name.as_deref(),
-                    )
-                    .await;
-                }
-                let org = select_api_key_org_for_setup(
-                    base,
-                    &matched_orgs,
-                    project_name.as_deref(),
-                    &[],
-                )?;
-                let client = build_api_key_client(base, api_key, &org).await?;
-                let api_url = base
-                    .api_url
-                    .clone()
-                    .or_else(|| org.api_url.clone())
-                    .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-                auth::commit_api_key_profile(
-                    &org.name,
-                    api_key,
-                    api_url,
-                    base.app_url.clone(),
-                    Some(org.name.clone()),
-                )?;
-                return build_setup_auth_context(base, client, false, needs_api_key, None).await;
-            }
-
-            let preferred_org_names = matching_profile_org_names(&stored_profiles, None);
-            let matching_orgs = available_orgs
-                .iter()
-                .filter(|org| preferred_org_names.iter().any(|name| name == &org.name))
-                .cloned()
-                .collect::<Vec<_>>();
-            if matching_orgs.is_empty() {
-                return ensure_profile_or_setup_browser_auth_context(
-                    base,
-                    prompt_for_profile_choice,
-                    needs_api_key,
-                    project_name.as_deref(),
-                    project_was_explicit,
-                    org_name.as_deref(),
-                )
-                .await;
-            }
-
-            let candidate_orgs = match project_name.as_deref() {
-                Some(project_name) => {
-                    orgs_with_project(base, api_key, &matching_orgs, project_name).await?
-                }
-                None => matching_orgs,
-            };
-            if candidate_orgs.is_empty() {
-                return ensure_profile_or_setup_browser_auth_context(
-                    base,
-                    prompt_for_profile_choice,
-                    needs_api_key,
-                    project_name.as_deref(),
-                    project_was_explicit,
-                    org_name.as_deref(),
-                )
-                .await;
-            }
-            let org = select_api_key_org_for_setup(
-                base,
-                &candidate_orgs,
-                project_name.as_deref(),
-                &preferred_org_names,
-            )?;
-            let client = build_api_key_client(base, api_key, &org).await?;
-            return build_setup_auth_context(base, client, false, needs_api_key, None).await;
         }
 
         let candidate_orgs = match project_name.as_deref() {
@@ -5435,12 +5341,11 @@ mod tests {
             no_color: false,
             no_input: false,
             profile: None,
-            profile_explicit: false,
             org_name: None,
             project: None,
             api_key: None,
             api_key_source: None,
-            prefer_profile: false,
+            prefer_api_key: false,
             api_url: None,
             app_url: None,
             ca_cert: None,
@@ -5778,6 +5683,7 @@ mod tests {
         let profiles = vec![
             auth::ProfileInfo {
                 name: "zeta".to_string(),
+                auth_method: "api_key".to_string(),
                 org_name: Some("Zeta Org".to_string()),
                 user_name: None,
                 email: None,
@@ -5785,6 +5691,7 @@ mod tests {
             },
             auth::ProfileInfo {
                 name: "alpha".to_string(),
+                auth_method: "api_key".to_string(),
                 org_name: Some("Alpha Org".to_string()),
                 user_name: None,
                 email: None,
@@ -5813,6 +5720,7 @@ mod tests {
         base.profile = Some("missing".to_string());
         let profiles = vec![auth::ProfileInfo {
             name: "work".to_string(),
+            auth_method: "api_key".to_string(),
             org_name: Some("Acme".to_string()),
             user_name: None,
             email: None,
@@ -5821,7 +5729,7 @@ mod tests {
 
         let err =
             resolve_profile_name_for_setup(&base, &profiles, false).expect_err("missing profile");
-        assert!(err.to_string().contains("profile 'missing' not found"));
+        assert!(err.to_string().contains("auth login 'missing' not found"));
     }
 
     #[test]
@@ -5829,6 +5737,7 @@ mod tests {
         let profiles = vec![
             auth::ProfileInfo {
                 name: "Acme".to_string(),
+                auth_method: "api_key".to_string(),
                 org_name: Some("Acme".to_string()),
                 user_name: None,
                 email: None,
@@ -5836,6 +5745,7 @@ mod tests {
             },
             auth::ProfileInfo {
                 name: "Acme-2".to_string(),
+                auth_method: "api_key".to_string(),
                 org_name: Some("Acme".to_string()),
                 user_name: None,
                 email: None,

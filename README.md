@@ -312,34 +312,34 @@ Local version and pagination-key conversion helpers:
 
 ## `bt auth`
 
-- Authenticate interactively (prompts for auth method, profile name defaults to org name):
+- Authenticate interactively (prompts for auth method and organization):
   - `bt auth login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
-  - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
-  - After login, `bt` updates the active profile/org context immediately. If `--project` is set, it also switches that project; otherwise it clears any stale default project for the new login.
+  - OAuth can be saved for an org or in cross-org mode. API-key logins are saved per org; if a key can access multiple orgs, `bt` uses a searchable org picker.
+  - After login, `bt` updates the active org context immediately. If `--project` is set, it also switches that project; otherwise it clears any stale default project for the new login.
   - `bt` confirms the resolved API URL before saving.
 - Login with OAuth (browser-based, stores refresh token in secure credential store):
-  - `bt auth login --oauth --profile work`
+  - `bt auth login --oauth --org myorg`
   - You can pass `--no-browser` to print the URL without auto-opening.
   - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
-- List profiles:
+- List saved auth logins:
   - `bt auth profiles`
-- Log out (remove a saved profile):
-  - `bt auth logout`
+- Log out:
+  - `bt auth logout --org myorg`
+  - `bt auth logout --org myorg --api-key-hint sk-****abcde`
   - `bt auth logout --force` (skip confirmation)
-- Show current auth source/profile:
-  - `bt auth status`
+- Show current auth context:
+  - `bt status`
 - Force-refresh OAuth access token for debugging:
-  - `bt auth refresh --profile work`
+  - `bt auth refresh --org myorg`
 
 Auth resolution order for commands is:
 
-1. Explicit `--profile`
-2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
-3. `BRAINTRUST_PROFILE`
-4. Org-based profile match (profile whose org matches `--org`/config org)
-5. Single-profile auto-select (if only one profile exists)
-6. Interactive profile picker (if multiple profiles exist and a TTY is available)
+1. Explicit `--api-key sk-...`
+2. `--prefer-api-key` / `BRAINTRUST_PREFER_API_KEY` (uses `BRAINTRUST_API_KEY` first, then a stored API key for the selected org, then falls back to OAuth)
+3. Stored OAuth login for the selected org (or cross-org OAuth when selected)
+4. Stored API key login for the selected org when no OAuth login is available
+5. `BRAINTRUST_API_KEY`
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
 
@@ -357,8 +357,8 @@ Interactively switch org and project context:
 
 Show current org and project context:
 
-- `bt status` — display current org, project, and config source
-- `bt status --verbose` — show detailed config resolution
+- `bt status` — display current org, project, selected auth method, and config source
+- `bt status --verbose` — show detailed config and auth resolution
 - `bt status -j` — JSON output
 
 ## `bt setup` and `bt docs`

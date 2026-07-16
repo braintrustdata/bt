@@ -17,6 +17,26 @@ Examples:
 ")]
 pub struct InitArgs {}
 
+fn select_saved_auth_org_for_init() -> Result<Option<String>> {
+    let mut orgs = auth::list_profiles()?
+        .into_iter()
+        .filter_map(|profile| profile.org_name)
+        .filter(|org| !org.trim().is_empty())
+        .collect::<Vec<_>>();
+    orgs.sort();
+    orgs.dedup();
+
+    match orgs.len() {
+        0 => Ok(None),
+        1 => Ok(orgs.into_iter().next()),
+        _ => {
+            let labels = orgs.iter().map(String::as_str).collect::<Vec<_>>();
+            let idx = crate::ui::fuzzy_select("Select organization", &labels, 0)?;
+            Ok(Some(orgs[idx].clone()))
+        }
+    }
+}
+
 pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
     let config_path = config::local_save_path()?;
     if config_path.exists() {
@@ -44,10 +64,8 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         bail!("--org and --project required in non-interactive mode");
     } else {
         let mut login_base = base.clone();
-        if login_base.org_name.is_none() && login_base.profile.is_none() {
-            if let Some(profile) = auth::select_profile_interactive(None)? {
-                login_base.profile = Some(profile);
-            }
+        if login_base.org_name.is_none() {
+            login_base.org_name = select_saved_auth_org_for_init()?;
         }
         let ctx = login(&login_base).await?;
         let client = ApiClient::new(&ctx)?;

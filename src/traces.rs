@@ -33,7 +33,7 @@ use unicode_width::UnicodeWidthStr;
 use urlencoding::{decode, encode};
 
 use crate::args::BaseArgs;
-use crate::auth::{self, login};
+use crate::auth::login;
 use crate::experiments::api as experiments_api;
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
@@ -1060,7 +1060,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
     let has_more = next_cursor.is_some();
     let rows = parse_summary_rows(response.data);
     let object_ref_arg = format_object_ref_arg(&object_ref);
-    let profile_flag = base.profile.as_deref();
+    let org_flag = base.org_name.as_deref();
 
     if base.json {
         let payload = json!({
@@ -1082,7 +1082,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
                 has_more,
                 &object_ref_arg,
                 next_cursor.as_deref(),
-                profile_flag,
+                org_flag,
                 args.limit,
             ),
         });
@@ -1092,7 +1092,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
             &rows,
             args.list_mode,
             &object_ref_arg,
-            profile_flag,
+            org_flag,
             args.limit,
             args.preview_length,
             next_cursor.as_deref(),
@@ -1141,7 +1141,7 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
         next_cursor_if_full_page(response.cursor.clone(), response.data.len(), selector.limit);
     let has_more = next_cursor.is_some();
     let object_ref_arg = format_object_ref_arg(&target.object_ref);
-    let profile_flag = base.profile.as_deref();
+    let org_flag = base.org_name.as_deref();
 
     if base.json {
         let payload = json!({
@@ -1164,7 +1164,7 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
                 &object_ref_arg,
                 &target.root_span_id,
                 next_cursor.as_deref(),
-                profile_flag,
+                org_flag,
                 selector.limit,
             ),
         });
@@ -1174,7 +1174,7 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
             &target.root_span_id,
             &response.data,
             &object_ref_arg,
-            profile_flag,
+            org_flag,
             selector.limit,
             selector.preview_length,
             next_cursor.as_deref(),
@@ -1231,11 +1231,11 @@ async fn run_thread_command(base: BaseArgs, client: ApiClient, args: ThreadArgs)
             },
             "summary": summary,
             "messages": messages,
-            "hints": thread_hints(base.profile.as_deref()),
+            "hints": thread_hints(base.org_name.as_deref()),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        print_thread_text(&target, &messages, &summary, base.profile.as_deref());
+        print_thread_text(&target, &messages, &summary, base.org_name.as_deref());
     }
 
     Ok(())
@@ -1287,14 +1287,14 @@ async fn run_waterfall_command(
                 "has_more": has_more,
             },
             "waterfall": waterfall,
-            "hints": waterfall_hints(base.profile.as_deref(), has_more),
+            "hints": waterfall_hints(base.org_name.as_deref(), has_more),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         waterfall::print_waterfall_text(
             &target,
             &waterfall,
-            base.profile.as_deref(),
+            base.org_name.as_deref(),
             selector.limit,
             has_more,
         );
@@ -5683,9 +5683,9 @@ fn format_object_ref_arg(object_ref: &ObjectRef) -> String {
     format!("{}:{}", object_ref.object_type, object_ref.object_name)
 }
 
-fn profile_flag_suffix(profile: Option<&str>) -> String {
-    match profile.filter(|p| !p.trim().is_empty()) {
-        Some(profile) => format!(" --profile {}", btql_quote(profile)),
+fn profile_flag_suffix(org: Option<&str>) -> String {
+    match org.filter(|p| !p.trim().is_empty()) {
+        Some(org) => format!(" --org {}", btql_quote(org)),
         None => String::new(),
     }
 }
@@ -5715,21 +5715,7 @@ fn parse_startup_trace_url_from_view_args(args: &ViewArgs) -> Result<Option<Pars
     startup_url.as_deref().map(parse_trace_url).transpose()
 }
 
-fn apply_url_hints_to_base(base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
-    apply_url_hints_with_profile_resolver(base, parsed_url, |org| {
-        let profiles = auth::list_profiles().ok()?;
-        auth::resolve_org_to_profile(org, &profiles).ok()
-    })
-}
-
-fn apply_url_hints_with_profile_resolver<F>(
-    mut base: BaseArgs,
-    parsed_url: Option<&ParsedTraceUrl>,
-    resolve_profile_for_org: F,
-) -> BaseArgs
-where
-    F: Fn(&str) -> Option<String>,
-{
+fn apply_url_hints_to_base(mut base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
     let Some(parsed) = parsed_url else {
         return base;
     };
@@ -5742,26 +5728,28 @@ where
         return base;
     };
 
-    let has_profile_override = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
     let has_org_override = base
         .org_name
         .as_deref()
         .map(str::trim)
         .is_some_and(|v| !v.is_empty());
 
-    if !has_org_override && !has_profile_override {
+    if !has_org_override {
         base.org_name = Some(url_org.to_string());
     }
-    if !has_profile_override && !has_org_override {
-        if let Some(profile_name) = resolve_profile_for_org(url_org) {
-            base.profile = Some(profile_name);
-        }
-    }
     base
+}
+
+#[cfg(test)]
+fn apply_url_hints_with_profile_resolver<F>(
+    base: BaseArgs,
+    parsed_url: Option<&ParsedTraceUrl>,
+    _resolve_profile_for_org: F,
+) -> BaseArgs
+where
+    F: Fn(&str) -> Option<String>,
+{
+    apply_url_hints_to_base(base, parsed_url)
 }
 
 fn select_startup_url(
@@ -6729,12 +6717,11 @@ mod tests {
             no_color: false,
             no_input: false,
             profile: None,
-            profile_explicit: false,
             org_name: None,
             project: None,
             api_key: None,
             api_key_source: None,
-            prefer_profile: false,
+            prefer_api_key: false,
             api_url: None,
             app_url: None,
             ca_cert: None,
@@ -6963,7 +6950,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_url_hints_infers_profile_from_url_org() {
+    fn apply_url_hints_infers_org_from_url() {
         let base = base_args();
         let parsed = parsed_url_with_org("Lovable");
 
@@ -6972,21 +6959,20 @@ mod tests {
         });
 
         assert_eq!(updated.org_name.as_deref(), Some("Lovable"));
-        assert_eq!(updated.profile.as_deref(), Some("lovable-profile"));
+        assert_eq!(updated.profile, None);
     }
 
     #[test]
-    fn apply_url_hints_preserves_explicit_profile() {
+    fn apply_url_hints_preserves_explicit_org() {
         let mut base = base_args();
-        base.profile = Some("explicit-profile".to_string());
+        base.org_name = Some("explicit-org".to_string());
         let parsed = parsed_url_with_org("Lovable");
 
         let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |_| {
             Some("other".to_string())
         });
 
-        assert_eq!(updated.profile.as_deref(), Some("explicit-profile"));
-        assert!(updated.org_name.is_none());
+        assert_eq!(updated.org_name.as_deref(), Some("explicit-org"));
     }
 
     #[test]

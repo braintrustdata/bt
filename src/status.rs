@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::args::BaseArgs;
 use crate::auth;
-use crate::{config, utils::resolve_profile_info};
+use crate::config;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -19,13 +19,14 @@ pub struct StatusArgs {}
 struct StatusOutput {
     org: Option<String>,
     project: Option<String>,
-    profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_method: Option<String>,
     source: Option<String>,
 }
 
@@ -40,6 +41,13 @@ fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
     }
 }
 
+fn format_auth(p: &auth::ProfileInfo) -> String {
+    match format_identity(p) {
+        Some(identity) => format!("{} — {identity}", p.auth_method),
+        None => p.auth_method.clone(),
+    }
+}
+
 pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     let global_path = config::global_path().ok();
     let global_cfg = config::load_global().unwrap_or_default();
@@ -51,7 +59,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
 
     let cli_org = cli_flag_value(&["--org", "-o"]);
     let cli_project = cli_flag_value(&["--project", "-p"]);
-    let (mut org, mut project, source) = resolve_config(
+    let (org, mut project, source) = resolve_config(
         cli_org,
         cli_project,
         &global_cfg,
@@ -60,27 +68,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         &global_path,
     );
     let merged_cfg = global_cfg.merge(&local_cfg);
-    let selected_profile = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            merged_cfg
-                .profile
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
-    let profile_info = resolve_profile_info(selected_profile.as_deref(), org.as_deref());
-
-    if selected_profile.is_some() && org.as_deref().map(str::trim).is_none_or(str::is_empty) {
-        if let Some(profile_org) = profile_info.as_ref().and_then(|p| p.org_name.clone()) {
-            org = Some(profile_org);
-        }
-    }
+    let auth_info = auth::active_auth_info(&base, org.as_deref());
 
     if base
         .project
@@ -88,27 +76,17 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        let mut project_base = base.clone();
-        if project_base
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            project_base.profile = selected_profile.clone();
-        }
-        project =
-            config::project_from_config_for_context(&project_base, &merged_cfg, org.as_deref());
+        project = config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
     }
 
     if base.json {
         let output = StatusOutput {
             org,
             project,
-            profile: profile_info.as_ref().map(|p| p.name.clone()),
-            user_name: profile_info.as_ref().and_then(|p| p.user_name.clone()),
-            user_email: profile_info.as_ref().and_then(|p| p.email.clone()),
-            api_key_hint: profile_info.as_ref().and_then(|p| p.api_key_hint.clone()),
+            user_name: auth_info.as_ref().and_then(|p| p.user_name.clone()),
+            user_email: auth_info.as_ref().and_then(|p| p.email.clone()),
+            api_key_hint: auth_info.as_ref().and_then(|p| p.api_key_hint.clone()),
+            auth_method: auth_info.as_ref().map(|p| p.auth_method.clone()),
             source,
         };
         println!("{}", serde_json::to_string(&output)?);
@@ -116,13 +94,19 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     }
 
     if base.verbose {
-        println!("org: {}", org.as_deref().unwrap_or("(unset)"));
+        let org_display = if org.is_none()
+            && auth_info
+                .as_ref()
+                .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none())
+        {
+            "cross-org"
+        } else {
+            org.as_deref().unwrap_or("(unset)")
+        };
+        println!("org: {org_display}");
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
-        if let Some(ref p) = profile_info {
-            println!("profile: {}", p.name);
-            if let Some(id) = format_identity(p) {
-                println!("user: {id}");
-            }
+        if let Some(ref p) = auth_info {
+            println!("auth: {}", format_auth(p));
         }
         if let Some(src) = source {
             println!("source: {src}");
@@ -134,14 +118,19 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
             _ => unreachable!(),
         };
         println!("{scope}");
-        let profile_line = match &profile_info {
-            Some(p) => match format_identity(p) {
-                Some(id) => format!("  profile: {} — {id}", p.name),
-                None => format!("  profile: {}", p.name),
-            },
-            None => "  profile: (none)".to_string(),
+        let auth_line = match &auth_info {
+            Some(p) => format!("  auth: {}", format_auth(p)),
+            None => "  auth: (none)".to_string(),
         };
-        println!("{profile_line}");
+        println!("{auth_line}");
+    } else if auth_info
+        .as_ref()
+        .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none())
+    {
+        println!("cross-org");
+        if let Some(p) = &auth_info {
+            println!("  auth: {}", format_auth(p));
+        }
     } else {
         println!("No org/project configured. Run `bt switch` to set one.");
     }
@@ -345,6 +334,12 @@ mod tests {
     ) -> auth::ProfileInfo {
         auth::ProfileInfo {
             name: name.into(),
+            auth_method: if api_key_hint.is_some() {
+                "api_key"
+            } else {
+                "oauth"
+            }
+            .into(),
             org_name: None,
             user_name: user_name.map(Into::into),
             email: email.map(Into::into),
