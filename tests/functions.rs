@@ -794,6 +794,25 @@ fn auth_logout_json_with_no_profiles_emits_empty_status() {
 }
 
 #[test]
+fn auth_logout_requires_force_without_an_interactive_terminal() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+    seed_api_key_profile(config_dir.path());
+
+    let output = auth_sub_command(
+        cwd.path(),
+        config_dir.path(),
+        &["logout", "--org", "test-org", "--no-input"],
+    )
+    .output()
+    .expect("run non-interactive auth logout");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rerun with --force"));
+    assert!(config_dir.path().join("bt").join("auth.json").exists());
+}
+
+#[test]
 fn auth_refresh_errors_when_no_oauth_login_exists_even_with_json() {
     // --json must not swallow a real error: refresh only applies to OAuth
     // logins, and an org with only API-key auth should fail actionably.

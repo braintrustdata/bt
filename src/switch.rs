@@ -57,11 +57,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
 
     let mut login_base = base.clone();
     if login_base.org_name.is_none() {
-        let saved_org = select_saved_auth_org_for_switch()?;
-        login_base.org_name = resolved_org
-            .clone()
-            .or_else(|| current_cfg.org.clone())
-            .or(saved_org);
+        login_base.org_name = resolved_org.clone().or_else(|| current_cfg.org.clone());
+        if login_base.org_name.is_none() {
+            login_base.org_name = select_saved_auth_org_for_switch()?;
+        }
     }
 
     let ctx = login(&login_base).await?;

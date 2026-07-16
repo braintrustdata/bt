@@ -523,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_profile_key_is_ignored_and_not_persisted() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(&path, r#"{"org":"test-org","profile":"legacy-login"}"#).unwrap();
+
+        let config = load_file(&path);
+        assert_eq!(config.org.as_deref(), Some("test-org"));
+        assert!(!config.extra.contains_key("profile"));
+
+        save_file(&path, &config).unwrap();
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("profile"));
+    }
+
+    #[test]
     fn unknown_keys_roundtrip_through_save() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.json");

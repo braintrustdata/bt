@@ -65,6 +65,9 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
     } else {
         let mut login_base = base.clone();
         if login_base.org_name.is_none() {
+            login_base.org_name = config::load().ok().and_then(|cfg| cfg.org);
+        }
+        if login_base.org_name.is_none() {
             login_base.org_name = select_saved_auth_org_for_init()?;
         }
         let ctx = login(&login_base).await?;
