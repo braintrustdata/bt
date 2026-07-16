@@ -38,12 +38,12 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_NO_INPUT", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub no_input: bool,
 
-    #[arg(skip)]
-    pub profile: Option<String>,
-
     /// Override active org (or via BRAINTRUST_ORG_NAME)
     #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
     pub org_name: Option<String>,
+
+    #[arg(skip)]
+    pub org_name_source: Option<ArgValueSource>,
 
     /// Override active project
     #[arg(
@@ -54,6 +54,9 @@ pub struct BaseArgs {
         global = true
     )]
     pub project: Option<String>,
+
+    #[arg(skip)]
+    pub project_source: Option<ArgValueSource>,
 
     /// Override stored API key (or via BRAINTRUST_API_KEY)
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true, hide = true)]

@@ -62,18 +62,11 @@ pub struct ResolvedAuth {
 
 #[derive(Debug, Clone)]
 pub struct ProfileInfo {
-    pub name: String,
     pub auth_method: String,
     pub org_name: Option<String>,
     pub user_name: Option<String>,
     pub email: Option<String>,
     pub api_key_hint: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct StoredProfileInfo {
-    pub name: String,
-    pub org_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,118 +120,9 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
     let store = load_auth_store()?;
     Ok(store
         .profiles
-        .iter()
-        .map(|(name, p)| profile_info_from_store_entry(name, p))
+        .values()
+        .map(profile_info_from_store_entry)
         .collect())
-}
-
-pub(crate) fn list_stored_profiles() -> Result<Vec<StoredProfileInfo>> {
-    let store = load_auth_store()?;
-    Ok(store
-        .profiles
-        .iter()
-        .map(|(name, profile)| StoredProfileInfo {
-            name: name.clone(),
-            org_name: profile.org_name.clone(),
-        })
-        .collect())
-}
-
-#[cfg(test)]
-pub fn resolve_org_to_profile(identifier: &str, profiles: &[ProfileInfo]) -> Result<String> {
-    if profiles.is_empty() {
-        bail!("no auth profiles found. Run `bt auth login` to create one.");
-    }
-
-    if let Some(p) = profiles.iter().find(|p| p.name == identifier) {
-        return Ok(p.name.clone());
-    }
-
-    let matches: Vec<&ProfileInfo> = profiles
-        .iter()
-        .filter(|p| p.org_name.as_deref() == Some(identifier))
-        .collect();
-
-    match matches.len() {
-        0 => {
-            let available: Vec<String> = profiles
-                .iter()
-                .filter_map(|p| {
-                    p.org_name
-                        .as_ref()
-                        .map(|org| format!("  {} (profile: {})", org, p.name))
-                })
-                .collect();
-            bail!(
-                "no profile found for '{identifier}'.\nAvailable:\n{}",
-                available.join("\n")
-            );
-        }
-        1 => Ok(matches[0].name.clone()),
-        _ => {
-            if !ui::can_prompt() {
-                bail!(
-                    "multiple auth logins for org '{identifier}': {}. Use --org to disambiguate.",
-                    matches
-                        .iter()
-                        .map(|p| p.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            let names: Vec<&str> = matches.iter().map(|p| p.name.as_str()).collect();
-            let idx = crate::ui::fuzzy_select(
-                &format!("Multiple profiles for '{identifier}'. Select one"),
-                &names,
-                0,
-            )?;
-            Ok(matches[idx].name.clone())
-        }
-    }
-}
-
-fn profile_info_identity_label(profile: &ProfileInfo) -> Option<String> {
-    if let Some(email) = profile.email.as_deref() {
-        return match profile.user_name.as_deref() {
-            Some(name) => Some(format!("{name} ({email})")),
-            None => Some(email.to_string()),
-        };
-    }
-    profile.api_key_hint.clone()
-}
-
-pub(crate) fn profile_info_label(profile: &ProfileInfo) -> String {
-    let mut parts = vec![profile
-        .org_name
-        .clone()
-        .unwrap_or_else(|| "cross-org".to_string())];
-    parts.push(profile.auth_method.clone());
-    if let Some(identity) = profile_info_identity_label(profile) {
-        parts.push(identity);
-    }
-    parts.join(" — ")
-}
-
-pub fn select_profile_interactive(current: Option<&str>) -> Result<Option<String>> {
-    let profiles = list_profiles()?;
-    if profiles.is_empty() {
-        bail!("no auth logins found. Run `bt auth login` to create one.");
-    }
-    if profiles.len() == 1 {
-        return Ok(Some(profiles[0].name.clone()));
-    }
-
-    let labels: Vec<String> = profiles.iter().map(profile_info_label).collect();
-
-    let default = current
-        .and_then(|c| {
-            profiles
-                .iter()
-                .position(|p| p.name == c || p.org_name.as_deref() == Some(c))
-        })
-        .unwrap_or(0);
-    let idx = crate::ui::fuzzy_select("Select auth login", &labels, default)?;
-    Ok(Some(profiles[idx].name.clone()))
 }
 
 pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
@@ -842,11 +726,6 @@ fn resolve_env_api_key(base: &BaseArgs) -> Option<String> {
     Some(value.to_string())
 }
 
-#[cfg(test)]
-fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
-    resolve_cli_api_key_override(base)
-}
-
 fn config_auth_context(base: &BaseArgs) -> Option<String> {
     let cfg = crate::config::load().unwrap_or_default();
     config_auth_context_from_config(base, &cfg)
@@ -1185,32 +1064,6 @@ fn auth_slot_label(name: &str, profile: &AuthProfile) -> String {
     parts.join(" — ")
 }
 
-#[cfg(test)]
-fn resolve_profile_for_org<'a>(org: &str, store: &'a AuthStore) -> Option<&'a str> {
-    let matches: Vec<&str> = store
-        .profiles
-        .iter()
-        .filter(|(name, p)| name.as_str() == org || profile_matches_org_identifier(p, org))
-        .map(|(name, _)| name.as_str())
-        .collect();
-
-    match matches.len() {
-        0 => None,
-        1 => Some(matches[0]),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-fn profile_names_for_org<'a>(org: &str, store: &'a AuthStore) -> Vec<&'a str> {
-    store
-        .profiles
-        .iter()
-        .filter(|(_, profile)| profile_matches_org_identifier(profile, org))
-        .map(|(name, _)| name.as_str())
-        .collect()
-}
-
 fn is_cross_org_oauth_profile(profile: &AuthProfile) -> bool {
     profile.auth_kind == AuthKind::Oauth
         && profile
@@ -1241,9 +1094,8 @@ fn auth_profile_names_by_kind<'a>(
         .collect()
 }
 
-fn profile_info_from_store_entry(name: &str, profile: &AuthProfile) -> ProfileInfo {
+fn profile_info_from_store_entry(profile: &AuthProfile) -> ProfileInfo {
     ProfileInfo {
-        name: name.to_string(),
         auth_method: auth_kind_label(profile.auth_kind).to_string(),
         org_name: profile.org_name.clone(),
         user_name: profile.user_name.clone(),
@@ -1253,15 +1105,11 @@ fn profile_info_from_store_entry(name: &str, profile: &AuthProfile) -> ProfileIn
 }
 
 fn profile_info_for_candidate(store: &AuthStore, name: &str) -> Option<ProfileInfo> {
-    store
-        .profiles
-        .get(name)
-        .map(|profile| profile_info_from_store_entry(name, profile))
+    store.profiles.get(name).map(profile_info_from_store_entry)
 }
 
 fn ad_hoc_api_key_profile(org: Option<&str>, api_key: &str) -> ProfileInfo {
     ProfileInfo {
-        name: String::new(),
         auth_method: auth_kind_label(AuthKind::ApiKey).to_string(),
         org_name: org.map(str::to_string),
         user_name: None,
@@ -1456,148 +1304,6 @@ fn select_auth_profile_candidate(
             );
         }
     }
-}
-
-#[cfg(test)]
-fn maybe_select_profile_for_auth(
-    base: &BaseArgs,
-    store: &AuthStore,
-    cfg_org: &Option<String>,
-    can_prompt: bool,
-) -> Result<Option<String>> {
-    if resolve_api_key_override(base).is_some() {
-        return Ok(None);
-    }
-
-    let requested_profile = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if requested_profile.is_some() {
-        return Ok(None);
-    }
-
-    let effective_org = base.org_name.as_deref().or(cfg_org.as_deref());
-    if let Some(org) = effective_org {
-        if resolve_profile_for_org(org, store).is_some() {
-            return Ok(None);
-        }
-
-        let matching_profiles = profile_names_for_org(org, store);
-        if matching_profiles.is_empty() {
-            return Ok(None);
-        }
-
-        if !can_prompt {
-            bail!(
-                "multiple auth logins for org '{org}': {}. Use --org to disambiguate.",
-                matching_profiles.join(", ")
-            );
-        }
-
-        return select_profile_from_store(
-            &format!("Multiple profiles for '{org}'. Select one"),
-            &matching_profiles,
-            Some(org),
-            store,
-        )
-        .map(Some);
-    }
-
-    if store.profiles.len() <= 1 {
-        return Ok(None);
-    }
-
-    let names: Vec<&str> = store.profiles.keys().map(|name| name.as_str()).collect();
-    if !can_prompt {
-        bail!(
-            "multiple auth logins available: {}. Pass --org <ORG> to disambiguate.",
-            names.join(", ")
-        );
-    }
-
-    select_profile_from_store("Select org", &names, None, store).map(Some)
-}
-
-#[cfg(test)]
-fn resolve_auth_from_store_with_secret_lookup<F>(
-    base: &BaseArgs,
-    store: &AuthStore,
-    load_secret: F,
-    cfg_org: &Option<String>,
-) -> Result<ResolvedAuth>
-where
-    F: Fn(&str) -> Result<Option<String>>,
-{
-    if let Some(api_key) = resolve_api_key_override(base) {
-        return Ok(ResolvedAuth {
-            api_key: Some(api_key),
-            api_url: base.api_url.clone(),
-            app_url: base.app_url.clone(),
-            org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
-            is_oauth: false,
-        });
-    }
-
-    let requested_profile = base
-        .profile
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
-
-    let effective_org = base.org_name.as_deref().or(cfg_org.as_deref());
-
-    let selected_profile_name = if let Some(profile) = requested_profile {
-        Some(profile)
-    } else if let Some(org) = effective_org {
-        resolve_profile_for_org(org, store)
-    } else if store.profiles.len() == 1 {
-        store.profiles.keys().next().map(|k| k.as_str())
-    } else {
-        None
-    };
-
-    if let Some(profile_name) = selected_profile_name {
-        let profile = store.profiles.get(profile_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "auth login '{profile_name}' not found; run `bt auth profiles` or `bt auth login --org <ORG>`"
-            )
-        })?;
-        let is_oauth = profile.auth_kind == AuthKind::Oauth;
-        let api_key = if is_oauth {
-            None
-        } else {
-            Some(load_secret(profile_name)?.ok_or_else(|| {
-                recoverable_auth_error(
-                    RecoverableAuthErrorKind::StoredCredential,
-                    format!(
-                        "no keychain credential found for auth login '{profile_name}'; re-run `bt auth login --org <ORG>`"
-                    ),
-                )
-            })?)
-        };
-
-        return Ok(ResolvedAuth {
-            api_key,
-            api_url: base.api_url.clone().or_else(|| profile.api_url.clone()),
-            app_url: base.app_url.clone().or_else(|| profile.app_url.clone()),
-            org_name: base
-                .org_name
-                .clone()
-                .or_else(|| cfg_org.clone())
-                .or_else(|| profile.org_name.clone()),
-            is_oauth,
-        });
-    }
-
-    Ok(ResolvedAuth {
-        api_key: None,
-        api_url: base.api_url.clone(),
-        app_url: base.app_url.clone(),
-        org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
-        is_oauth: false,
-    })
 }
 
 async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
@@ -2016,240 +1722,6 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     )
 }
 
-#[cfg(test)]
-fn resolve_selected_profile_name_for_debug(
-    base: &BaseArgs,
-    store: &AuthStore,
-) -> Result<(String, &'static str)> {
-    if let Some(profile_name) = base.profile.as_deref() {
-        let profile_name = profile_name.trim();
-        if !profile_name.is_empty() {
-            return Ok((profile_name.to_string(), "legacy profile"));
-        }
-    }
-
-    if let Some(org) = base.org_name.as_deref() {
-        if let Some(profile_name) = resolve_profile_for_org(org, store) {
-            return Ok((profile_name.to_string(), "org-based resolution"));
-        }
-    }
-
-    if store.profiles.len() == 1 {
-        let name = store.profiles.keys().next().unwrap().clone();
-        return Ok((name, "only profile"));
-    }
-
-    if store.profiles.len() > 1 && ui::can_prompt() {
-        if let Some(name) = select_profile_interactive(None)? {
-            return Ok((name, "interactive selection"));
-        }
-    }
-
-    bail!("no auth login selected; pass --org <ORG> or rerun interactively")
-}
-
-#[cfg(test)]
-fn resolve_profile_name(
-    explicit_profile: Option<&str>,
-    suggested_org_name: Option<&str>,
-) -> Result<String> {
-    if let Some(profile) = explicit_profile {
-        let profile = profile.trim();
-        if profile.is_empty() {
-            bail!("profile name cannot be empty");
-        }
-        return Ok(profile.to_string());
-    }
-
-    Ok(suggested_org_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("profile")
-        .to_string())
-}
-
-#[cfg(test)]
-fn default_login_org_name(
-    store: &AuthStore,
-    profile_name: Option<&str>,
-    requested_org_name: Option<&str>,
-) -> Option<String> {
-    if requested_org_name
-        .map(str::trim)
-        .is_some_and(|name| !name.is_empty())
-    {
-        return None;
-    }
-
-    let profile_name = profile_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())?;
-    let stored_org_name = store
-        .profiles
-        .get(profile_name)
-        .and_then(|profile| profile.org_name.as_deref())
-        .map(str::trim)
-        .filter(|org_name| !org_name.is_empty());
-
-    Some(stored_org_name.unwrap_or(profile_name).to_string())
-}
-
-#[cfg(test)]
-fn default_profile_name(suggested_org_name: Option<&str>) -> String {
-    suggested_org_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("profile")
-        .to_string()
-}
-
-#[cfg(test)]
-fn next_available_profile_name(base_name: &str, store: &AuthStore) -> String {
-    if !store.profiles.contains_key(base_name) {
-        return base_name.to_string();
-    }
-
-    (2u32..)
-        .map(|idx| format!("{base_name}-{idx}"))
-        .find(|candidate| !store.profiles.contains_key(candidate))
-        .expect("profile name sequence is infinite")
-}
-
-#[cfg(test)]
-fn resolve_api_key_login_profile_name(
-    explicit_profile: Option<&str>,
-    suggested_org_name: Option<&str>,
-    selected_api_url: &str,
-    store: &AuthStore,
-) -> Result<(String, bool)> {
-    if let Some(profile_name) = explicit_profile {
-        let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
-        let should_confirm_overwrite = store.profiles.get(&profile_name).is_some_and(|profile| {
-            !profile_matches_api_key_login_target(profile, selected_api_url, suggested_org_name)
-        });
-        return Ok((profile_name.clone(), should_confirm_overwrite));
-    }
-
-    let default_name = default_profile_name(suggested_org_name);
-    let has_matching_api_key_profile = store.profiles.values().any(|profile| {
-        profile.auth_kind == AuthKind::ApiKey
-            && profile.api_url.as_deref() == Some(selected_api_url)
-            && profile.org_name.as_deref() == suggested_org_name
-    });
-
-    if has_matching_api_key_profile {
-        return Ok((next_available_profile_name(&default_name, store), false));
-    }
-
-    Ok((
-        default_name.clone(),
-        store.profiles.contains_key(&default_name),
-    ))
-}
-
-#[cfg(test)]
-fn resolve_oauth_login_profile_name(
-    explicit_profile: Option<&str>,
-    suggested_org_name: Option<&str>,
-    selected_api_url: &str,
-    app_url: &str,
-    jwt_id: &JwtIdentity,
-    store: &AuthStore,
-) -> Result<(String, bool)> {
-    if let Some(profile_name) = explicit_profile {
-        let profile_name = resolve_profile_name(Some(profile_name), suggested_org_name)?;
-        let should_confirm_overwrite = store.profiles.get(&profile_name).is_some_and(|profile| {
-            !profile_matches_oauth_login_target(
-                profile,
-                selected_api_url,
-                app_url,
-                suggested_org_name,
-                jwt_id,
-            )
-        });
-        return Ok((profile_name.clone(), should_confirm_overwrite));
-    }
-
-    let matched_profile = store
-        .profiles
-        .iter()
-        .filter(|(_, profile)| {
-            profile_matches_oauth_login_target(
-                profile,
-                selected_api_url,
-                app_url,
-                suggested_org_name,
-                jwt_id,
-            )
-        })
-        .max_by(|(left_name, left), (right_name, right)| {
-            left.oauth_access_expires_at
-                .unwrap_or_default()
-                .cmp(&right.oauth_access_expires_at.unwrap_or_default())
-                .then_with(|| left_name.cmp(right_name))
-        })
-        .map(|(name, _)| name.clone());
-
-    if let Some(profile_name) = matched_profile {
-        return Ok((profile_name, false));
-    }
-
-    let default_name = default_profile_name(suggested_org_name);
-    Ok((
-        default_name.clone(),
-        store.profiles.contains_key(&default_name),
-    ))
-}
-
-#[cfg(test)]
-fn profile_matches_api_key_login_target(
-    profile: &AuthProfile,
-    selected_api_url: &str,
-    suggested_org_name: Option<&str>,
-) -> bool {
-    profile.auth_kind == AuthKind::ApiKey
-        && profile.api_url.as_deref() == Some(selected_api_url)
-        && profile.org_name.as_deref() == suggested_org_name
-}
-
-#[cfg(test)]
-fn profile_matches_oauth_login_target(
-    profile: &AuthProfile,
-    selected_api_url: &str,
-    app_url: &str,
-    suggested_org_name: Option<&str>,
-    jwt_id: &JwtIdentity,
-) -> bool {
-    profile.auth_kind == AuthKind::Oauth
-        && profile.api_url.as_deref() == Some(selected_api_url)
-        && profile.app_url.as_deref() == Some(app_url)
-        && profile.org_name.as_deref() == suggested_org_name
-        && profile.user_name == jwt_id.name
-        && profile.email == jwt_id.email
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn confirm_profile_overwrite(profile_name: &str) -> Result<()> {
-    let store = load_auth_store()?;
-    if !store.profiles.contains_key(profile_name) {
-        return Ok(());
-    }
-    let Some(term) = ui::prompt_term() else {
-        return Ok(());
-    };
-    let confirmed = Confirm::new()
-        .with_prompt(format!(
-            "Profile '{profile_name}' already exists. Overwrite?"
-        ))
-        .default(false)
-        .interact_on(&term)?;
-    if !confirmed {
-        bail!("login cancelled");
-    }
-    Ok(())
-}
-
 fn format_login_success(selected_org: Option<&LoginOrgInfo>, api_url: &str) -> String {
     match selected_org {
         Some(org) => format!("Logged in as {} (api: {api_url})", org.name),
@@ -2331,7 +1803,6 @@ async fn persist_post_login_context(
     let mut cfg = config::load_file(&path);
     switch::apply_switch_config(
         &mut cfg,
-        None,
         selected_org.map(|org| org.name.as_str()),
         project.as_ref(),
     );
@@ -2700,8 +2171,8 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
     if json {
         let output: Vec<serde_json::Value> = store
             .profiles
-            .iter()
-            .map(|(_name, p)| {
+            .values()
+            .map(|p| {
                 serde_json::json!({
                     "auth": auth_kind_label(p.auth_kind),
                     "org": p.org_name,
@@ -4283,9 +3754,10 @@ mod tests {
             quiet_source: None,
             no_color: false,
             no_input: false,
-            profile: None,
             project: None,
+            project_source: None,
             org_name: None,
+            org_name_source: None,
             api_key: None,
             api_key_source: None,
             prefer_api_key: false,
@@ -4296,9 +3768,8 @@ mod tests {
         }
     }
 
-    fn auth_config(profile: Option<&str>, org: Option<&str>) -> crate::config::Config {
+    fn auth_config(org: Option<&str>) -> crate::config::Config {
         crate::config::Config {
-            profile: profile.map(str::to_string),
             org: org.map(str::to_string),
             ..Default::default()
         }
@@ -4937,230 +4408,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_uses_profile_when_no_api_key_override() {
-        let mut base = make_base();
-        base.profile = Some("work".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
-                app_url: Some("https://www.example.com".to_string()),
-                org_name: Some("Example Org".to_string()),
-                oauth_client_id: None,
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".to_string())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
-        assert_eq!(resolved.api_url.as_deref(), Some("https://api.example.com"));
-        assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
-        assert!(!resolved.is_oauth);
-    }
-
-    #[test]
     fn config_auth_context_returns_config_org() {
         let base = make_base();
-        let cfg = auth_config(Some("default-profile"), Some("local-org"));
+        let cfg = auth_config(Some("local-org"));
 
         let org = config_auth_context_from_config(&base, &cfg);
 
         assert_eq!(org.as_deref(), Some("local-org"));
-    }
-
-    #[test]
-    fn config_auth_context_ignores_legacy_profile_and_preserves_config_org() {
-        let mut base = make_base();
-        base.profile = Some("explicit-profile".to_string());
-        let cfg = auth_config(Some("config-profile"), Some("local-org"));
-
-        let org = config_auth_context_from_config(&base, &cfg);
-
-        assert_eq!(org.as_deref(), Some("local-org"));
-    }
-
-    #[test]
-    fn resolve_auth_prefers_explicit_api_key() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".to_string());
-        base.api_url = Some("https://override.example.com".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
-                app_url: None,
-                org_name: None,
-                oauth_client_id: None,
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".to_string())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
-        assert_eq!(
-            resolved.api_url.as_deref(),
-            Some("https://override.example.com")
-        );
-        assert!(!resolved.is_oauth);
-    }
-
-    #[test]
-    fn resolve_auth_prefer_api_key_uses_api_key_override() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".to_string());
-        base.prefer_api_key = true;
-        base.profile = Some("work".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
-                app_url: None,
-                org_name: Some("Example Org".to_string()),
-                oauth_client_id: None,
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".to_string())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
-        assert_eq!(resolved.org_name, None);
-    }
-
-    #[test]
-    fn resolve_auth_prefers_cli_api_key_even_with_prefer_api_key() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".to_string());
-        base.api_key_source = Some(crate::args::ArgValueSource::CommandLine);
-        base.prefer_api_key = true;
-        base.profile = Some("work".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
-                app_url: None,
-                org_name: Some("Example Org".to_string()),
-                oauth_client_id: None,
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".to_string())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
-        assert_eq!(resolved.org_name, None);
-    }
-
-    #[test]
-    fn resolve_auth_legacy_explicit_profile_does_not_override_api_key() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".to_string());
-        base.profile = Some("work".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
-                app_url: None,
-                org_name: Some("Example Org".to_string()),
-                oauth_client_id: None,
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".to_string())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
-        assert_eq!(resolved.org_name, None);
-    }
-
-    #[test]
-    fn resolve_auth_marks_oauth_profiles() {
-        let mut base = make_base();
-        base.profile = Some("work".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.example.com".to_string()),
-                app_url: Some("https://www.example.com".to_string()),
-                org_name: Some("Example Org".to_string()),
-                oauth_client_id: Some("bt_cli_work".to_string()),
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("should-not-be-used".to_string())),
-            &None,
-        )
-        .expect("resolve");
-
-        assert!(resolved.is_oauth);
-        assert_eq!(resolved.api_key, None);
-        assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
-    }
-
-    #[test]
-    fn refresh_profile_selector_prefers_explicit_profile() {
-        let mut base = make_base();
-        base.profile = Some(" work ".to_string());
-        let store = AuthStore::default();
-        let (profile_name, source) =
-            resolve_selected_profile_name_for_debug(&base, &store).expect("resolve");
-        assert_eq!(profile_name, "work");
-        assert_eq!(source, "legacy profile");
     }
 
     #[test]
@@ -5192,388 +4446,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_profile_for_org_exact_profile_name() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "acme".into(),
-            AuthProfile {
-                org_name: Some("acme-corp".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(resolve_profile_for_org("acme", &store), Some("acme"));
-    }
-
-    #[test]
-    fn resolve_profile_for_org_by_org_name() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                org_name: Some("acme-corp".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(resolve_profile_for_org("acme-corp", &store), Some("work"));
-    }
-
-    #[test]
-    fn resolve_profile_for_org_no_match() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                org_name: Some("acme-corp".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(resolve_profile_for_org("unknown", &store), None);
-    }
-
-    #[test]
-    fn resolve_profile_for_org_multiple_returns_none() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work-1".into(),
-            AuthProfile {
-                org_name: Some("acme".into()),
-                ..Default::default()
-            },
-        );
-        store.profiles.insert(
-            "work-2".into(),
-            AuthProfile {
-                org_name: Some("acme".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(resolve_profile_for_org("acme", &store), None);
-    }
-
-    #[test]
-    fn profile_selection_requires_choice_when_multiple_profiles_without_prompt() {
-        let base = make_base();
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "alpha".into(),
-            AuthProfile {
-                org_name: Some("alpha-org".into()),
-                ..Default::default()
-            },
-        );
-        store.profiles.insert(
-            "beta".into(),
-            AuthProfile {
-                org_name: Some("beta-org".into()),
-                ..Default::default()
-            },
-        );
-
-        let err = maybe_select_profile_for_auth(&base, &store, &None, false)
-            .expect_err("selection should be required");
-
-        assert!(err.to_string().contains("multiple auth logins available"));
-        assert!(err.to_string().contains("alpha"));
-        assert!(err.to_string().contains("beta"));
-        assert!(err.to_string().contains("--org <ORG>"));
-    }
-
-    #[test]
-    fn profile_selection_requires_choice_for_ambiguous_org_without_prompt() {
-        let mut base = make_base();
-        base.org_name = Some("acme".into());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work-1".into(),
-            AuthProfile {
-                org_name: Some("acme".into()),
-                ..Default::default()
-            },
-        );
-        store.profiles.insert(
-            "work-2".into(),
-            AuthProfile {
-                org_name: Some("acme".into()),
-                ..Default::default()
-            },
-        );
-
-        let err = maybe_select_profile_for_auth(&base, &store, &None, false)
-            .expect_err("org selection should be required");
-
-        assert!(err
-            .to_string()
-            .contains("multiple auth logins for org 'acme'"));
-        assert!(err.to_string().contains("work-1"));
-        assert!(err.to_string().contains("work-2"));
-    }
-
-    #[test]
-    fn profile_selection_skips_when_api_key_override_is_active() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".into());
-
-        let mut store = AuthStore::default();
-        store
-            .profiles
-            .insert("alpha".into(), AuthProfile::default());
-        store.profiles.insert("beta".into(), AuthProfile::default());
-
-        let selection = maybe_select_profile_for_auth(&base, &store, &None, false)
-            .expect("api key override should skip profile selection");
-
-        assert_eq!(selection, None);
-    }
-
-    #[test]
-    fn resolve_auth_uses_org_to_find_profile() {
-        let mut base = make_base();
-        base.org_name = Some("acme-corp".into());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                org_name: Some("acme-corp".into()),
-                api_url: Some("https://api.acme.com".into()),
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".into())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
-        assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));
-    }
-
-    #[test]
-    fn resolve_auth_uses_config_org_to_find_profile() {
-        let base = make_base();
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                org_name: Some("acme-corp".into()),
-                api_url: Some("https://api.acme.com".into()),
-                ..Default::default()
-            },
-        );
-        let cfg_org = Some("acme-corp".to_string());
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".into())),
-            &cfg_org,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
-        assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));
-    }
-
-    #[test]
-    fn resolve_auth_config_org_overrides_profile_org() {
-        let mut base = make_base();
-        base.profile = Some("default-profile".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "default-profile".into(),
-            AuthProfile {
-                org_name: Some("profile-org".into()),
-                ..Default::default()
-            },
-        );
-        let cfg_org = Some("local-org".to_string());
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".into())),
-            &cfg_org,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
-        assert_eq!(resolved.org_name.as_deref(), Some("local-org"));
-    }
-
-    #[test]
-    fn resolve_auth_api_key_override_keeps_config_org() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".into());
-
-        let store = AuthStore::default();
-        let cfg_org = Some("local-org".to_string());
-
-        let resolved =
-            resolve_auth_from_store_with_secret_lookup(&base, &store, |_| Ok(None), &cfg_org)
-                .expect("resolve");
-
-        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
-        assert_eq!(resolved.org_name.as_deref(), Some("local-org"));
-    }
-
-    #[test]
-    fn resolve_auth_explicit_profile_overrides_org_resolution() {
-        let mut base = make_base();
-        base.profile = Some("other".into());
-        base.org_name = Some("acme-corp".into());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                org_name: Some("acme-corp".into()),
-                ..Default::default()
-            },
-        );
-        store.profiles.insert(
-            "other".into(),
-            AuthProfile {
-                org_name: Some("other-org".into()),
-                api_url: Some("https://api.other.com".into()),
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("other-key".into())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("other-key"));
-        assert_eq!(resolved.org_name.as_deref(), Some("acme-corp"));
-    }
-
-    #[test]
-    fn resolve_api_key_login_profile_name_creates_new_profile_for_matching_org() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "acme".into(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.acme.example".into()),
-                org_name: Some("acme".into()),
-                ..Default::default()
-            },
-        );
-
-        let (profile_name, should_confirm) = resolve_api_key_login_profile_name(
-            None,
-            Some("acme"),
-            "https://api.acme.example",
-            &store,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile_name, "acme-2");
-        assert!(!should_confirm);
-    }
-
-    #[test]
-    fn resolve_api_key_login_profile_name_updates_explicit_matching_profile_without_confirm() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.test.example".into()),
-                org_name: Some("test-org".into()),
-                ..Default::default()
-            },
-        );
-
-        let (profile_name, should_confirm) = resolve_api_key_login_profile_name(
-            Some("work"),
-            Some("test-org"),
-            "https://api.test.example",
-            &store,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile_name, "work");
-        assert!(!should_confirm);
-    }
-
-    #[test]
-    fn resolve_api_key_login_profile_name_confirms_explicit_different_target() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.test.example".into()),
-                org_name: Some("test-org".into()),
-                ..Default::default()
-            },
-        );
-
-        let (profile_name, should_confirm) = resolve_api_key_login_profile_name(
-            Some("work"),
-            Some("other-org"),
-            "https://api.test.example",
-            &store,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile_name, "work");
-        assert!(should_confirm);
-    }
-
-    #[test]
-    fn default_login_org_name_uses_profile_org_when_org_not_requested() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                org_name: Some("acme".into()),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            default_login_org_name(&store, Some(" work "), None).as_deref(),
-            Some("acme")
-        );
-    }
-
-    #[test]
-    fn default_login_org_name_falls_back_to_profile_name() {
-        let store = AuthStore::default();
-
-        assert_eq!(
-            default_login_org_name(&store, Some(" acme "), None).as_deref(),
-            Some("acme")
-        );
-    }
-
-    #[test]
-    fn default_login_org_name_ignores_profile_when_org_requested() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                org_name: Some("acme".into()),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            default_login_org_name(&store, Some("work"), Some("other")),
-            None
-        );
-    }
-
-    #[test]
     fn move_default_login_org_first_moves_matching_org() {
         let mut orgs = vec![
             login_org("org_1", "acme"),
@@ -5595,122 +4467,6 @@ mod tests {
         assert_eq!(orgs[1].name, "beta");
     }
 
-    #[test]
-    fn resolve_oauth_login_profile_name_reuses_most_recent_matching_profile() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "older".into(),
-            AuthProfile {
-                auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.acme.example".into()),
-                app_url: Some("https://www.acme.example".into()),
-                org_name: Some("acme".into()),
-                oauth_access_expires_at: Some(100),
-                user_name: Some("Alice".into()),
-                email: Some("alice@example.com".into()),
-                ..Default::default()
-            },
-        );
-        store.profiles.insert(
-            "newer".into(),
-            AuthProfile {
-                auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.acme.example".into()),
-                app_url: Some("https://www.acme.example".into()),
-                org_name: Some("acme".into()),
-                oauth_access_expires_at: Some(200),
-                user_name: Some("Alice".into()),
-                email: Some("alice@example.com".into()),
-                ..Default::default()
-            },
-        );
-
-        let jwt_id = JwtIdentity {
-            name: Some("Alice".into()),
-            email: Some("alice@example.com".into()),
-        };
-        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
-            None,
-            Some("acme"),
-            "https://api.acme.example",
-            "https://www.acme.example",
-            &jwt_id,
-            &store,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile_name, "newer");
-        assert!(!should_confirm);
-    }
-
-    #[test]
-    fn resolve_oauth_login_profile_name_updates_explicit_matching_profile_without_confirm() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.test.example".into()),
-                app_url: Some("https://app.test.example".into()),
-                org_name: Some("test-org".into()),
-                user_name: Some("Test User".into()),
-                email: Some("user@test.example".into()),
-                ..Default::default()
-            },
-        );
-        let jwt_id = JwtIdentity {
-            name: Some("Test User".into()),
-            email: Some("user@test.example".into()),
-        };
-
-        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
-            Some("work"),
-            Some("test-org"),
-            "https://api.test.example",
-            "https://app.test.example",
-            &jwt_id,
-            &store,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile_name, "work");
-        assert!(!should_confirm);
-    }
-
-    #[test]
-    fn resolve_oauth_login_profile_name_confirms_explicit_different_target() {
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".into(),
-            AuthProfile {
-                auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.test.example".into()),
-                app_url: Some("https://app.test.example".into()),
-                org_name: Some("test-org".into()),
-                user_name: Some("Test User".into()),
-                email: Some("user@test.example".into()),
-                ..Default::default()
-            },
-        );
-        let jwt_id = JwtIdentity {
-            name: Some("Test User".into()),
-            email: Some("user@test.example".into()),
-        };
-
-        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
-            Some("work"),
-            Some("other-org"),
-            "https://api.test.example",
-            "https://app.test.example",
-            &jwt_id,
-            &store,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile_name, "work");
-        assert!(should_confirm);
-    }
-
     fn login_org(id: &str, name: &str) -> LoginOrgInfo {
         LoginOrgInfo {
             id: id.to_string(),
@@ -5723,7 +4479,6 @@ mod tests {
     async fn persist_post_login_context_clears_stale_project_for_org_only_login() {
         let _env = TestEnv::new(None, None).await;
         crate::config::save_global(&crate::config::Config {
-            profile: Some("old-profile".to_string()),
             org: Some("old-org".to_string()),
             project: Some("stale-project".to_string()),
             project_id: Some("proj_stale".to_string()),
@@ -5743,7 +4498,6 @@ mod tests {
         let cfg = crate::config::load_global().expect("load global config");
 
         assert_eq!(update.display, "acme");
-        assert_eq!(cfg.profile, None);
         assert_eq!(cfg.org.as_deref(), Some("acme"));
         assert_eq!(cfg.project, None);
         assert_eq!(cfg.project_id, None);

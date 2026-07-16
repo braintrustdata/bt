@@ -1,59 +1,5 @@
 use crate::auth::ProfileInfo;
 
-#[cfg(test)]
-fn resolve_profile_info_from_profiles(
-    profile: Option<&str>,
-    org: Option<&str>,
-    profiles: Vec<ProfileInfo>,
-) -> Option<ProfileInfo> {
-    if let Some(profile_name) = profile {
-        if let Some(profile) = profiles
-            .iter()
-            .find(|profile| profile.name == profile_name)
-            .cloned()
-        {
-            return Some(profile);
-        }
-    }
-
-    if let Some(org_name) = org {
-        if profiles.iter().any(|profile| profile.name == org_name) {
-            return profiles
-                .into_iter()
-                .find(|profile| profile.name == org_name);
-        }
-
-        let org_matches: Vec<&ProfileInfo> = profiles
-            .iter()
-            .filter(|profile| profile.org_name.as_deref() == Some(org_name))
-            .collect();
-        if org_matches.len() == 1 {
-            let profile_name = org_matches[0].name.clone();
-            return profiles
-                .into_iter()
-                .find(|profile| profile.name == profile_name);
-        }
-        let oauth_matches: Vec<&ProfileInfo> = org_matches
-            .iter()
-            .copied()
-            .filter(|profile| profile.email.is_some() || profile.user_name.is_some())
-            .collect();
-        if oauth_matches.len() == 1 {
-            let profile_name = oauth_matches[0].name.clone();
-            return profiles
-                .into_iter()
-                .find(|profile| profile.name == profile_name);
-        }
-        return None;
-    }
-
-    if profiles.len() == 1 {
-        return profiles.into_iter().next();
-    }
-
-    None
-}
-
 pub(crate) fn profile_author_slug(profile: &ProfileInfo) -> Option<String> {
     [
         profile.user_name.as_deref(),
@@ -102,13 +48,11 @@ mod tests {
     use super::*;
 
     fn profile_info(
-        name: &str,
         org_name: Option<&str>,
         user_name: Option<&str>,
         email: Option<&str>,
     ) -> ProfileInfo {
         ProfileInfo {
-            name: name.to_string(),
             auth_method: if email.is_some() || user_name.is_some() {
                 "oauth"
             } else {
@@ -123,35 +67,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_profile_info_prefers_explicit_profile() {
-        let profile = resolve_profile_info_from_profiles(
-            Some("work"),
-            Some("other-org"),
-            vec![
-                profile_info("other", Some("other-org"), None, None),
-                profile_info("work", Some("work-org"), None, None),
-            ],
-        )
-        .expect("profile");
-
-        assert_eq!(profile.name, "work");
-    }
-
-    #[test]
-    fn resolve_profile_info_finds_profile_by_org_name() {
-        let profile = resolve_profile_info_from_profiles(
-            None,
-            Some("work-org"),
-            vec![profile_info("work", Some("work-org"), None, None)],
-        )
-        .expect("profile");
-
-        assert_eq!(profile.name, "work");
-    }
-
-    #[test]
     fn profile_author_slug_prefers_user_name() {
-        let profile = profile_info("work", None, Some("Alice Smith"), Some("alice@example.com"));
+        let profile = profile_info(None, Some("Alice Smith"), Some("alice@example.com"));
         assert_eq!(
             profile_author_slug(&profile).as_deref(),
             Some("alice-smith")
@@ -160,13 +77,13 @@ mod tests {
 
     #[test]
     fn profile_author_slug_falls_back_to_email_local_part() {
-        let profile = profile_info("work", None, None, Some("alice.dev@example.com"));
+        let profile = profile_info(None, None, Some("alice.dev@example.com"));
         assert_eq!(profile_author_slug(&profile).as_deref(), Some("alice-dev"));
     }
 
     #[test]
-    fn profile_author_slug_ignores_internal_profile_name() {
-        let profile = profile_info("Work Profile", None, None, None);
+    fn profile_author_slug_returns_none_without_identity_or_org() {
+        let profile = profile_info(None, None, None);
         assert_eq!(profile_author_slug(&profile), None);
     }
 

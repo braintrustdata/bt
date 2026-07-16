@@ -346,6 +346,8 @@ fn try_main() -> Result<()> {
 fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
     base.verbose_source = find_value_source(matches, "verbose").and_then(map_value_source);
     base.quiet_source = find_value_source(matches, "quiet").and_then(map_value_source);
+    base.org_name_source = find_value_source(matches, "org_name").and_then(map_value_source);
+    base.project_source = find_value_source(matches, "project").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
 }
 
@@ -542,6 +544,32 @@ mod tests {
 
         assert_eq!(
             cli.command.base().api_key_source,
+            Some(ArgValueSource::CommandLine)
+        );
+    }
+
+    #[test]
+    fn apply_base_arg_sources_tracks_cli_org_and_project() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "bt",
+                "status",
+                "--org",
+                "test-org",
+                "--project",
+                "test-project",
+            ])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        assert_eq!(
+            cli.command.base().org_name_source,
+            Some(ArgValueSource::CommandLine)
+        );
+        assert_eq!(
+            cli.command.base().project_source,
             Some(ArgValueSource::CommandLine)
         );
     }

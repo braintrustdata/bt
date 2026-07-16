@@ -130,12 +130,12 @@ fn status_quiet_and_verbose_conflict() {
 }
 
 #[test]
-fn status_json_keeps_local_org_when_global_profile_has_different_org() {
+fn status_json_prefers_local_org_over_global_org() {
     let repo = make_git_repo();
     fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
     fs::write(
         repo.path().join(".bt/config.json"),
-        r#"{"profile":null,"org":"local-org","project":"local-project","project_id":null}"#,
+        r#"{"org":"local-org","project":"local-project","project_id":null}"#,
     )
     .expect("write local config");
 
@@ -145,11 +145,9 @@ fn status_json_keeps_local_org_when_global_profile_has_different_org() {
     fs::create_dir_all(&global_bt_dir).expect("create global bt dir");
     fs::write(
         global_bt_dir.join("config.json"),
-        r#"{"profile":"default-profile","org":"profile-org"}"#,
+        r#"{"org":"profile-org"}"#,
     )
     .expect("write global config");
-    write_auth_store(config_home.path(), &[("default-profile", "profile-org")]);
-
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
     cmd.current_dir(repo.path())
@@ -160,7 +158,6 @@ fn status_json_keeps_local_org_when_global_profile_has_different_org() {
         .success()
         .stdout(predicate::str::contains(r#""org":"local-org""#))
         .stdout(predicate::str::contains(r#""project":"local-project""#))
-        .stdout(predicate::str::contains(r#""profile""#).not())
         .stdout(predicate::str::contains(r#""org":"profile-org""#).not());
 }
 
