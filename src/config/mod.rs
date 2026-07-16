@@ -18,8 +18,6 @@ mod set;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
     pub org: Option<String>,
     pub project: Option<String>,
     pub project_id: Option<String>,
@@ -82,7 +80,6 @@ impl Config {
             self.project_id.clone()
         };
         Config {
-            profile: None,
             org: other.org.clone().or_else(|| self.org.clone()),
             project,
             project_id,
@@ -128,9 +125,7 @@ pub fn load_file(path: &Path) -> Config {
         }
     };
 
-    // Legacy config files may contain `profile`; profiles are no longer a
-    // user-facing selector, so ignore it rather than warning or preserving it.
-    config.profile = None;
+    config.extra.remove("profile");
 
     for key in config.extra.keys() {
         print_command_status(
@@ -427,7 +422,7 @@ mod tests {
         assert_eq!(merged.project, Some("other-proj".into()));
     }
 
-    fn base_with_profile(profile: Option<&str>) -> BaseArgs {
+    fn base_args() -> BaseArgs {
         BaseArgs {
             json: false,
             verbose: false,
@@ -436,9 +431,10 @@ mod tests {
             quiet_source: None,
             no_color: false,
             no_input: false,
-            profile: profile.map(str::to_string),
             org_name: None,
+            org_name_source: None,
             project: None,
+            project_source: None,
             api_key: None,
             api_key_source: None,
             prefer_api_key: false,
@@ -449,9 +445,8 @@ mod tests {
         }
     }
 
-    fn config(profile: Option<&str>, org: Option<&str>, project: Option<&str>) -> Config {
+    fn config(org: Option<&str>, project: Option<&str>) -> Config {
         Config {
-            profile: profile.map(str::to_string),
             org: org.map(str::to_string),
             project: project.map(str::to_string),
             ..Default::default()
@@ -459,20 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn project_config_matches_org_and_ignores_legacy_profile() {
-        let base = base_with_profile(Some("work"));
+    fn project_config_matches_org() {
+        let base = base_args();
         let cases = [
-            (config(None, Some("acme"), Some("demo")), Some("demo")),
-            (config(None, Some("other"), Some("demo")), None),
-            (config(None, None, Some("demo")), Some("demo")),
-            (
-                config(Some("other"), Some("acme"), Some("demo")),
-                Some("demo"),
-            ),
-            (
-                config(Some("work"), Some("acme"), Some("demo")),
-                Some("demo"),
-            ),
+            (config(Some("acme"), Some("demo")), Some("demo")),
+            (config(Some("other"), Some("demo")), None),
+            (config(None, Some("demo")), Some("demo")),
         ];
 
         for (cfg, expected) in cases {

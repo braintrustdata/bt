@@ -219,17 +219,12 @@ fn apply_experiment_url_hints_to_base(
         }
     }
 
-    let has_profile_override = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
     let has_org_override = base
         .org_name
         .as_deref()
         .map(str::trim)
         .is_some_and(|v| !v.is_empty());
-    if !has_profile_override && !has_org_override {
+    if !has_org_override {
         if let Some(org) = parsed_url
             .org
             .as_deref()

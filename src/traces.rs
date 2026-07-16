@@ -5277,7 +5277,7 @@ fn logs_hints(
         if let Some(cursor) = next_cursor {
             hints.push(format!(
                 "Next page: bt view logs{} --object-ref {object_ref} --cursor {cursor}{limit_suffix}",
-                profile_flag_suffix(profile)
+                org_flag_suffix(profile)
             ));
         } else {
             hints.push(format!(
@@ -5299,7 +5299,7 @@ fn trace_hints(
     let mut hints = vec![
         format!(
             "Trace fetch returns truncated span rows; use `bt view span{} --object-ref {object_ref} --id <row-id>` for full single-span payloads.",
-            profile_flag_suffix(profile)
+            org_flag_suffix(profile)
         ),
         "Write output to a file for long traces.".to_string(),
     ];
@@ -5312,7 +5312,7 @@ fn trace_hints(
         if let Some(cursor) = next_cursor {
             hints.push(format!(
                 "Next page: bt view trace{} --object-ref {object_ref} --trace-id {trace_id} --cursor {cursor}{limit_suffix}",
-                profile_flag_suffix(profile)
+                org_flag_suffix(profile)
             ));
         } else {
             hints.push(format!(
@@ -5341,7 +5341,7 @@ fn thread_hints(profile: Option<&str>) -> Vec<String> {
     vec![
         format!(
             "Open an interactive thread view with `bt view thread{} --trace-id <root-span-id>`.",
-            profile_flag_suffix(profile)
+            org_flag_suffix(profile)
         ),
         "Use `--non-interactive` for a compact text transcript.".to_string(),
     ]
@@ -5351,7 +5351,7 @@ fn waterfall_hints(profile: Option<&str>, has_more: bool) -> Vec<String> {
     let mut hints = vec![
         format!(
             "Render an agent-readable trace report with `bt view waterfall{} --trace-id <root-span-id>`.",
-            profile_flag_suffix(profile)
+            org_flag_suffix(profile)
         ),
         "Use `--json` for computed offsets, token counts, costs, cache metrics, and raw ids."
             .to_string(),
@@ -5406,7 +5406,7 @@ fn print_logs_text(
         println!("next_cursor: {cursor}");
         println!(
             "next: bt view logs{} --object-ref {object_ref} --cursor {cursor} --non-interactive{limit_suffix}",
-            profile_flag_suffix(profile)
+            org_flag_suffix(profile)
         );
     } else {
         println!("No additional rows.");
@@ -5552,7 +5552,7 @@ fn print_thread_text(
 
     println!(
         "\njson: bt view thread --json{} --trace-id {}",
-        profile_flag_suffix(profile),
+        org_flag_suffix(profile),
         target.root_span_id
     );
 }
@@ -5589,7 +5589,7 @@ fn print_trace_text(
     }
     println!(
         "\nTrace output is truncated. Re-run with --json for the full trace (`bt view trace --json{0} --object-ref {1} --trace-id {2}`), or fetch a single span with `bt view span{0} --object-ref {1} --id <row-id>`.",
-        profile_flag_suffix(profile),
+        org_flag_suffix(profile),
         object_ref,
         trace_id
     );
@@ -5602,7 +5602,7 @@ fn print_trace_text(
         println!("next_cursor: {cursor}");
         println!(
             "next: bt view trace{} --object-ref {} --trace-id {} --cursor {} --non-interactive{limit_suffix}",
-            profile_flag_suffix(profile),
+            org_flag_suffix(profile),
             object_ref,
             trace_id,
             cursor
@@ -5683,7 +5683,7 @@ fn format_object_ref_arg(object_ref: &ObjectRef) -> String {
     format!("{}:{}", object_ref.object_type, object_ref.object_name)
 }
 
-fn profile_flag_suffix(org: Option<&str>) -> String {
+fn org_flag_suffix(org: Option<&str>) -> String {
     match org.filter(|p| !p.trim().is_empty()) {
         Some(org) => format!(" --org {}", btql_quote(org)),
         None => String::new(),
@@ -5741,14 +5741,7 @@ fn apply_url_hints_to_base(mut base: BaseArgs, parsed_url: Option<&ParsedTraceUr
 }
 
 #[cfg(test)]
-fn apply_url_hints_with_profile_resolver<F>(
-    base: BaseArgs,
-    parsed_url: Option<&ParsedTraceUrl>,
-    _resolve_profile_for_org: F,
-) -> BaseArgs
-where
-    F: Fn(&str) -> Option<String>,
-{
+fn apply_url_hints_for_test(base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
     apply_url_hints_to_base(base, parsed_url)
 }
 
@@ -6716,9 +6709,10 @@ mod tests {
             quiet_source: None,
             no_color: false,
             no_input: false,
-            profile: None,
             org_name: None,
+            org_name_source: None,
             project: None,
+            project_source: None,
             api_key: None,
             api_key_source: None,
             prefer_api_key: false,
@@ -6954,12 +6948,9 @@ mod tests {
         let base = base_args();
         let parsed = parsed_url_with_org("Lovable");
 
-        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |org| {
-            (org == "Lovable").then(|| "lovable-profile".to_string())
-        });
+        let updated = apply_url_hints_for_test(base, Some(&parsed));
 
         assert_eq!(updated.org_name.as_deref(), Some("Lovable"));
-        assert_eq!(updated.profile, None);
     }
 
     #[test]
@@ -6968,9 +6959,7 @@ mod tests {
         base.org_name = Some("explicit-org".to_string());
         let parsed = parsed_url_with_org("Lovable");
 
-        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |_| {
-            Some("other".to_string())
-        });
+        let updated = apply_url_hints_for_test(base, Some(&parsed));
 
         assert_eq!(updated.org_name.as_deref(), Some("explicit-org"));
     }
