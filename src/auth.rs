@@ -363,7 +363,6 @@ pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
 /// Build login context from stored auth without forcing a login validation request.
 /// Use for read-oriented flows where downstream API calls can surface auth errors.
 pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
-    maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
     let api_key = auth.api_key.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -397,7 +396,6 @@ pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
 }
 
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
-    maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
     let api_key = auth.api_key.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -731,8 +729,6 @@ fn is_unauthorized_auth_error(err: &anyhow::Error) -> bool {
         false
     })
 }
-
-fn maybe_warn_api_key_override(_base: &BaseArgs) {}
 
 fn resolve_cli_api_key_override(base: &BaseArgs) -> Option<String> {
     if matches!(
@@ -3623,13 +3619,6 @@ fn save_profile_oauth_refresh_token(profile_name: &str, refresh_token: &str) -> 
     save_profile_secret(&key, refresh_token)
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn load_profile_oauth_refresh_token(profile_name: &str) -> Result<Option<String>> {
-    let key = oauth_refresh_secret_key(profile_name);
-    load_profile_secret(&key)
-}
-
 fn load_profile_oauth_refresh_token_for_profile(
     profile_name: &str,
     profile: &AuthProfile,
@@ -3650,13 +3639,6 @@ fn delete_profile_oauth_refresh_token(profile_name: &str) -> Result<()> {
 fn save_profile_oauth_access_token(profile_name: &str, access_token: &str) -> Result<()> {
     let key = oauth_access_secret_key(profile_name);
     save_profile_secret(&key, access_token)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn load_profile_oauth_access_token(profile_name: &str) -> Result<Option<String>> {
-    let key = oauth_access_secret_key(profile_name);
-    load_profile_secret(&key)
 }
 
 fn load_profile_oauth_access_token_for_profile(
@@ -3787,12 +3769,6 @@ fn oauth_slot_key(org_id: &str, email: &str) -> String {
 
 fn api_key_slot_key(api_key_hash: &str, org_id: &str) -> String {
     format!("{api_key_hash}::{org_id}")
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn split_slot_key(slot_key: &str) -> Option<(&str, &str)> {
-    slot_key.split_once("::")
 }
 
 fn current_unix_timestamp() -> u64 {
