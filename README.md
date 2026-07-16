@@ -49,6 +49,7 @@ $env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw
 version = "0.15.1"
 
 # Optional, to specify the expected sha
+# The sha are given by https://github.com/braintrustdata/bt/releases#release-v0.15.1, they are the checksum files
 [tools."github:braintrustdata/bt".platforms]
 macos-arm64.checksum = "sha256:dca05a9d4b694c24e91e4d771d9d954fd6372079c8f72f2709f6e68478f0eb28"
 macos-x64.checksum = "sha256:e81155f6d894ef44c653ced9a5b5fc9ba1a2ccc7765c41ada1e8baa345e09d2f"
