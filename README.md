@@ -42,6 +42,33 @@ Canary:
 $env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
 ```
 
+### [mise](https://mise.jdx.dev)
+
+To use the latest stable version:
+
+```toml
+[tools."github:braintrustdata/bt"]
+version = "stable"
+```
+
+To pin a specific version with sha256 hash:
+
+```toml
+[tools."github:braintrustdata/bt"]
+version = "major.minor.patch"
+# The sha are given by the checksum files in https://github.com/braintrustdata/bt/releases#release-vmajor.minor.patch
+# https://github.com/braintrustdata/bt/releases/download/vmajor.minor.patch/bt-aarch64-apple-darwin.tar.gz.sha256 for macos-arm64
+[tools."github:braintrustdata/bt".platforms]
+macos-arm64.checksum = "sha256:the sha256 for macos-arm64"
+linux-x64.checksum = "sha256:the sha256 for linux-x64"
+```
+
+The supported architectures are macos-arm64, macos-x64, linux-arm64, linux-x64, linux-x64-musl, windows-arm64 and windows-x64.
+
+The version can be `"stable"` for the latest stable version, `"major.minor.patch"` for a specific version, `"canary"` to get the latest canary version, or `"canary-7129692509ab"` (12 character short SHA1) to get a specific canary version.
+Don't choose `"stable"` or `"canary"` while pinning SHA256 since they change every release.
+The SHA1 is the commit hash while the (optional) SHA256 of `mise.toml` are hashed from the archive with the binaries.
+
 ### PR/branch builds (no release)
 
 Non-`main` branch builds are available as GitHub Actions run artifacts (download from the workflow run page or with `gh run download`). They are not published as GitHub Releases.
