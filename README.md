@@ -44,27 +44,28 @@ $env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw
 
 ### [mise](https://mise.jdx.dev)
 
+To use the latest stable version:
 ```toml
 [tools."github:braintrustdata/bt"]
-version = "0.15.1"
-
-# Optional, to specify the expected sha
-# The sha are given by https://github.com/braintrustdata/bt/releases#release-v0.15.1, they are the checksum files
-[tools."github:braintrustdata/bt".platforms]
-macos-arm64.checksum = "sha256:dca05a9d4b694c24e91e4d771d9d954fd6372079c8f72f2709f6e68478f0eb28"
-macos-x64.checksum = "sha256:e81155f6d894ef44c653ced9a5b5fc9ba1a2ccc7765c41ada1e8baa345e09d2f"
-linux-arm64.checksum = "sha256:1ff86377e1d6fcaccf9a6f6496a8e94eff7298f44cb98906c97518c9fa2bb73e"
-linux-x64.checksum = "sha256:2fab9f8ece4ac2c66386206fa5f9d905e076da59d95e35423d641c24525740b1"
-linux-x64-musl.checksum = "sha256:a33dea199b74c3282ef1aab5fab916cf9e22b5e11e396e6ef012a104c90fea1a"
-windows-arm64.checksum = "sha256:2cc328337965997a23c95be20dd88318602aac76f5a35311675f416d46095771"
-windows-x64.checksum = "sha256:70f7d7cfebfd978c3e475e13ac035e8931797ead33d1171073520470785f1244"
+version = "stable"
 ```
 
-The version can be `"stable"` for the latest stable version, `"0.15.1"` for a specific version, `"canary"` to get the latest canary version, or `"canary-7129692509ab"` (12 character short SHA1) to get a specific canary version.
+To pin a specific version with sha256 hash:
+```toml
+[tools."github:braintrustdata/bt"]
+version = "major.minor.patch"
+# The sha are given by the checksum files in https://github.com/braintrustdata/bt/releases#release-vmajor.minor.patch
+# https://github.com/braintrustdata/bt/releases/download/vmajor.minor.patch/bt-aarch64-apple-darwin.tar.gz.sha256 for macos-arm64
+[tools."github:braintrustdata/bt".platforms]
+macos-arm64.checksum = "sha256:the sha256 for macos-arm64"
+linux-x64.checksum = "sha256:the sha256 for linux-x64"
+```
 
+The supported architectures are macos-arm64, macos-x64, linux-arm64, linux-x64, linux-x64-musl, windows-arm64 and windows-x64.
+
+The version can be `"stable"` for the latest stable version, `"major.minor.patch"` for a specific version, `"canary"` to get the latest canary version, or `"canary-7129692509ab"` (12 character short SHA1) to get a specific canary version.
 Don't choose `"stable"` or `"canary"` while pinning SHA256 since they change every release.
-
-Do note the SHA1 is the commit hash while the (optional) SHA256 of `mise.toml` are hashed from the archive with the binaries.
+The SHA1 is the commit hash while the (optional) SHA256 of `mise.toml` are hashed from the archive with the binaries.
 
 ### PR/branch builds (no release)
 
