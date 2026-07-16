@@ -45,12 +45,14 @@ $env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw
 ### [mise](https://mise.jdx.dev)
 
 To use the latest stable version:
+
 ```toml
 [tools."github:braintrustdata/bt"]
 version = "stable"
 ```
 
 To pin a specific version with sha256 hash:
+
 ```toml
 [tools."github:braintrustdata/bt"]
 version = "major.minor.patch"
