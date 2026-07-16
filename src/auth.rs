@@ -398,7 +398,11 @@ enum AuthCommand {
 }
 
 #[derive(Debug, Clone, Args)]
-struct AuthProfilesArgs {}
+struct AuthProfilesArgs {
+    /// Only show the profile with this name
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+}
 
 #[derive(Debug, Clone, Args)]
 struct AuthLoginArgs {
@@ -1278,18 +1282,28 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     .await
     .context("login succeeded, but failed to update active context")?;
 
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format_login_success(&selected_org, &profile_name, &selected_api_url),
-    );
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format!("Switched to {}", context_update.display),
-    );
-    if base.verbose {
-        eprintln!("Wrote to {}", context_update.path.display());
-    }
-    Ok(())
+    let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    emit_result(
+        base.json,
+        serde_json::json!({
+            "name": profile_name,
+            "auth": "api_key",
+            "org": selected_org.as_ref().map(|org| org.name.clone()),
+            "api_url": selected_api_url,
+            "app_url": base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL),
+            "status": "ok",
+        }),
+        || {
+            ui::print_command_status(ui::CommandStatus::Success, &human);
+            ui::print_command_status(
+                ui::CommandStatus::Success,
+                &format!("Switched to {}", context_update.display),
+            );
+            if base.verbose {
+                eprintln!("Wrote to {}", context_update.path.display());
+            }
+        },
+    )
 }
 
 async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
@@ -1407,19 +1421,28 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     .await
     .context("login succeeded, but failed to update active context")?;
 
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format_login_success(&selected_org, &profile_name, &selected_api_url),
-    );
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format!("Switched to {}", context_update.display),
-    );
-    if base.verbose {
-        eprintln!("Wrote to {}", context_update.path.display());
-    }
-
-    Ok(())
+    let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    emit_result(
+        base.json,
+        serde_json::json!({
+            "name": profile_name,
+            "auth": "oauth",
+            "org": selected_org.as_ref().map(|org| org.name.clone()),
+            "api_url": selected_api_url,
+            "app_url": app_url,
+            "status": "ok",
+        }),
+        || {
+            ui::print_command_status(ui::CommandStatus::Success, &human);
+            ui::print_command_status(
+                ui::CommandStatus::Success,
+                &format!("Switched to {}", context_update.display),
+            );
+            if base.verbose {
+                eprintln!("Wrote to {}", context_update.path.display());
+            }
+        },
+    )
 }
 
 pub(crate) fn commit_api_key_profile(
@@ -1492,11 +1515,10 @@ fn commit_oauth_profile(
 async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     let mut store = load_auth_store()?;
     let (profile_name, source) = resolve_selected_profile_name_for_debug(base, &store)?;
-    let profile = store.profiles.get(profile_name.as_str()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "profile '{profile_name}' not found; run `bt auth profiles` to see available profiles"
-        )
-    })?;
+    let profile = store
+        .profiles
+        .get(profile_name.as_str())
+        .ok_or_else(|| profile_not_found_err(&profile_name, &store))?;
     if profile.auth_kind != AuthKind::Oauth {
         bail!(
             "profile '{profile_name}' uses api key auth; `bt auth refresh` only applies to oauth profiles"
@@ -1519,17 +1541,17 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         )
     })?;
 
-    println!(
+    eprintln!(
         "Refreshing OAuth token for profile '{profile_name}' (source: {source}, api_url: {api_url})"
     );
     if let Some(expires_at) = previous_expires_at {
         let now = current_unix_timestamp();
         let remaining = expires_at.saturating_sub(now);
-        println!(
+        eprintln!(
             "Cached access token expiry before refresh: {expires_at} (about {remaining}s remaining)"
         );
     } else {
-        println!("Cached access token expiry before refresh: unknown");
+        eprintln!("Cached access token expiry before refresh: unknown");
     }
 
     let refreshed =
@@ -1553,18 +1575,27 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     if let Some(expires_at) = new_expires_at {
         let now = current_unix_timestamp();
         let remaining = expires_at.saturating_sub(now);
-        println!("New access token expiry: {expires_at} (about {remaining}s remaining)");
+        eprintln!("New access token expiry: {expires_at} (about {remaining}s remaining)");
     } else {
-        println!("New access token expiry: unknown");
+        eprintln!("New access token expiry: unknown");
     }
     if refresh_rotated {
-        println!("Refresh token rotation: yes");
+        eprintln!("Refresh token rotation: yes");
     } else {
-        println!("Refresh token rotation: no");
+        eprintln!("Refresh token rotation: no");
     }
-    println!("OAuth refresh complete.");
 
-    Ok(())
+    emit_result(
+        base.json,
+        serde_json::json!({
+            "name": profile_name,
+            "auth": "oauth",
+            "access_expires_at": new_expires_at,
+            "refresh_token_rotated": refresh_rotated,
+            "status": "ok",
+        }),
+        || ui::print_command_status(ui::CommandStatus::Success, "OAuth refresh complete."),
+    )
 }
 
 fn resolve_selected_profile_name_for_debug(
@@ -1892,20 +1923,61 @@ async fn persist_post_login_context(
     })
 }
 
-async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
+/// Build an actionable "profile not found" error that lists the available
+/// profiles, so non-interactive callers can see what they can pick from.
+fn profile_not_found_err(name: &str, store: &AuthStore) -> anyhow::Error {
+    let available: Vec<String> = store.profiles.keys().cloned().collect();
+    let suffix = if available.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", available.join(", "))
+    };
+    anyhow::anyhow!(
+        "profile '{name}' not found; run `bt auth profiles` to see available profiles{suffix}"
+    )
+}
+
+/// Emit a machine-readable JSON payload on stdout when `--json` is set,
+/// otherwise run the human-readable printer. Keeps stdout pure JSON.
+fn emit_result(json: bool, payload: serde_json::Value, human: impl FnOnce()) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        human();
+    }
+    Ok(())
+}
+
+async fn run_profiles(base: &BaseArgs, args: AuthProfilesArgs) -> Result<()> {
     let store = load_auth_store()?;
-    if store.profiles.is_empty() {
-        println!("No saved profiles. Run `bt auth login` to create one.");
-        return Ok(());
+
+    // Filter to a single profile when --profile is given; error out if it doesn't match.
+    let filtered_store = match &args.profile {
+        Some(name) => {
+            let profile = store
+                .profiles
+                .get(name)
+                .ok_or_else(|| profile_not_found_err(name, &store))?;
+            let mut s = AuthStore::default();
+            s.profiles.insert(name.clone(), profile.clone());
+            s
+        }
+        None => store,
+    };
+
+    if filtered_store.profiles.is_empty() {
+        return emit_result(base.json, serde_json::json!([]), || {
+            println!("No saved profiles. Run `bt auth login` to create one.")
+        });
     }
 
-    let verifications = verify_all_profiles_from_store(&store).await;
+    let verifications = verify_all_profiles_from_store(&filtered_store).await;
     let all_network_errors = verifications
         .iter()
         .all(|v| v.status == "error" && !v.error.as_deref().unwrap_or("").contains("invalid"));
     if all_network_errors {
         eprintln!("Could not reach Braintrust API. Showing saved profiles:");
-        print_saved_profiles(&store, base.json)?;
+        print_saved_profiles(&filtered_store, base.json)?;
         return Ok(());
     }
 
@@ -1932,7 +2004,7 @@ async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
+fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<()> {
     let profile_name = profile_name.trim();
     if profile_name.is_empty() {
         bail!("profile name cannot be empty");
@@ -1940,9 +2012,7 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
 
     let mut store = load_auth_store()?;
     if !store.profiles.contains_key(profile_name) {
-        bail!(
-            "profile '{profile_name}' not found; run `bt auth profiles` to see available profiles"
-        );
+        return Err(profile_not_found_err(profile_name, &store));
     }
 
     if !force {
@@ -1952,8 +2022,11 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
                 .default(false)
                 .interact_on(&term)?;
             if !confirmed {
-                eprintln!("Cancelled");
-                return Ok(());
+                return emit_result(
+                    base_json,
+                    serde_json::json!({ "name": profile_name, "status": "cancelled" }),
+                    || eprintln!("Cancelled"),
+                );
             }
         }
     }
@@ -1970,24 +2043,30 @@ fn run_login_delete(profile_name: &str, force: bool) -> Result<()> {
         eprintln!("warning: failed to delete oauth access token for '{profile_name}': {err}");
     }
 
-    ui::print_command_status(
-        ui::CommandStatus::Success,
-        &format!("Deleted profile '{profile_name}'"),
-    );
-    Ok(())
+    emit_result(
+        base_json,
+        serde_json::json!({ "name": profile_name, "status": "deleted" }),
+        || {
+            ui::print_command_status(
+                ui::CommandStatus::Success,
+                &format!("Deleted profile '{profile_name}'"),
+            )
+        },
+    )
 }
 
 fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
-        println!("No saved profiles.");
-        return Ok(());
+        return emit_result(base.json, serde_json::json!({ "status": "empty" }), || {
+            println!("No saved profiles.")
+        });
     }
 
     let profile_name = if let Some(p) = args.profile.or(base.profile) {
         let p = p.trim().to_string();
         if !store.profiles.contains_key(&p) {
-            bail!("profile '{p}' not found; run `bt auth profiles` to see available profiles");
+            return Err(profile_not_found_err(&p, &store));
         }
         p
     } else if store.profiles.len() == 1 {
@@ -2000,7 +2079,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         bail!("multiple profiles exist. Use --profile <NAME> to specify which one.");
     };
 
-    run_login_delete(&profile_name, args.force)
+    run_login_delete(&profile_name, args.force, base.json)
 }
 
 enum ProfileStatus {
