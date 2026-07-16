@@ -776,101 +776,111 @@ fn effective_org_name<'a>(base: &'a BaseArgs, cfg_org: &'a Option<String>) -> Op
         .or_else(|| crate::config::trimmed_option(cfg_org.as_deref()))
 }
 
+/// The auth source selected by the precedence ladder, before any live
+/// credential is fetched. `resolve_auth` turns this into a `ResolvedAuth`
+/// (fetching/refreshing tokens); `active_auth_info` turns it into a
+/// `ProfileInfo` for display. Both share [`resolve_auth_source`] so the
+/// precedence order documented in the README lives in exactly one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthSource {
+    CliApiKey(String),
+    EnvApiKey(String),
+    Oauth(String),
+    ApiKey(String),
+    None,
+}
+
+/// Pure auth-source precedence ladder (README "Auth resolution order"):
+/// 1. explicit `--api-key`
+/// 2. `--prefer-api-key`: `BRAINTRUST_API_KEY` → stored API key → OAuth fallback
+/// 3. stored OAuth login for the selected org
+/// 4. stored API key login for the selected org
+/// 5. `BRAINTRUST_API_KEY`
+///
+/// The slot selectors return `Ok(None)` when no candidate matches (the ladder
+/// continues) and may return `Err` for an ambiguous selection that neither
+/// caller can resolve without prompting (the ladder stops).
+fn resolve_auth_source(
+    prefer_api_key: bool,
+    cli_api_key: Option<String>,
+    env_api_key: impl Fn() -> Option<String>,
+    select_oauth: impl Fn() -> Result<Option<String>>,
+    select_api_key: impl Fn() -> Result<Option<String>>,
+) -> Result<AuthSource> {
+    if let Some(api_key) = cli_api_key {
+        return Ok(AuthSource::CliApiKey(api_key));
+    }
+
+    if prefer_api_key {
+        if let Some(api_key) = env_api_key() {
+            return Ok(AuthSource::EnvApiKey(api_key));
+        }
+        if let Some(slot) = select_api_key()? {
+            return Ok(AuthSource::ApiKey(slot));
+        }
+        if let Some(slot) = select_oauth()? {
+            return Ok(AuthSource::Oauth(slot));
+        }
+        return Ok(AuthSource::None);
+    }
+
+    if let Some(slot) = select_oauth()? {
+        return Ok(AuthSource::Oauth(slot));
+    }
+    if let Some(slot) = select_api_key()? {
+        return Ok(AuthSource::ApiKey(slot));
+    }
+    if let Some(api_key) = env_api_key() {
+        return Ok(AuthSource::EnvApiKey(api_key));
+    }
+    Ok(AuthSource::None)
+}
+
 pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     let mut store = load_auth_store()?;
     let cfg_org = config_auth_context(base);
+    let can_prompt = ui::can_prompt();
 
-    if let Some(api_key) = resolve_cli_api_key_override(base) {
-        return Ok(ResolvedAuth {
+    let source = resolve_auth_source(
+        base.prefer_api_key,
+        resolve_cli_api_key_override(base),
+        || resolve_env_api_key(base),
+        || select_oauth_profile_for_auth(base, &store, &cfg_org, can_prompt),
+        || select_api_key_profile_for_auth(base, &store, &cfg_org, can_prompt),
+    )?;
+
+    match source {
+        AuthSource::CliApiKey(api_key) | AuthSource::EnvApiKey(api_key) => Ok(ResolvedAuth {
             api_key: Some(api_key),
             api_url: base.api_url.clone(),
             app_url: base.app_url.clone(),
             org_name: effective_org_name(base, &cfg_org).map(str::to_string),
             is_oauth: false,
             slot_key: None,
-        });
-    }
-
-    if base.prefer_api_key {
-        if let Some(auth) = resolve_preferred_api_key_auth(base, &mut store, &cfg_org)? {
-            return Ok(auth);
+        }),
+        AuthSource::Oauth(slot) => {
+            resolve_oauth_profile_auth(base, &mut store, &cfg_org, &slot).await
         }
-        if let Some(profile_name) =
-            select_oauth_profile_for_auth(base, &store, &cfg_org, ui::can_prompt())?
-        {
-            return resolve_oauth_profile_auth(base, &mut store, &cfg_org, &profile_name).await;
-        }
-        bail!("--prefer-api-key requires an API key or OAuth login for the selected org");
-    }
-
-    if let Some(profile_name) =
-        select_oauth_profile_for_auth(base, &store, &cfg_org, ui::can_prompt())?
-    {
-        return resolve_oauth_profile_auth(base, &mut store, &cfg_org, &profile_name).await;
-    }
-
-    if let Some(profile_name) =
-        select_api_key_profile_for_auth(base, &store, &cfg_org, ui::can_prompt())?
-    {
-        return resolve_api_key_profile_auth(base, &mut store, &cfg_org, &profile_name);
-    }
-
-    if let Some(api_key) = resolve_env_api_key(base) {
-        return Ok(ResolvedAuth {
-            api_key: Some(api_key),
-            api_url: base.api_url.clone(),
-            app_url: base.app_url.clone(),
-            org_name: effective_org_name(base, &cfg_org).map(str::to_string),
-            is_oauth: false,
-            slot_key: None,
-        });
-    }
-
-    if effective_org_name(base, &cfg_org).is_none() {
-        if let Some(err) = missing_org_for_stored_logins_error(&store) {
-            return Err(err);
+        AuthSource::ApiKey(slot) => resolve_api_key_profile_auth(base, &mut store, &cfg_org, &slot),
+        AuthSource::None => {
+            if base.prefer_api_key {
+                bail!("--prefer-api-key requires an API key or OAuth login for the selected org");
+            }
+            if effective_org_name(base, &cfg_org).is_none() {
+                if let Some(err) = missing_org_for_stored_logins_error(&store) {
+                    return Err(err);
+                }
+            }
+            Ok(ResolvedAuth {
+                api_key: None,
+                api_url: base.api_url.clone(),
+                app_url: base.app_url.clone(),
+                org_name: effective_org_name(base, &cfg_org).map(str::to_string),
+                is_oauth: false,
+                slot_key: None,
+            })
         }
     }
-
-    Ok(ResolvedAuth {
-        api_key: None,
-        api_url: base.api_url.clone(),
-        app_url: base.app_url.clone(),
-        org_name: effective_org_name(base, &cfg_org).map(str::to_string),
-        is_oauth: false,
-        slot_key: None,
-    })
-}
-
-fn resolve_preferred_api_key_auth(
-    base: &BaseArgs,
-    store: &mut AuthStore,
-    cfg_org: &Option<String>,
-) -> Result<Option<ResolvedAuth>> {
-    let Some(org) = effective_org_name(base, cfg_org) else {
-        bail!(
-            "--prefer-api-key requires an org; pass --org <ORG> or run `bt switch <ORG>/<PROJECT>`"
-        );
-    };
-
-    if let Some(api_key) = resolve_env_api_key(base) {
-        return Ok(Some(ResolvedAuth {
-            api_key: Some(api_key),
-            api_url: base.api_url.clone(),
-            app_url: base.app_url.clone(),
-            org_name: Some(org.to_string()),
-            is_oauth: false,
-            slot_key: None,
-        }));
-    }
-
-    if let Some(profile_name) =
-        select_api_key_profile_for_auth(base, store, cfg_org, ui::can_prompt())?
-    {
-        return resolve_api_key_profile_auth(base, store, cfg_org, &profile_name).map(Some);
-    }
-
-    Ok(None)
 }
 
 fn resolve_api_key_profile_auth(
@@ -893,7 +903,7 @@ fn resolve_api_key_profile_auth(
             RecoverableAuthErrorKind::StoredCredential,
             format!(
                 "no keychain credential found for auth login '{}'; re-run `bt auth login --org <ORG> --api-key <KEY>`",
-                auth_slot_label(profile_name, &profile)
+                auth_slot_label(&profile)
             ),
         )
     })?;
@@ -1089,7 +1099,7 @@ async fn resolve_oauth_profile_auth(
             RecoverableAuthErrorKind::OauthClientId,
             format!(
                 "oauth login for '{}' is missing client_id; re-run `bt auth login --oauth --org <ORG>`",
-                auth_slot_label(profile_name, &profile)
+                auth_slot_label(&profile)
             ),
         )
     })?;
@@ -1127,11 +1137,11 @@ async fn resolve_oauth_profile_auth(
                 RecoverableAuthErrorKind::OauthRefreshToken,
                 format!(
                     "oauth refresh token missing for '{}'; re-run `bt auth login --oauth --org <ORG>`",
-                    auth_slot_label(profile_name, &profile)
+                    auth_slot_label(&profile)
                 ),
             )
         })?;
-    let login_label = auth_slot_label(profile_name, &profile);
+    let login_label = auth_slot_label(&profile);
     let refreshed =
         refresh_oauth_access_token(&api_url, &refresh_token, client_id, &login_label).await?;
     save_profile_oauth_access_token(profile_name, &refreshed.access_token)?;
@@ -1220,7 +1230,7 @@ fn profile_identity_label(profile: &AuthProfile) -> Option<String> {
     }
 }
 
-fn auth_slot_label(_name: &str, profile: &AuthProfile) -> String {
+fn auth_slot_label(profile: &AuthProfile) -> String {
     let mut parts = vec![profile_org_label(profile)];
     parts.push(auth_kind_label(profile.auth_kind).to_string());
     if let Some(identity) = profile_identity_label(profile) {
@@ -1284,48 +1294,35 @@ fn ad_hoc_api_key_profile(org: Option<&str>, api_key: &str) -> ProfileInfo {
 }
 
 pub(crate) fn active_auth_info(base: &BaseArgs, org: Option<&str>) -> Option<ProfileInfo> {
-    if let Some(api_key) = resolve_cli_api_key_override(base) {
-        return Some(ad_hoc_api_key_profile(org, &api_key));
-    }
-
     let store = load_auth_store().unwrap_or_default();
 
-    if base.prefer_api_key {
-        let org = org?;
-        if let Some(api_key) = resolve_env_api_key(base) {
-            return Some(ad_hoc_api_key_profile(Some(org), &api_key));
+    // Display-side mirror of the interactive selectors: a lone candidate is
+    // chosen, no candidates continue the ladder, and an ambiguous set stops it
+    // (a real command would prompt or error, so status shows nothing here).
+    let select = |kind| match auth_profile_names_by_kind(&store, org, kind).as_slice() {
+        [] => Ok(None),
+        [name] => Ok(Some((*name).to_string())),
+        _ => bail!("multiple {kind:?} logins"),
+    };
+
+    let source = resolve_auth_source(
+        base.prefer_api_key,
+        resolve_cli_api_key_override(base),
+        || resolve_env_api_key(base),
+        || select(AuthKind::Oauth),
+        || select(AuthKind::ApiKey),
+    )
+    .ok()?;
+
+    match source {
+        AuthSource::CliApiKey(api_key) | AuthSource::EnvApiKey(api_key) => {
+            Some(ad_hoc_api_key_profile(org, &api_key))
         }
-
-        let api_key_candidates = auth_profile_names_by_kind(&store, Some(org), AuthKind::ApiKey);
-        match api_key_candidates.as_slice() {
-            [name] => return profile_info_for_candidate(&store, name),
-            [] => {}
-            _ => return None,
+        AuthSource::Oauth(slot) | AuthSource::ApiKey(slot) => {
+            profile_info_for_candidate(&store, &slot)
         }
-
-        let oauth_candidates = auth_profile_names_by_kind(&store, Some(org), AuthKind::Oauth);
-        return match oauth_candidates.as_slice() {
-            [name] => profile_info_for_candidate(&store, name),
-            [] => None,
-            _ => None,
-        };
+        AuthSource::None => None,
     }
-
-    let oauth_candidates = auth_profile_names_by_kind(&store, org, AuthKind::Oauth);
-    match oauth_candidates.as_slice() {
-        [name] => return profile_info_for_candidate(&store, name),
-        [] => {}
-        _ => return None,
-    }
-
-    let api_key_candidates = auth_profile_names_by_kind(&store, org, AuthKind::ApiKey);
-    match api_key_candidates.as_slice() {
-        [name] => return profile_info_for_candidate(&store, name),
-        [] => {}
-        _ => return None,
-    }
-
-    resolve_env_api_key(base).map(|api_key| ad_hoc_api_key_profile(org, &api_key))
 }
 
 fn missing_org_for_stored_logins_error(store: &AuthStore) -> Option<anyhow::Error> {
@@ -1350,7 +1347,7 @@ fn missing_org_for_stored_logins_error(store: &AuthStore) -> Option<anyhow::Erro
 
     let labels = candidates
         .iter()
-        .map(|(name, profile)| auth_slot_label(name, profile))
+        .map(|(_, profile)| auth_slot_label(profile))
         .collect::<Vec<_>>()
         .join(", ");
     let all_api_key = candidates
@@ -1376,7 +1373,7 @@ fn profile_label_from_store(name: &str, store: &AuthStore) -> String {
     store
         .profiles
         .get(name)
-        .map(|profile| auth_slot_label(name, profile))
+        .map(auth_slot_label)
         .unwrap_or_else(|| "saved auth login".to_string())
 }
 
@@ -1415,7 +1412,7 @@ fn candidate_identities<'a>(names: &[&'a str], store: &'a AuthStore) -> Vec<Stri
                 .get(*name)
                 .map(|profile| {
                     profile_identity_label(profile)
-                        .unwrap_or_else(|| auth_slot_label(name, profile))
+                        .unwrap_or_else(|| auth_slot_label(profile))
                 })
                 .unwrap_or_else(|| "saved auth login".to_string())
         })
@@ -1531,7 +1528,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), Some(&selected_org), &login_orgs)?;
 
-    let _slot_key = commit_api_key_profile(
+    commit_api_key_profile(
         &api_key,
         selected_api_url.clone(),
         base.app_url.clone(),
@@ -1648,7 +1645,7 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let selected_api_url =
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
 
-    let _slot_key = commit_oauth_profile(
+    commit_oauth_profile(
         &oauth_tokens,
         selected_api_url.clone(),
         app_url.clone(),
@@ -1696,7 +1693,7 @@ pub(crate) fn commit_api_key_profile(
     app_url: Option<String>,
     org_id: String,
     org_name: String,
-) -> Result<String> {
+) -> Result<()> {
     let hash = api_key_hash(api_key);
     let slot_key = api_key_slot_key(&hash, &org_id);
     save_profile_secret(&slot_key, api_key)?;
@@ -1706,7 +1703,7 @@ pub(crate) fn commit_api_key_profile(
         delete_legacy_profile_secrets(old_profile);
     }
     store.profiles.insert(
-        slot_key.clone(),
+        slot_key,
         AuthProfile {
             auth_kind: AuthKind::ApiKey,
             api_url: Some(api_url),
@@ -1722,8 +1719,7 @@ pub(crate) fn commit_api_key_profile(
             legacy_secret_key: None,
         },
     );
-    save_auth_store(&store)?;
-    Ok(slot_key)
+    save_auth_store(&store)
 }
 
 fn commit_oauth_profile(
@@ -1732,7 +1728,7 @@ fn commit_oauth_profile(
     app_url: String,
     client_id: String,
     selected_org: Option<&LoginOrgInfo>,
-) -> Result<String> {
+) -> Result<()> {
     let refresh_token = tokens.refresh_token.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "oauth token response did not include a refresh_token; cannot create persistent oauth login"
@@ -1762,7 +1758,7 @@ fn commit_oauth_profile(
         delete_legacy_profile_secrets(old_profile);
     }
     store.profiles.insert(
-        slot_key.clone(),
+        slot_key,
         AuthProfile {
             auth_kind: AuthKind::Oauth,
             api_url: Some(api_url),
@@ -1778,8 +1774,7 @@ fn commit_oauth_profile(
             legacy_secret_key: None,
         },
     );
-    save_auth_store(&store)?;
-    Ok(slot_key)
+    save_auth_store(&store)
 }
 
 async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
@@ -1806,7 +1801,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     let client_id = profile.oauth_client_id.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "OAuth login for '{}' is missing client_id; re-run `bt auth login --oauth --org <ORG>`",
-            auth_slot_label(&profile_name, &profile)
+            auth_slot_label(&profile)
         )
     })?;
     let previous_expires_at = profile.oauth_access_expires_at;
@@ -1815,14 +1810,14 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
             || {
                 anyhow::anyhow!(
             "OAuth refresh token missing for '{}'; re-run `bt auth login --oauth --org <ORG>`",
-            auth_slot_label(&profile_name, &profile)
+            auth_slot_label(&profile)
         )
             },
         )?;
 
     eprintln!(
         "Refreshing OAuth token for {} (api_url: {api_url})",
-        auth_slot_label(&profile_name, &profile)
+        auth_slot_label(&profile)
     );
     if let Some(expires_at) = previous_expires_at {
         let now = current_unix_timestamp();
@@ -1834,7 +1829,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         eprintln!("Cached access token expiry before refresh: unknown");
     }
 
-    let login_label = auth_slot_label(&profile_name, &profile);
+    let login_label = auth_slot_label(&profile);
     let refreshed =
         refresh_oauth_access_token(&api_url, &refresh_token, &client_id, &login_label).await?;
     save_profile_oauth_access_token(profile_name.as_str(), &refreshed.access_token)?;
@@ -2062,7 +2057,7 @@ fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<
     let profile = store.profiles.get(profile_name).cloned().ok_or_else(|| {
         anyhow::anyhow!("auth login not found; run `bt auth profiles` to see available logins")
     })?;
-    let label = auth_slot_label(profile_name, &profile);
+    let label = auth_slot_label(&profile);
 
     if !force {
         let term = ui::prompt_term().ok_or_else(|| {
@@ -2439,8 +2434,8 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
             .collect();
         println!("{}", serde_json::to_string(&output)?);
     } else {
-        for (name, profile) in &store.profiles {
-            println!("  {}", auth_slot_label(name, profile));
+        for profile in store.profiles.values() {
+            println!("  {}", auth_slot_label(profile));
         }
     }
     Ok(())
@@ -4950,6 +4945,86 @@ mod tests {
             name: name.to_string(),
             api_url: None,
         }
+    }
+
+    fn auth_source(
+        prefer_api_key: bool,
+        cli: Option<&str>,
+        env: Option<&str>,
+        oauth: Option<&str>,
+        api_key: Option<&str>,
+    ) -> AuthSource {
+        resolve_auth_source(
+            prefer_api_key,
+            cli.map(str::to_string),
+            || env.map(str::to_string),
+            || Ok(oauth.map(str::to_string)),
+            || Ok(api_key.map(str::to_string)),
+        )
+        .expect("resolve auth source")
+    }
+
+    #[test]
+    fn auth_source_cli_api_key_wins_over_everything() {
+        assert_eq!(
+            auth_source(false, Some("cli"), Some("env"), Some("oauth"), Some("ak")),
+            AuthSource::CliApiKey("cli".into())
+        );
+        assert_eq!(
+            auth_source(true, Some("cli"), Some("env"), Some("oauth"), Some("ak")),
+            AuthSource::CliApiKey("cli".into())
+        );
+    }
+
+    #[test]
+    fn auth_source_default_order_is_oauth_then_api_key_then_env() {
+        assert_eq!(
+            auth_source(false, None, Some("env"), Some("oauth"), Some("ak")),
+            AuthSource::Oauth("oauth".into())
+        );
+        assert_eq!(
+            auth_source(false, None, Some("env"), None, Some("ak")),
+            AuthSource::ApiKey("ak".into())
+        );
+        assert_eq!(
+            auth_source(false, None, Some("env"), None, None),
+            AuthSource::EnvApiKey("env".into())
+        );
+        assert_eq!(
+            auth_source(false, None, None, None, None),
+            AuthSource::None
+        );
+    }
+
+    #[test]
+    fn auth_source_prefer_api_key_order_is_env_then_api_key_then_oauth() {
+        assert_eq!(
+            auth_source(true, None, Some("env"), Some("oauth"), Some("ak")),
+            AuthSource::EnvApiKey("env".into())
+        );
+        assert_eq!(
+            auth_source(true, None, None, Some("oauth"), Some("ak")),
+            AuthSource::ApiKey("ak".into())
+        );
+        // No env/stored API key, but OAuth for the org is available: fall back to it.
+        assert_eq!(
+            auth_source(true, None, None, Some("oauth"), None),
+            AuthSource::Oauth("oauth".into())
+        );
+        assert_eq!(auth_source(true, None, None, None, None), AuthSource::None);
+    }
+
+    #[test]
+    fn auth_source_ambiguous_selection_stops_the_ladder() {
+        let err = resolve_auth_source(
+            false,
+            None,
+            || None,
+            || bail!("multiple oauth logins"),
+            || Ok(Some("ak".to_string())),
+        )
+        .expect_err("ambiguous oauth should stop the ladder");
+        assert!(err.to_string().contains("multiple oauth logins"));
     }
 
     #[tokio::test]
