@@ -165,8 +165,6 @@ enum Commands {
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
     Status(CLIArgs<status::StatusArgs>),
-    // /// View and modify config
-    // Config(CLIArgs<config::ConfigArgs>),
 }
 
 impl Commands {
