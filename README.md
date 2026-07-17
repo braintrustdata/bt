@@ -323,7 +323,7 @@ Local version and pagination-key conversion helpers:
   - You can pass `--no-browser` to print the URL without auto-opening.
   - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
 - List saved auth logins:
-  - `bt auth profiles`
+  - `bt auth logins`
 - Log out:
   - `bt auth logout --org myorg`
   - `bt auth logout --org myorg --api-key-hint sk-****abcde`

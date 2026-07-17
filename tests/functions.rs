@@ -190,8 +190,8 @@ fn sanitized_env_keys() -> &'static [&'static str] {
     ]
 }
 
-fn auth_profiles_command(cwd: &Path, config_dir: &Path) -> Command {
-    auth_sub_command(cwd, config_dir, &["profiles"])
+fn auth_logins_command(cwd: &Path, config_dir: &Path) -> Command {
+    auth_sub_command(cwd, config_dir, &["logins"])
 }
 
 #[derive(Debug, Clone)]
@@ -704,14 +704,14 @@ fn functions_help_lists_push_and_pull() {
 }
 
 #[test]
-fn auth_profiles_ignores_api_key_env_override() {
+fn auth_logins_ignores_api_key_env_override() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
 
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
+    let output = auth_logins_command(cwd.path(), config_dir.path())
         .env("BRAINTRUST_API_KEY", "test-key")
         .output()
-        .expect("run bt auth profiles with api key env");
+        .expect("run bt auth logins with api key env");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -720,15 +720,15 @@ fn auth_profiles_ignores_api_key_env_override() {
 }
 
 #[test]
-fn auth_profiles_ignores_api_key_from_dotenv() {
+fn auth_logins_ignores_api_key_from_dotenv() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
     fs::write(cwd.path().join(".env"), "BRAINTRUST_API_KEY=test-key\n").expect("write .env");
 
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
+    let output = auth_logins_command(cwd.path(), config_dir.path())
         .env_remove("BRAINTRUST_API_KEY")
         .output()
-        .expect("run bt auth profiles with dotenv api key");
+        .expect("run bt auth logins with dotenv api key");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -737,14 +737,14 @@ fn auth_profiles_ignores_api_key_from_dotenv() {
 }
 
 #[test]
-fn auth_profiles_json_with_no_profiles_emits_empty_array() {
+fn auth_logins_json_with_no_profiles_emits_empty_array() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
 
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
+    let output = auth_logins_command(cwd.path(), config_dir.path())
         .arg("--json")
         .output()
-        .expect("run bt auth profiles --json");
+        .expect("run bt auth logins --json");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -764,7 +764,7 @@ fn seed_api_key_profile(config_dir: &Path) {
 
 fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
     // Shared builder for `bt auth <sub>` so each auth subcommand inherits the
-    // same isolated config dir / env scrubbing as `auth profiles`.
+    // same isolated config dir / env scrubbing as `auth logins`.
     let mut cmd = Command::new(bt_binary_path());
     cmd.arg("auth")
         .args(sub)

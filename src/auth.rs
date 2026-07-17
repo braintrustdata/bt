@@ -280,7 +280,7 @@ struct OAuthErrorResponse {
 #[command(after_help = "\
 Examples:
   bt auth login
-  bt auth profiles
+  bt auth logins
   bt auth refresh --org acme
   bt auth logout --org acme
 ")]
@@ -296,13 +296,13 @@ enum AuthCommand {
     /// Force-refresh OAuth access token for the selected org
     Refresh,
     /// List saved auth logins and check connection status
-    Profiles(AuthProfilesArgs),
+    Logins(AuthLoginsArgs),
     /// Log out by removing a saved auth login
     Logout(AuthLogoutArgs),
 }
 
 #[derive(Debug, Clone, Args)]
-struct AuthProfilesArgs {}
+struct AuthLoginsArgs {}
 
 #[derive(Debug, Clone, Args)]
 struct AuthLoginArgs {
@@ -335,7 +335,7 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     match args.command {
         AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
-        AuthCommand::Profiles(profile_args) => run_profiles(&base, profile_args).await,
+        AuthCommand::Logins(logins_args) => run_logins(&base, logins_args).await,
         AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args),
     }
 }
@@ -886,7 +886,7 @@ fn resolve_api_key_profile_auth(
         .profiles
         .get(profile_name)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("saved auth login not found; run `bt auth profiles`"))?;
+        .ok_or_else(|| anyhow::anyhow!("saved auth login not found; run `bt auth logins`"))?;
     let api_key = load_profile_secret_with_legacy(
         profile_name,
         profile.legacy_secret_key.as_deref(),
@@ -1043,7 +1043,7 @@ fn reconcile_resolved_auth_slot(auth: &ResolvedAuth, login: &LoginState) -> Resu
             .is_none_or(|org| org.trim().is_empty());
     if login_org_id.trim().is_empty() && !is_cross_org {
         // The SDK's OAuth compatibility path does not always return org
-        // metadata. `bt auth profiles` performs the same reconciliation after
+        // metadata. `bt auth logins` performs the same reconciliation after
         // its explicit credential verification request.
         return Ok(());
     }
@@ -1083,10 +1083,11 @@ async fn resolve_oauth_profile_auth(
     cfg_org: &Option<String>,
     profile_name: &str,
 ) -> Result<ResolvedAuth> {
-    let profile =
-        store.profiles.get(profile_name).cloned().ok_or_else(|| {
-            anyhow::anyhow!("saved OAuth login not found; run `bt auth profiles`")
-        })?;
+    let profile = store
+        .profiles
+        .get(profile_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("saved OAuth login not found; run `bt auth logins`"))?;
     let api_url = base
         .api_url
         .clone()
@@ -1751,7 +1752,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     let profile_name = select_oauth_profile_for_auth(base, &store, &cfg_org, ui::can_prompt())?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OAuth login selected; pass --org <ORG> or run `bt auth profiles` to see available logins"
+                "no OAuth login selected; pass --org <ORG> or run `bt auth logins` to see available logins"
             )
         })?;
     let profile = store
@@ -1759,7 +1760,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         .get(profile_name.as_str())
         .cloned()
         .ok_or_else(|| {
-            anyhow::anyhow!("OAuth login not found; run `bt auth profiles` to see available logins")
+            anyhow::anyhow!("OAuth login not found; run `bt auth logins` to see available logins")
         })?;
 
     let api_url = profile
@@ -1954,7 +1955,7 @@ fn emit_result(json: bool, payload: serde_json::Value, human: impl FnOnce()) -> 
     Ok(())
 }
 
-async fn run_profiles(base: &BaseArgs, _args: AuthProfilesArgs) -> Result<()> {
+async fn run_logins(base: &BaseArgs, _args: AuthLoginsArgs) -> Result<()> {
     let mut store = load_auth_store()?;
     if store.profiles.is_empty() {
         return emit_result(base.json, serde_json::json!([]), || {
@@ -2016,7 +2017,7 @@ fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<
 
     let mut store = load_auth_store()?;
     let profile = store.profiles.get(profile_name).cloned().ok_or_else(|| {
-        anyhow::anyhow!("auth login not found; run `bt auth profiles` to see available logins")
+        anyhow::anyhow!("auth login not found; run `bt auth logins` to see available logins")
     })?;
     let label = auth_slot_label(&profile);
 
@@ -2095,7 +2096,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
     }
 
     let profile_name = match candidates.len() {
-        0 => bail!("no matching auth login found; run `bt auth profiles` to see available logins"),
+        0 => bail!("no matching auth login found; run `bt auth logins` to see available logins"),
         1 => candidates[0].to_string(),
         _ if ui::can_prompt() => {
             select_profile_from_store("Select auth login to log out", &candidates, org, &store)?
