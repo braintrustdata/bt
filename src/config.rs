@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Subcommand};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -10,9 +9,6 @@ use serde::{Deserialize, Serialize};
 use crate::args::BaseArgs;
 use crate::ui::{print_command_status, CommandStatus};
 
-mod get;
-mod list;
-mod set;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -25,54 +21,7 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["profile", "org", "project", "project_id"];
-
 impl Config {
-    pub fn get_field(&self, key: &str) -> Option<&str> {
-        match key {
-            "profile" => self.profile.as_deref(),
-            "org" => self.org.as_deref(),
-            "project" => self.project.as_deref(),
-            "project_id" => self.project_id.as_deref(),
-            _ => None,
-        }
-    }
-
-    pub fn set_field(&mut self, key: &str, value: String) -> bool {
-        match key {
-            "profile" => self.profile = Some(value),
-            "org" => self.org = Some(value),
-            "project" => {
-                self.project = Some(value);
-                self.project_id = None;
-            }
-            "project_id" => self.project_id = Some(value),
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn unset_field(&mut self, key: &str) -> bool {
-        match key {
-            "profile" => self.profile = None,
-            "org" => self.org = None,
-            "project" => {
-                self.project = None;
-                self.project_id = None;
-            }
-            "project_id" => self.project_id = None,
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn non_empty_fields(&self) -> Vec<(&str, &str)> {
-        KNOWN_KEYS
-            .iter()
-            .filter_map(|&key| self.get_field(key).map(|v| (key, v)))
-            .collect()
-    }
-
     pub(crate) fn merge(&self, other: &Config) -> Config {
         let mut extra = self.extra.clone();
         extra.extend(other.extra.clone());
@@ -224,36 +173,6 @@ pub fn local_path() -> Option<PathBuf> {
     find_local_config_dir().map(|dir| dir.join("config.json"))
 }
 
-pub enum WriteTarget {
-    Global(PathBuf),
-    Local(PathBuf),
-}
-
-pub fn write_target() -> Result<WriteTarget> {
-    match local_path() {
-        Some(p) => Ok(WriteTarget::Local(p)),
-        None => Ok(WriteTarget::Global(global_path()?)),
-    }
-}
-
-/// Resolve which config file to write based on --global/--local flags.
-pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
-    if global {
-        global_path()
-    } else if local {
-        match local_path() {
-            Some(p) => Ok(p),
-            None => {
-                bail!("No local .bt directory found. Use bt init to initialize this directory.")
-            }
-        }
-    } else {
-        match write_target()? {
-            WriteTarget::Local(p) | WriteTarget::Global(p) => Ok(p),
-        }
-    }
-}
-
 pub fn local_save_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".bt").join("config.json"))
 }
@@ -318,91 +237,6 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
     }
     save_file(&path, config)?;
     Ok(path)
-}
-
-// --- CLI commands ---
-
-#[derive(Debug, Clone, Args)]
-pub struct ScopeArgs {
-    /// Apply to global config (~/.config/bt/config.json)
-    #[arg(long, short = 'g', conflicts_with = "local")]
-    global: bool,
-
-    /// Apply to local config (.bt/config.json)
-    #[arg(long, short = 'l')]
-    local: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ConfigArgs {
-    #[command(subcommand)]
-    command: Option<ConfigCommands>,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-enum ConfigCommands {
-    /// List config values
-    List {
-        #[command(flatten)]
-        scope: ScopeArgs,
-        /// Show config values grouped by source
-        #[arg(long)]
-        verbose: bool,
-    },
-    /// Get a config value
-    Get {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-    /// Set a config value
-    Set {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        /// Value to set
-        value: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-    /// Remove a config value
-    Unset {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-}
-
-fn validate_key(key: &str) -> Result<()> {
-    if !KNOWN_KEYS.contains(&key) {
-        bail!(
-            "Unknown config key: {key}\nValid keys: {}",
-            KNOWN_KEYS.join(", ")
-        );
-    }
-    Ok(())
-}
-
-pub fn run(base: BaseArgs, args: ConfigArgs) -> Result<()> {
-    match args.command {
-        None => list::run(base, false, false, false),
-        Some(ConfigCommands::List { scope, verbose }) => {
-            list::run(base, scope.global, scope.local, verbose)
-        }
-        Some(ConfigCommands::Get { key, scope }) => {
-            validate_key(&key)?;
-            get::run(base, &key, scope.global, scope.local)
-        }
-        Some(ConfigCommands::Set { key, value, scope }) => {
-            validate_key(&key)?;
-            set::run(&key, &value, scope.global, scope.local)
-        }
-        Some(ConfigCommands::Unset { key, scope }) => {
-            validate_key(&key)?;
-            set::unset(&key, scope.global, scope.local)
-        }
-    }
 }
 
 #[cfg(test)]
