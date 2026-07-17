@@ -42,8 +42,8 @@ pub async fn run(
             .with_prompt(format!(
                 "Delete {} '{}' from {}?",
                 label(ft),
-                &function.name,
-                &ctx.project.name
+                function.name,
+                ctx.project.name
             ))
             .default(false)
             .interact()?;
