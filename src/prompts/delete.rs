@@ -31,7 +31,7 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Resu
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete prompt '{}' from {}?",
-                &prompt.name, project_name
+                prompt.name, project_name
             ))
             .default(false)
             .interact()?;
