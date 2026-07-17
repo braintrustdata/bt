@@ -50,6 +50,15 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 }
 
 #[test]
+fn auth_login_does_not_expose_client_id() {
+    bt_command()
+        .args(["auth", "login", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--client-id").not());
+}
+
+#[test]
 fn global_quiet_flag_still_parses_for_other_commands() {
     bt_command().args(["status", "--quiet"]).assert().success();
 }

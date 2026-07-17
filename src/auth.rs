@@ -37,6 +37,7 @@ use crate::{
 };
 
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
+const OAUTH_CLIENT_ID: &str = "bt_cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
@@ -79,7 +80,6 @@ pub struct AvailableOrg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoverableAuthErrorKind {
-    OauthClientId,
     OauthRefreshToken,
     StoredCredential,
 }
@@ -109,8 +109,7 @@ pub fn is_missing_credential_error(err: &anyhow::Error) -> bool {
             .is_some_and(|err| {
                 matches!(
                     err.kind,
-                    RecoverableAuthErrorKind::OauthClientId
-                        | RecoverableAuthErrorKind::OauthRefreshToken
+                    RecoverableAuthErrorKind::OauthRefreshToken
                         | RecoverableAuthErrorKind::StoredCredential
                 )
             })
@@ -204,8 +203,6 @@ struct AuthProfile {
     org_id: Option<String>,
     #[serde(default)]
     org_name: Option<String>,
-    #[serde(default)]
-    oauth_client_id: Option<String>,
     #[serde(default)]
     oauth_access_expires_at: Option<u64>,
     #[serde(default)]
@@ -312,10 +309,6 @@ struct AuthLoginArgs {
     /// Use OAuth login instead of API key login
     #[arg(long)]
     oauth: bool,
-
-    /// OAuth client id (defaults to bt_cli)
-    #[arg(long, value_name = "CLIENT_ID")]
-    client_id: Option<String>,
 
     /// Do not try to open a browser automatically
     #[arg(long)]
@@ -1094,15 +1087,6 @@ async fn resolve_oauth_profile_auth(
         store.profiles.get(profile_name).cloned().ok_or_else(|| {
             anyhow::anyhow!("saved OAuth login not found; run `bt auth profiles`")
         })?;
-    let client_id = profile.oauth_client_id.as_deref().ok_or_else(|| {
-        recoverable_auth_error(
-            RecoverableAuthErrorKind::OauthClientId,
-            format!(
-                "oauth login for '{}' is missing client_id; re-run `bt auth login --oauth --org <ORG>`",
-                auth_slot_label(&profile)
-            ),
-        )
-    })?;
     let api_url = base
         .api_url
         .clone()
@@ -1142,8 +1126,7 @@ async fn resolve_oauth_profile_auth(
             )
         })?;
     let login_label = auth_slot_label(&profile);
-    let refreshed =
-        refresh_oauth_access_token(&api_url, &refresh_token, client_id, &login_label).await?;
+    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &login_label).await?;
     save_profile_oauth_access_token(profile_name, &refreshed.access_token)?;
     let mut refresh_rotated = false;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
@@ -1411,8 +1394,7 @@ fn candidate_identities<'a>(names: &[&'a str], store: &'a AuthStore) -> Vec<Stri
                 .profiles
                 .get(*name)
                 .map(|profile| {
-                    profile_identity_label(profile)
-                        .unwrap_or_else(|| auth_slot_label(profile))
+                    profile_identity_label(profile).unwrap_or_else(|| auth_slot_label(profile))
                 })
                 .unwrap_or_else(|| "saved auth login".to_string())
         })
@@ -1579,17 +1561,12 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let client_id = args
-        .client_id
-        .clone()
-        .unwrap_or_else(default_oauth_client_id);
-
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let state = generate_random_token(32)?;
 
     let callback_server = bind_oauth_callback_server()?;
     let redirect_uri = callback_server.redirect_uri();
-    let oauth_client = build_oauth_client(&api_url, &client_id, Some(&redirect_uri))?;
+    let oauth_client = build_oauth_client(&api_url, Some(&redirect_uri))?;
     let (authorize_url, _) = oauth_client
         .authorize_url(|| CsrfToken::new(state.clone()))
         .add_scope(Scope::new(OAUTH_SCOPE.to_string()))
@@ -1624,14 +1601,9 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         bail!("oauth state mismatch; please try again");
     }
 
-    let oauth_tokens = exchange_oauth_authorization_code(
-        &api_url,
-        &client_id,
-        &redirect_uri,
-        &auth_code,
-        pkce_verifier,
-    )
-    .await?;
+    let oauth_tokens =
+        exchange_oauth_authorization_code(&api_url, &redirect_uri, &auth_code, pkce_verifier)
+            .await?;
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
     let selected_org = select_login_org(
         login_orgs.clone(),
@@ -1649,7 +1621,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         &oauth_tokens,
         selected_api_url.clone(),
         app_url.clone(),
-        client_id.clone(),
         selected_org.as_ref(),
     )?;
     let context_update = persist_post_login_context(
@@ -1710,7 +1681,6 @@ pub(crate) fn commit_api_key_profile(
             app_url,
             org_id: Some(org_id),
             org_name: Some(org_name),
-            oauth_client_id: None,
             oauth_access_expires_at: None,
             user_name: None,
             email: None,
@@ -1726,7 +1696,6 @@ fn commit_oauth_profile(
     tokens: &OAuthTokenResponse,
     api_url: String,
     app_url: String,
-    client_id: String,
     selected_org: Option<&LoginOrgInfo>,
 ) -> Result<()> {
     let refresh_token = tokens.refresh_token.as_ref().ok_or_else(|| {
@@ -1765,7 +1734,6 @@ fn commit_oauth_profile(
             app_url: Some(app_url),
             org_id: Some(org_id),
             org_name: selected_org.map(|org| org.name.clone()),
-            oauth_client_id: Some(client_id),
             oauth_access_expires_at,
             user_name: jwt_id.name,
             email: jwt_id.email,
@@ -1798,12 +1766,6 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         .api_url
         .clone()
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-    let client_id = profile.oauth_client_id.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "OAuth login for '{}' is missing client_id; re-run `bt auth login --oauth --org <ORG>`",
-            auth_slot_label(&profile)
-        )
-    })?;
     let previous_expires_at = profile.oauth_access_expires_at;
     let refresh_token =
         load_profile_oauth_refresh_token_for_profile(profile_name.as_str(), &profile)?.ok_or_else(
@@ -1830,8 +1792,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     }
 
     let login_label = auth_slot_label(&profile);
-    let refreshed =
-        refresh_oauth_access_token(&api_url, &refresh_token, &client_id, &login_label).await?;
+    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &login_label).await?;
     save_profile_oauth_access_token(profile_name.as_str(), &refreshed.access_token)?;
     let mut refresh_rotated = false;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
@@ -2664,10 +2625,6 @@ fn resolve_profile_api_url(
     )
 }
 
-fn default_oauth_client_id() -> String {
-    "bt_cli".to_string()
-}
-
 fn generate_random_token(num_bytes: usize) -> Result<String> {
     let mut bytes = vec![0u8; num_bytes];
     getrandom::fill(&mut bytes)
@@ -3024,7 +2981,6 @@ fn is_ssh_session() -> bool {
 
 async fn exchange_oauth_authorization_code(
     api_url: &str,
-    client_id: &str,
     redirect_uri: &str,
     code: &str,
     code_verifier: PkceCodeVerifier,
@@ -3040,7 +2996,7 @@ async fn exchange_oauth_authorization_code(
         api_url,
         &[
             ("grant_type", "authorization_code"),
-            ("client_id", client_id),
+            ("client_id", OAUTH_CLIENT_ID),
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("code_verifier", code_verifier.secret()),
@@ -3077,7 +3033,6 @@ fn map_refresh_oauth_error(
 async fn refresh_oauth_access_token(
     api_url: &str,
     refresh_token: &str,
-    client_id: &str,
     auth_login: &str,
 ) -> Result<OAuthTokenResponse> {
     let http_client = build_http_client_from_builder(
@@ -3091,7 +3046,7 @@ async fn refresh_oauth_access_token(
         .post(&token_url)
         .form(&[
             ("grant_type", "refresh_token"),
-            ("client_id", client_id),
+            ("client_id", OAUTH_CLIENT_ID),
             ("refresh_token", refresh_token),
         ])
         .send()
@@ -3133,18 +3088,14 @@ async fn request_oauth_token(
         .context("failed to parse oauth token response")
 }
 
-fn build_oauth_client(
-    api_url: &str,
-    client_id: &str,
-    redirect_uri: Option<&str>,
-) -> Result<BasicClient> {
+fn build_oauth_client(api_url: &str, redirect_uri: Option<&str>) -> Result<BasicClient> {
     let api_url = api_url.trim_end_matches('/');
     let auth_url = AuthUrl::new(format!("{api_url}/oauth/authorize"))
         .context("failed to construct oauth authorize URL")?;
     let token_url = TokenUrl::new(format!("{api_url}/oauth/token"))
         .context("failed to construct oauth token URL")?;
     let client = BasicClient::new(
-        ClientId::new(client_id.to_string()),
+        ClientId::new(OAUTH_CLIENT_ID.to_string()),
         None,
         auth_url,
         Some(token_url),
@@ -4282,7 +4233,6 @@ mod tests {
                     app_url: Some((*app_url).to_string()),
                     org_id: None,
                     org_name: Some((*org_name).to_string()),
-                    oauth_client_id: None,
                     oauth_access_expires_at: None,
                     user_name: None,
                     email: None,
@@ -4486,7 +4436,6 @@ mod tests {
                 app_url: Some("https://www.example.test".to_string()),
                 org_id: Some(org_id.to_string()),
                 org_name: Some(org_name.to_string()),
-                oauth_client_id: Some("bt_cli".to_string()),
                 oauth_access_expires_at: Some(current_unix_timestamp() + 3600),
                 user_name: Some("Test User".to_string()),
                 email: Some("user@example.test".to_string()),
@@ -4656,7 +4605,6 @@ mod tests {
                 api_url: Some("https://api.example.com".to_string()),
                 app_url: Some("https://www.example.com".to_string()),
                 org_name: Some("Example Org".to_string()),
-                oauth_client_id: None,
                 oauth_access_expires_at: None,
                 ..Default::default()
             },
@@ -4680,7 +4628,6 @@ mod tests {
                 org_id: Some("org_fake".to_string()),
                 org_name: Some("test-org".to_string()),
                 email: Some("user@example.test".to_string()),
-                oauth_client_id: Some("bt_cli_work".to_string()),
                 ..Default::default()
             },
         );
@@ -4690,7 +4637,6 @@ mod tests {
         let profile = migrated.profiles.get(&key).expect("migrated profile");
 
         assert_eq!(profile.legacy_secret_key.as_deref(), Some("work"));
-        assert_eq!(profile.oauth_client_id.as_deref(), Some("bt_cli_work"));
     }
 
     #[test]
@@ -4702,7 +4648,6 @@ mod tests {
                 auth_kind: AuthKind::Oauth,
                 org_name: None,
                 email: Some("user@example.test".to_string()),
-                oauth_client_id: Some("bt_cli_legacy".to_string()),
                 ..Default::default()
             },
         );
@@ -4718,7 +4663,6 @@ mod tests {
             profile.legacy_secret_key.as_deref(),
             Some("legacy-cross-org")
         );
-        assert_eq!(profile.oauth_client_id.as_deref(), Some("bt_cli_legacy"));
     }
 
     #[test]
@@ -4763,7 +4707,6 @@ mod tests {
                 org_id: Some("org_fake".to_string()),
                 org_name: Some("test-org".to_string()),
                 email: Some("user@example.test".to_string()),
-                oauth_client_id: Some("bt_cli_legacy".to_string()),
                 ..Default::default()
             },
         );
@@ -4781,7 +4724,6 @@ mod tests {
                 .get(&slot_key)
                 .expect("canonical OAuth slot");
             assert_eq!(profile.legacy_secret_key.as_deref(), Some("legacy-login"));
-            assert_eq!(profile.oauth_client_id.as_deref(), Some("bt_cli_legacy"));
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -4796,7 +4738,6 @@ mod tests {
             AuthProfile {
                 auth_kind: AuthKind::Oauth,
                 org_name: Some("test-org".to_string()),
-                oauth_client_id: Some("bt_cli_legacy".to_string()),
                 ..Default::default()
             },
         );
@@ -4855,8 +4796,7 @@ mod tests {
     #[test]
     fn migrate_auth_store_dedupes_oauth_slots_by_latest_expiry() {
         let mut store = AuthStore::default();
-        for (name, expires_at, client_id) in [("old", 10, "bt_cli_old"), ("new", 20, "bt_cli_new")]
-        {
+        for (name, expires_at) in [("old", 10), ("new", 20)] {
             store.profiles.insert(
                 name.to_string(),
                 AuthProfile {
@@ -4864,7 +4804,6 @@ mod tests {
                     org_id: Some("org_fake".to_string()),
                     org_name: Some("test-org".to_string()),
                     email: Some("user@example.test".to_string()),
-                    oauth_client_id: Some(client_id.to_string()),
                     oauth_access_expires_at: Some(expires_at),
                     ..Default::default()
                 },
@@ -4875,7 +4814,6 @@ mod tests {
         let key = oauth_slot_key("org_fake", "user@example.test");
         assert_eq!(migrated.profiles.len(), 1);
         let profile = migrated.profiles.get(&key).expect("migrated profile");
-        assert_eq!(profile.oauth_client_id.as_deref(), Some("bt_cli_new"));
         assert_eq!(profile.legacy_secret_key.as_deref(), Some("new"));
     }
 
@@ -4990,10 +4928,7 @@ mod tests {
             auth_source(false, None, Some("env"), None, None),
             AuthSource::EnvApiKey("env".into())
         );
-        assert_eq!(
-            auth_source(false, None, None, None, None),
-            AuthSource::None
-        );
+        assert_eq!(auth_source(false, None, None, None, None), AuthSource::None);
     }
 
     #[test]
