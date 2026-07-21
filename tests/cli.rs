@@ -257,6 +257,14 @@ fn setup_uses_codex_detected_on_path_without_explicit_agent() {
         .path()
         .join(".agents/skills/braintrust/SKILL.md")
         .exists());
+    assert!(home
+        .path()
+        .join(".agents/skills/eval-improvement-loop/SKILL.md")
+        .exists());
+    assert!(home
+        .path()
+        .join(".agents/skills/eval-improvement-loop/scripts/eval_loop_log.py")
+        .exists());
 }
 
 #[test]
