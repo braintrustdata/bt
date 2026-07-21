@@ -50,6 +50,19 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 }
 
 #[test]
+fn cost_without_subcommand_prints_help_without_authentication() {
+    let mut command = bt_command();
+    clear_braintrust_auth_env(&mut command);
+    command
+        .arg("cost")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: bt cost"))
+        .stdout(predicate::str::contains("experiments"))
+        .stdout(predicate::str::contains("logs"));
+}
+
+#[test]
 fn auth_login_does_not_expose_client_id() {
     bt_command()
         .args(["auth", "login", "--help"])
