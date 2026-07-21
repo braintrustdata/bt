@@ -88,19 +88,9 @@ fn setup_verbose_is_accepted_after_subcommand() {
 }
 
 #[test]
-fn update_help_exposes_self_update_flags() {
+fn update_help_exposes_update_flags() {
     bt_command()
         .args(["update", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--check"))
-        .stdout(predicate::str::contains("--channel"));
-}
-
-#[test]
-fn self_update_remains_as_hidden_compatibility_path() {
-    bt_command()
-        .args(["self", "update", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--check"))

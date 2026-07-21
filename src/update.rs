@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, ValueEnum};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -17,18 +17,6 @@ Examples:
   bt update --check
   bt update --channel canary
 ")]
-pub struct SelfArgs {
-    #[command(subcommand)]
-    pub command: SelfSubcommand,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum SelfSubcommand {
-    /// Update bt in-place (installer-managed installs only)
-    Update(UpdateArgs),
-}
-
-#[derive(Debug, Clone, Args)]
 pub struct UpdateArgs {
     /// Check for updates without installing
     #[arg(long)]
@@ -85,10 +73,8 @@ struct GitHubRelease {
     target_commitish: Option<String>,
 }
 
-pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
-    match args.command {
-        SelfSubcommand::Update(args) => run_update(&base, args).await,
-    }
+pub async fn run(base: BaseArgs, args: UpdateArgs) -> Result<()> {
+    run_update(&base, args).await
 }
 
 async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {

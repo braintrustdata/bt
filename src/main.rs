@@ -21,7 +21,6 @@ mod prompts;
 mod python_runner;
 mod runner_sse;
 mod scorers;
-mod self_update;
 mod setup;
 mod source_language;
 mod sql;
@@ -32,6 +31,7 @@ mod tools;
 mod topics;
 mod traces;
 mod ui;
+mod update;
 mod util_cmd;
 mod utils;
 
@@ -145,10 +145,7 @@ enum Commands {
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
     /// Update bt in-place
-    Update(CLIArgs<self_update::UpdateArgs>),
-    #[command(name = "self", hide = true)]
-    /// Self-management commands
-    SelfCommand(CLIArgs<self_update::SelfArgs>),
+    Update(CLIArgs<update::UpdateArgs>),
     /// Manage tools
     Tools(CLIArgs<tools::ToolsArgs>),
     /// Manage scorers
@@ -185,7 +182,6 @@ impl Commands {
             Commands::Datasets(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
             Commands::Update(cmd) => &cmd.base,
-            Commands::SelfCommand(cmd) => &cmd.base,
             Commands::Tools(cmd) => &cmd.base,
             Commands::Scorers(cmd) => &cmd.base,
             Commands::Functions(cmd) => &cmd.base,
@@ -212,7 +208,6 @@ impl Commands {
             Commands::Topics(cmd) => &mut cmd.base,
             Commands::Prompts(cmd) => &mut cmd.base,
             Commands::Update(cmd) => &mut cmd.base,
-            Commands::SelfCommand(cmd) => &mut cmd.base,
             Commands::Tools(cmd) => &mut cmd.base,
             Commands::Scorers(cmd) => &mut cmd.base,
             Commands::Functions(cmd) => &mut cmd.base,
@@ -318,22 +313,13 @@ fn try_main() -> Result<()> {
             Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
             Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
             Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
-            Commands::Update(cmd) => {
-                self_update::run(
-                    cmd.base,
-                    self_update::SelfArgs {
-                        command: self_update::SelfSubcommand::Update(cmd.args),
-                    },
-                )
-                .await?
-            }
+            Commands::Update(cmd) => update::run(cmd.base, cmd.args).await?,
             Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
             Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
             Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
             Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
             Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
             Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
-            Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
         }
