@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 
 const SUPPORTED_PRICING_VERSION: u32 = 1;
@@ -336,21 +336,41 @@ fn normalize_model_name(model: &str) -> String {
 }
 
 pub(super) fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
+    parse_timestamp_in_offset(
+        value,
+        FixedOffset::east_opt(0).expect("UTC is a valid offset"),
+    )
+}
+
+/// Parse a timestamp. RFC 3339 values keep their explicit offset; a bare
+/// `YYYY-MM-DD` is interpreted at midnight in `offset` (so `--since 2026-07-20`
+/// with UTC-7 means `2026-07-20T00:00:00-07:00`).
+pub(super) fn parse_timestamp_in_offset(value: &str, offset: FixedOffset) -> Result<DateTime<Utc>> {
     let value = value.trim();
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
         return Ok(timestamp.with_timezone(&Utc));
     }
     if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        return Ok(date
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is a valid time")
-            .and_utc());
+        let naive = date.and_hms_opt(0, 0, 0).expect("midnight is a valid time");
+        return offset
+            .from_local_datetime(&naive)
+            .single()
+            .map(|local| local.with_timezone(&Utc))
+            .context("ambiguous local timestamp for the given time zone");
     }
     bail!("expected RFC 3339 timestamp or YYYY-MM-DD date, got '{value}'")
 }
 
 pub(super) fn format_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+}
+
+/// Format an instant in the given offset, showing the offset suffix (or `Z`).
+pub(super) fn format_timestamp_in_offset(timestamp: DateTime<Utc>, offset: FixedOffset) -> String {
+    let use_z = offset.local_minus_utc() == 0;
+    timestamp
+        .with_timezone(&offset)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, use_z)
 }
 
 #[cfg(test)]
