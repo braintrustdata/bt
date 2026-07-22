@@ -235,7 +235,7 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
 
         let response = with_spinner(
             "Running query...",
-            execute_query(&client, &query, lint_mode),
+            execute_query(&client, &query, lint_mode, RowLimit::Default, None),
         )
         .await?;
         print_response(&response, base.json)?;
@@ -364,7 +364,13 @@ fn handle_key_event(
             }
 
             app.status = "Running query...".to_string();
-            let result = handle.block_on(execute_query(client, &query, app.lint_mode.as_str()));
+            let result = handle.block_on(execute_query(
+                client,
+                &query,
+                app.lint_mode.as_str(),
+                RowLimit::Default,
+                None,
+            ));
             match result {
                 Ok(response) => {
                     app.output = format_response(&response, app.json_output)?;
@@ -437,21 +443,49 @@ fn format_response(response: &SqlResponse, json_output: bool) -> Result<String> 
     }
 }
 
-/// Run a read-only BTQL/SQL query and return just the result rows.
+/// How the BTQL row cap should be applied to a query.
 ///
-/// Thin wrapper over [`execute_query`] so other commands (for example
-/// `bt cost`) can reuse the `/btql` request body and headers without
-/// duplicating them.
-pub(crate) async fn run_btql_rows(
+/// The backend applies a default limit of 1000 rows to grouped queries when the
+/// request neither carries an explicit limit nor sets `disable_limit`. `bt cost`
+/// exposes this as `--limit`/`--no-limit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowLimit {
+    /// Let the backend apply its default (currently 1000 rows).
+    Default,
+    /// Send `disable_limit: true` to return every group.
+    Disabled,
+    /// Send an explicit `LIMIT`-equivalent cap.
+    Explicit(u64),
+}
+
+/// Time-zone offset for `day()`/`hour()` bucketing, in the
+/// `Date.prototype.getTimezoneOffset()` convention BTQL expects: minutes to add
+/// to local time to reach UTC, so UTC-7 is `+420`. `None` buckets in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TzOffset(pub i32);
+
+/// Run a read-only BTQL query, returning result rows, with control over the row
+/// cap. See [`RowLimit`].
+pub(crate) async fn run_btql_rows_with_limit(
     client: &ApiClient,
     query: &str,
     lint_mode: &str,
+    limit: RowLimit,
+    tz_offset: Option<TzOffset>,
 ) -> Result<Vec<Map<String, Value>>> {
-    Ok(execute_query(client, query, lint_mode).await?.data)
+    Ok(execute_query(client, query, lint_mode, limit, tz_offset)
+        .await?
+        .data)
 }
 
-async fn execute_query(client: &ApiClient, query: &str, lint_mode: &str) -> Result<SqlResponse> {
-    let body = query_body(query, lint_mode);
+async fn execute_query(
+    client: &ApiClient,
+    query: &str,
+    lint_mode: &str,
+    limit: RowLimit,
+    tz_offset: Option<TzOffset>,
+) -> Result<SqlResponse> {
+    let body = query_body(query, lint_mode, limit, tz_offset);
     let headers = org_headers(client);
 
     match client.post_with_headers("/btql", &body, &headers).await {
@@ -613,14 +647,28 @@ fn org_headers(client: &ApiClient) -> Vec<(&'static str, &str)> {
     vec![("x-bt-org-name", org_name)]
 }
 
-fn query_body(query: &str, lint_mode: &str) -> Value {
-    json!({
+fn query_body(query: &str, lint_mode: &str, limit: RowLimit, tz_offset: Option<TzOffset>) -> Value {
+    let mut body = json!({
         "query": query,
         "fmt": "json",
         "lint_mode": lint_mode,
         "strict_lint_mode": lint_mode == "strict",
         "query_source": QUERY_SOURCE,
-    })
+    });
+    let object = body.as_object_mut().expect("query body is a json object");
+    match limit {
+        RowLimit::Default => {}
+        RowLimit::Disabled => {
+            object.insert("disable_limit".to_string(), json!(true));
+        }
+        RowLimit::Explicit(limit) => {
+            object.insert("limit".to_string(), json!(limit));
+        }
+    }
+    if let Some(TzOffset(minutes)) = tz_offset {
+        object.insert("tz_offset".to_string(), json!(minutes));
+    }
+    body
 }
 
 fn async_query_submit_body(query: &str, batch_size: Option<u64>) -> SubmitAsyncQueryRequest<'_> {
@@ -1002,13 +1050,38 @@ mod tests {
 
     #[test]
     fn query_body_sets_lint_mode() {
-        let body = query_body("select 1", "strict");
+        let body = query_body("select 1", "strict", RowLimit::Default, None);
 
         assert_eq!(body["query"], "select 1");
         assert_eq!(body["fmt"], "json");
         assert_eq!(body["lint_mode"], "strict");
         assert_eq!(body["strict_lint_mode"], true);
         assert_eq!(body["query_source"], QUERY_SOURCE);
+        assert!(body.get("limit").is_none());
+        assert!(body.get("disable_limit").is_none());
+        assert!(body.get("tz_offset").is_none());
+    }
+
+    #[test]
+    fn query_body_applies_row_limit() {
+        let disabled = query_body("select 1", "default", RowLimit::Disabled, None);
+        assert_eq!(disabled["disable_limit"], true);
+        assert!(disabled.get("limit").is_none());
+
+        let explicit = query_body("select 1", "default", RowLimit::Explicit(25), None);
+        assert_eq!(explicit["limit"], 25);
+        assert!(explicit.get("disable_limit").is_none());
+    }
+
+    #[test]
+    fn query_body_applies_tz_offset() {
+        let body = query_body(
+            "select 1",
+            "default",
+            RowLimit::Default,
+            Some(TzOffset(420)),
+        );
+        assert_eq!(body["tz_offset"], 420);
     }
 
     #[test]
