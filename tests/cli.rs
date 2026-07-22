@@ -50,16 +50,18 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 }
 
 #[test]
-fn cost_without_subcommand_prints_help_without_authentication() {
+fn cost_help_lists_sources_and_group_by() {
     let mut command = bt_command();
     clear_braintrust_auth_env(&mut command);
     command
-        .arg("cost")
+        .args(["cost", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Usage: bt cost"))
-        .stdout(predicate::str::contains("experiments"))
-        .stdout(predicate::str::contains("logs"));
+        .stdout(predicate::str::contains("--source"))
+        .stdout(predicate::str::contains("--group-by"))
+        .stdout(predicate::str::contains("playgrounds"))
+        .stdout(predicate::str::contains("--no-limit"));
 }
 
 #[test]

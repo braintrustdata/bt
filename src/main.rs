@@ -76,7 +76,7 @@ Data & evaluation
   datasets     Manage datasets
   eval         Run eval files
   sql          Run SQL queries against Braintrust
-  cost         Estimate LLM cost for Braintrust resources
+  cost         Estimate LLM cost for the active project
   sync         Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
@@ -131,7 +131,7 @@ enum Commands {
     Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
-    /// Estimate LLM cost for Braintrust resources
+    /// Estimate LLM cost for the active project
     Cost(CLIArgs<cost::CostArgs>),
     /// Authenticate bt with Braintrust
     Auth(CLIArgs<auth::AuthArgs>),
