@@ -140,7 +140,7 @@ pub(super) fn build_waterfall_view(
 pub(super) fn print_waterfall_text(
     target: &ResolvedTraceCommandTarget,
     waterfall: &WaterfallView,
-    profile: Option<&str>,
+    org: Option<&str>,
     limit: usize,
     has_more: bool,
 ) {
@@ -197,13 +197,13 @@ pub(super) fn print_waterfall_text(
     }
     println!(
         "\nspan detail: bt view span{} --object-ref {} --id <id>",
-        org_flag_suffix(profile),
+        org_flag_suffix(org),
         format_object_ref_arg(&target.object_ref)
     );
     println!("Use the inline `id=` value from a span row.");
     println!(
         "json: bt view waterfall --json{} --trace-id {}",
-        org_flag_suffix(profile),
+        org_flag_suffix(org),
         target.root_span_id
     );
 }

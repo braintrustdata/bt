@@ -5260,7 +5260,7 @@ fn logs_hints(
     has_more: bool,
     object_ref: &str,
     next_cursor: Option<&str>,
-    profile: Option<&str>,
+    org: Option<&str>,
     limit: usize,
 ) -> Vec<String> {
     let mut hints = vec![
@@ -5277,7 +5277,7 @@ fn logs_hints(
         if let Some(cursor) = next_cursor {
             hints.push(format!(
                 "Next page: bt view logs{} --object-ref {object_ref} --cursor {cursor}{limit_suffix}",
-                org_flag_suffix(profile)
+                org_flag_suffix(org)
             ));
         } else {
             hints.push(format!(
@@ -5293,13 +5293,13 @@ fn trace_hints(
     object_ref: &str,
     trace_id: &str,
     next_cursor: Option<&str>,
-    profile: Option<&str>,
+    org: Option<&str>,
     limit: usize,
 ) -> Vec<String> {
     let mut hints = vec![
         format!(
             "Trace fetch returns truncated span rows; use `bt view span{} --object-ref {object_ref} --id <row-id>` for full single-span payloads.",
-            org_flag_suffix(profile)
+            org_flag_suffix(org)
         ),
         "Write output to a file for long traces.".to_string(),
     ];
@@ -5312,7 +5312,7 @@ fn trace_hints(
         if let Some(cursor) = next_cursor {
             hints.push(format!(
                 "Next page: bt view trace{} --object-ref {object_ref} --trace-id {trace_id} --cursor {cursor}{limit_suffix}",
-                org_flag_suffix(profile)
+                org_flag_suffix(org)
             ));
         } else {
             hints.push(format!(
@@ -5337,21 +5337,21 @@ fn detail_view_trace_url_value(view: DetailView) -> Option<&'static str> {
     }
 }
 
-fn thread_hints(profile: Option<&str>) -> Vec<String> {
+fn thread_hints(org: Option<&str>) -> Vec<String> {
     vec![
         format!(
             "Open an interactive thread view with `bt view thread{} --trace-id <root-span-id>`.",
-            org_flag_suffix(profile)
+            org_flag_suffix(org)
         ),
         "Use `--non-interactive` for a compact text transcript.".to_string(),
     ]
 }
 
-fn waterfall_hints(profile: Option<&str>, has_more: bool) -> Vec<String> {
+fn waterfall_hints(org: Option<&str>, has_more: bool) -> Vec<String> {
     let mut hints = vec![
         format!(
             "Render an agent-readable trace report with `bt view waterfall{} --trace-id <root-span-id>`.",
-            org_flag_suffix(profile)
+            org_flag_suffix(org)
         ),
         "Use `--json` for computed offsets, token counts, costs, cache metrics, and raw ids."
             .to_string(),
@@ -5369,7 +5369,7 @@ fn print_logs_text(
     rows: &[TraceSummaryRow],
     list_mode: ListMode,
     object_ref: &str,
-    profile: Option<&str>,
+    org: Option<&str>,
     limit: usize,
     preview_length: usize,
     next_cursor: Option<&str>,
@@ -5406,7 +5406,7 @@ fn print_logs_text(
         println!("next_cursor: {cursor}");
         println!(
             "next: bt view logs{} --object-ref {object_ref} --cursor {cursor} --non-interactive{limit_suffix}",
-            org_flag_suffix(profile)
+            org_flag_suffix(org)
         );
     } else {
         println!("No additional rows.");
@@ -5513,7 +5513,7 @@ fn print_thread_text(
     target: &ResolvedTraceCommandTarget,
     messages: &[Value],
     summary: &ThreadSummary,
-    profile: Option<&str>,
+    org: Option<&str>,
 ) {
     println!(
         "bt view thread: project={} root_span_id={} messages={}",
@@ -5552,7 +5552,7 @@ fn print_thread_text(
 
     println!(
         "\njson: bt view thread --json{} --trace-id {}",
-        org_flag_suffix(profile),
+        org_flag_suffix(org),
         target.root_span_id
     );
 }
@@ -5561,7 +5561,7 @@ fn print_trace_text(
     trace_id: &str,
     rows: &[Map<String, Value>],
     object_ref: &str,
-    profile: Option<&str>,
+    org: Option<&str>,
     limit: usize,
     preview_length: usize,
     next_cursor: Option<&str>,
@@ -5589,7 +5589,7 @@ fn print_trace_text(
     }
     println!(
         "\nTrace output is truncated. Re-run with --json for the full trace (`bt view trace --json{0} --object-ref {1} --trace-id {2}`), or fetch a single span with `bt view span{0} --object-ref {1} --id <row-id>`.",
-        org_flag_suffix(profile),
+        org_flag_suffix(org),
         object_ref,
         trace_id
     );
@@ -5602,7 +5602,7 @@ fn print_trace_text(
         println!("next_cursor: {cursor}");
         println!(
             "next: bt view trace{} --object-ref {} --trace-id {} --cursor {} --non-interactive{limit_suffix}",
-            org_flag_suffix(profile),
+            org_flag_suffix(org),
             object_ref,
             trace_id,
             cursor
@@ -6701,26 +6701,7 @@ mod tests {
     use serde_json::json;
 
     fn base_args() -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            org_name: None,
-            org_name_source: None,
-            project: None,
-            project_source: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_api_key: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
+        BaseArgs::default()
     }
 
     fn parsed_url_with_org(org: &str) -> ParsedTraceUrl {

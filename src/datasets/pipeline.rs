@@ -2065,26 +2065,7 @@ mod tests {
     }
 
     fn test_base_args() -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            org_name: None,
-            org_name_source: None,
-            project: None,
-            project_source: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_api_key: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
+        BaseArgs::default()
     }
 
     fn test_source() -> PipelineSourceInspect {
