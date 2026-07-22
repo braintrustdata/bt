@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use urlencoding::encode;
 
 use crate::http::ApiClient;
@@ -50,4 +51,14 @@ pub async fn get_prompt_by_slug(
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
     client.delete(&path).await
+}
+
+/// Partially update a prompt by id via `PATCH /v1/prompt/{id}`.
+///
+/// The Braintrust API deep-merges object fields, so callers can send the
+/// nested fields they want to change (for example `prompt_data.prompt`)
+/// without sending the whole prompt object.
+pub async fn patch_prompt(client: &ApiClient, prompt_id: &str, body: &Value) -> Result<Prompt> {
+    let path = format!("/v1/prompt/{}", encode(prompt_id));
+    client.patch(&path, body).await
 }
