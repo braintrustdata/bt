@@ -8,6 +8,7 @@ pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 mod api;
 mod delete;
 mod list;
+mod update;
 mod view;
 
 #[derive(Debug, Clone, Args)]
@@ -16,6 +17,7 @@ Examples:
   bt prompts list
   bt prompts view my-prompt
   bt prompts delete my-prompt
+  bt prompts update my-prompt --prompt-file prompt.md
 ")]
 pub struct PromptsArgs {
     #[command(subcommand)]
@@ -28,6 +30,8 @@ enum PromptsCommands {
     List,
     /// View a prompt's content
     View(ViewArgs),
+    /// Update a prompt in place (prompt text, model, description, or arbitrary patch)
+    Update(update::UpdateArgs),
     /// Delete a prompt
     Delete(DeleteArgs),
 }
@@ -87,6 +91,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         Some(PromptsCommands::View(p)) => {
             view::run(&ctx, p.slug(), base.json, p.web, base.verbose).await
         }
+        Some(PromptsCommands::Update(p)) => update::run(&ctx, &p, base.json).await,
         Some(PromptsCommands::Delete(p)) => delete::run(&ctx, p.slug(), p.force).await,
     }
 }
@@ -100,7 +105,15 @@ fn prompts_command_is_read_only(command: Option<&PromptsCommands>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
+
+    #[derive(Debug, Parser)]
+    struct PromptsArgsHarness {
+        #[command(flatten)]
+        args: PromptsArgs,
+    }
 
     #[test]
     fn prompts_routes_list_and_view_to_read_only_auth() {
@@ -124,5 +137,20 @@ mod tests {
                 force: true,
             })
         )));
+    }
+
+    #[test]
+    fn prompts_routes_update_to_validated_auth() {
+        let parsed = PromptsArgsHarness::try_parse_from([
+            "bt-prompts",
+            "update",
+            "my-prompt",
+            "--description",
+            "updated",
+            "--yes",
+        ])
+        .expect("parse update");
+
+        assert!(!prompts_command_is_read_only(parsed.args.command.as_ref()));
     }
 }

@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
@@ -39,16 +38,12 @@ pub struct BaseArgs {
     #[arg(long, env = "BRAINTRUST_NO_INPUT", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub no_input: bool,
 
-    /// Use a saved login profile (or via BRAINTRUST_PROFILE)
-    #[arg(long, env = "BRAINTRUST_PROFILE", global = true)]
-    pub profile: Option<String>,
-
-    #[arg(skip = false)]
-    pub profile_explicit: bool,
-
     /// Override active org (or via BRAINTRUST_ORG_NAME)
     #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
     pub org_name: Option<String>,
+
+    #[arg(skip)]
+    pub org_name_source: Option<ArgValueSource>,
 
     /// Override active project
     #[arg(
@@ -60,6 +55,9 @@ pub struct BaseArgs {
     )]
     pub project: Option<String>,
 
+    #[arg(skip)]
+    pub project_source: Option<ArgValueSource>,
+
     /// Override stored API key (or via BRAINTRUST_API_KEY)
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true, hide = true)]
     pub api_key: Option<String>,
@@ -67,9 +65,9 @@ pub struct BaseArgs {
     #[arg(skip)]
     pub api_key_source: Option<ArgValueSource>,
 
-    /// Prefer profile credentials even if BRAINTRUST_API_KEY/--api-key is set.
-    #[arg(long, global = true)]
-    pub prefer_profile: bool,
+    /// Prefer API key credentials for the selected org when available.
+    #[arg(long = "prefer-api-key", env = "BRAINTRUST_PREFER_API_KEY", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
+    pub prefer_api_key: bool,
 
     /// Override API URL (or via BRAINTRUST_API_URL)
     #[arg(
@@ -124,66 +122,5 @@ impl BaseArgs {
 
     pub fn verbose_explicit(&self) -> bool {
         self.verbose && self.verbose_source.is_some()
-    }
-}
-
-pub fn has_explicit_profile_arg(args: &[OsString]) -> bool {
-    let mut idx = 1usize;
-    while idx < args.len() {
-        let Some(arg) = args[idx].to_str() else {
-            idx += 1;
-            continue;
-        };
-
-        if arg == "--" {
-            break;
-        }
-
-        if arg == "--profile" || arg.starts_with("--profile=") {
-            return true;
-        }
-
-        idx += 1;
-    }
-
-    false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::has_explicit_profile_arg;
-    use std::ffi::OsString;
-
-    #[test]
-    fn has_explicit_profile_arg_detects_split_flag() {
-        let args = vec![
-            OsString::from("bt"),
-            OsString::from("status"),
-            OsString::from("--profile"),
-            OsString::from("work"),
-        ];
-        assert!(has_explicit_profile_arg(&args));
-    }
-
-    #[test]
-    fn has_explicit_profile_arg_detects_equals_flag() {
-        let args = vec![
-            OsString::from("bt"),
-            OsString::from("status"),
-            OsString::from("--profile=work"),
-        ];
-        assert!(has_explicit_profile_arg(&args));
-    }
-
-    #[test]
-    fn has_explicit_profile_arg_ignores_passthrough_args() {
-        let args = vec![
-            OsString::from("bt"),
-            OsString::from("eval"),
-            OsString::from("--"),
-            OsString::from("--profile"),
-            OsString::from("work"),
-        ];
-        assert!(!has_explicit_profile_arg(&args));
     }
 }
