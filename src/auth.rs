@@ -108,6 +108,17 @@ fn recoverable_auth_error(kind: RecoverableAuthErrorKind, message: String) -> an
     anyhow::Error::new(RecoverableAuthError { kind, message })
 }
 
+fn shell_quote_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 pub fn is_missing_credential_error(err: &anyhow::Error) -> bool {
     err.chain().any(|source| {
         source
@@ -914,7 +925,8 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
         recoverable_auth_error(
             RecoverableAuthErrorKind::OauthClientId,
             format!(
-                "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
+                "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {}`",
+                shell_quote_arg(&profile_name)
             ),
         )
     })?;
@@ -935,7 +947,8 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
         recoverable_auth_error(
             RecoverableAuthErrorKind::OauthRefreshToken,
             format!(
-                "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
+                "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {}`",
+                shell_quote_arg(&profile_name)
             ),
         )
     })?;
@@ -1159,7 +1172,8 @@ where
     if let Some(profile_name) = selected_profile_name {
         let profile = store.profiles.get(profile_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "profile '{profile_name}' not found; run `bt auth profiles` or `bt auth login --profile {profile_name}`"
+                "profile '{profile_name}' not found; run `bt auth profiles` or `bt auth login --profile {}`",
+                shell_quote_arg(profile_name)
             )
         })?;
         let is_oauth = profile.auth_kind == AuthKind::Oauth;
@@ -1170,7 +1184,8 @@ where
                 recoverable_auth_error(
                     RecoverableAuthErrorKind::StoredCredential,
                     format!(
-                        "no keychain credential found for profile '{profile_name}'; re-run `bt auth login --profile {profile_name}`"
+                        "no keychain credential found for profile '{profile_name}'; re-run `bt auth login --profile {}`",
+                        shell_quote_arg(profile_name)
                     ),
                 )
             })?)
@@ -1531,13 +1546,15 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let client_id = profile.oauth_client_id.clone().ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {profile_name}`"
+            "oauth profile '{profile_name}' is missing client_id; re-run `bt auth login --oauth --profile {}`",
+            shell_quote_arg(&profile_name)
         )
     })?;
     let previous_expires_at = profile.oauth_access_expires_at;
     let refresh_token = load_profile_oauth_refresh_token(profile_name.as_str())?.ok_or_else(|| {
         anyhow::anyhow!(
-            "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {profile_name}`"
+            "oauth refresh token missing for profile '{profile_name}'; re-run `bt auth login --oauth --profile {}`",
+            shell_quote_arg(&profile_name)
         )
     })?;
 
@@ -2929,7 +2946,8 @@ fn map_refresh_oauth_error(
                 message.push_str(&format!(" ({description})"));
             }
             message.push_str(&format!(
-                "; re-run `bt auth login --oauth --profile {profile_name}`"
+                "; re-run `bt auth login --oauth --profile {}`",
+                shell_quote_arg(profile_name)
             ));
             return recoverable_auth_error(RecoverableAuthErrorKind::OauthRefreshToken, message);
         }
@@ -4019,13 +4037,21 @@ mod tests {
     fn invalid_grant_refresh_error_is_treated_as_recoverable() {
         let err = map_refresh_oauth_error(
             "https://api.example.com",
-            "work",
+            "test profile",
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":"invalid_grant","error_description":"refresh token expired"}"#,
         );
 
         assert!(is_missing_credential_error(&err));
         assert!(err.to_string().contains("refresh token expired"));
+        assert!(err
+            .to_string()
+            .contains("re-run `bt auth login --oauth --profile 'test profile'`"));
+    }
+
+    #[test]
+    fn shell_quote_arg_escapes_single_quotes() {
+        assert_eq!(shell_quote_arg("test profile's"), "'test profile'\\''s'");
     }
 
     #[test]
