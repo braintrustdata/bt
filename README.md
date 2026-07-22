@@ -135,21 +135,41 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Commands
 
-| Command       | Description                                                        |
-| ------------- | ------------------------------------------------------------------ |
-| `bt init`     | Initialize `.bt/` config directory and link to a project           |
-| `bt auth`     | Authenticate with Braintrust                                       |
-| `bt switch`   | Switch org and project context                                     |
-| `bt status`   | Show current org and project context                               |
-| `bt datasets` | Manage datasets and dataset pipelines                              |
-| `bt eval`     | Run eval files (Unix only)                                         |
-| `bt sql`      | Run SQL queries against Braintrust                                 |
-| `bt view`     | View logs, traces, and spans                                       |
-| `bt projects` | Manage projects (list, create, view, delete)                       |
-| `bt datasets` | Manage remote datasets (list, create, update, view, delete)        |
-| `bt prompts`  | Manage prompts (list, view, delete)                                |
-| `bt sync`     | Synchronize project logs between Braintrust and local NDJSON files |
-| `bt update`   | Update bt in-place                                                 |
+| Command        | Description                                                        |
+| -------------- | ------------------------------------------------------------------ |
+| `bt init`      | Initialize `.bt/` config directory and link to a project           |
+| `bt auth`      | Authenticate with Braintrust                                       |
+| `bt switch`    | Switch org and project context                                     |
+| `bt status`    | Show current org and project context                               |
+| `bt datasets`  | Manage datasets and dataset pipelines                              |
+| `bt eval`      | Run eval files (Unix only)                                         |
+| `bt sql`       | Run SQL queries against Braintrust                                 |
+| `bt view`      | View logs, traces, and spans                                       |
+| `bt projects`  | Manage projects (list, create, view, delete)                       |
+| `bt datasets`  | Manage remote datasets (list, create, update, view, delete)        |
+| `bt prompts`   | Manage prompts (list, view, update, delete)                        |
+| `bt functions` | Manage functions (list, view, invoke, update, push, pull, delete)  |
+| `bt tools`     | Manage tools (list, view, invoke, update, delete)                  |
+| `bt scorers`   | Manage scorers (list, create, view, invoke, update, delete)        |
+| `bt sync`      | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt update`    | Update bt in-place                                                 |
+
+## `bt scorers`
+
+Create and update prompt-based LLM scorers in the current project:
+
+```bash
+bt scorers create "Helpfulness" \
+  --model gpt-4o-mini \
+  --prompt-file judge.md \
+  --choice-scores '{"A":1,"B":0}' \
+  --use-cot
+
+bt scorers update helpfulness --prompt-file judge.md
+bt scorers update helpfulness --model gpt-4o-mini
+```
+
+Use `--if-exists error|ignore|replace` when creating a scorer. For fields without a dedicated update flag, use `--patch` or `--patch-file` with a JSON object.
 
 ## `bt eval`
 
