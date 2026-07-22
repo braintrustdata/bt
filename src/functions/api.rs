@@ -144,6 +144,20 @@ pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()
     client.delete(&path).await
 }
 
+/// Partially update a function (scorer/tool/prompt/...) by id.
+///
+/// The Braintrust API deep-merges object fields, so callers can send only the
+/// nested fields they want to change (for example `prompt_data.prompt`) without
+/// sending the complete function definition.
+pub async fn patch_function(
+    client: &ApiClient,
+    function_id: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let path = format!("/v1/function/{}", encode(function_id));
+    client.patch(&path, body).await
+}
+
 pub async fn list_functions_page(
     client: &ApiClient,
     query: &FunctionListQuery,

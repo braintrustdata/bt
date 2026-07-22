@@ -815,6 +815,36 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
 }
 
 #[test]
+fn scorers_create_help_includes_llm_judge_flags() {
+    bt_command()
+        .args(["scorers", "create", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--prompt-file"))
+        .stdout(predicate::str::contains("--model"))
+        .stdout(predicate::str::contains("--choice-scores"))
+        .stdout(predicate::str::contains("--use-cot"))
+        .stdout(predicate::str::contains("--if-exists"));
+}
+
+#[test]
+fn scorer_and_prompt_update_help_is_conflict_free() {
+    bt_command()
+        .args(["scorers", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--patch-file"))
+        .stdout(predicate::str::contains("--prompt-file"));
+
+    bt_command()
+        .args(["prompts", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--patch-file"))
+        .stdout(predicate::str::contains("--prompt-file"));
+}
+
+#[test]
 fn topics_report_help_accepts_global_org_short_conflict_free() {
     bt_command()
         .args([
