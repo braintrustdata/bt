@@ -35,6 +35,7 @@ use crate::ui::{
     summary_metric_unit, SummaryExperimentColumn, SummaryMetricCell, SummaryMetricKind,
     SummaryMetricRow, SummaryTableOptions,
 };
+use crate::utils::shell_quote_arg;
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -3399,17 +3400,6 @@ fn build_experiment_compare_command(
         shell_quote_arg(baseline),
         shell_quote_arg(experiment),
     ))
-}
-
-fn shell_quote_arg(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
 }
 
 #[cfg(test)]

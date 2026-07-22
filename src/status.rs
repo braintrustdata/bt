@@ -30,22 +30,14 @@ struct StatusOutput {
     source: Option<String>,
 }
 
-fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
-    if let Some(ref email) = p.email {
-        match p.user_name.as_deref() {
-            Some(name) => Some(format!("{name} ({email})")),
-            None => Some(email.clone()),
-        }
-    } else {
-        p.api_key_hint.clone()
-    }
-}
-
 fn format_auth(p: &auth::ProfileInfo) -> String {
-    match format_identity(p) {
-        Some(identity) => format!("{} — {identity}", p.auth_method),
-        None => p.auth_method.clone(),
-    }
+    auth::identity_label(
+        p.user_name.as_deref(),
+        p.email.as_deref(),
+        p.api_key_hint.as_deref(),
+    )
+    .map(|identity| format!("{} — {identity}", p.auth_method))
+    .unwrap_or_else(|| p.auth_method.clone())
 }
 
 pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
@@ -66,7 +58,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         &global_path,
     );
     let merged_cfg = global_cfg.merge(&local_cfg);
-    let auth_info = auth::active_auth_info(&base, org.as_deref());
+    let auth_info = auth::active_auth_info(&base, org.as_deref())?;
 
     if base
         .project
@@ -77,9 +69,10 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         project = config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
     }
 
+    let display_org = org.as_deref().map(config::display_org);
     if base.json {
         let output = StatusOutput {
-            org,
+            org: display_org.map(str::to_string),
             project,
             user_name: auth_info.as_ref().and_then(|p| p.user_name.clone()),
             user_email: auth_info.as_ref().and_then(|p| p.email.clone()),
@@ -92,16 +85,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     }
 
     if base.verbose {
-        let org_display = if org.is_none()
-            && auth_info
-                .as_ref()
-                .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none())
-        {
-            "cross-org"
-        } else {
-            org.as_deref().unwrap_or("(unset)")
-        };
-        println!("org: {org_display}");
+        println!("org: {}", display_org.unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
         if let Some(ref p) = auth_info {
             println!("auth: {}", format_auth(p));
@@ -109,11 +93,11 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         if let Some(src) = source {
             println!("source: {src}");
         }
-    } else if org.is_some() {
-        let scope = match (&org, &project) {
-            (Some(o), Some(p)) => format!("{o}/{p}"),
-            (Some(o), None) => o.to_string(),
-            _ => unreachable!(),
+    } else if let Some(org) = display_org {
+        let scope = match (org, project.as_deref()) {
+            ("cross-org", _) => org.to_string(),
+            (org, Some(project)) => format!("{org}/{project}"),
+            (org, None) => org.to_string(),
         };
         println!("{scope}");
         let auth_line = match &auth_info {
@@ -182,20 +166,19 @@ pub(crate) fn resolve_config(
         cli_project,
         env_project,
     } = overrides;
-    let env_org = env_org.filter(|s| !s.is_empty());
+    // `Some("")` is the canonical cross-org marker for both CLI and env
+    // sources, so org overrides must not filter empty strings.
     let env_project = env_project.filter(|s| !s.is_empty());
-
+    let merged = global.merge(local);
     let org = cli_org
         .clone()
         .or_else(|| env_org.clone())
-        .or_else(|| local.org.clone())
-        .or_else(|| global.org.clone());
+        .or_else(|| merged.org.clone());
 
     let project = cli_project
         .clone()
         .or_else(|| env_project.clone())
-        .or_else(|| local.project.clone())
-        .or_else(|| global.project.clone());
+        .or_else(|| merged.project.clone());
 
     let source = if cli_org.is_some() || cli_project.is_some() {
         Some("cli".to_string())
@@ -230,199 +213,108 @@ mod tests {
     }
 
     #[test]
-    fn cli_overrides_everything() {
-        let global = config(Some("global-org"), Some("global-proj"));
-        let local = config(Some("local-org"), Some("local-proj"));
+    fn config_precedence_and_context_safety() {
+        let both = || config(Some("global-org"), Some("global-proj"));
+        let cases = [
+            (
+                "cli",
+                ConfigOverrides {
+                    cli_org: s("cli-org"),
+                    cli_project: s("cli-proj"),
+                    ..Default::default()
+                },
+                both(),
+                config(Some("local-org"), Some("local-proj")),
+                (Some("cli-org"), Some("cli-proj"), Some("cli")),
+            ),
+            (
+                "env",
+                ConfigOverrides {
+                    env_org: s("env-org"),
+                    env_project: s("env-proj"),
+                    ..Default::default()
+                },
+                both(),
+                config(Some("local-org"), Some("local-proj")),
+                (Some("env-org"), Some("env-proj"), Some("env")),
+            ),
+            (
+                "local",
+                ConfigOverrides::default(),
+                both(),
+                config(Some("local-org"), Some("local-proj")),
+                (
+                    Some("local-org"),
+                    Some("local-proj"),
+                    Some("/project/.bt/config.json"),
+                ),
+            ),
+            (
+                "global",
+                ConfigOverrides::default(),
+                both(),
+                config(None, None),
+                (
+                    Some("global-org"),
+                    Some("global-proj"),
+                    Some("/home/.bt/config.json"),
+                ),
+            ),
+            (
+                "empty",
+                ConfigOverrides::default(),
+                config(None, None),
+                config(None, None),
+                (None, None, None),
+            ),
+            (
+                "mixed cli/local",
+                ConfigOverrides {
+                    cli_org: s("cli-org"),
+                    ..Default::default()
+                },
+                both(),
+                config(None, Some("local-proj")),
+                (Some("cli-org"), Some("local-proj"), Some("cli")),
+            ),
+            (
+                "local project does not inherit global org",
+                ConfigOverrides::default(),
+                config(Some("global-org"), None),
+                config(None, Some("local-proj")),
+                (None, Some("local-proj"), Some("/project/.bt/config.json")),
+            ),
+            (
+                "local cross-org",
+                ConfigOverrides::default(),
+                both(),
+                config(Some(""), None),
+                (Some(""), None, Some("/project/.bt/config.json")),
+            ),
+            (
+                "env cross-org",
+                ConfigOverrides {
+                    env_org: s(""),
+                    ..Default::default()
+                },
+                both(),
+                config(None, None),
+                (Some(""), Some("global-proj"), Some("env")),
+            ),
+        ];
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
-
-        let (org, project, source) = resolve_config(
-            ConfigOverrides {
-                cli_org: s("cli-org"),
-                cli_project: s("cli-proj"),
-                ..Default::default()
-            },
-            &global,
-            &local,
-            &local_path,
-            &global_path,
-        );
-
-        assert_eq!(org, s("cli-org"));
-        assert_eq!(project, s("cli-proj"));
-        assert_eq!(source, s("cli"));
-    }
-
-    #[test]
-    fn env_overrides_config_below_cli() {
-        let global = config(Some("global-org"), Some("global-proj"));
-        let local = config(Some("local-org"), Some("local-proj"));
-        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
-        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
-
-        let (org, project, source) = resolve_config(
-            ConfigOverrides {
-                env_org: s("env-org"),
-                env_project: s("env-proj"),
-                ..Default::default()
-            },
-            &global,
-            &local,
-            &local_path,
-            &global_path,
-        );
-
-        assert_eq!(org, s("env-org"));
-        assert_eq!(project, s("env-proj"));
-        assert_eq!(source, s("env"));
-    }
-
-    #[test]
-    fn local_overrides_global() {
-        let global = config(Some("global-org"), Some("global-proj"));
-        let local = config(Some("local-org"), Some("local-proj"));
-        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
-        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
-
-        let (org, project, source) = resolve_config(
-            ConfigOverrides::default(),
-            &global,
-            &local,
-            &local_path,
-            &global_path,
-        );
-
-        assert_eq!(org, s("local-org"));
-        assert_eq!(project, s("local-proj"));
-        assert_eq!(source, s("/project/.bt/config.json"));
-    }
-
-    #[test]
-    fn global_used_when_local_empty() {
-        let global = config(Some("global-org"), Some("global-proj"));
-        let local = config(None, None);
-        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
-        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
-
-        let (org, project, source) = resolve_config(
-            ConfigOverrides::default(),
-            &global,
-            &local,
-            &local_path,
-            &global_path,
-        );
-
-        assert_eq!(org, s("global-org"));
-        assert_eq!(project, s("global-proj"));
-        assert_eq!(source, s("/home/.bt/config.json"));
-    }
-
-    #[test]
-    fn no_source_when_all_empty() {
-        let global = config(None, None);
-        let local = config(None, None);
-        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
-        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
-
-        let (org, project, source) = resolve_config(
-            ConfigOverrides::default(),
-            &global,
-            &local,
-            &local_path,
-            &global_path,
-        );
-
-        assert_eq!(org, None);
-        assert_eq!(project, None);
-        assert_eq!(source, None);
-    }
-
-    #[test]
-    fn mixed_sources_org_cli_project_local() {
-        let global = config(Some("global-org"), Some("global-proj"));
-        let local = config(None, Some("local-proj"));
-        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
-        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
-
-        let (org, project, source) = resolve_config(
-            ConfigOverrides {
-                cli_org: s("cli-org"),
-                ..Default::default()
-            },
-            &global,
-            &local,
-            &local_path,
-            &global_path,
-        );
-
-        assert_eq!(org, s("cli-org"));
-        assert_eq!(project, s("local-proj"));
-        assert_eq!(source, s("cli"));
-    }
-
-    #[test]
-    fn values_cascade_across_layers() {
-        let global = config(Some("global-org"), None);
-        let local = config(None, Some("local-proj"));
-        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
-        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
-
-        let (org, project, source) = resolve_config(
-            ConfigOverrides::default(),
-            &global,
-            &local,
-            &local_path,
-            &global_path,
-        );
-
-        assert_eq!(org, s("global-org"));
-        assert_eq!(project, s("local-proj"));
-        assert_eq!(source, s("/project/.bt/config.json"));
-    }
-
-    fn profile(
-        user_name: Option<&str>,
-        email: Option<&str>,
-        api_key_hint: Option<&str>,
-    ) -> auth::ProfileInfo {
-        auth::ProfileInfo {
-            auth_method: if api_key_hint.is_some() {
-                "api_key"
-            } else {
-                "oauth"
-            }
-            .into(),
-            org_name: None,
-            user_name: user_name.map(Into::into),
-            email: email.map(Into::into),
-            api_key_hint: api_key_hint.map(Into::into),
+        for (name, overrides, global, local, expected) in cases {
+            let actual = resolve_config(overrides, &global, &local, &local_path, &global_path);
+            assert_eq!(
+                actual,
+                (
+                    expected.0.map(str::to_string),
+                    expected.1.map(str::to_string),
+                    expected.2.map(str::to_string),
+                ),
+                "{name}"
+            );
         }
-    }
-
-    #[test]
-    fn format_identity_name_and_email() {
-        let p = profile(Some("Alice"), Some("alice@example.com"), None);
-        assert_eq!(
-            format_identity(&p),
-            Some("Alice (alice@example.com)".into())
-        );
-    }
-
-    #[test]
-    fn format_identity_email_only() {
-        let p = profile(None, Some("alice@example.com"), None);
-        assert_eq!(format_identity(&p), Some("alice@example.com".into()));
-    }
-
-    #[test]
-    fn format_identity_api_key_hint() {
-        let p = profile(None, None, Some("sk-****zhJwO"));
-        assert_eq!(format_identity(&p), Some("sk-****zhJwO".into()));
-    }
-
-    #[test]
-    fn format_identity_none() {
-        let p = profile(None, None, None);
-        assert_eq!(format_identity(&p), None);
     }
 }

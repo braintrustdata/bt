@@ -813,6 +813,36 @@ fn auth_logout_requires_force_without_an_interactive_terminal() {
 }
 
 #[test]
+fn auth_logout_bare_does_not_default_to_current_login() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+    let bt_config_dir = config_dir.path().join("bt");
+    fs::create_dir_all(&bt_config_dir).expect("create bt config dir");
+    fs::write(bt_config_dir.join("config.json"), r#"{"org":"test-org-a"}"#)
+        .expect("write active config");
+    fs::write(
+        bt_config_dir.join("auth.json"),
+        r#"{"profiles":{"test-profile-a":{"auth_kind":"api_key","org_id":"org_test_a","org_name":"test-org-a","api_key_hint":"sk-****aaaaa"},"test-profile-b":{"auth_kind":"api_key","org_id":"org_test_b","org_name":"test-org-b","api_key_hint":"sk-****bbbbb"}}}"#,
+    )
+    .expect("write auth logins");
+
+    let output = auth_sub_command(
+        cwd.path(),
+        config_dir.path(),
+        &["logout", "--no-input", "--force"],
+    )
+    .output()
+    .expect("run bare non-interactive auth logout");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("multiple auth logins match"));
+    let remaining =
+        fs::read_to_string(bt_config_dir.join("auth.json")).expect("read remaining auth logins");
+    assert!(remaining.contains("test-org-a"));
+    assert!(remaining.contains("test-org-b"));
+}
+
+#[test]
 fn auth_refresh_errors_when_no_oauth_login_exists_even_with_json() {
     // --json must not swallow a real error: refresh only applies to OAuth
     // logins, and an org with only API-key auth should fail actionably.

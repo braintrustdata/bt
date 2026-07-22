@@ -1093,7 +1093,9 @@ fn resolve_default_snapshot_author(base: &BaseArgs, ctx: &ResolvedContext) -> Op
         return None;
     }
 
-    let profile = auth::active_auth_info(base, Some(ctx.client.org_name()))?;
+    let profile = auth::active_auth_info(base, Some(ctx.client.org_name()))
+        .ok()
+        .flatten()?;
     profile_author_slug(&profile)
 }
 

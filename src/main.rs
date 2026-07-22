@@ -491,11 +491,16 @@ fn has_io_error(err: &anyhow::Error) -> bool {
 }
 
 fn looks_like_user_error(err: &anyhow::Error) -> bool {
-    let message = err.to_string().to_lowercase();
-    message.contains("required")
-        || message.contains("use:")
-        || message.contains("not found")
-        || message.contains("invalid")
+    err.chain().any(|source| {
+        let message = source.to_string().to_lowercase();
+        message.contains("required")
+            || message.contains("use:")
+            || message.contains("not found")
+            || message.contains("invalid")
+            || message.contains("already exists")
+            || message.contains("without finding")
+            || message.contains("without config.json")
+    })
 }
 
 fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
