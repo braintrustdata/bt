@@ -6,30 +6,34 @@
 //! experiment enumeration); playgrounds are a separate `playground_logs(...)`
 //! table that needs a prompt-session enumeration first.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, Local, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, NaiveDate, Timelike, Utc};
 use clap::Args;
 
 use crate::{
     args::BaseArgs,
     project_context::resolve_project_command_context_with_auth_mode,
     sql::{run_btql_rows_with_limit, RowLimit, TzOffset},
-    ui::with_spinner,
+    ui::{print_command_status, with_spinner, CommandStatus},
     utils::parse_duration_to_seconds,
 };
 
+mod plot;
 mod pricing;
 mod query;
 mod render;
 mod rows;
 mod sessions;
+mod termimage;
+
+use termimage::ImageMode;
 
 pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 
-use pricing::{format_timestamp_in_offset, parse_timestamp_in_offset, PriceBook};
+use pricing::{format_timestamp, format_timestamp_in_offset, parse_timestamp_in_offset, PriceBook};
 
 #[cfg(test)]
 use pricing::parse_timestamp;
@@ -42,6 +46,11 @@ use query::{
 /// `api-ts/src/btql.ts`). Used to detect truncation.
 const BACKEND_DEFAULT_LIMIT: usize = 1000;
 
+/// High-resolution fallback for inline images when the terminal doesn't report
+/// its pixel size. Rendering large and letting the terminal downscale stays
+/// crisp (unlike upscaling a small image).
+const IMAGE_FALLBACK_SIZE: (u32, u32) = (2400, 1200);
+
 #[derive(Debug, Clone, Args)]
 #[command(
     about = "Estimate LLM cost for the active project",
@@ -52,6 +61,9 @@ Examples:
   bt cost --source experiments         Only experiment (eval) cost
   bt cost --group-by day --window 30d  Daily spend over 30 days
   bt cost --group-by trace --no-limit  Per-trace cost, all groups
+  bt cost --group-by day --plot        Chart daily spend in the console
+  bt cost --group-by day --save-fig cost.svg  Save the chart as SVG (or .png)
+  bt cost --group-by model --csv > cost.csv   Export the breakdown as CSV
   bt cost --pricing-file prices.toml   Price models Braintrust doesn't know
 
 Pricing file (USD per 1 million tokens):
@@ -74,6 +86,9 @@ Examples:
   bt cost --source experiments         Only experiment (eval) cost
   bt cost --group-by day --window 30d  Daily spend over 30 days
   bt cost --group-by trace --no-limit  Per-trace cost, all groups
+  bt cost --group-by day --plot        Chart daily spend in the console
+  bt cost --group-by day --save-fig cost.svg  Save the chart as SVG (or .png)
+  bt cost --group-by model --csv > cost.csv   Export the breakdown as CSV
   bt cost --pricing-file prices.toml   Price models Braintrust doesn't know
 
 Pricing file:
@@ -102,20 +117,30 @@ Pricing file:
   [effective_from, effective_until). Unknown fields are rejected."
 )]
 pub struct CostArgs {
-    /// Relative time window ending at --until
-    #[arg(long, env = "BRAINTRUST_COST_WINDOW", default_value = "7d")]
+    /// Relative time window ending at --until, e.g. 7d, 24h, 90m
+    #[arg(
+        long,
+        env = "BRAINTRUST_COST_WINDOW",
+        default_value = "7d",
+        value_name = "DURATION"
+    )]
     window: String,
 
     /// Absolute inclusive lower bound (RFC 3339 or YYYY-MM-DD); overrides --window
-    #[arg(long)]
+    #[arg(long, value_name = "DATE")]
     since: Option<String>,
 
     /// Absolute exclusive upper bound (RFC 3339 or YYYY-MM-DD); defaults to now
-    #[arg(long)]
+    #[arg(long, value_name = "DATE")]
     until: Option<String>,
 
     /// Cost pools to include (default: all)
-    #[arg(long = "source", value_enum, value_delimiter = ',')]
+    #[arg(
+        long = "source",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "SOURCE"
+    )]
     sources: Vec<Source>,
 
     /// Break cost down by these dimensions (comma-separated or repeated)
@@ -123,49 +148,92 @@ pub struct CostArgs {
         long = "group-by",
         value_enum,
         value_delimiter = ',',
-        default_value = "model"
+        default_value = "model",
+        value_name = "DIMENSION"
     )]
     group_by: Vec<Dimension>,
 
     /// Only count spans for these models (repeatable)
-    #[arg(long = "model")]
+    #[arg(long = "model", value_name = "MODEL")]
     models: Vec<String>,
 
-    /// Only count spans of these span types, e.g. llm (repeatable)
-    #[arg(long = "type")]
+    /// Only count spans of these span types, e.g. llm or score (repeatable)
+    #[arg(long = "type", value_name = "TYPE")]
     types: Vec<String>,
 
-    /// Only count spans with these purposes, e.g. scorer (repeatable)
-    #[arg(long = "purpose")]
-    purposes: Vec<String>,
-
-    /// Exclude spans whose purpose is scorer
-    #[arg(long)]
-    exclude_scorers: bool,
-
     /// Cap the number of breakdown rows each query returns
-    #[arg(long, conflicts_with = "no_limit")]
+    #[arg(long, conflicts_with = "no_limit", value_name = "N")]
     limit: Option<u64>,
 
     /// Return every group, bypassing the backend row cap
     #[arg(long = "no-limit")]
     no_limit: bool,
 
+    /// Draw a console chart of cost across the breakdown (best with --group-by day/hour;
+    /// mutually exclusive with --json/--csv)
+    #[arg(long)]
+    plot: bool,
+
+    /// In time plots, collapse empty stretches of 2+ buckets ($0) instead of drawing them
+    #[arg(long = "skip-gaps")]
+    skip_gaps: bool,
+
+    /// Output the breakdown rows as CSV (mutually exclusive with --json/--plot)
+    #[arg(long)]
+    csv: bool,
+
+    /// Save the chart to a file instead of the console (.svg or .png; defaults to .svg)
+    #[arg(long = "save-fig", value_name = "PATH")]
+    save_fig: Option<PathBuf>,
+
+    /// Whether --plot may draw an inline image in terminals that support it like Kitty, Ghostty, iTerm2
+    #[arg(
+        long = "image",
+        env = "BRAINTRUST_COST_IMAGE",
+        value_enum,
+        default_value = "auto",
+        value_name = "MODE"
+    )]
+    image: ImageMode,
+
     /// TOML file of per-model token prices for models Braintrust cannot price
     #[arg(long, env = "BRAINTRUST_COST_PRICING_FILE", value_name = "PATH")]
     pricing_file: Option<PathBuf>,
 
     /// Time zone for day/hour buckets, bare YYYY-MM-DD bounds, and display:
-    /// utc, local, or a fixed offset like -07:00
+    /// local, utc, or a fixed offset like -07:00
     #[arg(
         long = "timezone",
         env = "BRAINTRUST_COST_TIMEZONE",
-        default_value = "utc"
+        default_value = "local",
+        allow_hyphen_values = true,
+        value_name = "ZONE"
     )]
     timezone: String,
 }
 
 pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
+    // --plot / --csv / --json are three ways to render the same result and are
+    // mutually exclusive. (`--json` is a global flag, so it can't be a clap
+    // `conflicts_with` target for the cost-local flags without breaking arg
+    // validation — hence the manual check.)
+    let mut modes = Vec::new();
+    if base.json {
+        modes.push("--json");
+    }
+    if args.csv {
+        modes.push("--csv");
+    }
+    if args.plot {
+        modes.push("--plot");
+    }
+    if modes.len() > 1 {
+        bail!(
+            "{} cannot be used together; choose one",
+            modes.join(" and ")
+        );
+    }
+
     let now = Utc::now()
         .with_nanosecond(0)
         .expect("zero nanoseconds is a valid timestamp");
@@ -189,8 +257,6 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
         sources: sources.clone(),
         models: args.models.clone(),
         types: args.types.clone(),
-        purposes: args.purposes.clone(),
-        exclude_scorers: args.exclude_scorers,
     };
 
     let ctx = resolve_project_command_context_with_auth_mode(&base, true).await?;
@@ -269,10 +335,41 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
         .iter()
         .map(|source| source.label().to_string())
         .collect();
+
+    // A saved figure is a file action, independent of the console chart/JSON.
+    if let Some(path) = args.save_fig.as_deref() {
+        let (points, title) =
+            chart_points(&cost_rows, &display_dims, range, offset, args.skip_gaps);
+        let written = plot::save_cost_chart(&title, &points, path)?;
+        print_command_status(
+            CommandStatus::Success,
+            &format!("Saved cost chart to {}", written.display()),
+        );
+    }
+
+    // For --plot, prefer an inline image when the terminal supports it and
+    // --image=auto; otherwise draw the ASCII chart.
+    let mut chart: Option<String> = None;
+    let mut image: Option<String> = None;
+    if args.plot {
+        let (points, title) =
+            chart_points(&cost_rows, &display_dims, range, offset, args.skip_gaps);
+        if matches!(args.image, ImageMode::Auto) {
+            image = inline_chart_image(&title, &points)?;
+        }
+        if image.is_none() {
+            let ascii = plot::render_cost_chart(&title, &points, chart_size())?;
+            chart = (!ascii.trim().is_empty()).then_some(ascii);
+        }
+    }
+
+    let timezone_label = offset_label(offset);
     let report = render::Report {
         ctx: &ctx,
         since: format_timestamp_in_offset(range.since, offset),
         until: format_timestamp_in_offset(range.until, offset),
+        offset,
+        timezone: &timezone_label,
         display_dims: &display_dims,
         sources: &source_labels,
         rows: &cost_rows,
@@ -280,13 +377,302 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
         pricing_file: args.pricing_file.as_deref(),
         truncated,
         verbose: base.verbose,
+        chart: chart.as_deref(),
+        image: image.as_deref(),
     };
 
+    // At most one of --json/--csv/--plot is set (rejected together up front);
+    // --plot flows through the table path via `chart`/`image`.
     if base.json {
         render::print_json(&report)
+    } else if args.csv {
+        render::print_csv(&report)
     } else {
         render::print_table(&report)
     }
+}
+
+/// Render the chart as an inline terminal image, when supported. Returns `None`
+/// on unsupported terminals or when there is nothing to plot.
+fn inline_chart_image(title: &str, points: &[(String, f64)]) -> Result<Option<String>> {
+    if !termimage::is_supported() {
+        return Ok(None);
+    }
+    let cols = chart_size().0 as u16;
+    let size = image_pixel_size(cols);
+    let Some(png) = plot::render_png_bytes(title, points, size)? else {
+        return Ok(None);
+    };
+    Ok(termimage::inline_image(&png, cols))
+}
+
+/// Pixel size to render an inline image at. Matches the terminal's real pixel
+/// grid when it reports one (so the image is 1:1 and crisp), otherwise renders
+/// high-res for a crisp downscale.
+fn image_pixel_size(cols: u16) -> (u32, u32) {
+    if let Ok(window) = crossterm::terminal::window_size() {
+        if window.width > 0 && window.height > 0 && window.columns > 0 {
+            let cell_width = f64::from(window.width) / f64::from(window.columns);
+            let width = (cell_width * f64::from(cols)).round().clamp(320.0, 4000.0) as u32;
+            let height = ((f64::from(width) * 0.5).round() as u32)
+                .min(u32::from(window.height))
+                .max(200);
+            return (width, height);
+        }
+    }
+    IMAGE_FALLBACK_SIZE
+}
+
+/// Build the `(label, cost)` points and chart title. Time breakdowns
+/// (`day`/`hour`) are ordered chronologically (left-to-right); everything else
+/// keeps the cost-ranked order of the table.
+fn chart_points(
+    rows: &[rows::CostRow],
+    display_dims: &[Dimension],
+    range: TimeRange,
+    offset: FixedOffset,
+    skip_gaps: bool,
+) -> (Vec<(String, f64)>, String) {
+    let points = match time_granularity(display_dims) {
+        // Time breakdowns get a true, evenly-spaced time axis: every bucket in
+        // the window is present (missing ones are $0), so real gaps show as the
+        // line dropping to zero rather than being compressed away. Labels are
+        // compact and in the display time zone.
+        Some(granularity) => {
+            let mut points = densify_time_points(rows, granularity, range, offset);
+            // Optionally collapse long empty stretches so the plot isn't
+            // dominated by flat zero when data is bursty.
+            if skip_gaps {
+                points = drop_long_zero_runs(points);
+            }
+            let raw: Vec<String> = points.iter().map(|(label, _)| label.clone()).collect();
+            let span = range.until - range.since;
+            for (point, label) in
+                points
+                    .iter_mut()
+                    .zip(axis_labels(&raw, granularity, offset, span))
+            {
+                point.0 = label;
+            }
+            points
+        }
+        // Categorical breakdowns keep the table's cost-ranked order.
+        None => rows
+            .iter()
+            .map(|row| (chart_label(&row.keys), row.cost().unwrap_or(0.0)))
+            .collect(),
+    };
+
+    let title = format!(
+        "Cost by {}",
+        display_dims
+            .iter()
+            .map(|dim| dim.header())
+            .collect::<Vec<_>>()
+            .join(" / ")
+    );
+    (points, title)
+}
+
+fn chart_label(keys: &[Option<String>]) -> String {
+    keys.iter()
+        .map(|value| match value {
+            Some(value) if !value.is_empty() => value.as_str(),
+            _ => "—",
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeGranularity {
+    Day,
+    Hour,
+}
+
+/// Expand time-bucketed rows into a complete, evenly-spaced series over the
+/// window: every hour/day bucket is present, with $0 for buckets that had no
+/// data, so gaps are represented instead of compressed. Points are chronological
+/// and keyed by their UTC RFC 3339 bucket start.
+fn densify_time_points(
+    rows: &[rows::CostRow],
+    granularity: TimeGranularity,
+    range: TimeRange,
+    offset: FixedOffset,
+) -> Vec<(String, f64)> {
+    let step = match granularity {
+        TimeGranularity::Hour => Duration::hours(1),
+        TimeGranularity::Day => Duration::days(1),
+    };
+
+    // Sum cost into bucket-start instants (keyed by epoch seconds).
+    let mut by_bucket: HashMap<i64, f64> = HashMap::new();
+    for row in rows {
+        let Some(Some(key)) = row.keys.first() else {
+            continue;
+        };
+        let Ok(instant) = DateTime::parse_from_rfc3339(key) else {
+            continue;
+        };
+        let start = floor_to_bucket(instant.with_timezone(&Utc), granularity, offset);
+        *by_bucket.entry(start.timestamp()).or_insert(0.0) += row.cost().unwrap_or(0.0);
+    }
+
+    let mut points = Vec::new();
+    let mut cursor = floor_to_bucket(range.since, granularity, offset);
+    // Cap the number of buckets so a huge window can't blow up (e.g. hourly
+    // over years); such ranges aren't meaningfully plottable anyway.
+    let mut remaining = 100_000;
+    while cursor < range.until && remaining > 0 {
+        let cost = by_bucket.get(&cursor.timestamp()).copied().unwrap_or(0.0);
+        points.push((format_timestamp(cursor), cost));
+        cursor += step;
+        remaining -= 1;
+    }
+    points
+}
+
+/// Drop stretches of `$0` that span two or more consecutive buckets, so bursty
+/// data isn't buried under long flat-zero runs. Isolated single-bucket zeros
+/// are kept (a brief dip). The remaining points keep their real time labels, so
+/// a collapsed stretch shows up as a jump in the axis labels.
+fn drop_long_zero_runs(points: Vec<(String, f64)>) -> Vec<(String, f64)> {
+    let count = points.len();
+    let is_zero: Vec<bool> = points.iter().map(|(_, cost)| *cost <= 0.0).collect();
+    let mut keep = vec![true; count];
+    let mut index = 0;
+    while index < count {
+        if is_zero[index] {
+            let start = index;
+            while index < count && is_zero[index] {
+                index += 1;
+            }
+            if index - start >= 2 {
+                keep[start..index].fill(false);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    points
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(point, keep)| keep.then_some(point))
+        .collect()
+}
+
+/// Truncate an instant to the start of its hour/day bucket in `offset`.
+fn floor_to_bucket(
+    instant: DateTime<Utc>,
+    granularity: TimeGranularity,
+    offset: FixedOffset,
+) -> DateTime<Utc> {
+    let local = instant.with_timezone(&offset);
+    let floored = match granularity {
+        TimeGranularity::Hour => local
+            .with_minute(0)
+            .and_then(|value| value.with_second(0))
+            .and_then(|value| value.with_nanosecond(0)),
+        TimeGranularity::Day => local
+            .with_hour(0)
+            .and_then(|value| value.with_minute(0))
+            .and_then(|value| value.with_second(0))
+            .and_then(|value| value.with_nanosecond(0)),
+    };
+    floored.unwrap_or(local).with_timezone(&Utc)
+}
+
+fn time_granularity(display_dims: &[Dimension]) -> Option<TimeGranularity> {
+    match display_dims {
+        [Dimension::Day] => Some(TimeGranularity::Day),
+        [Dimension::Hour] => Some(TimeGranularity::Hour),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeParts {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Parse a bucket key (e.g. `2026-07-21T05:00:00Z` or `2026-07-21`) and express
+/// it in `offset`, so labels read in the chosen time zone. BTQL returns bucket
+/// keys as UTC instants; converting is what makes `--timezone` visibly shift
+/// hour labels and keep day labels correct across the date line.
+fn parse_time_parts(label: &str, offset: FixedOffset) -> Option<TimeParts> {
+    if let Ok(instant) = DateTime::parse_from_rfc3339(label) {
+        let local = instant.with_timezone(&offset);
+        return Some(TimeParts {
+            year: local.year(),
+            month: local.month(),
+            day: local.day(),
+            hour: local.hour(),
+        });
+    }
+    // Date-only keys carry no time or zone; take them at face value.
+    if let Ok(date) = NaiveDate::parse_from_str(label, "%Y-%m-%d") {
+        return Some(TimeParts {
+            year: date.year(),
+            month: date.month(),
+            day: date.day(),
+            hour: 0,
+        });
+    }
+    None
+}
+
+/// Build self-contained axis labels in `offset`. Each tick carries its own
+/// context because plotters shows only a sparse subset of ticks — a "show the
+/// coarser unit only when it changes" scheme would leave most ticks without a
+/// day. The detail is chosen from the span: beyond a few days, hourly ticks are
+/// meaningless without their day, so every label gets the day (and month).
+fn axis_labels(
+    labels: &[String],
+    granularity: TimeGranularity,
+    offset: FixedOffset,
+    span: Duration,
+) -> Vec<String> {
+    let long = span.num_days() > 3;
+    labels
+        .iter()
+        .map(|label| match parse_time_parts(label, offset) {
+            Some(parts) => format_axis_label(parts, granularity, long),
+            None => label.clone(),
+        })
+        .collect()
+}
+
+fn format_axis_label(parts: TimeParts, granularity: TimeGranularity, long: bool) -> String {
+    let month = MONTH_NAMES
+        .get((parts.month as usize).saturating_sub(1))
+        .copied()
+        .unwrap_or("?");
+    // Buckets start on the hour, so minutes are always :00 — use a compact
+    // `HHh` form to leave room for more ticks.
+    match granularity {
+        // Over a few days, hourly ticks show the day (and month) plus the hour.
+        TimeGranularity::Hour if long => format!("{month} {} {:02}h", parts.day, parts.hour),
+        // Short spans: day number + hour is enough context.
+        TimeGranularity::Hour => format!("{} {:02}h", parts.day, parts.hour),
+        // Daily buckets always show month + day.
+        TimeGranularity::Day => format!("{month} {}", parts.day),
+    }
+}
+
+/// Chart dimensions in characters, based on the terminal when available.
+fn chart_size() -> (u32, u32) {
+    let (cols, rows) = dialoguer::console::Term::stdout()
+        .size_checked()
+        .map(|(rows, cols)| (u32::from(cols), u32::from(rows)))
+        .unwrap_or((100, 24));
+    (cols.clamp(60, 160), (rows.saturating_sub(4)).clamp(14, 30))
 }
 
 /// All sources when none are specified; otherwise the deduped request.
@@ -357,6 +743,17 @@ fn parse_fixed_offset(value: &str) -> Result<FixedOffset> {
     }
     let seconds = sign * (hours * 3600 + minutes * 60);
     FixedOffset::east_opt(seconds).with_context(|| format!("invalid --timezone offset '{value}'"))
+}
+
+/// Human label for a fixed offset: `UTC` or `±HH:MM`.
+fn offset_label(offset: FixedOffset) -> String {
+    let seconds = offset.local_minus_utc();
+    if seconds == 0 {
+        return "UTC".to_string();
+    }
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let seconds = seconds.abs();
+    format!("{sign}{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60)
 }
 
 /// Convert a fixed offset to BTQL's `tz_offset` (minutes to add to local to
@@ -440,6 +837,29 @@ fn build_time_segments(range: TimeRange, price_book: Option<&PriceBook>) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct Harness {
+        #[command(flatten)]
+        args: CostArgs,
+    }
+
+    #[test]
+    fn negative_timezone_offset_parses_as_a_value() {
+        // `-7` looks like a flag; allow_hyphen_values lets it be the value.
+        let parsed = Harness::try_parse_from(["bt-cost", "--timezone", "-7"]).unwrap();
+        assert_eq!(parsed.args.timezone, "-7");
+        assert_eq!(
+            parse_timezone(&parsed.args.timezone)
+                .unwrap()
+                .local_minus_utc(),
+            -7 * 3600
+        );
+
+        let colon = Harness::try_parse_from(["bt-cost", "--timezone", "-07:00"]).unwrap();
+        assert_eq!(colon.args.timezone, "-07:00");
+    }
 
     fn base_args() -> CostArgs {
         CostArgs {
@@ -450,10 +870,13 @@ mod tests {
             group_by: vec![Dimension::Model],
             models: Vec::new(),
             types: Vec::new(),
-            purposes: Vec::new(),
-            exclude_scorers: false,
             limit: None,
             no_limit: false,
+            plot: false,
+            skip_gaps: false,
+            csv: false,
+            save_fig: None,
+            image: ImageMode::Auto,
             pricing_file: None,
             timezone: "utc".to_string(),
         }
@@ -565,6 +988,98 @@ mod tests {
             Some(TzOffset(-330))
         );
         assert_eq!(btql_tz_offset(utc()), None);
+    }
+
+    #[test]
+    fn axis_labels_day_are_self_contained() {
+        let labels = [
+            "2026-07-30T00:00:00Z".to_string(),
+            "2026-07-31T00:00:00Z".to_string(),
+            "2026-08-01T00:00:00Z".to_string(),
+        ];
+        // Every daily tick carries month + day, regardless of span.
+        let out = axis_labels(&labels, TimeGranularity::Day, utc(), Duration::days(3));
+        assert_eq!(out, vec!["Jul 30", "Jul 31", "Aug 1"]);
+    }
+
+    #[test]
+    fn axis_labels_hour_add_the_day_over_long_spans() {
+        let labels = [
+            "2026-07-21T15:00:00Z".to_string(),
+            "2026-07-24T09:00:00Z".to_string(),
+        ];
+        // Span > 3 days: each hourly tick shows month, day and hour.
+        let long = axis_labels(&labels, TimeGranularity::Hour, utc(), Duration::days(30));
+        assert_eq!(long, vec!["Jul 21 15h", "Jul 24 09h"]);
+        // Span <= 3 days: day number + hour.
+        let short = axis_labels(&labels, TimeGranularity::Hour, utc(), Duration::days(1));
+        assert_eq!(short, vec!["21 15h", "24 09h"]);
+    }
+
+    fn time_row(key: &str, cost: f64) -> rows::CostRow {
+        rows::CostRow {
+            keys: vec![Some(key.to_string())],
+            logged_cost: cost,
+            file_cost: 0.0,
+            logged_priced_spans: 1,
+            file_priced_spans: 0,
+            unpriced_spans: 0,
+            no_usage_spans: 0,
+        }
+    }
+
+    #[test]
+    fn skip_gaps_drops_runs_of_two_or_more_zeros() {
+        let points = vec![
+            ("a".to_string(), 5.0),
+            ("b".to_string(), 0.0), // isolated zero: kept
+            ("c".to_string(), 3.0),
+            ("d".to_string(), 0.0), // run of 3 zeros: dropped
+            ("e".to_string(), 0.0),
+            ("f".to_string(), 0.0),
+            ("g".to_string(), 4.0),
+        ];
+        let kept: Vec<String> = drop_long_zero_runs(points)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(kept, vec!["a", "b", "c", "g"]);
+    }
+
+    #[test]
+    fn densify_fills_missing_buckets_with_zero() {
+        let rows = [
+            time_row("2026-07-20T00:00:00Z", 5.0),
+            time_row("2026-07-22T00:00:00Z", 3.0),
+        ];
+        let range = TimeRange {
+            since: parse_timestamp("2026-07-20T00:00:00Z").unwrap(),
+            until: parse_timestamp("2026-07-23T00:00:00Z").unwrap(),
+        };
+        let points = densify_time_points(&rows, TimeGranularity::Day, range, utc());
+        // Three consecutive days, with the missing middle day represented as $0.
+        let costs: Vec<f64> = points.iter().map(|(_, cost)| *cost).collect();
+        assert_eq!(costs, vec![5.0, 0.0, 3.0]);
+    }
+
+    #[test]
+    fn hour_labels_shift_into_the_display_timezone() {
+        let labels = [
+            "2026-07-21T05:00:00Z".to_string(),
+            "2026-07-21T06:00:00Z".to_string(),
+        ];
+        let span = Duration::days(1);
+        // UTC: hours 05, 06 on the 21st.
+        assert_eq!(
+            axis_labels(&labels, TimeGranularity::Hour, utc(), span),
+            vec!["21 05h", "21 06h"]
+        );
+        // UTC-7: the same instants are 22:00 and 23:00 the previous day.
+        let minus7 = parse_timezone("-7").unwrap();
+        assert_eq!(
+            axis_labels(&labels, TimeGranularity::Hour, minus7, span),
+            vec!["20 22h", "20 23h"]
+        );
     }
 
     #[test]
