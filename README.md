@@ -408,9 +408,10 @@ Current behavior:
 - If `--workflow` is omitted in non-interactive mode, setup defaults to all workflows.
 - Use `--refresh-docs` in setup (or `bt docs fetch --refresh`) to clear old docs before re-fetching.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
-- Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
-- Gemini and Qwen integration symlink `.gemini/skills`/`.qwen/skills` to `.agents/skills/braintrust/SKILL.md`.
-- Copilot integration symlinks `.copilot/skills` to `.agents/skills/braintrust/SKILL.md`. MCP config is written via `copilot mcp add` to the project `.copilot` dir (local) or the default user config (global).
+- Skills setup installs the core Braintrust skill plus `eval-improvement-loop`, which repeatedly runs `bt eval` in offline, uploaded-experiment, or hill-climbing mode; commits every evaluated candidate on a dedicated branch; keeps eval data and scorers frozen; supports optional Braintrust session metadata; and uses a bundled helper to generate and validate its JSONL run log.
+- Claude integration exposes skills under `.claude/skills/`; canonical skill paths are `.agents/skills/braintrust/SKILL.md` and `.agents/skills/eval-improvement-loop/SKILL.md`.
+- Gemini and Qwen integration symlink `.gemini/skills`/`.qwen/skills` to `.agents/skills/`.
+- Copilot integration symlinks `.copilot/skills` to `.agents/skills/`. MCP config is written via `copilot mcp add` to the project `.copilot` dir (local) or the default user config (global).
 - Cursor integration installs `.cursor/rules/braintrust.mdc` with the same shared Braintrust guidance plus an auto-generated command-reference excerpt from this README.
 - Setup-time docs prefetch writes to `.bt/skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `.bt/skills/docs/README.md` and per-section `.bt/skills/docs/<section>/_index.md` (or the global equivalents under `~/.config/bt/skills/docs`).

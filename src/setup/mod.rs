@@ -35,6 +35,9 @@ const SHARED_SKILL_BODY: &str = include_str!("../../skills/shared/braintrust-cli
 const SHARED_WORKFLOW_GUIDE: &str = include_str!("../../skills/shared/workflows.md");
 const SHARED_SKILL_TEMPLATE: &str = include_str!("../../skills/shared/skill_template.md");
 const SKILL_FRONTMATTER: &str = include_str!("../../skills/shared/skill_frontmatter.md");
+const EVAL_IMPROVEMENT_SKILL: &str = include_str!("../../skills/eval-improvement-loop/SKILL.md");
+const EVAL_IMPROVEMENT_LOG_SCRIPT: &str =
+    include_str!("../../skills/eval-improvement-loop/scripts/eval_loop_log.py");
 const BT_README: &str = include_str!("../../README.md");
 const SETUP_WIZARD_CREATE_PATH: &str = "/api/cli/wizard-session/create";
 const SETUP_WIZARD_POLL_PATH: &str = "/api/cli/wizard-session/poll";
@@ -559,10 +562,15 @@ struct SkillsSetupOutcome {
     successful_count: usize,
 }
 
+struct BundledSkill {
+    name: &'static str,
+    files: Vec<(&'static str, String)>,
+}
+
 #[derive(Debug, Clone)]
 struct SkillsAliasResult {
     changed: bool,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
@@ -4479,15 +4487,23 @@ fn install_agent_skill(
     alias_dir: Option<&str>,
 ) -> Result<AgentInstallResult> {
     let root = scope_root(scope, local_root, home)?;
-    let skill_content = render_braintrust_skill();
-    let (canonical_changed, skill_path) = install_canonical_skill(root, &skill_content)?;
+    let skills = bundled_skills();
+    let (canonical_changed, canonical_paths) = install_canonical_skills(root, &skills)?;
     let mut changed = canonical_changed;
-    let mut paths = vec![skill_path.display().to_string()];
+    let mut paths = canonical_paths
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
 
     if let Some(alias_dir) = alias_dir {
-        let alias = ensure_agent_skills_alias(root, alias_dir, &skill_content)?;
+        let alias = ensure_agent_skills_alias(root, alias_dir, &skills)?;
         changed |= alias.changed;
-        paths.push(alias.path.display().to_string());
+        paths.extend(
+            alias
+                .paths
+                .into_iter()
+                .map(|path| path.display().to_string()),
+        );
     }
 
     Ok(AgentInstallResult {
@@ -4498,7 +4514,7 @@ fn install_agent_skill(
             InstallStatus::Skipped
         },
         message: if changed {
-            "installed skill".to_string()
+            "installed skills".to_string()
         } else {
             "already configured".to_string()
         },
@@ -4506,16 +4522,49 @@ fn install_agent_skill(
     })
 }
 
-fn install_canonical_skill(root: &Path, skill_content: &str) -> Result<(bool, PathBuf)> {
-    let skill_path = root.join(".agents/skills/braintrust/SKILL.md");
-    let changed = write_text_file_if_changed(&skill_path, skill_content)?;
-    Ok((changed, skill_path))
+fn bundled_skills() -> Vec<BundledSkill> {
+    vec![
+        BundledSkill {
+            name: "braintrust",
+            files: vec![("SKILL.md", render_braintrust_skill())],
+        },
+        BundledSkill {
+            name: "eval-improvement-loop",
+            files: vec![
+                ("SKILL.md", EVAL_IMPROVEMENT_SKILL.trim().to_string()),
+                (
+                    "scripts/eval_loop_log.py",
+                    EVAL_IMPROVEMENT_LOG_SCRIPT.trim().to_string(),
+                ),
+            ],
+        },
+    ]
+}
+
+fn install_canonical_skills(root: &Path, skills: &[BundledSkill]) -> Result<(bool, Vec<PathBuf>)> {
+    install_skills_in_dir(&root.join(".agents/skills"), skills)
+}
+
+fn install_skills_in_dir(
+    skills_dir: &Path,
+    skills: &[BundledSkill],
+) -> Result<(bool, Vec<PathBuf>)> {
+    let mut changed = false;
+    let mut paths = Vec::new();
+    for skill in skills {
+        for (relative_path, content) in &skill.files {
+            let path = skills_dir.join(skill.name).join(relative_path);
+            changed |= write_text_file_if_changed(&path, content)?;
+            paths.push(path);
+        }
+    }
+    Ok((changed, paths))
 }
 
 fn ensure_agent_skills_alias(
     root: &Path,
     agent_dir: &str,
-    skill_content: &str,
+    skills: &[BundledSkill],
 ) -> Result<SkillsAliasResult> {
     let canonical_skills_dir = root.join(".agents/skills");
     fs::create_dir_all(&canonical_skills_dir).with_context(|| {
@@ -4536,33 +4585,25 @@ fn ensure_agent_skills_alias(
             if symlink_points_to(&alias_path, &canonical_skills_dir) {
                 return Ok(SkillsAliasResult {
                     changed: false,
-                    path: alias_path,
+                    paths: vec![alias_path],
                 });
             }
             fs::remove_file(&alias_path)
                 .with_context(|| format!("failed to replace symlink {}", alias_path.display()))?;
         } else {
-            let mirror_skill_path = alias_path.join("braintrust/SKILL.md");
-            let changed = write_text_file_if_changed(&mirror_skill_path, skill_content)?;
-            return Ok(SkillsAliasResult {
-                changed,
-                path: mirror_skill_path,
-            });
+            let (changed, paths) = install_skills_in_dir(&alias_path, skills)?;
+            return Ok(SkillsAliasResult { changed, paths });
         }
     }
 
     match create_dir_symlink(&canonical_skills_dir, &alias_path) {
         Ok(()) => Ok(SkillsAliasResult {
             changed: true,
-            path: alias_path,
+            paths: vec![alias_path],
         }),
         Err(_) => {
-            let mirror_skill_path = alias_path.join("braintrust/SKILL.md");
-            let changed = write_text_file_if_changed(&mirror_skill_path, skill_content)?;
-            Ok(SkillsAliasResult {
-                changed,
-                path: mirror_skill_path,
-            })
+            let (changed, paths) = install_skills_in_dir(&alias_path, skills)?;
+            Ok(SkillsAliasResult { changed, paths })
         }
     }
 }
@@ -7694,6 +7735,12 @@ mod tests {
             .install_skill(InstallScope::Local, Some(&root), &home)
             .expect("first install");
         assert!(matches!(first.status, InstallStatus::Installed));
+        assert!(root
+            .join(".agents/skills/eval-improvement-loop/SKILL.md")
+            .exists());
+        assert!(root
+            .join(".agents/skills/eval-improvement-loop/scripts/eval_loop_log.py")
+            .exists());
 
         let second = Agent::Codex
             .install_skill(InstallScope::Local, Some(&root), &home)
@@ -7782,6 +7829,15 @@ mod tests {
     fn rendered_skill_frontmatter_name_matches_braintrust_directory() {
         let content = render_braintrust_skill();
         assert!(content.starts_with("---\nname: braintrust\n"));
+    }
+
+    #[test]
+    fn bundled_eval_skill_frontmatter_matches_directory() {
+        assert!(EVAL_IMPROVEMENT_SKILL.starts_with("---\nname: eval-improvement-loop\n"));
+        assert!(EVAL_IMPROVEMENT_SKILL.contains("Settings → Logging"));
+        assert!(EVAL_IMPROVEMENT_SKILL.contains("git_metadata_settings"));
+        assert!(EVAL_IMPROVEMENT_SKILL.contains("eval_loop_session"));
+        assert!(EVAL_IMPROVEMENT_LOG_SCRIPT.starts_with("#!/usr/bin/env python3\n"));
     }
 
     #[test]
