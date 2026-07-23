@@ -8,11 +8,12 @@ use serde_json::json;
 
 use crate::{
     args::BaseArgs,
+    auth,
     ui::{
         apply_column_padding, header, is_interactive, print_command_status, print_with_pager,
         styled_table, truncate, with_spinner, with_spinner_visible, CommandStatus,
     },
-    utils::{pluralize, profile_author_slug, resolve_profile_info, sanitize_name_segment},
+    utils::{pluralize, profile_author_slug, sanitize_name_segment},
 };
 
 use super::{
@@ -1092,7 +1093,9 @@ fn resolve_default_snapshot_author(base: &BaseArgs, ctx: &ResolvedContext) -> Op
         return None;
     }
 
-    let profile = resolve_profile_info(base.profile.as_deref(), Some(ctx.client.org_name()))?;
+    let profile = auth::active_auth_info(base, Some(ctx.client.org_name()))
+        .ok()
+        .flatten()?;
     profile_author_slug(&profile)
 }
 
@@ -1102,11 +1105,13 @@ fn default_snapshot_name(author: &str, now: DateTime<Utc>) -> String {
 }
 
 fn api_key_override_active(base: &BaseArgs) -> bool {
-    !base.prefer_profile
-        && base
-            .api_key
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
+    matches!(
+        base.api_key_source,
+        Some(crate::args::ArgValueSource::CommandLine)
+    ) && base
+        .api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]
