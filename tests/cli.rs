@@ -50,6 +50,23 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 }
 
 #[test]
+fn cost_rejects_multiple_output_modes() {
+    for combo in [
+        ["cost", "--json", "--csv"],
+        ["cost", "--json", "--plot"],
+        ["cost", "--csv", "--plot"],
+    ] {
+        let mut command = bt_command();
+        clear_braintrust_auth_env(&mut command);
+        command
+            .args(combo)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used together"));
+    }
+}
+
+#[test]
 fn cost_help_lists_sources_and_group_by() {
     let mut command = bt_command();
     clear_braintrust_auth_env(&mut command);

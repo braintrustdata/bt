@@ -365,12 +365,25 @@ pub(super) fn format_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
-/// Format an instant in the given offset, showing the offset suffix (or `Z`).
+/// Format an instant for display in the given offset, without any time-zone
+/// suffix (no `Z` or `+HH:MM`).
 pub(super) fn format_timestamp_in_offset(timestamp: DateTime<Utc>, offset: FixedOffset) -> String {
-    let use_z = offset.local_minus_utc() == 0;
     timestamp
         .with_timezone(&offset)
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, use_z)
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string()
+}
+
+/// Reformat a UTC bucket key (RFC 3339, e.g. `2026-07-22T18:00:00Z`) in
+/// `offset`, without a time-zone suffix. Returns `None` if it isn't a timestamp.
+pub(super) fn reoffset_local(raw: &str, offset: FixedOffset) -> Option<String> {
+    let instant = DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(
+        instant
+            .with_timezone(&offset)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
