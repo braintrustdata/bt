@@ -230,6 +230,16 @@ pub async fn list_dataset_rows_limited(
     Ok((rows, truncated))
 }
 
+pub async fn get_dataset_row_by_id(
+    client: &ApiClient,
+    dataset_id: &str,
+    row_id: &str,
+) -> Result<Option<DatasetRow>> {
+    let query = build_dataset_row_by_id_query(dataset_id, row_id, DatasetRowsPreviewLength::Full);
+    let response = client.btql_structured::<DatasetRow, _>(&query).await?;
+    Ok(response.data.into_iter().next())
+}
+
 pub async fn create_dataset(
     client: &ApiClient,
     project_id: &str,
@@ -399,6 +409,38 @@ fn build_dataset_rows_query(
         query["cursor"] = Value::String(cursor.to_string());
     }
     query
+}
+
+fn build_dataset_row_by_id_query(
+    dataset_id: &str,
+    row_id: &str,
+    preview_length: DatasetRowsPreviewLength,
+) -> Value {
+    json!({
+        "select": dataset_rows_select_fields(),
+        "from": {
+            "op": "function",
+            "name": {"op": "ident", "name": ["dataset"]},
+            "args": [{"op": "literal", "value": dataset_id}]
+        },
+        "filter": {
+            "op": "and",
+            "children": [
+                {
+                    "op": "ge",
+                    "left": {"op": "ident", "name": ["created"]},
+                    "right": {"op": "literal", "value": DATASET_ROWS_SINCE}
+                },
+                {
+                    "op": "eq",
+                    "left": {"op": "ident", "name": ["id"]},
+                    "right": {"op": "literal", "value": row_id}
+                }
+            ]
+        },
+        "preview_length": preview_length.btql_value(),
+        "limit": 1
+    })
 }
 
 fn dataset_rows_select_fields() -> Vec<Value> {
