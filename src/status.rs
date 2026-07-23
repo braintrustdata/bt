@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::args::BaseArgs;
 use crate::auth;
-use crate::{config, utils::resolve_profile_info};
+use crate::config;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -19,13 +19,14 @@ pub struct StatusArgs {}
 struct StatusOutput {
     org: Option<String>,
     project: Option<String>,
-    profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_method: Option<String>,
     source: Option<String>,
 }
 
@@ -40,6 +41,13 @@ fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
     }
 }
 
+fn format_auth(p: &auth::ProfileInfo) -> String {
+    match format_identity(p) {
+        Some(identity) => format!("{} — {identity}", p.auth_method),
+        None => p.auth_method.clone(),
+    }
+}
+
 pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     let global_path = config::global_path().ok();
     let global_cfg = config::load_global().unwrap_or_default();
@@ -49,38 +57,16 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         .map(|p| config::load_file(p))
         .unwrap_or_default();
 
-    let cli_org = cli_flag_value(&["--org", "-o"]);
-    let cli_project = cli_flag_value(&["--project", "-p"]);
-    let (mut org, mut project, source) = resolve_config(
-        cli_org,
-        cli_project,
+    let overrides = ConfigOverrides::from_base(&base);
+    let (org, mut project, source) = resolve_config(
+        overrides,
         &global_cfg,
         &local_cfg,
         &local_path,
         &global_path,
     );
     let merged_cfg = global_cfg.merge(&local_cfg);
-    let selected_profile = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            merged_cfg
-                .profile
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
-    let profile_info = resolve_profile_info(selected_profile.as_deref(), org.as_deref());
-
-    if selected_profile.is_some() && org.as_deref().map(str::trim).is_none_or(str::is_empty) {
-        if let Some(profile_org) = profile_info.as_ref().and_then(|p| p.org_name.clone()) {
-            org = Some(profile_org);
-        }
-    }
+    let auth_info = auth::active_auth_info(&base, org.as_deref());
 
     if base
         .project
@@ -88,27 +74,17 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        let mut project_base = base.clone();
-        if project_base
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            project_base.profile = selected_profile.clone();
-        }
-        project =
-            config::project_from_config_for_context(&project_base, &merged_cfg, org.as_deref());
+        project = config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
     }
 
     if base.json {
         let output = StatusOutput {
             org,
             project,
-            profile: profile_info.as_ref().map(|p| p.name.clone()),
-            user_name: profile_info.as_ref().and_then(|p| p.user_name.clone()),
-            user_email: profile_info.as_ref().and_then(|p| p.email.clone()),
-            api_key_hint: profile_info.as_ref().and_then(|p| p.api_key_hint.clone()),
+            user_name: auth_info.as_ref().and_then(|p| p.user_name.clone()),
+            user_email: auth_info.as_ref().and_then(|p| p.email.clone()),
+            api_key_hint: auth_info.as_ref().and_then(|p| p.api_key_hint.clone()),
+            auth_method: auth_info.as_ref().map(|p| p.auth_method.clone()),
             source,
         };
         println!("{}", serde_json::to_string(&output)?);
@@ -116,13 +92,19 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     }
 
     if base.verbose {
-        println!("org: {}", org.as_deref().unwrap_or("(unset)"));
+        let org_display = if org.is_none()
+            && auth_info
+                .as_ref()
+                .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none())
+        {
+            "cross-org"
+        } else {
+            org.as_deref().unwrap_or("(unset)")
+        };
+        println!("org: {org_display}");
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
-        if let Some(ref p) = profile_info {
-            println!("profile: {}", p.name);
-            if let Some(id) = format_identity(p) {
-                println!("user: {id}");
-            }
+        if let Some(ref p) = auth_info {
+            println!("auth: {}", format_auth(p));
         }
         if let Some(src) = source {
             println!("source: {src}");
@@ -134,14 +116,19 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
             _ => unreachable!(),
         };
         println!("{scope}");
-        let profile_line = match &profile_info {
-            Some(p) => match format_identity(p) {
-                Some(id) => format!("  profile: {} — {id}", p.name),
-                None => format!("  profile: {}", p.name),
-            },
-            None => "  profile: (none)".to_string(),
+        let auth_line = match &auth_info {
+            Some(p) => format!("  auth: {}", format_auth(p)),
+            None => "  auth: (none)".to_string(),
         };
-        println!("{profile_line}");
+        println!("{auth_line}");
+    } else if auth_info
+        .as_ref()
+        .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none())
+    {
+        println!("cross-org");
+        if let Some(p) = &auth_info {
+            println!("  auth: {}", format_auth(p));
+        }
     } else {
         println!("No org/project configured. Run `bt switch` to set one.");
     }
@@ -149,21 +136,54 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+pub(crate) struct ConfigOverrides {
+    cli_org: Option<String>,
+    env_org: Option<String>,
+    cli_project: Option<String>,
+    env_project: Option<String>,
+}
+
+impl ConfigOverrides {
+    fn from_base(base: &BaseArgs) -> Self {
+        use crate::args::ArgValueSource;
+
+        let (cli_org, env_org) = match base.org_name_source {
+            Some(ArgValueSource::CommandLine) => (base.org_name.clone(), None),
+            Some(ArgValueSource::EnvVariable) => (None, base.org_name.clone()),
+            None => (None, None),
+        };
+        let (cli_project, env_project) = match base.project_source {
+            Some(ArgValueSource::CommandLine) => (base.project.clone(), None),
+            Some(ArgValueSource::EnvVariable) => (None, base.project.clone()),
+            None => (None, None),
+        };
+
+        Self {
+            cli_org,
+            env_org,
+            cli_project,
+            env_project,
+        }
+    }
+}
+
 /// Precedence (clig.dev): CLI flag > env var > local config > global config.
 pub(crate) fn resolve_config(
-    cli_org: Option<String>,
-    cli_project: Option<String>,
+    overrides: ConfigOverrides,
     global: &config::Config,
     local: &config::Config,
     local_path: &Option<std::path::PathBuf>,
     global_path: &Option<std::path::PathBuf>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let env_org = std::env::var("BRAINTRUST_ORG_NAME")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let env_project = std::env::var("BRAINTRUST_DEFAULT_PROJECT")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let ConfigOverrides {
+        cli_org,
+        env_org,
+        cli_project,
+        env_project,
+    } = overrides;
+    let env_org = env_org.filter(|s| !s.is_empty());
+    let env_project = env_project.filter(|s| !s.is_empty());
 
     let org = cli_org
         .clone()
@@ -192,32 +212,6 @@ pub(crate) fn resolve_config(
     (org, project, source)
 }
 
-fn cli_flag_value(flags: &[&str]) -> Option<String> {
-    let args: Vec<String> = std::env::args().collect();
-    for (i, arg) in args.iter().enumerate() {
-        if arg == "--" {
-            break;
-        }
-        for flag in flags {
-            if arg == *flag {
-                return args.get(i + 1).cloned();
-            }
-            if let Some(val) = arg.strip_prefix(&format!("{flag}=")) {
-                return Some(val.to_string());
-            }
-            // Handle -oVALUE style (short flags only)
-            if flag.len() == 2 && flag.starts_with('-') {
-                if let Some(val) = arg.strip_prefix(flag) {
-                    if !val.is_empty() {
-                        return Some(val.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,8 +237,11 @@ mod tests {
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
         let (org, project, source) = resolve_config(
-            s("cli-org"),
-            s("cli-proj"),
+            ConfigOverrides {
+                cli_org: s("cli-org"),
+                cli_project: s("cli-proj"),
+                ..Default::default()
+            },
             &global,
             &local,
             &local_path,
@@ -257,14 +254,43 @@ mod tests {
     }
 
     #[test]
+    fn env_overrides_config_below_cli() {
+        let global = config(Some("global-org"), Some("global-proj"));
+        let local = config(Some("local-org"), Some("local-proj"));
+        let local_path = Some(PathBuf::from("/project/.bt/config.json"));
+        let global_path = Some(PathBuf::from("/home/.bt/config.json"));
+
+        let (org, project, source) = resolve_config(
+            ConfigOverrides {
+                env_org: s("env-org"),
+                env_project: s("env-proj"),
+                ..Default::default()
+            },
+            &global,
+            &local,
+            &local_path,
+            &global_path,
+        );
+
+        assert_eq!(org, s("env-org"));
+        assert_eq!(project, s("env-proj"));
+        assert_eq!(source, s("env"));
+    }
+
+    #[test]
     fn local_overrides_global() {
         let global = config(Some("global-org"), Some("global-proj"));
         let local = config(Some("local-org"), Some("local-proj"));
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
-            resolve_config(None, None, &global, &local, &local_path, &global_path);
+        let (org, project, source) = resolve_config(
+            ConfigOverrides::default(),
+            &global,
+            &local,
+            &local_path,
+            &global_path,
+        );
 
         assert_eq!(org, s("local-org"));
         assert_eq!(project, s("local-proj"));
@@ -278,8 +304,13 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
-            resolve_config(None, None, &global, &local, &local_path, &global_path);
+        let (org, project, source) = resolve_config(
+            ConfigOverrides::default(),
+            &global,
+            &local,
+            &local_path,
+            &global_path,
+        );
 
         assert_eq!(org, s("global-org"));
         assert_eq!(project, s("global-proj"));
@@ -293,8 +324,13 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
-            resolve_config(None, None, &global, &local, &local_path, &global_path);
+        let (org, project, source) = resolve_config(
+            ConfigOverrides::default(),
+            &global,
+            &local,
+            &local_path,
+            &global_path,
+        );
 
         assert_eq!(org, None);
         assert_eq!(project, None);
@@ -309,8 +345,10 @@ mod tests {
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
         let (org, project, source) = resolve_config(
-            s("cli-org"),
-            None,
+            ConfigOverrides {
+                cli_org: s("cli-org"),
+                ..Default::default()
+            },
             &global,
             &local,
             &local_path,
@@ -329,8 +367,13 @@ mod tests {
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
         let global_path = Some(PathBuf::from("/home/.bt/config.json"));
 
-        let (org, project, source) =
-            resolve_config(None, None, &global, &local, &local_path, &global_path);
+        let (org, project, source) = resolve_config(
+            ConfigOverrides::default(),
+            &global,
+            &local,
+            &local_path,
+            &global_path,
+        );
 
         assert_eq!(org, s("global-org"));
         assert_eq!(project, s("local-proj"));
@@ -338,13 +381,17 @@ mod tests {
     }
 
     fn profile(
-        name: &str,
         user_name: Option<&str>,
         email: Option<&str>,
         api_key_hint: Option<&str>,
     ) -> auth::ProfileInfo {
         auth::ProfileInfo {
-            name: name.into(),
+            auth_method: if api_key_hint.is_some() {
+                "api_key"
+            } else {
+                "oauth"
+            }
+            .into(),
             org_name: None,
             user_name: user_name.map(Into::into),
             email: email.map(Into::into),
@@ -354,7 +401,7 @@ mod tests {
 
     #[test]
     fn format_identity_name_and_email() {
-        let p = profile("work", Some("Alice"), Some("alice@example.com"), None);
+        let p = profile(Some("Alice"), Some("alice@example.com"), None);
         assert_eq!(
             format_identity(&p),
             Some("Alice (alice@example.com)".into())
@@ -363,19 +410,19 @@ mod tests {
 
     #[test]
     fn format_identity_email_only() {
-        let p = profile("work", None, Some("alice@example.com"), None);
+        let p = profile(None, Some("alice@example.com"), None);
         assert_eq!(format_identity(&p), Some("alice@example.com".into()));
     }
 
     #[test]
     fn format_identity_api_key_hint() {
-        let p = profile("work", None, None, Some("sk-****zhJwO"));
+        let p = profile(None, None, Some("sk-****zhJwO"));
         assert_eq!(format_identity(&p), Some("sk-****zhJwO".into()));
     }
 
     #[test]
     fn format_identity_none() {
-        let p = profile("work", None, None, None);
+        let p = profile(None, None, None);
         assert_eq!(format_identity(&p), None);
     }
 }
