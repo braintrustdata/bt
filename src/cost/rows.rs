@@ -7,8 +7,9 @@
 //! dimensions plus `model`) up to the display dimensions.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use chrono::{DateTime, NaiveDate};
 use serde_json::{Map, Value};
 
 use super::pricing::{PriceBook, TokenUsage};
@@ -157,16 +158,80 @@ fn dimension_value(row: &Map<String, Value>, dim: Dimension) -> Option<String> {
     }
 }
 
-/// Sort rows by cost descending, then by key for stable ordering.
-pub(super) fn sort_rows(rows: &mut [CostRow]) {
+/// Sort rows according to the `--group-by` order. The order defines the
+/// nesting hierarchy: the first dimension is the outer group, the next nests
+/// within it, and so on.
+///
+/// Time dimensions (`day`/`hour`) and everything nested below the first time
+/// dimension are ordered chronologically (oldest first, most recent last).
+/// Categorical levels are ordered by their group total cost descending — so a
+/// categorical level above a time dimension groups its values together (each
+/// by its subtotal), and a categorical level below a time dimension orders
+/// siblings within the same time bucket by cost.
+pub(super) fn sort_rows(rows: &mut [CostRow], display_dims: &[Dimension]) {
+    let is_time: Vec<bool> = display_dims
+        .iter()
+        .map(|dim| matches!(dim, Dimension::Day | Dimension::Hour))
+        .collect();
+
+    // Total cost per distinct key prefix, so a categorical level is ordered by
+    // its group subtotal (summing every row that shares that prefix) rather than
+    // by any single row's cost. The full-key prefix is the row itself, so a leaf
+    // categorical level falls back to per-row cost.
+    let mut prefix_costs: HashMap<Vec<Option<String>>, f64> = HashMap::new();
+    for row in rows.iter() {
+        let cost = row.cost().unwrap_or(0.0);
+        for end in 1..=row.keys.len() {
+            *prefix_costs.entry(row.keys[..end].to_vec()).or_insert(0.0) += cost;
+        }
+    }
+
     rows.sort_by(|left, right| {
-        let left_cost = left.cost().unwrap_or(f64::NEG_INFINITY);
-        let right_cost = right.cost().unwrap_or(f64::NEG_INFINITY);
-        right_cost
-            .partial_cmp(&left_cost)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.keys.cmp(&right.keys))
+        for (index, &time_dim) in is_time.iter().enumerate() {
+            let left_key = left.keys.get(index).and_then(|value| value.as_deref());
+            let right_key = right.keys.get(index).and_then(|value| value.as_deref());
+            let ordering = if time_dim {
+                time_ordering(left_key, right_key)
+            } else {
+                let left_cost = prefix_costs
+                    .get(&left.keys[..=index])
+                    .copied()
+                    .unwrap_or(0.0);
+                let right_cost = prefix_costs
+                    .get(&right.keys[..=index])
+                    .copied()
+                    .unwrap_or(0.0);
+                right_cost
+                    .partial_cmp(&left_cost)
+                    .unwrap_or(Ordering::Equal)
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        left.keys.cmp(&right.keys)
     });
+}
+
+/// Chronological ordering (ascending) for time-bucket keys. Both `day()` and
+/// `hour()` return RFC 3339 bucket starts; date-only keys are accepted as a
+/// fallback. Unparseable keys sort last so real chronology stays clean.
+fn time_ordering(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (time_epoch(left), time_epoch(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn time_epoch(value: Option<&str>) -> Option<i64> {
+    let value = value?;
+    if let Ok(instant) = DateTime::parse_from_rfc3339(value) {
+        return Some(instant.timestamp());
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
 }
 
 /// Compute totals from the final rows and the summed candidate span count.
@@ -362,7 +427,101 @@ output_usd_per_1m_tokens = 2.0
                 no_usage_spans: 0,
             },
         ];
-        sort_rows(&mut rows);
+        sort_rows(&mut rows, &[Dimension::Model]);
         assert_eq!(rows[0].keys, vec![Some("b".to_string())]);
+    }
+
+    fn row(keys: &[&str], cost: f64) -> CostRow {
+        CostRow {
+            keys: keys
+                .iter()
+                .map(|value| Some((*value).to_string()))
+                .collect(),
+            logged_cost: cost,
+            file_cost: 0.0,
+            logged_priced_spans: 1,
+            file_priced_spans: 0,
+            unpriced_spans: 0,
+            no_usage_spans: 0,
+        }
+    }
+
+    fn key_str(row: &CostRow) -> String {
+        row.keys
+            .iter()
+            .map(|value| value.clone().unwrap_or_else(|| "—".to_string()))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    #[test]
+    fn categorical_levels_order_by_group_subtotal_descending() {
+        // --group-by user --group-by model: users ordered by their total cost
+        // (desc), models ordered within each user by their subtotal (desc).
+        let mut rows = vec![
+            row(&["alice", "gpt"], 1.0),
+            row(&["alice", "claude"], 3.0),
+            row(&["bob", "gpt"], 5.0),
+            row(&["bob", "claude"], 1.0),
+        ];
+        sort_rows(&mut rows, &[Dimension::User, Dimension::Model]);
+        let keys: Vec<String> = rows.iter().map(key_str).collect();
+        // bob total (6.0) > alice total (4.0); within bob, gpt (5.0) > claude
+        // (1.0); within alice, claude (3.0) > gpt (1.0).
+        assert_eq!(
+            keys,
+            vec!["bob/gpt", "bob/claude", "alice/claude", "alice/gpt"]
+        );
+    }
+
+    #[test]
+    fn time_dimension_orders_chronologically_oldest_first() {
+        // --group-by hour: rows ordered by time ascending (oldest first).
+        let mut rows = vec![
+            row(&["2026-07-21T05:00:00Z"], 5.0),
+            row(&["2026-07-21T03:00:00Z"], 1.0),
+            row(&["2026-07-21T04:00:00Z"], 3.0),
+        ];
+        sort_rows(&mut rows, &[Dimension::Hour]);
+        let keys: Vec<String> = rows.iter().map(key_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "2026-07-21T03:00:00Z",
+                "2026-07-21T04:00:00Z",
+                "2026-07-21T05:00:00Z"
+            ]
+        );
+    }
+
+    #[test]
+    fn time_dimension_orders_descending_levels_chronologically() {
+        // --group-by user --group-by hour --group-by model: users by cost desc,
+        // then hours chronological within each user, then models by cost desc
+        // within each (user, hour).
+        let mut rows = vec![
+            row(&["alice", "2026-07-21T05:00:00Z", "gpt"], 1.0),
+            row(&["alice", "2026-07-21T03:00:00Z", "claude"], 1.0),
+            row(&["alice", "2026-07-21T04:00:00Z", "gpt"], 3.0),
+            row(&["bob", "2026-07-21T03:00:00Z", "gpt"], 1.0),
+            row(&["bob", "2026-07-21T05:00:00Z", "claude"], 5.0),
+        ];
+        sort_rows(
+            &mut rows,
+            &[Dimension::User, Dimension::Hour, Dimension::Model],
+        );
+        let keys: Vec<String> = rows.iter().map(key_str).collect();
+        // bob (6.0) before alice (5.0); within each, hours ascending; within
+        // (alice, 04:00), only gpt; within (bob, 05:00), only claude.
+        assert_eq!(
+            keys,
+            vec![
+                "bob/2026-07-21T03:00:00Z/gpt",
+                "bob/2026-07-21T05:00:00Z/claude",
+                "alice/2026-07-21T03:00:00Z/claude",
+                "alice/2026-07-21T04:00:00Z/gpt",
+                "alice/2026-07-21T05:00:00Z/gpt"
+            ]
+        );
     }
 }
