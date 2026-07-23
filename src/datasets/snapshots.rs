@@ -1089,10 +1089,6 @@ fn print_restore_preview(
 }
 
 fn resolve_default_snapshot_author(base: &BaseArgs, ctx: &ResolvedContext) -> Option<String> {
-    if api_key_override_active(base) {
-        return None;
-    }
-
     let profile = auth::active_auth_info(base, Some(ctx.client.org_name()))
         .ok()
         .flatten()?;
@@ -1102,16 +1098,6 @@ fn resolve_default_snapshot_author(base: &BaseArgs, ctx: &ResolvedContext) -> Op
 fn default_snapshot_name(author: &str, now: DateTime<Utc>) -> String {
     let author = sanitize_name_segment(author).unwrap_or_else(|| "user".to_string());
     format!("{author}-{}", now.format("%Y%m%d-%H%M%Sz"))
-}
-
-fn api_key_override_active(base: &BaseArgs) -> bool {
-    matches!(
-        base.api_key_source,
-        Some(crate::args::ArgValueSource::CommandLine)
-    ) && base
-        .api_key
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]
