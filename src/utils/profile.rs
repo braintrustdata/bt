@@ -1,10 +1,12 @@
 use crate::auth::ProfileInfo;
 
+/// Slug for the authenticated human (name, else email local part). Org is
+/// deliberately not a fallback: a bare API key has no author, so callers
+/// substitute a generic placeholder rather than name the snapshot after the org.
 pub(crate) fn profile_author_slug(profile: &ProfileInfo) -> Option<String> {
     [
         profile.user_name.as_deref(),
         profile.email.as_deref().and_then(email_local_part),
-        profile.org_name.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -82,8 +84,15 @@ mod tests {
     }
 
     #[test]
-    fn profile_author_slug_returns_none_without_identity_or_org() {
+    fn profile_author_slug_returns_none_without_identity() {
         let profile = profile_info(None, None, None);
+        assert_eq!(profile_author_slug(&profile), None);
+    }
+
+    #[test]
+    fn profile_author_slug_ignores_org_name() {
+        // A bare API key has an org but no human identity — not an author.
+        let profile = profile_info(Some("test-org"), None, None);
         assert_eq!(profile_author_slug(&profile), None);
     }
 
