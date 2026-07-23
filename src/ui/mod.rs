@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use dialoguer::console::Term;
 
+mod line_editor;
 mod pager;
 pub mod prompt_render;
 mod ratatui_table;
@@ -51,6 +52,7 @@ pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && !NO_INPUT.load(Ordering::Relaxed)
 }
 
+pub use line_editor::LinePrompt;
 pub use pager::print_with_pager;
 pub use ratatui_table::{
     box_with_title, render_experiment_summary_table, summary_metric_unit, SummaryExperimentColumn,
