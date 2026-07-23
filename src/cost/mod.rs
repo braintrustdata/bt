@@ -248,7 +248,7 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
         .transpose()?;
     let segments = build_time_segments(range, price_book.as_ref());
 
-    let display_dims = dedup_dimensions(&args.group_by);
+    let display_dims = dedup_dimensions(&args.group_by)?;
     let internal_dims = internal_dimensions(&display_dims, price_book.is_some());
     let sources = resolve_sources(&args.sources);
     let row_limit = resolve_row_limit(&args);
@@ -328,7 +328,7 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
     }
 
     let mut cost_rows: Vec<rows::CostRow> = accumulator.into_values().collect();
-    rows::sort_rows(&mut cost_rows);
+    rows::sort_rows(&mut cost_rows, &display_dims);
     let totals = rows::totals_from_rows(&cost_rows, candidate_spans);
 
     let source_labels: Vec<String> = sources
@@ -694,17 +694,21 @@ fn resolve_sources(requested: &[Source]) -> Vec<Source> {
     seen
 }
 
-fn dedup_dimensions(requested: &[Dimension]) -> Vec<Dimension> {
+fn dedup_dimensions(requested: &[Dimension]) -> Result<Vec<Dimension>> {
     let mut seen = Vec::new();
     for dim in requested {
-        if !seen.contains(dim) {
-            seen.push(*dim);
+        if seen.contains(dim) {
+            bail!(
+                "--group-by '{}' is repeated; each dimension may be grouped at most once",
+                dim.alias()
+            );
         }
+        seen.push(*dim);
     }
     if seen.is_empty() {
         seen.push(Dimension::Model);
     }
-    seen
+    Ok(seen)
 }
 
 /// Parse `--timezone` into a fixed offset. Accepts `utc`, `local`, or a fixed
@@ -1084,10 +1088,16 @@ mod tests {
 
     #[test]
     fn group_by_defaults_to_model() {
-        assert_eq!(dedup_dimensions(&[]), vec![Dimension::Model]);
+        assert_eq!(dedup_dimensions(&[]).unwrap(), vec![Dimension::Model]);
         assert_eq!(
-            dedup_dimensions(&[Dimension::Source, Dimension::Source, Dimension::Model]),
+            dedup_dimensions(&[Dimension::Source, Dimension::Model]).unwrap(),
             vec![Dimension::Source, Dimension::Model]
         );
+    }
+
+    #[test]
+    fn group_by_rejects_repeated_dimensions() {
+        assert!(dedup_dimensions(&[Dimension::Source, Dimension::Source]).is_err());
+        assert!(dedup_dimensions(&[Dimension::Model, Dimension::User, Dimension::Model]).is_err());
     }
 }
