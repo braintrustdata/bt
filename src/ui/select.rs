@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use anyhow::{bail, Result};
 use dialoguer::console::{style, Key, Term};
-use dialoguer::{theme::ColorfulTheme, FuzzySelect, Input};
+use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 
 const MAX_VISIBLE_ITEMS: usize = 12;
@@ -246,6 +246,41 @@ fn fuzzy_select_with_pinned_first(
     }
 }
 
+/// Resolve an explicitly named project, optionally creating it, or select an existing one.
+pub(crate) async fn select_or_create_project(
+    client: &ApiClient,
+    requested: Option<&str>,
+    current: Option<&str>,
+    select_label: Option<&str>,
+) -> Result<api::Project> {
+    let Some(name) = requested else {
+        return select_project(
+            client,
+            current,
+            select_label,
+            ProjectSelectMode::ExistingOnly,
+        )
+        .await;
+    };
+    if let Some(project) =
+        with_spinner("Loading project...", api::get_project_by_name(client, name)).await?
+    {
+        return Ok(project);
+    }
+    let Some(term) = super::prompt_term() else {
+        bail!("project '{name}' not found");
+    };
+    if Confirm::new()
+        .with_prompt(format!("Project '{name}' not found. Create it?"))
+        .default(false)
+        .interact_on(&term)?
+    {
+        with_spinner("Creating project...", api::create_project(client, name)).await
+    } else {
+        bail!("project '{name}' not found")
+    }
+}
+
 /// Interactive selector for project data.
 pub async fn select_project(
     client: &ApiClient,
@@ -257,6 +292,20 @@ pub async fn select_project(
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
     let label = select_label.unwrap_or("Select project");
+
+    if mode == ProjectSelectMode::ExistingOnly {
+        match projects.len() {
+            0 => bail!("organization '{}' has no projects", client.org_name()),
+            1 => return Ok(projects.remove(0)),
+            _ if !super::can_prompt() => {
+                bail!(
+                    "organization '{}' has multiple projects; pass --project <PROJECT>",
+                    client.org_name()
+                )
+            }
+            _ => {}
+        }
+    }
 
     if mode_allows_create(mode) {
         let names = project_display_names(&projects, mode);
