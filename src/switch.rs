@@ -30,7 +30,7 @@ impl SwitchArgs {
             None => (None, None),
             Some(t) if t.contains('/') => {
                 let parts: Vec<&str> = t.splitn(2, '/').collect();
-                let o = (!parts[0].is_empty()).then(|| parts[0].to_string());
+                let o = (!parts[0].is_empty()).then(|| config::normalize_org(parts[0]).to_string());
                 let p = (!parts[1].is_empty()).then(|| parts[1].to_string());
                 (o, p)
             }
@@ -154,6 +154,14 @@ mod tests {
                 (None, Some("test-project")),
             ),
             (Some("test-org/"), None, None, (Some("test-org"), None)),
+            // Positional "cross-org" folds to the "" marker, matching --org.
+            (
+                Some("cross-org/test-project"),
+                None,
+                None,
+                (Some(""), Some("test-project")),
+            ),
+            (Some("cross-org/"), None, None, (Some(""), None)),
             (None, Some("test-org"), None, (Some("test-org"), None)),
             (
                 None,
