@@ -1,0 +1,5 @@
+{"event":"processing","data":{"evaluators":1}}
+{"event":"start","data":{"projectName":"test-project","experimentName":"minimal","projectId":"project-test-id","experimentId":"minimal-id","projectUrl":"https://example.test/project/test-project","experimentUrl":"https://example.test/experiment/minimal"}}
+{"event":"summary","data":{"projectName":"test-project","experimentName":"minimal","projectId":null,"experimentId":null,"projectUrl":null,"experimentUrl":null,"scores":{},"metrics":null}}
+{"event":"done","data":""}
+{"exit":0}

@@ -1,0 +1,4 @@
+{"event":"processing","data":{"evaluators":1}}
+{"event":"error","data":{"message":"Please specify an api key to continue","stack":"auth stack"}}
+{"event":"done","data":""}
+{"exit":0}

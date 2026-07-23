@@ -1,0 +1,9 @@
+Processing 1 evaluator...
+[m▶[m Experiment [1mcanonical-exp[0m is running at https://example.test/experiment/canonical-exp
+first case: completed
+second case: errored
+third case: skipped
+
+╭[m Experiment summary [m──────────────────────────────────────────╮
+│ See results at https://example.test/experiment/canonical-exp │
+╰──────────────────────────────────────────────────────────────╯

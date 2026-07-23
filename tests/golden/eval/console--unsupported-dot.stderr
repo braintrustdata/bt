@@ -1,0 +1,3 @@
+Reporter 'dot' requires real per-case results; upgrade the installed braintrust SDK.
+error: an eval reporter vetoed the successful run
+If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.

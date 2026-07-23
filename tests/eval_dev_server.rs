@@ -255,8 +255,18 @@ fn curl_get(url: &str, headers: &[(&str, &str)]) -> String {
 }
 
 fn curl_post(url: &str, headers: &[(&str, &str)], body: &str) -> String {
+    let (status, body) = curl_post_with_status(url, headers, body);
+    assert_eq!(status, 200, "curl POST {url} returned {status}: {body}");
+    body
+}
+
+fn curl_post_with_status(url: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+    let output_file = tempfile::NamedTempFile::new().expect("create curl output file");
     let mut cmd = Command::new("curl");
-    cmd.args(["-s", "--max-time", "60", "-X", "POST", "-d", body, url]);
+    cmd.args(["-s", "--max-time", "60", "-X", "POST", "-d", body])
+        .arg("-o")
+        .arg(output_file.path())
+        .args(["-w", "%{http_code}", url]);
     for (key, value) in headers {
         cmd.arg("-H").arg(format!("{key}: {value}"));
     }
@@ -266,7 +276,27 @@ fn curl_post(url: &str, headers: &[(&str, &str)], body: &str) -> String {
         "curl POST {url} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).to_string()
+    let status = String::from_utf8_lossy(&output.stdout)
+        .parse()
+        .expect("parse curl status");
+    let body = std::fs::read_to_string(output_file.path()).expect("read curl response body");
+    (status, body)
+}
+
+fn assert_devserver_golden(name: &str, actual: &str) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/eval")
+        .join(format!("devserver--{name}"));
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        std::fs::write(&path, actual).expect("update devserver golden");
+    }
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "missing {}; run UPDATE_GOLDENS=1 cargo test --test eval_dev_server",
+            path.display()
+        )
+    });
+    assert_eq!(actual, expected, "devserver response differed for {name}");
 }
 
 fn ensure_python_env(fixtures_py_root: &std::path::Path) -> Option<PathBuf> {
@@ -341,6 +371,145 @@ fn bt_binary_path(root: &std::path::Path) -> PathBuf {
             }
             candidate
         }
+    }
+}
+
+#[test]
+fn eval_dev_server_fake_runner_byte_contracts() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fake_runner = root.join("tests/fixtures/eval/fake_runner.py");
+    let frames = root.join("tests/fixtures/eval/scenarios/devserver.jsonl");
+    let fixture_dir = tempfile::tempdir().expect("create fake eval directory");
+    std::fs::write(
+        fixture_dir.path().join("fixture.eval.ts"),
+        "// Scripted by fake_runner.py.\n",
+    )
+    .unwrap();
+
+    let (mock_auth_port, _mock_handle) = start_mock_auth_server();
+    let dev_port = free_port();
+    let bt_path = bt_binary_path(&root);
+    let mut child = Command::new(&bt_path)
+        .args([
+            "eval",
+            "--dev",
+            "--dev-port",
+            &dev_port.to_string(),
+            "--no-send-logs",
+            "--runner",
+        ])
+        .arg(&fake_runner)
+        .arg("fixture.eval.ts")
+        .current_dir(fixture_dir.path())
+        .env(
+            "BRAINTRUST_APP_URL",
+            format!("http://127.0.0.1:{mock_auth_port}"),
+        )
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BT_TEST_FRAME_SCRIPT", &frames)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fake eval devserver");
+
+    let output = Arc::new(Mutex::new(String::new()));
+    let mut threads = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        threads.push(spawn_output_collector(stdout, Arc::clone(&output)));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        threads.push(spawn_output_collector(stderr, Arc::clone(&output)));
+    }
+    wait_for_output(
+        &mut child,
+        &output,
+        "Starting eval dev server",
+        Duration::from_secs(30),
+    );
+    thread::sleep(Duration::from_millis(200));
+
+    let base_url = format!("http://127.0.0.1:{dev_port}");
+    let auth_headers = [
+        ("x-bt-auth-token", "test-key"),
+        ("x-bt-org-name", "test-org"),
+    ];
+    assert_devserver_golden(
+        "list.json",
+        &curl_get(&format!("{base_url}/list"), &auth_headers),
+    );
+
+    let post_headers = [
+        ("x-bt-auth-token", "test-key"),
+        ("x-bt-org-name", "test-org"),
+        ("Content-Type", "application/json"),
+    ];
+    let request = |name: &str, stream: bool| {
+        serde_json::json!({"name": name, "data": {"data": []}, "stream": stream}).to_string()
+    };
+
+    let stream_body = curl_post(
+        &format!("{base_url}/eval"),
+        &post_headers,
+        &request("test-eval", true),
+    );
+    assert_devserver_golden("stream-happy.sse", &stream_body);
+
+    let error_stream = curl_post(
+        &format!("{base_url}/eval"),
+        &post_headers,
+        &request("error-eval", true),
+    );
+    assert_devserver_golden("stream-error.sse", &error_stream);
+
+    let canonical_headers = [
+        ("x-bt-auth-token", "test-key"),
+        ("x-bt-org-name", "test-org"),
+        ("Content-Type", "application/json"),
+        ("x-bt-stream-fmt", "canonical"),
+    ];
+    let canonical_stream = curl_post(
+        &format!("{base_url}/eval"),
+        &canonical_headers,
+        &request("canonical-eval", true),
+    );
+    assert_devserver_golden("stream-canonical.sse", &canonical_stream);
+
+    let (status, response) = curl_post_with_status(
+        &format!("{base_url}/eval"),
+        &post_headers,
+        &request("test-eval", false),
+    );
+    assert_eq!(status, 200);
+    assert_devserver_golden("response-happy.json", &response);
+
+    let (status, response) = curl_post_with_status(
+        &format!("{base_url}/eval"),
+        &post_headers,
+        &request("canonical-eval", false),
+    );
+    assert_eq!(status, 200);
+    assert_devserver_golden("response-canonical.json", &response);
+
+    let (status, response) = curl_post_with_status(
+        &format!("{base_url}/eval"),
+        &post_headers,
+        &request("error-eval", false),
+    );
+    assert_eq!(status, 429);
+    assert_devserver_golden("response-error.json", &response);
+
+    let (status, response) = curl_post_with_status(
+        &format!("{base_url}/eval"),
+        &post_headers,
+        &request("fallback-eval", false),
+    );
+    assert_eq!(status, 500);
+    assert_eq!(response, r#"{"error":"Eval runner exited with an error."}"#);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    for handle in threads {
+        let _ = handle.join();
     }
 }
 

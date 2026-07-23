@@ -1,0 +1,17 @@
+{"event":"processing","data":{"evaluators":1}}
+{"event":"start","data":{"projectName":"test-project","experimentName":"exp-1","projectId":"project-test-id","experimentId":"exp-1-id","projectUrl":"https://example.test/project/test-project","experimentUrl":"https://example.test/experiment/exp-1"}}
+{"event":"console","data":{"stream":"stdout","message":"before errors"}}
+{"event":"error","data":{"message":" evaluator error 1 ","stack":"stack line 1\nstack detail 1","status":422}}
+{"event":"error","data":{"message":" evaluator error 2 ","stack":"stack line 2\nstack detail 2","status":null}}
+{"event":"error","data":{"message":"evaluator error 1","stack":"duplicate stack"}}
+{"event":"error","data":{"message":" evaluator error 3 ","stack":"stack line 3\nstack detail 3","status":null}}
+{"event":"error","data":{"message":" evaluator error 4 ","stack":"stack line 4\nstack detail 4","status":null}}
+{"event":"console","data":{"stream":"stderr","message":"between errors"}}
+{"event":"error","data":{"message":" evaluator error 5 ","stack":"stack line 5\nstack detail 5","status":null}}
+{"event":"error","data":{"message":" evaluator error 6 ","stack":"stack line 6\nstack detail 6","status":null}}
+{"event":"error","data":{"message":" evaluator error 7 ","stack":"stack line 7\nstack detail 7","status":null}}
+{"event":"error","data":{"message":" evaluator error 8 ","stack":"stack line 8\nstack detail 8","status":null}}
+{"event":"error","data":{"message":" evaluator error 9 ","stack":"stack line 9\nstack detail 9","status":null}}
+{"event":"error","data":{"message":" evaluator error 10 ","stack":"stack line 10\nstack detail 10","status":null}}
+{"event":"done","data":""}
+{"exit":0}
