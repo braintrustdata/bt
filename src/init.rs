@@ -58,7 +58,9 @@ pub async fn run(base: BaseArgs, args: InitArgs) -> Result<()> {
         Some("Link to project"),
     )
     .await?;
-    let mut cfg = config::Config::default();
+    // Load any existing file (only reachable via --force) so unknown passthrough
+    // keys are preserved, matching switch/config-set/post-login writers.
+    let mut cfg = config::load_file(&config_path);
     cfg.set_context(
         Some(&org),
         Some((project.name.as_str(), project.id.as_str())),

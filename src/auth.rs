@@ -1049,6 +1049,18 @@ fn maybe_rekey_api_key_profile_after_secret_load(
     }
 
     profile.api_key_hash = Some(api_key_hash(api_key));
+
+    // If the secret still lives only in the lazy legacy keychain slot, relocate
+    // it to the canonical slot now (mirroring the OAuth refresh path) so future
+    // resolves stop paying a permanent miss+fallback and deleting the old-named
+    // keychain item can't orphan the login.
+    if profile.legacy_secret_key.is_some() {
+        let canonical_key = canonical_profile_key(profile_name, &profile);
+        save_profile_secret(&canonical_key, api_key)?;
+        delete_legacy_profile_secrets(&profile);
+        profile.legacy_secret_key = None;
+    }
+
     if replace_with_canonical_auth_profile(store, profile_name, profile) {
         save_auth_store(store)?;
     }
