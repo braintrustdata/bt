@@ -267,8 +267,14 @@ enum ProjectBoundary {
 }
 
 fn project_boundary(start: PathBuf, home: Option<&Path>) -> ProjectBoundary {
+    // `current_dir()` is the physical path (symlinks resolved) while `$HOME` may
+    // not be, so also compare canonicalized forms — exact equality alone can
+    // walk straight past a symlinked home boundary.
+    let home_canon = home.and_then(|h| fs::canonicalize(h).ok());
     for dir in start.ancestors() {
-        if Some(dir) == home {
+        let at_home =
+            Some(dir) == home || (home_canon.is_some() && fs::canonicalize(dir).ok() == home_canon);
+        if at_home {
             return ProjectBoundary::Home;
         }
         if dir.parent().is_none() {

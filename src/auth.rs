@@ -3954,8 +3954,13 @@ pub fn obscure_api_key(key: &str) -> String {
     if !key.is_ascii() || key.len() <= 8 {
         return "****".to_string();
     }
-    let prefix_end = key.find('-').map(|i| i + 1).unwrap_or(0);
     let suffix_start = key.len().saturating_sub(5);
+    let prefix_end = key.find('-').map(|i| i + 1).unwrap_or(0);
+    // A late first dash can push the prefix up to (or past) the suffix, leaving
+    // no masked middle and revealing the whole key. Fully mask instead.
+    if prefix_end >= suffix_start {
+        return "****".to_string();
+    }
     format!("{}****{}", &key[..prefix_end], &key[suffix_start..])
 }
 
@@ -5509,6 +5514,9 @@ mod tests {
             ("sk-LumEdp0BbLRzhJwO", "sk-****zhJwO"),
             ("abc", "****"),
             ("abcdefghijklm", "****ijklm"),
+            // Late first dash leaves no maskable middle: fully mask rather than
+            // reveal the whole key (would otherwise be "abcdefg-****g-hij").
+            ("abcdefg-hij", "****"),
             ("sk-café-résumé-key", "****"),
         ] {
             assert_eq!(obscure_api_key(key), expected);
