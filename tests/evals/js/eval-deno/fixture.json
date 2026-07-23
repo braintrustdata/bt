@@ -1,5 +1,4 @@
 {
-  "runtime": "deno",
-  "runner": "deno",
-  "files": ["tests/basic.eval.ts"]
+  "files": ["tests/basic.eval.ts"],
+  "runners_js": ["deno"]
 }
