@@ -1011,12 +1011,20 @@ fn replace_with_canonical_auth_profile(
     }
 
     if canonical_key != current_key {
-        store.profiles.remove(current_key);
-        if let Some(existing) = store.profiles.get(&canonical_key) {
-            if !should_replace_migrated_profile(existing, &profile) {
+        // Two entries collapse onto the same slot (same OAuth org+email, or the
+        // same API key+org). Keep the usable one and delete the loser's secrets
+        // so we never orphan a credential in the keychain, and never drop the
+        // entry that still holds a working refresh token.
+        if let Some(existing) = store.profiles.get(&canonical_key).cloned() {
+            if should_replace_canonical_profile(&canonical_key, &existing, &profile) {
+                delete_all_profile_secrets(&canonical_key, &existing);
+            } else {
+                delete_all_profile_secrets(current_key, &profile);
+                store.profiles.remove(current_key);
                 return true;
             }
         }
+        store.profiles.remove(current_key);
     }
     store.profiles.insert(canonical_key, profile);
     true
@@ -1463,6 +1471,16 @@ fn select_profile_from_store(
     current: Option<&str>,
     store: &AuthStore,
 ) -> Result<String> {
+    // Surface cross-org OAuth first so it is a predictable top-of-list choice
+    // rather than falling wherever its slot key happens to sort. The stable
+    // sort preserves the existing order of the remaining entries.
+    let mut names: Vec<&str> = names.to_vec();
+    names.sort_by_key(|name| {
+        !store
+            .profiles
+            .get(*name)
+            .is_some_and(is_cross_org_oauth_profile)
+    });
     let labels: Vec<String> = names
         .iter()
         .map(|name| profile_label_from_store(name, store))
@@ -1651,8 +1669,12 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     let selected_org = selected_org.ok_or_else(|| {
         anyhow::anyhow!("API-key login requires an org; pass --org <ORG> or rerun interactively")
     })?;
-    let selected_api_url =
-        resolve_profile_api_url(base.api_url.clone(), Some(&selected_org), &login_orgs)?;
+    let selected_api_url = resolve_profile_api_url(
+        base.api_url.clone(),
+        Some(&selected_org),
+        &login_orgs,
+        ui::can_prompt(),
+    )?;
 
     commit_api_key_profile(
         &api_key,
@@ -1760,8 +1782,12 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         true,
         explicitly_quiet(base),
     )?;
-    let selected_api_url =
-        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
+    let selected_api_url = resolve_profile_api_url(
+        base.api_url.clone(),
+        selected_org.as_ref(),
+        &login_orgs,
+        ui::can_prompt(),
+    )?;
 
     commit_oauth_profile(
         &oauth_tokens,
@@ -2812,6 +2838,7 @@ fn resolve_profile_api_url(
     explicit_api_url: Option<String>,
     selected_org: Option<&LoginOrgInfo>,
     orgs: &[LoginOrgInfo],
+    can_prompt: bool,
 ) -> Result<String> {
     if let Some(api_url) = explicit_api_url {
         return Ok(api_url);
@@ -2834,8 +2861,18 @@ fn resolve_profile_api_url(
             .unwrap_or_else(|| DEFAULT_API_URL.to_string()));
     }
 
+    // A cross-org login spans orgs on different data planes. Let the user pick
+    // which API URL to store rather than failing outright.
+    if can_prompt {
+        let idx = ui::fuzzy_select("Select API URL", &api_urls, 0)?;
+        return Ok(api_urls
+            .into_iter()
+            .nth(idx)
+            .expect("selected API URL should be in range"));
+    }
+
     bail!(
-        "multiple organizations expose different API URLs; choose an organization or pass --api-url explicitly"
+        "multiple organizations expose different API URLs; pass --org to pick one, or --api-url explicitly"
     )
 }
 
@@ -3834,6 +3871,22 @@ fn delete_legacy_profile_secrets(profile: &AuthProfile) {
     }
 }
 
+/// Delete every secret a profile could reference: those stored under its own
+/// slot key and those under its lazy legacy fallback key. Used when a duplicate
+/// login is discarded during canonicalization so nothing is orphaned.
+fn delete_all_profile_secrets(slot_key: &str, profile: &AuthProfile) {
+    match profile.auth_kind {
+        AuthKind::ApiKey => {
+            let _ = delete_profile_secret(slot_key);
+        }
+        AuthKind::Oauth => {
+            let _ = delete_profile_oauth_refresh_token(slot_key);
+            let _ = delete_profile_oauth_access_token(slot_key);
+        }
+    }
+    delete_legacy_profile_secrets(profile);
+}
+
 fn load_valid_cached_oauth_access_token(
     profile_name: &str,
     profile: &AuthProfile,
@@ -4000,6 +4053,32 @@ fn should_replace_migrated_profile(existing: &AuthProfile, candidate: &AuthProfi
         }
         _ => false,
     }
+}
+
+/// Runtime variant of [`should_replace_migrated_profile`] that can read the
+/// keychain: when two OAuth logins collapse onto the same slot, keep whichever
+/// still has a loadable refresh token (cached access-token expiry is unrelated
+/// to which refresh token is live). Falls back to the pure expiry heuristic
+/// when both or neither can refresh.
+fn should_replace_canonical_profile(
+    slot_key: &str,
+    existing: &AuthProfile,
+    candidate: &AuthProfile,
+) -> bool {
+    if let (AuthKind::Oauth, AuthKind::Oauth) = (existing.auth_kind, candidate.auth_kind) {
+        let has_refresh = |profile: &AuthProfile| {
+            matches!(
+                load_profile_oauth_refresh_token_for_profile(slot_key, profile),
+                Ok(Some(_))
+            )
+        };
+        match (has_refresh(existing), has_refresh(candidate)) {
+            (false, true) => return true,
+            (true, false) => return false,
+            _ => {}
+        }
+    }
+    should_replace_migrated_profile(existing, candidate)
 }
 
 fn looks_like_sha256_hex(value: &str) -> bool {
