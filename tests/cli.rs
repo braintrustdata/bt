@@ -110,16 +110,33 @@ fn top_level_help_shows_update_not_self() {
 }
 
 #[test]
-fn scorers_create_help_includes_llm_judge_flags() {
+fn scorers_create_help_includes_llm_judge_configuration() {
     bt_command()
         .args(["scorers", "create", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--prompt-file"))
+        .stdout(predicate::str::contains("--messages <SOURCE>"))
         .stdout(predicate::str::contains("--model"))
+        .stdout(predicate::str::contains("--temperature"))
+        .stdout(predicate::str::contains("--max-tokens"))
+        .stdout(predicate::str::contains("--top-p"))
+        .stdout(predicate::str::contains("--frequency-penalty"))
+        .stdout(predicate::str::contains("--presence-penalty"))
+        .stdout(predicate::str::contains("--stop-sequence"))
+        .stdout(predicate::str::contains("--tool-choice"))
+        .stdout(predicate::str::contains("--reasoning-effort"))
+        .stdout(predicate::str::contains("--verbosity"))
+        .stdout(predicate::str::contains("--template-format"))
         .stdout(predicate::str::contains("--choice-scores"))
+        .stdout(predicate::str::contains("--classifications"))
         .stdout(predicate::str::contains("--use-cot"))
-        .stdout(predicate::str::contains("--if-exists"));
+        .stdout(predicate::str::contains("--pass-threshold"))
+        .stdout(predicate::str::contains("--metadata"))
+        .stdout(predicate::str::contains("--if-exists"))
+        .stdout(predicate::str::contains("TypeScript: projects.create"))
+        .stdout(predicate::str::contains("Python:     projects.create"))
+        .stdout(predicate::str::contains("bt functions push scorer.ts"))
+        .stdout(predicate::str::contains("bt functions push scorer.py"));
 }
 
 #[test]
@@ -128,15 +145,24 @@ fn scorer_and_prompt_update_help_is_conflict_free() {
         .args(["scorers", "update", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--patch-file"))
-        .stdout(predicate::str::contains("--prompt-file"));
+        .stdout(predicate::str::contains("--patch <SOURCE>"))
+        .stdout(predicate::str::contains("--patch-file").not())
+        .stdout(predicate::str::contains("--messages <SOURCE>"))
+        .stdout(predicate::str::contains("--temperature"))
+        .stdout(predicate::str::contains("--classifications"))
+        .stdout(predicate::str::contains("--pass-threshold"))
+        .stdout(predicate::str::contains("--metadata"));
 
     bt_command()
         .args(["prompts", "update", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--patch-file"))
-        .stdout(predicate::str::contains("--prompt-file"));
+        .stdout(predicate::str::contains("--patch <SOURCE>"))
+        .stdout(predicate::str::contains("--patch-file").not())
+        .stdout(predicate::str::contains("--messages <SOURCE>"))
+        .stdout(predicate::str::contains("--temperature"))
+        .stdout(predicate::str::contains("--template-format"))
+        .stdout(predicate::str::contains("--metadata"));
 }
 
 #[test]
