@@ -405,11 +405,16 @@ fn scope_labels(global: &Path, local: &Path) -> [String; 2] {
 type ResolvedScope = (PathBuf, &'static str);
 
 impl ScopeArgs {
+    fn needs_preflight(&self, can_prompt: bool) -> bool {
+        self.global || self.local || !can_prompt
+    }
+
     pub(crate) fn preflight(&self, can_prompt: bool) -> Result<()> {
-        (!can_prompt)
-            .then(|| self.resolve(false, ""))
-            .transpose()
-            .map(drop)
+        if self.needs_preflight(can_prompt) {
+            self.resolve(false, "").map(drop)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn resolve(&self, can_prompt: bool, prompt: &str) -> Result<ResolvedScope> {
@@ -558,6 +563,24 @@ mod tests {
         );
         assert_eq!(labels[1], "Local (/work/test-project/.bt)");
         assert!(labels.iter().all(|label| !label.contains('\u{1b}')));
+    }
+
+    #[test]
+    fn explicit_scope_is_preflighted_even_when_interactive() {
+        for scope in [
+            ScopeArgs {
+                global: true,
+                local: false,
+            },
+            ScopeArgs {
+                global: false,
+                local: true,
+            },
+        ] {
+            assert!(scope.needs_preflight(true));
+        }
+        assert!(!ScopeArgs::default().needs_preflight(true));
+        assert!(ScopeArgs::default().needs_preflight(false));
     }
 
     #[test]
