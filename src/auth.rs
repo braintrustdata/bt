@@ -4014,11 +4014,15 @@ fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
         // The migrated store is already usable in memory, so a failed write-back
         // must not break read-only commands (`bt status`, `bt auth logins`). Warn
         // and proceed; the next writable run retries the migration.
-        if let Err(err) = save_auth_store_to_path(path, &migrated) {
-            eprintln!(
+        match save_auth_store_to_path(path, &migrated) {
+            // Only prune once the collapsed store is durably on disk; otherwise
+            // the on-disk file still references the dropped duplicate and the
+            // next load must be able to retry the migration.
+            Ok(()) => prune_orphaned_migration_secrets(&store, &migrated),
+            Err(err) => eprintln!(
                 "warning: Migrating {} to use the new format failed. Please delete this file and login again. ({err})",
                 path.display()
-            );
+            ),
         }
     }
     Ok(migrated)
@@ -4052,6 +4056,48 @@ fn migrate_auth_store(store: AuthStore) -> AuthStore {
         migrated.profiles.insert(new_key, profile);
     }
     migrated
+}
+
+/// Secret slots left dangling after migration collapsed duplicate logins onto a
+/// shared canonical key. A surviving login keeps its secret under its
+/// `legacy_secret_key` (until it is lazily relocated) or, absent one, under its
+/// own slot key; any pre-migration key outside that referenced set belonged to a
+/// dropped duplicate and can be deleted. Pure so it stays unit-testable; the
+/// caller performs the keychain I/O.
+fn orphaned_migration_secret_keys<'a>(
+    before: &'a AuthStore,
+    after: &AuthStore,
+) -> Vec<(&'a str, AuthKind)> {
+    let referenced: BTreeSet<&str> = after
+        .profiles
+        .iter()
+        .map(|(slot, profile)| {
+            profile
+                .legacy_secret_key
+                .as_deref()
+                .unwrap_or(slot.as_str())
+        })
+        .collect();
+    before
+        .profiles
+        .iter()
+        .filter(|(key, _)| !referenced.contains(key.as_str()))
+        .map(|(key, profile)| (key.as_str(), profile.auth_kind))
+        .collect()
+}
+
+fn prune_orphaned_migration_secrets(before: &AuthStore, after: &AuthStore) {
+    for (key, auth_kind) in orphaned_migration_secret_keys(before, after) {
+        match auth_kind {
+            AuthKind::ApiKey => {
+                let _ = delete_profile_secret(key);
+            }
+            AuthKind::Oauth => {
+                let _ = delete_profile_oauth_refresh_token(key);
+                let _ = delete_profile_oauth_access_token(key);
+            }
+        }
+    }
 }
 
 fn should_replace_migrated_profile(existing: &AuthProfile, candidate: &AuthProfile) -> bool {
@@ -5187,6 +5233,56 @@ mod tests {
         assert_eq!(migrated.profiles.len(), 1);
         let profile = migrated.profiles.get(&key).expect("migrated profile");
         assert_eq!(profile.legacy_secret_key.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn migration_reports_dropped_duplicate_secret_as_orphan() {
+        // Two legacy OAuth entries for the same org+email collapse onto one
+        // canonical slot. The survivor's secret stays reachable (via its
+        // legacy_secret_key), while the dropped duplicate's key must be reported
+        // as an orphan so its keychain secret can be deleted.
+        let mut store = AuthStore::default();
+        for (name, expires_at) in [("old", 10), ("new", 20)] {
+            store.profiles.insert(
+                name.to_string(),
+                AuthProfile {
+                    auth_kind: AuthKind::Oauth,
+                    org_id: Some("org_fake".to_string()),
+                    org_name: Some("test-org".to_string()),
+                    email: Some("user@example.test".to_string()),
+                    oauth_access_expires_at: Some(expires_at),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let migrated = migrate_auth_store(store.clone());
+        let orphans = orphaned_migration_secret_keys(&store, &migrated);
+
+        assert_eq!(orphans, vec![("old", AuthKind::Oauth)]);
+        // The survivor "new" is referenced through the canonical slot's
+        // legacy_secret_key and must never be pruned.
+        assert!(!orphans.iter().any(|(key, _)| *key == "new"));
+    }
+
+    #[test]
+    fn migration_without_collapse_reports_no_orphans() {
+        // A single entry that merely gets rekeyed keeps its secret under the
+        // legacy key, so nothing is orphaned.
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "test-org".to_string(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                org_id: Some("org_fake".to_string()),
+                org_name: Some("test-org".to_string()),
+                email: Some("user@example.test".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let migrated = migrate_auth_store(store.clone());
+        assert!(orphaned_migration_secret_keys(&store, &migrated).is_empty());
     }
 
     #[test]

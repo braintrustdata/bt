@@ -93,28 +93,29 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         if let Some(src) = source {
             println!("source: {src}");
         }
-    } else if let Some(org) = display_org {
-        let scope = match (org, project.as_deref()) {
-            ("cross-org", _) => org.to_string(),
-            (org, Some(project)) => format!("{org}/{project}"),
-            (org, None) => org.to_string(),
-        };
-        println!("{scope}");
-        let auth_line = match &auth_info {
-            Some(p) => format!("  auth: {}", format_auth(p)),
-            None => "  auth: (none)".to_string(),
-        };
-        println!("{auth_line}");
-    } else if auth_info
-        .as_ref()
-        .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none())
-    {
-        println!("cross-org");
-        if let Some(p) = &auth_info {
-            println!("  auth: {}", format_auth(p));
-        }
     } else {
-        println!("No org/project configured. Run `bt switch` to set one.");
+        // Plain one-liner. Always surface the active auth — even when no org is
+        // configured (an env-only API key, or a cross-org OAuth login) — instead
+        // of hiding it behind --verbose.
+        let cross_org_oauth = auth_info
+            .as_ref()
+            .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none());
+        let header = match display_org {
+            Some("cross-org") => "cross-org".to_string(),
+            Some(org) => match project.as_deref() {
+                Some(project) => format!("{org}/{project}"),
+                None => org.to_string(),
+            },
+            None if cross_org_oauth => "cross-org".to_string(),
+            None if auth_info.is_some() => "No default org".to_string(),
+            None => "No org/project configured. Run `bt switch` to set one.".to_string(),
+        };
+        println!("{header}");
+        match &auth_info {
+            Some(p) => println!("  auth: {}", format_auth(p)),
+            None if display_org.is_some() => println!("  auth: (none)"),
+            None => {}
+        }
     }
 
     Ok(())
