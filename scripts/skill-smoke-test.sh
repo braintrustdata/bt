@@ -27,7 +27,7 @@ Options:
 
 Examples:
   scripts/skill-smoke-test.sh --agent codex
-  scripts/skill-smoke-test.sh --agent codex --agent-cmd 'codex run --prompt-file AGENT_TASK.md'
+  scripts/skill-smoke-test.sh --agent codex --agent-cmd 'codex exec - < AGENT_TASK.md'
   scripts/skill-smoke-test.sh --demo-dir /tmp/bt-skill-demo --verify-only
 EOF
 }

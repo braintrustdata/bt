@@ -1,5 +1,18 @@
 use serde_json::{Map, Value};
 
+pub(crate) fn merge_json_objects(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(Value::Object(target_inner)), Value::Object(source_inner)) => {
+                merge_json_objects(target_inner, source_inner);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 pub(crate) fn lookup_object_path<'a, P>(
     object: &'a Map<String, Value>,
     path: &[P],
@@ -19,6 +32,27 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn merge_json_objects_deep_merges_nested_maps() {
+        let mut target = json!({
+            "prompt_data": { "options": { "model": "gpt-test" } }
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+        let source = json!({
+            "prompt_data": { "options": { "params": { "temperature": 0 } } }
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+
+        merge_json_objects(&mut target, &source);
+
+        assert_eq!(target["prompt_data"]["options"]["model"], "gpt-test");
+        assert_eq!(target["prompt_data"]["options"]["params"]["temperature"], 0);
+    }
 
     #[test]
     fn lookup_object_path_finds_nested_values() {

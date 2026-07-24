@@ -17,7 +17,7 @@ Examples:
   bt prompts list
   bt prompts view my-prompt
   bt prompts delete my-prompt
-  bt prompts update my-prompt --prompt-file prompt.md
+  bt prompts update my-prompt --messages @messages.json
 ")]
 pub struct PromptsArgs {
     #[command(subcommand)]
@@ -30,8 +30,8 @@ enum PromptsCommands {
     List,
     /// View a prompt's content
     View(ViewArgs),
-    /// Update a prompt in place (prompt text, model, description, or arbitrary patch)
-    Update(update::UpdateArgs),
+    /// Update a prompt in place (prompt configuration, metadata, or arbitrary patch)
+    Update(Box<update::UpdateArgs>),
     /// Delete a prompt
     Delete(DeleteArgs),
 }

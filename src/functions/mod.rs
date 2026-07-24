@@ -17,6 +17,7 @@ pub(crate) mod create;
 mod delete;
 mod invoke;
 mod list;
+pub(crate) mod prompt_config;
 mod pull;
 mod push;
 pub(crate) mod report;
@@ -116,6 +117,9 @@ fn build_web_path(function: &Function) -> String {
     match function.function_type.as_deref() {
         Some("tool") => format!("tools?pr={}", urlencoding::encode(id)),
         Some("scorer") => format!("scorers/{}", urlencoding::encode(id)),
+        Some("classifier") if function.prompt_data.is_some() => {
+            format!("scorers/{}", urlencoding::encode(id))
+        }
         Some("classifier") => {
             let xact_id = function._xact_id.as_deref().unwrap_or("");
             format!(
@@ -170,7 +174,7 @@ Examples:
   bt tools view my-tool
   bt tools view fn_123
   bt tools view --id fn_123
-  bt tools update my-tool --patch-file tool-patch.json
+  bt tools update my-tool --patch @tool-patch.json
 ")]
 pub struct FunctionArgs {
     #[command(subcommand)]
@@ -187,8 +191,8 @@ pub(crate) enum FunctionCommands {
     Delete(DeleteArgs),
     /// Invoke a function
     Invoke(invoke::InvokeArgs),
-    /// Update a function in place (prompt, model, description, or arbitrary patch)
-    Update(update::UpdateArgs),
+    /// Update a function in place (prompt configuration, metadata, or arbitrary patch)
+    Update(Box<update::UpdateArgs>),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -221,8 +225,8 @@ enum FunctionsCommands {
     Delete(FunctionsDeleteArgs),
     /// Invoke a function
     Invoke(FunctionsInvokeArgs),
-    /// Update a function in place (prompt, model, description, or arbitrary patch)
-    Update(FunctionsUpdateArgs),
+    /// Update a function in place (prompt configuration, metadata, or arbitrary patch)
+    Update(Box<FunctionsUpdateArgs>),
     /// Push local function definitions
     Push(PushArgs),
     /// Pull remote function definitions
@@ -277,12 +281,7 @@ struct FunctionsUpdateArgs {
     #[command(flatten)]
     inner: update::UpdateArgs,
     /// Filter by function type (for interactive selection)
-    #[arg(
-        long = "type",
-        short = 't',
-        env = "BT_FUNCTIONS_UPDATE_TYPE",
-        value_enum
-    )]
+    #[arg(long = "type", short = 't', value_enum)]
     function_type: Option<FunctionTypeFilter>,
 }
 
@@ -1120,6 +1119,26 @@ mod tests {
         };
         let err = view.inner.selector().expect_err("id and slug conflict");
         assert!(err.to_string().contains("either --id or a slug"));
+    }
+
+    #[test]
+    fn prompt_classifier_web_path_uses_scorers_page() {
+        let function = Function {
+            id: "fn_test_classifier".to_string(),
+            name: "Test classifier".to_string(),
+            slug: "test-classifier".to_string(),
+            project_id: "test-project".to_string(),
+            description: None,
+            function_type: Some("classifier".to_string()),
+            prompt_data: Some(serde_json::json!({"parser": {"choice": ["a", "b"]}})),
+            function_data: Some(serde_json::json!({"type": "prompt"})),
+            tags: None,
+            metadata: None,
+            created: None,
+            _xact_id: None,
+        };
+
+        assert_eq!(build_web_path(&function), "scorers/fn_test_classifier");
     }
 
     #[test]

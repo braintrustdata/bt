@@ -579,6 +579,7 @@ dependencies = [
  "serde",
  "serde_json 1.0.151",
  "serde_path_to_error",
+ "serde_yaml",
  "sha2",
  "strip-ansi-escapes",
  "tempfile",
