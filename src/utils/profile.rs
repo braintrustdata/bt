@@ -1,60 +1,12 @@
-use crate::auth::{self, ProfileInfo};
+use crate::auth::ProfileInfo;
 
-pub(crate) fn resolve_profile_info(
-    profile: Option<&str>,
-    org: Option<&str>,
-) -> Option<ProfileInfo> {
-    let profiles = auth::list_profiles().ok()?;
-    resolve_profile_info_from_profiles(profile, org, profiles)
-}
-
-fn resolve_profile_info_from_profiles(
-    profile: Option<&str>,
-    org: Option<&str>,
-    profiles: Vec<ProfileInfo>,
-) -> Option<ProfileInfo> {
-    if let Some(profile_name) = profile {
-        if let Some(profile) = profiles
-            .iter()
-            .find(|profile| profile.name == profile_name)
-            .cloned()
-        {
-            return Some(profile);
-        }
-    }
-
-    if let Some(org_name) = org {
-        if profiles.iter().any(|profile| profile.name == org_name) {
-            return profiles
-                .into_iter()
-                .find(|profile| profile.name == org_name);
-        }
-
-        let org_matches: Vec<&ProfileInfo> = profiles
-            .iter()
-            .filter(|profile| profile.org_name.as_deref() == Some(org_name))
-            .collect();
-        if org_matches.len() == 1 {
-            let profile_name = org_matches[0].name.clone();
-            return profiles
-                .into_iter()
-                .find(|profile| profile.name == profile_name);
-        }
-        return None;
-    }
-
-    if profiles.len() == 1 {
-        return profiles.into_iter().next();
-    }
-
-    None
-}
-
+/// Slug for the authenticated human (name, else email local part). Org is
+/// deliberately not a fallback: a bare API key has no author, so callers
+/// substitute a generic placeholder rather than name the snapshot after the org.
 pub(crate) fn profile_author_slug(profile: &ProfileInfo) -> Option<String> {
     [
         profile.user_name.as_deref(),
         profile.email.as_deref().and_then(email_local_part),
-        Some(profile.name.as_str()),
     ]
     .into_iter()
     .flatten()
@@ -98,13 +50,17 @@ mod tests {
     use super::*;
 
     fn profile_info(
-        name: &str,
         org_name: Option<&str>,
         user_name: Option<&str>,
         email: Option<&str>,
     ) -> ProfileInfo {
         ProfileInfo {
-            name: name.to_string(),
+            auth_method: if email.is_some() || user_name.is_some() {
+                "oauth"
+            } else {
+                "api_key"
+            }
+            .to_string(),
             org_name: org_name.map(ToOwned::to_owned),
             user_name: user_name.map(ToOwned::to_owned),
             email: email.map(ToOwned::to_owned),
@@ -113,35 +69,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_profile_info_prefers_explicit_profile() {
-        let profile = resolve_profile_info_from_profiles(
-            Some("work"),
-            Some("other-org"),
-            vec![
-                profile_info("other", Some("other-org"), None, None),
-                profile_info("work", Some("work-org"), None, None),
-            ],
-        )
-        .expect("profile");
-
-        assert_eq!(profile.name, "work");
-    }
-
-    #[test]
-    fn resolve_profile_info_finds_profile_by_org_name() {
-        let profile = resolve_profile_info_from_profiles(
-            None,
-            Some("work-org"),
-            vec![profile_info("work", Some("work-org"), None, None)],
-        )
-        .expect("profile");
-
-        assert_eq!(profile.name, "work");
-    }
-
-    #[test]
     fn profile_author_slug_prefers_user_name() {
-        let profile = profile_info("work", None, Some("Alice Smith"), Some("alice@example.com"));
+        let profile = profile_info(None, Some("Alice Smith"), Some("alice@example.com"));
         assert_eq!(
             profile_author_slug(&profile).as_deref(),
             Some("alice-smith")
@@ -150,17 +79,21 @@ mod tests {
 
     #[test]
     fn profile_author_slug_falls_back_to_email_local_part() {
-        let profile = profile_info("work", None, None, Some("alice.dev@example.com"));
+        let profile = profile_info(None, None, Some("alice.dev@example.com"));
         assert_eq!(profile_author_slug(&profile).as_deref(), Some("alice-dev"));
     }
 
     #[test]
-    fn profile_author_slug_falls_back_to_profile_name() {
-        let profile = profile_info("Work Profile", None, None, None);
-        assert_eq!(
-            profile_author_slug(&profile).as_deref(),
-            Some("work-profile")
-        );
+    fn profile_author_slug_returns_none_without_identity() {
+        let profile = profile_info(None, None, None);
+        assert_eq!(profile_author_slug(&profile), None);
+    }
+
+    #[test]
+    fn profile_author_slug_ignores_org_name() {
+        // A bare API key has an org but no human identity — not an author.
+        let profile = profile_info(Some("test-org"), None, None);
+        assert_eq!(profile_author_slug(&profile), None);
     }
 
     #[test]

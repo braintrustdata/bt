@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::{
     env, fs,
@@ -18,7 +18,6 @@ mod set;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    pub profile: Option<String>,
     pub org: Option<String>,
     pub project: Option<String>,
     pub project_id: Option<String>,
@@ -26,12 +25,11 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["profile", "org", "project", "project_id"];
+pub const KNOWN_KEYS: &[&str] = &["org", "project", "project_id"];
 
 impl Config {
     pub fn get_field(&self, key: &str) -> Option<&str> {
         match key {
-            "profile" => self.profile.as_deref(),
             "org" => self.org.as_deref(),
             "project" => self.project.as_deref(),
             "project_id" => self.project_id.as_deref(),
@@ -41,7 +39,6 @@ impl Config {
 
     pub fn set_field(&mut self, key: &str, value: String) -> bool {
         match key {
-            "profile" => self.profile = Some(value),
             "org" => self.org = Some(value),
             "project" => {
                 self.project = Some(value);
@@ -55,7 +52,6 @@ impl Config {
 
     pub fn unset_field(&mut self, key: &str) -> bool {
         match key {
-            "profile" => self.profile = None,
             "org" => self.org = None,
             "project" => {
                 self.project = None;
@@ -74,18 +70,32 @@ impl Config {
             .collect()
     }
 
-    pub(crate) fn merge(&self, other: &Config) -> Config {
+    pub(crate) fn set_context(&mut self, org: Option<&str>, project: Option<(&str, &str)>) {
+        self.org = org_option(org).map(str::to_string);
+        (self.project, self.project_id) = project
+            .map(|(name, id)| (name.to_string(), id.to_string()))
+            .unzip();
+    }
+
+    pub(crate) fn merge(&self, local: &Config) -> Config {
         let mut extra = self.extra.clone();
-        extra.extend(other.extra.clone());
-        let project = other.project.clone().or_else(|| self.project.clone());
-        let project_id = if other.project.is_some() {
-            other.project_id.clone()
-        } else {
-            self.project_id.clone()
+        extra.extend(local.extra.clone());
+        let global_id = self.project.as_ref().and(self.project_id.clone());
+        let (org, project, project_id) = match (&local.org, &local.project) {
+            (Some(org), Some(project)) => (
+                Some(org.clone()),
+                Some(project.clone()),
+                local.project_id.clone(),
+            ),
+            (Some(org), None) if self.org.as_ref() == Some(org) => {
+                (Some(org.clone()), self.project.clone(), global_id)
+            }
+            (Some(org), None) => (Some(org.clone()), None, None),
+            (None, Some(project)) => (None, Some(project.clone()), local.project_id.clone()),
+            (None, None) => (self.org.clone(), self.project.clone(), global_id),
         };
         Config {
-            profile: other.profile.clone().or_else(|| self.profile.clone()),
-            org: other.org.clone().or_else(|| self.org.clone()),
+            org,
             project,
             project_id,
             extra,
@@ -119,7 +129,7 @@ pub fn load_file(path: &Path) -> Config {
         }
     };
 
-    let config: Config = match serde_json::from_str(&file_contents) {
+    let mut config: Config = match serde_json::from_str(&file_contents) {
         Ok(c) => c,
         Err(e) => {
             print_command_status(
@@ -129,6 +139,16 @@ pub fn load_file(path: &Path) -> Config {
             return Config::default();
         }
     };
+
+    config.extra.remove("profile");
+
+    // Fold a literal "cross-org" to the canonical "" marker on load.
+    if let Some(org) = config.org.as_deref() {
+        let normalized = normalize_org(org);
+        if normalized != org {
+            config.org = Some(normalized.to_string());
+        }
+    }
 
     for key in config.extra.keys() {
         print_command_status(
@@ -181,19 +201,35 @@ pub(crate) fn project_from_config_for_context(
 }
 
 fn config_matches_context(base: &BaseArgs, cfg: &Config, resolved_org: Option<&str>) -> bool {
-    let selected_profile = trimmed_option(base.profile.as_deref());
-    let cfg_profile = trimmed_option(cfg.profile.as_deref());
-    let cfg_org = trimmed_option(cfg.org.as_deref());
-    let resolved_org = trimmed_option(resolved_org);
+    let cfg_org = org_option(cfg.org.as_deref());
+    let requested_org = org_option(resolved_org).or_else(|| org_option(base.org_name.as_deref()));
 
-    match selected_profile {
-        Some(profile) => {
-            cfg_profile == Some(profile)
-                || (cfg_profile.is_none() && cfg_org.is_some() && cfg_org == resolved_org)
-        }
-        None => cfg_org
-            .zip(resolved_org)
-            .is_none_or(|(cfg, resolved)| cfg == resolved),
+    requested_org.is_none_or(|resolved| cfg_org == Some(resolved))
+}
+
+/// Trim an org while preserving the empty cross-org marker.
+pub(crate) fn org_option(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim)
+}
+
+/// Human-facing spelling of the empty cross-org marker.
+pub(crate) const CROSS_ORG_ALIAS: &str = "cross-org";
+
+/// Trim an org and fold the [`CROSS_ORG_ALIAS`] to the canonical `""` marker.
+pub(crate) fn normalize_org(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed == CROSS_ORG_ALIAS {
+        ""
+    } else {
+        trimmed
+    }
+}
+
+pub(crate) fn display_org(org: &str) -> &str {
+    if org.is_empty() {
+        CROSS_ORG_ALIAS
+    } else {
+        org
     }
 }
 
@@ -220,22 +256,45 @@ pub fn save_global(config: &Config) -> Result<()> {
 }
 
 pub fn find_local_config_dir() -> Option<PathBuf> {
-    let home = dirs::home_dir();
-    let mut current_dir = std::env::current_dir().ok()?;
+    find_local_config_dir_from(std::env::current_dir().ok()?, dirs::home_dir().as_deref())
+}
 
-    loop {
-        if current_dir.join(".bt").is_dir() {
-            return Some(current_dir.join(".bt"));
+enum ProjectBoundary {
+    Bt(PathBuf),
+    Git(PathBuf),
+    Home,
+    Root,
+}
+
+fn project_boundary(start: PathBuf, home: Option<&Path>) -> ProjectBoundary {
+    // `current_dir()` is the physical path (symlinks resolved) while `$HOME` may
+    // not be, so also compare canonicalized forms — exact equality alone can
+    // walk straight past a symlinked home boundary.
+    let home_canon = home.and_then(|h| fs::canonicalize(h).ok());
+    for dir in start.ancestors() {
+        let at_home =
+            Some(dir) == home || (home_canon.is_some() && fs::canonicalize(dir).ok() == home_canon);
+        if at_home {
+            return ProjectBoundary::Home;
         }
-        if current_dir.join(".git").exists() {
-            return None;
+        if dir.parent().is_none() {
+            return ProjectBoundary::Root;
         }
-        if Some(&current_dir) == home.as_ref() {
-            return None;
+        let bt = dir.join(".bt");
+        if bt.is_dir() {
+            return ProjectBoundary::Bt(bt);
         }
-        if !current_dir.pop() {
-            return None;
+        if dir.join(".git").exists() {
+            return ProjectBoundary::Git(dir.to_path_buf());
         }
+    }
+    unreachable!("path ancestors always include a filesystem root")
+}
+
+fn find_local_config_dir_from(current_dir: PathBuf, home: Option<&Path>) -> Option<PathBuf> {
+    match project_boundary(current_dir, home) {
+        ProjectBoundary::Bt(dir) if dir.join("config.json").is_file() => Some(dir),
+        _ => None,
     }
 }
 
@@ -243,34 +302,70 @@ pub fn local_path() -> Option<PathBuf> {
     find_local_config_dir().map(|dir| dir.join("config.json"))
 }
 
-pub enum WriteTarget {
-    Global(PathBuf),
-    Local(PathBuf),
-}
-
-pub fn write_target() -> Result<WriteTarget> {
-    match local_path() {
-        Some(p) => Ok(WriteTarget::Local(p)),
-        None => Ok(WriteTarget::Global(global_path()?)),
-    }
-}
-
 /// Resolve which config file to write based on --global/--local flags.
 pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
     if global {
-        global_path()
-    } else if local {
-        match local_path() {
-            Some(p) => Ok(p),
-            None => {
-                bail!("No local .bt directory found. Use bt init to initialize this directory.")
-            }
-        }
-    } else {
-        match write_target()? {
-            WriteTarget::Local(p) | WriteTarget::Global(p) => Ok(p),
-        }
+        return global_path();
     }
+    match local_path() {
+        Some(path) => Ok(path),
+        None if local => {
+            bail!("No existing local .bt/config.json found. Run `bt init` first, or use --global.")
+        }
+        None => global_path(),
+    }
+}
+
+/// Resolve the create/overwrite target for `bt init`.
+pub fn init_target(here: bool, force: bool) -> Result<PathBuf> {
+    init_target_from(
+        std::env::current_dir().context("could not read current directory")?,
+        dirs::home_dir().as_deref(),
+        here,
+        force,
+    )
+}
+
+fn init_target_from(
+    current_dir: PathBuf,
+    home: Option<&Path>,
+    here: bool,
+    force: bool,
+) -> Result<PathBuf> {
+    if here {
+        let path = current_dir.join(".bt/config.json");
+        if path.exists() && !force {
+            bail!(
+                "{} already exists; rerun with --force to overwrite it",
+                path.display()
+            );
+        }
+        return Ok(path);
+    }
+
+    let path = match project_boundary(current_dir, home) {
+        ProjectBoundary::Home => bail!(
+            "reached the home directory without finding a project git root; run `bt init` inside a repository, or pass --here"
+        ),
+        ProjectBoundary::Root => bail!(
+            "reached the filesystem root without finding a project git root; run `bt init` inside a repository, or pass --here"
+        ),
+        ProjectBoundary::Git(dir) => return Ok(dir.join(".bt/config.json")),
+        ProjectBoundary::Bt(dir) => dir.join("config.json"),
+    };
+    if !path.is_file() {
+        bail!(
+            "found {} without config.json; remove the incomplete .bt directory, then rerun `bt init`",
+            path.parent().unwrap_or(&path).display()
+        );
+    }
+    if !force {
+        bail!(
+            "{} already exists; use `bt switch` to change it, or rerun with --force to overwrite it",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 pub fn local_save_path() -> Result<PathBuf> {
@@ -289,15 +384,53 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
 
 // --- CLI commands ---
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub struct ScopeArgs {
-    /// Apply to global config (~/.config/bt/config.json)
+    /// Use global config (~/.config/bt/config.json)
     #[arg(long, short = 'g', conflicts_with = "local")]
-    global: bool,
+    pub(crate) global: bool,
 
-    /// Apply to local config (.bt/config.json)
+    /// Use local config (.bt/config.json)
     #[arg(long, short = 'l')]
-    local: bool,
+    pub(crate) local: bool,
+}
+
+fn scope_labels(global: &Path, local: &Path) -> [String; 2] {
+    [
+        format!("Global ({})", global.parent().unwrap_or(global).display()),
+        format!("Local ({})", local.parent().unwrap_or(local).display()),
+    ]
+}
+
+type ResolvedScope = (PathBuf, &'static str);
+
+impl ScopeArgs {
+    pub(crate) fn preflight(&self, can_prompt: bool) -> Result<()> {
+        (!can_prompt)
+            .then(|| self.resolve(false, ""))
+            .transpose()
+            .map(drop)
+    }
+
+    pub(crate) fn resolve(&self, can_prompt: bool, prompt: &str) -> Result<ResolvedScope> {
+        if self.global || self.local {
+            let scope = if self.global { "global" } else { "local" };
+            return resolve_write_path(self.global, self.local).map(|path| (path, scope));
+        }
+        let Some(local) = local_path() else {
+            return Ok((global_path()?, "global"));
+        };
+        if !can_prompt {
+            bail!("both global and local config scopes are available; pass --global or --local");
+        }
+        let global = global_path()?;
+        let options = scope_labels(&global, &local);
+        Ok(if crate::ui::fuzzy_select(prompt, &options, 1)? == 0 {
+            (global, "global")
+        } else {
+            (local, "local")
+        })
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -318,14 +451,14 @@ enum ConfigCommands {
     },
     /// Get a config value
     Get {
-        /// Config key (profile, org, project, project_id)
+        /// Config key (org, project, project_id)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,
     },
     /// Set a config value
     Set {
-        /// Config key (profile, org, project, project_id)
+        /// Config key (org, project, project_id)
         key: String,
         /// Value to set
         value: String,
@@ -334,7 +467,7 @@ enum ConfigCommands {
     },
     /// Remove a config value
     Unset {
-        /// Config key (profile, org, project, project_id)
+        /// Config key (org, project, project_id)
         key: String,
         #[command(flatten)]
         scope: ScopeArgs,
@@ -378,87 +511,82 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn merge_other_takes_precedence() {
-        let base = Config {
-            org: Some("base-org".into()),
-            project: Some("base-proj".into()),
+    fn merge_keeps_org_and_project_contexts_together() {
+        let c = |org: Option<&str>, project: Option<&str>, id: Option<&str>| Config {
+            org: org.map(str::to_string),
+            project: project.map(str::to_string),
+            project_id: id.map(str::to_string),
             ..Default::default()
         };
-        let other = Config {
-            org: Some("other-org".into()),
-            project: Some("other-proj".into()),
-            ..Default::default()
-        };
-        let merged = base.merge(&other);
-        assert_eq!(merged.org, Some("other-org".into()));
-        assert_eq!(merged.project, Some("other-proj".into()));
-    }
-
-    #[test]
-    fn merge_self_fills_when_other_none() {
-        let base = Config {
-            org: Some("base-org".into()),
-            project: Some("base-proj".into()),
-            ..Default::default()
-        };
-        let other = Config::default();
-        let merged = base.merge(&other);
-        assert_eq!(merged.org, Some("base-org".into()));
-        assert_eq!(merged.project, Some("base-proj".into()));
-    }
-
-    #[test]
-    fn merge_both_none_stays_none() {
-        let base = Config::default();
-        let other = Config::default();
-        let merged = base.merge(&other);
-        assert_eq!(merged.org, None);
-        assert_eq!(merged.project, None);
-    }
-
-    #[test]
-    fn merge_partial_fill() {
-        let base = Config {
-            org: Some("base-org".into()),
-            project: None,
-            ..Default::default()
-        };
-        let other = Config {
-            org: None,
-            project: Some("other-proj".into()),
-            ..Default::default()
-        };
-        let merged = base.merge(&other);
-        assert_eq!(merged.org, Some("base-org".into()));
-        assert_eq!(merged.project, Some("other-proj".into()));
-    }
-
-    fn base_with_profile(profile: Option<&str>) -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: profile.map(str::to_string),
-            profile_explicit: profile.is_some(),
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
+        let g = || c(Some("global"), Some("global-proj"), Some("proj_g"));
+        let cases = [
+            (Config::default(), Config::default(), Config::default()),
+            (
+                g(),
+                c(Some("other"), Some("other-proj"), None),
+                c(Some("other"), Some("other-proj"), None),
+            ),
+            (
+                c(Some("base"), None, None),
+                c(None, Some("local"), None),
+                c(None, Some("local"), None),
+            ),
+            (g(), c(Some("global"), None, None), g()),
+            (
+                g(),
+                c(Some("local"), None, None),
+                c(Some("local"), None, None),
+            ),
+            (
+                g(),
+                c(None, Some("local"), Some("proj_l")),
+                c(None, Some("local"), Some("proj_l")),
+            ),
+            (g(), c(Some(""), None, None), c(Some(""), None, None)),
+            (g(), Config::default(), g()),
+        ];
+        for (global, local, expected) in cases {
+            assert_eq!(global.merge(&local), expected);
         }
     }
 
-    fn config(profile: Option<&str>, org: Option<&str>, project: Option<&str>) -> Config {
+    #[test]
+    fn scope_labels_are_plain_text() {
+        let labels = scope_labels(
+            Path::new("/home/test-user/.config/bt/config.json"),
+            Path::new("/work/test-project/.bt/config.json"),
+        );
+        assert_eq!(labels[1], "Local (/work/test-project/.bt)");
+        assert!(labels.iter().all(|label| !label.contains('\u{1b}')));
+    }
+
+    #[test]
+    fn option_helpers_handle_empty_values() {
+        for (input, org, trimmed) in [
+            (None, None, None),
+            (Some(""), Some(""), None),
+            (Some("   "), Some(""), None),
+            (Some("test-org"), Some("test-org"), Some("test-org")),
+        ] {
+            assert_eq!(org_option(input), org);
+            assert_eq!(trimmed_option(input), trimmed);
+        }
+
+        let mut cfg = Config::default();
+        cfg.set_context(Some(" test-org "), Some(("test-project", "proj_test")));
+        assert_eq!(cfg.org.as_deref(), Some("test-org"));
+        assert_eq!(cfg.project.as_deref(), Some("test-project"));
+        assert_eq!(cfg.project_id.as_deref(), Some("proj_test"));
+        cfg.set_context(Some(""), None);
+        assert_eq!((cfg.org.as_deref(), cfg.project), (Some(""), None));
+    }
+
+    fn base_args() -> BaseArgs {
+        BaseArgs::default()
+    }
+
+    fn config(org: Option<&str>, project: Option<&str>) -> Config {
         Config {
-            profile: profile.map(str::to_string),
             org: org.map(str::to_string),
             project: project.map(str::to_string),
             ..Default::default()
@@ -466,22 +594,18 @@ mod tests {
     }
 
     #[test]
-    fn project_config_matches_explicit_profile_or_legacy_org() {
-        let base = base_with_profile(Some("work"));
-        let cases = [
-            (config(None, Some("acme"), Some("demo")), Some("demo")),
-            (config(None, Some("other"), Some("demo")), None),
-            (config(None, None, Some("demo")), None),
-            (config(Some("other"), Some("acme"), Some("demo")), None),
-            (
-                config(Some("work"), Some("acme"), Some("demo")),
-                Some("demo"),
-            ),
-        ];
-
-        for (cfg, expected) in cases {
+    fn project_config_must_match_org_context() {
+        let base = base_args();
+        for (config_org, resolved_org, expected) in [
+            (Some("test-org"), "test-org", Some("test-project")),
+            (Some("other-org"), "test-org", None),
+            (None, "test-org", None),
+            (Some(""), "test-org", None),
+            (Some(""), "", Some("test-project")),
+        ] {
+            let cfg = config(config_org, Some("test-project"));
             assert_eq!(
-                project_from_config_for_context(&base, &cfg, Some("acme")).as_deref(),
+                project_from_config_for_context(&base, &cfg, Some(resolved_org)).as_deref(),
                 expected
             );
         }
@@ -540,6 +664,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_profile_key_is_ignored_and_not_persisted() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(&path, r#"{"org":"test-org","profile":"legacy-login"}"#).unwrap();
+
+        let config = load_file(&path);
+        assert_eq!(config.org.as_deref(), Some("test-org"));
+        assert!(!config.extra.contains_key("profile"));
+
+        save_file(&path, &config).unwrap();
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("profile"));
+    }
+
+    #[test]
+    fn load_folds_cross_org_alias_to_empty_marker() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        // Literal "cross-org" must load identically to the "" marker.
+        for spelling in [
+            r#"{"org":"cross-org"}"#,
+            r#"{"org":"  cross-org  "}"#,
+            r#"{"org":""}"#,
+        ] {
+            fs::write(&path, spelling).unwrap();
+            assert_eq!(load_file(&path).org.as_deref(), Some(""), "{spelling}");
+        }
+
+        fs::write(&path, r#"{"org":"test-org"}"#).unwrap();
+        assert_eq!(load_file(&path).org.as_deref(), Some("test-org"));
+    }
+
+    #[test]
     fn unknown_keys_roundtrip_through_save() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.json");
@@ -570,5 +727,114 @@ mod tests {
 
         save_file(&path, &config).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn local_discovery_requires_config_json_and_stops_at_first_bt() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(repo.join(".git")).unwrap();
+        fs::create_dir(repo.join(".bt")).unwrap();
+
+        assert_eq!(find_local_config_dir_from(nested.clone(), None), None);
+
+        fs::write(repo.join(".bt/config.json"), "{}").unwrap();
+        assert_eq!(
+            find_local_config_dir_from(nested, None),
+            Some(repo.join(".bt"))
+        );
+    }
+
+    #[test]
+    fn local_discovery_does_not_use_home_bt() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".bt")).unwrap();
+        fs::write(home.join(".bt/config.json"), "{}").unwrap();
+
+        assert_eq!(
+            find_local_config_dir_from(home.clone(), Some(home.as_path())),
+            None
+        );
+    }
+
+    #[test]
+    fn init_target_finds_nested_git_directory_or_file() {
+        for git_is_file in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            let nested = repo.join("nested").join("deeper");
+            fs::create_dir_all(&nested).unwrap();
+            if git_is_file {
+                fs::write(repo.join(".git"), "gitdir: synthetic").unwrap();
+            } else {
+                fs::create_dir(repo.join(".git")).unwrap();
+            }
+
+            assert_eq!(
+                init_target_from(nested, Some(tmp.path()), false, false).unwrap(),
+                repo.join(".bt/config.json")
+            );
+        }
+    }
+
+    #[test]
+    fn init_target_existing_bt_requires_force_and_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("nested");
+        fs::create_dir_all(repo.join(".bt")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+
+        assert!(init_target_from(nested.clone(), Some(tmp.path()), false, true).is_err());
+
+        let target = repo.join(".bt/config.json");
+        fs::write(&target, "{}").unwrap();
+        assert!(init_target_from(nested.clone(), Some(tmp.path()), false, false).is_err());
+        assert_eq!(
+            init_target_from(nested, Some(tmp.path()), false, true).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn init_target_here_bypasses_home_boundary_and_honors_force() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let target = home.join(".bt/config.json");
+
+        assert_eq!(
+            init_target_from(home.clone(), Some(home.as_path()), true, false).unwrap(),
+            target
+        );
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "{}").unwrap();
+        assert!(init_target_from(home.clone(), Some(home.as_path()), true, false).is_err());
+        assert_eq!(
+            init_target_from(home, Some(tmp.path()), true, true).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn init_target_home_wins_over_git_marker() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".git")).unwrap();
+        assert!(init_target_from(home.clone(), Some(home.as_path()), false, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_target_here_bypasses_filesystem_root_boundary() {
+        let root = PathBuf::from("/");
+        assert_eq!(
+            init_target_from(root.clone(), None, true, true).unwrap(),
+            root.join(".bt/config.json")
+        );
+        assert!(init_target_from(root, None, false, false).is_err());
     }
 }

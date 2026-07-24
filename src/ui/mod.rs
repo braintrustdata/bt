@@ -56,6 +56,7 @@ pub use ratatui_table::{
     box_with_title, render_experiment_summary_table, summary_metric_unit, SummaryExperimentColumn,
     SummaryMetricCell, SummaryMetricKind, SummaryMetricRow, SummaryTableOptions,
 };
+pub(crate) use select::select_or_create_project;
 pub use select::{fuzzy_select, select_project, ProjectSelectMode};
 
 pub use spinner::{with_spinner, with_spinner_visible};

@@ -10,7 +10,6 @@ fn bt_command() -> Command {
 fn clear_braintrust_auth_env(cmd: &mut Command) {
     for key in [
         "BRAINTRUST_API_KEY",
-        "BRAINTRUST_PROFILE",
         "BRAINTRUST_ORG_NAME",
         "BRAINTRUST_DEFAULT_PROJECT",
     ] {
@@ -48,6 +47,15 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 
     let body = format!("{{\"profiles\":{{{}}}}}", entries.join(","));
     fs::write(auth_dir.join("auth.json"), body).expect("write auth store");
+}
+
+#[test]
+fn auth_login_does_not_expose_client_id() {
+    bt_command()
+        .args(["auth", "login", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--client-id").not());
 }
 
 #[test]
@@ -113,13 +121,7 @@ fn top_level_help_shows_update_not_self() {
 fn topics_report_help_accepts_global_org_short_conflict_free() {
     bt_command()
         .args([
-            "topics",
-            "report",
-            "--profile",
-            "test-profile",
-            "--id",
-            "fn_123",
-            "--help",
+            "topics", "report", "--org", "test-org", "--id", "fn_123", "--help",
         ])
         .assert()
         .success()
@@ -137,12 +139,12 @@ fn status_quiet_and_verbose_conflict() {
 }
 
 #[test]
-fn status_json_keeps_local_org_when_global_profile_has_different_org() {
+fn status_json_prefers_local_org_over_global_org() {
     let repo = make_git_repo();
     fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
     fs::write(
         repo.path().join(".bt/config.json"),
-        r#"{"profile":null,"org":"local-org","project":"local-project","project_id":null}"#,
+        r#"{"org":"local-org","project":"local-project","project_id":null}"#,
     )
     .expect("write local config");
 
@@ -152,11 +154,9 @@ fn status_json_keeps_local_org_when_global_profile_has_different_org() {
     fs::create_dir_all(&global_bt_dir).expect("create global bt dir");
     fs::write(
         global_bt_dir.join("config.json"),
-        r#"{"profile":"default-profile","org":"profile-org"}"#,
+        r#"{"org":"profile-org"}"#,
     )
     .expect("write global config");
-    write_auth_store(config_home.path(), &[("default-profile", "profile-org")]);
-
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
     cmd.current_dir(repo.path())
@@ -167,7 +167,6 @@ fn status_json_keeps_local_org_when_global_profile_has_different_org() {
         .success()
         .stdout(predicate::str::contains(r#""org":"local-org""#))
         .stdout(predicate::str::contains(r#""project":"local-project""#))
-        .stdout(predicate::str::contains(r#""profile":"default-profile""#))
         .stdout(predicate::str::contains(r#""org":"profile-org""#).not());
 }
 
@@ -459,12 +458,12 @@ fn setup_mcp_only_requires_auth_in_non_interactive_mode() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "profile selection required in non-interactive mode",
+            "auth org selection required in non-interactive mode",
         ));
 }
 
 #[test]
-fn datasets_requires_profile_selection_when_multiple_profiles_exist() {
+fn datasets_requires_org_selection_when_multiple_api_key_logins_exist() {
     let repo = make_git_repo();
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
@@ -481,8 +480,10 @@ fn datasets_requires_profile_selection_when_multiple_profiles_exist() {
         .args(["datasets", "--no-input"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("multiple auth profiles available"))
-        .stderr(predicate::str::contains("--profile <NAME>"))
+        .stderr(predicate::str::contains(
+            "multiple API key logins available",
+        ))
+        .stderr(predicate::str::contains("--org <ORG>"))
         .stderr(predicate::str::contains("alpha"))
         .stderr(predicate::str::contains("beta"));
 }

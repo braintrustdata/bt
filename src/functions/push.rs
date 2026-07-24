@@ -13,8 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::args::BaseArgs;
-use crate::args::DEFAULT_API_URL;
+use crate::args::{custom_api_without_app_url, BaseArgs};
 
 use crate::auth::{list_available_orgs, resolve_auth};
 use crate::config;
@@ -270,21 +269,10 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             );
         }
     };
-    let has_app_url = resolved_auth
-        .app_url
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    let custom_api_without_app_url = resolved_auth
-        .api_url
-        .as_deref()
-        .map(str::trim)
-        .map(|value| value.trim_end_matches('/'))
-        .is_some_and(|api_url| {
-            !api_url.eq_ignore_ascii_case(DEFAULT_API_URL.trim_end_matches('/'))
-        })
-        && !has_app_url;
-    if custom_api_without_app_url {
+    if custom_api_without_app_url(
+        resolved_auth.api_url.as_deref(),
+        resolved_auth.app_url.as_deref(),
+    ) {
         return fail_push(
             &base,
             0,
@@ -4055,25 +4043,6 @@ mod tests {
     }
 
     fn test_base_args() -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: None,
-            profile_explicit: false,
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
+        BaseArgs::default()
     }
 }
