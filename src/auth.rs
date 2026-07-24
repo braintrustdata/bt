@@ -4011,9 +4011,15 @@ fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
         .with_context(|| format!("failed to parse auth config {}", path.display()))?;
     let migrated = migrate_auth_store(store.clone());
     if migrated != store {
-        save_auth_store_to_path(path, &migrated).with_context(|| {
-            format!("failed to persist auth config migration {}", path.display())
-        })?;
+        // The migrated store is already usable in memory, so a failed write-back
+        // must not break read-only commands (`bt status`, `bt auth logins`). Warn
+        // and proceed; the next writable run retries the migration.
+        if let Err(err) = save_auth_store_to_path(path, &migrated) {
+            eprintln!(
+                "warning: Migrating {} to use the new format failed. Please delete this file and login again. ({err})",
+                path.display()
+            );
+        }
     }
     Ok(migrated)
 }
