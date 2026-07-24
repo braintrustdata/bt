@@ -35,7 +35,7 @@ mod ui;
 mod util_cmd;
 mod utils;
 
-use crate::args::{has_explicit_profile_arg, ArgValueSource, BaseArgs, CLIArgs};
+use crate::args::{ArgValueSource, BaseArgs, CLIArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 pub(crate) const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -84,9 +84,9 @@ Additional
   update       Update bt in-place
 
 Flags
-      --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
   -o, --org <ORG>            Override active org [env: BRAINTRUST_ORG_NAME]
-      -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
+  -p, --project <PROJECT>    Override active project [env: BRAINTRUST_DEFAULT_PROJECT]
+      --prefer-api-key       Prefer API key credentials for the selected org [env: BRAINTRUST_PREFER_API_KEY=]
       --json                 Output as JSON
   -v, --verbose              Increase output verbosity [env: BRAINTRUST_VERBOSE=]
   -q, --quiet                Reduce interactive UI output [env: BRAINTRUST_QUIET=]
@@ -296,7 +296,6 @@ fn try_main() -> Result<()> {
     let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
     apply_base_arg_sources(&matches, cli.command.base_mut());
-    cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     apply_base_output_defaults(&mut cli.command);
     configure_output(cli.command.base());
     apply_runtime_env_overrides(cli.command.base());
@@ -347,6 +346,8 @@ fn try_main() -> Result<()> {
 fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
     base.verbose_source = find_value_source(matches, "verbose").and_then(map_value_source);
     base.quiet_source = find_value_source(matches, "quiet").and_then(map_value_source);
+    base.org_name_source = find_value_source(matches, "org_name").and_then(map_value_source);
+    base.project_source = find_value_source(matches, "project").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
 }
 
@@ -490,17 +491,22 @@ fn has_io_error(err: &anyhow::Error) -> bool {
 }
 
 fn looks_like_user_error(err: &anyhow::Error) -> bool {
-    let message = err.to_string().to_lowercase();
-    message.contains("required")
-        || message.contains("use:")
-        || message.contains("not found")
-        || message.contains("invalid")
+    err.chain().any(|source| {
+        let message = source.to_string().to_lowercase();
+        message.contains("required")
+            || message.contains("use:")
+            || message.contains("not found")
+            || message.contains("invalid")
+            || message.contains("already exists")
+            || message.contains("without finding")
+            || message.contains("without config.json")
+    })
 }
 
 fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
     eprintln!("error: {err}");
     if code == ExitCode::Auth && !missing_credential {
-        eprintln!("Your credentials may be expired or invalid. For OAuth profiles, try `bt auth refresh --profile <NAME>`; if refresh fails, re-run `bt auth login --oauth --profile <NAME>`. Run `bt auth profiles` and `bt status` to inspect profile status.");
+        eprintln!("Your credentials may be expired or invalid. For OAuth login, try `bt auth refresh --org <ORG>`; if refresh fails, re-run `bt auth login --oauth --org <ORG>`. Run `bt auth logins` and `bt status` to inspect auth status.");
     }
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
@@ -543,6 +549,32 @@ mod tests {
 
         assert_eq!(
             cli.command.base().api_key_source,
+            Some(ArgValueSource::CommandLine)
+        );
+    }
+
+    #[test]
+    fn apply_base_arg_sources_tracks_cli_org_and_project() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "bt",
+                "status",
+                "--org",
+                "test-org",
+                "--project",
+                "test-project",
+            ])
+            .expect("matches");
+        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
+
+        apply_base_arg_sources(&matches, cli.command.base_mut());
+
+        assert_eq!(
+            cli.command.base().org_name_source,
+            Some(ArgValueSource::CommandLine)
+        );
+        assert_eq!(
+            cli.command.base().project_source,
             Some(ArgValueSource::CommandLine)
         );
     }

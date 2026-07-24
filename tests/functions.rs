@@ -190,8 +190,8 @@ fn sanitized_env_keys() -> &'static [&'static str] {
     ]
 }
 
-fn auth_profiles_command(cwd: &Path, config_dir: &Path) -> Command {
-    auth_sub_command(cwd, config_dir, &["profiles"])
+fn auth_logins_command(cwd: &Path, config_dir: &Path) -> Command {
+    auth_sub_command(cwd, config_dir, &["logins"])
 }
 
 #[derive(Debug, Clone)]
@@ -669,15 +669,17 @@ fn functions_push_rejects_invalid_language() {
 
 #[test]
 fn functions_push_requires_app_url_with_custom_api_url() {
+    let config_dir = tempdir().expect("config tempdir");
     let output = Command::new(bt_binary_path())
         .arg("functions")
         .arg("--json")
         .arg("push")
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
         .env("BRAINTRUST_API_KEY", "test-key")
         .env("BRAINTRUST_API_URL", "http://127.0.0.1:1")
         .env_remove("BRAINTRUST_APP_URL")
         .env_remove("BRAINTRUST_ORG_NAME")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run push with custom API URL and no app URL");
 
@@ -702,79 +704,55 @@ fn functions_help_lists_push_and_pull() {
 }
 
 #[test]
-fn auth_profiles_ignores_api_key_env_override() {
+fn auth_logins_ignores_api_key_env_override() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
 
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
+    let output = auth_logins_command(cwd.path(), config_dir.path())
         .env("BRAINTRUST_API_KEY", "test-key")
         .output()
-        .expect("run bt auth profiles with api key env");
+        .expect("run bt auth logins with api key env");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
+    assert!(stdout.contains("No saved auth logins. Run `bt auth login` to create one."));
     assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
-    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
 }
 
 #[test]
-fn auth_profiles_ignores_api_key_from_dotenv() {
+fn auth_logins_ignores_api_key_from_dotenv() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
     fs::write(cwd.path().join(".env"), "BRAINTRUST_API_KEY=test-key\n").expect("write .env");
 
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
+    let output = auth_logins_command(cwd.path(), config_dir.path())
         .env_remove("BRAINTRUST_API_KEY")
         .output()
-        .expect("run bt auth profiles with dotenv api key");
+        .expect("run bt auth logins with dotenv api key");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
+    assert!(stdout.contains("No saved auth logins. Run `bt auth login` to create one."));
     assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
-    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
 }
 
 #[test]
-fn auth_profiles_json_with_no_profiles_emits_empty_array() {
+fn auth_logins_json_with_no_profiles_emits_empty_array() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
 
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
+    let output = auth_logins_command(cwd.path(), config_dir.path())
         .arg("--json")
         .output()
-        .expect("run bt auth profiles --json");
+        .expect("run bt auth logins --json");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert_eq!(stdout, "[]");
 }
 
-#[test]
-fn auth_profiles_profile_not_found_is_actionable() {
-    let cwd = tempdir().expect("create temp cwd");
-    let config_dir = tempdir().expect("create temp config dir");
-
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
-        .arg("--profile")
-        .arg("test-profile")
-        .output()
-        .expect("run bt auth profiles --profile test-profile");
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("profile 'test-profile' not found"));
-    assert!(
-        stderr.contains("run `bt auth profiles` to see available profiles"),
-        "expected actionable hint, got: {stderr}"
-    );
-}
-
-/// Seed a synthetic api_key `test-profile` so verification reports "missing"
-/// without touching the network or keychain.
+/// Seed a synthetic API-key auth login so refresh can fail before touching the
+/// network or keychain.
 fn seed_api_key_profile(config_dir: &Path) {
     fs::create_dir_all(config_dir.join("bt")).expect("create bt config dir");
     fs::write(
@@ -786,7 +764,7 @@ fn seed_api_key_profile(config_dir: &Path) {
 
 fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
     // Shared builder for `bt auth <sub>` so each auth subcommand inherits the
-    // same isolated config dir / env scrubbing as `auth profiles`.
+    // same isolated config dir / env scrubbing as `auth logins`.
     let mut cmd = Command::new(bt_binary_path());
     cmd.arg("auth")
         .args(sub)
@@ -794,7 +772,6 @@ fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", config_dir)
         .env("APPDATA", config_dir)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .env_remove("BRAINTRUST_ORG_NAME")
         .env_remove("BRAINTRUST_API_URL")
         .env_remove("BRAINTRUST_APP_URL")
@@ -817,9 +794,58 @@ fn auth_logout_json_with_no_profiles_emits_empty_status() {
 }
 
 #[test]
-fn auth_refresh_errors_for_api_key_profile_even_with_json() {
-    // --json must not swallow a real error: an api_key profile cannot be
-    // refreshed, and the command should fail with an actionable message.
+fn auth_logout_requires_force_without_an_interactive_terminal() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+    seed_api_key_profile(config_dir.path());
+
+    let output = auth_sub_command(
+        cwd.path(),
+        config_dir.path(),
+        &["logout", "--org", "test-org", "--no-input"],
+    )
+    .output()
+    .expect("run non-interactive auth logout");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rerun with --force"));
+    assert!(config_dir.path().join("bt").join("auth.json").exists());
+}
+
+#[test]
+fn auth_logout_bare_does_not_default_to_current_login() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+    let bt_config_dir = config_dir.path().join("bt");
+    fs::create_dir_all(&bt_config_dir).expect("create bt config dir");
+    fs::write(bt_config_dir.join("config.json"), r#"{"org":"test-org-a"}"#)
+        .expect("write active config");
+    fs::write(
+        bt_config_dir.join("auth.json"),
+        r#"{"profiles":{"test-profile-a":{"auth_kind":"api_key","org_id":"org_test_a","org_name":"test-org-a","api_key_hint":"sk-****aaaaa"},"test-profile-b":{"auth_kind":"api_key","org_id":"org_test_b","org_name":"test-org-b","api_key_hint":"sk-****bbbbb"}}}"#,
+    )
+    .expect("write auth logins");
+
+    let output = auth_sub_command(
+        cwd.path(),
+        config_dir.path(),
+        &["logout", "--no-input", "--force"],
+    )
+    .output()
+    .expect("run bare non-interactive auth logout");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("multiple auth logins match"));
+    let remaining =
+        fs::read_to_string(bt_config_dir.join("auth.json")).expect("read remaining auth logins");
+    assert!(remaining.contains("test-org-a"));
+    assert!(remaining.contains("test-org-b"));
+}
+
+#[test]
+fn auth_refresh_errors_when_no_oauth_login_exists_even_with_json() {
+    // --json must not swallow a real error: refresh only applies to OAuth
+    // logins, and an org with only API-key auth should fail actionably.
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
 
@@ -828,15 +854,15 @@ fn auth_refresh_errors_for_api_key_profile_even_with_json() {
     let output = auth_sub_command(
         cwd.path(),
         config_dir.path(),
-        &["refresh", "--profile", "test-profile", "--json"],
+        &["refresh", "--org", "test-org", "--json"],
     )
     .output()
-    .expect("run bt auth refresh --profile test-profile --json");
+    .expect("run bt auth refresh --org test-org --json");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("only applies to oauth profiles"),
+        stderr.contains("no OAuth login selected"),
         "expected oauth-only refresh hint, got: {stderr}"
     );
     assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
@@ -1877,7 +1903,6 @@ exit 24
         .env("BRAINTRUST_API_URL", &server.base_url)
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run bt functions push");
 
@@ -2066,7 +2091,6 @@ exit 24
         .env("BRAINTRUST_API_URL", &server.base_url)
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run bt functions push");
 
@@ -2200,7 +2224,6 @@ exit 24
         .env("BRAINTRUST_API_URL", &server.base_url)
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run bt functions push");
 
@@ -2347,7 +2370,6 @@ exit 24
         .env("BRAINTRUST_API_URL", &server.base_url)
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run bt functions push");
 
@@ -2410,7 +2432,6 @@ async fn functions_view_by_positional_id_does_not_require_project_context() {
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
         .env("BRAINTRUST_NO_INPUT", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .env_remove("BRAINTRUST_DEFAULT_PROJECT")
         .env_remove("BT_FUNCTIONS_VIEW_ID")
         .env_remove("BT_FUNCTIONS_VIEW_VERSION")
@@ -2485,7 +2506,6 @@ async fn functions_view_by_id_passes_version() {
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
         .env("BRAINTRUST_NO_INPUT", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .env_remove("BRAINTRUST_DEFAULT_PROJECT")
         .env_remove("BT_FUNCTIONS_VIEW_ID")
         .env_remove("BT_FUNCTIONS_VIEW_VERSION")
@@ -2569,7 +2589,6 @@ async fn functions_view_by_slug_passes_version() {
         .env("BRAINTRUST_DEFAULT_PROJECT", "mock-project")
         .env("BRAINTRUST_NO_COLOR", "1")
         .env("BRAINTRUST_NO_INPUT", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .env_remove("BT_FUNCTIONS_VIEW_ID")
         .env_remove("BT_FUNCTIONS_VIEW_VERSION")
         .output()
@@ -2660,7 +2679,6 @@ async fn functions_pull_works_against_mock_api() {
         .env("BRAINTRUST_API_URL", &server.base_url)
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run bt functions pull");
 
@@ -2779,7 +2797,6 @@ async fn functions_pull_skips_untracked_existing_file_without_force() {
         .env("BRAINTRUST_API_URL", &server.base_url)
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run bt functions pull");
 
@@ -2859,7 +2876,6 @@ async fn functions_pull_selector_with_unsupported_only_rows_still_succeeds() {
         .env("BRAINTRUST_API_URL", &server.base_url)
         .env("BRAINTRUST_APP_URL", &server.base_url)
         .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
         .output()
         .expect("run bt functions pull");
 

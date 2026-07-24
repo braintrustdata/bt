@@ -312,53 +312,77 @@ Local version and pagination-key conversion helpers:
 
 ## `bt auth`
 
-- Authenticate interactively (prompts for auth method, profile name defaults to org name):
+- Authenticate interactively (prompts for auth method and organization):
   - `bt auth login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
-  - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
-  - After login, `bt` updates the active profile/org context immediately. If `--project` is set, it also switches that project; otherwise it clears any stale default project for the new login.
+  - OAuth can be saved for an org or in cross-org mode. API-key logins are saved per org; if a key can access multiple orgs, `bt` uses a searchable org picker.
+  - After login, `bt` updates the active org context immediately. If `--project` is set, it validates and saves that project's name and ID. Without `--project`, a same-org login preserves the existing project; changing orgs clears stale project context.
+  - Use `--global` or `--local` to choose the config scope. Without either flag, an existing local config causes an interactive scope picker (default: local); non-interactive runs must pass a scope. `--local` never creates `.bt`.
   - `bt` confirms the resolved API URL before saving.
 - Login with OAuth (browser-based, stores refresh token in secure credential store):
-  - `bt auth login --oauth --profile work`
+  - `bt auth login --oauth --org myorg`
   - You can pass `--no-browser` to print the URL without auto-opening.
   - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
-- List profiles:
-  - `bt auth profiles`
-- Log out (remove a saved profile):
-  - `bt auth logout`
-  - `bt auth logout --force` (skip confirmation)
-- Show current auth source/profile:
-  - `bt auth status`
+- List saved auth logins:
+  - `bt auth logins`
+  - `bt auth logins --org test-org` (matches stored org name or ID)
+  - `bt auth logins --prefer-api-key` (API-key logins only)
+  - Both filters can be combined.
+- Log out:
+  - `bt auth logout` — choose from all saved logins interactively
+  - `bt auth logout --org test-org --oauth` — filter to the org's OAuth login
+  - `bt auth logout --org test-org --api-key-hint sk-****abcde` — select an API-key login
+  - `bt auth logout --force` (skip confirmation after selecting a login)
+- Show current auth context:
+  - `bt status`
 - Force-refresh OAuth access token for debugging:
-  - `bt auth refresh --profile work`
+  - `bt auth refresh --org myorg`
 
 Auth resolution order for commands is:
 
-1. Explicit `--profile`
-2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
-3. `BRAINTRUST_PROFILE`
-4. Org-based profile match (profile whose org matches `--org`/config org)
-5. Single-profile auto-select (if only one profile exists)
-6. Interactive profile picker (if multiple profiles exist and a TTY is available)
+1. Explicit `--api-key sk-...`
+2. `--prefer-api-key` / `BRAINTRUST_PREFER_API_KEY` (uses `BRAINTRUST_API_KEY` first, then a stored API key for the selected org, then falls back to OAuth)
+3. Stored OAuth login for the selected org (or cross-org OAuth when selected)
+4. `BRAINTRUST_API_KEY`
+5. Stored API key login for the selected org
+
+`--prefer-api-key` without `--org` targets the org shown by `bt status`. It cannot be used from cross-org context; pass a concrete `--org`. Once a key is selected, an invalid key or a key belonging to another requested org is an error and does not fall back to OAuth. Multiple keys in one org remain separate and are shown with key hints.
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
+
+## `bt init`
+
+`bt init` creates a project-local `.bt/config.json`. It walks upward to the first `.bt`, `.git`, home, or filesystem-root boundary. A git marker (directory or file) selects that repository root; reaching home/root or an existing `.bt` is an error.
+
+- `bt init --org test-org --project test-project` — initialize the containing repository
+- `bt init --here` — create in the current directory without walking (including at home or `/`)
+- `bt init --force` — overwrite an existing discovered `.bt/config.json`; it does not change discovery
+
+The saved context includes `org`, `project`, and `project_id`. Cross-org is excluded from the init picker because init always requires a project.
 
 ## `bt switch`
 
 Interactively switch org and project context:
 
-- `bt switch` — interactive picker for org and project
-- `bt switch myproject` — switch to a project by name
-- `bt switch myorg/myproject` — switch to a specific org and project
+- `bt switch` — first choose a saved OAuth-backed org or a specific API-key login, then choose a project
+- `bt switch myproject` — switch the current org to a project by name
+- `bt switch test-org/test-project` — switch to a specific org and project
+- `bt switch --org cross-org` — select cross-org OAuth and clear project context
 - `bt switch --global` — persist to global config (`~/.config/bt/config.json`)
-- `bt switch --local` — persist to local config (`.bt/config.json`)
+- `bt switch --local` — update an existing local config (`.bt/config.json`); it never creates one
+
+A sole login/project is selected automatically. Multiple API keys in one org remain separate picker entries with hints; OAuth accounts collapse to an org choice, so run `bt auth login` again to change OAuth accounts within that org. With an existing local config and no scope flag, interactive mode asks for global/local (default: local); non-interactive mode requires `--global` or `--local`.
+
+## Config context merging
+
+Global config is `~/.config/bt/config.json`; local config is the first discovered `.bt/config.json`. Local context wins, but a local org inherits the global project only when both configs select the same org. A local project with no org never inherits a global org. Cross-org is stored as `"org": ""`, treated as a distinct org, and rendered as `cross-org` by `bt status`. Legacy `profile` fields are ignored; unknown extra keys are preserved when context is updated.
 
 ## `bt status`
 
 Show current org and project context:
 
-- `bt status` — display current org, project, and config source
-- `bt status --verbose` — show detailed config resolution
+- `bt status` — display current org, project, selected auth method, and config source
+- `bt status --verbose` — show detailed config and auth resolution
 - `bt status -j` — JSON output
 
 ## `bt setup` and `bt docs`
