@@ -238,7 +238,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             materializable.push(row);
         } else {
             summary.unsupported_records_skipped += 1;
-            if args.verbose {
+            if base.verbose {
                 eprintln!(
                     "{} skipping '{}' because it is not a prompt",
                     style("warning:").yellow(),
@@ -415,7 +415,7 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             }
         }
     }
-    emit_summary(&base, &summary, args.verbose)?;
+    emit_summary(&base, &summary, base.verbose)?;
     if failure {
         bail!("functions pull failed; see summary for details");
     }
@@ -1410,7 +1410,7 @@ fn format_py_value_inner(value: &Value, depth: usize) -> String {
             let closing_indent = "    ".repeat(depth);
             let mut out = String::from("{\n");
             let mut entries = object.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             for (index, (key, val)) in entries.into_iter().enumerate() {
                 out.push_str(&indent);
                 out.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
@@ -1612,7 +1612,6 @@ mod tests {
             id: Some("missing".to_string()),
             version: None,
             force: false,
-            verbose: false,
         };
 
         let err = apply_selector_narrowing(vec![row], &args).expect_err("should fail");
@@ -1668,7 +1667,6 @@ mod tests {
             id: None,
             version: None,
             force: false,
-            verbose: false,
         };
 
         let narrowed = apply_selector_narrowing(rows, &args).expect("should narrow");

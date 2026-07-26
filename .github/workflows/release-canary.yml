@@ -13,8 +13,10 @@ concurrency:
 permissions:
   actions: read
   contents: write
+  id-token: write
   issues: write
   pull-requests: write
+  checks: write
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -32,7 +34,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -48,10 +50,10 @@ jobs:
 
       - name: Install dist
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
 
       - name: Cache dist
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
@@ -95,7 +97,7 @@ jobs:
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dist plan manifest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
@@ -117,7 +119,7 @@ jobs:
       - name: Enable windows longpaths
         run: git config --global core.longpaths true
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -139,11 +141,19 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
 
+      - name: Install sha256sum (macOS ARM64)
+        if: ${{ runner.os == 'macOS' && runner.arch == 'ARM64' }}
+        shell: bash
+        run: |
+          printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > /tmp/sha256sum
+          chmod +x /tmp/sha256sum
+          echo /tmp >> "$GITHUB_PATH"
+
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
 
       - name: Fetch local artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -151,6 +161,19 @@ jobs:
 
       - name: Install dependencies
         run: ${{ matrix.packages_install }}
+
+      - name: Set up MSVC cross-compilation for Windows ARM64
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: amd64_arm64
+
+      - name: Set MSVC ARM64 linker for cargo cross-compilation
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        shell: pwsh
+        run: |
+          $link = (Get-Command link.exe -ErrorAction Stop).Source
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$link" >> $env:GITHUB_ENV
 
       - name: Build artifacts
         shell: bash
@@ -168,7 +191,7 @@ jobs:
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
@@ -184,7 +207,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -199,7 +222,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cached dist
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
@@ -207,7 +230,7 @@ jobs:
       - run: chmod +x ~/.cargo/bin/dist
 
       - name: Fetch local artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -224,7 +247,7 @@ jobs:
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-global
           path: |
@@ -248,7 +271,7 @@ jobs:
       REPO: ${{ github.repository }}
     steps:
       - name: Download GitHub artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: artifacts
@@ -392,7 +415,7 @@ jobs:
 
           marker="<!-- bt-pr-canary-install-comment -->"
           run_url="https://github.com/${REPO}/actions/runs/${RUN_ID}"
-          artifacts="$(gh api --method GET "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" | jq -r '.artifacts[] | select(.expired == false) | .name' | sed 's/^/- `&`/' || true)"
+          artifacts="$(gh api --method GET "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" | jq -r '.artifacts[] | select(.expired == false) | .name' | sed 's/.*/- `&`/' || true)"
           if [ -z "$artifacts" ]; then
             artifacts="- (no artifacts found)"
           fi
@@ -450,7 +473,7 @@ jobs:
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version | grep -i canary
-          bt self update --check
+          bt update --check
 
   smoke-install-macos:
     needs:
@@ -473,7 +496,7 @@ jobs:
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version | grep -i canary
-          bt self update --check
+          bt update --check
 
   smoke-install-windows:
     needs:
@@ -504,4 +527,4 @@ jobs:
             throw "expected canary version string, got: $version"
           }
           $env:PATH = "$binDir;$env:PATH"
-          & $btExe self update --check
+          & $btExe update --check

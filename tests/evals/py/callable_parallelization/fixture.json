@@ -1,0 +1,5 @@
+{
+  "runtime": "python",
+  "files": ["eval_callable_parallelization.py"],
+  "args": ["--num-workers", "8"]
+}

@@ -30,6 +30,37 @@ enum StreamLine {
         #[serde(flatten)]
         _extra: Value,
     },
+    // cursor-agent emits tool_call events instead of stream_event
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        subtype: String,
+        tool_call: Value,
+        #[serde(flatten)]
+        _extra: Value,
+    },
+    // gemini emits tool_use / tool_result pairs
+    #[serde(rename = "tool_use")]
+    GeminiToolUse {
+        tool_name: String,
+        parameters: Value,
+        #[serde(flatten)]
+        _extra: Value,
+    },
+    #[serde(rename = "tool_result")]
+    GeminiToolResult {
+        #[serde(flatten)]
+        _extra: Value,
+    },
+    // gemini streams assistant text as message events
+    #[serde(rename = "message")]
+    GeminiMessage {
+        role: String,
+        content: String,
+        #[serde(default)]
+        delta: bool,
+        #[serde(flatten)]
+        _extra: Value,
+    },
     #[serde(rename = "user")]
     User {
         #[serde(flatten)]
@@ -111,6 +142,7 @@ struct AgentStreamDisplay {
     spinner: Option<ProgressBar>,
     has_text_output: bool,
     is_tty: bool,
+    current_tool_desc: Option<String>,
 }
 
 impl AgentStreamDisplay {
@@ -120,12 +152,71 @@ impl AgentStreamDisplay {
             spinner: None,
             has_text_output: false,
             is_tty: std::io::stderr().is_terminal(),
+            current_tool_desc: None,
         }
     }
 
     fn handle(&mut self, line: StreamLine) {
         match line {
             StreamLine::StreamEvent { event, .. } => self.handle_event(event),
+            StreamLine::ToolCall {
+                subtype, tool_call, ..
+            } => {
+                if subtype == "started" {
+                    let desc = cursor_tool_display(&tool_call);
+                    self.current_tool_desc = Some(desc.clone());
+                    self.clear_spinner();
+                    if self.has_text_output {
+                        eprintln!();
+                        self.has_text_output = false;
+                    }
+                    self.start_spinner(&desc);
+                } else if subtype == "completed" {
+                    let done = self
+                        .current_tool_desc
+                        .take()
+                        .as_deref()
+                        .map(tool_done_from_in_progress)
+                        .unwrap_or_else(|| cursor_tool_done_display(&tool_call));
+                    self.finish_spinner_with(&done);
+                }
+            }
+            StreamLine::GeminiToolUse {
+                tool_name,
+                parameters,
+                ..
+            } => {
+                let desc = gemini_tool_display(&tool_name, &parameters);
+                self.current_tool_desc = Some(desc.clone());
+                self.clear_spinner();
+                if self.has_text_output {
+                    eprintln!();
+                    self.has_text_output = false;
+                }
+                self.start_spinner(&desc);
+            }
+            StreamLine::GeminiToolResult { .. } => {
+                let done = self
+                    .current_tool_desc
+                    .take()
+                    .as_deref()
+                    .map(tool_done_from_in_progress)
+                    .unwrap_or_else(|| "Done".to_string());
+                self.finish_spinner_with(&done);
+            }
+            StreamLine::GeminiMessage {
+                role,
+                content,
+                delta,
+                ..
+            } => {
+                if role == "assistant" && delta && !content.is_empty() {
+                    self.clear_spinner();
+                    eprint!("{}", style(&content).dim());
+                    let _ = std::io::stderr().flush();
+                    self.has_text_output = true;
+                }
+            }
             StreamLine::Assistant { .. } | StreamLine::User { .. } | StreamLine::Unknown => {}
             StreamLine::Result { .. } => {}
         }
@@ -340,6 +431,123 @@ fn short_path(path: &str) -> String {
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn gemini_tool_display(tool_name: &str, parameters: &Value) -> String {
+    match tool_name {
+        "read_file" | "view_file" => {
+            if let Some(p) = parameters.get("file_path").and_then(|v| v.as_str()) {
+                return format!("Reading {}", short_path(p));
+            }
+            "Reading".to_string()
+        }
+        "write_file" | "create_file" => {
+            if let Some(p) = parameters.get("file_path").and_then(|v| v.as_str()) {
+                return format!("Writing {}", short_path(p));
+            }
+            "Writing".to_string()
+        }
+        "edit_file" | "replace_in_file" => {
+            if let Some(p) = parameters.get("file_path").and_then(|v| v.as_str()) {
+                return format!("Editing {}", short_path(p));
+            }
+            "Editing".to_string()
+        }
+        "run_shell_command" | "bash" | "shell" | "run_command" => {
+            if let Some(cmd) = parameters.get("command").and_then(|v| v.as_str()) {
+                return format!("Running: {}", truncate(cmd, 50));
+            }
+            "Running command".to_string()
+        }
+        "search_files" | "grep" | "search" => {
+            if let Some(q) = parameters
+                .get("pattern")
+                .or_else(|| parameters.get("query"))
+                .and_then(|v| v.as_str())
+            {
+                return format!("Searching {}", truncate(q, 30));
+            }
+            "Searching".to_string()
+        }
+        "list_directory" | "ls" => {
+            if let Some(p) = parameters
+                .get("directory_path")
+                .or_else(|| parameters.get("path"))
+                .and_then(|v| v.as_str())
+            {
+                return format!("Listing {}", short_path(p));
+            }
+            "Listing directory".to_string()
+        }
+        "glob" | "find_files" => "Finding files".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn tool_done_from_in_progress(desc: &str) -> String {
+    for (prefix, done) in [
+        ("Running: ", "Ran: "),
+        ("Reading ", "Read "),
+        ("Writing ", "Wrote "),
+        ("Editing ", "Edited "),
+        ("Searching ", "Searched "),
+        ("Listing ", "Listed "),
+        ("Finding ", "Found "),
+    ] {
+        if let Some(rest) = desc.strip_prefix(prefix) {
+            return format!("{done}{rest}");
+        }
+    }
+    desc.to_string()
+}
+
+fn cursor_tool_display(tool_call: &Value) -> String {
+    if let Some(cmd) = tool_call
+        .pointer("/shellToolCall/args/command")
+        .and_then(|v| v.as_str())
+    {
+        return format!("Running: {}", truncate(cmd, 50));
+    }
+    cursor_tool_label(tool_call, false)
+}
+
+fn cursor_tool_done_display(tool_call: &Value) -> String {
+    if let Some(cmd) = tool_call
+        .pointer("/shellToolCall/args/command")
+        .and_then(|v| v.as_str())
+    {
+        return format!("Ran: {}", truncate(cmd, 50));
+    }
+    if let Some(cmd) = tool_call
+        .pointer("/shellToolCall/result/success/command")
+        .and_then(|v| v.as_str())
+    {
+        return format!("Ran: {}", truncate(cmd, 50));
+    }
+    cursor_tool_label(tool_call, true)
+}
+
+fn cursor_tool_label(tool_call: &Value, done: bool) -> String {
+    let key = tool_call
+        .as_object()
+        .and_then(|o| o.keys().next())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let k = key.as_str();
+    match done {
+        false if k.contains("read") || k.contains("view") => "Reading".to_string(),
+        true if k.contains("read") || k.contains("view") => "Read".to_string(),
+        false if k.contains("edit") || k.contains("write") => "Editing".to_string(),
+        true if k.contains("edit") || k.contains("write") => "Edited".to_string(),
+        false if k.contains("create") => "Creating".to_string(),
+        true if k.contains("create") => "Created".to_string(),
+        false if k.contains("glob") => "Finding files".to_string(),
+        true if k.contains("glob") => "Found files".to_string(),
+        false if k.contains("search") || k.contains("grep") => "Searching".to_string(),
+        true if k.contains("search") || k.contains("grep") => "Searched".to_string(),
+        true => "Done".to_string(),
+        false => "Working".to_string(),
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

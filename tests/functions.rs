@@ -177,6 +177,8 @@ fn sanitized_env_keys() -> &'static [&'static str] {
         "BT_FUNCTIONS_PUSH_REQUIREMENTS",
         "BT_FUNCTIONS_PUSH_TSCONFIG",
         "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+        "BT_FUNCTIONS_VIEW_ID",
+        "BT_FUNCTIONS_VIEW_VERSION",
         "BT_FUNCTIONS_PULL_OUTPUT_DIR",
         "BT_FUNCTIONS_PULL_PROJECT_ID",
         "BT_FUNCTIONS_PULL_PROJECT_NAME",
@@ -186,6 +188,10 @@ fn sanitized_env_keys() -> &'static [&'static str] {
         "BT_FUNCTIONS_PULL_FORCE",
         "BT_FUNCTIONS_PULL_LANGUAGE",
     ]
+}
+
+fn auth_profiles_command(cwd: &Path, config_dir: &Path) -> Command {
+    auth_sub_command(cwd, config_dir, &["profiles"])
 }
 
 #[derive(Debug, Clone)]
@@ -582,6 +588,22 @@ fn functions_pull_help_includes_expected_flags() {
 }
 
 #[test]
+fn functions_view_help_includes_expected_flags() {
+    let output = Command::new(bt_binary_path())
+        .arg("functions")
+        .arg("view")
+        .arg("--help")
+        .output()
+        .expect("run bt functions view --help");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--id"));
+    assert!(stdout.contains("--version"));
+    assert!(stdout.contains("BT_FUNCTIONS_VIEW_VERSION"));
+}
+
+#[test]
 fn functions_pull_accepts_id_and_slug_together() {
     let output = Command::new(bt_binary_path())
         .arg("functions")
@@ -677,6 +699,147 @@ fn functions_help_lists_push_and_pull() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("push"));
     assert!(stdout.contains("pull"));
+}
+
+#[test]
+fn auth_profiles_ignores_api_key_env_override() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .output()
+        .expect("run bt auth profiles with api key env");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
+    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
+    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
+}
+
+#[test]
+fn auth_profiles_ignores_api_key_from_dotenv() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+    fs::write(cwd.path().join(".env"), "BRAINTRUST_API_KEY=test-key\n").expect("write .env");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .env_remove("BRAINTRUST_API_KEY")
+        .output()
+        .expect("run bt auth profiles with dotenv api key");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
+    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
+    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
+}
+
+#[test]
+fn auth_profiles_json_with_no_profiles_emits_empty_array() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .arg("--json")
+        .output()
+        .expect("run bt auth profiles --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(stdout, "[]");
+}
+
+#[test]
+fn auth_profiles_profile_not_found_is_actionable() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_profiles_command(cwd.path(), config_dir.path())
+        .arg("--profile")
+        .arg("test-profile")
+        .output()
+        .expect("run bt auth profiles --profile test-profile");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("profile 'test-profile' not found"));
+    assert!(
+        stderr.contains("run `bt auth profiles` to see available profiles"),
+        "expected actionable hint, got: {stderr}"
+    );
+}
+
+/// Seed a synthetic api_key `test-profile` so verification reports "missing"
+/// without touching the network or keychain.
+fn seed_api_key_profile(config_dir: &Path) {
+    fs::create_dir_all(config_dir.join("bt")).expect("create bt config dir");
+    fs::write(
+        config_dir.join("bt").join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
+    )
+    .expect("write auth.json");
+}
+
+fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
+    // Shared builder for `bt auth <sub>` so each auth subcommand inherits the
+    // same isolated config dir / env scrubbing as `auth profiles`.
+    let mut cmd = Command::new(bt_binary_path());
+    cmd.arg("auth")
+        .args(sub)
+        .current_dir(cwd)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .env("APPDATA", config_dir)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_ORG_NAME")
+        .env_remove("BRAINTRUST_API_URL")
+        .env_remove("BRAINTRUST_APP_URL")
+        .env_remove("BRAINTRUST_ENV_FILE");
+    cmd
+}
+
+#[test]
+fn auth_logout_json_with_no_profiles_emits_empty_status() {
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    let output = auth_sub_command(cwd.path(), config_dir.path(), &["logout", "--json"])
+        .output()
+        .expect("run bt auth logout --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(stdout, r#"{"status":"empty"}"#);
+}
+
+#[test]
+fn auth_refresh_errors_for_api_key_profile_even_with_json() {
+    // --json must not swallow a real error: an api_key profile cannot be
+    // refreshed, and the command should fail with an actionable message.
+    let cwd = tempdir().expect("create temp cwd");
+    let config_dir = tempdir().expect("create temp config dir");
+
+    seed_api_key_profile(config_dir.path());
+
+    let output = auth_sub_command(
+        cwd.path(),
+        config_dir.path(),
+        &["refresh", "--profile", "test-profile", "--json"],
+    )
+    .output()
+    .expect("run bt auth refresh --profile test-profile --json");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("only applies to oauth profiles"),
+        "expected oauth-only refresh hint, got: {stderr}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
 }
 
 #[test]
@@ -1320,7 +1483,7 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
     std::fs::write(framework_dir.join("__init__.py"), "").expect("write framework __init__");
     std::fs::write(
         framework_dir.join("global_.py"),
-        "functions = []\nprompts = []\n",
+        "functions = []\nprompts = []\nparameters = []\n",
     )
     .expect("write global_.py");
     std::fs::write(
@@ -1332,7 +1495,9 @@ fn functions_python_runner_emits_valid_manifest_with_bundle() {
     let sample_path = tmp.path().join("sample_tool.py");
     std::fs::write(
         &sample_path,
-        r#"from braintrust.framework2.global_ import functions
+        r#"from braintrust.framework2.global_ import functions, parameters
+
+print("import noise")
 
 class TypeEnum:
     value = "tool"
@@ -1351,6 +1516,22 @@ class Item:
         self.preview = "def handler(x):\n    return x"
 
 functions.append(Item())
+
+class ParameterItem:
+    def __init__(self):
+        self.project = "My Project"
+
+    def to_function_definition(self, _if_exists, resolver):
+        return {
+            "project_id": resolver.get(self.project),
+            "name": "py-parameters",
+            "slug": "py-parameters",
+            "function_type": "parameters",
+            "function_data": {"type": "parameters", "data": {}, "__schema": {}},
+            "if_exists": _if_exists,
+        }
+
+parameters.append(ParameterItem())
 "#,
     )
     .expect("write sample_tool.py");
@@ -1375,6 +1556,11 @@ functions.append(Item())
         let stderr = String::from_utf8_lossy(&output.stderr);
         panic!("python functions runner failed:\n{stderr}");
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("import noise"),
+        "import-time stdout should be redirected to stderr"
+    );
 
     let manifest: Value = serde_json::from_slice(&output.stdout).expect("parse manifest JSON");
     assert_eq!(
@@ -1409,8 +1595,12 @@ functions.append(Item())
         .get("entries")
         .and_then(Value::as_array)
         .expect("entries array");
-    assert_eq!(entries.len(), 1, "expected one code entry");
-    let entry = entries[0].as_object().expect("entry object");
+    assert_eq!(entries.len(), 2, "expected code and parameter entries");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some("code"))
+        .and_then(Value::as_object)
+        .expect("code entry object");
     assert_eq!(entry.get("kind").and_then(Value::as_str), Some("code"));
     assert_eq!(entry.get("name").and_then(Value::as_str), Some("py-tool"));
     assert_eq!(entry.get("slug").and_then(Value::as_str), Some("py-tool"));
@@ -1421,6 +1611,35 @@ functions.append(Item())
     assert_eq!(
         entry.get("preview").and_then(Value::as_str),
         Some("def handler(x):\n    return x")
+    );
+    let parameter_entry = entries
+        .iter()
+        .find(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some("function_event")
+                && entry
+                    .get("event")
+                    .and_then(|event| event.get("slug"))
+                    .and_then(Value::as_str)
+                    == Some("py-parameters")
+        })
+        .expect("parameter function_event entry");
+    assert_eq!(
+        parameter_entry.get("project_name").and_then(Value::as_str),
+        Some("My Project")
+    );
+    assert_eq!(
+        parameter_entry
+            .get("event")
+            .and_then(|event| event.get("function_type"))
+            .and_then(Value::as_str),
+        Some("parameters")
+    );
+    assert!(
+        parameter_entry
+            .get("event")
+            .and_then(|event| event.get("if_exists"))
+            .is_none(),
+        "unset parameter if_exists should be omitted so CLI fallback applies"
     );
 
     let bundle = file
@@ -1638,6 +1857,7 @@ exit 24
         .args([
             "functions",
             "--json",
+            "--verbose",
             "push",
             "--file",
             source
@@ -1672,6 +1892,16 @@ exit 24
     assert_eq!(summary["status"].as_str(), Some("success"));
     assert_eq!(summary["uploaded_files"].as_u64(), Some(1));
     assert_eq!(summary["failed_files"].as_u64(), Some(0));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("building payload"),
+        "expected insert payload construction log, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("request body for POST /insert-functions"),
+        "expected final insert payload log, got:\n{stderr}"
+    );
 
     let inserted = state
         .inserted_functions
@@ -2143,6 +2373,224 @@ exit 24
                 .expect("tsconfig path should be valid UTF-8 for test")
         )),
         "uploaded bundle should include tsconfig marker emitted by bundler path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_view_by_positional_id_does_not_require_project_context() {
+    let state = Arc::new(MockServerState::default());
+    state
+        .pull_rows
+        .lock()
+        .expect("pull rows lock")
+        .push(serde_json::json!({
+            "id": "fn_123",
+            "name": "Doc Search",
+            "slug": "doc-search",
+            "project_id": "proj_mock",
+            "description": "Search docs",
+            "function_type": "tool",
+            "function_data": { "type": "code", "data": { "type": "inline", "code": "export default async function handler() {}" } },
+            "_xact_id": "0000000000000001"
+        }));
+
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tempdir().expect("config dir");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args(["functions", "--json", "view", "fn_123"])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env("BRAINTRUST_NO_INPUT", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_DEFAULT_PROJECT")
+        .env_remove("BT_FUNCTIONS_VIEW_ID")
+        .env_remove("BT_FUNCTIONS_VIEW_VERSION")
+        .output()
+        .expect("run bt functions view fn_123");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock view by id failed:\n{stderr}");
+    }
+
+    let function: Value = serde_json::from_slice(&output.stdout).expect("parse function JSON");
+    assert_eq!(function["id"].as_str(), Some("fn_123"));
+    assert_eq!(function["slug"].as_str(), Some("doc-search"));
+
+    let requests = state.requests.lock().expect("requests lock").clone();
+    assert!(
+        requests
+            .iter()
+            .any(|entry| entry == "/v1/function?ids=fn_123"),
+        "view request should fetch the function by id, got {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|entry| entry.starts_with("/v1/project")),
+        "view by id should not resolve project context, got {requests:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_view_by_id_passes_version() {
+    let state = Arc::new(MockServerState::default());
+    state
+        .pull_rows
+        .lock()
+        .expect("pull rows lock")
+        .push(serde_json::json!({
+            "id": "fn_123",
+            "name": "Doc Search",
+            "slug": "doc-search",
+            "project_id": "proj_mock",
+            "description": "Search docs",
+            "function_type": "tool",
+            "function_data": { "type": "code", "data": { "type": "inline", "code": "export default async function handler() {}" } },
+            "_xact_id": "0000000000000007"
+        }));
+
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tempdir().expect("config dir");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "view",
+            "--id",
+            "fn_123",
+            "--version",
+            "0000000000000007",
+        ])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env("BRAINTRUST_NO_INPUT", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BRAINTRUST_DEFAULT_PROJECT")
+        .env_remove("BT_FUNCTIONS_VIEW_ID")
+        .env_remove("BT_FUNCTIONS_VIEW_VERSION")
+        .output()
+        .expect("run bt functions view --id fn_123 --version");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock view by id at version failed:\n{stderr}");
+    }
+
+    let function: Value = serde_json::from_slice(&output.stdout).expect("parse function JSON");
+    assert_eq!(function["id"].as_str(), Some("fn_123"));
+    assert_eq!(function["_xact_id"].as_str(), Some("0000000000000007"));
+
+    let requests = state.requests.lock().expect("requests lock").clone();
+    assert!(
+        requests
+            .iter()
+            .any(|entry| entry == "/v1/function?ids=fn_123&version=0000000000000007"),
+        "view request should include the version selector, got {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|entry| entry.starts_with("/v1/project")),
+        "view by id should not resolve project context, got {requests:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn functions_view_by_slug_passes_version() {
+    let state = Arc::new(MockServerState::default());
+    state
+        .projects
+        .lock()
+        .expect("projects lock")
+        .push(MockProject {
+            id: "proj_mock".to_string(),
+            name: "mock-project".to_string(),
+            org_id: "org_mock".to_string(),
+        });
+    state
+        .pull_rows
+        .lock()
+        .expect("pull rows lock")
+        .push(serde_json::json!({
+            "id": "fn_123",
+            "name": "Doc Search",
+            "slug": "doc-search",
+            "project_id": "proj_mock",
+            "description": "Search docs",
+            "function_type": "tool",
+            "function_data": { "type": "code", "data": { "type": "inline", "code": "export default async function handler() {}" } },
+            "_xact_id": "0000000000000007"
+        }));
+
+    let server = MockServer::start(state.clone()).await;
+
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tempdir().expect("config dir");
+
+    let output = Command::new(bt_binary_path())
+        .current_dir(tmp.path())
+        .args([
+            "functions",
+            "--json",
+            "view",
+            "doc-search",
+            "--version",
+            "0000000000000007",
+        ])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_API_URL", &server.base_url)
+        .env("BRAINTRUST_APP_URL", &server.base_url)
+        .env("BRAINTRUST_DEFAULT_PROJECT", "mock-project")
+        .env("BRAINTRUST_NO_COLOR", "1")
+        .env("BRAINTRUST_NO_INPUT", "1")
+        .env_remove("BRAINTRUST_PROFILE")
+        .env_remove("BT_FUNCTIONS_VIEW_ID")
+        .env_remove("BT_FUNCTIONS_VIEW_VERSION")
+        .output()
+        .expect("run bt functions view doc-search --version");
+
+    server.stop().await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("mock view by slug at version failed:\n{stderr}");
+    }
+
+    let function: Value = serde_json::from_slice(&output.stdout).expect("parse function JSON");
+    assert_eq!(function["slug"].as_str(), Some("doc-search"));
+    assert_eq!(function["_xact_id"].as_str(), Some("0000000000000007"));
+
+    let requests = state.requests.lock().expect("requests lock").clone();
+    assert!(
+        requests.iter().any(|entry| entry
+            == "/v1/function?project_id=proj_mock&slug=doc-search&version=0000000000000007"),
+        "view request should include project, slug, and version selectors, got {requests:?}"
     );
 }
 

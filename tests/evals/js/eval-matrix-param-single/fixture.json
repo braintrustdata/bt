@@ -1,0 +1,9 @@
+{
+  "files": ["matrix-single.eval.mjs"],
+  "args": [
+    "--matrix-param",
+    "model=a,b",
+    "--matrix-param",
+    "enableBashTool=true,false"
+  ]
+}

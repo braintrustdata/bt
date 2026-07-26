@@ -1,0 +1,10 @@
+{
+  "name": "bt-eval-sample-init-dataset",
+  "private": true,
+  "dependencies": {
+    "braintrust": "link:./local-braintrust"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2"
+  }
+}

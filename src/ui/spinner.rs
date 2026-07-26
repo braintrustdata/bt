@@ -7,10 +7,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use super::{animations_enabled, is_quiet};
 
-const SPINNER_DELAY: Duration = Duration::from_millis(300);
+const SPINNER_DELAY: Duration = Duration::from_millis(500);
 
 /// Run an async operation with a spinner showing the given message.
-/// Only shows spinner if the operation takes longer than 300ms.
+/// Only shows spinner if the operation takes longer than 500ms.
 pub async fn with_spinner<T, F: Future<Output = T>>(message: &str, fut: F) -> T {
     if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
         return fut.await;

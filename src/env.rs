@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
@@ -11,15 +11,14 @@ pub fn bootstrap_from_args(args: &[OsString]) -> Result<()> {
 }
 
 pub fn load_env(explicit_env_file: Option<&PathBuf>) -> Result<()> {
+    let Some(explicit_env_file) = explicit_env_file else {
+        return Ok(());
+    };
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let env_files = resolve_env_files(&cwd, explicit_env_file);
     let mut loaded = HashMap::new();
 
     for env_file in env_files {
-        if !env_file.exists() && explicit_env_file.is_none() {
-            continue;
-        }
-
         let parsed = dotenvy::from_path_iter(&env_file)
             .with_context(|| format!("failed to read env file {}", env_file.display()))?;
         for item in parsed {
@@ -72,21 +71,11 @@ fn extract_env_file_arg(args: &[OsString]) -> Option<PathBuf> {
     explicit
 }
 
-fn resolve_env_files(cwd: &Path, explicit_env_file: Option<&PathBuf>) -> Vec<PathBuf> {
-    if let Some(path) = explicit_env_file {
-        let full_path = if path.is_absolute() {
-            path.clone()
-        } else {
-            cwd.join(path)
-        };
-        return vec![full_path];
-    }
-
-    let node_env = std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string());
-    let mut files = vec![cwd.join(".env"), cwd.join(format!(".env.{node_env}"))];
-    if node_env != "test" {
-        files.push(cwd.join(".env.local"));
-    }
-    files.push(cwd.join(format!(".env.{node_env}.local")));
-    files
+fn resolve_env_files(cwd: &std::path::Path, explicit_env_file: &PathBuf) -> Vec<PathBuf> {
+    let full_path = if explicit_env_file.is_absolute() {
+        explicit_env_file.clone()
+    } else {
+        cwd.join(explicit_env_file)
+    };
+    vec![full_path]
 }

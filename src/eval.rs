@@ -3,9 +3,9 @@ use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use actix_web::dev::Service;
 use actix_web::http::header::{
@@ -16,33 +16,25 @@ use actix_web::http::header::{
 use actix_web::{guard, web, App, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
-use crossterm::queue;
-use crossterm::style::{
-    Attribute, Color as CtColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    Stylize,
-};
+use crossterm::style::Stylize;
 use futures_util::stream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use strip_ansi_escapes::strip;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use unicode_width::UnicodeWidthStr;
-
-use ratatui::backend::TestBackend;
-use ratatui::layout::{Alignment, Constraint};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Row, Table};
-use ratatui::Terminal;
 
 use crate::args::BaseArgs;
-use crate::auth::resolved_auth_env;
-use crate::ui::{animations_enabled, is_quiet};
+use crate::auth::resolved_runner_env;
+use crate::js_runner;
+use crate::python_runner;
+use crate::runner_sse;
+use crate::ui::{
+    animations_enabled, box_with_title, is_quiet, render_experiment_summary_table,
+    summary_metric_unit, SummaryExperimentColumn, SummaryMetricCell, SummaryMetricKind,
+    SummaryMetricRow, SummaryTableOptions,
+};
 
 const MAX_NAME_LENGTH: usize = 40;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -56,11 +48,30 @@ const HEADER_BT_AUTH_TOKEN: &str = "x-bt-auth-token";
 const HEADER_BT_ORG_NAME: &str = "x-bt-org-name";
 const HEADER_CORS_REQ_PRIVATE_NETWORK: &str = "access-control-request-private-network";
 const HEADER_CORS_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
-const SSE_SOCKET_BIND_MAX_ATTEMPTS: u8 = 16;
 const EVAL_NODE_MAX_OLD_SPACE_SIZE_MB: usize = 8192;
 const MAX_DEFERRED_EVAL_ERRORS: usize = 8;
-static SSE_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
+const DEFAULT_EVAL_SAMPLE_SEED: u64 = 0;
+const EVAL_SPINNER_TICK_STRINGS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
+// UI-only smoothing knobs for adaptive totals.
+// We intentionally smooth in the CLI renderer (not the runner protocol) so
+// non-CLI consumers still receive truthful progress events.
+// `EVAL_TOTAL_SMOOTH_INTERVAL` roughly matches perceptible terminal updates.
+// `EVAL_TOTAL_SMOOTH_DELTA_DIVISOR` + `EVAL_TOTAL_SMOOTH_MIN_STEP` avoid redrawing
+// for tiny len changes while still applying meaningful jumps immediately.
+const EVAL_TOTAL_SMOOTH_INTERVAL: Duration = Duration::from_millis(100);
+const EVAL_TOTAL_SMOOTH_DELTA_DIVISOR: u64 = 50;
+const EVAL_TOTAL_SMOOTH_MIN_STEP: u64 = 2;
+const EVAL_MIN_DETERMINATE_TOTAL: u64 = 2;
 
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer '{value}'"))?;
+    if parsed == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(parsed)
+}
 struct EvalRunOutput {
     status: ExitStatus,
     dependencies: Vec<PathBuf>,
@@ -71,7 +82,7 @@ struct EvalRunnerProcess {
     rx: mpsc::UnboundedReceiver<EvalEvent>,
     sse_task: tokio::task::JoinHandle<()>,
     sse_connected: Arc<AtomicBool>,
-    _socket_cleanup_guard: SocketCleanupGuard,
+    _sse_guard: runner_sse::SseListenerGuard,
 }
 
 struct EvalProcessOutput {
@@ -181,6 +192,7 @@ struct DevServerState {
 struct DevAuthContext {
     token: String,
     org_name: String,
+    api_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,26 +201,46 @@ struct RunnerFilter {
     pattern: String,
 }
 
-const JS_RUNNER_FILE: &str = "eval-runner.ts";
+// vite-node's CLI has a unique lifecycle: it `await runner.executeFile(file)`
+// and then immediately `await server.close()`. `executeFile` resolves the
+// moment vite-node's async wrapper around the entry body resolves — which is
+// immediately if the body uses fire-and-forget. Any in-flight dynamic imports
+// inside `main()` then race against `server.close()` and throw
+// ERR_CLOSED_SERVER. Every other supported runner (tsx, bun, deno, ts-node,
+// plain Node) has Node-style event-loop semantics where fire-and-forget at the
+// top level is the natural pattern.
+//
+// So bt ships two entry shapes:
+//
+//   eval-runner.ts       — default. Standalone: the full `eval-runner-impl.ts`
+//                          body plus a fire-and-forget `main().catch(...)`
+//                          appended. Generated at materialization time so the
+//                          impl source stays the single point of truth.
+//   eval-runner-vite-node.mts
+//                        — vite-node only. Two-line wrapper that imports
+//                          `main` from a sibling `eval-runner-impl.ts` and
+//                          awaits it via top-level await, keeping vite-node's
+//                          wrapper pending until the work is done.
+//
+// The default `.ts` is standalone (no import) because a shared impl file would
+// force a cross-runner import-extension conflict: Deno requires explicit `.ts`
+// extensions in import paths, while ts-node 10.x rejects them by default
+// (TS5097 unless `allowImportingTsExtensions`). With the impl appended inline
+// for non-vite-node runners, the import only exists in the vite-node `.mts`,
+// where we control the loader.
+const JS_RUNNER_DEFAULT_FILE: &str = "eval-runner.ts";
+const JS_RUNNER_VITE_NODE_FILE: &str = "eval-runner-vite-node.mts";
+const JS_RUNNER_IMPL_FILE: &str = "eval-runner-impl.ts";
 const PY_RUNNER_FILE: &str = "eval-runner.py";
-const JS_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.ts");
+const JS_RUNNER_VITE_NODE_SOURCE: &str = include_str!("../scripts/eval-runner-vite-node.mts");
+const JS_RUNNER_IMPL_SOURCE: &str = include_str!("../scripts/eval-runner-impl.ts");
 const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
-
-struct SocketCleanupGuard {
-    path: PathBuf,
-}
-
-impl SocketCleanupGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for SocketCleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+// Appended to the impl source to produce the standalone default `.ts` entry.
+// `main` is `export async function main()` in the impl, but it's still callable
+// from within the same file via the local binding.
+const JS_RUNNER_FIRE_AND_FORGET_ENTRY: &str =
+    "\nmain().catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n";
+const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 pub enum EvalLanguage {
@@ -294,15 +326,34 @@ pub struct EvalArgs {
     )]
     pub filter: Vec<String>,
 
-    /// Show verbose evaluator errors and stderr output.
+    /// Run only the first N dataset records. Marks the run as non-final.
     #[arg(
         long,
-        env = "BT_EVAL_VERBOSE",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        default_value_t = false
+        env = "BT_EVAL_FIRST",
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        conflicts_with = "sample"
     )]
-    pub verbose: bool,
+    pub first: Option<usize>,
 
+    /// Run a deterministic random sample of N dataset records. Marks the run as non-final.
+    #[arg(
+        long,
+        env = "BT_EVAL_SAMPLE",
+        value_name = "N",
+        value_parser = parse_positive_usize,
+        conflicts_with = "first"
+    )]
+    pub sample: Option<usize>,
+
+    /// Seed used with --sample.
+    #[arg(
+        long = "sample-seed",
+        env = "BT_EVAL_SAMPLE_SEED",
+        value_name = "SEED",
+        requires = "sample"
+    )]
+    pub sample_seed: Option<u64>,
     /// Re-run evals when input files change.
     #[arg(
         long,
@@ -312,6 +363,31 @@ pub struct EvalArgs {
         default_value_t = false
     )]
     pub watch: bool,
+
+    /// Override one or more evaluator parameters for this run.
+    /// Accepts key=value pairs where the value is JSON (e.g. --param model='"gpt-4o"' --param enabled=true),
+    /// or a single JSON object (e.g. --param '{"model":"gpt-4o"}').
+    /// Repeat the flag to set multiple parameters.
+    #[arg(
+        long,
+        value_name = "KEY=JSON_VALUE | JSON_OBJECT",
+        allow_hyphen_values = true
+    )]
+    pub param: Vec<String>,
+
+    /// Run the selected eval once per combination of matrix values.
+    /// Two value formats are supported:
+    ///   key=v1,v2,v3          comma-separated (each value parsed as JSON, falling back to string)
+    ///   key=[JSON_ARRAY]      JSON array, e.g. --matrix-param model='["gpt-4","hello, world"]'
+    ///                         Use the JSON array form when values must contain commas.
+    /// Repeat the flag to sweep multiple keys; the Cartesian product of all values is run.
+    /// Requires exactly one eval after filters; multiple evals error out.
+    #[arg(
+        long = "matrix-param",
+        value_name = "KEY=V1,V2,... | KEY=[JSON_ARRAY]",
+        allow_hyphen_values = true
+    )]
+    pub matrix_param: Vec<String>,
 
     /// Arguments forwarded to the eval file via process.argv (everything after `--`).
     /// Example: bt eval foo.eval.ts -- --description "Prod" --shard=1/4
@@ -350,6 +426,13 @@ pub struct EvalArgs {
     pub dev_allowed_origin: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalSamplingMode {
+    Full,
+    First { count: usize },
+    Sample { count: usize, seed: u64 },
+}
+
 #[derive(Debug, Clone)]
 struct EvalRunOptions {
     jsonl: bool,
@@ -357,8 +440,11 @@ struct EvalRunOptions {
     num_workers: Option<usize>,
     list: bool,
     filter: Vec<String>,
+    sampling: EvalSamplingMode,
     verbose: bool,
     extra_args: Vec<String>,
+    params: Vec<String>,
+    matrix_axes: Vec<(String, Vec<serde_json::Value>)>,
 }
 
 pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
@@ -379,14 +465,37 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     }
     validate_eval_input_files(&files)?;
 
+    let sampling = if let Some(first) = args.first {
+        EvalSamplingMode::First { count: first }
+    } else if let Some(sample) = args.sample {
+        EvalSamplingMode::Sample {
+            count: sample,
+            seed: args.sample_seed.unwrap_or(DEFAULT_EVAL_SAMPLE_SEED),
+        }
+    } else {
+        EvalSamplingMode::Full
+    };
+
+    let matrix_axes = if args.matrix_param.is_empty() {
+        Vec::new()
+    } else {
+        if args.watch || args.dev || args.list {
+            anyhow::bail!("--matrix-param cannot be combined with --watch, --dev, or --list");
+        }
+        parse_matrix_params(&args.matrix_param)?
+    };
+
     let options = EvalRunOptions {
         jsonl: args.jsonl,
         terminate_on_failure: args.terminate_on_failure,
         num_workers: args.num_workers,
         list: args.list,
         filter: args.filter,
-        verbose: args.verbose,
+        verbose: base.verbose,
+        sampling,
         extra_args: args.extra_args,
+        params: args.param,
+        matrix_axes,
     };
 
     if args.dev {
@@ -404,9 +513,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
             allowed_org_name: args.dev_org_name.clone(),
             allowed_origins: collect_allowed_dev_origins(&args.dev_allowed_origin, &app_url),
             app_url,
-            http_client: Client::builder()
-                .timeout(crate::http::DEFAULT_HTTP_TIMEOUT)
-                .build()
+            http_client: crate::http::build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
                 .context("failed to create dev server HTTP client")?,
         };
         return run_dev_server(state).await;
@@ -635,7 +742,12 @@ async fn run_eval_attempt(
         js_mode,
     )
     .await?;
-    let mut ui = EvalUi::new(options.jsonl, options.list, options.verbose);
+    let mut ui = EvalUi::new(
+        options.jsonl,
+        options.list,
+        options.verbose,
+        base.profile.clone(),
+    );
     let output =
         drive_eval_runner(spawned.process, console_policy, |event| ui.handle(event)).await?;
     ui.finish();
@@ -671,32 +783,30 @@ async fn spawn_eval_runner(
     let (js_runner, py_runner) = prepare_eval_runners()?;
     let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
-    let (listener, socket_path, socket_cleanup_guard) = bind_sse_listener()?;
+    let (listener, sse_guard) = runner_sse::bind_sse_listener("bt-eval")?;
     let (tx, rx) = mpsc::unbounded_channel();
     let sse_connected = Arc::new(AtomicBool::new(false));
 
     let tx_sse = tx.clone();
     let sse_connected_for_task = Arc::clone(&sse_connected);
     let sse_task = tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        if let Err(err) = runner_sse::accept_and_read_sse_stream(
+            listener,
+            || {
                 sse_connected_for_task.store(true, Ordering::Relaxed);
-                if let Err(err) = read_sse_stream(stream, tx_sse.clone()).await {
-                    let _ = tx_sse.send(EvalEvent::Error {
-                        message: format!("SSE stream error: {err}"),
-                        stack: None,
-                        status: None,
-                    });
-                }
-            }
-            Err(err) => {
-                let _ = tx_sse.send(EvalEvent::Error {
-                    message: format!("Failed to accept SSE connection: {err}"),
-                    stack: None,
-                    status: None,
-                });
-            }
-        };
+            },
+            |event, data| {
+                handle_sse_event(event, data, &tx_sse);
+            },
+        )
+        .await
+        {
+            let _ = tx_sse.send(EvalEvent::Error {
+                message: format!("SSE stream error: {err}"),
+                stack: None,
+                status: None,
+            });
+        }
     });
 
     let (mut cmd, runner_kind) = match language {
@@ -720,7 +830,7 @@ async fn spawn_eval_runner(
         set_node_heap_size_env(&mut cmd);
     }
 
-    cmd.envs(build_env(base).await?);
+    cmd.envs(resolved_runner_env(base).await?);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -746,6 +856,16 @@ async fn spawn_eval_runner(
             serde_json::to_string(&parsed).context("failed to serialize eval filters")?;
         cmd.env("BT_EVAL_FILTER_PARSED", serialized);
     }
+    match options.sampling {
+        EvalSamplingMode::Full => {}
+        EvalSamplingMode::First { count } => {
+            cmd.env("BT_EVAL_FIRST", count.to_string());
+        }
+        EvalSamplingMode::Sample { count, seed } => {
+            cmd.env("BT_EVAL_SAMPLE", count.to_string());
+            cmd.env("BT_EVAL_SAMPLE_SEED", seed.to_string());
+        }
+    }
     if language == EvalLanguage::JavaScript && force_esm {
         cmd.env("BT_EVAL_FORCE_ESM", "1");
     }
@@ -764,10 +884,29 @@ async fn spawn_eval_runner(
             serde_json::to_string(&options.extra_args).context("failed to serialize extra args")?;
         cmd.env("BT_EVAL_EXTRA_ARGS_JSON", serialized);
     }
-    cmd.env(
-        "BT_EVAL_SSE_SOCK",
-        socket_path.to_string_lossy().to_string(),
-    );
+    if !options.params.is_empty() {
+        let parsed = parse_eval_params(&options.params)?;
+        let serialized =
+            serde_json::to_string(&parsed).context("failed to serialize eval params")?;
+        cmd.env("BT_EVAL_PARAMS_JSON", serialized);
+    }
+    if !options.matrix_axes.is_empty() {
+        let payload: Vec<serde_json::Value> = options
+            .matrix_axes
+            .iter()
+            .map(|(key, values)| {
+                serde_json::json!({
+                    "key": key,
+                    "values": values,
+                })
+            })
+            .collect();
+        let serialized =
+            serde_json::to_string(&payload).context("failed to serialize matrix axes")?;
+        cmd.env("BT_EVAL_MATRIX_JSON", serialized);
+    }
+    let (sse_env_name, sse_env_value) = sse_guard.env("BT_EVAL_SSE_SOCK", "BT_EVAL_SSE_ADDR");
+    cmd.env(sse_env_name, sse_env_value);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -779,7 +918,14 @@ async fn spawn_eval_runner(
     if let Some(stdout) = stdout {
         let tx_stdout = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stdout, "stdout", tx_stdout).await {
+            if let Err(err) = runner_sse::forward_stream(stdout, "stdout", |stream, message| {
+                let _ = tx_stdout.send(EvalEvent::Console {
+                    stream: stream.to_string(),
+                    message,
+                });
+            })
+            .await
+            {
                 eprintln!("Failed to read eval stdout: {err}");
             }
         });
@@ -788,7 +934,14 @@ async fn spawn_eval_runner(
     if let Some(stderr) = stderr {
         let tx_stderr = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = forward_stream(stderr, "stderr", tx_stderr).await {
+            if let Err(err) = runner_sse::forward_stream(stderr, "stderr", |stream, message| {
+                let _ = tx_stderr.send(EvalEvent::Console {
+                    stream: stream.to_string(),
+                    message,
+                });
+            })
+            .await
+            {
                 eprintln!("Failed to read eval stderr: {err}");
             }
         });
@@ -802,77 +955,71 @@ async fn spawn_eval_runner(
             rx,
             sse_task,
             sse_connected,
-            _socket_cleanup_guard: socket_cleanup_guard,
+            _sse_guard: sse_guard,
         },
         runner_kind,
     })
 }
 
 async fn drive_eval_runner<F>(
-    mut process: EvalRunnerProcess,
+    process: EvalRunnerProcess,
     console_policy: ConsolePolicy,
     mut on_event: F,
 ) -> Result<EvalProcessOutput>
 where
     F: FnMut(EvalEvent),
 {
-    let mut status = None;
+    let EvalRunnerProcess {
+        mut child,
+        rx,
+        mut sse_task,
+        sse_connected,
+        _sse_guard,
+    } = process;
     let mut dependency_files: Vec<String> = Vec::new();
     let mut error_messages: Vec<String> = Vec::new();
     let mut stderr_lines: Vec<String> = Vec::new();
-
-    loop {
-        tokio::select! {
-            event = process.rx.recv() => {
-                match event {
-                    Some(EvalEvent::Dependencies { files }) => {
-                        dependency_files.extend(files.clone());
-                        on_event(EvalEvent::Dependencies { files });
-                    }
-                    Some(EvalEvent::Error { message, stack, status }) => {
-                        error_messages.push(message.clone());
-                        if let Some(stack) = stack.as_ref() {
-                            error_messages.push(stack.clone());
-                        }
-                        on_event(EvalEvent::Error { message, stack, status });
-                    }
-                    Some(EvalEvent::Console { stream, message }) => {
-                        if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr)
-                        {
-                            stderr_lines.push(message);
-                        } else {
-                            on_event(EvalEvent::Console { stream, message });
-                        }
-                    }
-                    Some(event) => on_event(event),
-                    None => {
-                        if status.is_none() {
-                            status = Some(process.child.wait().await.context("eval runner process failed")?);
-                            if !process.sse_connected.load(Ordering::Relaxed) {
-                                process.sse_task.abort();
-                            }
-                        }
-                        break;
-                    }
+    let wait = Box::pin(async { child.wait().await.context("eval runner process failed") });
+    let status = runner_sse::drive_runner_events(
+        rx,
+        wait,
+        &mut sse_task,
+        &sse_connected,
+        "eval runner process exited without a status",
+        |event| match event {
+            EvalEvent::Dependencies { files } => {
+                dependency_files.extend(files.clone());
+                on_event(EvalEvent::Dependencies { files });
+            }
+            EvalEvent::Error {
+                message,
+                stack,
+                status,
+            } => {
+                error_messages.push(message.clone());
+                if let Some(stack) = stack.as_ref() {
+                    error_messages.push(stack.clone());
+                }
+                on_event(EvalEvent::Error {
+                    message,
+                    stack,
+                    status,
+                });
+            }
+            EvalEvent::Console { stream, message } => {
+                if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr) {
+                    stderr_lines.push(message);
+                } else {
+                    on_event(EvalEvent::Console { stream, message });
                 }
             }
-            exit_status = process.child.wait(), if status.is_none() => {
-                status = Some(exit_status.context("eval runner process failed")?);
-                if !process.sse_connected.load(Ordering::Relaxed) {
-                    process.sse_task.abort();
-                }
-            }
-        }
-
-        if status.is_some() && process.rx.is_closed() {
-            break;
-        }
-    }
-
-    let _ = process.sse_task.await;
+            event => on_event(event),
+        },
+    )
+    .await?;
 
     Ok(EvalProcessOutput {
-        status: status.context("eval runner process exited without a status")?,
+        status,
         dependency_files,
         error_messages,
         stderr_lines,
@@ -1093,26 +1240,33 @@ async fn authenticate_dev_request(
 
     let payload = response.json::<Value>().await.unwrap_or(Value::Null);
     if let Some(orgs) = payload.get("org_info").and_then(|value| value.as_array()) {
-        let matched = orgs.iter().any(|org| {
+        let matched_org = orgs.iter().find(|org| {
             org.get("name")
                 .and_then(|name| name.as_str())
                 .map(|name| name == org_name)
                 .unwrap_or(false)
         });
-        if !matched {
+        let Some(matched_org) = matched_org else {
             return Err(json_error_response(
                 actix_web::http::StatusCode::UNAUTHORIZED,
                 "Unauthorized",
             ));
-        }
+        };
+        let api_url = matched_org
+            .get("api_url")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        Ok(DevAuthContext {
+            token,
+            org_name,
+            api_url,
+        })
     } else {
-        return Err(json_error_response(
+        Err(json_error_response(
             actix_web::http::StatusCode::UNAUTHORIZED,
             "Unauthorized",
-        ));
+        ))
     }
-
-    Ok(DevAuthContext { token, org_name })
 }
 
 async fn resolve_dataset_ref_for_eval_request(
@@ -1227,6 +1381,9 @@ fn make_dev_mode_env(
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
+    if let Some(api_url) = auth.api_url.as_ref() {
+        env.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
+    }
     if let Some(request) = request {
         let serialized =
             serde_json::to_string(request).context("failed to serialize eval request payload")?;
@@ -1700,6 +1857,77 @@ fn resolve_watch_paths(files: &[String]) -> Result<Vec<PathBuf>> {
     normalize_watch_paths(files.iter().map(PathBuf::from))
 }
 
+fn parse_eval_params(params: &[String]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut result = serde_json::Map::new();
+    for param in params {
+        let trimmed = param.trim();
+        if trimmed.starts_with('{') {
+            let parsed: serde_json::Map<String, serde_json::Value> = serde_json::from_str(trimmed)
+                .with_context(|| format!("--param value is not a valid JSON object: {param}"))?;
+            result.extend(parsed);
+        } else {
+            let eq_pos = trimmed.find('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--param value must be in key=JSON_VALUE format or a JSON object: {param}"
+                )
+            })?;
+            let key = &trimmed[..eq_pos];
+            if key.is_empty() {
+                anyhow::bail!("--param key must not be empty: {param}");
+            }
+            let value_str = &trimmed[eq_pos + 1..];
+            let value: serde_json::Value = serde_json::from_str(value_str)
+                .unwrap_or_else(|_| serde_json::Value::String(value_str.to_string()));
+            result.insert(key.to_string(), value);
+        }
+    }
+    Ok(result)
+}
+
+fn parse_matrix_params(raw: &[String]) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+    let mut axes: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for entry in raw {
+        let trimmed = entry.trim();
+        let eq_pos = trimmed.find('=').ok_or_else(|| {
+            anyhow::anyhow!("--matrix-param value must be in key=V1,V2,... format: {entry}")
+        })?;
+        let key = trimmed[..eq_pos].trim();
+        if key.is_empty() {
+            anyhow::bail!("--matrix-param key must not be empty: {entry}");
+        }
+        if axes.iter().any(|(k, _)| k == key) {
+            anyhow::bail!("--matrix-param key specified more than once: {key}");
+        }
+        let rest = &trimmed[eq_pos + 1..];
+        let rest_trimmed = rest.trim();
+        let values: Vec<serde_json::Value> = if rest_trimmed.starts_with('[') {
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_str(rest_trimmed).with_context(|| {
+                    format!("--matrix-param value is not a valid JSON array: {entry}")
+                })?;
+            if arr.is_empty() {
+                anyhow::bail!("--matrix-param must have at least one value: {entry}");
+            }
+            arr
+        } else {
+            let pieces: Vec<&str> = rest.split(',').collect();
+            if pieces.iter().all(|p| p.trim().is_empty()) {
+                anyhow::bail!("--matrix-param must have at least one value: {entry}");
+            }
+            pieces
+                .iter()
+                .map(|piece| {
+                    let s = piece.trim();
+                    serde_json::from_str(s)
+                        .unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
+                })
+                .collect()
+        };
+        axes.push((key.to_string(), values));
+    }
+    Ok(axes)
+}
+
 fn parse_eval_filter_expression(expression: &str) -> Result<RunnerFilter> {
     let (path, pattern) = expression
         .split_once('=')
@@ -1921,18 +2149,6 @@ fn format_watch_paths(paths: &[PathBuf]) -> String {
     }
 }
 
-async fn build_env(base: &BaseArgs) -> Result<Vec<(String, String)>> {
-    let mut envs = resolved_auth_env(base).await?;
-    let project = base
-        .project
-        .clone()
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
-    if let Some(project) = &project {
-        envs.push(("BRAINTRUST_DEFAULT_PROJECT".to_string(), project.clone()));
-    }
-    Ok(envs)
-}
-
 fn detect_eval_language(
     files: &[String],
     language_override: Option<EvalLanguage>,
@@ -2133,7 +2349,7 @@ fn build_js_plan(
 ) -> Result<JsRunnerPlan> {
     if let Some(explicit) = runner_override {
         let resolved_runner = resolve_js_runner_command(explicit, files);
-        if is_deno_runner(explicit) || is_deno_runner_path(resolved_runner.as_ref()) {
+        if is_deno_runner(explicit) || js_runner::is_deno_runner_path(resolved_runner.as_ref()) {
             let runner_script = prepare_js_runner_in_cwd()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(resolved_runner.as_os_str(), &runner_script, files),
@@ -2142,13 +2358,14 @@ fn build_js_plan(
         }
         let kind = runner_kind_for_bin(resolved_runner.as_ref());
         let runner_script = select_js_runner_entrypoint(runner, resolved_runner.as_ref())?;
+        let runner_script = js_runner_path_for_kind(&runner_script, kind);
         let mut command = Command::new(resolved_runner);
         command.arg(runner_script).args(files);
         return Ok(JsRunnerPlan { cmd: command, kind });
     }
 
     if let Some(auto_runner) = find_js_runner_binary(files) {
-        if is_deno_runner_path(&auto_runner) {
+        if js_runner::is_deno_runner_path(&auto_runner) {
             let runner_script = prepare_js_runner_in_cwd()?;
             return Ok(JsRunnerPlan {
                 cmd: build_deno_js_command(auto_runner.as_os_str(), &runner_script, files),
@@ -2157,6 +2374,7 @@ fn build_js_plan(
         }
         let kind = runner_kind_for_bin(auto_runner.as_ref());
         let runner_script = select_js_runner_entrypoint(runner, auto_runner.as_ref())?;
+        let runner_script = js_runner_path_for_kind(&runner_script, kind);
         let mut command = Command::new(auto_runner);
         command.arg(runner_script).args(files);
         return Ok(JsRunnerPlan { cmd: command, kind });
@@ -2172,7 +2390,7 @@ fn build_js_plan(
 
 fn build_vite_node_fallback_command(runner: &Path, files: &[String]) -> Result<Command> {
     if let Some(path) = find_node_module_bin_for_files("vite-node", files)
-        .or_else(|| find_binary_in_path(&["vite-node"]))
+        .or_else(|| js_runner::find_binary_in_path(&["vite-node"]))
     {
         let mut command = Command::new(path);
         command.arg(runner).args(files);
@@ -2199,15 +2417,7 @@ fn build_deno_js_command(
 }
 
 fn deno_js_command_args(runner: &Path, files: &[String]) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("run"),
-        OsString::from("-A"),
-        OsString::from("--node-modules-dir=auto"),
-        OsString::from("--unstable-detect-cjs"),
-        runner.as_os_str().to_os_string(),
-    ];
-    args.extend(files.iter().map(OsString::from));
-    args
+    js_runner::deno_runner_args(runner, &files_as_paths(files))
 }
 
 fn build_python_command(
@@ -2215,68 +2425,23 @@ fn build_python_command(
     runner: &Path,
     files: &[String],
 ) -> Result<Command> {
-    let runner_override = runner_override
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("BT_EVAL_PYTHON_RUNNER").ok())
-        .or_else(|| std::env::var("BT_EVAL_PYTHON").ok());
-
-    let command = if let Some(explicit) = runner_override {
-        let mut command = Command::new(explicit);
-        command.arg(runner).args(files);
-        command
-    } else if let Some(python) = find_python_binary() {
-        let mut command = Command::new(python);
-        command.arg(runner).args(files);
-        command
-    } else {
+    let search_roots = python_runner_search_roots(files);
+    let Some(python) = python_runner::resolve_python_interpreter_for_roots(
+        runner_override,
+        PYTHON_INTERPRETER_ENV_OVERRIDES,
+        &search_roots,
+    ) else {
         anyhow::bail!(
-            "No Python interpreter found in PATH. Please install python or pass --runner."
+            "No Python interpreter found. Please install python, create a virtualenv, or pass --runner."
         );
     };
 
+    let mut command = Command::new(python);
+    command.arg(runner).args(files);
     Ok(command)
 }
 
-fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
-    // Prefer local project bins first, then PATH. `tsx` remains the preferred
-    // default, with other common TS runners as fallback.
-    const RUNNER_CANDIDATES: &[&str] = &["tsx", "vite-node", "ts-node", "ts-node-esm", "deno"];
-
-    for candidate in RUNNER_CANDIDATES {
-        if let Some(path) = find_node_module_bin_for_files(candidate, files) {
-            return Some(path);
-        }
-    }
-
-    find_binary_in_path(RUNNER_CANDIDATES)
-}
-
-fn resolve_js_runner_command(runner: &str, files: &[String]) -> PathBuf {
-    if is_path_like_runner(runner) {
-        return PathBuf::from(runner);
-    }
-
-    find_node_module_bin_for_files(runner, files)
-        .or_else(|| find_binary_in_path(&[runner]))
-        .unwrap_or_else(|| PathBuf::from(runner))
-}
-
-fn is_path_like_runner(runner: &str) -> bool {
-    let path = Path::new(runner);
-    path.is_absolute() || runner.contains('/') || runner.contains('\\') || runner.starts_with('.')
-}
-
-fn find_node_module_bin_for_files(binary: &str, files: &[String]) -> Option<PathBuf> {
-    let search_roots = js_runner_search_roots(files);
-    for root in &search_roots {
-        if let Some(path) = find_node_module_bin(binary, root) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn js_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
+fn python_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
     let mut search_roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         search_roots.push(cwd.clone());
@@ -2295,47 +2460,67 @@ fn js_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
     search_roots
 }
 
-fn is_deno_runner(runner: &str) -> bool {
-    let file_name = Path::new(runner)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(runner);
-    file_name.eq_ignore_ascii_case("deno") || file_name.eq_ignore_ascii_case("deno.exe")
+fn find_js_runner_binary(files: &[String]) -> Option<PathBuf> {
+    js_runner::find_js_runner_binary(&files_as_paths(files))
 }
 
-fn is_deno_runner_path(runner: &Path) -> bool {
-    runner
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(|name| name.eq_ignore_ascii_case("deno") || name.eq_ignore_ascii_case("deno.exe"))
-        .unwrap_or(false)
+fn resolve_js_runner_command(runner: &str, files: &[String]) -> PathBuf {
+    js_runner::resolve_js_runner_command(runner, &files_as_paths(files))
+}
+
+fn find_node_module_bin_for_files(binary: &str, files: &[String]) -> Option<PathBuf> {
+    js_runner::find_node_module_bin_for_files(binary, &files_as_paths(files))
+}
+
+fn files_as_paths(files: &[String]) -> Vec<PathBuf> {
+    files.iter().map(PathBuf::from).collect()
+}
+
+fn is_deno_runner(runner: &str) -> bool {
+    js_runner::is_deno_runner_path(Path::new(runner))
 }
 
 fn select_js_runner_entrypoint(default_runner: &Path, runner_command: &Path) -> Result<PathBuf> {
-    if is_ts_node_runner(runner_command) {
+    if js_runner::is_ts_node_runner_path(runner_command) {
+        // ts-node resolves modules relative to the cwd's node_modules, so the
+        // runner must live inside the project tree.
         return prepare_js_runner_in_cwd();
     }
     Ok(default_runner.to_path_buf())
 }
 
+/// vite-node's CLI tears down its dev server the moment `runner.executeFile`
+/// resolves, and its module wrapper resolves the instant the entry body's
+/// synchronous top-level returns. The default `.ts` entry uses fire-and-forget,
+/// so under vite-node specifically we swap to the `.mts` entry that wraps
+/// `main()` in top-level await and keeps the wrapper pending until the work
+/// is done. See `scripts/eval-runner-vite-node.mts` for the full annotation.
+fn js_runner_path_for_kind(default_path: &Path, kind: RunnerKind) -> PathBuf {
+    if matches!(kind, RunnerKind::ViteNode) {
+        default_path.with_file_name(JS_RUNNER_VITE_NODE_FILE)
+    } else {
+        default_path.to_path_buf()
+    }
+}
+
 fn prepare_js_runner_in_cwd() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    let cache_dir = cwd
-        .join(".bt")
-        .join("eval-runners")
-        .join(env!("CARGO_PKG_VERSION"));
-    std::fs::create_dir_all(&cache_dir).with_context(|| {
-        format!(
-            "failed to create eval runner cache dir {}",
-            cache_dir.display()
-        )
-    })?;
-    materialize_runner_script(&cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)
+    let source = js_runner_default_source();
+    js_runner::materialize_runner_script_in_cwd("eval-runners", JS_RUNNER_DEFAULT_FILE, &source)
+}
+
+/// Builds the standalone default entry: the impl body with a fire-and-forget
+/// `main().catch(...)` appended. Used everywhere except vite-node, which gets
+/// the `.mts` wrapper that uses TLA against the same impl as a sibling file.
+fn js_runner_default_source() -> String {
+    let mut source =
+        String::with_capacity(JS_RUNNER_IMPL_SOURCE.len() + JS_RUNNER_FIRE_AND_FORGET_ENTRY.len());
+    source.push_str(JS_RUNNER_IMPL_SOURCE);
+    source.push_str(JS_RUNNER_FIRE_AND_FORGET_ENTRY);
+    source
 }
 
 fn runner_bin_name(runner_command: &Path) -> Option<String> {
-    let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
-    Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
+    js_runner::runner_bin_name(runner_command)
 }
 
 fn runner_kind_for_bin(runner_command: &Path) -> RunnerKind {
@@ -2367,100 +2552,6 @@ fn set_node_heap_size_env(command: &mut Command) {
     command.env("NODE_OPTIONS", merged);
 }
 
-fn is_ts_node_runner(runner_command: &Path) -> bool {
-    runner_bin_name(runner_command).is_some_and(|n| n == "ts-node" || n == "ts-node-esm")
-}
-
-fn find_python_binary() -> Option<PathBuf> {
-    if let Some(venv_root) = std::env::var_os("VIRTUAL_ENV") {
-        let candidate = PathBuf::from(venv_root).join("bin").join("python");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    find_binary_in_path(&["python3", "python"])
-}
-
-fn find_node_module_bin(binary: &str, start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        let base = dir.join("node_modules").join(".bin").join(binary);
-        if base.is_file() {
-            return Some(base);
-        }
-        if cfg!(windows) {
-            let cmd = base.with_extension("cmd");
-            if cmd.is_file() {
-                return Some(cmd);
-            }
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        for candidate in candidates {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-            if cfg!(windows) {
-                let cmd = path.with_extension("cmd");
-                if cmd.is_file() {
-                    return Some(cmd);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn build_sse_socket_path() -> Result<PathBuf> {
-    let pid = std::process::id();
-    let serial = SSE_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("failed to read system time")?
-        .as_nanos();
-    Ok(std::env::temp_dir().join(format!("bt-eval-{pid}-{now}-{serial}.sock")))
-}
-
-fn bind_sse_listener() -> Result<(UnixListener, PathBuf, SocketCleanupGuard)> {
-    let mut last_bind_err: Option<std::io::Error> = None;
-    for _ in 0..SSE_SOCKET_BIND_MAX_ATTEMPTS {
-        let socket_path = build_sse_socket_path()?;
-        let socket_cleanup_guard = SocketCleanupGuard::new(socket_path.clone());
-        let _ = std::fs::remove_file(&socket_path);
-        match UnixListener::bind(&socket_path) {
-            Ok(listener) => return Ok((listener, socket_path, socket_cleanup_guard)),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::AddrInUse
-                ) =>
-            {
-                last_bind_err = Some(err);
-                continue;
-            }
-            Err(err) => {
-                return Err(err).context("failed to bind SSE unix socket");
-            }
-        }
-    }
-    let err = last_bind_err.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "failed to allocate a unique SSE socket path",
-        )
-    });
-    Err(err).context(format!(
-        "failed to bind SSE unix socket after {SSE_SOCKET_BIND_MAX_ATTEMPTS} attempts"
-    ))
-}
-
 fn eval_runner_cache_dir() -> PathBuf {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -2484,19 +2575,27 @@ fn prepare_eval_runners_in_dir(cache_dir: &Path) -> Result<(PathBuf, PathBuf)> {
         )
     })?;
 
-    let js_runner = materialize_runner_script(cache_dir, JS_RUNNER_FILE, JS_RUNNER_SOURCE)?;
+    // vite-node needs the impl as a sibling file because its `.mts` wrapper
+    // imports `main` from it. Every other runner uses the standalone default
+    // `.ts` (impl + fire-and-forget appended). Both are materialized so the
+    // runner-kind-aware path swap in `js_runner_path_for_kind` works.
+    materialize_runner_script(cache_dir, JS_RUNNER_IMPL_FILE, JS_RUNNER_IMPL_SOURCE)?;
+    materialize_runner_script(
+        cache_dir,
+        JS_RUNNER_VITE_NODE_FILE,
+        JS_RUNNER_VITE_NODE_SOURCE,
+    )?;
+    let js_runner = materialize_runner_script(
+        cache_dir,
+        JS_RUNNER_DEFAULT_FILE,
+        &js_runner_default_source(),
+    )?;
     let py_runner = materialize_runner_script(cache_dir, PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
     Ok((js_runner, py_runner))
 }
 
 fn materialize_runner_script(cache_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
-    let path = cache_dir.join(file_name);
-    let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() != Some(source) {
-        std::fs::write(&path, source)
-            .with_context(|| format!("failed to write eval runner script {}", path.display()))?;
-    }
-    Ok(path)
+    js_runner::materialize_runner_script(cache_dir, file_name, source)
 }
 
 #[derive(Debug)]
@@ -2556,6 +2655,20 @@ struct ExperimentSummary {
     comparison_experiment_name: Option<String>,
     scores: HashMap<String, ScoreSummary>,
     metrics: Option<HashMap<String, MetricSummary>>,
+    #[serde(default)]
+    run_mode: Option<String>,
+    #[serde(default)]
+    is_final: Option<bool>,
+    #[serde(default)]
+    run_label: Option<String>,
+    #[serde(default)]
+    sample_count: Option<u64>,
+    #[serde(default)]
+    sample_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compare_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compare_more: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2621,57 +2734,6 @@ struct SseDependenciesEventData {
     files: Vec<String>,
 }
 
-async fn forward_stream<T>(
-    stream: T,
-    name: &'static str,
-    tx: mpsc::UnboundedSender<EvalEvent>,
-) -> Result<()>
-where
-    T: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    while let Some(line) = lines.next_line().await? {
-        let _ = tx.send(EvalEvent::Console {
-            stream: name.to_string(),
-            message: line,
-        });
-    }
-    Ok(())
-}
-
-async fn read_sse_stream<T>(stream: T, tx: mpsc::UnboundedSender<EvalEvent>) -> Result<()>
-where
-    T: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    let mut event: Option<String> = None;
-    let mut data_lines: Vec<String> = Vec::new();
-
-    while let Some(line) = lines.next_line().await? {
-        if line.is_empty() {
-            if event.is_some() || !data_lines.is_empty() {
-                let data = data_lines.join("\n");
-                handle_sse_event(event.take(), data, &tx);
-                data_lines.clear();
-            }
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.trim_start().to_string());
-        }
-    }
-
-    if event.is_some() || !data_lines.is_empty() {
-        let data = data_lines.join("\n");
-        handle_sse_event(event.take(), data, &tx);
-    }
-
-    Ok(())
-}
-
 fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSender<EvalEvent>) {
     let event_name = event.unwrap_or_default();
     match event_name.as_str() {
@@ -2734,7 +2796,7 @@ fn handle_sse_event(event: Option<String>, data: String, tx: &mpsc::UnboundedSen
 
 struct EvalUi {
     progress: MultiProgress,
-    bars: HashMap<String, ProgressBar>,
+    bars: HashMap<String, EvalBarState>,
     bar_style: ProgressStyle,
     spinner_style: ProgressStyle,
     jsonl: bool,
@@ -2743,10 +2805,17 @@ struct EvalUi {
     deferred_errors: Vec<String>,
     suppressed_stderr_lines: usize,
     finished: bool,
+    profile: Option<String>,
+}
+
+struct EvalBarState {
+    bar: ProgressBar,
+    pending_total: Option<u64>,
+    last_total_update: Option<std::time::Instant>,
 }
 
 impl EvalUi {
-    fn new(jsonl: bool, list: bool, verbose: bool) -> Self {
+    fn new(jsonl: bool, list: bool, verbose: bool, profile: Option<String>) -> Self {
         let draw_target = if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet()
         {
             ProgressDrawTarget::stderr_with_hz(10)
@@ -2757,7 +2826,10 @@ impl EvalUi {
         let bar_style =
             ProgressStyle::with_template("{bar:10.blue} {msg} {percent}% {pos}/{len} {eta}")
                 .unwrap();
-        let spinner_style = ProgressStyle::with_template("{spinner} {msg}").unwrap();
+        let spinner_style = ProgressStyle::default_spinner()
+            .tick_strings(EVAL_SPINNER_TICK_STRINGS)
+            .template("{spinner:.cyan} {msg}")
+            .unwrap();
         Self {
             progress,
             bars: HashMap::new(),
@@ -2769,6 +2841,7 @@ impl EvalUi {
             deferred_errors: Vec::new(),
             suppressed_stderr_lines: 0,
             finished: false,
+            profile,
         }
     }
 
@@ -2776,8 +2849,8 @@ impl EvalUi {
         if self.finished {
             return;
         }
-        for (_, bar) in self.bars.drain() {
-            bar.finish_and_clear();
+        for (_, state) in self.bars.drain() {
+            state.bar.finish_and_clear();
         }
         let _ = self.progress.clear();
         self.progress.set_draw_target(ProgressDrawTarget::hidden());
@@ -2796,6 +2869,7 @@ impl EvalUi {
                 }
             }
             EvalEvent::Summary(summary) => {
+                let summary = enrich_experiment_summary(summary, self.profile.as_deref());
                 if self.jsonl {
                     if let Ok(line) = serde_json::to_string(&summary) {
                         println!("{line}");
@@ -2821,11 +2895,10 @@ impl EvalUi {
             EvalEvent::Error { message, stack, .. } => {
                 let show_hint = message.contains("Please specify an api key");
                 if self.verbose {
-                    let line = message.as_str().red().to_string();
-                    let _ = self.progress.println(line);
+                    self.print_persistent_line(message.as_str().red().to_string());
                     if let Some(stack) = stack {
                         for line in stack.lines() {
-                            let _ = self.progress.println(line.dark_grey().to_string());
+                            self.print_persistent_line(line.dark_grey().to_string());
                         }
                     }
                 } else {
@@ -2855,43 +2928,133 @@ impl EvalUi {
         match payload.kind.as_str() {
             "start" => {
                 let bar = if let Some(total) = payload.total {
-                    if total > 0 {
+                    if total >= EVAL_MIN_DETERMINATE_TOTAL {
                         let bar = self.progress.add(ProgressBar::new(total));
                         bar.set_style(self.bar_style.clone());
                         bar
                     } else {
                         let bar = self.progress.add(ProgressBar::new_spinner());
                         bar.set_style(self.spinner_style.clone());
+                        if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                            bar.enable_steady_tick(Duration::from_millis(80));
+                        }
                         bar
                     }
                 } else {
                     let bar = self.progress.add(ProgressBar::new_spinner());
                     bar.set_style(self.spinner_style.clone());
+                    if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
+                        bar.enable_steady_tick(Duration::from_millis(80));
+                    }
                     bar
                 };
                 bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
-                self.bars.insert(progress.name.clone(), bar);
+                let last_total_update = if bar.length().is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                self.bars.insert(
+                    progress.name.clone(),
+                    EvalBarState {
+                        bar,
+                        pending_total: None,
+                        last_total_update,
+                    },
+                );
             }
             "increment" => {
-                if let Some(bar) = self.bars.get(&progress.name) {
-                    bar.inc(1);
-                    bar.set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
+                if let Some(state) = self.bars.get_mut(&progress.name) {
+                    state.bar.inc(1);
+                    state
+                        .bar
+                        .set_message(fit_name_to_spaces(&progress.name, MAX_NAME_LENGTH));
+                    Self::ensure_total_not_below_position(state, &self.bar_style);
+                    Self::maybe_apply_pending_total(state, &self.bar_style, false);
                 }
             }
             "set_total" => {
-                if let Some(bar) = self.bars.get(&progress.name) {
+                if let Some(state) = self.bars.get_mut(&progress.name) {
                     if let Some(total) = payload.total {
-                        bar.set_length(total);
-                        bar.set_style(self.bar_style.clone());
+                        let target = total.max(state.bar.position());
+                        state.pending_total = Some(
+                            state
+                                .pending_total
+                                .map_or(target, |pending| pending.max(target)),
+                        );
+                        let force_apply = state.bar.length().is_none();
+                        Self::maybe_apply_pending_total(state, &self.bar_style, force_apply);
                     }
                 }
             }
             "stop" => {
-                if let Some(bar) = self.bars.remove(&progress.name) {
-                    bar.finish_and_clear();
+                if let Some(mut state) = self.bars.remove(&progress.name) {
+                    Self::maybe_apply_pending_total(&mut state, &self.bar_style, true);
+                    state.bar.finish_and_clear();
                 }
             }
             _ => {}
+        }
+    }
+
+    fn min_total_update_step(current_total: u64) -> u64 {
+        EVAL_TOTAL_SMOOTH_MIN_STEP.max(current_total / EVAL_TOTAL_SMOOTH_DELTA_DIVISOR)
+    }
+
+    fn should_apply_total_update(state: &EvalBarState, target_total: u64) -> bool {
+        let current_total = state.bar.length().unwrap_or(0);
+        if current_total == 0 {
+            return true;
+        }
+        let delta = target_total.saturating_sub(current_total);
+        if delta >= Self::min_total_update_step(current_total) {
+            return true;
+        }
+        state
+            .last_total_update
+            .map(|instant| instant.elapsed() >= EVAL_TOTAL_SMOOTH_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    fn apply_total_update(state: &mut EvalBarState, style: &ProgressStyle, total: u64) {
+        let clamped = total.max(state.bar.position());
+        state.bar.disable_steady_tick();
+        state.bar.set_length(clamped);
+        state.bar.set_style(style.clone());
+        state.last_total_update = Some(std::time::Instant::now());
+    }
+
+    fn maybe_apply_pending_total(state: &mut EvalBarState, style: &ProgressStyle, force: bool) {
+        let mut target_total = match state.pending_total {
+            Some(total) => total,
+            None => return,
+        };
+
+        target_total = target_total.max(state.bar.position());
+        if state.bar.length().is_none() && target_total < EVAL_MIN_DETERMINATE_TOTAL {
+            return;
+        }
+        let current_total = state.bar.length().unwrap_or(0);
+        if target_total <= current_total {
+            state.pending_total = None;
+            return;
+        }
+
+        if force || Self::should_apply_total_update(state, target_total) {
+            Self::apply_total_update(state, style, target_total);
+            state.pending_total = None;
+        }
+    }
+
+    fn ensure_total_not_below_position(state: &mut EvalBarState, style: &ProgressStyle) {
+        if let Some(total) = state.bar.length() {
+            let position = state.bar.position();
+            if position > total {
+                Self::apply_total_update(state, style, position);
+                if let Some(pending_total) = state.pending_total {
+                    state.pending_total = Some(pending_total.max(position));
+                }
+            }
         }
     }
 
@@ -3037,6 +3200,15 @@ fn format_start_line(start: &ExperimentStart) -> Option<String> {
 fn format_experiment_summary(summary: &ExperimentSummary) -> String {
     let mut parts: Vec<String> = Vec::new();
 
+    if let Some(run_label) = summary.run_label.as_deref() {
+        let line = if summary.is_final == Some(false) {
+            run_label.yellow().to_string()
+        } else {
+            run_label.to_string()
+        };
+        parts.push(line);
+    }
+
     if let Some(comparison) = summary.comparison_experiment_name.as_deref() {
         let line = format!(
             "{baseline} {baseline_tag} ← {comparison_name} {comparison_tag}",
@@ -3057,359 +3229,186 @@ fn format_experiment_summary(summary: &ExperimentSummary) -> String {
 
     if has_scores || has_metrics {
         let has_comparison = summary.comparison_experiment_name.is_some();
-        let mut rows: Vec<Vec<Line>> = Vec::new();
-
-        let header = if has_comparison {
-            Some(vec![
-                header_line("Name"),
-                header_line("Value"),
-                header_line("Change"),
-                header_line("Improvements"),
-                header_line("Regressions"),
-            ])
-        } else {
-            None
-        };
+        let columns = experiment_summary_columns(summary);
+        let mut rows: Vec<SummaryMetricRow> = Vec::new();
 
         let mut score_values: Vec<_> = summary.scores.values().collect();
         score_values.sort_by(|a, b| a.name.cmp(&b.name));
         for score in score_values {
-            let score_percent =
-                Line::from(format!("{:.2}%", score.score * 100.0)).alignment(Alignment::Right);
-            let diff = format_diff_line(score.diff);
-            let improvements = format_improvements_line(score.improvements);
-            let regressions = format_regressions_line(score.regressions);
-            let name = truncate_plain(&score.name, MAX_NAME_LENGTH);
-            let name = Line::from(vec![
-                Span::styled("◯", Style::default().fg(Color::Blue)),
-                Span::raw(" "),
-                Span::raw(name),
-            ]);
-            if has_comparison {
-                rows.push(vec![name, score_percent, diff, improvements, regressions]);
-            } else {
-                rows.push(vec![name, score_percent]);
-            }
+            rows.push(score_summary_row(score, has_comparison));
         }
 
         if let Some(metrics) = &summary.metrics {
             let mut metric_values: Vec<_> = metrics.values().collect();
             metric_values.sort_by(|a, b| a.name.cmp(&b.name));
             for metric in metric_values {
-                let formatted_value = Line::from(format_metric_value(metric.metric, &metric.unit))
-                    .alignment(Alignment::Right);
-                let diff = format_diff_line(metric.diff);
-                let improvements = format_improvements_line(metric.improvements);
-                let regressions = format_regressions_line(metric.regressions);
-                let name = truncate_plain(&metric.name, MAX_NAME_LENGTH);
-                let name = Line::from(vec![
-                    Span::styled("◯", Style::default().fg(Color::Magenta)),
-                    Span::raw(" "),
-                    Span::raw(name),
-                ]);
-                if has_comparison {
-                    rows.push(vec![name, formatted_value, diff, improvements, regressions]);
-                } else {
-                    rows.push(vec![name, formatted_value]);
-                }
+                rows.push(metric_summary_row(metric, has_comparison));
             }
         }
 
-        parts.push(render_table_ratatui(header, rows, has_comparison));
+        parts.push(render_experiment_summary_table(
+            &columns,
+            &rows,
+            &SummaryTableOptions {
+                show_all_rows: false,
+                hidden_rows_message: Some("zero/no-change rows omitted".to_string()),
+            },
+        ));
     }
 
     if let Some(url) = &summary.experiment_url {
         parts.push(format!("See results at {url}"));
     }
 
+    if let Some(command) = format_experiment_compare_command(summary) {
+        parts.push(command);
+    }
+
     let content = parts.join("\n\n");
     box_with_title("Experiment summary", &content)
 }
 
-fn format_diff_line(diff: Option<f64>) -> Line<'static> {
-    match diff {
-        Some(value) => {
-            let sign = if value > 0.0 { "+" } else { "" };
-            let percent = format!("{sign}{:.2}%", value * 100.0);
-            let style = if value > 0.0 {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::Red)
-            };
-            Line::from(Span::styled(percent, style)).alignment(Alignment::Right)
-        }
-        None => Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
-            .alignment(Alignment::Right),
+fn experiment_summary_columns(summary: &ExperimentSummary) -> Vec<SummaryExperimentColumn> {
+    if let Some(baseline) = summary.comparison_experiment_name.as_deref() {
+        vec![
+            SummaryExperimentColumn {
+                name: baseline.to_string(),
+                role: Some("baseline".to_string()),
+            },
+            SummaryExperimentColumn {
+                name: summary.experiment_name.clone(),
+                role: Some("comparison".to_string()),
+            },
+        ]
+    } else {
+        vec![SummaryExperimentColumn {
+            name: summary.experiment_name.clone(),
+            role: None,
+        }]
     }
 }
 
-fn format_improvements_line(value: i64) -> Line<'static> {
-    if value > 0 {
-        Line::from(Span::styled(
-            value.to_string(),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::DIM),
-        ))
-        .alignment(Alignment::Right)
-    } else {
-        Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
-            .alignment(Alignment::Right)
-    }
-}
-
-fn format_regressions_line(value: i64) -> Line<'static> {
-    if value > 0 {
-        Line::from(Span::styled(
-            value.to_string(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
-        ))
-        .alignment(Alignment::Right)
-    } else {
-        Line::from(Span::styled("-", Style::default().fg(Color::DarkGray)))
-            .alignment(Alignment::Right)
-    }
-}
-
-fn format_metric_value(metric: f64, unit: &str) -> String {
-    let formatted = if metric.fract() == 0.0 {
-        format!("{metric:.0}")
-    } else {
-        format!("{metric:.2}")
+fn score_summary_row(score: &ScoreSummary, has_comparison: bool) -> SummaryMetricRow {
+    let comparison_cell = SummaryMetricCell {
+        value: Some(score.score),
+        delta: score.diff,
+        improvements: score.improvements,
+        regressions: score.regressions,
     };
-    if unit == "$" {
-        format!("{unit}{formatted}")
-    } else {
-        format!("{formatted}{unit}")
+    SummaryMetricRow {
+        name: score.name.clone(),
+        kind: SummaryMetricKind::Score,
+        unit: Some("%".to_string()),
+        cells: summary_cells(comparison_cell, has_comparison),
     }
 }
 
-fn render_table_ratatui(
-    header: Option<Vec<Line<'static>>>,
-    rows: Vec<Vec<Line<'static>>>,
+fn metric_summary_row(metric: &MetricSummary, has_comparison: bool) -> SummaryMetricRow {
+    let comparison_cell = SummaryMetricCell {
+        value: Some(metric.metric),
+        delta: metric.diff,
+        improvements: metric.improvements,
+        regressions: metric.regressions,
+    };
+    SummaryMetricRow {
+        name: metric.name.clone(),
+        kind: SummaryMetricKind::Metric,
+        unit: summary_metric_unit(&metric.name, Some(&metric.unit)),
+        cells: summary_cells(comparison_cell, has_comparison),
+    }
+}
+
+fn summary_cells(
+    comparison_cell: SummaryMetricCell,
     has_comparison: bool,
-) -> String {
-    if rows.is_empty() {
-        return String::new();
+) -> Vec<SummaryMetricCell> {
+    if has_comparison {
+        let baseline_value = comparison_cell
+            .value
+            .zip(comparison_cell.delta)
+            .map(|(value, delta)| value - delta);
+        vec![
+            SummaryMetricCell {
+                value: baseline_value,
+                delta: None,
+                improvements: 0,
+                regressions: 0,
+            },
+            comparison_cell,
+        ]
+    } else {
+        vec![SummaryMetricCell {
+            delta: None,
+            improvements: 0,
+            regressions: 0,
+            ..comparison_cell
+        }]
     }
-
-    let columns = if has_comparison { 5 } else { 2 };
-    let mut widths = vec![0usize; columns];
-
-    if let Some(header_row) = &header {
-        for (idx, line) in header_row.iter().enumerate().take(columns) {
-            widths[idx] = widths[idx].max(line.width());
-        }
-    }
-
-    for row in &rows {
-        for (idx, line) in row.iter().enumerate().take(columns) {
-            widths[idx] = widths[idx].max(line.width());
-        }
-    }
-
-    let column_spacing = 2;
-    let total_width = widths.iter().sum::<usize>() + column_spacing * (columns - 1);
-    let mut height = rows.len();
-    if header.is_some() {
-        height += 1;
-    }
-    let backend = TestBackend::new(total_width as u16, height as u16);
-    let mut terminal = Terminal::new(backend).expect("failed to create table backend");
-
-    let table_rows = rows.into_iter().map(|row| {
-        let cells = row.into_iter().map(Cell::new).collect::<Vec<_>>();
-        Row::new(cells)
-    });
-
-    let mut table = Table::new(
-        table_rows,
-        widths.iter().map(|w| Constraint::Length(*w as u16)),
-    )
-    .column_spacing(column_spacing as u16);
-
-    if let Some(header_row) = header {
-        let header_cells = header_row.into_iter().map(Cell::new).collect::<Vec<_>>();
-        table = table.header(Row::new(header_cells));
-    }
-
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            frame.render_widget(table, area);
-        })
-        .expect("failed to render table");
-
-    let buffer = terminal.backend().buffer();
-    buffer_to_ansi_lines(buffer).join("\n")
 }
 
-fn header_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_string(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
+const COMPARE_MORE_HINT: &str = "append more experiment names at the end; max 7 comparisons";
+
+fn enrich_experiment_summary(
+    mut summary: ExperimentSummary,
+    profile: Option<&str>,
+) -> ExperimentSummary {
+    if summary.compare_command.is_none() {
+        summary.compare_command = build_experiment_compare_command(&summary, profile);
+    }
+    if summary.compare_command.is_some() && summary.compare_more.is_none() {
+        summary.compare_more = Some(COMPARE_MORE_HINT.to_string());
+    }
+    summary
+}
+
+fn format_experiment_compare_command(summary: &ExperimentSummary) -> Option<String> {
+    let command = summary
+        .compare_command
+        .clone()
+        .or_else(|| build_experiment_compare_command(summary, None))?;
+    let compare_more = summary.compare_more.as_deref().unwrap_or(COMPARE_MORE_HINT);
+
+    Some(format!(
+        "compare_command: {command}\ncompare_more: {compare_more}"
     ))
 }
 
-fn truncate_plain(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
-        return text.to_string();
+fn build_experiment_compare_command(
+    summary: &ExperimentSummary,
+    profile: Option<&str>,
+) -> Option<String> {
+    let baseline = summary.comparison_experiment_name.as_deref()?.trim();
+    if baseline.is_empty() {
+        return None;
     }
-    if max_len <= 3 {
-        return text.chars().take(max_len).collect();
+    let project = summary.project_name.trim();
+    let experiment = summary.experiment_name.trim();
+    if project.is_empty() || experiment.is_empty() {
+        return None;
     }
-    let truncated: String = text.chars().take(max_len - 3).collect();
-    format!("{truncated}...")
+
+    let profile_args = profile
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| format!(" --profile {}", shell_quote_arg(profile)))
+        .unwrap_or_default();
+
+    Some(format!(
+        "bt experiments compare{profile_args} -p {} {} {}",
+        shell_quote_arg(project),
+        shell_quote_arg(baseline),
+        shell_quote_arg(experiment),
+    ))
 }
 
-fn box_with_title(title: &str, content: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let content_width = lines
-        .iter()
-        .map(|line| visible_width(line))
-        .max()
-        .unwrap_or(0);
-    let padding = 1;
-    let inner_width = content_width + padding * 2;
-
-    let title_plain = format!(" {title} ");
-    let title_width = visible_width(&title_plain);
-    let mut top = String::from("╭");
-    top.push_str(&title_plain.dark_grey().to_string());
-    if inner_width > title_width {
-        top.push_str(&"─".repeat(inner_width - title_width));
-    }
-    top.push('╮');
-
-    let mut boxed = vec![top];
-    for line in lines {
-        let line_width = visible_width(line);
-        // Defensive: if width accounting ever drifts (e.g. escape-sequence parsing),
-        // avoid underflow and render without extra trailing padding.
-        let right_padding = inner_width.saturating_sub(line_width + padding);
-        let mut row = String::from("│");
-        row.push_str(&" ".repeat(padding));
-        row.push_str(line);
-        row.push_str(&" ".repeat(right_padding));
-        row.push('│');
-        boxed.push(row);
-    }
-
-    let bottom = format!("╰{}╯", "─".repeat(inner_width));
-    boxed.push(bottom);
-
-    format!("\n{}", boxed.join("\n"))
-}
-
-fn visible_width(text: &str) -> usize {
-    let stripped = strip(text.as_bytes());
-    let stripped = String::from_utf8_lossy(&stripped);
-    UnicodeWidthStr::width(stripped.as_ref())
-}
-
-fn buffer_to_ansi_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
-    let width = buffer.area.width as usize;
-    let height = buffer.area.height as usize;
-    let mut lines = Vec::with_capacity(height);
-    let mut current_style = Style::reset();
-
-    for y in 0..height {
-        let mut line = String::new();
-        let mut skip = 0usize;
-        for x in 0..width {
-            let cell = &buffer[(x as u16, y as u16)];
-            let symbol = cell.symbol();
-            let symbol_width = UnicodeWidthStr::width(symbol);
-            if skip > 0 {
-                skip -= 1;
-                continue;
-            }
-
-            let style = Style {
-                fg: Some(cell.fg),
-                bg: Some(cell.bg),
-                add_modifier: cell.modifier,
-                ..Style::default()
-            };
-
-            if style != current_style {
-                line.push_str(&style_to_ansi(style));
-                current_style = style;
-            }
-
-            line.push_str(symbol);
-            skip = symbol_width.saturating_sub(1);
-        }
-        line.push_str(&style_to_ansi(Style::reset()));
-        lines.push(line.trim_end().to_string());
-    }
-
-    lines
-}
-
-fn style_to_ansi(style: Style) -> String {
-    let mut buf = Vec::new();
-    let _ = queue!(buf, SetAttribute(Attribute::Reset), ResetColor);
-
-    if let Some(fg) = style.fg {
-        let _ = queue!(buf, SetForegroundColor(convert_color(fg)));
-    }
-    if let Some(bg) = style.bg {
-        let _ = queue!(buf, SetBackgroundColor(convert_color(bg)));
-    }
-
-    let mods = style.add_modifier;
-    if mods.contains(Modifier::BOLD) {
-        let _ = queue!(buf, SetAttribute(Attribute::Bold));
-    }
-    if mods.contains(Modifier::DIM) {
-        let _ = queue!(buf, SetAttribute(Attribute::Dim));
-    }
-    if mods.contains(Modifier::ITALIC) {
-        let _ = queue!(buf, SetAttribute(Attribute::Italic));
-    }
-    if mods.contains(Modifier::UNDERLINED) {
-        let _ = queue!(buf, SetAttribute(Attribute::Underlined));
-    }
-    if mods.contains(Modifier::REVERSED) {
-        let _ = queue!(buf, SetAttribute(Attribute::Reverse));
-    }
-    if mods.contains(Modifier::CROSSED_OUT) {
-        let _ = queue!(buf, SetAttribute(Attribute::CrossedOut));
-    }
-    if mods.contains(Modifier::SLOW_BLINK) {
-        let _ = queue!(buf, SetAttribute(Attribute::SlowBlink));
-    }
-    if mods.contains(Modifier::RAPID_BLINK) {
-        let _ = queue!(buf, SetAttribute(Attribute::RapidBlink));
-    }
-
-    String::from_utf8_lossy(&buf).to_string()
-}
-
-fn convert_color(color: Color) -> CtColor {
-    match color {
-        Color::Reset => CtColor::Reset,
-        Color::Black => CtColor::Black,
-        Color::Red => CtColor::Red,
-        Color::Green => CtColor::Green,
-        Color::Yellow => CtColor::Yellow,
-        Color::Blue => CtColor::Blue,
-        Color::Magenta => CtColor::Magenta,
-        Color::Cyan => CtColor::Cyan,
-        Color::Gray => CtColor::Grey,
-        Color::DarkGray => CtColor::DarkGrey,
-        Color::LightRed => CtColor::Red,
-        Color::LightGreen => CtColor::Green,
-        Color::LightYellow => CtColor::Yellow,
-        Color::LightBlue => CtColor::Blue,
-        Color::LightMagenta => CtColor::Magenta,
-        Color::LightCyan => CtColor::Cyan,
-        Color::White => CtColor::White,
-        Color::Indexed(value) => CtColor::AnsiValue(value),
-        Color::Rgb(r, g, b) => CtColor::Rgb { r, g, b },
+fn shell_quote_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
@@ -3499,6 +3498,24 @@ mod tests {
         path
     }
 
+    fn eval_progress_event(name: &str, kind: &str, total: Option<u64>) -> SseProgressEventData {
+        SseProgressEventData {
+            id: format!("id-{kind}"),
+            object_type: "task".to_string(),
+            origin: None,
+            format: "global".to_string(),
+            output_type: "any".to_string(),
+            name: name.to_string(),
+            event: "progress".to_string(),
+            data: serde_json::json!({
+                "type": "eval_progress",
+                "kind": kind,
+                "total": total,
+            })
+            .to_string(),
+        }
+    }
+
     #[test]
     fn join_app_url_normalizes_slashes() {
         let joined =
@@ -3563,10 +3580,34 @@ mod tests {
         let (js_runner, py_runner) =
             prepare_eval_runners_in_dir(&dir).expect("embedded runners should be materialized");
 
-        let js = fs::read_to_string(js_runner).expect("js runner should be readable");
+        let js = fs::read_to_string(&js_runner).expect("js runner should be readable");
         let py = fs::read_to_string(py_runner).expect("python runner should be readable");
-        assert_eq!(js, JS_RUNNER_SOURCE);
+        assert_eq!(js, js_runner_default_source());
         assert_eq!(py, PY_RUNNER_SOURCE);
+
+        // The shared impl and vite-node entry are materialized alongside the
+        // default entry so vite-node's `.mts` can import the impl as a sibling.
+        let impl_path = dir.join(JS_RUNNER_IMPL_FILE);
+        let vite_node_path = dir.join(JS_RUNNER_VITE_NODE_FILE);
+        assert_eq!(
+            fs::read_to_string(&impl_path).expect("impl should be readable"),
+            JS_RUNNER_IMPL_SOURCE
+        );
+        assert_eq!(
+            fs::read_to_string(&vite_node_path).expect("vite-node entry should be readable"),
+            JS_RUNNER_VITE_NODE_SOURCE
+        );
+
+        // The vite-node entry sits in the same directory as the default entry,
+        // which is what `js_runner_path_for_kind` relies on.
+        assert_eq!(
+            js_runner_path_for_kind(&js_runner, RunnerKind::ViteNode),
+            vite_node_path
+        );
+        assert_eq!(
+            js_runner_path_for_kind(&js_runner, RunnerKind::Tsx),
+            js_runner
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4005,6 +4046,44 @@ mod tests {
     }
 
     #[test]
+    fn js_runner_entries_have_their_expected_shapes() {
+        // The default entry must use fire-and-forget so non-vite-node hosts
+        // (which observe the full event loop) keep main()'s pending promises
+        // alive after the module body returns.
+        let default_source = js_runner_default_source();
+        assert!(
+            default_source.contains("main().catch"),
+            "default entry should fire main() without awaiting"
+        );
+        assert!(
+            !default_source.contains("await main()"),
+            "default entry should not use top-level await"
+        );
+        // The default entry is standalone (impl + fire-and-forget appended),
+        // not an import-based wrapper. ts-node and Deno can't agree on `.ts`
+        // import extensions, so we inline.
+        assert!(
+            default_source.contains("export async function main"),
+            "default entry should be the impl body plus the fire-and-forget tail"
+        );
+        assert!(
+            !default_source.contains("from \"./eval-runner-impl"),
+            "default entry should be standalone, not import the impl"
+        );
+
+        // The vite-node entry must use TLA so vite-node's CLI waits for main()
+        // before tearing down its dev server. See scripts/eval-runner-vite-node.mts.
+        assert!(
+            JS_RUNNER_VITE_NODE_SOURCE.contains("await main()"),
+            "vite-node entry must await main() at the top level"
+        );
+        assert!(
+            JS_RUNNER_VITE_NODE_SOURCE.contains("from \"./eval-runner-impl.js\""),
+            "vite-node entry should import main from the sibling impl"
+        );
+    }
+
+    #[test]
     fn set_node_heap_size_env_sets_default_when_absent() {
         let _guard = env_test_lock()
             .lock()
@@ -4093,10 +4172,11 @@ mod tests {
         assert!(message.contains("pnpm add -D vite-node"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn build_sse_socket_path_is_unique_for_consecutive_calls() {
-        let first = build_sse_socket_path().expect("first socket path");
-        let second = build_sse_socket_path().expect("second socket path");
+        let first = runner_sse::build_sse_socket_path("bt-eval").expect("first socket path");
+        let second = runner_sse::build_sse_socket_path("bt-eval").expect("second socket path");
         assert_ne!(first, second);
     }
 
@@ -4132,6 +4212,78 @@ mod tests {
         let encoded = encode_eval_event_for_http(&event).expect("progress should be forwarded");
         assert!(encoded.contains("event: progress"));
         assert!(encoded.contains("json_delta"));
+    }
+
+    #[test]
+    fn eval_ui_preserves_spinner_increments_before_set_total() {
+        let mut ui = EvalUi::new(false, false, false, None);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(10)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(bar.bar.position(), 2);
+        assert_eq!(bar.bar.length(), Some(10));
+
+        ui.finish();
+    }
+
+    #[test]
+    fn eval_ui_never_sets_total_below_position() {
+        let mut ui = EvalUi::new(false, false, false, None);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", Some(1)));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "increment", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(1)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert!(
+            bar.bar
+                .length()
+                .expect("determinate bar should have a total")
+                >= bar.bar.position()
+        );
+
+        ui.finish();
+    }
+
+    #[test]
+    fn eval_ui_keeps_spinner_until_total_exceeds_one() {
+        let mut ui = EvalUi::new(false, false, false, None);
+        let eval_name = "My evaluation";
+
+        ui.handle_progress(eval_progress_event(eval_name, "start", None));
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(1)));
+
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(bar.bar.length(), None, "total=1 should remain spinner mode");
+
+        ui.handle_progress(eval_progress_event(eval_name, "set_total", Some(2)));
+        let bar = ui
+            .bars
+            .get(eval_name)
+            .expect("progress bar should still exist");
+        assert_eq!(
+            bar.bar.length(),
+            Some(2),
+            "total>1 should become determinate"
+        );
+
+        ui.finish();
     }
 
     #[test]
@@ -4231,6 +4383,369 @@ mod tests {
     }
 
     #[test]
+    fn handle_sse_event_parses_summary_run_metadata() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_sse_event(
+            Some("summary".to_string()),
+            r#"{
+              "projectName":"Topics",
+              "experimentName":"sample-run",
+              "scores":{},
+              "runMode":"sample",
+              "isFinal":false,
+              "runLabel":"Run mode: random sample of 20 examples (seed 7, non-final smoke run)",
+              "sampleCount":20,
+              "sampleSeed":7
+            }"#
+            .to_string(),
+            &tx,
+        );
+
+        match rx.try_recv().expect("summary event should be emitted") {
+            EvalEvent::Summary(summary) => {
+                assert_eq!(summary.run_mode.as_deref(), Some("sample"));
+                assert_eq!(summary.is_final, Some(false));
+                assert_eq!(
+                    summary.run_label.as_deref(),
+                    Some("Run mode: random sample of 20 examples (seed 7, non-final smoke run)")
+                );
+                assert_eq!(summary.sample_count, Some(20));
+                assert_eq!(summary.sample_seed, Some(7));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_experiment_summary_includes_run_label() {
+        let summary = ExperimentSummary {
+            project_name: "Demo".to_string(),
+            experiment_name: "sample-run".to_string(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: None,
+            scores: HashMap::new(),
+            metrics: None,
+            run_mode: Some("first".to_string()),
+            is_final: Some(false),
+            run_label: Some("Run mode: first 20 examples (non-final smoke run)".to_string()),
+            sample_count: Some(20),
+            sample_seed: None,
+            compare_command: None,
+            compare_more: None,
+        };
+
+        let rendered = format_experiment_summary(&summary);
+        assert!(rendered.contains("Run mode: first 20 examples (non-final smoke run)"));
+    }
+
+    #[test]
+    fn format_experiment_summary_includes_compare_command_for_comparison() {
+        let summary = ExperimentSummary {
+            project_name: "test-project".to_string(),
+            experiment_name: "challenger-a".to_string(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: Some(
+                "https://www.example.test/app/test-org/p/test-project/experiments/challenger-a"
+                    .to_string(),
+            ),
+            comparison_experiment_name: Some("baseline".to_string()),
+            scores: HashMap::new(),
+            metrics: None,
+            run_mode: None,
+            is_final: None,
+            run_label: None,
+            sample_count: None,
+            sample_seed: None,
+            compare_command: None,
+            compare_more: None,
+        };
+
+        let rendered = format_experiment_summary(&summary);
+
+        assert!(rendered.contains(
+            "compare_command: bt experiments compare -p test-project baseline challenger-a"
+        ));
+        assert!(rendered.contains("compare_more: append more experiment names at the end"));
+    }
+
+    #[test]
+    fn format_experiment_summary_treats_time_to_first_token_as_seconds() {
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "time_to_first_token".to_string(),
+            MetricSummary {
+                name: "time_to_first_token".to_string(),
+                metric: 1.23,
+                unit: "tok".to_string(),
+                diff: None,
+                improvements: 0,
+                regressions: 0,
+            },
+        );
+
+        let summary = ExperimentSummary {
+            project_name: "test-project".to_string(),
+            experiment_name: "challenger-a".to_string(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: None,
+            scores: HashMap::new(),
+            metrics: Some(metrics),
+            run_mode: None,
+            is_final: None,
+            run_label: None,
+            sample_count: None,
+            sample_seed: None,
+            compare_command: None,
+            compare_more: None,
+        };
+
+        let rendered = format_experiment_summary(&summary);
+
+        assert!(rendered.contains("1.23s"));
+        assert!(!rendered.contains("1.23tok"));
+    }
+
+    #[test]
+    fn enrich_experiment_summary_adds_compare_command_for_jsonl() {
+        let summary = ExperimentSummary {
+            project_name: "test-project".to_string(),
+            experiment_name: "challenger-a".to_string(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: Some("baseline".to_string()),
+            scores: HashMap::new(),
+            metrics: None,
+            run_mode: None,
+            is_final: None,
+            run_label: None,
+            sample_count: None,
+            sample_seed: None,
+            compare_command: None,
+            compare_more: None,
+        };
+
+        let summary = enrich_experiment_summary(summary, None);
+
+        assert_eq!(
+            summary.compare_command.as_deref(),
+            Some("bt experiments compare -p test-project baseline challenger-a")
+        );
+        assert_eq!(summary.compare_more.as_deref(), Some(COMPARE_MORE_HINT));
+    }
+
+    #[test]
+    fn enrich_experiment_summary_preserves_profile_in_compare_command() {
+        let summary = ExperimentSummary {
+            project_name: "test-project".to_string(),
+            experiment_name: "challenger-a".to_string(),
+            project_id: None,
+            experiment_id: None,
+            project_url: None,
+            experiment_url: None,
+            comparison_experiment_name: Some("baseline".to_string()),
+            scores: HashMap::new(),
+            metrics: None,
+            run_mode: None,
+            is_final: None,
+            run_label: None,
+            sample_count: None,
+            sample_seed: None,
+            compare_command: None,
+            compare_more: None,
+        };
+
+        let summary = enrich_experiment_summary(summary, Some("test-profile"));
+
+        assert_eq!(
+            summary.compare_command.as_deref(),
+            Some("bt experiments compare --profile test-profile -p test-project baseline challenger-a")
+        );
+    }
+
+    #[test]
+    fn parse_eval_params_handles_key_value_pairs() {
+        let params = vec![
+            r#"myModel="gpt-4o""#.to_string(),
+            "enabled=true".to_string(),
+            "count=42".to_string(),
+        ];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["myModel"], serde_json::json!("gpt-4o"));
+        assert_eq!(result["enabled"], serde_json::json!(true));
+        assert_eq!(result["count"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn parse_eval_params_handles_json_object() {
+        let params = vec![r#"{"myModel":"gpt-4o","enabled":true}"#.to_string()];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["myModel"], serde_json::json!("gpt-4o"));
+        assert_eq!(result["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn parse_eval_params_last_key_value_wins() {
+        let params = vec![
+            r#"model="first""#.to_string(),
+            r#"model="second""#.to_string(),
+        ];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["model"], serde_json::json!("second"));
+    }
+
+    #[test]
+    fn parse_eval_params_treats_non_json_value_as_string() {
+        let params = vec!["model=gpt-4o".to_string()];
+        let result = parse_eval_params(&params).expect("should parse");
+        assert_eq!(result["model"], serde_json::json!("gpt-4o"));
+    }
+
+    #[test]
+    fn parse_eval_params_rejects_missing_equals() {
+        let params = vec!["modelonly".to_string()];
+        let err = parse_eval_params(&params).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key=JSON_VALUE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_eval_params_rejects_empty_key() {
+        let params = vec![r#"="value""#.to_string()];
+        let err = parse_eval_params(&params).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_single_axis_multiple_values() {
+        let raw = vec!["model=\"gpt-4\",\"gpt-5\"".to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(axes.len(), 1);
+        assert_eq!(axes[0].0, "model");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!("gpt-4"), serde_json::json!("gpt-5"),]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_bare_strings_fallback() {
+        let raw = vec!["model=gpt-4,gpt-5".to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!("gpt-4"), serde_json::json!("gpt-5"),]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_mixed_types() {
+        let raw = vec!["enableBashTool=true,false".to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!(true), serde_json::json!(false)]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_duplicate_key() {
+        let raw = vec!["model=a,b".to_string(), "model=c,d".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("specified more than once"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_empty_key() {
+        let raw = vec!["=a,b".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_missing_equals() {
+        let raw = vec!["modelonly".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("key=V1,V2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_rejects_empty_values() {
+        let raw = vec!["model=".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("at least one value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_allows_values_with_commas() {
+        let raw = vec![r#"prompt=["hello, world","goodbye, friend"]"#.to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![
+                serde_json::json!("hello, world"),
+                serde_json::json!("goodbye, friend"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_supports_nested_json() {
+        let raw = vec![r#"tools=[[1,2],[3,4]]"#.to_string()];
+        let axes = parse_matrix_params(&raw).expect("should parse");
+        assert_eq!(
+            axes[0].1,
+            vec![serde_json::json!([1, 2]), serde_json::json!([3, 4])]
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_rejects_empty() {
+        let raw = vec!["model=[]".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("at least one value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_matrix_params_json_array_rejects_malformed() {
+        let raw = vec!["model=[\"a\"".to_string()];
+        let err = parse_matrix_params(&raw).expect_err("should fail");
+        assert!(
+            err.to_string().contains("not a valid JSON array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn parse_eval_filter_expression_splits_path_and_pattern() {
         let parsed =
             parse_eval_filter_expression("metadata.case=smoke.*").expect("parse should succeed");
@@ -4263,6 +4778,52 @@ mod tests {
     }
 
     #[test]
+    fn eval_args_parse_first_sampling_flag() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+
+        let parsed = EvalArgsHarness::try_parse_from(["bt", "--first", "20", "sample.eval.ts"])
+            .expect("first flag should parse");
+        assert_eq!(parsed.eval.first, Some(20));
+        assert_eq!(parsed.eval.sample, None);
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
+    fn eval_args_parse_sample_and_seed_flags() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let previous: Vec<(&str, Option<String>)> =
+            keys.iter().map(|key| (*key, clear_env_var(key))).collect();
+
+        let parsed = EvalArgsHarness::try_parse_from([
+            "bt",
+            "--sample",
+            "20",
+            "--sample-seed",
+            "7",
+            "sample.eval.ts",
+        ])
+        .expect("sample flags should parse");
+        assert_eq!(parsed.eval.sample, Some(20));
+        assert_eq!(parsed.eval.sample_seed, Some(7));
+        assert_eq!(parsed.eval.first, None);
+
+        for (key, value) in previous {
+            restore_env_var(key, value);
+        }
+    }
+
+    #[test]
     fn eval_args_from_env_populates_supported_fields() {
         let _guard = env_test_lock()
             .lock()
@@ -4273,7 +4834,9 @@ mod tests {
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
-            "BT_EVAL_VERBOSE",
+            "BT_EVAL_FIRST",
+            "BT_EVAL_SAMPLE",
+            "BT_EVAL_SAMPLE_SEED",
             "BT_EVAL_WATCH",
             "BT_EVAL_DEV",
             "BT_EVAL_DEV_HOST",
@@ -4287,7 +4850,6 @@ mod tests {
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
-        set_env_var("BT_EVAL_VERBOSE", "1");
         set_env_var("BT_EVAL_WATCH", "on");
         set_env_var("BT_EVAL_DEV", "true");
         set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
@@ -4307,7 +4869,6 @@ mod tests {
                 "metadata.kind=fast".to_string()
             ]
         );
-        assert!(parsed.eval.verbose);
         assert!(parsed.eval.watch);
         assert!(parsed.eval.dev);
         assert_eq!(parsed.eval.dev_host, "127.0.0.1");

@@ -2,7 +2,6 @@ use std::fmt::Write as _;
 
 use anyhow::{anyhow, bail, Result};
 use dialoguer::console;
-use urlencoding::encode;
 
 use crate::ui::prompt_render::{
     render_code_lines, render_content_lines, render_options, render_prompt_block,
@@ -10,13 +9,16 @@ use crate::ui::prompt_render::{
 use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
 };
+use crate::utils::app_project_url_with_encoded_path;
+use crate::{http::ApiClient, projects::api as projects_api};
 
 use super::{api, build_web_path, label, label_plural, select_function_interactive};
-use super::{FunctionTypeFilter, ResolvedContext};
+use super::{AuthContext, FunctionTypeFilter, ResolvedContext};
 
 pub async fn run(
     ctx: &ResolvedContext,
     slug: Option<&str>,
+    version: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
@@ -26,7 +28,7 @@ pub async fn run(
     let function = match slug {
         Some(s) => with_spinner(
             &format!("Loading {}...", label(ft)),
-            api::get_function_by_slug(&ctx.client, project_id, s),
+            api::get_function_by_slug(&ctx.client, project_id, s, version),
         )
         .await?
         .ok_or_else(|| anyhow!("{} with slug '{s}' not found", label(ft)))?,
@@ -38,19 +40,88 @@ pub async fn run(
                     label_plural(ft),
                 );
             }
-            select_function_interactive(&ctx.client, project_id, ft).await?
+            let selected = select_function_interactive(&ctx.client, project_id, ft).await?;
+            if let Some(version) = version {
+                with_spinner(
+                    &format!("Loading {}...", label(ft)),
+                    api::get_function_by_slug(
+                        &ctx.client,
+                        project_id,
+                        &selected.slug,
+                        Some(version),
+                    ),
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{} with slug '{}' not found at version {version}",
+                        label(ft),
+                        selected.slug
+                    )
+                })?
+            } else {
+                selected
+            }
         }
     };
 
+    render_function(
+        &ctx.client,
+        &ctx.app_url,
+        Some(&ctx.project.name),
+        &function,
+        json,
+        web,
+        verbose,
+    )
+    .await
+}
+
+pub async fn run_by_id(
+    ctx: &AuthContext,
+    id: &str,
+    version: Option<&str>,
+    json: bool,
+    web: bool,
+    verbose: bool,
+    ft: Option<FunctionTypeFilter>,
+) -> Result<()> {
+    let function = with_spinner(
+        &format!("Loading {}...", label(ft)),
+        api::get_function_by_id(&ctx.client, id, version),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("{} with id '{id}' not found", label(ft)))?;
+
+    render_function(
+        &ctx.client,
+        &ctx.app_url,
+        None,
+        &function,
+        json,
+        web,
+        verbose,
+    )
+    .await
+}
+
+async fn render_function(
+    client: &ApiClient,
+    app_url: &str,
+    project_name: Option<&str>,
+    function: &api::Function,
+    json: bool,
+    web: bool,
+    verbose: bool,
+) -> Result<()> {
     if web {
-        let path = build_web_path(&function);
-        let url = format!(
-            "{}/app/{}/p/{}/{}",
-            ctx.app_url.trim_end_matches('/'),
-            encode(ctx.client.org_name()),
-            encode(&ctx.project.name),
-            path
-        );
+        let path = build_web_path(function);
+        let project_name = match project_name {
+            Some(project_name) => project_name.to_string(),
+            None => resolve_project_name(client, &function.project_id).await?,
+        };
+        let url =
+            app_project_url_with_encoded_path(app_url, client.org_name(), &project_name, &path);
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());
@@ -63,6 +134,12 @@ pub async fn run(
 
     let mut output = String::new();
     writeln!(output, "Viewing {}", console::style(&function.name).bold())?;
+    writeln!(
+        output,
+        "{} {}",
+        console::style("Slug:").dim(),
+        function.slug
+    )?;
 
     if let Some(ft) = &function.function_type {
         writeln!(output, "{} {}", console::style("Type:").dim(), ft)?;
@@ -260,13 +337,16 @@ pub async fn run(
                             writeln!(output, "  {name}")?;
                         }
                     }
-                    let path = build_web_path(&function);
-                    let url = format!(
-                        "{}/app/{}/p/{}/{}",
-                        ctx.app_url.trim_end_matches('/'),
-                        encode(ctx.client.org_name()),
-                        encode(&ctx.project.name),
-                        path
+                    let path = build_web_path(function);
+                    let project_name = match project_name {
+                        Some(project_name) => project_name.to_string(),
+                        None => resolve_project_name(client, &function.project_id).await?,
+                    };
+                    let url = app_project_url_with_encoded_path(
+                        app_url,
+                        client.org_name(),
+                        &project_name,
+                        &path,
                     );
                     writeln!(
                         output,
@@ -313,6 +393,15 @@ pub async fn run(
 
     print_with_pager(&output)?;
     Ok(())
+}
+
+async fn resolve_project_name(client: &ApiClient, project_id: &str) -> Result<String> {
+    let projects = with_spinner("Loading project...", projects_api::list_projects(client)).await?;
+    projects
+        .into_iter()
+        .find(|project| project.id == project_id)
+        .map(|project| project.name)
+        .ok_or_else(|| anyhow!("project '{project_id}' not found for function"))
 }
 
 fn render_prompt_value(output: &mut String, val: &serde_json::Value) -> Result<()> {

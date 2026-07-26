@@ -2,8 +2,10 @@ name: release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
+    paths:
+      - Cargo.toml
   workflow_dispatch:
     inputs:
       tag:
@@ -11,8 +13,14 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
+  id-token: write
+  checks: write
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -25,22 +33,52 @@ jobs:
       tag: ${{ steps.resolve-tag.outputs.tag }}
       tag-flag: ${{ steps.resolve-tag.outputs.tag_flag }}
       release-version: ${{ steps.resolve-tag.outputs.release_version }}
+      should-release: ${{ steps.resolve-tag.outputs.should_release }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - id: resolve-tag
         name: Resolve release tag
         shell: bash
         run: |
+          set -euo pipefail
+
+          should_release=true
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             tag="${{ inputs.tag }}"
-          else
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             tag="${{ github.ref_name }}"
+          else
+            version="$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)"
+            if [ -z "$version" ]; then
+              echo "Failed to parse version from Cargo.toml" >&2
+              exit 1
+            fi
+
+            previous_version=""
+            before_sha="${{ github.event.before }}"
+            if [ -n "$before_sha" ] && [ "$before_sha" != "0000000000000000000000000000000000000000" ]; then
+              if git cat-file -e "${before_sha}^{commit}" 2>/dev/null && git show "${before_sha}:Cargo.toml" >/dev/null 2>&1; then
+                previous_version="$(git show "${before_sha}:Cargo.toml" | grep -m1 '^version = "' | cut -d '"' -f2 || true)"
+              fi
+            fi
+
+            tag="v${version}"
+            if [ "$version" = "$previous_version" ]; then
+              echo "Cargo.toml version is unchanged (${version}); no release needed."
+              should_release=false
+            elif git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "Tag ${tag} already exists; nothing to release."
+              should_release=false
+            fi
           fi
 
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -51,8 +89,17 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "tag_flag=--tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release_version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$tag" > release-tag.txt
+
+      - name: Upload resolved release tag
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-metadata
+          path: release-tag.txt
 
       - name: Configure git auth for private dependencies
+        if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
         run: |
           token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
@@ -62,16 +109,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dist
+        if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
 
       - name: Cache dist
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.resolve-tag.outputs.should_release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
 
       - id: plan
+        if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
         run: |
           dist host --steps=create --tag="${{ steps.resolve-tag.outputs.tag }}" --output-format=json > plan-dist-manifest.json
@@ -80,7 +130,8 @@ jobs:
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dist plan manifest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.resolve-tag.outputs.should_release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
@@ -89,20 +140,24 @@ jobs:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
+    if: ${{ needs.plan.outputs.should-release == 'true' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
+    # OIDC token subject must match the AAD federated credential, which is
+    # scoped to the `release` environment.
+    environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_SUBSCRIPTION_ID != '' }}
     steps:
       - name: Enable windows longpaths
         run: git config --global core.longpaths true
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -124,11 +179,19 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
 
+      - name: Install sha256sum (macOS ARM64)
+        if: ${{ runner.os == 'macOS' && runner.arch == 'ARM64' }}
+        shell: bash
+        run: |
+          printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > /tmp/sha256sum
+          chmod +x /tmp/sha256sum
+          echo /tmp >> "$GITHUB_PATH"
+
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
 
       - name: Fetch local artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -137,6 +200,21 @@ jobs:
       - name: Install dependencies
         run: ${{ matrix.packages_install }}
 
+        # https://github.com/azure/artifact-signing-action
+        # As of 2026-06-23, windows arm runners are not supported so the compilation and signing of bt.exe for aarch64 windows needs to happend on x64 windows
+      - name: Set up MSVC cross-compilation for Windows ARM64
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: amd64_arm64
+
+      - name: Set MSVC ARM64 linker for cargo cross-compilation
+        if: ${{ contains(matrix.targets, 'aarch64-pc-windows-msvc') }}
+        shell: pwsh
+        run: |
+          $link = (Get-Command link.exe -ErrorAction Stop).Source
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$link" >> $env:GITHUB_ENV
+
       - name: Build artifacts
         shell: bash
         run: |
@@ -144,6 +222,27 @@ jobs:
           BT_VERSION_STRING="${{ needs.plan.outputs.release-version }}" \
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+
+      - name: Sign Windows artifacts
+        id: sign
+        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/sign-windows-artifacts
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          cert-profile: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
+
+      - name: Verify Windows signature and report
+        if: ${{ runner.os == 'Windows' && env.HAS_AZURE_SIGNING == 'true' && always() }}
+        uses: ./.github/actions/verify-windows-signature
+        with:
+          sign-outcome: ${{ steps.sign.outcome }}
+          targets: ${{ join(matrix.targets, ', ') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - id: dist-files
         name: Post-build
@@ -155,7 +254,7 @@ jobs:
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
@@ -166,12 +265,13 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+    if: ${{ needs.plan.outputs.should-release == 'true' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -186,7 +286,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cached dist
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
@@ -194,7 +294,7 @@ jobs:
       - run: chmod +x ~/.cargo/bin/dist
 
       - name: Fetch local artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -213,7 +313,7 @@ jobs:
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-global
           path: |
@@ -225,14 +325,14 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    if: ${{ always() && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.outputs.should-release == 'true' && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
@@ -247,7 +347,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cached dist
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
@@ -255,7 +355,7 @@ jobs:
       - run: chmod +x ~/.cargo/bin/dist
 
       - name: Fetch artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -270,7 +370,7 @@ jobs:
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dist manifest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-dist-manifest
           path: dist-manifest.json
@@ -284,13 +384,13 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
 
       - name: Download GitHub artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: artifacts
@@ -332,11 +432,11 @@ jobs:
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version
 
-      - name: Verify self-update check
+      - name: Verify update check
         shell: bash
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
-          bt self update --check --channel stable
+          bt update --check --channel stable
 
   smoke-install-macos:
     needs:
@@ -359,7 +459,7 @@ jobs:
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version
-          bt self update --check --channel stable
+          bt update --check --channel stable
 
   smoke-install-windows:
     needs:
@@ -387,4 +487,70 @@ jobs:
           }
           & $btExe --version
           $env:PATH = "$binDir;$env:PATH"
-          & $btExe self update --check --channel stable
+          & $btExe update --check --channel stable
+
+  publish-npm:
+    needs:
+      - plan
+      - announce
+    if: ${{ needs.announce.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: npm-publish
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download release archives
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p archives
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern 'bt-*.tar.gz' \
+            --pattern 'bt-*.zip' \
+            --dir archives
+          ls -la archives
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22.15.0"
+          registry-url: "https://registry.npmjs.org"
+      - name: Use npm 11.12.1
+        run: npm install -g npm@11.12.1
+
+      - name: Build npm packages
+        run: |
+          node npm/scripts/build-platform-packages.mjs \
+            --version "${{ needs.plan.outputs.release-version }}" \
+            --archives-dir archives \
+            --out-dir npm/dist
+
+      - name: Publish platform packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          package_dirs=(npm/dist/bt-*)
+          if [ "${#package_dirs[@]}" -eq 0 ]; then
+            echo "No npm platform packages found in npm/dist" >&2
+            exit 1
+          fi
+          for dir in "${package_dirs[@]}"; do
+            name="$(node -p "require('./$dir/package.json').name")"
+            version="$(node -p "require('./$dir/package.json').version")"
+            # Skip already-published versions so a partial publish can be re-run.
+            # Test output, not exit code: npm view is empty for a missing version.
+            published="$(npm view "$name@$version" version 2>/dev/null || true)"
+            if [ -n "$published" ]; then
+              echo "Skipping $name@$version (already published)"
+              continue
+            fi
+            echo "Publishing $name@$version"
+            (cd "$dir" && npm publish --access public)
+          done

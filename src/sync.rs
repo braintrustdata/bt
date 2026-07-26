@@ -26,6 +26,9 @@ use crate::experiments::api::create_experiment;
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
+use crate::utils::{app_project_url, parse_duration_to_seconds};
+
+pub(crate) mod discovery;
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
@@ -38,11 +41,22 @@ const BTQL_MAX_ATTEMPTS: usize = 5;
 const BTQL_RETRY_BASE_DELAY_MS: u64 = 300;
 const BTQL_MAX_BACKOFF_SECS: u64 = 8;
 const PULL_OUTPUT_PART_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const LINE_COUNT_BUFFER_BYTES: usize = 1024 * 1024;
+const PUSH_BATCH_MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const PUSH_MAX_IN_FLIGHT_INPUT_BYTES: usize = 128 * 1024 * 1024;
 
 pub(crate) fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(DEFAULT_WORKERS_FALLBACK)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SyncPushFileArgs {
+    pub object_ref: String,
+    pub input: PathBuf,
+    pub root: PathBuf,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -96,13 +110,13 @@ struct PullArgs {
     #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
     page_size: usize,
 
-    /// Initial cursor for spans mode. Implies a fresh run.
+    /// Initial cursor for spans mode. Implies a forced restart.
     #[arg(long)]
     cursor: Option<String>,
 
     /// Ignore previous state and start over for this spec.
     #[arg(long)]
-    fresh: bool,
+    force: bool,
 
     /// Root directory for sync artifacts.
     #[arg(long, default_value = "bt-sync")]
@@ -115,10 +129,6 @@ struct PullArgs {
     /// Include stored vectors in pulled rows so a subsequent push can re-ingest them.
     #[arg(long)]
     include_vectors: bool,
-
-    /// Print each BTQL query and timing information.
-    #[arg(long, env = "BT_SYNC_VERBOSE")]
-    verbose: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -150,9 +160,9 @@ struct PushArgs {
     #[arg(long, default_value_t = DEFAULT_PAGE_SIZE)]
     page_size: usize,
 
-    /// Ignore previous state and start over for this spec.
+    /// Ignore previous state and upload this input again from the beginning.
     #[arg(long)]
-    fresh: bool,
+    force: bool,
 
     /// Root directory for sync artifacts.
     #[arg(long, default_value = "bt-sync")]
@@ -161,6 +171,22 @@ struct PushArgs {
     /// Number of concurrent workers for upload mode.
     #[arg(long, default_value_t = default_workers())]
     workers: usize,
+
+    /// Maximum approximate input bytes per upload batch.
+    #[arg(
+        long,
+        env = "BT_SYNC_PUSH_MAX_BATCH_BYTES",
+        default_value_t = PUSH_BATCH_MAX_INPUT_BYTES
+    )]
+    max_batch_bytes: usize,
+
+    /// Maximum approximate input bytes held by in-flight upload batches.
+    #[arg(
+        long,
+        env = "BT_SYNC_PUSH_MAX_IN_FLIGHT_BYTES",
+        default_value_t = PUSH_MAX_IN_FLIGHT_INPUT_BYTES
+    )]
+    max_in_flight_bytes: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -191,6 +217,10 @@ struct StatusArgs {
     /// Root directory for sync artifacts.
     #[arg(long, default_value = "bt-sync")]
     root: PathBuf,
+
+    /// Input path used by this push spec. Required with --direction push.
+    #[arg(long = "in")]
+    input: Option<PathBuf>,
 
     /// Include vector-aware pull specs when resolving status (pull direction only).
     #[arg(long)]
@@ -293,6 +323,8 @@ struct SyncSpec {
     page_size: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     include_vectors: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +436,8 @@ struct ResolvedPushDestination {
     object: ObjectRef,
     object_ref: String,
     project_id: String,
+    project_name: String,
+    object_name: String,
     run_id: Option<String>,
 }
 
@@ -412,13 +446,17 @@ struct ResolvedDestination {
     object: ObjectRef,
     object_ref: String,
     project_id: String,
+    project_name: String,
+    object_name: String,
     run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedNamedObjectTarget {
     object_id: String,
+    object_name: String,
     project_id: String,
+    project_name: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -437,6 +475,7 @@ impl DestinationMode {
 struct PushBatchWork {
     batch_index: usize,
     rows: Vec<Map<String, Value>>,
+    input_bytes: usize,
     end_line_offset: usize,
     distinct_roots_done: usize,
 }
@@ -445,6 +484,7 @@ struct PushBatchWork {
 struct PushBatchResult {
     batch_index: usize,
     row_count: usize,
+    input_bytes: usize,
     bytes_sent: u64,
     end_line_offset: usize,
     distinct_roots_done: usize,
@@ -536,27 +576,62 @@ struct JsonlPartWriter {
 }
 
 pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
-    let project = base
-        .project
-        .clone()
-        .or_else(|| crate::config::load().ok().and_then(|c| c.project));
-    match args.command {
+    let command = match args.command {
+        SyncCommand::Status(status) => return run_status(base.json, status),
+        command => command,
+    };
+
+    let ctx = login(&base).await?;
+    let client = ApiClient::new(&ctx)?;
+    let project = base.project.clone().or_else(|| {
+        crate::config::configured_project_for_context(&base, ctx.login.org_name().as_deref())
+    });
+
+    match command {
         SyncCommand::Pull(pull) => {
-            let ctx = login(&base).await?;
-            let client = ApiClient::new(&ctx)?;
-            run_pull(base.json, &ctx, &client, project.as_deref(), pull).await
+            let verbose = base.verbose_explicit();
+            run_pull(base.json, verbose, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
-            let ctx = login(&base).await?;
-            let client = ApiClient::new(&ctx)?;
             run_push(base.json, &ctx, &client, project.as_deref(), push).await
         }
-        SyncCommand::Status(status) => run_status(base.json, status),
+        SyncCommand::Status(_) => unreachable!(),
     }
+}
+
+pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> Result<()> {
+    let json_output = base.json;
+    let ctx = login(&base).await?;
+    let client = ApiClient::new(&ctx)?;
+    let project = base.project.clone().or_else(|| {
+        crate::config::configured_project_for_context(&base, ctx.login.org_name().as_deref())
+    });
+
+    run_push(
+        json_output,
+        &ctx,
+        &client,
+        project.as_deref(),
+        PushArgs {
+            object_ref: args.object_ref,
+            input: Some(args.input),
+            filter: None,
+            traces: None,
+            spans: None,
+            page_size: DEFAULT_PAGE_SIZE,
+            force: args.force,
+            root: args.root,
+            workers: default_workers(),
+            max_batch_bytes: PUSH_BATCH_MAX_INPUT_BYTES,
+            max_in_flight_bytes: PUSH_MAX_IN_FLIGHT_INPUT_BYTES,
+        },
+    )
+    .await
 }
 
 async fn run_pull(
     json_output: bool,
+    verbose: bool,
     ctx: &LoginContext,
     client: &ApiClient,
     project_selector: Option<&str>,
@@ -567,7 +642,7 @@ async fn run_pull(
     let object = parse_object_ref(&resolved_object_ref)?;
     let source_expr = btql_source_expr(&object)?;
     let (scope, limit) = resolve_pull_scope_and_limit(args.traces, args.spans)?;
-    let fresh = args.fresh || args.cursor.is_some();
+    let fresh = args.force || args.cursor.is_some();
 
     let user_filter = trim_optional(args.filter.clone());
     let window = args.window.clone();
@@ -585,6 +660,7 @@ async fn run_pull(
         limit: Some(limit),
         page_size: args.page_size,
         include_vectors: args.include_vectors,
+        input_path: None,
     };
 
     let spec_hash = spec_hash(&spec)?;
@@ -705,7 +781,6 @@ async fn run_pull(
         Some(RunStatus::Running),
     )?;
     let btql_retry_tracker = Arc::new(BtqlRetryTracker::default());
-    let verbose = args.verbose;
 
     match scope {
         ScopeArg::Spans => {
@@ -760,14 +835,15 @@ async fn run_pull(
     )?;
 
     if json_output {
+        let org_name = ctx.login.org_name().unwrap_or_default();
         let warning = if state.items_done == 0 {
             Some(format!(
                 "no rows found for {} in org '{}'; verify object id and active credentials",
                 spec.object_ref,
-                if ctx.login.org_name.trim().is_empty() {
+                if org_name.trim().is_empty() {
                     "(default)".to_string()
                 } else {
-                    ctx.login.org_name.clone()
+                    org_name.clone()
                 }
             ))
         } else {
@@ -795,10 +871,11 @@ async fn run_pull(
         let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
         let bytes_per_sec = state.bytes_written as f64 / elapsed_secs as f64;
         if state.items_done == 0 {
-            let org_label = if ctx.login.org_name.trim().is_empty() {
+            let org_name = ctx.login.org_name().unwrap_or_default();
+            let org_label = if org_name.trim().is_empty() {
                 "(default)".to_string()
             } else {
-                ctx.login.org_name.clone()
+                org_name
             };
             println!(
                 "Warning: no rows found for {} in org '{}'; verify object id and active credentials.",
@@ -1470,8 +1547,7 @@ async fn process_trace_chunk(
             let serialized = rows
                 .iter()
                 .map(|row| {
-                    let line =
-                        serde_json::to_string(row).context("failed to serialize trace row")?;
+                    let line = serialize_jsonl_value(row)?;
                     bytes_written += (line.len() + 1) as u64;
                     Result::<String>::Ok(line)
                 })
@@ -1576,8 +1652,19 @@ async fn run_push(
     args: PushArgs,
 ) -> Result<()> {
     let destination = resolve_push_destination(client, &args.object_ref, project_selector).await?;
+    let object_url = push_destination_url(&ctx.app_url, client.org_name(), &destination);
     let object = destination.object.clone();
     let (scope, limit) = resolve_push_scope_and_limit(args.traces, args.spans)?;
+
+    let input_path = if let Some(path) = args.input {
+        path
+    } else {
+        resolve_default_push_input(&args.root, &object)?
+    };
+    if !input_path.exists() {
+        bail!("input path does not exist: {}", input_path.display());
+    }
+    let input_identity = canonical_input_path(&input_path)?;
 
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
@@ -1591,6 +1678,7 @@ async fn run_push(
         limit,
         page_size: args.page_size,
         include_vectors: false,
+        input_path: Some(input_identity),
     };
     let spec_hash = spec_hash(&spec)?;
     let spec_dir = resolve_spec_dir(
@@ -1599,7 +1687,7 @@ async fn run_push(
         DirectionArg::Push,
         &scope,
         &spec_hash,
-        !args.fresh,
+        !args.force,
     )?;
     fs::create_dir_all(&spec_dir)
         .with_context(|| format!("failed to create {}", spec_dir.display()))?;
@@ -1609,16 +1697,7 @@ async fn run_push(
     let manifest_path = spec_dir.join("manifest.json");
     write_json_atomic(&spec_path, &spec)?;
 
-    let input_path = if let Some(path) = args.input {
-        path
-    } else {
-        resolve_default_push_input(&args.root, &object)?
-    };
-    if !input_path.exists() {
-        bail!("input path does not exist: {}", input_path.display());
-    }
-
-    let mut state = if args.fresh || !state_path.exists() {
+    let mut state = if args.force || !state_path.exists() {
         let mut state = new_push_state(
             scope.as_str().to_string(),
             limit,
@@ -1635,21 +1714,24 @@ async fn run_push(
     if let Some(run_id) = destination.run_id.as_deref() {
         if state.run_id != run_id {
             bail!(
-                "existing push state run_id '{}' does not match destination experiment id '{}'; rerun with --fresh",
+                "existing push state run_id '{}' does not match destination experiment id '{}'; rerun with --force",
                 state.run_id,
                 run_id
             );
         }
     }
 
-    if state.status == RunStatus::Completed && !args.fresh {
+    if state.status == RunStatus::Completed && !args.force {
+        update_manifest_from_push_state(&manifest_path, &spec_hash, &spec, &state, None)?;
         if json_output {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "completed",
-                    "message": "already completed for this spec",
+                    "message": "already completed for this spec; use --force to upload again",
                     "source_path": state.source_path,
+                    "checkpoint_path": state_path,
+                    "object_url": object_url,
                     "items_done": state.items_done,
                     "pages_done": state.pages_done
                 }))?
@@ -1659,6 +1741,9 @@ async fn run_push(
                 "Sync already completed for this spec. input={} items={} pages={}",
                 state.source_path, state.items_done, state.pages_done
             );
+            println!("  Use --force to upload this input again from the beginning.");
+            println!("  Checkpoint: {}", state_path.display());
+            println!("  URL: {object_url}");
         }
         return Ok(());
     }
@@ -1676,17 +1761,11 @@ async fn run_push(
 
     let project_id = destination.project_id.clone();
     let input_files = resolve_push_input_files(&input_path)?;
-    let upload_total = upload_total_for_progress(&input_files, &scope, limit)?;
+    let mut upload_total_task = spawn_upload_total_task(input_files.clone(), scope.clone(), limit);
+    let mut upload_total: Option<usize> = None;
 
-    let pb = if let Some(total) = upload_total {
-        bounded_bar(total as u64, "Uploading rows", "spans")
-    } else {
-        spinner_bar("Uploading rows")
-    };
+    let pb = spinner_bar("Uploading rows");
     pb.set_prefix("Uploading rows".to_string());
-    if let Some(total) = upload_total {
-        pb.set_position(state.items_done.min(total) as u64);
-    }
 
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_signal = Arc::clone(&interrupted);
@@ -1698,8 +1777,12 @@ async fn run_push(
 
     let uploader_template = Logs3BatchUploader::new(
         ctx.api_url.clone(),
-        ctx.login.api_key.clone(),
-        (!ctx.login.org_name.trim().is_empty()).then_some(ctx.login.org_name.clone()),
+        ctx.login
+            .api_key()
+            .context("login state missing API key for sync uploader")?,
+        ctx.login
+            .org_name()
+            .filter(|org_name| !org_name.trim().is_empty()),
     )
     .context("failed to initialize logs3 uploader")?;
 
@@ -1729,9 +1812,13 @@ async fn run_push(
     }
 
     let worker_count = args.workers.max(1);
+    let max_batch_bytes = args.max_batch_bytes.max(1);
+    let max_in_flight_bytes = args.max_in_flight_bytes.max(max_batch_bytes);
     let mut selected_count: usize = state.items_done;
     let mut batch_end_line_offset = state.line_offset;
     let mut batch_distinct_roots_done = state.distinct_roots_done;
+    let mut batch_input_bytes = 0usize;
+    let mut in_flight_input_bytes = 0usize;
     let mut next_batch_index = 0usize;
     let mut next_commit_index = 0usize;
     let mut pending_results: BTreeMap<usize, PushBatchResult> = BTreeMap::new();
@@ -1757,6 +1844,7 @@ async fn run_push(
             if line.trim().is_empty() {
                 continue;
             }
+            let row_input_bytes = line.len() + 1;
             let mut row: Map<String, Value> = serde_json::from_str(&line).with_context(|| {
                 format!(
                     "invalid JSON in {} at line {}",
@@ -1794,16 +1882,44 @@ async fn run_push(
             selected_count += 1;
             batch_end_line_offset = current_line_offset + 1;
             batch_distinct_roots_done = seen_roots.len();
+            batch_input_bytes = batch_input_bytes.saturating_add(row_input_bytes);
             batch.push(row);
 
-            if batch.len() >= args.page_size {
+            if batch.len() >= args.page_size || batch_input_bytes >= max_batch_bytes {
+                while push_upload_needs_backpressure(
+                    join_set.len(),
+                    worker_count,
+                    in_flight_input_bytes,
+                    batch_input_bytes,
+                    max_in_flight_bytes,
+                ) {
+                    wait_for_push_upload_result(
+                        &mut join_set,
+                        &mut pending_results,
+                        &mut in_flight_input_bytes,
+                        &mut next_commit_index,
+                        &mut state,
+                        &state_path,
+                        &pb,
+                        &mut upload_total_task,
+                        &mut upload_total,
+                        push_phase_started_at,
+                        push_baseline_roots_done,
+                        push_baseline_items_done,
+                        push_baseline_bytes_sent,
+                    )
+                    .await?;
+                }
+
                 let work = PushBatchWork {
                     batch_index: next_batch_index,
                     rows: std::mem::take(&mut batch),
+                    input_bytes: batch_input_bytes,
                     end_line_offset: batch_end_line_offset,
                     distinct_roots_done: batch_distinct_roots_done,
                 };
                 next_batch_index += 1;
+                in_flight_input_bytes = in_flight_input_bytes.saturating_add(work.input_bytes);
                 spawn_push_upload_task(
                     &mut join_set,
                     uploader_template.clone(),
@@ -1812,39 +1928,46 @@ async fn run_push(
                 );
                 batch_end_line_offset = state.line_offset;
                 batch_distinct_roots_done = state.distinct_roots_done;
-
-                while join_set.len() >= worker_count {
-                    let result = join_set
-                        .join_next()
-                        .await
-                        .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
-                        .context("push upload worker join failed")??;
-                    pending_results.insert(result.batch_index, result);
-                    flush_ready_push_results(
-                        &mut pending_results,
-                        &mut next_commit_index,
-                        &mut state,
-                        &state_path,
-                        &pb,
-                        upload_total,
-                        push_phase_started_at,
-                        push_baseline_roots_done,
-                        push_baseline_items_done,
-                        push_baseline_bytes_sent,
-                    )?;
-                }
+                batch_input_bytes = 0;
             }
         }
     }
 
     if !batch.is_empty() && !interrupted.load(Ordering::SeqCst) {
+        while push_upload_needs_backpressure(
+            join_set.len(),
+            worker_count,
+            in_flight_input_bytes,
+            batch_input_bytes,
+            max_in_flight_bytes,
+        ) {
+            wait_for_push_upload_result(
+                &mut join_set,
+                &mut pending_results,
+                &mut in_flight_input_bytes,
+                &mut next_commit_index,
+                &mut state,
+                &state_path,
+                &pb,
+                &mut upload_total_task,
+                &mut upload_total,
+                push_phase_started_at,
+                push_baseline_roots_done,
+                push_baseline_items_done,
+                push_baseline_bytes_sent,
+            )
+            .await?;
+        }
+
         let work = PushBatchWork {
             batch_index: next_batch_index,
             rows: std::mem::take(&mut batch),
+            input_bytes: batch_input_bytes,
             end_line_offset: batch_end_line_offset,
             distinct_roots_done: batch_distinct_roots_done,
         };
         next_batch_index += 1;
+        in_flight_input_bytes = in_flight_input_bytes.saturating_add(work.input_bytes);
         spawn_push_upload_task(
             &mut join_set,
             uploader_template.clone(),
@@ -1855,6 +1978,7 @@ async fn run_push(
 
     while let Some(joined) = join_set.join_next().await {
         let result = joined.context("push upload worker join failed")??;
+        in_flight_input_bytes = in_flight_input_bytes.saturating_sub(result.input_bytes);
         pending_results.insert(result.batch_index, result);
         flush_ready_push_results(
             &mut pending_results,
@@ -1868,6 +1992,17 @@ async fn run_push(
             push_baseline_items_done,
             push_baseline_bytes_sent,
         )?;
+        update_upload_total_if_ready(
+            &mut upload_total_task,
+            &mut upload_total,
+            &state,
+            &pb,
+            push_phase_started_at,
+            push_baseline_roots_done,
+            push_baseline_items_done,
+            push_baseline_bytes_sent,
+        )
+        .await?;
     }
 
     if !pending_results.is_empty() || next_commit_index != next_batch_index {
@@ -1878,6 +2013,9 @@ async fn run_push(
 
     let was_interrupted = interrupted.load(Ordering::SeqCst);
     ctrlc_task.abort();
+    if let Some(task) = upload_total_task.take() {
+        task.abort();
+    }
 
     if was_interrupted {
         state.status = RunStatus::Interrupted;
@@ -1899,10 +2037,11 @@ async fn run_push(
                     "status": "interrupted",
                     "spec_dir": spec_dir,
                     "input_path": input_path,
+                    "object_url": object_url,
                     "rows_uploaded": state.items_done,
                     "pages_done": state.pages_done,
                     "bytes_sent": state.bytes_sent,
-                    "message": "resume by rerunning the same command; use --fresh to restart"
+                    "message": "resume by rerunning the same command; use --force to restart"
                 }))?
             );
         } else {
@@ -1913,7 +2052,8 @@ async fn run_push(
                 format_usize_commas(state.pages_done),
                 format_u64_commas(state.bytes_sent)
             );
-            println!("  Resume: rerun the same command (use --fresh to restart)");
+            println!("  Resume: rerun the same command (use --force to restart)");
+            println!("  URL: {object_url}");
         }
         return Ok(());
     }
@@ -1938,6 +2078,7 @@ async fn run_push(
                 "status": "completed",
                 "spec_dir": spec_dir,
                 "input_path": input_path,
+                "object_url": object_url,
                 "rows_uploaded": state.items_done,
                 "pages_done": state.pages_done,
                 "bytes_sent": state.bytes_sent
@@ -1951,6 +2092,7 @@ async fn run_push(
         let spans_per_sec = spans_done as f64 / elapsed_secs as f64;
         let bytes_per_sec = state.bytes_sent as f64 / elapsed_secs as f64;
         println!("Push complete");
+        println!("  URL: {object_url}");
         println!("  Input: {}", input_path.display());
         println!("  Time: {}", format_duration(elapsed_secs));
         println!("  Traces: {}", format_usize_commas(traces_done));
@@ -1971,9 +2113,47 @@ async fn run_push(
     Ok(())
 }
 
+fn push_destination_url(
+    app_url: &str,
+    org_name: &str,
+    destination: &ResolvedPushDestination,
+) -> String {
+    let project_name = if destination.project_name.trim().is_empty() {
+        destination.project_id.as_str()
+    } else {
+        destination.project_name.as_str()
+    };
+    let object_name = if destination.object_name.trim().is_empty() {
+        destination.object.object_name.as_str()
+    } else {
+        destination.object_name.as_str()
+    };
+    let path_segments: Vec<&str> = match destination.object.object_type {
+        ObjectType::ProjectLogs => vec!["logs"],
+        ObjectType::Experiment => vec!["experiments", object_name],
+        ObjectType::Dataset => vec!["datasets", object_name],
+    };
+    app_project_url(app_url, org_name, project_name, &path_segments)
+}
+
 fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
     let object = parse_object_ref(&args.object_ref)?;
     let (scope, limit) = resolve_status_scope_and_limit(args.traces, args.spans)?;
+    let input_path = match args.direction {
+        DirectionArg::Pull => {
+            if args.input.is_some() {
+                bail!("--in can only be used with --direction push");
+            }
+            None
+        }
+        DirectionArg::Push => {
+            let input = args
+                .input
+                .as_deref()
+                .context("--in is required with --direction push")?;
+            Some(canonical_input_path(input)?)
+        }
+    };
 
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
@@ -1987,6 +2167,7 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
         limit,
         page_size: args.page_size,
         include_vectors: matches!(args.direction, DirectionArg::Pull) && args.include_vectors,
+        input_path,
     };
     let spec_hash = spec_hash(&spec)?;
     let spec_dir = resolve_spec_dir(
@@ -2003,6 +2184,12 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
 
     if !spec_dir.exists() {
         bail!("no sync state found for spec at {}", spec_dir.display());
+    }
+
+    if matches!(args.direction, DirectionArg::Push) && state_path.exists() {
+        let state = read_json_file::<PushState>(&state_path)?;
+        write_json_atomic(&spec_path, &spec)?;
+        update_manifest_from_push_state(&manifest_path, &spec_hash, &spec, &state, None)?;
     }
 
     let mut output = BTreeMap::<String, Value>::new();
@@ -2047,18 +2234,23 @@ fn run_status(json_output: bool, args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_btql_query(
+async fn execute_btql_request<Q, T>(
     client: &ApiClient,
     ctx: &LoginContext,
-    query: &str,
+    query: &Q,
+    query_source: &str,
     btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
-) -> Result<BtqlResponse> {
+) -> Result<T>
+where
+    Q: Serialize + ?Sized,
+    T: DeserializeOwned,
+{
     let body = json!({
         "query": query,
         "fmt": "json",
-        "query_source": "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
+        "query_source": query_source,
     });
-    let org_name = ctx.login.org_name.clone();
+    let org_name = ctx.login.org_name().unwrap_or_default();
     let client = client.clone();
     let attempt_counter = Arc::new(AtomicUsize::new(0));
 
@@ -2091,7 +2283,7 @@ async fn execute_btql_query(
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            return response.json::<BtqlResponse>().await.map_err(|err| {
+                            return response.json::<T>().await.map_err(|err| {
                                 BackoffError::permanent(anyhow!("failed to parse BTQL response: {err}"))
                             });
                         }
@@ -2136,6 +2328,31 @@ async fn execute_btql_query(
         let attempts = attempt_counter.load(Ordering::Relaxed).max(1);
         anyhow!(err).context(format!("BTQL request failed after {attempts} attempt(s)"))
     })
+}
+
+async fn execute_btql_query(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &str,
+    btql_retry_tracker: Option<Arc<BtqlRetryTracker>>,
+) -> Result<BtqlResponse> {
+    execute_btql_request(
+        client,
+        ctx,
+        query,
+        "bt_sync_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d",
+        btql_retry_tracker,
+    )
+    .await
+}
+
+async fn execute_btql_json_query<T: DeserializeOwned>(
+    client: &ApiClient,
+    ctx: &LoginContext,
+    query: &Value,
+    query_source: &str,
+) -> Result<T> {
+    execute_btql_request(client, ctx, query, query_source, None).await
 }
 
 async fn execute_btql_query_timed(
@@ -2307,8 +2524,7 @@ async fn discover_vector_specs_global(
     } else {
         if verbose {
             eprintln!(
-                "btql[vector_models] unexpected models shape: {}; no vectors will be fetched.",
-                models
+                "btql[vector_models] unexpected models shape: {models}; no vectors will be fetched."
             );
         }
         return Ok(specs);
@@ -2594,30 +2810,6 @@ fn build_root_spans_query(
     parts.join(" | ")
 }
 
-fn parse_duration_to_seconds(input: &str) -> Result<u64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("duration cannot be empty");
-    }
-    if let Ok(seconds) = trimmed.parse::<u64>() {
-        return Ok(seconds);
-    }
-
-    let (num_str, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
-    let value: u64 = num_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid duration '{input}'"))?;
-    let multiplier = match unit.to_ascii_lowercase().as_str() {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 60 * 60 * 24,
-        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
-    };
-    Ok(value.saturating_mul(multiplier))
-}
-
 fn build_time_filter_clause(window: &str, extra_filter: Option<&str>) -> Result<String> {
     let seconds = parse_duration_to_seconds(window)?;
     let time_clause = format!("created >= NOW() - INTERVAL {seconds} SECOND");
@@ -2652,11 +2844,128 @@ fn spawn_push_upload_task(
         Ok(PushBatchResult {
             batch_index: work.batch_index,
             row_count: work.rows.len(),
+            input_bytes: work.input_bytes,
             bytes_sent: bytes as u64,
             end_line_offset: work.end_line_offset,
             distinct_roots_done: work.distinct_roots_done,
         })
     });
+}
+
+fn push_upload_needs_backpressure(
+    active_uploads: usize,
+    worker_count: usize,
+    in_flight_input_bytes: usize,
+    next_batch_input_bytes: usize,
+    max_in_flight_input_bytes: usize,
+) -> bool {
+    if active_uploads == 0 {
+        return false;
+    }
+    active_uploads >= worker_count
+        || in_flight_input_bytes.saturating_add(next_batch_input_bytes) > max_in_flight_input_bytes
+}
+
+fn spawn_upload_total_task(
+    input_files: Vec<PathBuf>,
+    scope: ScopeArg,
+    limit: Option<usize>,
+) -> Option<tokio::task::JoinHandle<Result<Option<usize>>>> {
+    if !push_progress_total_needs_line_count(&scope) {
+        return None;
+    }
+
+    Some(tokio::task::spawn_blocking(move || {
+        upload_total_for_progress(&input_files, &scope, limit)
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_push_upload_result(
+    join_set: &mut tokio::task::JoinSet<Result<PushBatchResult>>,
+    pending_results: &mut BTreeMap<usize, PushBatchResult>,
+    in_flight_input_bytes: &mut usize,
+    next_commit_index: &mut usize,
+    state: &mut PushState,
+    state_path: &Path,
+    pb: &ProgressBar,
+    upload_total_task: &mut Option<tokio::task::JoinHandle<Result<Option<usize>>>>,
+    upload_total: &mut Option<usize>,
+    push_phase_started_at: u64,
+    push_baseline_roots_done: usize,
+    push_baseline_items_done: usize,
+    push_baseline_bytes_sent: u64,
+) -> Result<()> {
+    let result = join_set
+        .join_next()
+        .await
+        .ok_or_else(|| anyhow!("push upload worker queue unexpectedly empty"))?
+        .context("push upload worker join failed")??;
+    *in_flight_input_bytes = in_flight_input_bytes.saturating_sub(result.input_bytes);
+    pending_results.insert(result.batch_index, result);
+    flush_ready_push_results(
+        pending_results,
+        next_commit_index,
+        state,
+        state_path,
+        pb,
+        *upload_total,
+        push_phase_started_at,
+        push_baseline_roots_done,
+        push_baseline_items_done,
+        push_baseline_bytes_sent,
+    )?;
+    update_upload_total_if_ready(
+        upload_total_task,
+        upload_total,
+        state,
+        pb,
+        push_phase_started_at,
+        push_baseline_roots_done,
+        push_baseline_items_done,
+        push_baseline_bytes_sent,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_upload_total_if_ready(
+    upload_total_task: &mut Option<tokio::task::JoinHandle<Result<Option<usize>>>>,
+    upload_total: &mut Option<usize>,
+    state: &PushState,
+    pb: &ProgressBar,
+    push_phase_started_at: u64,
+    push_baseline_roots_done: usize,
+    push_baseline_items_done: usize,
+    push_baseline_bytes_sent: u64,
+) -> Result<()> {
+    if upload_total.is_some()
+        || !upload_total_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    {
+        return Ok(());
+    }
+
+    let total = upload_total_task
+        .take()
+        .expect("checked task above")
+        .await
+        .context("push row count task failed")??;
+    if let Some(total) = total {
+        configure_upload_progress_bar(pb, total);
+        *upload_total = Some(total);
+        pb.set_position(state.items_done.min(total) as u64);
+        pb.set_message(push_progress_message_with_baseline(
+            state,
+            push_phase_started_at,
+            push_baseline_roots_done,
+            push_baseline_items_done,
+            push_baseline_bytes_sent,
+            *upload_total,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2924,7 +3233,9 @@ async fn resolve_destination(
             Ok(ResolvedDestination {
                 object_ref: format!("project_logs:{}", project.id),
                 object,
-                project_id: project.id,
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                object_name: project.name,
                 run_id: None,
             })
         }
@@ -2958,6 +3269,8 @@ async fn resolve_destination(
                 object_ref: format!("experiment:{}", resolved.object_id),
                 object,
                 project_id: resolved.project_id,
+                project_name: resolved.project_name,
+                object_name: resolved.object_name,
                 run_id,
             })
         }
@@ -2982,6 +3295,8 @@ async fn resolve_destination(
                 object_ref: format!("dataset:{}", resolved.object_id),
                 object,
                 project_id: resolved.project_id,
+                project_name: resolved.project_name,
+                object_name: resolved.object_name,
                 run_id: None,
             })
         }
@@ -3038,7 +3353,9 @@ async fn resolve_named_object_target(
         )?;
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
+            object_name: object.name.clone(),
             project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3054,7 +3371,9 @@ async fn resolve_named_object_target(
         if let Some(object) = objects.iter().find(|value| value.id == object_selector) {
             return Ok(ResolvedNamedObjectTarget {
                 object_id: object.id.clone(),
+                object_name: object.name.clone(),
                 project_id: project.id.clone(),
+                project_name: project.name.clone(),
             });
         }
     }
@@ -3104,7 +3423,9 @@ async fn resolve_push_experiment_target(
     ) {
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
-            project_id: project.id,
+            object_name: object.name.clone(),
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3131,7 +3452,9 @@ async fn resolve_push_experiment_target(
 
     Ok(ResolvedNamedObjectTarget {
         object_id: created.id,
+        object_name: created.name,
         project_id: project.id,
+        project_name: project.name,
     })
 }
 
@@ -3167,7 +3490,9 @@ async fn resolve_push_dataset_target(
     ) {
         return Ok(ResolvedNamedObjectTarget {
             object_id: object.id.clone(),
-            project_id: project.id,
+            object_name: object.name.clone(),
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
         });
     }
 
@@ -3194,7 +3519,9 @@ async fn resolve_push_dataset_target(
 
     Ok(ResolvedNamedObjectTarget {
         object_id: created.id,
+        object_name: created.name,
         project_id: project.id,
+        project_name: project.name,
     })
 }
 
@@ -3242,6 +3569,8 @@ async fn resolve_push_destination(
         object: resolved.object,
         object_ref: resolved.object_ref,
         project_id: resolved.project_id,
+        project_name: resolved.project_name,
+        object_name: resolved.object_name,
         run_id: resolved.run_id,
     })
 }
@@ -3406,13 +3735,26 @@ fn sanitize_segment(value: &str) -> String {
     }
 }
 
-fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
+pub(crate) fn artifact_base_dir(root: &Path, object_type: &str, object_name: &str) -> PathBuf {
     let object_key = format!(
         "{}_{}",
-        sanitize_segment(object.object_type.as_str()),
-        sanitize_segment(&object.object_name)
+        sanitize_segment(object_type),
+        sanitize_segment(object_name)
     );
-    root.join(object_key).join(&hash[..12])
+    root.join(object_key)
+}
+
+pub(crate) fn artifact_spec_dir(
+    root: &Path,
+    object_type: &str,
+    object_name: &str,
+    hash: &str,
+) -> PathBuf {
+    artifact_base_dir(root, object_type, object_name).join(&hash[..12])
+}
+
+fn spec_dir(root: &Path, object: &ObjectRef, hash: &str) -> PathBuf {
+    artifact_spec_dir(root, object.object_type.as_str(), &object.object_name, hash)
 }
 
 fn legacy_spec_dir(
@@ -3461,8 +3803,14 @@ fn resolve_spec_dir(
     }
 }
 
-fn spec_hash(spec: &SyncSpec) -> Result<String> {
-    let canonical = serde_json::to_vec(spec).context("failed to serialize sync spec")?;
+fn canonical_input_path(path: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve input path {}", path.display()))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+pub(crate) fn stable_spec_hash<T: Serialize + ?Sized>(spec: &T) -> Result<String> {
+    let canonical = serde_json::to_vec(spec).context("failed to serialize spec")?;
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     let digest = hasher.finalize();
@@ -3473,7 +3821,11 @@ fn spec_hash(spec: &SyncSpec) -> Result<String> {
     Ok(out)
 }
 
-fn epoch_seconds() -> u64 {
+fn spec_hash(spec: &SyncSpec) -> Result<String> {
+    stable_spec_hash(spec)
+}
+
+pub(crate) fn epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3719,8 +4071,73 @@ fn open_jsonl_part_writer(base_dir: &Path, append: bool) -> Result<JsonlPartWrit
     JsonlPartWriter::new(base_dir, append)
 }
 
+pub(crate) fn read_jsonl_values(path: &Path) -> Result<Vec<Value>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut values = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| {
+            format!("failed to read line {} from {}", index + 1, path.display())
+        })?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        values.push(serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "failed to parse JSON on line {} from {}",
+                index + 1,
+                path.display()
+            )
+        })?);
+    }
+    Ok(values)
+}
+
+fn serialize_jsonl_value<T: Serialize + ?Sized>(value: &T) -> Result<String> {
+    serde_json::to_string(value).context("failed to serialize row to JSONL")
+}
+
+pub(crate) fn write_jsonl_value<T: Serialize + ?Sized>(
+    writer: &mut dyn Write,
+    value: &T,
+) -> Result<usize> {
+    let encoded = serialize_jsonl_value(value)?;
+    writer
+        .write_all(encoded.as_bytes())
+        .context("failed to write JSONL row")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write JSONL newline")?;
+    Ok(encoded.len() + 1)
+}
+
+pub(crate) fn create_jsonl_file_writer(path: &Path) -> Result<BufWriter<File>> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Ok(BufWriter::new(File::create(path).with_context(|| {
+        format!("failed to create {}", path.display())
+    })?))
+}
+
+#[cfg(test)]
+pub(crate) fn write_jsonl_values<T: Serialize>(out: Option<&Path>, values: &[T]) -> Result<()> {
+    let mut writer: Box<dyn Write> = if let Some(path) = out {
+        Box::new(create_jsonl_file_writer(path)?)
+    } else {
+        Box::new(BufWriter::new(std::io::stdout()))
+    };
+
+    for value in values {
+        write_jsonl_value(writer.as_mut(), value)?;
+    }
+    writer.flush().context("failed to flush JSONL output")
+}
+
 fn write_jsonl_row(writer: &mut JsonlPartWriter, row: &Map<String, Value>) -> Result<usize> {
-    let encoded = serde_json::to_string(row).context("failed to serialize row to JSONL")?;
+    let encoded = serialize_jsonl_value(row)?;
     writer
         .write_line(&encoded)
         .context("failed to write JSONL row")
@@ -4064,26 +4481,70 @@ fn upload_total_for_progress(
     scope: &ScopeArg,
     limit: Option<usize>,
 ) -> Result<Option<usize>> {
-    if matches!(scope, ScopeArg::Traces) {
+    if !push_progress_total_needs_line_count(scope) {
         return Ok(None);
     }
 
-    let total_lines = count_lines(input_files)?;
+    let total_lines = count_lines(input_files, limit)?;
     let capped = limit.map(|l| l.min(total_lines)).unwrap_or(total_lines);
     Ok(Some(capped))
 }
 
-fn count_lines(paths: &[PathBuf]) -> Result<usize> {
+fn push_progress_total_needs_line_count(scope: &ScopeArg) -> bool {
+    !matches!(scope, ScopeArg::Traces)
+}
+
+fn count_lines(paths: &[PathBuf], max_lines: Option<usize>) -> Result<usize> {
     let mut count = 0usize;
     for path in paths {
-        let file =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            line.with_context(|| format!("failed reading {}", path.display()))?;
-            count += 1;
+        if max_lines.is_some_and(|max| count >= max) {
+            break;
+        }
+        let remaining = max_lines.map(|max| max.saturating_sub(count));
+        count += count_lines_in_file(path, remaining)?;
+    }
+    Ok(count)
+}
+
+fn count_lines_in_file(path: &Path, max_lines: Option<usize>) -> Result<usize> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(LINE_COUNT_BUFFER_BYTES, file);
+    let mut count = 0usize;
+    let mut saw_any_byte = false;
+    let mut last_byte = b'\n';
+    let mut reached_max = false;
+
+    loop {
+        let consumed = {
+            let buffer = reader
+                .fill_buf()
+                .with_context(|| format!("failed reading {}", path.display()))?;
+            if buffer.is_empty() {
+                break;
+            }
+            saw_any_byte = true;
+            for byte in buffer {
+                if *byte == b'\n' {
+                    count += 1;
+                    if max_lines.is_some_and(|max| count >= max) {
+                        reached_max = true;
+                        break;
+                    }
+                }
+            }
+            last_byte = *buffer.last().unwrap_or(&last_byte);
+            buffer.len()
+        };
+        reader.consume(consumed);
+        if reached_max {
+            break;
         }
     }
+
+    if !reached_max && saw_any_byte && last_byte != b'\n' {
+        count += 1;
+    }
+
     Ok(count)
 }
 
@@ -4135,7 +4596,7 @@ fn value_as_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
@@ -4154,7 +4615,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
@@ -4185,7 +4646,7 @@ fn sql_quote(value: &str) -> String {
 
 fn show_checkpoint_hint_line(pb: &ProgressBar) {
     if std::io::stderr().is_terminal() && animations_enabled() && !is_quiet() {
-        pb.println("  Ctrl+C safely checkpoints; rerun same command to resume (--fresh restarts).");
+        pb.println("  Ctrl+C safely checkpoints; rerun same command to resume (--force restarts).");
     }
 }
 
@@ -4233,7 +4694,7 @@ fn pull_status_line(show_checkpoint_hint: bool, retry_summary: Option<&str>) -> 
     let mut parts = Vec::new();
     if show_checkpoint_hint {
         parts.push(
-            "Ctrl+C checkpoints; rerun same command to resume (--fresh restarts).".to_string(),
+            "Ctrl+C checkpoints; rerun same command to resume (--force restarts).".to_string(),
         );
     }
     if let Some(summary) = retry_summary.filter(|s| !s.is_empty()) {
@@ -4246,18 +4707,17 @@ fn pull_status_line(show_checkpoint_hint: bool, retry_summary: Option<&str>) -> 
     }
 }
 
-fn bounded_bar(total: u64, message: &str, unit_label: &str) -> ProgressBar {
-    if !std::io::stderr().is_terminal() || !animations_enabled() || is_quiet() {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new(total);
+fn configure_upload_progress_bar(pb: &ProgressBar, total: usize) {
+    pb.set_length(total as u64);
+    configure_bounded_bar_style(pb, "spans");
+    pb.set_prefix("Uploading rows".to_string());
+}
+
+fn configure_bounded_bar_style(pb: &ProgressBar, unit_label: &str) {
     let template = format!(
         "{{spinner:.cyan}} {{prefix}} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {unit_label} ({{percent:>3}}%) | {{msg}}"
     );
     pb.set_style(ProgressStyle::with_template(&template).unwrap());
-    pb.set_prefix(message.to_string());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    pb
 }
 
 fn spinner_bar(message: &str) -> ProgressBar {
@@ -4279,6 +4739,107 @@ fn spinner_bar(message: &str) -> ProgressBar {
 mod tests {
     use super::*;
 
+    #[derive(Debug, clap::Parser)]
+    struct PushArgsHarness {
+        #[command(flatten)]
+        args: PushArgs,
+    }
+
+    #[test]
+    fn push_force_starts_from_the_beginning() -> Result<()> {
+        let parsed = <PushArgsHarness as clap::Parser>::try_parse_from([
+            "bt-sync-push",
+            "project_logs:test-project",
+            "--in",
+            "input.jsonl",
+            "--force",
+        ])?;
+
+        assert!(parsed.args.force);
+        Ok(())
+    }
+
+    #[test]
+    fn write_jsonl_value_serializes_one_line_and_reports_bytes() -> Result<()> {
+        let mut output = Vec::new();
+
+        let bytes = write_jsonl_value(&mut output, &json!({ "id": "row-1" }))?;
+
+        assert_eq!(bytes, output.len());
+        assert_eq!(String::from_utf8(output)?, "{\"id\":\"row-1\"}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn read_jsonl_values_skips_blank_lines() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-read-jsonl-values-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+
+        fs::write(&path, "{\"id\":\"row-1\"}\n\n{\"id\":\"row-2\"}\n")?;
+        let values = read_jsonl_values(&path)?;
+
+        assert_eq!(
+            values,
+            vec![json!({ "id": "row-1" }), json!({ "id": "row-2" })]
+        );
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn write_jsonl_values_writes_file() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-write-jsonl-values-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+
+        write_jsonl_values(
+            Some(&path),
+            &[json!({ "id": "row-1" }), json!({ "id": "row-2" })],
+        )?;
+
+        let content = fs::read_to_string(&path)?;
+        assert_eq!(content, "{\"id\":\"row-1\"}\n{\"id\":\"row-2\"}\n");
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn push_destination_url_links_to_dataset_object() {
+        let destination = ResolvedPushDestination {
+            object: ObjectRef {
+                object_type: ObjectType::Dataset,
+                object_name: "dataset-id".to_string(),
+            },
+            object_ref: "dataset:dataset-id".to_string(),
+            project_id: "project-id".to_string(),
+            project_name: "Facet Optimizer".to_string(),
+            object_name: "Loop Facet Ground Truth".to_string(),
+            run_id: None,
+        };
+
+        assert_eq!(
+            push_destination_url(
+                "https://www.braintrust.dev/",
+                "braintrustdata.com",
+                &destination
+            ),
+            "https://www.braintrust.dev/app/braintrustdata.com/p/Facet%20Optimizer/datasets/Loop%20Facet%20Ground%20Truth"
+        );
+    }
+
     #[test]
     fn push_checkpoint_line_offset_advances_only_after_commit() {
         let mut state =
@@ -4296,6 +4857,46 @@ mod tests {
         assert_eq!(state.bytes_sent, 128);
         assert_eq!(state.line_offset, 2);
         assert_eq!(state.distinct_roots_done, 1);
+    }
+
+    #[test]
+    fn push_checkpoint_hash_includes_canonical_input_path() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!(
+            "bt-sync-push-input-hash-{}-{unique}",
+            std::process::id()
+        ));
+        let input_a = root.join("input-a");
+        let input_b = root.join("input-b");
+        fs::create_dir_all(&input_a)?;
+        fs::create_dir_all(&input_b)?;
+
+        let mut spec = SyncSpec {
+            schema_version: STATE_SCHEMA_VERSION,
+            object_ref: "project_logs:test-project".to_string(),
+            object_type: ObjectType::ProjectLogs,
+            object_name: "test-project".to_string(),
+            direction: DirectionArg::Push.as_str().to_string(),
+            scope: ScopeArg::All.as_str().to_string(),
+            filter: None,
+            window: None,
+            limit: None,
+            page_size: DEFAULT_PAGE_SIZE,
+            include_vectors: false,
+            input_path: Some(canonical_input_path(&input_a)?),
+        };
+        let input_a_hash = spec_hash(&spec)?;
+
+        spec.input_path = Some(canonical_input_path(&input_b)?);
+        let input_b_hash = spec_hash(&spec)?;
+
+        assert_ne!(input_a_hash, input_b_hash);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     #[test]
@@ -4347,6 +4948,7 @@ mod tests {
             PushBatchResult {
                 batch_index: 1,
                 row_count: 2,
+                input_bytes: 20,
                 bytes_sent: 200,
                 end_line_offset: 4,
                 distinct_roots_done: 2,
@@ -4373,6 +4975,7 @@ mod tests {
             PushBatchResult {
                 batch_index: 0,
                 row_count: 2,
+                input_bytes: 10,
                 bytes_sent: 100,
                 end_line_offset: 2,
                 distinct_roots_done: 1,
@@ -4400,6 +5003,89 @@ mod tests {
         assert!(pending.is_empty());
 
         let _ = fs::remove_file(&state_path);
+        Ok(())
+    }
+
+    #[test]
+    fn upload_total_for_traces_does_not_scan_inputs() -> Result<()> {
+        let missing = PathBuf::from("definitely-missing-sync-input.jsonl");
+
+        let total = upload_total_for_progress(&[missing], &ScopeArg::Traces, Some(25))?;
+
+        assert_eq!(total, None);
+        Ok(())
+    }
+
+    #[test]
+    fn upload_total_for_all_counts_lines() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-upload-total-all-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        fs::write(&path, "{\"id\":\"1\"}\n{\"id\":\"2\"}\n{\"id\":\"3\"}\n")?;
+
+        let total = upload_total_for_progress(std::slice::from_ref(&path), &ScopeArg::All, None)?;
+
+        assert_eq!(total, Some(3));
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn upload_total_for_spans_caps_requested_limit() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-upload-total-spans-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        let missing = std::env::temp_dir().join(format!(
+            "bt-sync-upload-total-spans-missing-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        fs::write(&path, "{\"id\":\"1\"}\n{\"id\":\"2\"}\n")?;
+
+        let total = upload_total_for_progress(&[path.clone(), missing], &ScopeArg::Spans, Some(2))?;
+
+        assert_eq!(total, Some(2));
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn push_upload_backpressure_limits_workers_and_bytes() {
+        assert!(!push_upload_needs_backpressure(0, 4, 0, 256, 512));
+        assert!(push_upload_needs_backpressure(4, 4, 128, 128, 512));
+        assert!(push_upload_needs_backpressure(2, 4, 400, 200, 512));
+        assert!(!push_upload_needs_backpressure(2, 4, 200, 100, 512));
+    }
+
+    #[test]
+    fn count_lines_counts_final_line_without_newline() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "bt-sync-count-lines-{}-{}.jsonl",
+            std::process::id(),
+            unique
+        ));
+        fs::write(&path, "{\"id\":\"1\"}\n{\"id\":\"2\"}")?;
+
+        let total = count_lines_in_file(&path, None)?;
+
+        assert_eq!(total, 2);
+        let _ = fs::remove_file(&path);
         Ok(())
     }
 
@@ -4494,6 +5180,7 @@ mod tests {
             limit: Some(10),
             page_size: 200,
             include_vectors: false,
+            input_path: None,
         };
         let serialized = serde_json::to_value(&spec)?;
         let obj = serialized
@@ -4517,6 +5204,7 @@ mod tests {
             limit: Some(10),
             page_size: 200,
             include_vectors: true,
+            input_path: None,
         };
         let serialized = serde_json::to_value(&spec)?;
         let obj = serialized

@@ -1,0 +1,11 @@
+{
+  "files": ["params-kv.eval.mjs"],
+  "args": [
+    "--param",
+    "model=\"gpt-4o\"",
+    "--param",
+    "count=5",
+    "--param",
+    "enabled=true"
+  ]
+}

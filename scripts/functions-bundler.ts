@@ -41,9 +41,7 @@ function loadTsconfigPath(): string | undefined {
 
 function buildExternalPackagePatterns(additionalPackages: string[]): string[] {
   const knownPackages = [
-    "braintrust",
-    "autoevals",
-    "@braintrust/",
+    // Keep compatibility externals that are commonly optional/native.
     "config",
     "lightningcss",
     "@mapbox/node-pre-gyp",

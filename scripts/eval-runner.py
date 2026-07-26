@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import builtins
 import fnmatch
 import importlib.util
 import inspect
 import json
 import os
+import random
 import re
 import socket
 import sys
 import traceback
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -25,7 +28,23 @@ try:
     )
     from braintrust.logger import Dataset, init as init_logger_experiment, parent_context, _internal_get_global_state
     from braintrust.parameters import parameters_to_json_schema, validate_parameters
+
+    try:
+        from braintrust.parameters import serialize_remote_eval_parameters_container
+    except ImportError:
+        serialize_remote_eval_parameters_container = None
     from braintrust.util import eprint
+
+    try:
+        from braintrust.util import bt_iscoroutinefunction
+    except ImportError:
+        def bt_iscoroutinefunction(f):
+            return (
+                inspect.iscoroutinefunction(f)
+                or inspect.isasyncgenfunction(f)
+                or getattr(f, "_BT_IS_ASYNC", False)
+            )
+
     from braintrust.span_identifier_v4 import parse_parent
 except Exception as exc:  # pragma: no cover - runtime guard
     print(
@@ -53,14 +72,25 @@ class EvalFilter:
 
 
 @dataclass(frozen=True)
+class MatrixAxis:
+    key: str
+    values: list[Any]
+
+
+@dataclass(frozen=True)
 class RunnerConfig:
     jsonl: bool
     list_only: bool
     terminate_on_failure: bool
     num_workers: int | None
     filters: list[EvalFilter]
+    first: int | None
+    sample: int | None
+    sample_seed: int | None
     dev_mode: str | None
     dev_request_json: str | None
+    params: dict[str, Any] | None
+    matrix: list[MatrixAxis] | None
 
 
 @dataclass
@@ -142,6 +172,97 @@ def parse_dev_mode(value: str | None) -> str | None:
     raise ValueError(f"Invalid BT_EVAL_DEV_MODE value: {value}")
 
 
+def parse_positive_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def parse_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def parse_params_json(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"BT_EVAL_PARAMS_JSON is not valid JSON: {raw}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("BT_EVAL_PARAMS_JSON must be a JSON object.")
+    return parsed
+
+
+def parse_matrix_json(raw: str | None) -> list[MatrixAxis] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"BT_EVAL_MATRIX_JSON is not valid JSON: {raw}") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("BT_EVAL_MATRIX_JSON must be a JSON array.")
+    axes: list[MatrixAxis] = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            raise ValueError("BT_EVAL_MATRIX_JSON entries must be objects with key and values.")
+        key = entry.get("key")
+        values = entry.get("values")
+        if not isinstance(key, str) or not key:
+            raise ValueError("BT_EVAL_MATRIX_JSON entry missing string key.")
+        if not isinstance(values, list) or not values:
+            raise ValueError(
+                f"BT_EVAL_MATRIX_JSON axis \"{key}\" must have a non-empty values array."
+            )
+        axes.append(MatrixAxis(key=key, values=values))
+    return axes if axes else None
+
+
+def matrix_combinations(axes: list[MatrixAxis]) -> list[list[tuple[str, Any]]]:
+    combos: list[list[tuple[str, Any]]] = [[]]
+    for axis in axes:
+        next_combos: list[list[tuple[str, Any]]] = []
+        for existing in combos:
+            for value in axis.values:
+                next_combos.append(existing + [(axis.key, value)])
+        combos = next_combos
+    return combos
+
+
+def format_matrix_label(combo: list[tuple[str, Any]]) -> str:
+    return ", ".join(f"{k}={json.dumps(v)}" for k, v in combo)
+
+
+def get_declared_parameter_keys(parameters: Any) -> set[str] | None:
+    if parameters is None:
+        return None
+    schema = getattr(parameters, "schema", None)
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return set(properties.keys())
+    if isinstance(parameters, dict):
+        return set(parameters.keys())
+    return None
+
+
+def filter_params_for_evaluator(
+    params: dict[str, Any], evaluator_parameters: Any
+) -> dict[str, Any]:
+    declared = get_declared_parameter_keys(evaluator_parameters)
+    if declared is None:
+        return params
+    return {k: v for k, v in params.items() if k in declared}
+
+
 def read_runner_config() -> RunnerConfig:
     num_workers_value = os.getenv("BT_EVAL_NUM_WORKERS")
     num_workers = int(num_workers_value) if num_workers_value else None
@@ -151,9 +272,24 @@ def read_runner_config() -> RunnerConfig:
         terminate_on_failure=env_flag("BT_EVAL_TERMINATE_ON_FAILURE"),
         num_workers=num_workers,
         filters=parse_serialized_filters(os.getenv("BT_EVAL_FILTER_PARSED")),
+        first=parse_positive_int_env("BT_EVAL_FIRST"),
+        sample=parse_positive_int_env("BT_EVAL_SAMPLE"),
+        sample_seed=parse_int_env("BT_EVAL_SAMPLE_SEED"),
         dev_mode=parse_dev_mode(os.getenv("BT_EVAL_DEV_MODE")),
         dev_request_json=os.getenv("BT_EVAL_DEV_REQUEST_JSON"),
+        params=parse_params_json(os.getenv("BT_EVAL_PARAMS_JSON")),
+        matrix=parse_matrix_json(os.getenv("BT_EVAL_MATRIX_JSON")),
     )
+
+
+# Runtime values consumed by SDKs. Currently only --sample sets internal BTQL,
+# but this can carry more _internal_btql options over time.
+def inject_runtime_values(config: RunnerConfig) -> None:
+    if config.sample is None:
+        if hasattr(builtins, "__bt_eval_internal_btql"):
+            delattr(builtins, "__bt_eval_internal_btql")
+        return
+    setattr(builtins, "__bt_eval_internal_btql", {"sample": config.sample})
 
 
 def _to_mapping(value: Any) -> Any:
@@ -202,8 +338,35 @@ def snake_to_camel(value: str) -> str:
     return parts[0] + "".join(word.title() for word in parts[1:])
 
 
-def format_summary(summary: dict[str, Any]) -> dict[str, Any]:
-    return {snake_to_camel(k): v for k, v in summary.items()}
+def sampling_metadata(config: RunnerConfig) -> dict[str, Any]:
+    if config.first is not None:
+        return {
+            "runMode": "first",
+            "isFinal": False,
+            "runLabel": f"Run mode: first {config.first} examples (non-final smoke run)",
+            "sampleCount": config.first,
+        }
+    if config.sample is not None:
+        seed = config.sample_seed if config.sample_seed is not None else 0
+        return {
+            "runMode": "sample",
+            "isFinal": False,
+            "runLabel": f"Run mode: random sample of {config.sample} examples (seed {seed}, non-final smoke run)",
+            "sampleCount": config.sample,
+            "sampleSeed": seed,
+        }
+    return {
+        "runMode": "full",
+        "isFinal": True,
+        "runLabel": "Run mode: full dataset",
+    }
+
+
+def format_summary(summary: dict[str, Any], config: RunnerConfig) -> dict[str, Any]:
+    return {
+        **{snake_to_camel(k): v for k, v in summary.items()},
+        **sampling_metadata(config),
+    }
 
 
 def send_eval_progress(sse: SseWriter | None, evaluator_name: str, kind: str, total: int | None = None) -> None:
@@ -324,6 +487,79 @@ def resolve_eval_data(data: dict[str, Any]) -> Any:
     raise ValueError("Invalid eval data payload.")
 
 
+async def resolve_sampling_source(data: Any) -> Any:
+    current = data
+    while True:
+        if callable(current):
+            current = current()
+            continue
+        if inspect.isawaitable(current):
+            current = await current
+            continue
+        return current
+
+
+async def iter_data_source(data: Any, batch_size_hint: int | None = None):
+    resolved = await resolve_sampling_source(data)
+    if isinstance(resolved, Dataset):
+        fetched = resolved.fetch(batch_size=batch_size_hint)
+        if hasattr(fetched, "__aiter__"):
+            async for item in fetched:
+                yield item
+            return
+        for item in fetched:
+            yield item
+        return
+    if isinstance(resolved, (str, bytes, dict)):
+        raise ValueError(
+            "Sampling is only supported for arrays, iterables, and Braintrust datasets."
+        )
+    if hasattr(resolved, "__aiter__"):
+        async for item in resolved:
+            yield item
+        return
+    try:
+        iterator = iter(resolved)
+    except TypeError as exc:
+        raise ValueError(
+            "Sampling is only supported for arrays, iterables, and Braintrust datasets."
+        ) from exc
+    for item in iterator:
+        yield item
+
+
+async def collect_first_records(data: Any, count: int) -> list[Any]:
+    items: list[Any] = []
+    async for item in iter_data_source(data, batch_size_hint=count):
+        items.append(item)
+        if len(items) >= count:
+            break
+    return items
+
+
+async def reservoir_sample_records(data: Any, count: int, seed: int) -> list[Any]:
+    rng = random.Random(seed)
+    sample: list[Any] = []
+    seen = 0
+    async for item in iter_data_source(data):
+        seen += 1
+        if len(sample) < count:
+            sample.append(item)
+            continue
+        index = rng.randrange(seen)
+        if index < count:
+            sample[index] = item
+    return sample
+
+
+async def apply_sampling_to_data(data: Any, config: RunnerConfig) -> Any:
+    if config.first is not None:
+        return await collect_first_records(data, config.first)
+    if config.sample is not None:
+        return await reservoir_sample_records(data, config.sample, config.sample_seed or 0)
+    return data
+
+
 def make_eval_scorer(
     score: dict[str, Any],
     project_id: str | None,
@@ -358,10 +594,18 @@ def build_eval_definitions(evaluator_instances: list[EvaluatorInstance]) -> dict
         evaluator = evaluator_instance.evaluator
         scores = [{"name": getattr(score, "__name__", f"scorer_{i}")} for i, score in enumerate(evaluator.scores)]
         definitions[evaluator.eval_name] = {
-            "parameters": parameters_to_json_schema(evaluator.parameters) if evaluator.parameters else {},
+            "parameters": serialize_evaluator_parameters(evaluator.parameters),
             "scores": scores,
         }
     return definitions
+
+
+def serialize_evaluator_parameters(parameters: Any) -> dict[str, Any] | None:
+    if not parameters:
+        return {}
+    if serialize_remote_eval_parameters_container is not None:
+        return serialize_remote_eval_parameters_container(parameters)
+    return parameters_to_json_schema(parameters)
 
 
 def collect_files(input_path: str) -> list[str]:
@@ -606,20 +850,156 @@ def infer_data_total(data: Any) -> int | None:
     return None
 
 
+def normalize_trial_count(value: Any) -> int:
+    try:
+        trial_count = int(value)
+    except Exception:
+        trial_count = 1
+    if trial_count < 1:
+        trial_count = 1
+    return trial_count
+
+
 def infer_evaluator_total(evaluator: Any) -> int | None:
     data_total = infer_data_total(getattr(evaluator, "data", None))
     if data_total is None:
         return None
 
-    trial_count = getattr(evaluator, "trial_count", 1)
-    try:
-        trial_count = int(trial_count)
-    except Exception:
-        trial_count = 1
-    if trial_count < 1:
-        trial_count = 1
+    trial_count = normalize_trial_count(getattr(evaluator, "trial_count", 1))
 
     return data_total * trial_count
+
+
+def wrap_data_with_adaptive_total(
+    data: Any,
+    progress_cb: Callable[[str, int | None], None] | None,
+    trial_count: int,
+    state: dict[str, int] | None = None,
+) -> Any:
+    if progress_cb is None:
+        return data
+    if state is None:
+        state = {"rows_seen": 0, "last_emitted_total": 0}
+
+    def report_known_total_if_available(value: Any) -> bool:
+        data_total = infer_data_total(value)
+        if data_total is None:
+            return False
+        total = data_total * trial_count
+        if total > state["last_emitted_total"] or not state.get("known_total_emitted"):
+            state["last_emitted_total"] = max(state["last_emitted_total"], total)
+            state["known_total_emitted"] = 1
+            progress_cb("set_total", total)
+        return True
+
+    def report_rows_seen() -> None:
+        rows_seen = state["rows_seen"]
+        if rows_seen <= 0:
+            return
+        total = rows_seen * trial_count
+        if total <= state["last_emitted_total"]:
+            return
+        state["last_emitted_total"] = total
+        progress_cb("set_total", total)
+
+    def maybe_report_empty_total(exhausted: bool) -> None:
+        # Unknown-total evaluators that exhaust without yielding should still
+        # emit an explicit total of 0. The renderer decides whether that
+        # threshold is shown as spinner or determinate progress.
+        if not exhausted:
+            return
+        if state["rows_seen"] != 0:
+            return
+        if state["last_emitted_total"] != 0:
+            return
+        progress_cb("set_total", 0)
+
+    if report_known_total_if_available(data):
+        return data
+
+    if inspect.isclass(data):
+        return data
+
+    if inspect.isroutine(data):
+        def wrapped_data(*args, **kwargs):
+            resolved = data(*args, **kwargs)
+            return wrap_data_with_adaptive_total(
+                resolved,
+                progress_cb,
+                trial_count,
+                state,
+            )
+
+        if hasattr(data, "__name__"):
+            setattr(wrapped_data, "__name__", getattr(data, "__name__"))
+        if hasattr(data, "__qualname__"):
+            setattr(wrapped_data, "__qualname__", getattr(data, "__qualname__"))
+        return wrapped_data
+
+    if inspect.isawaitable(data):
+        async def wrapped_awaitable():
+            resolved = await data
+            return wrap_data_with_adaptive_total(
+                resolved,
+                progress_cb,
+                trial_count,
+                state,
+            )
+
+        return wrapped_awaitable()
+
+    if inspect.isasyncgen(data) or hasattr(data, "__aiter__"):
+        async def wrapped_async_iter():
+            exhausted = False
+            try:
+                async for item in data:
+                    state["rows_seen"] += 1
+                    report_rows_seen()
+                    yield item
+                exhausted = True
+            finally:
+                maybe_report_empty_total(exhausted)
+
+        return wrapped_async_iter()
+
+    if inspect.isgenerator(data):
+        async def wrapped_iter():
+            exhausted = False
+            try:
+                for item in data:
+                    state["rows_seen"] += 1
+                    report_rows_seen()
+                    yield item
+                    # Let scheduled eval tasks make progress while we keep ingesting rows.
+                    await asyncio.sleep(0)
+                exhausted = True
+            finally:
+                maybe_report_empty_total(exhausted)
+
+        return wrapped_iter()
+
+    if isinstance(data, (str, bytes, dict)):
+        return data
+
+    try:
+        iterator = iter(data)
+    except Exception:
+        return data
+
+    async def wrapped_iterable():
+        exhausted = False
+        try:
+            for item in iterator:
+                state["rows_seen"] += 1
+                report_rows_seen()
+                yield item
+                # Avoid starving task execution while iterating synchronous data sources.
+                await asyncio.sleep(0)
+            exhausted = True
+        finally:
+            maybe_report_empty_total(exhausted)
+
+    return wrapped_iterable()
 
 
 def wrap_task(
@@ -640,29 +1020,44 @@ def wrap_task(
 
     takes_hooks = task_signature is not None and len(task_signature.parameters) >= 2
 
-    async def wrapped_task(input, hooks):
-        result = None
-        try:
-            if takes_hooks:
-                result = task(input, hooks)
-            else:
-                result = task(input)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
-        finally:
-            if progress_cb is not None:
-                progress_cb("increment", None)
-            if stream_results and result is not None:
-                try:
-                    hooks.report_progress({
-                        "format": "code",
-                        "output_type": "completion",
-                        "event": "json_delta",
-                        "data": json.dumps(result),
-                    })
-                except Exception:
-                    pass
+    def maybe_report(result: Any, hooks: Any) -> None:
+        if progress_cb is not None:
+            progress_cb("increment", None)
+        if stream_results and result is not None:
+            try:
+                hooks.report_progress({
+                    "format": "code",
+                    "output_type": "completion",
+                    "event": "json_delta",
+                    "data": json.dumps(result),
+                })
+            except Exception:
+                pass
+
+    if bt_iscoroutinefunction(task):
+        async def wrapped_task(input, hooks):
+            result = None
+            try:
+                if takes_hooks:
+                    result = task(input, hooks)
+                else:
+                    result = task(input)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            finally:
+                maybe_report(result, hooks)
+    else:
+        def wrapped_task(input, hooks):
+            result = None
+            try:
+                if takes_hooks:
+                    result = task(input, hooks)
+                else:
+                    result = task(input)
+                return result
+            finally:
+                maybe_report(result, hooks)
 
     if hasattr(task, "__name__"):
         setattr(wrapped_task, "__name__", getattr(task, "__name__"))
@@ -680,7 +1075,13 @@ def run_evaluator_supports_stream() -> bool:
 
 
 async def run_evaluator_task(
-    evaluator, position: int, no_send_logs: bool, progress_cb, progress_mode: str, sse: SseWriter | None,
+    evaluator,
+    position: int,
+    no_send_logs: bool,
+    progress_cb,
+    progress_mode: str,
+    sse: SseWriter | None,
+    config: RunnerConfig,
     parent: str | None = None,
 ):
     experiment = None
@@ -690,10 +1091,21 @@ async def run_evaluator_task(
 
     fallback_progress = progress_cb is not None and progress_mode != "progress"
     original_task = evaluator.task
+    original_data = evaluator.data
+    sampled_data = await apply_sampling_to_data(original_data, config)
+    evaluator.data = sampled_data
     supports_stream = run_evaluator_supports_stream()
 
     if fallback_progress:
-        progress_cb("start", infer_evaluator_total(evaluator))
+        inferred_total = infer_evaluator_total(evaluator)
+        progress_cb("start", inferred_total)
+        if inferred_total is None:
+            trial_count = normalize_trial_count(getattr(evaluator, "trial_count", 1))
+            evaluator.data = wrap_data_with_adaptive_total(
+                evaluator.data,
+                progress_cb,
+                trial_count,
+            )
 
     evaluator.task = wrap_task(
         original_task,
@@ -727,6 +1139,7 @@ async def run_evaluator_task(
             )
     finally:
         evaluator.task = original_task
+        evaluator.data = original_data
         if fallback_progress:
             progress_cb("stop", None)
         if experiment:
@@ -812,6 +1225,7 @@ async def run_requested_eval(
             progress_cb,
             progress_mode,
             sse,
+            config,
             parent=parent,
         )
     except Exception as exc:
@@ -820,9 +1234,9 @@ async def run_requested_eval(
         return False
 
     if sse:
-        sse.send("summary", format_summary(result.summary.as_dict()))
+        sse.send("summary", format_summary(result.summary.as_dict(), config))
     elif config.jsonl:
-        print(json.dumps(format_summary(result.summary.as_dict())))
+        print(json.dumps(format_summary(result.summary.as_dict(), config)))
     else:
         print(result.summary)
 
@@ -863,6 +1277,49 @@ async def run_once(
             print(evaluator_instance.evaluator.eval_name)
         return True
 
+    if config.matrix:
+        if len(evaluators) != 1:
+            names = [ev.evaluator.eval_name for ev in evaluators]
+            listed = "  (none matched)" if not names else "\n".join(f"  - {n}" for n in names)
+            message = (
+                "--matrix-param is not supported when running multiple evals.\n"
+                f"Matched evals:\n{listed}\n"
+                "Use --filter to select exactly one eval."
+            )
+            if sse:
+                sse.send("error", serialize_error(message, None))
+            else:
+                eprint(message)
+            return False
+
+        source = evaluators[0]
+        expanded: list[EvaluatorInstance] = []
+        for combo in matrix_combinations(config.matrix):
+            label = format_matrix_label(combo)
+            overlay = {k: v for k, v in combo}
+            orig_experiment_name = getattr(source.evaluator, "experiment_name", None)
+            new_experiment_name = (
+                f"{orig_experiment_name} [{label}]"
+                if isinstance(orig_experiment_name, str) and orig_experiment_name
+                else f"[{label}]"
+            )
+            # Disambiguate the progress-bar / tracking key too — progress events are
+            # keyed by eval_name, so combos must have distinct eval_names or bars collapse.
+            new_eval_name = f"{source.evaluator.eval_name} [{label}]"
+            cloned_evaluator = dataclasses.replace(
+                source.evaluator,
+                eval_name=new_eval_name,
+                experiment_name=new_experiment_name,
+            )
+            cloned_instance = EvaluatorInstance(
+                evaluator=cloned_evaluator,
+                reporter=source.reporter,
+            )
+            # Attach the overlay so run_single_evaluator can merge it on top of config.params.
+            setattr(cloned_instance, "_bt_matrix_params_override", overlay)
+            expanded.append(cloned_instance)
+        evaluators = expanded
+
     if sse:
         sse.send("processing", {"evaluators": len(evaluators)})
 
@@ -881,6 +1338,18 @@ async def run_once(
             return evaluator_instance, None, None, err
 
         progress_cb = create_progress_reporter(sse, evaluator_instance.evaluator.eval_name)
+        matrix_override = getattr(evaluator_instance, "_bt_matrix_params_override", None)
+        effective_params: dict[str, Any] | None
+        if matrix_override is not None:
+            effective_params = {**(config.params or {}), **matrix_override}
+        else:
+            effective_params = config.params
+        if effective_params is not None and evaluator_instance.evaluator.parameters is not None:
+            evaluator = evaluator_instance.evaluator
+            # Drop any --param keys the evaluator doesn't declare so a single
+            # command running multiple evaluators doesn't fail on unrelated params.
+            filtered_params = filter_params_for_evaluator(effective_params, evaluator.parameters)
+            evaluator.parameters = validate_parameters(filtered_params, evaluator.parameters)
         try:
             result = await run_evaluator_task(
                 evaluator_instance.evaluator,
@@ -889,6 +1358,7 @@ async def run_once(
                 progress_cb,
                 progress_mode,
                 sse,
+                config,
             )
         except Exception as exc:
             err = serialize_error(str(exc), traceback.format_exc())
@@ -921,9 +1391,9 @@ async def run_once(
             continue
 
         if sse:
-            sse.send("summary", format_summary(result.summary.as_dict()))
+            sse.send("summary", format_summary(result.summary.as_dict(), config))
         elif config.jsonl:
-            print(json.dumps(format_summary(result.summary.as_dict())))
+            print(json.dumps(format_summary(result.summary.as_dict(), config)))
         else:
             print(result.summary)
 
@@ -962,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
     config = read_runner_config()
     local = args.local or env_flag("BT_EVAL_LOCAL") or env_flag("BT_EVAL_NO_SEND_LOGS")
     files = args.files or ["."]
+    inject_runtime_values(config)
     if config.num_workers is not None:
         set_thread_pool_max_workers(config.num_workers)
 

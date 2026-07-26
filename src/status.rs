@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::args::BaseArgs;
 use crate::auth;
-use crate::config;
+use crate::{config, utils::resolve_profile_info};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -13,11 +13,7 @@ Examples:
   bt status --json
   bt status --verbose
 ")]
-pub struct StatusArgs {
-    /// Output verbose status
-    #[arg(long)]
-    pub verbose: bool,
-}
+pub struct StatusArgs {}
 
 #[derive(Serialize)]
 struct StatusOutput {
@@ -44,7 +40,7 @@ fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
     }
 }
 
-pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
+pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     let global_path = config::global_path().ok();
     let global_cfg = config::load_global().unwrap_or_default();
     let local_path = config::local_path();
@@ -55,7 +51,7 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
 
     let cli_org = cli_flag_value(&["--org", "-o"]);
     let cli_project = cli_flag_value(&["--project", "-p"]);
-    let (org, project, source) = resolve_config(
+    let (mut org, mut project, source) = resolve_config(
         cli_org,
         cli_project,
         &global_cfg,
@@ -63,7 +59,47 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         &local_path,
         &global_path,
     );
-    let profile_info = resolve_profile_info(base.profile.as_deref(), org.as_deref());
+    let merged_cfg = global_cfg.merge(&local_cfg);
+    let selected_profile = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            merged_cfg
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let profile_info = resolve_profile_info(selected_profile.as_deref(), org.as_deref());
+
+    if selected_profile.is_some() && org.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        if let Some(profile_org) = profile_info.as_ref().and_then(|p| p.org_name.clone()) {
+            org = Some(profile_org);
+        }
+    }
+
+    if base
+        .project
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        let mut project_base = base.clone();
+        if project_base
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            project_base.profile = selected_profile.clone();
+        }
+        project =
+            config::project_from_config_for_context(&project_base, &merged_cfg, org.as_deref());
+    }
 
     if base.json {
         let output = StatusOutput {
@@ -79,7 +115,7 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
-    if args.verbose {
+    if base.verbose {
         println!("org: {}", org.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
         if let Some(ref p) = profile_info {
@@ -179,35 +215,6 @@ fn cli_flag_value(flags: &[&str]) -> Option<String> {
             }
         }
     }
-    None
-}
-
-fn resolve_profile_info(profile: Option<&str>, org: Option<&str>) -> Option<auth::ProfileInfo> {
-    let profiles = auth::list_profiles().ok()?;
-
-    if let Some(p) = profile {
-        return profiles.into_iter().find(|pi| pi.name == p);
-    }
-
-    if let Some(o) = org {
-        if profiles.iter().any(|pi| pi.name == o) {
-            return profiles.into_iter().find(|pi| pi.name == o);
-        }
-        let org_matches: Vec<&auth::ProfileInfo> = profiles
-            .iter()
-            .filter(|pi| pi.org_name.as_deref() == Some(o))
-            .collect();
-        if org_matches.len() == 1 {
-            let name = org_matches[0].name.clone();
-            return profiles.into_iter().find(|pi| pi.name == name);
-        }
-        return None;
-    }
-
-    if profiles.len() == 1 {
-        return profiles.into_iter().next();
-    }
-
     None
 }
 

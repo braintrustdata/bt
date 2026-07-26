@@ -1,0 +1,8 @@
+{
+  "name": "braintrust",
+  "version": "0.0.0-local",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  }
+}

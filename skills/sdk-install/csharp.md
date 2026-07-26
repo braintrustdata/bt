@@ -8,13 +8,13 @@ Reference guide for installing the Braintrust C# SDK.
 
 ## Find the latest version of the SDK
 
-Look up the latest version from NuGet **without installing anything**. Do not guess -- use a read-only query so the environment stays unchanged until you pin the exact version.
+Look up the latest version from NuGet **without installing anything**. Do not guess -- use a read-only query so the environment stays unchanged until you write the version into the project file.
 
 ```bash
 dotnet package search Braintrust.Sdk --exact-match
 ```
 
-Then install that exact version:
+Then install that version (the latest published release):
 
 ### .NET CLI
 

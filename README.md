@@ -42,6 +42,33 @@ Canary:
 $env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
 ```
 
+### [mise](https://mise.jdx.dev)
+
+To use the latest stable version:
+
+```toml
+[tools."github:braintrustdata/bt"]
+version = "stable"
+```
+
+To pin a specific version with sha256 hash:
+
+```toml
+[tools."github:braintrustdata/bt"]
+version = "major.minor.patch"
+# The sha are given by the checksum files in https://github.com/braintrustdata/bt/releases#release-vmajor.minor.patch
+# https://github.com/braintrustdata/bt/releases/download/vmajor.minor.patch/bt-aarch64-apple-darwin.tar.gz.sha256 for macos-arm64
+[tools."github:braintrustdata/bt".platforms]
+macos-arm64.checksum = "sha256:the sha256 for macos-arm64"
+linux-x64.checksum = "sha256:the sha256 for linux-x64"
+```
+
+The supported architectures are macos-arm64, macos-x64, linux-arm64, linux-x64, linux-x64-musl, windows-arm64 and windows-x64.
+
+The version can be `"stable"` for the latest stable version, `"major.minor.patch"` for a specific version, `"canary"` to get the latest canary version, or `"canary-7129692509ab"` (12 character short SHA1) to get a specific canary version.
+Don't choose `"stable"` or `"canary"` while pinning SHA256 since they change every release.
+The SHA1 is the commit hash while the (optional) SHA256 of `mise.toml` are hashed from the archive with the binaries.
+
 ### PR/branch builds (no release)
 
 Non-`main` branch builds are available as GitHub Actions run artifacts (download from the workflow run page or with `gh run download`). They are not published as GitHub Releases.
@@ -65,22 +92,22 @@ curl -fsSL -O "https://github.com/braintrustdata/bt/releases/download/<tag>/bt-<
 shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 ```
 
-## Self Update
+## Update
 
-`bt` can self-update when installed via the official installer.
+`bt` can update itself when installed via the official installer.
 
 ```bash
 # update on the current build channel (canary for local/dev builds, stable for official releases)
-bt self update
+bt update
 
 # check without installing
-bt self update --check
+bt update --check
 
 # switch/update to latest mainline canary
-bt self update --channel canary
+bt update --channel canary
 ```
 
-If `bt` was installed via another package manager (Homebrew, apt, choco, etc), use that package manager to update instead.
+If `bt` was installed via npm, use that to update instead.
 
 ## Uninstall
 
@@ -103,24 +130,26 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 ## Troubleshooting
 
 - If `bt` is not found after install, start a new shell or add `${XDG_BIN_HOME:-$HOME/.local/bin}` to your `PATH`.
-- If `bt self update --check` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
+- If `bt update --check --json` hits GitHub API limits in CI, set `GITHUB_TOKEN` in the environment.
 - If your network blocks GitHub asset downloads, install from a machine with direct access or configure your proxy/firewall to allow `github.com` and `api.github.com`.
 
 ## Commands
 
-| Command          | Description                                                        |
-| ---------------- | ------------------------------------------------------------------ |
-| `bt init`        | Initialize `.bt/` config directory and link to a project           |
-| `bt auth`        | Authenticate with Braintrust                                       |
-| `bt switch`      | Switch org and project context                                     |
-| `bt status`      | Show current org and project context                               |
-| `bt eval`        | Run eval files (Unix only)                                         |
-| `bt sql`         | Run SQL queries against Braintrust                                 |
-| `bt view`        | View logs, traces, and spans                                       |
-| `bt projects`    | Manage projects (list, create, view, delete)                       |
-| `bt prompts`     | Manage prompts (list, view, delete)                                |
-| `bt sync`        | Synchronize project logs between Braintrust and local NDJSON files |
-| `bt self update` | Update bt in-place                                                 |
+| Command       | Description                                                        |
+| ------------- | ------------------------------------------------------------------ |
+| `bt init`     | Initialize `.bt/` config directory and link to a project           |
+| `bt auth`     | Authenticate with Braintrust                                       |
+| `bt switch`   | Switch org and project context                                     |
+| `bt status`   | Show current org and project context                               |
+| `bt datasets` | Manage datasets and dataset pipelines                              |
+| `bt eval`     | Run eval files (Unix only)                                         |
+| `bt sql`      | Run SQL queries against Braintrust                                 |
+| `bt view`     | View logs, traces, and spans                                       |
+| `bt projects` | Manage projects (list, create, view, delete)                       |
+| `bt datasets` | Manage remote datasets (list, create, update, view, delete)        |
+| `bt prompts`  | Manage prompts (list, view, delete)                                |
+| `bt sync`     | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt update`   | Update bt in-place                                                 |
 
 ## `bt eval`
 
@@ -150,6 +179,64 @@ Use `--` to forward extra arguments to the eval file via `process.argv`:
 ```bash
 bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 ```
+
+**Sampling modes:**
+
+- `bt eval --first 20 qa.eval.ts` — run the first 20 examples and clearly label the summary as a non-final smoke run.
+- `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
+- If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
+
+## `bt datasets`
+
+- `bt datasets` works directly against remote Braintrust datasets — no local `bt sync` artifact flow is required.
+- `bt datasets create my-dataset` — create an empty remote dataset in the current project.
+- `bt datasets create my-dataset --description "Dataset for smoke tests"` — create a dataset with a description.
+- `bt datasets create my-dataset --file records.jsonl` — create the remote dataset and seed it from a JSON/JSONL file.
+- `cat records.jsonl | bt datasets create my-dataset` — create the dataset and seed it from stdin.
+- `bt datasets create my-dataset --rows '[{"id":"case-1","input":{"text":"hi"},"expected":"hello"}]'` — create the dataset from inline JSON rows.
+- `bt datasets create my-dataset --rows '[{"input":{"text":"hi"},"expected":"hello"}]'` — create a dataset when rows do not include `id`; bt auto-generates record IDs.
+- `bt datasets update my-dataset --file records.jsonl` — upsert rows by stable record id.
+- `bt datasets add my-dataset --rows '[{"id":"case-2","input":{"text":"bye"},"expected":"goodbye"}]'` — alias for `update`.
+- `bt datasets refresh my-dataset --file records.jsonl --id-field metadata.case_id` — alias for `update` with explicit id path (fails if the dataset does not exist, and does not delete remote rows missing from the input).
+- `bt datasets view my-dataset` — show dataset metadata and previewed row payloads; defaults to loading up to 200 rows. Use `--limit <N>` to adjust, `--all-rows` to load every row, `--full` for exact values, or `bt sync pull dataset:<id>` to export full rows to files.
+- `update`/`add`/`refresh` require explicit stable IDs via `id` or `--id-field`.
+- `--id-field` uses dot-separated paths; escape literal dots as `\.` and literal backslashes as `\\`.
+- `update`/`add`/`refresh` submit the provided rows directly and report success/failure without diffing remote rows first.
+- Accepted top-level record fields are `id`, `input`, `expected`, `metadata`, `tags`, and `origin` (plus the root field referenced by `--id-field`, if different).
+- Inputs may also be a JSON object with a top-level `rows` array, matching `bt datasets view --json`; sibling wrapper fields are ignored, and each row inside `rows` is still validated strictly.
+
+### `bt datasets pipeline`
+
+Run full dataset pipelines declared with `DatasetPipeline(...)`, or stage pull/transform/push.
+
+```bash
+# One-shot execution: discover refs, transform, and insert up to 100 new rows.
+bt datasets pipeline run ./pipeline.ts --limit 100
+
+# Staged execution for inspection or agent editing.
+bt datasets pipeline pull ./pipeline.ts --limit 500
+bt datasets pipeline transform ./pipeline.ts
+# Inspect or edit the transformed JSONL, then push to the pipeline target.
+bt datasets pipeline push ./pipeline.ts
+
+# Python pipelines are supported too.
+bt datasets pipeline run ./pipeline.py --project "<source project>" --limit 100
+```
+
+Useful flags:
+
+- `--limit <n>` controls how many source refs to discover.
+- `--window <duration>` constrains source ref discovery by `created` time; defaults to `1d`.
+- `--root-span-id <id>` restricts pulling to one or more specific root spans.
+- `--root <path>` controls where staged artifacts are written; it defaults to `bt-sync`. A staged run writes `pulled.jsonl` and `transformed.jsonl` in the same managed directory.
+- `--out` can override the managed output path for `pull` and `transform`.
+- `--in` can override the latest pull artifact for `transform`, or the latest transform artifact for `push`.
+- `push` reads the target from the pipeline and delegates to `bt sync push`; pass `--force` to restart an already completed push spec.
+- `--project <name>` supplies the active source project when the pipeline source omits a project.
+- `--source-project`, `--source-project-id`, `--source-org`, and `--source-filter` explicitly override source fields on `pull`, `transform`, and `run`.
+- `--target-project`, `--target-project-id`, `--target-org`, and `--target-dataset` override target fields on `run` and `push`.
+- `--max-concurrency <n>` controls transform concurrency.
+- `--name <name>` selects a pipeline when the file defines more than one.
 
 ## `bt sql`
 
@@ -196,25 +283,32 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
   - Detail view: `t` span/thread, `Left/Right` switch panes, `Backspace`/`Esc` back
   - Global: `q` quit
 
-## `bt util xact`
+## `bt util version`
 
-Local transaction-id conversion helpers:
+Local version and pagination-key conversion helpers:
 
 - Convert transaction id to pretty version id:
-  - `bt util xact to-pretty 1000192656880881099`
+  - `bt util version to-pretty 1000192656880881099`
 - Convert pretty version id to transaction id:
-  - `bt util xact from-pretty 81cd05ee665fdfb3`
-- Convert transaction id to timestamp:
-  - `bt util xact to-time 1000192656880881099`
-  - `bt util xact to-time 1000192656880881099 --format unix`
+  - `bt util version from-pretty 81cd05ee665fdfb3`
+- Convert transaction id, pretty version id, or pagination key to timestamp (local timezone by default):
+  - `bt util version to-time 1000192656880881099`
+  - `bt util version to-time 81cd05ee665fdfb3`
+  - `bt util version to-time p07639577379371417602`
+  - `bt util version to-time p07639577379371417602 --utc`
+  - `bt util version to-time 1000192656880881099 --format unix`
 - Convert timestamp to transaction id:
-  - `bt util xact from-time` (defaults to current time)
-  - `bt util xact from-time 2025-01-01` (date-only ISO at UTC midnight)
-  - `bt util xact from-time 2024-03-14T18:00:00Z`
-  - `bt util xact from-time 1710439200 --input unix --counter 42`
-- Inspect any xact value:
-  - `bt util xact inspect 1000192656880881099`
-  - `bt util xact inspect 81cd05ee665fdfb3`
+  - `bt util version from-time` (defaults to current time)
+  - `bt util version from-time 2025-01-01` (date-only ISO at UTC midnight)
+  - `bt util version from-time 2024-03-14T18:00:00Z`
+  - `bt util version from-time 1710439200 --input unix --counter 42`
+- Convert timestamp to pagination key:
+  - `bt util version from-time 2026-05-14T08:00:09-07:00 --pagination-key`
+- Inspect any version-like value:
+  - `bt util version inspect 1000192656880881099`
+  - `bt util version inspect 81cd05ee665fdfb3`
+  - `bt util version inspect p07639577379371417602`
+  - `bt util version inspect p07639577379371417602 --utc`
 
 ## `bt auth`
 
@@ -222,6 +316,7 @@ Local transaction-id conversion helpers:
   - `bt auth login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
   - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
+  - After login, `bt` updates the active profile/org context immediately. If `--project` is set, it also switches that project; otherwise it clears any stale default project for the new login.
   - `bt` confirms the resolved API URL before saving.
 - Login with OAuth (browser-based, stores refresh token in secure credential store):
   - `bt auth login --oauth --profile work`
@@ -239,10 +334,12 @@ Local transaction-id conversion helpers:
 
 Auth resolution order for commands is:
 
-1. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
-2. `--profile` or `BRAINTRUST_PROFILE`
-3. Org-based profile match (profile whose org matches `--org`/config org)
-4. Single-profile auto-select (if only one profile exists)
+1. Explicit `--profile`
+2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
+3. `BRAINTRUST_PROFILE`
+4. Org-based profile match (profile whose org matches `--org`/config org)
+5. Single-profile auto-select (if only one profile exists)
+6. Interactive profile picker (if multiple profiles exist and a TTY is available)
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
 
@@ -299,7 +396,7 @@ Use setup/docs commands to configure coding-agent skills and workflow docs for B
 
 Current behavior:
 
-- Supported agents: `claude`, `codex`, `cursor`, `opencode`.
+- Supported agents: `claude`, `codex`, `copilot`, `cursor`, `gemini`, `opencode`, `qwen`.
 - If no `--agent` values are provided, `bt` auto-detects likely agents from local/global context and falls back to all supported agents when none are detected.
 - In interactive TTY mode, skills setup shows a checklist so you can select/deselect agents before install.
 - In interactive TTY mode, setup also shows a workflow checklist and prefetches those docs automatically.
@@ -312,6 +409,8 @@ Current behavior:
 - Use `--refresh-docs` in setup (or `bt docs fetch --refresh`) to clear old docs before re-fetching.
 - `cursor` is local-only in this flow. If selected with `--global`, `bt` prints a warning and continues installing the other selected agents.
 - Claude integration installs the Braintrust skill file under `.claude/skills/braintrust/SKILL.md`.
+- Gemini and Qwen integration symlink `.gemini/skills`/`.qwen/skills` to `.agents/skills/braintrust/SKILL.md`.
+- Copilot integration symlinks `.copilot/skills` to `.agents/skills/braintrust/SKILL.md`. MCP config is written via `copilot mcp add` to the project `.copilot` dir (local) or the default user config (global).
 - Cursor integration installs `.cursor/rules/braintrust.mdc` with the same shared Braintrust guidance plus an auto-generated command-reference excerpt from this README.
 - Setup-time docs prefetch writes to `.bt/skills/docs` for `--local` and `~/.config/bt/skills/docs` (or `$XDG_CONFIG_HOME/bt/skills/docs`) for `--global`.
 - Docs fetch writes LLM-friendly local indexes: `.bt/skills/docs/README.md` and per-section `.bt/skills/docs/<section>/_index.md` (or the global equivalents under `~/.config/bt/skills/docs`).
@@ -324,7 +423,7 @@ Skill smoke-test harness:
 
 ## Roadmap / TODO
 
-- Add richer channel controls for self-update (for example pinned/branch canary selection).
+- Add richer channel controls for `bt update` (for example pinned/branch canary selection).
 - Expand release verification and smoke tests for installer flows across more architectures/environments.
 - Add `bt eval` support on Windows (today, `bt eval` is Unix-only due to Unix socket usage).
 - Add signed artifact verification guidance (signature flow) in install and upgrade docs.

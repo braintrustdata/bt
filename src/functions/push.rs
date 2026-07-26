@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use std::io::IsTerminal;
+use std::io::{ErrorKind, IsTerminal};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use dialoguer::console::style;
-use dialoguer::Confirm;
+use dialoguer::console::{style, Key};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -27,7 +26,7 @@ use crate::js_runner;
 use crate::projects::api::{create_project, get_project_by_name, list_projects};
 use crate::python_runner;
 use crate::source_language::{classify_runtime_extension, SourceLanguage};
-use crate::ui::{animations_enabled, is_interactive, is_quiet};
+use crate::ui::{animations_enabled, is_interactive, is_quiet, prompt_term};
 
 use super::api;
 use super::{
@@ -137,6 +136,59 @@ fn error_chain(err: &anyhow::Error) -> String {
     format!("{err:#}")
 }
 
+fn insert_functions_slug_conflict_hint(
+    details: &str,
+    function_events: &[Value],
+) -> Option<&'static str> {
+    let normalized = details.to_ascii_lowercase();
+    if !normalized.contains("slugs already exist") && !normalized.contains("slug already exists") {
+        return None;
+    }
+
+    let has_error_mode_entry = function_events.iter().any(|event| {
+        event
+            .get("if_exists")
+            .and_then(Value::as_str)
+            .is_none_or(|mode| mode == "error")
+    });
+    has_error_mode_entry
+        .then_some("Run again with `--if-exists replace` to update existing definitions.\n")
+}
+
+fn format_insert_functions_failure_message(
+    source_path: &Path,
+    bundle_id: Option<&str>,
+    details: &str,
+    function_events: &[Value],
+) -> String {
+    let mut message = if let Some(id) = bundle_id {
+        format!(
+            "failed to save function definitions for {} (bundle_id={}): {}",
+            source_path.display(),
+            id,
+            details
+        )
+    } else {
+        format!(
+            "failed to save function definitions for {}: {}",
+            source_path.display(),
+            details
+        )
+    };
+
+    if let Some(hint) = insert_functions_slug_conflict_hint(details, function_events) {
+        message.push('\n');
+        message.push_str(hint);
+    } else if bundle_id.is_some() {
+        message.push_str(&format!(
+            ". Retry by re-running `bt functions push --file {}`",
+            source_path.display()
+        ));
+    }
+
+    message
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectSelector {
     Id(String),
@@ -150,6 +202,20 @@ struct ProjectPreflight {
     requires_default_project: bool,
     named_projects: BTreeSet<String>,
     direct_project_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushConfirmationEntry {
+    source_file: String,
+    name: Option<String>,
+    slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushConfirmation {
+    Confirmed,
+    Declined,
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -446,7 +512,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         )
     };
 
-    let preflight = match collect_project_preflight(&base, &manifest) {
+    let preflight = match collect_project_preflight(&base, &manifest, auth_ctx.client.org_name()) {
         Ok(preflight) => preflight,
         Err(err) => {
             let message = format!("failed to resolve project selectors in manifest: {err}");
@@ -457,22 +523,16 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         }
     };
 
-    let preflight_source_files: Vec<&str> = manifest
-        .files
-        .iter()
-        .map(|f| f.source_file.as_str())
-        .collect();
+    let preflight_functions = collect_push_confirmation_entries(&manifest);
     let preflight_project_names: Vec<String> = preflight.named_projects.iter().cloned().collect();
 
     if !args.yes && is_interactive() {
         let prompt =
-            build_push_confirm_prompt(&auth_ctx, &preflight_source_files, &preflight_project_names);
-        let confirmed = Confirm::new()
-            .with_prompt(prompt)
-            .default(false)
-            .interact()?;
-        if !confirmed {
-            return cancel_push(&base, &files);
+            build_push_confirm_prompt(&auth_ctx, &preflight_functions, &preflight_project_names);
+        match confirm_push(prompt)? {
+            PushConfirmation::Confirmed => {}
+            PushConfirmation::Declined => return Ok(()),
+            PushConfirmation::Interrupted => return report_cancelled_push(&base, &files),
         }
     }
 
@@ -554,8 +614,12 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
         );
     }
 
-    let use_progress =
-        !base.json && std::io::stderr().is_terminal() && animations_enabled() && !is_quiet();
+    let is_verbose = base.verbose_explicit();
+    let use_progress = !is_verbose
+        && !base.json
+        && std::io::stderr().is_terminal()
+        && animations_enabled()
+        && !is_quiet();
 
     let file_parts: Vec<&str> = manifest
         .files
@@ -611,6 +675,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
             &classified.allowed_roots,
             &mut project_name_cache,
             &manifest.baseline_dep_versions,
+            is_verbose,
         )
         .await;
 
@@ -725,6 +790,21 @@ fn build_code_function_data(
     })
 }
 
+fn maybe_log_verbose(enabled: bool, args: std::fmt::Arguments<'_>) {
+    if enabled && !is_quiet() {
+        eprintln!("{args}");
+    }
+}
+
+fn maybe_log_verbose_json(enabled: bool, label: &str, value: &Value) {
+    if !enabled || is_quiet() {
+        return;
+    }
+
+    let formatted = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    eprintln!("bt functions push [insert-functions] {label}:\n{formatted}");
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_file(
     auth_ctx: &super::AuthContext,
@@ -739,6 +819,7 @@ async fn push_file(
     allowed_roots: &[PathBuf],
     project_name_cache: &mut BTreeMap<String, String>,
     baseline_dep_versions: &[String],
+    is_verbose: bool,
 ) -> std::result::Result<FileSuccess, FileFailure> {
     let mut code_entries = Vec::new();
     let mut events = Vec::new();
@@ -760,6 +841,16 @@ async fn push_file(
             ManifestEntry::FunctionEvent(event) => events.push((event, project_id)),
         }
     }
+
+    maybe_log_verbose(
+        is_verbose,
+        format_args!(
+            "bt functions push [insert-functions] building payload for {} (code entries: {}, function_event entries: {})",
+            source_path.display(),
+            code_entries.len(),
+            events.len()
+        ),
+    );
 
     let mut bundle_id: Option<String> = None;
 
@@ -863,9 +954,31 @@ async fn push_file(
                 .as_deref()
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| args.if_exists.as_str().to_string());
+            let if_exists_source = if code.if_exists.is_some() {
+                "code"
+            } else {
+                "--if-exists"
+            };
             obj.insert("if_exists".to_string(), Value::String(if_exists));
 
-            function_events.push(Value::Object(obj));
+            let entry = Value::Object(obj);
+            let entry_index = function_events.len();
+            maybe_log_verbose(
+                is_verbose,
+                format_args!(
+                    "bt functions push [insert-functions] entry {entry_index} from code {:?}: project_id={:?}, slug={:?}, if_exists={:?} from {if_exists_source},  bundle_id={:?}",
+                    code.name.as_str(),
+                    project_id.as_str(),
+                    code.slug.as_str(),
+                    entry
+                        .get("if_exists")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    slot.bundle_id.as_str()
+                ),
+            );
+            maybe_log_verbose_json(is_verbose, &format!("entry {entry_index} payload"), &entry);
+            function_events.push(entry);
         }
     }
 
@@ -904,9 +1017,21 @@ async fn push_file(
             resolved_placeholders.insert(project_name, resolved);
         }
 
+        if !resolved_placeholders.is_empty() {
+            maybe_log_verbose(
+                is_verbose,
+                format_args!(
+                    "bt functions push [insert-functions] resolved nested project selectors in function_event entry: {:?}",
+                    resolved_placeholders
+                ),
+            );
+        }
+
         replace_project_name_placeholders(&mut event, &resolved_placeholders);
 
         let fallback_project_id = resolved_project_id.clone();
+        let mut project_id_resolution = "kept from event".to_string();
+        let mut if_exists_resolution = "kept from event".to_string();
 
         if let Some(object) = event.as_object_mut() {
             let needs_project_id = object
@@ -916,19 +1041,36 @@ async fn push_file(
                 .unwrap_or(true);
             if needs_project_id {
                 object.insert("project_id".to_string(), Value::String(fallback_project_id));
+                project_id_resolution = format!("defaulted to {:?}", resolved_project_id);
             }
             if object.get("if_exists").is_none() {
                 object.insert(
                     "if_exists".to_string(),
                     Value::String(args.if_exists.as_str().to_string()),
                 );
+                if_exists_resolution = format!("defaulted to {:?}", args.if_exists.as_str());
             }
         }
 
+        let entry_index = function_events.len();
+        maybe_log_verbose(
+            is_verbose,
+            format_args!(
+                "bt functions push [insert-functions] entry {entry_index} from function_event: project_id {project_id_resolution}, if_exists {if_exists_resolution}"
+            ),
+        );
+        maybe_log_verbose_json(is_verbose, &format!("entry {entry_index} payload"), &event);
         function_events.push(event);
     }
 
     if function_events.is_empty() {
+        maybe_log_verbose(
+            is_verbose,
+            format_args!(
+                "bt functions push [insert-functions] no insert payload created for {} because no function entries were discovered",
+                source_path.display()
+            ),
+        );
         return Ok(FileSuccess {
             uploaded_entries: 0,
             ignored_entries: 0,
@@ -936,28 +1078,32 @@ async fn push_file(
         });
     }
 
+    if is_verbose {
+        let insert_body = api::insert_functions_body(&function_events);
+        maybe_log_verbose_json(
+            is_verbose,
+            "request body for POST /insert-functions",
+            &insert_body,
+        );
+    }
+    maybe_log_verbose(
+        is_verbose,
+        format_args!(
+            "bt functions push [insert-functions] sending {} entries to /insert-functions",
+            function_events.len()
+        ),
+    );
+
     let insert_result = api::insert_functions(&auth_ctx.client, &function_events)
         .await
         .map_err(|err| FileFailure {
             reason: HardFailureReason::InsertFunctionsFailed,
-            message: {
-                let details = format!("{err:#}");
-                if let Some(id) = &bundle_id {
-                    format!(
-                        "failed to save function definitions for {} (bundle_id={}): {}. Retry by re-running `bt functions push --file {}`",
-                        source_path.display(),
-                        id,
-                        details,
-                        source_path.display()
-                    )
-                } else {
-                    format!(
-                        "failed to save function definitions for {}: {}",
-                        source_path.display(),
-                        details
-                    )
-                }
-            },
+            message: format_insert_functions_failure_message(
+                source_path,
+                bundle_id.as_deref(),
+                &error_chain(&err),
+                &function_events,
+            ),
         })?;
 
     let (uploaded_entries, ignored_entries) =
@@ -1159,7 +1305,7 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
     let mut python = BTreeSet::new();
     let mut allowed_roots = BTreeSet::new();
     if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(canonical_cwd) = cwd.canonicalize() {
+        if let Ok(canonical_cwd) = dunce::canonicalize(&cwd) {
             allowed_roots.insert(canonical_cwd);
         }
     }
@@ -1183,8 +1329,7 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
 
         if path.is_file() {
             explicit_file_inputs += 1;
-            let canonical = path
-                .canonicalize()
+            let canonical = dunce::canonicalize(&path)
                 .with_context(|| format!("failed to canonicalize file {}", path.display()))?;
             let parent = canonical
                 .parent()
@@ -1207,8 +1352,7 @@ fn collect_classified_files(inputs: &[PathBuf]) -> Result<ClassifiedFiles> {
             continue;
         }
 
-        let canonical_dir = path
-            .canonicalize()
+        let canonical_dir = dunce::canonicalize(&path)
             .with_context(|| format!("failed to canonicalize directory {}", path.display()))?;
         allowed_roots.insert(canonical_dir.clone());
         collect_from_dir(&canonical_dir, &mut js_like, &mut python)?;
@@ -1259,8 +1403,7 @@ fn collect_from_dir_inner(
         if file_type.is_dir() && !file_type.is_symlink() {
             collect_from_dir_inner(&path, js_like, python, depth + 1)?;
         } else if file_type.is_file() {
-            let canonical = path
-                .canonicalize()
+            let canonical = dunce::canonicalize(&path)
                 .with_context(|| format!("failed to canonicalize file {}", path.display()))?;
             match classify_source_file(&canonical) {
                 Some(SourceLanguage::JsLike) => {
@@ -1337,9 +1480,8 @@ fn validate_manifest_paths(
     let mut seen = BTreeSet::new();
 
     for file in &manifest.files {
-        let path = PathBuf::from(&file.source_file)
-            .canonicalize()
-            .map_err(|err| FileFailure {
+        let path =
+            dunce::canonicalize(PathBuf::from(&file.source_file)).map_err(|err| FileFailure {
                 reason: HardFailureReason::ManifestPathMissing,
                 message: format!("manifest source file missing: {} ({err})", file.source_file),
             })?;
@@ -1424,7 +1566,7 @@ fn validate_python_bundle(
 
     let mut sources = BTreeSet::new();
     for raw_source in &python_bundle.sources {
-        let canonical = PathBuf::from(raw_source).canonicalize().with_context(|| {
+        let canonical = dunce::canonicalize(PathBuf::from(raw_source)).with_context(|| {
             format!(
                 "manifest file '{}' referenced missing python source {}",
                 manifest_file.source_file, raw_source
@@ -1448,23 +1590,18 @@ fn validate_python_bundle(
     }
 
     let source_list: Vec<PathBuf> = sources.into_iter().collect();
+    let archive_root = infer_python_archive_root(entry_module, source_path)?;
+    for source in &source_list {
+        let archive_path = archive_source_path(source, &archive_root)?;
+        validate_python_archive_path(&archive_path)?;
+    }
+
     if !entry_module_matches_sources(entry_module, &source_list, allowed_roots) {
         bail!(
             "python_bundle.entry_module '{}' does not match any bundled source module for '{}'",
             entry_module,
             source_path.display()
         );
-    }
-
-    let archive_root = infer_python_archive_root(entry_module, source_path)?;
-    for source in &source_list {
-        if !source.starts_with(&archive_root) {
-            bail!(
-                "python source '{}' is outside inferred archive root '{}'",
-                source.display(),
-                archive_root.display()
-            );
-        }
     }
 
     Ok(ValidatedPythonBundle {
@@ -1638,6 +1775,8 @@ fn build_python_bundle_archive(
         baseline_dep_versions,
         python_version,
     )?;
+    ensure_python_package_staged(&pkg_dir, &python, "braintrust")
+        .context("failed to stage required Python package 'braintrust'")?;
 
     let stage_dir = build_dir.path.join("stage");
     std::fs::create_dir_all(&stage_dir)
@@ -1675,6 +1814,25 @@ fn archive_source_path(source: &Path, archive_root: &Path) -> Result<PathBuf> {
         );
     }
     Ok(rel.to_path_buf())
+}
+
+fn validate_python_archive_path(archive_path: &Path) -> Result<()> {
+    for component in archive_path.iter() {
+        let component = component.to_str().ok_or_else(|| {
+            anyhow!(
+                "python bundle source path contains invalid utf-8: {}",
+                archive_path.display()
+            )
+        })?;
+        if component.chars().any(char::is_whitespace) {
+            bail!(
+                "python bundle source path '{}' contains whitespace in path component '{}'; rename the file or directory before running `bt functions push`",
+                archive_path.display(),
+                component
+            );
+        }
+    }
+    Ok(())
 }
 
 fn copy_directory_files_into_stage(source_root: &Path, stage_root: &Path) -> Result<()> {
@@ -1853,6 +2011,100 @@ fn install_python_dependencies(
     Ok(())
 }
 
+fn ensure_python_package_staged(pkg_dir: &Path, python: &Path, package_name: &str) -> Result<()> {
+    if python_package_staged(pkg_dir, package_name) {
+        return Ok(());
+    }
+
+    vendor_python_package_from_interpreter(pkg_dir, python, package_name)?;
+
+    if python_package_staged(pkg_dir, package_name) {
+        return Ok(());
+    }
+
+    bail!(
+        "python bundle staging is missing required package '{}' under {}",
+        package_name,
+        pkg_dir.display()
+    );
+}
+
+fn python_package_staged(pkg_dir: &Path, package_name: &str) -> bool {
+    pkg_dir.join(package_name).is_dir() || pkg_dir.join(format!("{package_name}.py")).is_file()
+}
+
+fn vendor_python_package_from_interpreter(
+    pkg_dir: &Path,
+    python: &Path,
+    package_name: &str,
+) -> Result<()> {
+    const VENDOR_PACKAGE_SCRIPT: &str = r#"import importlib
+import pathlib
+import shutil
+import sys
+
+target_root = pathlib.Path(sys.argv[1])
+package_name = sys.argv[2]
+module = importlib.import_module(package_name)
+module_file = getattr(module, "__file__", None)
+if not module_file:
+    raise RuntimeError(f"package {package_name!r} has no __file__")
+source = pathlib.Path(module_file).resolve()
+
+if source.name == "__init__.py":
+    src_dir = source.parent
+    dest = target_root / package_name
+    if dest.exists():
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    shutil.copytree(src_dir, dest)
+else:
+    dest = target_root / f"{package_name}.py"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
+"#;
+
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(VENDOR_PACKAGE_SCRIPT)
+        .arg(pkg_dir)
+        .arg(package_name)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to spawn Python package vendor helper for '{}'",
+                package_name
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let excerpt = stderr
+        .lines()
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if excerpt.is_empty() {
+        bail!(
+            "Python package vendor helper failed with status {} for '{}'",
+            output.status,
+            package_name
+        );
+    }
+    bail!(
+        "Python package vendor helper failed with status {} for '{}': {}",
+        output.status,
+        package_name,
+        excerpt
+    );
+}
+
 fn run_uv_command(uv: &Path, args: &[OsString], stage: &str) -> Result<()> {
     let args_debug = args
         .iter()
@@ -1920,8 +2172,7 @@ fn collect_regular_files_recursive_impl(
 }
 
 fn validate_requirements_path(path: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
-    let canonical = path
-        .canonicalize()
+    let canonical = dunce::canonicalize(path)
         .with_context(|| format!("requirements file not found: {}", path.display()))?;
     if !canonical.is_file() {
         bail!("requirements path is not a file: {}", canonical.display());
@@ -2062,8 +2313,7 @@ fn resolve_requirement_path(reference: &str, parent: &Path) -> Result<PathBuf> {
     } else {
         parent.join(candidate)
     };
-    absolute
-        .canonicalize()
+    dunce::canonicalize(&absolute)
         .with_context(|| format!("failed to resolve requirements reference {}", normalized))
 }
 
@@ -2084,28 +2334,73 @@ fn ensure_path_within_allowed_roots(
     );
 }
 
+fn collect_push_confirmation_entries(manifest: &RunnerManifest) -> Vec<PushConfirmationEntry> {
+    let mut entries = Vec::new();
+
+    for file in &manifest.files {
+        for entry in &file.entries {
+            let (name, slug) = match entry {
+                ManifestEntry::Code(code) => (Some(code.name.clone()), Some(code.slug.clone())),
+                ManifestEntry::FunctionEvent(event) => (
+                    string_field(&event.event, "name"),
+                    string_field(&event.event, "slug"),
+                ),
+            };
+            entries.push(PushConfirmationEntry {
+                source_file: file.source_file.clone(),
+                name,
+                slug,
+            });
+        }
+    }
+
+    entries
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn build_push_confirm_prompt(
     auth_ctx: &super::AuthContext,
-    source_files: &[&str],
+    functions: &[PushConfirmationEntry],
     project_names: &[String],
 ) -> String {
-    let file_names: Vec<&str> = source_files
-        .iter()
-        .map(|f| {
-            Path::new(f)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(f)
-        })
-        .collect();
-    let files_part = file_names
-        .iter()
-        .map(|f| style(f).green().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     let org_label = current_org_label(auth_ctx);
+    build_push_confirm_prompt_for_org(&org_label, functions, project_names)
+}
+
+fn build_push_confirm_prompt_for_org(
+    org_label: &str,
+    functions: &[PushConfirmationEntry],
+    project_names: &[String],
+) -> String {
+    let function_word = if functions.len() == 1 {
+        "function"
+    } else {
+        "functions"
+    };
+    let functions_part = if functions.is_empty() {
+        "no functions".to_string()
+    } else {
+        let labels = functions
+            .iter()
+            .map(|entry| {
+                style(push_confirmation_entry_label(entry))
+                    .green()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} {function_word}: {labels}", functions.len())
+    };
     let targets_part = if project_names.is_empty() {
-        style(&org_label).green().to_string()
+        style(org_label).green().to_string()
     } else {
         project_names
             .iter()
@@ -2114,49 +2409,129 @@ fn build_push_confirm_prompt(
             .join(", ")
     };
 
-    format!("Push {files_part} to {targets_part}")
+    format!("Push {functions_part} to {targets_part}")
 }
 
-fn cancel_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
-    if base.json {
-        let summary = PushSummary {
-            status: CommandStatus::Failed,
-            total_files: files.len(),
-            uploaded_files: 0,
-            failed_files: 0,
-            skipped_files: files.len(),
-            ignored_entries: 0,
-            files: files
-                .iter()
-                .map(|path| PushFileReport {
-                    source_file: path.display().to_string(),
-                    status: FileStatus::Skipped,
-                    uploaded_entries: 0,
-                    skipped_reason: Some(SoftSkipReason::TerminatedAfterFailure),
-                    error_reason: Some(HardFailureReason::UserCancelled),
-                    bundle_id: None,
-                    message: Some("push cancelled by user".to_string()),
-                })
-                .collect(),
-            warnings: vec![],
-            errors: vec![ReportError {
-                reason: HardFailureReason::UserCancelled,
-                message: "push cancelled by user".to_string(),
-            }],
+fn push_confirmation_entry_label(entry: &PushConfirmationEntry) -> String {
+    match (entry.name.as_deref(), entry.slug.as_deref()) {
+        (Some(name), Some(slug)) => format!("{name} (slug: {slug})"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(slug)) => format!("slug: {slug}"),
+        (None, None) => {
+            let source_file = Path::new(&entry.source_file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&entry.source_file);
+            format!("entry from {source_file}")
+        }
+    }
+}
+
+fn confirm_push(prompt: String) -> Result<PushConfirmation> {
+    let term = prompt_term().ok_or_else(|| anyhow!("interactive mode requires TTY"))?;
+    term.write_str(&format_push_confirm_prompt(&prompt))?;
+    term.hide_cursor()?;
+    term.flush()?;
+
+    struct ShowCursorOnDrop<'a>(&'a dialoguer::console::Term);
+    impl Drop for ShowCursorOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.show_cursor();
+        }
+    }
+    let _cursor_guard = ShowCursorOnDrop(&term);
+
+    loop {
+        let key = match term.read_key_raw() {
+            Ok(key) => key,
+            Err(err) if err.kind() == ErrorKind::Interrupted => {
+                return Ok(PushConfirmation::Interrupted);
+            }
+            Err(err) => return Err(err.into()),
         };
-        emit_summary(base, &summary)?;
+
+        let Some(confirmation) = push_confirmation_from_key(key) else {
+            continue;
+        };
+
+        // Raw mode doesn't echo the keypress, so append the answer to the
+        // already-visible "... [y/N] " line before returning.
+        if confirmation != PushConfirmation::Interrupted {
+            term.write_line(match confirmation {
+                PushConfirmation::Confirmed => "yes",
+                _ => "no",
+            })?;
+            term.flush()?;
+        }
+        return Ok(confirmation);
+    }
+}
+
+fn push_confirmation_from_key(key: Key) -> Option<PushConfirmation> {
+    match key {
+        Key::Char('y') | Key::Char('Y') => Some(PushConfirmation::Confirmed),
+        Key::Char('n') | Key::Char('N') | Key::Enter | Key::Escape | Key::Char('q') => {
+            Some(PushConfirmation::Declined)
+        }
+        Key::CtrlC => Some(PushConfirmation::Interrupted),
+        _ => None,
+    }
+}
+
+fn format_push_confirm_prompt(prompt: &str) -> String {
+    if prompt.is_empty() {
+        "[y/N] ".to_string()
     } else {
+        format!("{prompt} [y/N] ")
+    }
+}
+
+fn report_cancelled_push(base: &BaseArgs, files: &[PathBuf]) -> Result<()> {
+    if base.json {
+        emit_summary(base, &cancelled_push_summary(files))?;
+    } else if !is_quiet() {
         eprintln!("Push cancelled. No changes were made.");
     }
 
-    bail!("push cancelled by user");
+    Ok(())
 }
 
-fn resolve_default_project_name(base: &BaseArgs) -> Result<Option<String>> {
+fn cancelled_push_summary(files: &[PathBuf]) -> PushSummary {
+    PushSummary {
+        status: CommandStatus::Failed,
+        total_files: files.len(),
+        uploaded_files: 0,
+        failed_files: 0,
+        skipped_files: files.len(),
+        ignored_entries: 0,
+        files: files
+            .iter()
+            .map(|path| PushFileReport {
+                source_file: path.display().to_string(),
+                status: FileStatus::Skipped,
+                uploaded_entries: 0,
+                skipped_reason: Some(SoftSkipReason::TerminatedAfterFailure),
+                error_reason: Some(HardFailureReason::UserCancelled),
+                bundle_id: None,
+                message: Some("push cancelled by user".to_string()),
+            })
+            .collect(),
+        warnings: vec![],
+        errors: vec![ReportError {
+            reason: HardFailureReason::UserCancelled,
+            message: "push cancelled by user".to_string(),
+        }],
+    }
+}
+
+fn resolve_default_project_name(
+    base: &BaseArgs,
+    resolved_org: Option<&str>,
+) -> Result<Option<String>> {
     let configured = base
         .project
         .clone()
-        .or_else(|| config::load().ok().and_then(|value| value.project));
+        .or_else(|| config::configured_project_for_context(base, resolved_org));
     let Some(configured) = configured else {
         return Ok(None);
     };
@@ -2170,8 +2545,9 @@ fn resolve_default_project_name(base: &BaseArgs) -> Result<Option<String>> {
 fn collect_project_preflight(
     base: &BaseArgs,
     manifest: &RunnerManifest,
+    resolved_org: &str,
 ) -> Result<ProjectPreflight> {
-    let default_project_name = resolve_default_project_name(base)?;
+    let default_project_name = resolve_default_project_name(base, Some(resolved_org))?;
     let mut requires_default_project = false;
     let mut named_projects = BTreeSet::new();
     let mut direct_project_ids = BTreeSet::new();
@@ -2861,6 +3237,124 @@ mod tests {
     }
 
     #[test]
+    fn push_confirmation_entries_include_code_and_function_event_names_and_slugs() {
+        let manifest = RunnerManifest {
+            runtime_context: RuntimeContext {
+                runtime: "node".to_string(),
+                version: "20.0.0".to_string(),
+            },
+            files: vec![ManifestFile {
+                source_file: "functions.ts".to_string(),
+                entries: vec![
+                    ManifestEntry::Code(CodeEntry {
+                        project_id: None,
+                        project_name: None,
+                        name: "Code Tool".to_string(),
+                        slug: "code-tool".to_string(),
+                        description: None,
+                        function_type: Some("tool".to_string()),
+                        if_exists: None,
+                        metadata: None,
+                        tags: None,
+                        function_schema: None,
+                        location: None,
+                        preview: None,
+                    }),
+                    ManifestEntry::FunctionEvent(FunctionEventEntry {
+                        project_id: None,
+                        project_name: None,
+                        event: serde_json::json!({
+                            "name": " Prompt Function ",
+                            "slug": " prompt-function "
+                        }),
+                    }),
+                ],
+                python_bundle: None,
+            }],
+            baseline_dep_versions: vec![],
+        };
+
+        let entries = collect_push_confirmation_entries(&manifest);
+
+        assert_eq!(
+            entries,
+            vec![
+                PushConfirmationEntry {
+                    source_file: "functions.ts".to_string(),
+                    name: Some("Code Tool".to_string()),
+                    slug: Some("code-tool".to_string()),
+                },
+                PushConfirmationEntry {
+                    source_file: "functions.ts".to_string(),
+                    name: Some("Prompt Function".to_string()),
+                    slug: Some("prompt-function".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn push_confirm_prompt_lists_all_function_names_and_slugs() {
+        let functions = vec![
+            PushConfirmationEntry {
+                source_file: "functions.ts".to_string(),
+                name: Some("Code Tool".to_string()),
+                slug: Some("code-tool".to_string()),
+            },
+            PushConfirmationEntry {
+                source_file: "prompts.ts".to_string(),
+                name: Some("Prompt Function".to_string()),
+                slug: Some("prompt-function".to_string()),
+            },
+        ];
+        let project_names = vec!["test-project".to_string()];
+
+        let prompt = build_push_confirm_prompt_for_org("test-org", &functions, &project_names);
+
+        assert!(prompt.contains("2 functions"));
+        assert!(prompt.contains("Code Tool (slug: code-tool)"));
+        assert!(prompt.contains("Prompt Function (slug: prompt-function)"));
+        assert!(prompt.contains("test-org/test-project"));
+    }
+
+    #[test]
+    fn ctrl_c_confirmation_key_is_treated_as_interruption() {
+        assert_eq!(
+            push_confirmation_from_key(Key::CtrlC),
+            Some(PushConfirmation::Interrupted)
+        );
+        assert_eq!(
+            push_confirmation_from_key(Key::Char('y')),
+            Some(PushConfirmation::Confirmed)
+        );
+        assert_eq!(
+            push_confirmation_from_key(Key::Enter),
+            Some(PushConfirmation::Declined)
+        );
+    }
+
+    #[test]
+    fn cancelled_push_summary_reports_user_cancelled_files() {
+        let files = vec![PathBuf::from("functions.ts")];
+
+        let summary = cancelled_push_summary(&files);
+
+        assert_eq!(summary.status, CommandStatus::Failed);
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(summary.skipped_files, 1);
+        assert_eq!(summary.errors[0].reason, HardFailureReason::UserCancelled);
+        assert_eq!(summary.files[0].status, FileStatus::Skipped);
+        assert_eq!(
+            summary.files[0].error_reason,
+            Some(HardFailureReason::UserCancelled)
+        );
+        assert_eq!(
+            summary.files[0].message.as_deref(),
+            Some("push cancelled by user")
+        );
+    }
+
+    #[test]
     fn collect_project_preflight_uses_default_project_when_needed() {
         let mut base = test_base_args();
         base.project = Some("demo-project".to_string());
@@ -2890,7 +3384,7 @@ mod tests {
             baseline_dep_versions: vec![],
         };
 
-        let preflight = collect_project_preflight(&base, &manifest).expect("preflight");
+        let preflight = collect_project_preflight(&base, &manifest, "demo-org").expect("preflight");
         assert!(preflight.requires_default_project);
         assert!(
             preflight.named_projects.contains("demo-project"),
@@ -3031,6 +3525,64 @@ mod tests {
     }
 
     #[test]
+    fn insert_failure_message_suggests_if_exists_for_slug_conflicts() {
+        let events = vec![serde_json::json!({
+            "slug": "test-function",
+            "if_exists": "error"
+        })];
+
+        let message = format_insert_functions_failure_message(
+            Path::new("/tmp/test-functions/parameters.py"),
+            None,
+            "failed to insert functions: request failed (400 Bad Request): Slugs already exist: test-function",
+            &events,
+        );
+
+        assert!(message.contains(
+            "failed to save function definitions for /tmp/test-functions/parameters.py: failed to insert functions"
+        ));
+        assert!(message
+            .contains("Run again with `--if-exists replace` to update existing definitions."));
+        assert!(message
+            .contains("Slugs already exist: test-function\nRun again with `--if-exists replace`"));
+    }
+
+    #[test]
+    fn insert_failure_message_skips_if_exists_hint_when_entry_already_updates() {
+        let events = vec![serde_json::json!({
+            "slug": "test-function",
+            "if_exists": "replace"
+        })];
+
+        let message = format_insert_functions_failure_message(
+            Path::new("parameters.py"),
+            None,
+            "failed to insert functions: request failed (400 Bad Request): Slug already exists: test-function",
+            &events,
+        );
+
+        assert!(!message.contains("--if-exists replace"));
+    }
+
+    #[test]
+    fn insert_failure_message_preserves_bundle_retry_for_other_failures() {
+        let events = vec![serde_json::json!({
+            "slug": "test-function",
+            "if_exists": "error"
+        })];
+
+        let message = format_insert_functions_failure_message(
+            Path::new("functions.ts"),
+            Some("bundle-test"),
+            "failed to insert functions: request failed (500 Internal Server Error)",
+            &events,
+        );
+
+        assert!(message.contains("(bundle_id=bundle-test)"));
+        assert!(message.contains("Retry by re-running `bt functions push --file functions.ts`"));
+    }
+
+    #[test]
     fn requirements_reference_escape_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("root");
@@ -3050,8 +3602,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.js");
         std::fs::write(&source, "export const x = 1;\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3087,8 +3639,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.py");
         std::fs::write(&source, "VALUE = 1\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3132,8 +3684,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.py");
         std::fs::write(&source, "VALUE = 1\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3178,8 +3730,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("tool.py");
         std::fs::write(&source, "VALUE = 1\n").expect("write source file");
-        let source = source.canonicalize().expect("canonicalize source");
-        let root = dir.path().canonicalize().expect("canonicalize root");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
 
         let manifest = RunnerManifest {
             runtime_context: RuntimeContext {
@@ -3223,6 +3775,66 @@ mod tests {
             .contains("does not match any bundled source module"));
     }
 
+    fn assert_whitespace_in_filename_rejected(filename: &str, entry_module: &str) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join(filename);
+        std::fs::write(&source, "VALUE = 1\n").expect("write source file");
+        let source = dunce::canonicalize(&source).expect("canonicalize source");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize root");
+
+        let manifest = RunnerManifest {
+            runtime_context: RuntimeContext {
+                runtime: "python".to_string(),
+                version: "3.12.0".to_string(),
+            },
+            files: vec![ManifestFile {
+                source_file: source.to_string_lossy().to_string(),
+                entries: vec![ManifestEntry::Code(CodeEntry {
+                    project_id: None,
+                    project_name: None,
+                    name: "Tool".to_string(),
+                    slug: "tool".to_string(),
+                    description: None,
+                    function_type: Some("tool".to_string()),
+                    if_exists: None,
+                    metadata: None,
+                    tags: None,
+                    function_schema: None,
+                    location: Some(serde_json::json!({"type":"function","index":0})),
+                    preview: None,
+                })],
+                python_bundle: Some(PythonBundle {
+                    entry_module: entry_module.to_string(),
+                    sources: vec![source.to_string_lossy().to_string()],
+                }),
+            }],
+            baseline_dep_versions: vec![],
+        };
+
+        let err = validate_manifest_paths(
+            &manifest,
+            std::slice::from_ref(&source),
+            SourceLanguage::Python,
+            std::slice::from_ref(&root),
+        )
+        .expect_err("must fail");
+        assert_eq!(err.reason, HardFailureReason::ManifestSchemaInvalid);
+        assert!(err
+            .message
+            .contains("contains whitespace in path component"));
+    }
+
+    #[test]
+    fn validate_manifest_paths_rejects_python_bundle_with_whitespace_in_filename() {
+        assert_whitespace_in_filename_rejected("my tool.py", "my tool");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_manifest_paths_rejects_python_bundle_with_leading_whitespace_in_filename() {
+        assert_whitespace_in_filename_rejected(" tool.py", " tool");
+    }
+
     #[test]
     fn code_function_data_includes_non_empty_preview() {
         let runtime = RuntimeContext {
@@ -3257,6 +3869,61 @@ mod tests {
 
         assert_eq!(value["type"], "code");
         assert!(value["data"].get("preview").is_none());
+    }
+
+    #[test]
+    fn python_package_staged_detects_module_files_and_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = dir.path();
+
+        assert!(
+            !python_package_staged(pkg_dir, "braintrust"),
+            "package should be missing initially"
+        );
+
+        let package_dir = pkg_dir.join("braintrust");
+        std::fs::create_dir_all(&package_dir).expect("create package dir");
+        std::fs::write(package_dir.join("__init__.py"), "").expect("write __init__");
+        assert!(
+            python_package_staged(pkg_dir, "braintrust"),
+            "package directory should be detected"
+        );
+
+        std::fs::remove_dir_all(&package_dir).expect("remove package dir");
+        std::fs::write(pkg_dir.join("braintrust.py"), "VALUE = 1\n").expect("write module file");
+        assert!(
+            python_package_staged(pkg_dir, "braintrust"),
+            "single-file module should be detected"
+        );
+    }
+
+    #[test]
+    fn ensure_python_package_staged_can_vendor_stdlib_package() {
+        let Some(python) = crate::python_runner::resolve_python_interpreter(None, &[]) else {
+            eprintln!(
+                "Skipping ensure_python_package_staged_can_vendor_stdlib_package (python not installed)."
+            );
+            return;
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = dir.path();
+        ensure_python_package_staged(pkg_dir, &python, "json")
+            .expect("should vendor stdlib package from interpreter");
+        assert!(
+            python_package_staged(pkg_dir, "json"),
+            "json package should be staged after vendor fallback"
+        );
+    }
+
+    #[test]
+    fn js_bundler_defaults_do_not_externalize_braintrust_sdk() {
+        assert!(
+            !FUNCTIONS_JS_BUNDLER_SOURCE.contains("\"braintrust\"")
+                && !FUNCTIONS_JS_BUNDLER_SOURCE.contains("\"autoevals\"")
+                && !FUNCTIONS_JS_BUNDLER_SOURCE.contains("\"@braintrust/\""),
+            "default JS bundler externals must not include Braintrust SDK packages"
+        );
     }
 
     #[test]
@@ -3316,8 +3983,8 @@ mod tests {
         let mut python = BTreeSet::new();
         collect_from_dir(&root, &mut js_like, &mut python).expect("collect sources");
 
-        let inside = inside.canonicalize().expect("canonicalize inside");
-        let outside = outside.canonicalize().expect("canonicalize outside");
+        let inside = dunce::canonicalize(&inside).expect("canonicalize inside");
+        let outside = dunce::canonicalize(&outside).expect("canonicalize outside");
         assert!(js_like.contains(&inside));
         assert!(
             !js_like.contains(&outside),
@@ -3356,19 +4023,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collect_classified_files_yields_non_verbatim_paths() {
+        // On Windows `Path::canonicalize` emits `\\?\` verbatim paths the Python
+        // runner can't reconcile against a clean cwd; `dunce` must strip them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("scorer.py");
+        std::fs::write(&source, "x = 1\n").expect("write source");
+
+        let classified =
+            collect_classified_files(std::slice::from_ref(&source)).expect("collect classified");
+        assert_eq!(classified.python.len(), 1, "expected the python source");
+
+        let collected = &classified.python[0];
+        assert!(collected.is_file(), "collected path must resolve to a file");
+        assert!(
+            !collected.to_string_lossy().starts_with(r"\\?\"),
+            "collected path must not carry a verbatim prefix, got {}",
+            collected.display()
+        );
+
+        // Allowed roots must be verbatim-free too, so the runner's clean
+        // cwd-based comparisons keep matching.
+        for root in &classified.allowed_roots {
+            assert!(
+                !root.to_string_lossy().starts_with(r"\\?\"),
+                "allowed root must not carry a verbatim prefix, got {}",
+                root.display()
+            );
+        }
+    }
+
     fn test_base_args() -> BaseArgs {
         BaseArgs {
             json: false,
+            verbose: false,
+            verbose_source: None,
             quiet: false,
+            quiet_source: None,
             no_color: false,
+            no_input: false,
             profile: None,
+            profile_explicit: false,
             org_name: None,
             project: None,
             api_key: None,
+            api_key_source: None,
             prefer_profile: false,
-            no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }

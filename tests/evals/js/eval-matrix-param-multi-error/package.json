@@ -1,0 +1,12 @@
+{
+  "name": "bt-eval-matrix-param-multi-error",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "braintrust": "^2.2.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2"
+  }
+}

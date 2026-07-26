@@ -1,0 +1,8 @@
+{
+  "name": "bt-eval-bt-eval-main-matrix-error",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "braintrust": "^2.2.0"
+  }
+}

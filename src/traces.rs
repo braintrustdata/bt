@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -30,12 +30,16 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
-use urlencoding::encode;
+use urlencoding::{decode, encode};
 
 use crate::args::BaseArgs;
 use crate::auth::{self, login};
+use crate::experiments::api as experiments_api;
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
+use crate::utils::parse_duration_to_seconds;
+
+mod waterfall;
 
 const MAX_TRACE_SPANS: usize = 5000;
 const MAX_BTQL_PAGE_LIMIT: usize = 1000;
@@ -66,8 +70,10 @@ type FullSpanLoadResult = (String, Result<Option<Map<String, Value>>>);
 #[command(after_help = "\
 Examples:
   bt view logs --limit 25
-  bt view trace <ROOT_SPAN_ID>
-  bt view span <SPAN_ID>
+  bt view trace --trace-id <ROOT_SPAN_ID>
+  bt view span --id <SPAN_ROW_ID>
+  bt view thread --trace-id <ROOT_SPAN_ID>
+  bt view waterfall --trace-id <ROOT_SPAN_ID>
 ")]
 pub struct ViewArgs {
     #[command(subcommand)]
@@ -82,6 +88,17 @@ enum ViewCommand {
     Trace(TraceArgs),
     /// Fetch a single span by row id (or from a URL)
     Span(SpanArgs),
+    #[command(
+        about = "Render the LLM conversation thread for a trace",
+        long_about = "Render the LLM conversation thread for a trace.\n\nUses Braintrust's trace preprocessor to collapse repeated messages across LLM spans into one ordered transcript, so agents can inspect the conversation without opening each span."
+    )]
+    Thread(ThreadArgs),
+    #[command(
+        visible_alias = "timeline",
+        about = "Render a trace waterfall with timing, token, cost, and cache metrics",
+        long_about = "Render a trace waterfall with timing, token, cost, and cache metrics.\n\nShows each span's offset and duration within the trace, plus model/token/cost/cache details such as prompt cache hit percentage when available. Use the `timeline` alias for parity with the Braintrust app tab."
+    )]
+    Waterfall(WaterfallArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,7 +189,7 @@ impl Default for LogsArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct TraceArgs {
+struct TraceSelectorArgs {
     /// Object reference, format: object_type:object_selector (project_logs|experiment|dataset)
     #[arg(long)]
     object_ref: Option<String>,
@@ -197,10 +214,6 @@ struct TraceArgs {
     #[arg(long, default_value_t = 100)]
     limit: usize,
 
-    /// Cursor returned from a previous trace fetch
-    #[arg(long)]
-    cursor: Option<String>,
-
     /// Preview length for span rows
     #[arg(long, default_value_t = 125)]
     preview_length: usize,
@@ -212,6 +225,28 @@ struct TraceArgs {
     /// Force non-interactive mode
     #[arg(long)]
     non_interactive: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TraceArgs {
+    #[command(flatten)]
+    selector: TraceSelectorArgs,
+
+    /// Cursor returned from a previous trace fetch
+    #[arg(long)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ThreadArgs {
+    #[command(flatten)]
+    selector: TraceSelectorArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct WaterfallArgs {
+    #[command(flatten)]
+    selector: TraceSelectorArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -271,6 +306,8 @@ struct ParsedTraceUrl {
     org: Option<String>,
     project: Option<String>,
     page: Option<String>,
+    experiment: Option<String>,
+    comparison_experiment: Option<String>,
     row_ref: Option<String>,
     span_id: Option<String>,
     trace_view_type: Option<String>,
@@ -278,6 +315,15 @@ struct ParsedTraceUrl {
 
 #[derive(Debug, Clone)]
 struct ResolvedTraceTarget {
+    project: ProjectSelection,
+    root_span_id: String,
+    span_id: Option<String>,
+    detail_view: DetailView,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTraceCommandTarget {
+    object_ref: ObjectRef,
     project: ProjectSelection,
     root_span_id: String,
     span_id: Option<String>,
@@ -299,6 +345,15 @@ struct ProjectInfo {
 struct TraceSummaryRow {
     root_span_id: String,
     row: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ThreadSummary {
+    message_count: usize,
+    role_counts: BTreeMap<String, usize>,
+    tool_call_count: usize,
+    tool_names: Vec<String>,
+    final_assistant_message: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -883,12 +938,15 @@ pub async fn run(base: BaseArgs, args: ViewArgs) -> Result<()> {
 
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-
     match args.command {
         None => run_logs_command(base, client, LogsArgs::default()).await,
         Some(ViewCommand::Logs(logs)) => run_logs_command(base, client, logs).await,
         Some(ViewCommand::Trace(trace)) => run_trace_command(base, client, trace).await,
         Some(ViewCommand::Span(span)) => run_span_command(base, client, span).await,
+        Some(ViewCommand::Thread(thread)) => run_thread_command(base, client, thread).await,
+        Some(ViewCommand::Waterfall(waterfall)) => {
+            run_waterfall_command(base, client, waterfall).await
+        }
     }
 }
 
@@ -905,16 +963,12 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
 
     let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
     let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
-    let project_from_url = parsed_startup_url
-        .as_ref()
-        .and_then(|u| u.project.as_deref());
-
     let (object_ref, project_for_ui) = resolve_object_ref_for_view(
         &client,
         &base,
         args.object_ref.as_deref(),
         args.project_id.as_deref(),
-        project_from_url,
+        parsed_startup_url.as_ref(),
     )
     .await?;
     let source_expr = btql_source_expr(&object_ref)?;
@@ -1001,7 +1055,8 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
         ),
     )
     .await?;
-    let next_cursor = response.cursor.clone().filter(|c| !c.is_empty());
+    let next_cursor =
+        next_cursor_if_full_page(response.cursor.clone(), response.data.len(), args.limit);
     let has_more = next_cursor.is_some();
     let rows = parse_summary_rows(response.data);
     let object_ref_arg = format_object_ref_arg(&object_ref);
@@ -1028,6 +1083,7 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
                 &object_ref_arg,
                 next_cursor.as_deref(),
                 profile_flag,
+                args.limit,
             ),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1047,136 +1103,54 @@ async fn run_logs_command(base: BaseArgs, client: ApiClient, args: LogsArgs) -> 
 }
 
 async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -> Result<()> {
-    if args.limit == 0 {
-        bail!("--limit must be greater than 0");
-    }
-    if args.preview_length == 0 {
-        bail!("--preview-length must be greater than 0");
-    }
-    if args.object_ref.is_some() && args.project_id.is_some() {
-        bail!("--object-ref and --project-id are mutually exclusive");
-    }
-    let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
-    let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
-    let project_from_url = parsed_startup_url
-        .as_ref()
-        .and_then(|u| u.project.as_deref());
+    let selector = &args.selector;
+    validate_trace_selector_args(selector)?;
+    let target = resolve_trace_command_target(&client, &base, selector).await?;
 
-    let (mut object_ref, project_for_url) = resolve_object_ref_for_view(
-        &client,
-        &base,
-        args.object_ref.as_deref(),
-        args.project_id.as_deref(),
-        project_from_url,
-    )
-    .await?;
-
-    let mut trace_id = args
-        .trace_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-
-    let interactive = !base.json && is_interactive() && !args.non_interactive;
+    let interactive = !base.json && is_interactive() && !selector.non_interactive;
     if interactive {
-        if object_ref.object_type != "project_logs" {
-            bail!("interactive trace view currently supports only project_logs sources");
+        if args.cursor.is_some() {
+            bail!("--cursor is only available in non-interactive mode");
         }
-
-        let project = project_for_url.unwrap_or(ProjectSelection {
-            id: object_ref.object_name.clone(),
-            name: None,
-        });
-        let startup_target = if let Some(parsed) = parsed_startup_url.clone() {
-            parsed
-        } else {
-            let trace_id = trace_id.clone().context(
-                "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>",
-            )?;
-            ParsedTraceUrl {
-                org: Some(client.org_name().to_string()),
-                project: Some(project.id.clone()),
-                page: Some("logs".to_string()),
-                row_ref: Some(trace_id.clone()),
-                span_id: Some(trace_id),
-                trace_view_type: None,
-            }
-        };
-        let source_expr = btql_source_expr(&object_ref)?;
-        let base_filter = build_base_filter_clause(None, "1h", None)?;
-        return run_interactive(
-            InteractiveRunArgs {
-                init: TraceViewerInit {
-                    project,
-                    source_expr,
-                    list_mode: ListMode::Summary,
-                    base_filter,
-                    traces: Vec::new(),
-                    limit: args.limit,
-                    preview_length: args.preview_length,
-                    print_queries: args.print_queries,
-                },
-                initial_search_query: String::new(),
-                startup_trace_url: Some(startup_target),
-            },
+        return run_interactive_trace_target(
             client,
+            target,
+            None,
+            selector.limit,
+            selector.preview_length,
+            selector.print_queries,
         )
         .await;
     }
 
-    if trace_id.is_none() {
-        let parsed = parsed_startup_url.as_ref().with_context(|| {
-            "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>"
-        })?;
-
-        if object_ref.object_type != "project_logs" {
-            bail!("URL trace resolution currently supports only project_logs sources");
-        }
-        let current_project = project_for_url.clone().unwrap_or(ProjectSelection {
-            id: object_ref.object_name.clone(),
-            name: None,
-        });
-        let target = with_spinner(
-            "Resolving trace URL...",
-            resolve_trace_target_for_url(&client, &current_project, parsed, args.print_queries),
-        )
-        .await?;
-        trace_id = Some(target.root_span_id.clone());
-        object_ref = ObjectRef {
-            object_type: "project_logs".to_string(),
-            object_name: target.project.id.clone(),
-        };
-    }
-
-    let trace_id = trace_id.context("trace id resolution failed")?;
-    let source_expr = btql_source_expr(&object_ref)?;
+    let source_expr = btql_source_expr(&target.object_ref)?;
     let response = with_spinner(
         "Loading trace spans...",
         fetch_trace_spans_page(
             &client,
             &source_expr,
-            &trace_id,
-            args.preview_length,
-            args.limit,
+            &target.root_span_id,
+            selector.preview_length,
+            selector.limit,
             args.cursor.as_deref(),
-            args.print_queries,
+            selector.print_queries,
         ),
     )
     .await?;
-    let next_cursor = response.cursor.clone().filter(|c| !c.is_empty());
+    let next_cursor =
+        next_cursor_if_full_page(response.cursor.clone(), response.data.len(), selector.limit);
     let has_more = next_cursor.is_some();
-    let object_ref_arg = format_object_ref_arg(&object_ref);
+    let object_ref_arg = format_object_ref_arg(&target.object_ref);
     let profile_flag = base.profile.as_deref();
 
     if base.json {
         let payload = json!({
             "meta": {
                 "command": "view trace",
-                "source": object_ref,
-                "trace_id": trace_id,
-                "limit": args.limit,
-                "preview_length": args.preview_length,
+                "source": target.object_ref,
+                "trace_id": target.root_span_id,
+                "limit": selector.limit,
+                "preview_length": selector.preview_length,
                 "truncated": true,
             },
             "paging": {
@@ -1188,21 +1162,141 @@ async fn run_trace_command(base: BaseArgs, client: ApiClient, args: TraceArgs) -
             "hints": trace_hints(
                 has_more,
                 &object_ref_arg,
-                &trace_id,
+                &target.root_span_id,
                 next_cursor.as_deref(),
                 profile_flag,
+                selector.limit,
             ),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         print_trace_text(
-            &trace_id,
+            &target.root_span_id,
             &response.data,
             &object_ref_arg,
             profile_flag,
-            args.limit,
-            args.preview_length,
+            selector.limit,
+            selector.preview_length,
             next_cursor.as_deref(),
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_thread_command(base: BaseArgs, client: ApiClient, args: ThreadArgs) -> Result<()> {
+    let selector = &args.selector;
+    validate_trace_selector_args(selector)?;
+    let mut target = resolve_trace_command_target(&client, &base, selector).await?;
+    target.detail_view = DetailView::Thread;
+    if target.object_ref.object_type != "project_logs" {
+        bail!("thread view currently supports only project_logs sources");
+    }
+
+    let interactive = !base.json && is_interactive() && !selector.non_interactive;
+    if interactive {
+        return run_interactive_trace_target(
+            client,
+            target,
+            Some(DetailView::Thread),
+            selector.limit,
+            selector.preview_length,
+            selector.print_queries,
+        )
+        .await;
+    }
+
+    let messages = with_spinner(
+        "Loading thread...",
+        fetch_thread_messages(
+            &client,
+            &target.project.id,
+            &target.root_span_id,
+            selector.print_queries,
+        ),
+    )
+    .await?;
+    let summary = build_thread_summary(&messages);
+
+    if base.json {
+        let payload = json!({
+            "meta": {
+                "command": "view thread",
+                "source": target.object_ref,
+                "project": target.project,
+                "root_span_id": target.root_span_id,
+                "span_id": target.span_id,
+                "view": "thread",
+                "truncated": false,
+            },
+            "summary": summary,
+            "messages": messages,
+            "hints": thread_hints(base.profile.as_deref()),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_thread_text(&target, &messages, &summary, base.profile.as_deref());
+    }
+
+    Ok(())
+}
+
+async fn run_waterfall_command(
+    base: BaseArgs,
+    client: ApiClient,
+    args: WaterfallArgs,
+) -> Result<()> {
+    let selector = &args.selector;
+    validate_trace_selector_args(selector)?;
+    let target = resolve_trace_command_target(&client, &base, selector).await?;
+
+    let source_expr = btql_source_expr(&target.object_ref)?;
+    let response = with_spinner(
+        "Loading trace waterfall...",
+        fetch_waterfall_spans_page(
+            &client,
+            &source_expr,
+            &target.root_span_id,
+            selector.preview_length,
+            selector.limit,
+            None,
+            selector.print_queries,
+        ),
+    )
+    .await?;
+    let next_cursor =
+        next_cursor_if_full_page(response.cursor.clone(), response.data.len(), selector.limit);
+    let has_more = next_cursor.is_some();
+    let waterfall = waterfall::build_waterfall_view(response.data, &target.root_span_id);
+
+    if base.json {
+        let payload = json!({
+            "meta": {
+                "command": "view waterfall",
+                "source": target.object_ref,
+                "project": target.project,
+                "root_span_id": target.root_span_id,
+                "span_id": target.span_id,
+                "view": "waterfall",
+                "limit": selector.limit,
+                "preview_length": selector.preview_length,
+                "truncated": has_more,
+            },
+            "paging": {
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+            },
+            "waterfall": waterfall,
+            "hints": waterfall_hints(base.profile.as_deref(), has_more),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        waterfall::print_waterfall_text(
+            &target,
+            &waterfall,
+            base.profile.as_deref(),
+            selector.limit,
+            has_more,
         );
     }
 
@@ -1215,16 +1309,12 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
     }
     let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
     let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
-    let project_from_url = parsed_startup_url
-        .as_ref()
-        .and_then(|u| u.project.as_deref());
-
-    let (object_ref, _project_for_url) = resolve_object_ref_for_view(
+    let (mut object_ref, project_for_url) = resolve_object_ref_for_view(
         &client,
         &base,
         args.object_ref.as_deref(),
         args.project_id.as_deref(),
-        project_from_url,
+        parsed_startup_url.as_ref(),
     )
     .await?;
 
@@ -1269,6 +1359,8 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
                 org: Some(client.org_name().to_string()),
                 project: Some(project.id.clone()),
                 page: Some("logs".to_string()),
+                experiment: None,
+                comparison_experiment: None,
                 row_ref: row_id.clone(),
                 span_id: row_id.clone().or(span_id_from_url.clone()),
                 trace_view_type: None,
@@ -1296,33 +1388,51 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
         .await;
     }
 
-    let source_expr = btql_source_expr(&object_ref)?;
-    let item = if let Some(id) = row_id.as_deref() {
-        let query = build_full_span_query_by_id(&source_expr, id);
-        maybe_print_query(args.print_queries, "span-full-id", &query);
-        let response = with_spinner("Loading span...", async {
-            execute_query(&client, &query)
-                .await
-                .with_context(|| format!("BTQL query failed: {query}"))
-        })
-        .await?;
-        response.data.into_iter().next()
-    } else {
-        let query = build_full_span_query_by_span_id(
-            &source_expr,
-            span_id_from_url
-                .as_deref()
-                .expect("URL span id should be present when row_id is absent"),
-        );
-        maybe_print_query(args.print_queries, "span-full-span-id", &query);
-        let response = with_spinner("Loading span...", async {
-            execute_query(&client, &query)
-                .await
-                .with_context(|| format!("BTQL query failed: {query}"))
-        })
-        .await?;
-        response.data.into_iter().next()
-    };
+    let mut item = fetch_span_item(
+        &client,
+        &object_ref,
+        row_id.as_deref(),
+        span_id_from_url.as_deref(),
+        args.print_queries,
+    )
+    .await?;
+
+    if item.is_none() && args.object_ref.is_none() {
+        if let (Some(parsed), Some(project)) =
+            (parsed_startup_url.as_ref(), project_for_url.as_ref())
+        {
+            let experiments =
+                experiments_api::list_experiments_by_project_id(&client, &project.id).await?;
+            for selector in trace_url_experiment_selectors(parsed) {
+                let Ok(experiment) = find_experiment_by_selector(&experiments, selector, project)
+                else {
+                    continue;
+                };
+                let fallback_ref = ObjectRef {
+                    object_type: "experiment".to_string(),
+                    object_name: experiment.id.clone(),
+                };
+                if fallback_ref.object_type == object_ref.object_type
+                    && fallback_ref.object_name == object_ref.object_name
+                {
+                    continue;
+                }
+                let fallback_item = fetch_span_item(
+                    &client,
+                    &fallback_ref,
+                    row_id.as_deref(),
+                    span_id_from_url.as_deref(),
+                    args.print_queries,
+                )
+                .await?;
+                if fallback_item.is_some() {
+                    object_ref = fallback_ref;
+                    item = fallback_item;
+                    break;
+                }
+            }
+        }
+    }
 
     if base.json {
         let payload = json!({
@@ -1345,12 +1455,194 @@ async fn run_span_command(base: BaseArgs, client: ApiClient, args: SpanArgs) -> 
     Ok(())
 }
 
+async fn fetch_span_item(
+    client: &ApiClient,
+    object_ref: &ObjectRef,
+    row_id: Option<&str>,
+    span_id: Option<&str>,
+    print_queries: bool,
+) -> Result<Option<Map<String, Value>>> {
+    let source_expr = btql_source_expr(object_ref)?;
+    let (label, query) = if let Some(id) = row_id {
+        (
+            "span-full-id",
+            build_full_span_query_by_id(&source_expr, id),
+        )
+    } else {
+        let span_id = span_id.expect("span id should be present when row id is absent");
+        (
+            "span-full-span-id",
+            build_full_span_query_by_span_id(&source_expr, span_id),
+        )
+    };
+    maybe_print_query(print_queries, label, &query);
+    let response = with_spinner("Loading span...", async {
+        execute_query(client, &query)
+            .await
+            .with_context(|| format!("BTQL query failed: {query}"))
+    })
+    .await?;
+    Ok(response.data.into_iter().next())
+}
+
+#[derive(Debug)]
+struct TraceSelectorResolution {
+    object_ref: ObjectRef,
+    project: ProjectSelection,
+    trace_id: Option<String>,
+    parsed_startup_url: Option<ParsedTraceUrl>,
+}
+
+fn validate_trace_selector_args(args: &TraceSelectorArgs) -> Result<()> {
+    if args.limit == 0 {
+        bail!("--limit must be greater than 0");
+    }
+    if args.preview_length == 0 {
+        bail!("--preview-length must be greater than 0");
+    }
+    if args.object_ref.is_some() && args.project_id.is_some() {
+        bail!("--object-ref and --project-id are mutually exclusive");
+    }
+    if args.trace_id.is_some() && (args.url.is_some() || args.url_arg.is_some()) {
+        bail!("--trace-id cannot be combined with --url or positional URL");
+    }
+
+    Ok(())
+}
+
+async fn resolve_trace_selector(
+    client: &ApiClient,
+    base: &BaseArgs,
+    args: &TraceSelectorArgs,
+) -> Result<TraceSelectorResolution> {
+    let startup_url = select_startup_url(args.url.as_deref(), args.url_arg.as_deref())?;
+    let parsed_startup_url = startup_url.as_deref().map(parse_trace_url).transpose()?;
+    let (object_ref, project_for_url) = resolve_object_ref_for_view(
+        client,
+        base,
+        args.object_ref.as_deref(),
+        args.project_id.as_deref(),
+        parsed_startup_url.as_ref(),
+    )
+    .await?;
+
+    let trace_id = args
+        .trace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let project = project_for_url.unwrap_or(ProjectSelection {
+        id: object_ref.object_name.clone(),
+        name: None,
+    });
+
+    Ok(TraceSelectorResolution {
+        object_ref,
+        project,
+        trace_id,
+        parsed_startup_url,
+    })
+}
+
+async fn resolve_trace_command_target(
+    client: &ApiClient,
+    base: &BaseArgs,
+    args: &TraceSelectorArgs,
+) -> Result<ResolvedTraceCommandTarget> {
+    let resolution = resolve_trace_selector(client, base, args).await?;
+
+    if let Some(root_span_id) = resolution.trace_id {
+        return Ok(ResolvedTraceCommandTarget {
+            object_ref: resolution.object_ref,
+            project: resolution.project,
+            root_span_id,
+            span_id: None,
+            detail_view: DetailView::Span,
+        });
+    }
+
+    let parsed = resolution.parsed_startup_url.as_ref().with_context(|| {
+        "trace id is required. Pass --trace-id <root-span-id> or --url <trace-url>"
+    })?;
+    let source_expr = btql_source_expr(&resolution.object_ref)?;
+
+    let target = with_spinner(
+        "Resolving trace URL...",
+        resolve_trace_target_for_url(
+            client,
+            &resolution.project,
+            &source_expr,
+            parsed,
+            args.print_queries,
+        ),
+    )
+    .await?;
+
+    Ok(ResolvedTraceCommandTarget {
+        object_ref: resolution.object_ref,
+        project: target.project,
+        root_span_id: target.root_span_id,
+        span_id: target.span_id,
+        detail_view: target.detail_view,
+    })
+}
+
+async fn run_interactive_trace_target(
+    client: ApiClient,
+    target: ResolvedTraceCommandTarget,
+    detail_view: Option<DetailView>,
+    limit: usize,
+    preview_length: usize,
+    print_queries: bool,
+) -> Result<()> {
+    if target.object_ref.object_type != "project_logs" {
+        bail!("interactive trace view currently supports only project_logs sources");
+    }
+
+    let source_expr = btql_source_expr(&target.object_ref)?;
+    let base_filter = build_base_filter_clause(None, "1h", None)?;
+    let detail_view = detail_view.unwrap_or(target.detail_view);
+    let startup_target = ParsedTraceUrl {
+        org: Some(client.org_name().to_string()),
+        project: Some(target.project.id.clone()),
+        page: Some("logs".to_string()),
+        experiment: None,
+        comparison_experiment: None,
+        row_ref: Some(target.root_span_id.clone()),
+        span_id: target
+            .span_id
+            .clone()
+            .or_else(|| Some(target.root_span_id.clone())),
+        trace_view_type: detail_view_trace_url_value(detail_view).map(ToString::to_string),
+    };
+
+    run_interactive(
+        InteractiveRunArgs {
+            init: TraceViewerInit {
+                project: target.project,
+                source_expr,
+                list_mode: ListMode::Summary,
+                base_filter,
+                traces: Vec::new(),
+                limit,
+                preview_length,
+                print_queries,
+            },
+            initial_search_query: String::new(),
+            startup_trace_url: Some(startup_target),
+        },
+        client,
+    )
+    .await
+}
+
 async fn resolve_object_ref_for_view(
     client: &ApiClient,
     base: &BaseArgs,
     object_ref: Option<&str>,
     project_id: Option<&str>,
-    project_name_from_url: Option<&str>,
+    parsed_url: Option<&ParsedTraceUrl>,
 ) -> Result<(ObjectRef, Option<ProjectSelection>)> {
     if let Some(raw) = object_ref {
         let parsed = parse_object_ref(raw)?;
@@ -1365,15 +1657,30 @@ async fn resolve_object_ref_for_view(
         return Ok((parsed, project_for_ui));
     }
 
-    let cfg_project = crate::config::load().ok().and_then(|c| c.project);
+    let cfg_project = crate::config::configured_project_for_context(base, Some(client.org_name()));
     let project = resolve_project(
         client,
         base.project.as_deref(),
         cfg_project.as_deref(),
         project_id,
-        project_name_from_url,
+        parsed_url.and_then(|url| url.project.as_deref()),
     )
     .await?;
+
+    if let Some(parsed_url) =
+        parsed_url.filter(|url| !trace_url_experiment_selectors(url).is_empty())
+    {
+        let experiment =
+            resolve_first_experiment_for_trace_url(client, &project, parsed_url).await?;
+        return Ok((
+            ObjectRef {
+                object_type: "experiment".to_string(),
+                object_name: experiment.id,
+            },
+            Some(project),
+        ));
+    }
+
     Ok((
         ObjectRef {
             object_type: "project_logs".to_string(),
@@ -1381,6 +1688,96 @@ async fn resolve_object_ref_for_view(
         },
         Some(project),
     ))
+}
+
+async fn resolve_first_experiment_for_trace_url(
+    client: &ApiClient,
+    project: &ProjectSelection,
+    parsed_url: &ParsedTraceUrl,
+) -> Result<experiments_api::Experiment> {
+    let selectors = trace_url_experiment_selectors(parsed_url);
+    if selectors.is_empty() {
+        bail!("trace URL does not include an experiment selector");
+    }
+
+    let experiments = experiments_api::list_experiments_by_project_id(client, &project.id).await?;
+    let mut last_error = None;
+    for selector in selectors {
+        match find_experiment_by_selector(&experiments, selector, project) {
+            Ok(experiment) => return Ok(experiment.clone()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    Err(last_error.expect("at least one experiment selector should have been tried"))
+}
+
+fn trace_url_experiment_selectors(parsed_url: &ParsedTraceUrl) -> Vec<&str> {
+    let mut selectors = Vec::new();
+    for selector in [
+        parsed_url.experiment.as_deref(),
+        parsed_url.comparison_experiment.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let selector = selector.trim();
+        if !selector.is_empty() && !selectors.contains(&selector) {
+            selectors.push(selector);
+        }
+    }
+    selectors
+}
+
+fn find_experiment_by_selector<'a>(
+    experiments: &'a [experiments_api::Experiment],
+    selector: &str,
+    project: &ProjectSelection,
+) -> Result<&'a experiments_api::Experiment> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("experiment selector cannot be empty");
+    }
+
+    if let Some(experiment) = experiments
+        .iter()
+        .find(|experiment| experiment.id == selector)
+    {
+        return Ok(experiment);
+    }
+
+    let exact_name_matches = experiments
+        .iter()
+        .filter(|experiment| experiment.name == selector)
+        .collect::<Vec<_>>();
+    if exact_name_matches.len() == 1 {
+        return Ok(exact_name_matches[0]);
+    }
+    if exact_name_matches.len() > 1 {
+        if let Some(project_name) = project.name.as_deref() {
+            bail!("experiment name '{selector}' is duplicated in project '{project_name}'; use --object-ref experiment:<id>");
+        }
+        bail!("experiment name '{selector}' is duplicated; use --object-ref experiment:<id>");
+    }
+
+    let casefold_matches = experiments
+        .iter()
+        .filter(|experiment| experiment.name.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    if casefold_matches.len() == 1 {
+        return Ok(casefold_matches[0]);
+    }
+    if casefold_matches.len() > 1 {
+        bail!("experiment selector '{selector}' is ambiguous; use --object-ref experiment:<id>");
+    }
+
+    if let Some(project_name) = project.name.as_deref() {
+        bail!("experiment '{selector}' not found in project '{project_name}'");
+    }
+    bail!(
+        "experiment '{selector}' not found in project {}",
+        project.id
+    );
 }
 
 async fn resolve_project(
@@ -1816,12 +2213,14 @@ fn request_open_trace_for_parsed_url(
     let (tx, rx) = mpsc::channel();
     let client = client.clone();
     let current_project = app.project.clone();
+    let source_expr = app.source_expr.clone();
     let print_queries = app.print_queries;
     let parsed_for_task = parsed.clone();
     handle.spawn(async move {
         let result = resolve_trace_target_for_url(
             &client,
             &current_project,
+            &source_expr,
             &parsed_for_task,
             print_queries,
         )
@@ -2081,21 +2480,22 @@ fn handle_span_detail_key(
                 }
             }
         }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.detail_pane_focus == DetailPaneFocus::Detail {
-                if detail_message_list_mode {
-                    if app.detail_view == DetailView::Thread {
-                        for _ in 0..10 {
-                            app.move_thread_message_down();
-                        }
-                    } else {
-                        for _ in 0..10 {
-                            app.move_span_detail_message_down();
-                        }
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && app.detail_pane_focus == DetailPaneFocus::Detail =>
+        {
+            if detail_message_list_mode {
+                if app.detail_view == DetailView::Thread {
+                    for _ in 0..10 {
+                        app.move_thread_message_down();
                     }
                 } else {
-                    scroll_detail_down_bounded(app, 10)
+                    for _ in 0..10 {
+                        app.move_span_detail_message_down();
+                    }
                 }
+            } else {
+                scroll_detail_down_bounded(app, 10)
             }
         }
         _ => {}
@@ -3459,6 +3859,18 @@ fn extract_start_time(row: &Map<String, Value>) -> Option<f64> {
         Value::String(s) => s.parse::<f64>().ok(),
         _ => None,
     }
+    .filter(|value| value.is_finite())
+}
+
+fn extract_span_end_seconds(row: &Map<String, Value>) -> Option<f64> {
+    let metrics = value_as_object_owned(row.get("metrics"))?;
+    parse_f64ish(metrics.get("end"))
+        .filter(|value| value.is_finite())
+        .or_else(|| {
+            let start = extract_start_time(row)?;
+            let duration = extract_duration_seconds(row.get("metrics"))?;
+            Some(start + duration)
+        })
 }
 
 fn extract_exec_counter(row: &Map<String, Value>) -> i64 {
@@ -3495,14 +3907,7 @@ fn span_label(row: &Map<String, Value>, span_id: &str) -> String {
     let fallback_name =
         value_as_string(span_attributes.get("name")).unwrap_or_else(|| span_id.to_string());
     let kind = value_as_string(span_attributes.get("type")).unwrap_or_else(|| "span".to_string());
-    let has_error = row
-        .get("error")
-        .map(|v| match v {
-            Value::Null => false,
-            Value::String(s) => !s.is_empty(),
-            _ => true,
-        })
-        .unwrap_or(false);
+    let has_error = span_has_error(row);
 
     let model_name = if kind.eq_ignore_ascii_case("llm") {
         extract_model_name(row)
@@ -3535,6 +3940,24 @@ fn span_label(row: &Map<String, Value>, span_id: &str) -> String {
     label
 }
 
+fn extract_span_name_and_type(row: &Map<String, Value>, span_id: &str) -> (String, String) {
+    let span_attributes = value_as_object_owned(row.get("span_attributes")).unwrap_or_default();
+    let name = value_as_string(span_attributes.get("name")).unwrap_or_else(|| span_id.to_string());
+    let span_type =
+        value_as_string(span_attributes.get("type")).unwrap_or_else(|| "span".to_string());
+    (name, span_type)
+}
+
+fn span_has_error(row: &Map<String, Value>) -> bool {
+    row.get("error")
+        .map(|v| match v {
+            Value::Null => false,
+            Value::String(s) => !s.is_empty(),
+            _ => true,
+        })
+        .unwrap_or(false)
+}
+
 fn span_purpose_is_scorer(row: &Map<String, Value>) -> bool {
     let span_attributes = value_as_object_owned(row.get("span_attributes")).unwrap_or_default();
     value_as_string(span_attributes.get("purpose"))
@@ -3562,13 +3985,7 @@ fn extract_ttft_seconds(metrics: &Map<String, Value>) -> Option<f64> {
         "first_token_latency",
     ];
     keys.iter().find_map(|key| {
-        parse_f64ish(metrics.get(*key)).and_then(|value| {
-            if value.is_finite() && value >= 0.0 {
-                Some(value)
-            } else {
-                None
-            }
-        })
+        parse_f64ish(metrics.get(*key)).filter(|&value| value.is_finite() && value >= 0.0)
     })
 }
 
@@ -4844,16 +5261,22 @@ fn logs_hints(
     object_ref: &str,
     next_cursor: Option<&str>,
     profile: Option<&str>,
+    limit: usize,
 ) -> Vec<String> {
     let mut hints = vec![
         "Rows are truncated by preview_length; fetch a single span for full content.".to_string(),
         "Use --json to get machine-readable envelopes for agent workflows.".to_string(),
         "Write large responses to a file to preserve full output context.".to_string(),
     ];
+    let limit_suffix = if limit != 50 {
+        format!(" --limit {limit}")
+    } else {
+        String::new()
+    };
     if has_more {
         if let Some(cursor) = next_cursor {
             hints.push(format!(
-                "Next page: bt view logs{} --object-ref {object_ref} --cursor {cursor}",
+                "Next page: bt view logs{} --object-ref {object_ref} --cursor {cursor}{limit_suffix}",
                 profile_flag_suffix(profile)
             ));
         } else {
@@ -4871,6 +5294,7 @@ fn trace_hints(
     trace_id: &str,
     next_cursor: Option<&str>,
     profile: Option<&str>,
+    limit: usize,
 ) -> Vec<String> {
     let mut hints = vec![
         format!(
@@ -4879,10 +5303,15 @@ fn trace_hints(
         ),
         "Write output to a file for long traces.".to_string(),
     ];
+    let limit_suffix = if limit != 50 {
+        format!(" --limit {limit}")
+    } else {
+        String::new()
+    };
     if has_more {
         if let Some(cursor) = next_cursor {
             hints.push(format!(
-                "Next page: bt view trace{} --object-ref {object_ref} --trace-id {trace_id} --cursor {cursor}",
+                "Next page: bt view trace{} --object-ref {object_ref} --trace-id {trace_id} --cursor {cursor}{limit_suffix}",
                 profile_flag_suffix(profile)
             ));
         } else {
@@ -4899,6 +5328,41 @@ fn list_mode_label(list_mode: ListMode) -> &'static str {
         ListMode::Summary => "summary",
         ListMode::Spans => "spans",
     }
+}
+
+fn detail_view_trace_url_value(view: DetailView) -> Option<&'static str> {
+    match view {
+        DetailView::Span => None,
+        DetailView::Thread => Some("thread"),
+    }
+}
+
+fn thread_hints(profile: Option<&str>) -> Vec<String> {
+    vec![
+        format!(
+            "Open an interactive thread view with `bt view thread{} --trace-id <root-span-id>`.",
+            profile_flag_suffix(profile)
+        ),
+        "Use `--non-interactive` for a compact text transcript.".to_string(),
+    ]
+}
+
+fn waterfall_hints(profile: Option<&str>, has_more: bool) -> Vec<String> {
+    let mut hints = vec![
+        format!(
+            "Render an agent-readable trace report with `bt view waterfall{} --trace-id <root-span-id>`.",
+            profile_flag_suffix(profile)
+        ),
+        "Use `--json` for computed offsets, token counts, costs, cache metrics, and raw ids."
+            .to_string(),
+    ];
+    if has_more {
+        hints.push(
+            "The waterfall is truncated; increase --limit for complete timing and cache totals."
+                .to_string(),
+        );
+    }
+    hints
 }
 
 fn print_logs_text(
@@ -4934,14 +5398,163 @@ fn print_logs_text(
     }
     println!("\nTruncated fields use preview_length={preview_length}.");
     if let Some(cursor) = next_cursor {
+        let limit_suffix = if limit != 50 {
+            format!(" --limit {limit}")
+        } else {
+            String::new()
+        };
         println!("next_cursor: {cursor}");
         println!(
-            "next: bt view logs{} --object-ref {object_ref} --cursor {cursor} --non-interactive",
+            "next: bt view logs{} --object-ref {object_ref} --cursor {cursor} --non-interactive{limit_suffix}",
             profile_flag_suffix(profile)
         );
     } else {
         println!("No additional rows.");
     }
+}
+
+fn build_thread_summary(messages: &[Value]) -> ThreadSummary {
+    let mut role_counts = BTreeMap::new();
+    let mut tool_names = BTreeSet::new();
+    let mut tool_call_count = 0;
+    let mut final_assistant_message = None;
+
+    for (idx, message) in messages.iter().enumerate() {
+        let Some(obj) = message.as_object() else {
+            continue;
+        };
+        let role = value_as_string(obj.get("role")).unwrap_or_else(|| "message".to_string());
+        *role_counts.entry(role.clone()).or_insert(0) += 1;
+        if role == "assistant" {
+            final_assistant_message = Some(idx + 1);
+        }
+
+        let mut names = extract_tool_call_names(obj.get("tool_calls"));
+        names.extend(extract_content_tool_call_names(obj.get("content")));
+        tool_call_count += names.len();
+        tool_names.extend(names);
+    }
+
+    ThreadSummary {
+        message_count: messages.len(),
+        role_counts,
+        tool_call_count,
+        tool_names: tool_names.into_iter().collect(),
+        final_assistant_message,
+    }
+}
+
+fn extract_tool_call_names(tool_calls: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(calls)) = tool_calls else {
+        return Vec::new();
+    };
+
+    calls
+        .iter()
+        .map(|call| {
+            let Some(obj) = call.as_object() else {
+                return "tool_call".to_string();
+            };
+            value_as_string(obj.get("name"))
+                .or_else(|| {
+                    value_as_object_owned(obj.get("function"))
+                        .and_then(|f| value_as_string(f.get("name")))
+                })
+                .or_else(|| value_as_string(obj.get("tool_name")))
+                .or_else(|| value_as_string(obj.get("toolName")))
+                .unwrap_or_else(|| "tool_call".to_string())
+        })
+        .collect()
+}
+
+fn extract_content_tool_call_names(content: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(items)) = content else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let obj = item.as_object()?;
+            let item_type = value_as_string(obj.get("type")).unwrap_or_default();
+            if item_type != "tool_call" && item_type != "tool-call" {
+                return None;
+            }
+            Some(
+                value_as_string(obj.get("name"))
+                    .or_else(|| value_as_string(obj.get("tool_name")))
+                    .or_else(|| value_as_string(obj.get("toolName")))
+                    .unwrap_or_else(|| "tool_call".to_string()),
+            )
+        })
+        .collect()
+}
+
+fn format_role_counts(role_counts: &BTreeMap<String, usize>) -> String {
+    if role_counts.is_empty() {
+        return "none".to_string();
+    }
+    role_counts
+        .iter()
+        .map(|(role, count)| format!("{role}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_thread_tools(summary: &ThreadSummary) -> String {
+    if summary.tool_names.is_empty() {
+        "none".to_string()
+    } else {
+        summary.tool_names.join(",")
+    }
+}
+
+fn print_thread_text(
+    target: &ResolvedTraceCommandTarget,
+    messages: &[Value],
+    summary: &ThreadSummary,
+    profile: Option<&str>,
+) {
+    println!(
+        "bt view thread: project={} root_span_id={} messages={}",
+        project_label(&target.project),
+        target.root_span_id,
+        messages.len(),
+    );
+    if let Some(span_id) = target.span_id.as_deref() {
+        println!("selected_span_id: {span_id}");
+    }
+    println!(
+        "summary: messages={} roles={} tool_calls={} tools={} final_assistant_message={}",
+        summary.message_count,
+        format_role_counts(&summary.role_counts),
+        summary.tool_call_count,
+        format_thread_tools(summary),
+        summary
+            .final_assistant_message
+            .map(|idx| idx.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    if messages.is_empty() {
+        println!("\nNo messages returned by preprocessor.");
+    } else {
+        for (idx, message) in messages.iter().enumerate() {
+            let text = render_full_message_text(message);
+            let (preview, truncated) = truncate_for_preview(&text, 18, 180);
+            println!("\n--- message {} ---", idx + 1);
+            println!("{preview}");
+            if truncated {
+                println!("...");
+            }
+        }
+    }
+
+    println!(
+        "\njson: bt view thread --json{} --trace-id {}",
+        profile_flag_suffix(profile),
+        target.root_span_id
+    );
 }
 
 fn print_trace_text(
@@ -4975,14 +5588,20 @@ fn print_trace_text(
         );
     }
     println!(
-        "\nTrace output is truncated. Use `bt view span{} --object-ref {} --id <row-id>` for full span data.",
+        "\nTrace output is truncated. Re-run with --json for the full trace (`bt view trace --json{0} --object-ref {1} --trace-id {2}`), or fetch a single span with `bt view span{0} --object-ref {1} --id <row-id>`.",
         profile_flag_suffix(profile),
-        object_ref
+        object_ref,
+        trace_id
     );
     if let Some(cursor) = next_cursor {
+        let limit_suffix = if limit != 50 {
+            format!(" --limit {limit}")
+        } else {
+            String::new()
+        };
         println!("next_cursor: {cursor}");
         println!(
-            "next: bt view trace{} --object-ref {} --trace-id {} --cursor {} --non-interactive",
+            "next: bt view trace{} --object-ref {} --trace-id {} --cursor {} --non-interactive{limit_suffix}",
             profile_flag_suffix(profile),
             object_ref,
             trace_id,
@@ -5004,30 +5623,6 @@ fn print_span_text(item: Option<&Map<String, Value>>) {
         }
         None => println!("No span found."),
     }
-}
-
-fn parse_duration_to_seconds(input: &str) -> Result<u64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        bail!("duration cannot be empty");
-    }
-    if let Ok(seconds) = trimmed.parse::<u64>() {
-        return Ok(seconds);
-    }
-
-    let (num_str, unit) = trimmed.split_at(trimmed.len().saturating_sub(1));
-    let value: u64 = num_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid duration '{input}'"))?;
-    let multiplier = match unit.to_ascii_lowercase().as_str() {
-        "s" => 1,
-        "m" => 60,
-        "h" => 60 * 60,
-        "d" => 60 * 60 * 24,
-        _ => bail!("invalid duration '{input}'. expected suffix s/m/h/d"),
-    };
-    Ok(value.saturating_mul(multiplier))
 }
 
 fn build_base_filter_clause(
@@ -5101,12 +5696,21 @@ fn parse_startup_trace_url_from_view_args(args: &ViewArgs) -> Result<Option<Pars
         Some(ViewCommand::Logs(logs_args)) => {
             select_startup_url(logs_args.url.as_deref(), logs_args.url_arg.as_deref())?
         }
-        Some(ViewCommand::Trace(trace_args)) => {
-            select_startup_url(trace_args.url.as_deref(), trace_args.url_arg.as_deref())?
-        }
+        Some(ViewCommand::Trace(trace_args)) => select_startup_url(
+            trace_args.selector.url.as_deref(),
+            trace_args.selector.url_arg.as_deref(),
+        )?,
         Some(ViewCommand::Span(span_args)) => {
             select_startup_url(span_args.url.as_deref(), span_args.url_arg.as_deref())?
         }
+        Some(ViewCommand::Thread(thread_args)) => select_startup_url(
+            thread_args.selector.url.as_deref(),
+            thread_args.selector.url_arg.as_deref(),
+        )?,
+        Some(ViewCommand::Waterfall(waterfall_args)) => select_startup_url(
+            waterfall_args.selector.url.as_deref(),
+            waterfall_args.selector.url_arg.as_deref(),
+        )?,
     };
     startup_url.as_deref().map(parse_trace_url).transpose()
 }
@@ -5197,19 +5801,27 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
         org: None,
         project: None,
         page: None,
+        experiment: None,
+        comparison_experiment: None,
         row_ref: None,
         span_id: None,
         trace_view_type: None,
     };
 
     if let Some(segments) = parsed_url.path_segments() {
-        let parts: Vec<&str> = segments.filter(|part| !part.is_empty()).collect();
+        let parts: Vec<String> = segments
+            .filter(|part| !part.is_empty())
+            .map(decode_url_segment)
+            .collect();
         if parts.len() >= 2 && parts[0] == "app" {
-            parsed.org = Some(parts[1].to_string());
+            parsed.org = Some(parts[1].clone());
             if parts.len() >= 4 && parts[2] == "p" {
-                parsed.project = Some(parts[3].to_string());
+                parsed.project = Some(parts[3].clone());
                 if parts.len() >= 5 {
-                    parsed.page = Some(parts[4].to_string());
+                    parsed.page = Some(parts[4].clone());
+                }
+                if parts.len() >= 6 && parts[4] == "experiments" {
+                    parsed.experiment = Some(parts[5].clone());
                 }
             }
         }
@@ -5227,10 +5839,11 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
                     parsed.span_id = Some(value.to_string());
                 }
             }
-            "tvt" => {
-                if !value.is_empty() {
-                    parsed.trace_view_type = Some(value.to_string());
-                }
+            "tvt" if !value.is_empty() => {
+                parsed.trace_view_type = Some(value.to_string());
+            }
+            "c" if !value.is_empty() => {
+                parsed.comparison_experiment = Some(value.to_string());
             }
             _ => {}
         }
@@ -5241,6 +5854,12 @@ fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
     }
 
     Ok(parsed)
+}
+
+fn decode_url_segment(segment: &str) -> String {
+    decode(segment)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| segment.to_string())
 }
 
 fn detail_view_from_tvt(trace_view_type: Option<&str>) -> DetailView {
@@ -5277,18 +5896,18 @@ fn is_uuid_like(value: &str) -> bool {
 async fn resolve_trace_target_for_url(
     client: &ApiClient,
     current_project: &ProjectSelection,
+    source_expr: &str,
     parsed: &ParsedTraceUrl,
     print_queries: bool,
 ) -> Result<ResolvedTraceTarget> {
     let project =
         resolve_project_target_for_url(client, current_project, parsed.project.as_deref()).await?;
-    let project_id = project.id.as_str();
 
     let mut root_span_id: Option<String> = None;
     if let Some(row_ref) = parsed.row_ref.as_deref() {
         root_span_id = lookup_root_span_id_for_query(
             client,
-            &build_url_lookup_by_root_span_id_query(project_id, row_ref),
+            &build_url_lookup_by_root_span_id_query(source_expr, row_ref),
             "url-open-root-span-id",
             print_queries,
         )
@@ -5297,7 +5916,7 @@ async fn resolve_trace_target_for_url(
         if root_span_id.is_none() {
             root_span_id = lookup_root_span_id_for_query(
                 client,
-                &build_url_lookup_by_row_id_query(project_id, row_ref),
+                &build_url_lookup_by_row_id_query(source_expr, row_ref),
                 "url-open-row-id",
                 print_queries,
             )
@@ -5309,7 +5928,7 @@ async fn resolve_trace_target_for_url(
         if let Some(span_id) = parsed.span_id.as_deref() {
             root_span_id = lookup_root_span_id_for_query(
                 client,
-                &build_url_lookup_by_span_id_query(project_id, span_id),
+                &build_url_lookup_by_span_id_query(source_expr, span_id),
                 "url-open-span-id",
                 print_queries,
             )
@@ -5393,26 +6012,23 @@ async fn lookup_root_span_id_for_query(
         .filter(|v| !v.is_empty()))
 }
 
-fn build_url_lookup_by_root_span_id_query(project_id: &str, root_span_id: &str) -> String {
+fn build_url_lookup_by_root_span_id_query(source_expr: &str, root_span_id: &str) -> String {
     format!(
-        "select: root_span_id, span_id | from: project_logs({}) spans | filter: root_span_id = {} | limit: 1",
-        sql_quote(project_id),
+        "select: root_span_id, span_id | from: {source_expr} spans | filter: root_span_id = {} | limit: 1",
         sql_quote(root_span_id),
     )
 }
 
-fn build_url_lookup_by_row_id_query(project_id: &str, row_id: &str) -> String {
+fn build_url_lookup_by_row_id_query(source_expr: &str, row_id: &str) -> String {
     format!(
-        "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: id = {} | limit: 1",
-        sql_quote(project_id),
+        "select: root_span_id, span_id, id | from: {source_expr} spans | filter: id = {} | limit: 1",
         sql_quote(row_id),
     )
 }
 
-fn build_url_lookup_by_span_id_query(project_id: &str, span_id: &str) -> String {
+fn build_url_lookup_by_span_id_query(source_expr: &str, span_id: &str) -> String {
     format!(
-        "select: root_span_id, span_id, id | from: project_logs({}) spans | filter: span_id = {} | limit: 1",
-        sql_quote(project_id),
+        "select: root_span_id, span_id, id | from: {source_expr} spans | filter: span_id = {} | limit: 1",
         sql_quote(span_id),
     )
 }
@@ -5486,6 +6102,25 @@ fn build_trace_spans_query(
         .unwrap_or_default();
     format!(
         "select: * | from: {source_expr} spans | filter: root_span_id = {} | preview_length: {} | sort: _pagination_key ASC | limit: {}{}",
+        sql_quote(root_span_id),
+        preview_length,
+        limit,
+        cursor_clause,
+    )
+}
+
+fn build_waterfall_spans_query(
+    source_expr: &str,
+    root_span_id: &str,
+    preview_length: usize,
+    limit: usize,
+    cursor: Option<&str>,
+) -> String {
+    let cursor_clause = cursor
+        .map(|c| format!(" | cursor: {}", btql_quote(c)))
+        .unwrap_or_default();
+    format!(
+        "select: id, span_id, root_span_id, _pagination_key, _xact_id, created, span_parents, span_attributes, metadata.model, error, scores, metrics | from: {source_expr} spans | filter: root_span_id = {} | preview_length: {} | sort: _pagination_key ASC | limit: {}{}",
         sql_quote(root_span_id),
         preview_length,
         limit,
@@ -5581,6 +6216,16 @@ fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn next_cursor_if_full_page(
+    cursor: Option<String>,
+    returned_rows: usize,
+    requested_limit: usize,
+) -> Option<String> {
+    cursor
+        .filter(|c| !c.is_empty())
+        .filter(|_| requested_limit > 0 && returned_rows >= requested_limit)
+}
+
 async fn fetch_summary_rows(
     client: &ApiClient,
     query_ctx: &LogsQueryContext,
@@ -5611,9 +6256,10 @@ async fn fetch_summary_rows(
             break;
         }
 
+        let returned_rows = response.data.len();
         rows.extend(response.data);
 
-        let next_cursor = response.cursor.filter(|c| !c.is_empty());
+        let next_cursor = next_cursor_if_full_page(response.cursor, returned_rows, page_limit);
         if next_cursor.is_none() {
             break;
         }
@@ -5662,6 +6308,23 @@ async fn fetch_trace_spans_page(
         .with_context(|| format!("BTQL query failed: {query}"))
 }
 
+async fn fetch_waterfall_spans_page(
+    client: &ApiClient,
+    source_expr: &str,
+    root_span_id: &str,
+    preview_length: usize,
+    limit: usize,
+    cursor: Option<&str>,
+    print_queries: bool,
+) -> Result<BtqlResponse> {
+    let query =
+        build_waterfall_spans_query(source_expr, root_span_id, preview_length, limit, cursor);
+    maybe_print_query(print_queries, "waterfall", &query);
+    execute_query(client, &query)
+        .await
+        .with_context(|| format!("BTQL query failed: {query}"))
+}
+
 async fn fetch_trace_span_rows_for_tree(
     client: &ApiClient,
     project_id: &str,
@@ -5692,9 +6355,10 @@ async fn fetch_trace_span_rows_for_tree(
             break;
         }
 
+        let returned_rows = response.data.len();
         rows.extend(response.data);
 
-        let next_cursor = response.cursor.filter(|c| !c.is_empty());
+        let next_cursor = next_cursor_if_full_page(response.cursor, returned_rows, page_limit);
         if next_cursor.is_none() {
             break;
         }
@@ -6058,16 +6722,22 @@ mod tests {
     fn base_args() -> BaseArgs {
         BaseArgs {
             json: false,
+            verbose: false,
+            verbose_source: None,
             quiet: false,
+            quiet_source: None,
             no_color: false,
+            no_input: false,
             profile: None,
+            profile_explicit: false,
             org_name: None,
             project: None,
             api_key: None,
+            api_key_source: None,
             prefer_profile: false,
-            no_input: false,
             api_url: None,
             app_url: None,
+            ca_cert: None,
             env_file: None,
         }
     }
@@ -6077,6 +6747,8 @@ mod tests {
             org: Some(org.to_string()),
             project: None,
             page: None,
+            experiment: None,
+            comparison_experiment: None,
             row_ref: Some("r1".to_string()),
             span_id: None,
             trace_view_type: None,
@@ -6151,14 +6823,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_to_seconds_supports_units() {
-        assert_eq!(parse_duration_to_seconds("90").expect("seconds"), 90);
-        assert_eq!(parse_duration_to_seconds("15m").expect("minutes"), 900);
-        assert_eq!(parse_duration_to_seconds("2h").expect("hours"), 7_200);
-        assert_eq!(parse_duration_to_seconds("1d").expect("days"), 86_400);
-    }
-
-    #[test]
     fn build_base_filter_clause_uses_window_or_since() {
         let from_window = build_base_filter_clause(None, "1h", Some("metadata.model IS NOT NULL"))
             .expect("window filter");
@@ -6225,6 +6889,61 @@ mod tests {
         let full_by_span_id = build_full_span_query_by_span_id("project_logs('p1')", "span-1");
         assert!(full_by_span_id.contains("preview_length: -1"));
         assert!(full_by_span_id.contains("filter: span_id = 'span-1'"));
+
+        let url_lookup = build_url_lookup_by_span_id_query("experiment('experiment-id')", "span-1");
+        assert!(url_lookup.contains("from: experiment('experiment-id') spans"));
+        assert!(url_lookup.contains("filter: span_id = 'span-1'"));
+    }
+
+    #[test]
+    fn next_cursor_requires_full_page() {
+        assert_eq!(
+            next_cursor_if_full_page(Some("cursor".to_string()), 34, 1000),
+            None
+        );
+        assert_eq!(
+            next_cursor_if_full_page(Some("cursor".to_string()), 100, 100),
+            Some("cursor".to_string())
+        );
+        assert_eq!(
+            next_cursor_if_full_page(Some(String::new()), 100, 100),
+            None
+        );
+    }
+
+    #[test]
+    fn thread_summary_counts_roles_and_tool_calls() {
+        let messages = vec![
+            json!({"role": "system", "content": "instructions"}),
+            json!({"role": "user", "content": "go"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"function": {"name": "get_manifest", "arguments": "{}"}},
+                    {"name": "get_spans", "arguments": "{}"}
+                ]
+            }),
+            json!({"role": "tool", "content": "{}"}),
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_call", "name": "preprocess_spans", "arguments": "{}"}
+                ]
+            }),
+        ];
+
+        let summary = build_thread_summary(&messages);
+
+        assert_eq!(summary.message_count, 5);
+        assert_eq!(summary.role_counts.get("assistant"), Some(&2));
+        assert_eq!(summary.role_counts.get("tool"), Some(&1));
+        assert_eq!(summary.tool_call_count, 3);
+        assert_eq!(
+            summary.tool_names,
+            vec!["get_manifest", "get_spans", "preprocess_spans"]
+        );
+        assert_eq!(summary.final_assistant_message, Some(5));
     }
 
     #[test]
@@ -6274,18 +6993,21 @@ mod tests {
     fn parse_startup_trace_url_from_trace_subcommand_reads_positional_url() {
         let args = ViewArgs {
             command: Some(ViewCommand::Trace(TraceArgs {
-                object_ref: None,
-                project_id: None,
-                trace_id: None,
-                url: None,
-                url_arg: Some(
-                    "https://www.braintrust.dev/app/Lovable/p/lovable/logs?r=abc&s=def".to_string(),
-                ),
-                limit: 100,
+                selector: TraceSelectorArgs {
+                    object_ref: None,
+                    project_id: None,
+                    trace_id: None,
+                    url: None,
+                    url_arg: Some(
+                        "https://www.braintrust.dev/app/Lovable/p/lovable/logs?r=abc&s=def"
+                            .to_string(),
+                    ),
+                    limit: 100,
+                    preview_length: 125,
+                    print_queries: false,
+                    non_interactive: false,
+                },
                 cursor: None,
-                preview_length: 125,
-                print_queries: false,
-                non_interactive: false,
             })),
         };
 
@@ -6297,5 +7019,105 @@ mod tests {
         assert_eq!(parsed.project.as_deref(), Some("lovable"));
         assert_eq!(parsed.row_ref.as_deref(), Some("abc"));
         assert_eq!(parsed.span_id.as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn parse_trace_url_reads_experiment_source_from_comparison_url() {
+        let parsed = parse_trace_url(
+            "https://www.example.test/app/test-org/p/Test%20Project/experiments/baseline-exp?c=challenger-exp&r=root&s=span",
+        )
+        .expect("parse experiment trace URL");
+
+        assert_eq!(parsed.org.as_deref(), Some("test-org"));
+        assert_eq!(parsed.project.as_deref(), Some("Test Project"));
+        assert_eq!(parsed.page.as_deref(), Some("experiments"));
+        assert_eq!(parsed.experiment.as_deref(), Some("baseline-exp"));
+        assert_eq!(
+            parsed.comparison_experiment.as_deref(),
+            Some("challenger-exp")
+        );
+        assert_eq!(
+            trace_url_experiment_selectors(&parsed),
+            vec!["baseline-exp", "challenger-exp"]
+        );
+        assert_eq!(parsed.row_ref.as_deref(), Some("root"));
+        assert_eq!(parsed.span_id.as_deref(), Some("span"));
+    }
+
+    #[test]
+    fn parse_trace_url_uses_path_experiment_when_no_comparison_is_present() {
+        let parsed = parse_trace_url(
+            "https://www.example.test/app/test-org/p/test-project/experiments/baseline-exp?r=root",
+        )
+        .expect("parse experiment trace URL");
+
+        assert_eq!(
+            trace_url_experiment_selectors(&parsed),
+            vec!["baseline-exp"]
+        );
+    }
+
+    #[test]
+    fn parse_startup_trace_url_from_thread_subcommand_reuses_trace_selector_url() {
+        let args = ViewArgs {
+            command: Some(ViewCommand::Thread(ThreadArgs {
+                selector: TraceSelectorArgs {
+                    object_ref: None,
+                    project_id: None,
+                    trace_id: None,
+                    url: Some(
+                        "https://www.braintrust.dev/app/test-org/p/test-project/logs?r=root&s=span&tvt=thread"
+                            .to_string(),
+                    ),
+                    url_arg: None,
+                    limit: 100,
+                    preview_length: 125,
+                    print_queries: false,
+                    non_interactive: false,
+                },
+            })),
+        };
+
+        let parsed = parse_startup_trace_url_from_view_args(&args)
+            .expect("parse")
+            .expect("url present");
+
+        assert_eq!(parsed.org.as_deref(), Some("test-org"));
+        assert_eq!(parsed.project.as_deref(), Some("test-project"));
+        assert_eq!(parsed.row_ref.as_deref(), Some("root"));
+        assert_eq!(parsed.span_id.as_deref(), Some("span"));
+        assert_eq!(parsed.trace_view_type.as_deref(), Some("thread"));
+    }
+
+    #[test]
+    fn parse_startup_trace_url_from_waterfall_subcommand_reuses_trace_selector_url() {
+        let args = ViewArgs {
+            command: Some(ViewCommand::Waterfall(WaterfallArgs {
+                selector: TraceSelectorArgs {
+                    object_ref: None,
+                    project_id: None,
+                    trace_id: None,
+                    url: Some(
+                        "https://www.braintrust.dev/app/test-org/p/test-project/logs?r=root&s=span&tvt=timeline"
+                            .to_string(),
+                    ),
+                    url_arg: None,
+                    limit: 100,
+                    preview_length: 125,
+                    print_queries: false,
+                    non_interactive: false,
+                },
+            })),
+        };
+
+        let parsed = parse_startup_trace_url_from_view_args(&args)
+            .expect("parse")
+            .expect("url present");
+
+        assert_eq!(parsed.org.as_deref(), Some("test-org"));
+        assert_eq!(parsed.project.as_deref(), Some("test-project"));
+        assert_eq!(parsed.row_ref.as_deref(), Some("root"));
+        assert_eq!(parsed.span_id.as_deref(), Some("span"));
+        assert_eq!(parsed.trace_view_type.as_deref(), Some("timeline"));
     }
 }

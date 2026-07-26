@@ -8,13 +8,13 @@ Reference guide for installing the Braintrust Java SDK.
 
 ## Find the latest version of the SDK
 
-Look up the latest version from Maven Central **without modifying the project**. Do not guess -- use a read-only query so dependencies stay unchanged until you pin the exact version.
+Look up the latest version from Maven Central **without modifying the project**. Do not guess -- use a read-only query so dependencies stay unchanged until you write the version into the build file.
 
 ```bash
 curl -s 'https://search.maven.org/solrsearch/select?q=g:dev.braintrust+AND+a:braintrust-sdk-java&rows=1&wt=json' | python3 -c "import sys,json; print(json.load(sys.stdin)['response']['docs'][0]['latestVersion'])"
 ```
 
-Then add the dependency with that exact version:
+Then add the dependency with that version (the latest published release):
 
 ### Gradle
 
@@ -52,15 +52,23 @@ If the project uses a different build tool, the Maven coordinates are:
 ```java
 import dev.braintrust.Braintrust;
 import dev.braintrust.config.BraintrustConfig;
+import io.opentelemetry.api.OpenTelemetry;
 
-var config = BraintrustConfig.builder()
-    .defaultProjectName("my-project")
-    .build();
-var braintrust = Braintrust.get(config);
-var openTelemetry = braintrust.openTelemetryCreate();
+var apiKey = System.getenv("BRAINTRUST_API_KEY");
+Braintrust braintrust = null;
+OpenTelemetry openTelemetry = null;
+
+if (apiKey != null && !apiKey.isEmpty()) {
+    var config = BraintrustConfig.builder()
+        .apiKey(apiKey)
+        .defaultProjectName("my-project")
+        .build();
+    braintrust = Braintrust.get(config);
+    openTelemetry = braintrust.openTelemetryCreate();
+}
 ```
 
-`Braintrust.get()` is the main entry point. It reads `BRAINTRUST_API_KEY` from the environment automatically.
+`Braintrust.get()` is the main entry point. The SDK requires an API key to be present, so initialize Braintrust conditionally and run the application normally when `BRAINTRUST_API_KEY` is missing.
 
 ## Install instrumentation
 
@@ -120,7 +128,7 @@ Assistant assistant = BraintrustLangchain.wrap(
 
 ### Spring AI
 
-For Spring Boot apps using Spring AI, register Braintrust beans and wrap the underlying LLM client. Example with Google GenAI:
+For Spring Boot apps using Spring AI, only register Braintrust beans when `BRAINTRUST_API_KEY` is non-empty, and wrap the underlying LLM client only in that case. Example with Google GenAI:
 
 ```java
 @Bean
@@ -158,4 +166,4 @@ If you can't determine how to run the app, ask the user.
 
 ## Generate a permalink (required)
 
-Follow the permalink generation steps in the agent task (Step 5). Use the value passed to `defaultProjectName(...)` as the project name.
+Follow the permalink generation steps in the agent task (Step 5). Use the project name you configured in code above.
