@@ -4,13 +4,16 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
+use futures_util::StreamExt;
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::args::BaseArgs;
 use crate::auth::login;
-use crate::http::{ApiClient, HttpError, RawRequestBody, ServiceBase};
+use crate::http::{
+    build_http_client, ApiClient, HttpError, RawRequestBody, ServiceBase, DEFAULT_HTTP_TIMEOUT,
+};
 
 const OPENAPI_SPEC_URL: &str =
     "https://raw.githubusercontent.com/braintrustdata/braintrust-openapi/main/openapi/spec.json";
@@ -19,6 +22,7 @@ const OPENAPI_SPEC_URL: &str =
 #[command(after_help = "\
 Examples:
   bt api get /v1/project
+  bt api get /v1/project --json
   bt api post /v1/project_score --body '{\"name\":\"example\"}'
   bt api post /api/project_score/register --base app --body-file payload.json
   bt api spec --filter project_score
@@ -123,20 +127,25 @@ pub async fn run(base: BaseArgs, args: ApiArgs) -> Result<()> {
         command => {
             let ctx = login(&base).await?;
             let client = ApiClient::new(&ctx)?;
-            run_authenticated_command(&client, command).await
+            run_authenticated_command(&client, command, base.json).await
         }
     }
 }
 
-async fn run_authenticated_command(client: &ApiClient, command: ApiCommand) -> Result<()> {
+async fn run_authenticated_command(
+    client: &ApiClient,
+    command: ApiCommand,
+    json: bool,
+) -> Result<()> {
     match command {
-        ApiCommand::Get(args) => run_request(client, Method::GET, args.target, None).await,
+        ApiCommand::Get(args) => run_request(client, Method::GET, args.target, None, json).await,
         ApiCommand::Post(args) => {
             run_request(
                 client,
                 Method::POST,
                 args.target,
                 load_request_body(args.body)?,
+                json,
             )
             .await
         }
@@ -146,6 +155,7 @@ async fn run_authenticated_command(client: &ApiClient, command: ApiCommand) -> R
                 Method::PUT,
                 args.target,
                 load_request_body(args.body)?,
+                json,
             )
             .await
         }
@@ -155,10 +165,13 @@ async fn run_authenticated_command(client: &ApiClient, command: ApiCommand) -> R
                 Method::PATCH,
                 args.target,
                 load_request_body(args.body)?,
+                json,
             )
             .await
         }
-        ApiCommand::Delete(args) => run_request(client, Method::DELETE, args.target, None).await,
+        ApiCommand::Delete(args) => {
+            run_request(client, Method::DELETE, args.target, None, json).await
+        }
         ApiCommand::Spec(_) => unreachable!("spec commands are handled before auth is loaded"),
     }
 }
@@ -168,6 +181,7 @@ async fn run_request(
     method: Method,
     args: RequestTargetArgs,
     body: Option<RawRequestBody>,
+    json: bool,
 ) -> Result<()> {
     if is_absolute_url(&args.path) {
         bail!("absolute URLs are not supported; pass a relative path such as /v1/project");
@@ -184,21 +198,41 @@ async fn run_request(
         .request_raw(method, service, &args.path, &headers, body)
         .await?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .context("failed to read response body")?;
     if !status.is_success() {
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read error response body")?;
         let body = String::from_utf8_lossy(&bytes).into_owned();
         return Err(HttpError { status, body }.into());
     }
 
-    if !bytes.is_empty() {
-        io::stdout()
-            .write_all(&bytes)
+    if json {
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read JSON response body")?;
+        let value = parse_json_response_body(&bytes)?;
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(());
+    }
+
+    let mut stdout = io::stdout().lock();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        stdout
+            .write_all(&chunk.context("failed to read response body")?)
             .context("failed to write response body")?;
     }
+    stdout.flush().context("failed to flush response body")?;
     Ok(())
+}
+
+fn parse_json_response_body(bytes: &[u8]) -> Result<Value> {
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(bytes).context("response body is not valid JSON")
 }
 
 async fn run_spec(json: bool, args: SpecArgs) -> Result<()> {
@@ -323,7 +357,9 @@ struct SpecOutput {
 }
 
 async fn fetch_openapi_spec(source_url: &str) -> Result<String> {
-    let response = reqwest::Client::new()
+    let client =
+        build_http_client(DEFAULT_HTTP_TIMEOUT).context("failed to initialize HTTP client")?;
+    let response = client
         .get(source_url)
         .send()
         .await
@@ -508,6 +544,20 @@ mod tests {
         .expect_err("expected failure");
 
         assert!(err.to_string().contains("--content-type requires"));
+    }
+
+    #[test]
+    fn parse_json_response_body_uses_null_for_empty_responses() {
+        assert_eq!(
+            parse_json_response_body(b"").expect("parse response"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn parse_json_response_body_rejects_non_json_responses() {
+        let err = parse_json_response_body(b"plain text").expect_err("expected parse failure");
+        assert!(err.to_string().contains("not valid JSON"));
     }
 
     #[test]

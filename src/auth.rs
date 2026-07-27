@@ -423,7 +423,7 @@ enum AuthCommand {
     Login(AuthLoginArgs),
     /// Force-refresh OAuth access token for a profile
     Refresh,
-    /// Print the resolved bearer token for the current auth context
+    /// Print a short-lived org-scoped bearer token for the current auth context
     Token(AuthTokenArgs),
     /// List auth profiles and check connection status
     Profiles(AuthProfilesArgs),
@@ -498,7 +498,7 @@ struct AuthTokenOutput {
 
 async fn run_token(base: &BaseArgs, args: AuthTokenArgs) -> Result<()> {
     let auth = resolve_auth(base).await?;
-    let token = resolve_api_bearer_token(&auth).await?;
+    let token = resolve_short_lived_bearer_token(&auth).await?;
 
     if base.json {
         println!(
@@ -544,16 +544,15 @@ async fn resolve_api_bearer_token(auth: &ResolvedAuth) -> Result<ResolvedBearerT
         });
     }
 
-    let org_name = auth
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "oauth login is missing an active org; pass --org or re-run `bt auth login --oauth`"
-            )
-        })?;
+    resolve_short_lived_bearer_token(auth).await
+}
+
+async fn resolve_short_lived_bearer_token(auth: &ResolvedAuth) -> Result<ResolvedBearerToken> {
+    let token = auth.api_key.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
+        )
+    })?;
     let app_url = auth
         .app_url
         .as_deref()
@@ -561,18 +560,25 @@ async fn resolve_api_bearer_token(auth: &ResolvedAuth) -> Result<ResolvedBearerT
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_APP_URL);
     let orgs = fetch_login_orgs(&token, app_url).await?;
-    let org_id = orgs
-        .iter()
-        .find(|org| org.name == org_name)
-        .map(|org| org.id.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!("oauth token does not have access to organization '{org_name}'")
-        })?;
+    let requested_org_name = auth
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let org = match requested_org_name {
+        Some(org_name) => find_login_org(&orgs, org_name).ok_or_else(|| {
+            anyhow::anyhow!("credential does not have access to organization '{org_name}'")
+        })?,
+        None if orgs.len() == 1 => &orgs[0],
+        None => {
+            bail!("an active org is required to mint a short-lived token; pass --org or select a profile with an org")
+        }
+    };
 
-    exchange_oauth_token_for_org_scoped_jwt(&token, app_url, org_id).await
+    exchange_credential_for_org_scoped_token(&token, app_url, &org.id).await
 }
 
-async fn exchange_oauth_token_for_org_scoped_jwt(
+async fn exchange_credential_for_org_scoped_token(
     login_token: &str,
     app_url: &str,
     org_id: &str,
@@ -580,6 +586,7 @@ async fn exchange_oauth_token_for_org_scoped_jwt(
     let token_url = format!("{}/api/oauth/token", app_url.trim_end_matches('/'));
     let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
         .context("failed to initialize HTTP client")?;
+    let requested_at = Utc::now();
     let response = client
         .post(&token_url)
         .bearer_auth(login_token)
@@ -606,7 +613,7 @@ async fn exchange_oauth_token_for_org_scoped_jwt(
     }
     let expires_in = i64::try_from(payload.expires_in)
         .context("OAuth token expiration exceeds supported range")?;
-    let expires_at = Utc::now()
+    let expires_at = requested_at
         .checked_add_signed(ChronoDuration::seconds(expires_in))
         .context("OAuth token expiration exceeds supported range")?
         .to_rfc3339();
@@ -3953,7 +3960,7 @@ mod tests {
             api_key: Some("oauth-access-token".to_string()),
             api_url: Some("https://api.example.com".to_string()),
             app_url: Some(app_url),
-            org_name: Some("Acme".to_string()),
+            org_name: Some("acme".to_string()),
             is_oauth: true,
         })
         .await
@@ -3992,6 +3999,31 @@ mod tests {
                 grant_type: TOKEN_EXCHANGE_GRANT.to_string(),
                 org_id: "11111111-1111-4111-8111-111111111111".to_string(),
             })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_short_lived_bearer_token_exchanges_api_keys() {
+        let (app_url, state) = start_mock_token_exchange_server();
+        let token = resolve_short_lived_bearer_token(&ResolvedAuth {
+            api_key: Some("permanent-api-key".to_string()),
+            api_url: Some("https://api.example.com".to_string()),
+            app_url: Some(app_url),
+            org_name: None,
+            is_oauth: false,
+        })
+        .await
+        .expect("resolve short-lived bearer token");
+
+        assert_eq!(token.token, "scoped-token");
+        assert!(token.expires_at.is_some());
+        assert_eq!(
+            state
+                .token_authorization
+                .lock()
+                .expect("token_authorization lock")
+                .as_deref(),
+            Some("Bearer permanent-api-key")
         );
     }
 
