@@ -9,7 +9,7 @@ pub(crate) fn read_yaml_object_source(
 ) -> Result<Map<String, Value>> {
     let raw = read_text_source(source, description)?;
     let value: Value =
-        serde_yaml::from_str(&raw).with_context(|| format!("invalid YAML in {description}"))?;
+        yaml_serde::from_str(&raw).with_context(|| format!("invalid YAML in {description}"))?;
     match value {
         Value::Object(object) => Ok(object),
         _ => bail!("{description} must be a YAML mapping/object"),
