@@ -11,8 +11,8 @@ use crate::{
 use super::{api, label, label_plural, select_function_interactive};
 use super::{
     prompt_config::{
-        parse_choice_scores_source, parse_classifications_source, validate_unit_interval,
-        PromptConfigArgs,
+        parse_choice_scores_source, parse_classifications_source, validate_prompt_data_patch,
+        validate_unit_interval, PromptConfigArgs,
     },
     FunctionTypeFilter, ResolvedContext,
 };
@@ -27,7 +27,7 @@ use super::{
 #[command(after_help = "\
 Examples:
   bt scorers update my-scorer --messages @messages.json
-  bt scorers update my-scorer --model gpt-5.4-nano --temperature 0.1
+  bt scorers update my-scorer --model gpt-5.4-nano --reasoning-effort none --temperature 0.1
   bt scorers update my-scorer --template-format jinja --pass-threshold 0.7
   bt scorers update my-scorer --classifications '[\"safe\",\"unsafe\"]'
   bt scorers update my-scorer --metadata @metadata.yaml
@@ -164,6 +164,7 @@ pub async fn run(
     let body = build_patch_body(args)?;
 
     let function = resolve_target_function(ctx, args, ft).await?;
+    validate_prompt_data_patch(function.prompt_data.as_ref(), &body)?;
 
     // LLM scorer/classifier output flags only apply to prompt-based scorers and
     // classifiers. Reject them on other function kinds (for example tools) so an
