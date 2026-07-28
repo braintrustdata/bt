@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Args;
 use serde::Serialize;
 
-use crate::args::BaseArgs;
+use crate::args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
 use crate::auth;
 use crate::config;
 
@@ -18,7 +18,11 @@ pub struct StatusArgs {}
 #[derive(Serialize)]
 struct StatusOutput {
     org: Option<String>,
+    org_id: Option<String>,
     project: Option<String>,
+    project_id: Option<String>,
+    app_url: Option<String>,
+    api_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,11 +73,38 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         project = config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
     }
 
-    let display_org = org.as_deref().map(config::display_org);
+    let org_id = if base.org_name_source.is_some() {
+        None
+    } else {
+        base.org_id.clone()
+    };
+    let configured_project =
+        config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
+    let project_id = (base.project_source.is_none()
+        && configured_project.is_some()
+        && configured_project == project)
+        .then(|| merged_cfg.project_id.clone())
+        .flatten();
+    let app_url = Some(
+        base.app_url
+            .clone()
+            .or_else(|| merged_cfg.app_url.clone())
+            .unwrap_or_else(|| DEFAULT_APP_URL.to_string()),
+    );
+    let api_url = Some(
+        base.api_url
+            .clone()
+            .or_else(|| merged_cfg.api_url.clone())
+            .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
+    );
     if base.json {
         let output = StatusOutput {
-            org: display_org.map(str::to_string),
+            org: org.clone(),
+            org_id,
             project,
+            project_id,
+            app_url,
+            api_url,
             user_name: auth_info.as_ref().and_then(|p| p.user_name.clone()),
             user_email: auth_info.as_ref().and_then(|p| p.email.clone()),
             api_key_hint: auth_info.as_ref().and_then(|p| p.api_key_hint.clone()),
@@ -85,8 +116,12 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
     }
 
     if base.verbose {
-        println!("org: {}", display_org.unwrap_or("(unset)"));
+        println!("org: {}", org.as_deref().unwrap_or("(unset)"));
+        println!("org_id: {}", org_id.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
+        println!("project_id: {}", project_id.as_deref().unwrap_or("(unset)"));
+        println!("app_url: {}", app_url.as_deref().unwrap_or(DEFAULT_APP_URL));
+        println!("api_url: {}", api_url.as_deref().unwrap_or(DEFAULT_API_URL));
         if let Some(ref p) = auth_info {
             println!("auth: {}", format_auth(p));
         }
@@ -94,26 +129,18 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
             println!("source: {src}");
         }
     } else {
-        // Plain one-liner. Always surface the active auth — even when no org is
-        // configured (an env-only API key, or a cross-org OAuth login) — instead
-        // of hiding it behind --verbose.
-        let cross_org_oauth = auth_info
-            .as_ref()
-            .is_some_and(|p| p.auth_method == "oauth" && p.org_name.is_none());
-        let header = match display_org {
-            Some("cross-org") => "cross-org".to_string(),
+        let header = match org.as_deref() {
             Some(org) => match project.as_deref() {
                 Some(project) => format!("{org}/{project}"),
                 None => org.to_string(),
             },
-            None if cross_org_oauth => "cross-org".to_string(),
             None if auth_info.is_some() => "No default org".to_string(),
             None => "No org/project configured. Run `bt switch` to set one.".to_string(),
         };
         println!("{header}");
         match &auth_info {
             Some(p) => println!("  auth: {}", format_auth(p)),
-            None if display_org.is_some() => println!("  auth: (none)"),
+            None if org.is_some() => println!("  auth: (none)"),
             None => {}
         }
     }
@@ -127,6 +154,10 @@ pub(crate) struct ConfigOverrides {
     env_org: Option<String>,
     cli_project: Option<String>,
     env_project: Option<String>,
+    cli_app_url: Option<String>,
+    env_app_url: Option<String>,
+    cli_api_url: Option<String>,
+    env_api_url: Option<String>,
 }
 
 impl ConfigOverrides {
@@ -143,12 +174,26 @@ impl ConfigOverrides {
             Some(ArgValueSource::EnvVariable) => (None, base.project.clone()),
             None => (None, None),
         };
+        let (cli_app_url, env_app_url) = match base.app_url_source {
+            Some(ArgValueSource::CommandLine) => (base.app_url.clone(), None),
+            Some(ArgValueSource::EnvVariable) => (None, base.app_url.clone()),
+            None => (None, None),
+        };
+        let (cli_api_url, env_api_url) = match base.api_url_source {
+            Some(ArgValueSource::CommandLine) => (base.api_url.clone(), None),
+            Some(ArgValueSource::EnvVariable) => (None, base.api_url.clone()),
+            None => (None, None),
+        };
 
         Self {
             cli_org,
             env_org,
             cli_project,
             env_project,
+            cli_app_url,
+            env_app_url,
+            cli_api_url,
+            env_api_url,
         }
     }
 }
@@ -166,28 +211,48 @@ pub(crate) fn resolve_config(
         env_org,
         cli_project,
         env_project,
+        cli_app_url,
+        env_app_url,
+        cli_api_url,
+        env_api_url,
     } = overrides;
-    // `Some("")` is the canonical cross-org marker for both CLI and env
-    // sources, so org overrides must not filter empty strings.
     let env_project = env_project.filter(|s| !s.is_empty());
     let merged = global.merge(local);
-    let org = cli_org
-        .clone()
-        .or_else(|| env_org.clone())
-        .or_else(|| merged.org.clone());
+    let app_override = cli_app_url.as_deref().or(env_app_url.as_deref());
+    let config_app = merged.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    let same_instance = app_override.is_none_or(|app| config::urls_equal(app, config_app));
+    let config_org = same_instance.then(|| merged.org.clone()).flatten();
+    let config_project = same_instance.then(|| merged.project.clone()).flatten();
+    let org = cli_org.clone().or_else(|| env_org.clone()).or(config_org);
 
     let project = cli_project
         .clone()
         .or_else(|| env_project.clone())
-        .or_else(|| merged.project.clone());
+        .or(config_project);
 
-    let source = if cli_org.is_some() || cli_project.is_some() {
+    let source = if cli_org.is_some()
+        || cli_project.is_some()
+        || cli_app_url.is_some()
+        || cli_api_url.is_some()
+    {
         Some("cli".to_string())
-    } else if env_org.is_some() || env_project.is_some() {
+    } else if env_org.is_some()
+        || env_project.is_some()
+        || env_app_url.is_some()
+        || env_api_url.is_some()
+    {
         Some("env".to_string())
-    } else if local.org.is_some() || local.project.is_some() {
+    } else if local.org.is_some()
+        || local.project.is_some()
+        || local.app_url.is_some()
+        || local.api_url.is_some()
+    {
         local_path.as_ref().map(|p| p.display().to_string())
-    } else if global.org.is_some() || global.project.is_some() {
+    } else if global.org.is_some()
+        || global.project.is_some()
+        || global.app_url.is_some()
+        || global.api_url.is_some()
+    {
         global_path.as_ref().map(|p| p.display().to_string())
     } else {
         None
@@ -269,6 +334,16 @@ mod tests {
                 (None, None, None),
             ),
             (
+                "app override does not inherit another instance's context",
+                ConfigOverrides {
+                    cli_app_url: s("https://other.example.test"),
+                    ..Default::default()
+                },
+                both(),
+                config(None, None),
+                (None, None, Some("cli")),
+            ),
+            (
                 "mixed cli/local",
                 ConfigOverrides {
                     cli_org: s("cli-org"),
@@ -284,23 +359,6 @@ mod tests {
                 config(Some("global-org"), None),
                 config(None, Some("local-proj")),
                 (None, Some("local-proj"), Some("/project/.bt/config.json")),
-            ),
-            (
-                "local cross-org",
-                ConfigOverrides::default(),
-                both(),
-                config(Some(""), None),
-                (Some(""), None, Some("/project/.bt/config.json")),
-            ),
-            (
-                "env cross-org",
-                ConfigOverrides {
-                    env_org: s(""),
-                    ..Default::default()
-                },
-                both(),
-                config(None, None),
-                (Some(""), Some("global-proj"), Some("env")),
             ),
         ];
         let local_path = Some(PathBuf::from("/project/.bt/config.json"));
