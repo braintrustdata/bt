@@ -10,6 +10,11 @@ use clap::ValueEnum;
 
 use super::pricing::format_timestamp;
 
+/// Hidden grouping column that preserves the trace only for rows whose user is
+/// missing. This keeps normal user groups aggregated while allowing the caller
+/// to attribute otherwise-anonymous cost through the originating trace.
+pub(super) const USER_FALLBACK_TRACE_ALIAS: &str = "attribution_trace";
+
 /// A cost breakdown dimension. Each maps to a BTQL expression; new dimensions
 /// are new enum values rather than new flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -245,11 +250,22 @@ pub(super) fn build_query(
     let activity = &tokens.activity;
 
     // `dims` is the internal grouping (display dimensions, plus `model` when a
-    // pricing file forced it for per-model rate lookup). Select and group by
-    // exactly these — nothing else, to keep cardinality minimal.
+    // pricing file forced it for per-model rate lookup). When grouping by user,
+    // preserve the trace only for missing-user rows. That avoids exploding the
+    // cardinality of already-attributed user groups while retaining enough
+    // information to apply the originating-trace fallback after this query.
     let mut select_fields: Vec<String> = Vec::new();
     for dim in dims {
         select_fields.push(format!("{} AS {}", dim.expr(table), dim.alias()));
+    }
+    let user_fallback_trace_expr =
+        (dims.contains(&Dimension::User) && !dims.contains(&Dimension::Trace)).then(|| {
+            "CASE WHEN span_attributes.created_by_user_id IS NULL \
+         THEN root_span_id ELSE NULL END"
+                .to_string()
+        });
+    if let Some(expr) = user_fallback_trace_expr.as_deref() {
+        select_fields.push(format!("{expr} AS {USER_FALLBACK_TRACE_ALIAS}"));
     }
 
     select_fields.push(format!(
@@ -340,8 +356,12 @@ pub(super) fn build_query(
         ));
     }
 
-    // GROUP BY exactly the selected dimension expressions.
-    let group_exprs: Vec<String> = dims.iter().map(|dim| dim.expr(table)).collect();
+    // GROUP BY exactly the selected dimension expressions plus the conditional
+    // trace used for missing-user attribution, when present.
+    let mut group_exprs: Vec<String> = dims.iter().map(|dim| dim.expr(table)).collect();
+    if let Some(expr) = user_fallback_trace_expr {
+        group_exprs.push(expr);
+    }
 
     format!(
         "SELECT\n  {}\nFROM {}\nWHERE {}\nGROUP BY {}",
@@ -365,6 +385,31 @@ pub(super) fn playground_from(session_ids: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("playground_logs({ids}, shape => 'spans')")
+}
+
+/// Build a lookup query for the distinct non-scorer users on a set of traces.
+///
+/// The root-span predicate is intentionally the only time constraint: scorer
+/// work can run after the originating trace has fallen outside the cost window,
+/// and a `root_span_id` filter satisfies the repository's BTQL safety rule.
+pub(super) fn build_trace_owner_query(from_clause: &str, trace_ids: &[String]) -> String {
+    assert!(
+        !trace_ids.is_empty(),
+        "trace owner query requires at least one trace ID"
+    );
+    let trace_ids = trace_ids
+        .iter()
+        .map(|id| sql_quote(id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT\n  root_span_id AS trace,\n  span_attributes.created_by_user_id AS user\n\
+         FROM {from_clause}\n\
+         WHERE root_span_id IN ({trace_ids})\n\
+           AND span_attributes.created_by_user_id IS NOT NULL\n\
+           AND (span_attributes.purpose IS NULL OR span_attributes.purpose != 'scorer')\n\
+         GROUP BY root_span_id, span_attributes.created_by_user_id"
+    )
 }
 
 #[cfg(test)]
@@ -495,6 +540,52 @@ mod tests {
             "{query}"
         );
         assert!(query.contains("'playgrounds' AS source"), "{query}");
+    }
+
+    #[test]
+    fn user_grouping_preserves_only_missing_user_traces() {
+        let query = build_query(
+            TableKind::Project,
+            &project_from("proj-1"),
+            range(),
+            &[],
+            &[Dimension::User],
+            &Filters::default(),
+        );
+        let fallback_expr =
+            "CASE WHEN span_attributes.created_by_user_id IS NULL THEN root_span_id ELSE NULL END";
+        assert!(
+            query.contains(&format!("{fallback_expr} AS {USER_FALLBACK_TRACE_ALIAS}")),
+            "{query}"
+        );
+        assert!(query.contains(&format!(
+            "GROUP BY span_attributes.created_by_user_id, {fallback_expr}"
+        )));
+
+        let explicit_trace = build_query(
+            TableKind::Project,
+            &project_from("proj-1"),
+            range(),
+            &[],
+            &[Dimension::User, Dimension::Trace],
+            &Filters::default(),
+        );
+        assert!(!explicit_trace.contains(USER_FALLBACK_TRACE_ALIAS));
+    }
+
+    #[test]
+    fn trace_owner_query_is_root_bounded_and_excludes_scorers() {
+        let query = build_trace_owner_query(
+            &project_from("proj-1"),
+            &[
+                "00000000-0000-0000-0000-000000000001".to_string(),
+                "00000000-0000-0000-0000-000000000002".to_string(),
+            ],
+        );
+        assert!(query.contains("root_span_id IN ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002')"), "{query}");
+        assert!(query.contains("span_attributes.purpose != 'scorer'"));
+        assert!(query.contains("GROUP BY root_span_id, span_attributes.created_by_user_id"));
+        assert!(!query.contains("created >="));
     }
 
     #[test]

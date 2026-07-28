@@ -7,13 +7,13 @@
 //! dimensions plus `model`) up to the display dimensions.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, NaiveDate};
 use serde_json::{Map, Value};
 
 use super::pricing::{PriceBook, TokenUsage};
-use super::query::{Dimension, TimeSegment};
+use super::query::{Dimension, TimeSegment, USER_FALLBACK_TRACE_ALIAS};
 
 /// One rendered breakdown row, keyed by the display dimension values.
 #[derive(Debug, Clone)]
@@ -67,6 +67,99 @@ impl Totals {
     pub(super) fn cost(&self) -> Option<f64> {
         (self.priced_spans() > 0).then_some(self.logged_cost + self.file_cost)
     }
+}
+
+/// Return the distinct trace IDs for cost-bearing rows whose direct user is
+/// missing. The hidden conditional trace is used for a user-only breakdown;
+/// the regular `trace` column covers an explicit `--group-by trace,user`.
+pub(super) fn unattributed_trace_ids(result_rows: &[Map<String, Value>]) -> Vec<String> {
+    result_rows
+        .iter()
+        .filter(|row| {
+            value_as_u64(row.get("candidate_spans")) > 0
+                && row
+                    .get(Dimension::User.alias())
+                    .and_then(Value::as_str)
+                    .is_none_or(|user| user.trim().is_empty())
+        })
+        .filter_map(trace_id_for_user_fallback)
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn trace_id_for_user_fallback(row: &Map<String, Value>) -> Option<&str> {
+    [USER_FALLBACK_TRACE_ALIAS, Dimension::Trace.alias()]
+        .into_iter()
+        .find_map(|alias| {
+            row.get(alias)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|trace| !trace.is_empty())
+        })
+}
+
+/// Convert `(trace, user)` lookup rows into a map only where exactly one
+/// distinct non-scorer user was found for the trace. Ambiguous traces are
+/// deliberately omitted rather than assigned by frequency or query order.
+pub(super) fn unique_trace_owners(owner_rows: &[Map<String, Value>]) -> HashMap<String, String> {
+    let mut candidates: HashMap<String, HashSet<String>> = HashMap::new();
+    for row in owner_rows {
+        let Some(trace) = row
+            .get(Dimension::Trace.alias())
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|trace| !trace.is_empty())
+        else {
+            continue;
+        };
+        let Some(user) = row
+            .get(Dimension::User.alias())
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|user| !user.is_empty())
+        else {
+            continue;
+        };
+        candidates
+            .entry(trace.to_string())
+            .or_default()
+            .insert(user.to_string());
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(trace, users)| {
+            (users.len() == 1).then(|| (trace, users.into_iter().next().expect("one user")))
+        })
+        .collect()
+}
+
+/// Fill only missing direct users from an unambiguous originating-trace map.
+/// Existing span-level attribution always wins.
+pub(super) fn apply_trace_owner_fallback(
+    result_rows: &mut [Map<String, Value>],
+    trace_owners: &HashMap<String, String>,
+) -> usize {
+    let mut attributed = 0;
+    for row in result_rows {
+        let user_is_missing = row
+            .get(Dimension::User.alias())
+            .and_then(Value::as_str)
+            .is_none_or(|user| user.trim().is_empty());
+        if !user_is_missing {
+            continue;
+        }
+        let Some(owner) = trace_id_for_user_fallback(row)
+            .and_then(|trace| trace_owners.get(trace))
+            .cloned()
+        else {
+            continue;
+        };
+        row.insert(Dimension::User.alias().to_string(), Value::String(owner));
+        attributed += 1;
+    }
+    attributed
 }
 
 /// Accumulate result rows from one query into `accumulator`, keyed by the
@@ -293,6 +386,60 @@ mod tests {
 
     fn map(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn attributes_only_missing_users_from_unambiguous_trace_owners() {
+        let mut cost_rows = vec![
+            map(json!({
+                "user": null,
+                "attribution_trace": "trace-a",
+                "candidate_spans": 2,
+            })),
+            map(json!({
+                "user": null,
+                "trace": "trace-b",
+                "candidate_spans": 1,
+            })),
+            map(json!({
+                "user": "direct-user",
+                "attribution_trace": null,
+                "candidate_spans": 3,
+            })),
+            map(json!({
+                "user": null,
+                "attribution_trace": "ignored-no-cost",
+                "candidate_spans": 0,
+            })),
+        ];
+        assert_eq!(
+            unattributed_trace_ids(&cost_rows),
+            vec!["trace-a".to_string(), "trace-b".to_string()]
+        );
+
+        let owners = unique_trace_owners(&[
+            map(json!({"trace": "trace-a", "user": "fallback-user"})),
+            // Duplicate rows do not make a trace ambiguous.
+            map(json!({"trace": "trace-a", "user": "fallback-user"})),
+            map(json!({"trace": "trace-b", "user": "first-user"})),
+            map(json!({"trace": "trace-b", "user": "second-user"})),
+            map(json!({"trace": "trace-without-user", "user": null})),
+        ]);
+        assert_eq!(
+            owners,
+            HashMap::from([("trace-a".to_string(), "fallback-user".to_string())])
+        );
+
+        assert_eq!(apply_trace_owner_fallback(&mut cost_rows, &owners), 1);
+        assert_eq!(
+            cost_rows[0].get("user").and_then(Value::as_str),
+            Some("fallback-user")
+        );
+        assert_eq!(cost_rows[1].get("user"), Some(&Value::Null));
+        assert_eq!(
+            cost_rows[2].get("user").and_then(Value::as_str),
+            Some("direct-user")
+        );
     }
 
     #[test]
