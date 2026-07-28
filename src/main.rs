@@ -58,7 +58,7 @@ const HELP_TEMPLATE: &str = "\
 Core
   init         Initialize .bt config directory and files
   auth         Authenticate bt with Braintrust
-  switch       Switch org and project context
+  switch       Switch instance, org, and project context
   view         View logs, traces, and spans
 
 Projects & resources
@@ -161,7 +161,7 @@ enum Commands {
     Sync(CLIArgs<sync::SyncArgs>),
     /// Local utility commands
     Util(CLIArgs<util_cmd::UtilArgs>),
-    /// Switch org and project context
+    /// Switch instance, org, and project context
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
     Status(CLIArgs<status::StatusArgs>),
@@ -296,6 +296,7 @@ fn try_main() -> Result<()> {
     let matches = Cli::command().get_matches_from(&argv);
     let mut cli = Cli::from_arg_matches(&matches).expect("clap matches should parse");
     apply_base_arg_sources(&matches, cli.command.base_mut());
+    config::apply_base_config(cli.command.base_mut());
     apply_base_output_defaults(&mut cli.command);
     configure_output(cli.command.base());
     apply_runtime_env_overrides(cli.command.base());
@@ -349,6 +350,8 @@ fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
     base.org_name_source = find_value_source(matches, "org_name").and_then(map_value_source);
     base.project_source = find_value_source(matches, "project").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
+    base.api_url_source = find_value_source(matches, "api_url").and_then(map_value_source);
+    base.app_url_source = find_value_source(matches, "app_url").and_then(map_value_source);
 }
 
 fn apply_base_output_defaults(command: &mut Commands) {

@@ -59,6 +59,7 @@ pub struct ResolvedAuth {
     pub api_url: Option<String>,
     pub app_url: Option<String>,
     pub org_name: Option<String>,
+    pub org_id: Option<String>,
     pub is_oauth: bool,
     slot_key: Option<String>,
 }
@@ -73,6 +74,11 @@ pub struct ProfileInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableInstance {
+    pub app_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableOrg {
     pub id: String,
     pub name: String,
@@ -82,6 +88,7 @@ pub struct AvailableOrg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoverableAuthErrorKind {
     OauthRefreshToken,
+    OauthOrgAccess,
     StoredCredential,
 }
 
@@ -101,6 +108,14 @@ impl StdError for RecoverableAuthError {}
 
 fn recoverable_auth_error(kind: RecoverableAuthErrorKind, message: String) -> anyhow::Error {
     anyhow::Error::new(RecoverableAuthError { kind, message })
+}
+
+fn is_oauth_org_access_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source
+            .downcast_ref::<RecoverableAuthError>()
+            .is_some_and(|err| err.kind == RecoverableAuthErrorKind::OauthOrgAccess)
+    })
 }
 
 pub fn is_missing_credential_error(err: &anyhow::Error) -> bool {
@@ -124,6 +139,14 @@ pub fn list_profiles() -> Result<Vec<ProfileInfo>> {
         .values()
         .map(profile_info_from_store_entry)
         .collect())
+}
+
+pub(crate) fn has_oauth_login_for_instance(base: &BaseArgs) -> Result<bool> {
+    let store = load_auth_store()?;
+    Ok(store
+        .profiles
+        .values()
+        .any(|profile| profile.auth_kind == AuthKind::Oauth && profile_matches_urls(base, profile)))
 }
 
 pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
@@ -161,6 +184,133 @@ async fn available_orgs(api_key: &str, app_url: &str) -> Result<Vec<AvailableOrg
             api_url: org.api_url,
         })
         .collect())
+}
+
+pub(crate) fn available_instances(base: &BaseArgs) -> Result<Vec<AvailableInstance>> {
+    let store = load_auth_store()?;
+    let constrain_app = matches!(
+        base.app_url_source,
+        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
+    );
+    let requested_app = constrain_app
+        .then_some(base.app_url.as_deref())
+        .flatten()
+        .map(canonical_url);
+    let mut apps = store
+        .profiles
+        .values()
+        .map(profile_app_url)
+        .filter(|app| requested_app.is_none_or(|requested| canonical_url(app) == requested))
+        .map(|app| canonical_url(app).to_string())
+        .collect::<BTreeSet<_>>();
+
+    if base
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        let app = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+        if requested_app.is_none_or(|requested| canonical_url(app) == requested) {
+            apps.insert(canonical_url(app).to_string());
+        }
+    }
+
+    if apps.is_empty() && constrain_app {
+        bail!(
+            "no credentials found for app URL '{}'; run `bt auth login --app-url {}`",
+            base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL),
+            shell_quote_arg(base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL))
+        );
+    }
+    Ok(apps
+        .into_iter()
+        .map(|app_url| AvailableInstance { app_url })
+        .collect())
+}
+
+pub(crate) async fn available_orgs_for_instance(
+    base: &BaseArgs,
+    app_url: &str,
+) -> Result<Vec<AvailableOrg>> {
+    let mut store = load_auth_store()?;
+    let explicit_api = matches!(
+        base.api_url_source,
+        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
+    )
+    .then(|| base.api_url.as_deref())
+    .flatten();
+    let mut orgs = BTreeMap::<String, AvailableOrg>::new();
+    let matching = store
+        .profiles
+        .iter()
+        .filter(|(_, profile)| canonical_url(profile_app_url(profile)) == canonical_url(app_url))
+        .filter(|(_, profile)| {
+            profile.auth_kind == AuthKind::Oauth
+                || explicit_api
+                    .is_none_or(|url| canonical_url(url) == canonical_url(profile_api_url(profile)))
+        })
+        .map(|(slot, profile)| (slot.clone(), profile.clone()))
+        .collect::<Vec<_>>();
+
+    for (slot, profile) in matching {
+        match profile.auth_kind {
+            AuthKind::Oauth => {
+                let mut oauth_base = base.clone();
+                oauth_base.app_url = Some(app_url.to_string());
+                if oauth_base.api_url_source.is_none() {
+                    oauth_base.api_url = profile.api_url.clone();
+                }
+                let token = load_oauth_access_token(&oauth_base, &mut store, &slot).await?;
+                for org in fetch_login_orgs(&token, app_url).await? {
+                    orgs.insert(
+                        org.id.clone(),
+                        AvailableOrg {
+                            id: org.id,
+                            name: org.name,
+                            api_url: org.api_url,
+                        },
+                    );
+                }
+            }
+            AuthKind::ApiKey => {
+                if let (Some(id), Some(name)) = (profile.org_id, profile.org_name) {
+                    orgs.entry(id.clone()).or_insert(AvailableOrg {
+                        id,
+                        name,
+                        api_url: profile.api_url,
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some(api_key) = base.api_key.as_deref().filter(|key| !key.trim().is_empty()) {
+        let base_app = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+        if canonical_url(base_app) == canonical_url(app_url) {
+            for org in fetch_login_orgs(api_key, app_url).await? {
+                orgs.insert(
+                    org.id.clone(),
+                    AvailableOrg {
+                        id: org.id,
+                        name: org.name,
+                        api_url: org.api_url,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut orgs = orgs.into_values().collect::<Vec<_>>();
+    orgs.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    if orgs.is_empty() {
+        bail!("no organizations are available for Braintrust instance '{app_url}'");
+    }
+    Ok(orgs)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -279,7 +429,7 @@ pub struct AuthArgs {
 enum AuthCommand {
     /// Authenticate with Braintrust (OAuth or API key)
     Login(AuthLoginArgs),
-    /// Force-refresh OAuth access token for the selected org
+    /// Force-refresh the OAuth access token for the selected instance
     Refresh,
     /// List saved auth logins and check connection status
     Logins(AuthLoginsArgs),
@@ -332,7 +482,7 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
         }
         AuthCommand::Refresh => run_login_refresh(&base).await,
         AuthCommand::Logins(logins_args) => run_logins(&base, logins_args).await,
-        AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args),
+        AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args).await,
     }
 }
 
@@ -371,7 +521,7 @@ pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
     let login = LoginState::new();
     login.set(
         api_key,
-        String::new(),
+        auth.org_id.clone().unwrap_or_default(),
         org_name,
         api_url.clone(),
         app_url.clone(),
@@ -428,7 +578,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
             let login = LoginState::new();
             login.set(
                 api_key.clone(),
-                String::new(),
+                auth.org_id.clone().unwrap_or_default(),
                 org_name,
                 auth.api_url
                     .clone()
@@ -752,8 +902,20 @@ fn config_auth_context(base: &BaseArgs) -> Option<String> {
     config_auth_context_from_config(base, &cfg)
 }
 
+fn configured_org_for_app_url(app_url: &str) -> Option<String> {
+    let cfg = crate::config::load().ok()?;
+    let config_app = cfg.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    crate::config::urls_equal(app_url, config_app)
+        .then_some(cfg.org)
+        .flatten()
+}
+
 fn config_auth_context_from_config(base: &BaseArgs, cfg: &crate::config::Config) -> Option<String> {
-    if crate::config::org_option(base.org_name.as_deref()).is_none() {
+    let base_app = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    let config_app = cfg.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    if crate::config::org_option(base.org_name.as_deref()).is_none()
+        && crate::config::urls_equal(base_app, config_app)
+    {
         crate::config::org_option(cfg.org.as_deref()).map(str::to_string)
     } else {
         None
@@ -831,11 +993,6 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
     let can_prompt = ui::can_prompt();
 
     let effective_org = effective_org_name(base, &cfg_org);
-    reject_cross_org_api_key_preference(base.prefer_api_key, effective_org, &store)?;
-
-    if let Some(slot) = base.pinned_auth_slot.clone() {
-        return resolve_saved_auth_slot(base, &mut store, &None, &slot).await;
-    }
 
     let source = resolve_auth_source(
         base.prefer_api_key,
@@ -849,12 +1006,48 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
         AuthSource::CliApiKey(api_key) | AuthSource::EnvApiKey(api_key) => {
             resolve_ad_hoc_api_key_auth(base, &cfg_org, api_key).await
         }
-        AuthSource::Oauth(slot) | AuthSource::ApiKey(slot) => {
+        AuthSource::Oauth(slot) => {
+            match resolve_saved_auth_slot(base, &mut store, &cfg_org, &slot).await {
+                Ok(auth) => Ok(auth),
+                Err(err) if is_oauth_org_access_error(&err) && !base.prefer_api_key => {
+                    if let Some(api_key) = resolve_env_api_key(base) {
+                        return resolve_ad_hoc_api_key_auth(base, &cfg_org, api_key).await;
+                    }
+                    if let Some(api_key_slot) = select_profile_for_auth(
+                        base,
+                        &store,
+                        &cfg_org,
+                        AuthKind::ApiKey,
+                        can_prompt,
+                    )? {
+                        return resolve_saved_auth_slot(base, &mut store, &cfg_org, &api_key_slot)
+                            .await;
+                    }
+                    Err(err)
+                }
+                Err(err) => Err(err),
+            }
+        }
+        AuthSource::ApiKey(slot) => {
             resolve_saved_auth_slot(base, &mut store, &cfg_org, &slot).await
         }
         AuthSource::None => {
             if base.prefer_api_key {
                 bail!("--prefer-api-key requires an API key or OAuth login for the selected org");
+            }
+            if !store.profiles.is_empty()
+                && !store
+                    .profiles
+                    .values()
+                    .any(|profile| profile_matches_urls(base, profile))
+            {
+                let app = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+                let api = base.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
+                bail!(
+                    "no credentials match app URL '{}' and API URL '{}'; run `bt auth login` with these URLs",
+                    app,
+                    api
+                );
             }
             if effective_org.is_none() {
                 if let Some(err) = missing_org_for_stored_logins_error(&store) {
@@ -866,6 +1059,7 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
                 api_url: base.api_url.clone(),
                 app_url: base.app_url.clone(),
                 org_name: effective_org.map(str::to_string),
+                org_id: base.org_id.clone(),
                 is_oauth: false,
                 slot_key: None,
             })
@@ -884,6 +1078,7 @@ async fn resolve_ad_hoc_api_key_auth(
     }
 
     let mut resolved_org = requested_org.map(str::to_string);
+    let mut resolved_org_id = base.org_id.clone();
     let mut resolved_api_url = base.api_url.clone();
     if let Some(requested_org) = requested_org {
         if crate::args::custom_api_without_app_url(base.api_url.as_deref(), base.app_url.as_deref())
@@ -905,6 +1100,7 @@ async fn resolve_ad_hoc_api_key_auth(
             )
         })?;
         resolved_org = Some(selected_org.name.clone());
+        resolved_org_id = Some(selected_org.id.clone());
         resolved_api_url = resolved_api_url.or_else(|| selected_org.api_url.clone());
     }
 
@@ -913,6 +1109,7 @@ async fn resolve_ad_hoc_api_key_auth(
         api_url: resolved_api_url,
         app_url: base.app_url.clone(),
         org_name: resolved_org,
+        org_id: resolved_org_id,
         is_oauth: false,
         slot_key: None,
     })
@@ -980,6 +1177,7 @@ fn resolve_api_key_profile_auth(
         org_name: effective_org_name(base, cfg_org)
             .map(str::to_string)
             .or_else(|| profile.org_name.clone()),
+        org_id: profile.org_id.clone().or_else(|| base.org_id.clone()),
         is_oauth: false,
         slot_key: Some(profile_name.to_string()),
     };
@@ -1067,57 +1265,6 @@ fn maybe_rekey_api_key_profile_after_secret_load(
     Ok(())
 }
 
-async fn reconcile_oauth_slot_from_access_token(
-    store: &mut AuthStore,
-    slot_key: &str,
-    access_token: &str,
-    app_url: &str,
-) -> Result<()> {
-    let Some(mut profile) = store.profiles.get(slot_key).cloned() else {
-        return Ok(());
-    };
-    if profile.auth_kind != AuthKind::Oauth || profile.org_id.is_some() {
-        return Ok(());
-    }
-
-    let Some(org_name) = profile
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|org| !org.is_empty())
-    else {
-        profile.org_id = Some(String::new());
-        if replace_with_canonical_auth_profile(store, slot_key, profile) {
-            save_auth_store(store)?;
-        }
-        return Ok(());
-    };
-
-    // A legacy auth entry only cached the org name. Resolve the stable ID from
-    // the newly refreshed token; a failed best-effort lookup must not turn a
-    // successful token refresh into a failed command.
-    let Ok(orgs) = fetch_login_orgs(access_token, app_url).await else {
-        return Ok(());
-    };
-    let Some(org) = find_login_org(&orgs, org_name) else {
-        return Ok(());
-    };
-
-    profile.org_id = Some(org.id.clone());
-    profile.org_name = Some(org.name.clone());
-    let identity = decode_jwt_identity(access_token);
-    if identity.email.is_some() {
-        profile.email = identity.email;
-    }
-    if identity.name.is_some() {
-        profile.user_name = identity.name;
-    }
-    if replace_with_canonical_auth_profile(store, slot_key, profile) {
-        save_auth_store(store)?;
-    }
-    Ok(())
-}
-
 fn reconcile_resolved_auth_slot(auth: &ResolvedAuth, login: &LoginState) -> Result<()> {
     let Some(slot_key) = auth.slot_key.as_deref() else {
         return Ok(());
@@ -1127,40 +1274,25 @@ fn reconcile_resolved_auth_slot(auth: &ResolvedAuth, login: &LoginState) -> Resu
         return Ok(());
     };
 
+    if profile.auth_kind == AuthKind::Oauth {
+        return Ok(());
+    }
     let login_org_id = login.org_id().unwrap_or_default();
-    let is_cross_org = profile.auth_kind == AuthKind::Oauth
-        && auth
-            .org_name
-            .as_deref()
-            .is_none_or(|org| org.trim().is_empty());
-    if login_org_id.trim().is_empty() && !is_cross_org {
-        // The SDK's OAuth compatibility path does not always return org
-        // metadata. `bt auth logins` performs the same reconciliation after
-        // its explicit credential verification request.
+    if login_org_id.trim().is_empty() {
         return Ok(());
     }
 
     profile.org_id = Some(login_org_id);
-    profile.org_name = if is_cross_org {
-        None
-    } else {
-        login
-            .org_name()
-            .filter(|org| !org.trim().is_empty())
-            .or_else(|| auth.org_name.clone())
+    profile.org_name = login
+        .org_name()
+        .filter(|org| !org.trim().is_empty())
+        .or_else(|| auth.org_name.clone());
+    let Some(api_key) = auth.api_key.as_deref() else {
+        return Ok(());
     };
-    match profile.auth_kind {
-        AuthKind::ApiKey => {
-            let Some(api_key) = auth.api_key.as_deref() else {
-                return Ok(());
-            };
-            profile.api_key_hash = Some(api_key_hash(api_key));
-            if profile.api_key_hint.is_none() {
-                profile.api_key_hint = Some(obscure_api_key(api_key));
-            }
-        }
-        AuthKind::Oauth if profile.email.as_deref().is_none_or(str::is_empty) => return Ok(()),
-        AuthKind::Oauth => {}
+    profile.api_key_hash = Some(api_key_hash(api_key));
+    if profile.api_key_hint.is_none() {
+        profile.api_key_hint = Some(obscure_api_key(api_key));
     }
 
     if replace_with_canonical_auth_profile(&mut store, slot_key, profile) {
@@ -1169,43 +1301,22 @@ fn reconcile_resolved_auth_slot(auth: &ResolvedAuth, login: &LoginState) -> Resu
     Ok(())
 }
 
-async fn resolve_oauth_profile_auth(
+async fn load_oauth_access_token(
     base: &BaseArgs,
     store: &mut AuthStore,
-    cfg_org: &Option<String>,
     profile_name: &str,
-) -> Result<ResolvedAuth> {
+) -> Result<String> {
     let profile = store
         .profiles
         .get(profile_name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("saved OAuth login not found; run `bt auth logins`"))?;
-    let api_url = base
-        .api_url
-        .clone()
-        .or_else(|| profile.api_url.clone())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-    let app_url = base.app_url.clone().or_else(|| profile.app_url.clone());
-    let org_name = effective_org_name(base, cfg_org)
-        .map(str::to_string)
-        .or_else(|| profile.org_name.clone());
-
-    let mut auth = ResolvedAuth {
-        api_key: None,
-        api_url: Some(api_url.clone()),
-        app_url,
-        org_name,
-        is_oauth: true,
-        slot_key: Some(profile_name.to_string()),
-    };
-
-    if let Some(cached_access_token) = load_valid_cached_oauth_access_token(
+    if let Some(cached) = load_valid_cached_oauth_access_token(
         profile_name,
         &profile,
         profile.oauth_access_expires_at,
     )? {
-        auth.api_key = Some(cached_access_token);
-        return Ok(auth);
+        return Ok(cached);
     }
 
     let refresh_token = load_profile_oauth_refresh_token_for_profile(profile_name, &profile)?
@@ -1219,7 +1330,11 @@ async fn resolve_oauth_profile_auth(
                 ),
             )
         })?;
-    let refreshed = refresh_oauth_access_token(&api_url, &refresh_token, &profile).await?;
+    let api_url = base
+        .api_url
+        .as_deref()
+        .unwrap_or_else(|| profile_api_url(&profile));
+    let refreshed = refresh_oauth_access_token(api_url, &refresh_token, &profile).await?;
     save_profile_oauth_access_token(profile_name, &refreshed.access_token)?;
     let mut refresh_rotated = false;
     if let Some(next_refresh_token) = refreshed.refresh_token.as_ref() {
@@ -1239,14 +1354,70 @@ async fn resolve_oauth_profile_auth(
         }
     }
     save_auth_store(store)?;
-    reconcile_oauth_slot_from_access_token(
-        store,
-        profile_name,
-        &refreshed.access_token,
-        auth.app_url.as_deref().unwrap_or(DEFAULT_APP_URL),
-    )
-    .await?;
-    auth.api_key = Some(refreshed.access_token);
+    Ok(refreshed.access_token)
+}
+
+async fn resolve_oauth_profile_auth(
+    base: &BaseArgs,
+    store: &mut AuthStore,
+    cfg_org: &Option<String>,
+    profile_name: &str,
+) -> Result<ResolvedAuth> {
+    let profile = store
+        .profiles
+        .get(profile_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("saved OAuth login not found; run `bt auth logins`"))?;
+    let access_token = load_oauth_access_token(base, store, profile_name).await?;
+    let auth = ResolvedAuth {
+        api_key: Some(access_token),
+        api_url: Some(
+            base.api_url
+                .clone()
+                .or_else(|| profile.api_url.clone())
+                .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
+        ),
+        app_url: Some(
+            base.app_url
+                .clone()
+                .or_else(|| profile.app_url.clone())
+                .unwrap_or_else(|| DEFAULT_APP_URL.to_string()),
+        ),
+        org_name: effective_org_name(base, cfg_org).map(str::to_string),
+        org_id: base.org_id.clone(),
+        is_oauth: true,
+        slot_key: Some(profile_name.to_string()),
+    };
+    resolve_oauth_org_context(auth).await
+}
+
+async fn resolve_oauth_org_context(mut auth: ResolvedAuth) -> Result<ResolvedAuth> {
+    let requested_org = auth.org_name.as_deref().ok_or_else(|| {
+        recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthOrgAccess,
+            "an active organization is required; run `bt switch` or pass --org <ORG>".to_string(),
+        )
+    })?;
+    let credential = auth
+        .api_key
+        .as_deref()
+        .context("OAuth access token is missing")?;
+    let app_url = auth.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    let orgs = fetch_login_orgs(credential, app_url).await?;
+    let selected = find_login_org(&orgs, requested_org).ok_or_else(|| {
+        recoverable_auth_error(
+            RecoverableAuthErrorKind::OauthOrgAccess,
+            format!(
+                "OAuth login for '{}' cannot access organization '{requested_org}'",
+                canonical_url(app_url)
+            ),
+        )
+    })?;
+    auth.org_name = Some(selected.name.clone());
+    auth.org_id = Some(selected.id.clone());
+    if auth.api_url.is_none() {
+        auth.api_url = selected.api_url.clone();
+    }
     Ok(auth)
 }
 
@@ -1281,6 +1452,44 @@ pub async fn resolved_runner_env(base: &BaseArgs) -> Result<Vec<(String, String)
     Ok(envs)
 }
 
+fn canonical_url(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
+}
+
+fn profile_app_url(profile: &AuthProfile) -> &str {
+    profile.app_url.as_deref().unwrap_or(DEFAULT_APP_URL)
+}
+
+fn profile_api_url(profile: &AuthProfile) -> &str {
+    profile.api_url.as_deref().unwrap_or(DEFAULT_API_URL)
+}
+
+fn profile_matches_urls(base: &BaseArgs, profile: &AuthProfile) -> bool {
+    let app_url = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
+    if canonical_url(app_url) != canonical_url(profile_app_url(profile)) {
+        return false;
+    }
+    profile.auth_kind == AuthKind::Oauth
+        || canonical_url(base.api_url.as_deref().unwrap_or(DEFAULT_API_URL))
+            == canonical_url(profile_api_url(profile))
+}
+
+/// Match only URL filters the caller actually supplied. Listing and logout use
+/// this variant so an absent filter means "all instances", while command auth
+/// uses [`profile_matches_urls`] and therefore honors the built-in URL defaults.
+fn profile_matches_url_filters(base: &BaseArgs, profile: &AuthProfile) -> bool {
+    let app_matches = base
+        .app_url
+        .as_deref()
+        .is_none_or(|url| canonical_url(url) == canonical_url(profile_app_url(profile)));
+    app_matches
+        && (profile.auth_kind == AuthKind::Oauth
+            || base
+                .api_url
+                .as_deref()
+                .is_none_or(|url| canonical_url(url) == canonical_url(profile_api_url(profile))))
+}
+
 fn profile_matches_org_identifier(profile: &AuthProfile, org: &str) -> bool {
     profile.org_id.as_deref() == Some(org) || profile.org_name.as_deref() == Some(org)
 }
@@ -1298,13 +1507,13 @@ fn profile_org(profile: &AuthProfile) -> &str {
 }
 
 fn profile_org_label(profile: &AuthProfile) -> String {
-    config::display_org(profile_org(profile)).to_string()
+    profile_org(profile).to_string()
 }
 
 fn oauth_reauth_command(profile: &AuthProfile) -> String {
     format!(
-        "bt auth login --oauth --org {}",
-        shell_quote_arg(config::display_org(profile_org(profile)))
+        "bt auth login --oauth --app-url {}",
+        shell_quote_arg(profile_app_url(profile))
     )
 }
 
@@ -1333,32 +1542,18 @@ fn profile_identity_label(profile: &AuthProfile) -> Option<String> {
 }
 
 fn auth_slot_label(profile: &AuthProfile) -> String {
-    let mut parts = vec![profile_org_label(profile)];
-    parts.push(auth_kind_label(profile.auth_kind).to_string());
+    let mut parts = match profile.auth_kind {
+        AuthKind::Oauth => vec![profile_app_url(profile).to_string(), "oauth".to_string()],
+        AuthKind::ApiKey => vec![profile_org_label(profile), "api_key".to_string()],
+    };
     if let Some(identity) = profile_identity_label(profile) {
         parts.push(identity);
     }
     parts.join(" — ")
 }
 
-fn is_cross_org_oauth_profile(profile: &AuthProfile) -> bool {
-    profile.auth_kind == AuthKind::Oauth && profile_org(profile).is_empty()
-}
-
-fn reject_cross_org_api_key_preference(
-    prefer_api_key: bool,
-    org: Option<&str>,
-    store: &AuthStore,
-) -> Result<()> {
-    let cross_org = org == Some("")
-        || (org.is_none() && store.profiles.values().any(is_cross_org_oauth_profile));
-    if prefer_api_key && cross_org {
-        bail!("--prefer-api-key cannot be used from cross-org context; rerun with --org <ORG>");
-    }
-    Ok(())
-}
-
 fn auth_profile_names_by_kind<'a>(
+    base: &BaseArgs,
     store: &'a AuthStore,
     org: Option<&str>,
     kind: AuthKind,
@@ -1367,10 +1562,10 @@ fn auth_profile_names_by_kind<'a>(
         .profiles
         .iter()
         .filter(|(_, profile)| profile.auth_kind == kind)
-        .filter(|(_, profile)| match org {
-            Some(org) => profile_matches_org_identifier(profile, org),
-            None if kind == AuthKind::Oauth => is_cross_org_oauth_profile(profile),
-            None => false,
+        .filter(|(_, profile)| profile_matches_urls(base, profile))
+        .filter(|(_, profile)| {
+            kind == AuthKind::Oauth
+                || org.is_some_and(|org| profile_matches_org_identifier(profile, org))
         })
         .map(|(name, _)| name.as_str())
         .collect()
@@ -1403,9 +1598,7 @@ fn ad_hoc_api_key_profile(org: Option<&str>, api_key: &str) -> ProfileInfo {
 pub(crate) fn active_auth_info(base: &BaseArgs, org: Option<&str>) -> Result<Option<ProfileInfo>> {
     let store = load_auth_store().unwrap_or_default();
 
-    reject_cross_org_api_key_preference(base.prefer_api_key, org, &store)?;
-
-    let select = |kind| match auth_profile_names_by_kind(&store, org, kind).as_slice() {
+    let select = |kind| match auth_profile_names_by_kind(base, &store, org, kind).as_slice() {
         [] => Ok(None),
         [name] => Ok(Some((*name).to_string())),
         _ => bail!("multiple {kind:?} logins"),
@@ -1434,13 +1627,7 @@ pub(crate) fn active_auth_info(base: &BaseArgs, org: Option<&str>) -> Result<Opt
 }
 
 fn missing_org_for_stored_logins_error(store: &AuthStore) -> Option<anyhow::Error> {
-    let candidates = store
-        .profiles
-        .iter()
-        .filter(|(_, profile)| {
-            !is_cross_org_oauth_profile(profile) && !profile_org(profile).is_empty()
-        })
-        .collect::<Vec<_>>();
+    let candidates = store.profiles.iter().collect::<Vec<_>>();
     if candidates.is_empty() {
         return None;
     }
@@ -1483,16 +1670,7 @@ fn select_profile_from_store(
     current: Option<&str>,
     store: &AuthStore,
 ) -> Result<String> {
-    // Surface cross-org OAuth first so it is a predictable top-of-list choice
-    // rather than falling wherever its slot key happens to sort. The stable
-    // sort preserves the existing order of the remaining entries.
-    let mut names: Vec<&str> = names.to_vec();
-    names.sort_by_key(|name| {
-        !store
-            .profiles
-            .get(*name)
-            .is_some_and(is_cross_org_oauth_profile)
-    });
+    let names: Vec<&str> = names.to_vec();
     let labels: Vec<String> = names
         .iter()
         .map(|name| profile_label_from_store(name, store))
@@ -1511,53 +1689,6 @@ fn select_profile_from_store(
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let idx = ui::fuzzy_select(prompt, &label_refs, default)?;
     Ok(names[idx].to_string())
-}
-
-fn saved_login_names(store: &AuthStore, include_cross_org: bool) -> Vec<&str> {
-    let mut oauth_orgs = BTreeSet::new();
-    store
-        .profiles
-        .iter()
-        .filter(|(_, profile)| {
-            profile.auth_kind == AuthKind::ApiKey
-                || ((include_cross_org || !is_cross_org_oauth_profile(profile))
-                    && oauth_orgs.insert(
-                        profile
-                            .org_id
-                            .as_deref()
-                            .filter(|id| !id.is_empty())
-                            .unwrap_or_else(|| profile_org(profile))
-                            .to_ascii_lowercase(),
-                    ))
-        })
-        .map(|(name, _)| name.as_str())
-        .collect()
-}
-
-pub(crate) fn select_saved_login(
-    base: &mut BaseArgs,
-    current_org: Option<&str>,
-    include_cross_org: bool,
-) -> Result<bool> {
-    let store = load_auth_store()?;
-    let names = saved_login_names(&store, include_cross_org);
-    let selected = match names.as_slice() {
-        [] => return Ok(false),
-        [name] => (*name).to_string(),
-        _ if ui::can_prompt() => {
-            select_profile_from_store("Select login", &names, current_org, &store)?
-        }
-        _ => {
-            bail!("multiple saved logins match; pass --org <ORG>, or rerun interactively to choose")
-        }
-    };
-    let profile = &store.profiles[&selected];
-    if profile.auth_kind == AuthKind::ApiKey {
-        base.pinned_auth_slot = Some(selected);
-    } else {
-        base.org_name = Some(profile_org(profile).to_string());
-    }
-    Ok(true)
 }
 
 fn candidate_identities<'a>(names: &[&'a str], store: &'a AuthStore) -> Vec<String> {
@@ -1583,12 +1714,18 @@ fn select_profile_for_auth(
     can_prompt: bool,
 ) -> Result<Option<String>> {
     let org = effective_org_name(base, cfg_org);
-    let candidates = auth_profile_names_by_kind(store, org, kind);
+    let candidates = auth_profile_names_by_kind(base, store, org, kind);
     let label = match kind {
         AuthKind::Oauth => "OAuth login",
         AuthKind::ApiKey => "API key",
     };
-    select_auth_profile_candidate(label, org, &candidates, store, can_prompt)
+    select_auth_profile_candidate(
+        label,
+        org,
+        &candidates,
+        store,
+        can_prompt && kind == AuthKind::ApiKey,
+    )
 }
 
 fn select_auth_profile_candidate(
@@ -1609,13 +1746,18 @@ fn select_auth_profile_candidate(
         }
         _ => {
             let identities = candidate_identities(candidates, store).join(", ");
+            if kind_label == "OAuth login" {
+                bail!(
+                    "multiple Braintrust OAuth instances are available: {identities}. Run `bt switch` or pass --app-url <URL>."
+                );
+            }
             if let Some(org) = org {
                 bail!(
                     "multiple {kind_label} logins for org '{org}': {identities}. Rerun interactively or remove one with `bt auth logout`."
                 );
             }
             bail!(
-                "multiple cross-org {kind_label} logins available: {identities}. Rerun interactively or remove one with `bt auth logout`."
+                "multiple {kind_label} logins available: {identities}. Pass --app-url <URL>, rerun interactively, or remove one with `bt auth logout`."
             );
         }
     }
@@ -1625,10 +1767,12 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if args.oauth {
         return run_login_oauth(base, args).await;
     }
-    if base.org_name.as_deref() == Some("") {
-        bail!(
-            "API-key login requires a concrete org; cross-org API keys do not exist. Use --oauth, or rerun with --org <ORG>"
-        );
+    if base
+        .org_name
+        .as_deref()
+        .is_some_and(|org| org.trim().is_empty())
+    {
+        bail!("API-key login requires a non-empty organization");
     }
 
     let has_explicit_api_key = base.api_key.as_ref().is_some_and(|k| !k.trim().is_empty());
@@ -1662,7 +1806,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     if requested_org_resolution == RequestedOrgResolution::SwitchToOauth {
         return run_login_oauth(base, args).await;
     }
-    let configured_org = config::load().ok().and_then(|cfg| cfg.org);
+    let configured_org = configured_org_for_app_url(&login_app_url);
     let selected_org = select_login_org(
         login_orgs.clone(),
         match requested_org_resolution {
@@ -1675,7 +1819,6 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         configured_org.as_deref(),
         interactive,
         base.verbose,
-        false,
         explicitly_quiet(base),
     )?;
     let selected_org = selected_org.ok_or_else(|| {
@@ -1691,7 +1834,7 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     commit_api_key_profile(
         &api_key,
         selected_api_url.clone(),
-        base.app_url.clone(),
+        Some(login_app_url.clone()),
         selected_org.id.clone(),
         selected_org.name.clone(),
     )?;
@@ -1784,48 +1927,46 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         exchange_oauth_authorization_code(&api_url, &redirect_uri, &auth_code, pkce_verifier)
             .await?;
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
-    let configured_org = config::load().ok().and_then(|cfg| cfg.org);
+    let configured_org = configured_org_for_app_url(&app_url);
     let selected_org = select_login_org(
         login_orgs.clone(),
         base.org_name.as_deref(),
         configured_org.as_deref(),
         ui::can_prompt(),
         base.verbose,
-        true,
         explicitly_quiet(base),
     )?;
+    let selected_org = selected_org.ok_or_else(|| {
+        anyhow::anyhow!(
+            "OAuth login requires an organization; pass --org <ORG> or rerun interactively"
+        )
+    })?;
     let selected_api_url = resolve_profile_api_url(
         base.api_url.clone(),
-        selected_org.as_ref(),
+        Some(&selected_org),
         &login_orgs,
         ui::can_prompt(),
     )?;
 
-    commit_oauth_profile(
-        &oauth_tokens,
-        selected_api_url.clone(),
-        app_url.clone(),
-        selected_org.as_ref(),
-    )?;
+    commit_oauth_profile(&oauth_tokens, api_url.clone(), app_url.clone())?;
     let context_update = persist_post_login_context(
         base,
         &oauth_tokens.access_token,
         &selected_api_url,
         &app_url,
-        selected_org.as_ref(),
+        Some(&selected_org),
         &args.scope,
     )
     .await
     .context("login succeeded, but failed to update active context")?;
 
-    let human = format_login_success(selected_org.as_ref(), &selected_api_url);
+    let human = format_login_success(Some(&selected_org), &selected_api_url);
     emit_result(
         base.json,
         serde_json::json!({
             "auth": "oauth",
-            "org": selected_org.as_ref().map(|org| org.name.clone()),
-            "org_id": selected_org.as_ref().map(|org| org.id.clone()),
-            "cross_org": selected_org.is_none(),
+            "org": selected_org.name,
+            "org_id": selected_org.id,
             "api_url": selected_api_url,
             "app_url": app_url,
             "status": "ok",
@@ -1881,7 +2022,6 @@ fn commit_oauth_profile(
     tokens: &OAuthTokenResponse,
     api_url: String,
     app_url: String,
-    selected_org: Option<&LoginOrgInfo>,
 ) -> Result<()> {
     let refresh_token = tokens.refresh_token.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1891,7 +2031,7 @@ fn commit_oauth_profile(
 
     let oauth_access_expires_at = determine_oauth_access_expiry_epoch(tokens);
     let jwt_id = decode_jwt_identity(&tokens.access_token);
-    let email = jwt_id
+    let _email = jwt_id
         .email
         .clone()
         .filter(|email| !email.trim().is_empty())
@@ -1900,25 +2040,25 @@ fn commit_oauth_profile(
                 "oauth token did not include an email; cannot create persistent oauth login"
             )
         })?;
-    let org_id = selected_org.map(|org| org.id.clone()).unwrap_or_default();
-    let slot_key = oauth_slot_key(&org_id, &email);
+    let app_url = canonical_url(&app_url).to_string();
+    let slot_key = oauth_slot_key(&app_url);
 
+    let mut store = load_auth_store()?;
+    if let Some(old_profile) = store.profiles.get(&slot_key) {
+        delete_all_profile_secrets(&slot_key, old_profile);
+    }
     save_profile_oauth_refresh_token(&slot_key, refresh_token)?;
     save_profile_oauth_access_token(&slot_key, &tokens.access_token)?;
     let _ = delete_profile_secret(&slot_key);
 
-    let mut store = load_auth_store()?;
-    if let Some(old_profile) = store.profiles.get(&slot_key) {
-        delete_legacy_profile_secrets(old_profile);
-    }
     store.profiles.insert(
         slot_key,
         AuthProfile {
             auth_kind: AuthKind::Oauth,
             api_url: Some(api_url),
             app_url: Some(app_url),
-            org_id: Some(org_id),
-            org_name: selected_org.map(|org| org.name.clone()),
+            org_id: None,
+            org_name: None,
             oauth_access_expires_at,
             user_name: jwt_id.name,
             email: jwt_id.email,
@@ -1942,7 +2082,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     )?
     .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OAuth login selected; pass --org <ORG> or run `bt auth logins` to see available logins"
+                "no OAuth login selected; pass --app-url <URL> or run `bt auth logins` to see available logins"
             )
         })?;
     let profile = store
@@ -1953,9 +2093,10 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
             anyhow::anyhow!("OAuth login not found; run `bt auth logins` to see available logins")
         })?;
 
-    let api_url = profile
+    let api_url = base
         .api_url
         .clone()
+        .or_else(|| profile.api_url.clone())
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let previous_expires_at = profile.oauth_access_expires_at;
     let refresh_token =
@@ -2005,14 +2146,6 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         }
     }
     save_auth_store(&store)?;
-    reconcile_oauth_slot_from_access_token(
-        &mut store,
-        profile_name.as_str(),
-        &refreshed.access_token,
-        profile.app_url.as_deref().unwrap_or(DEFAULT_APP_URL),
-    )
-    .await?;
-
     if let Some(expires_at) = new_expires_at {
         let now = current_unix_timestamp();
         let remaining = expires_at.saturating_sub(now);
@@ -2030,8 +2163,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         base.json,
         serde_json::json!({
             "auth": "oauth",
-            "org": profile.org_name,
-            "org_id": profile.org_id.filter(|org_id| !org_id.trim().is_empty()),
+            "app_url": profile.app_url,
             "user_email": profile.email,
             "access_expires_at": new_expires_at,
             "refresh_token_rotated": refresh_rotated,
@@ -2042,10 +2174,9 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
 }
 
 fn format_login_success(selected_org: Option<&LoginOrgInfo>, api_url: &str) -> String {
-    match selected_org {
-        Some(org) => format!("Logged in as {} (api: {api_url})", org.name),
-        None => format!("Logged in (cross-org, api: {api_url})"),
-    }
+    selected_org
+        .map(|org| format!("Logged in as {} (api: {api_url})", org.name))
+        .unwrap_or_else(|| format!("Logged in (api: {api_url})"))
 }
 
 fn build_login_context_for_selected_org(
@@ -2076,7 +2207,7 @@ fn format_post_login_context(
     match (selected_org, project) {
         (Some(org), Some(project)) => format!("{}/{}", org.name, project.name),
         (Some(org), None) => org.name.clone(),
-        (None, _) => "cross-org mode".to_string(),
+        (None, _) => "Braintrust".to_string(),
     }
 }
 
@@ -2091,11 +2222,8 @@ async fn resolve_post_login_project(
         return Ok(None);
     };
 
-    let selected_org = selected_org.ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot set a default project in cross-org mode; rerun `bt auth login --org <ORG> --project <PROJECT>`"
-        )
-    })?;
+    let selected_org = selected_org
+        .ok_or_else(|| anyhow::anyhow!("an organization is required to select a project"))?;
     let ctx =
         build_login_context_for_selected_org(credential, api_url, app_url, Some(selected_org));
     let client = ApiClient::new(&ctx)?;
@@ -2117,23 +2245,35 @@ async fn persist_post_login_context(
         resolve_post_login_project(base, credential, api_url, app_url, selected_org).await?;
     let (path, _) = scope.resolve(ui::can_prompt(), "Where to use this login")?;
     let mut cfg = config::load_file(&path);
-    let org = selected_org.map_or("", |org| org.name.as_str());
+    let selected_org = selected_org
+        .ok_or_else(|| anyhow::anyhow!("an organization is required to update config"))?;
     let preserve_project = project.is_none()
-        && selected_org.is_some()
-        && config::org_option(cfg.org.as_deref()) == Some(org);
-    if !preserve_project {
-        cfg.set_context(
-            Some(org),
-            project
-                .as_ref()
-                .map(|project| (project.name.as_str(), project.id.as_str())),
-        );
-    }
+        && config::org_option(cfg.org.as_deref()) == Some(selected_org.name.as_str())
+        && cfg.org_id.as_deref() == Some(selected_org.id.as_str())
+        && cfg
+            .app_url
+            .as_deref()
+            .is_some_and(|url| config::urls_equal(url, app_url));
+    let selected_project = if preserve_project {
+        cfg.project.clone().zip(cfg.project_id.clone())
+    } else {
+        project
+            .as_ref()
+            .map(|project| (project.name.clone(), project.id.clone()))
+    };
+    cfg.set_context(
+        (selected_org.name.as_str(), selected_org.id.as_str()),
+        selected_project
+            .as_ref()
+            .map(|(name, id)| (name.as_str(), id.as_str())),
+        app_url,
+        api_url,
+    );
     config::save_file(&path, &cfg)
         .with_context(|| format!("Could not save config to {}", path.display()))?;
 
     Ok(PostLoginContextUpdate {
-        display: format_post_login_context(selected_org, project.as_ref()),
+        display: format_post_login_context(Some(selected_org), project.as_ref()),
         path,
     })
 }
@@ -2150,14 +2290,14 @@ fn emit_result(json: bool, payload: serde_json::Value, human: impl FnOnce()) -> 
 }
 
 fn filter_auth_store(
+    base: &BaseArgs,
     store: &AuthStore,
-    org: Option<&str>,
     kind: Option<AuthKind>,
     api_key_hint: Option<&str>,
 ) -> AuthStore {
     let mut filtered = store.clone();
     filtered.profiles.retain(|_, profile| {
-        org.is_none_or(|org| profile_matches_org_identifier(profile, org))
+        profile_matches_url_filters(base, profile)
             && kind.is_none_or(|kind| profile.auth_kind == kind)
             && api_key_hint.is_none_or(|hint| {
                 profile.auth_kind == AuthKind::ApiKey
@@ -2167,15 +2307,68 @@ fn filter_auth_store(
     filtered
 }
 
+async fn filter_auth_store_for_org(
+    base: &BaseArgs,
+    store: &mut AuthStore,
+    candidates: AuthStore,
+    org: Option<&str>,
+) -> Result<AuthStore> {
+    let Some(org) = org else {
+        return Ok(candidates);
+    };
+    let mut filtered = AuthStore::default();
+    for (slot, profile) in candidates.profiles {
+        let matches = match profile.auth_kind {
+            AuthKind::ApiKey => profile_matches_org_identifier(&profile, org),
+            AuthKind::Oauth => {
+                let mut oauth_base = base.clone();
+                oauth_base.app_url = Some(profile_app_url(&profile).to_string());
+                if oauth_base.api_url_source.is_none() {
+                    oauth_base.api_url = profile.api_url.clone();
+                }
+                let token = load_oauth_access_token(&oauth_base, store, &slot).await?;
+                let orgs = fetch_login_orgs(&token, profile_app_url(&profile)).await?;
+                find_login_org(&orgs, org).is_some()
+            }
+        };
+        if matches {
+            filtered.profiles.insert(slot, profile);
+        }
+    }
+    Ok(filtered)
+}
+
 async fn run_logins(base: &BaseArgs, _args: AuthLoginsArgs) -> Result<()> {
     let mut store = load_auth_store()?;
-    let has_filter = base.org_name.is_some() || base.prefer_api_key;
-    let filtered = filter_auth_store(
+    let requested_org = matches!(
+        base.org_name_source,
+        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
+    )
+    .then(|| base.org_name.as_deref())
+    .flatten();
+    let has_url_filter = matches!(
+        base.app_url_source,
+        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
+    ) || matches!(
+        base.api_url_source,
+        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
+    );
+    let has_filter = requested_org.is_some() || base.prefer_api_key || has_url_filter;
+    let mut filter_base = base.clone();
+    if filter_base.app_url_source.is_none() {
+        filter_base.app_url = None;
+    }
+    if filter_base.api_url_source.is_none() {
+        filter_base.api_url = None;
+    }
+    let candidates = filter_auth_store(
+        &filter_base,
         &store,
-        base.org_name.as_deref(),
         base.prefer_api_key.then_some(AuthKind::ApiKey),
         None,
     );
+    let filtered =
+        filter_auth_store_for_org(&filter_base, &mut store, candidates, requested_org).await?;
     if filtered.profiles.is_empty() {
         return emit_result(base.json, serde_json::json!([]), || {
             if store.profiles.is_empty() && !has_filter {
@@ -2226,6 +2419,8 @@ fn auth_profile_json(profile: &AuthProfile, status: &str) -> serde_json::Value {
         "user_name": profile.user_name,
         "user_email": profile.email,
         "api_key_hint": profile.api_key_hint,
+        "app_url": profile.app_url,
+        "api_url": profile.api_url,
         "status": status,
     })
 }
@@ -2277,7 +2472,7 @@ fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<
     })
 }
 
-fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
+async fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
     let store = load_auth_store()?;
     if store.profiles.is_empty() {
         return emit_result(base.json, serde_json::json!({ "status": "empty" }), || {
@@ -2287,18 +2482,29 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
 
     let requested_org = if matches!(
         base.org_name_source,
-        Some(crate::args::ArgValueSource::CommandLine)
+        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
     ) {
         config::org_option(base.org_name.as_deref())
     } else {
         None
     };
-    let filtered = filter_auth_store(
+    let mut filter_base = base.clone();
+    if filter_base.app_url_source.is_none() {
+        filter_base.app_url = None;
+    }
+    if filter_base.api_url_source.is_none() {
+        filter_base.api_url = None;
+    }
+    let candidates = filter_auth_store(
+        &filter_base,
         &store,
-        requested_org,
         args.oauth.then_some(AuthKind::Oauth),
         args.api_key_hint.as_deref(),
     );
+    let mut mutable_store = store.clone();
+    let filtered =
+        filter_auth_store_for_org(&filter_base, &mut mutable_store, candidates, requested_org)
+            .await?;
     let candidates = filtered
         .profiles
         .keys()
@@ -2319,7 +2525,7 @@ fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
         _ => {
             let labels = candidate_identities(&candidates, &filtered).join(", ");
             bail!(
-                "multiple auth logins match: {labels}. Rerun interactively, or use --org <ORG> with --oauth or --api-key-hint <HINT> to disambiguate."
+                "multiple auth logins match: {labels}. Rerun interactively, use --app-url <URL> with --oauth, or use --org <ORG> with --api-key-hint <HINT>."
             );
         }
     };
@@ -2382,6 +2588,10 @@ pub struct ProfileVerification {
     pub user_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -2389,9 +2599,7 @@ pub struct ProfileVerification {
 
 fn build_verification(
     name: &str,
-    auth_kind: &str,
-    org: Option<String>,
-    org_id: Option<String>,
+    profile: &AuthProfile,
     jwt_id: Option<JwtIdentity>,
     api_key_hint: Option<String>,
     status: ProfileStatus,
@@ -2405,12 +2613,17 @@ fn build_verification(
     ProfileVerification {
         name: name.to_string(),
         slot_hash: None,
-        auth: auth_kind.to_string(),
-        org,
-        org_id,
+        auth: auth_kind_label(profile.auth_kind).to_string(),
+        org: profile.org_name.clone(),
+        org_id: profile
+            .org_id
+            .clone()
+            .filter(|org_id| !org_id.trim().is_empty()),
         user_name: jwt_id.as_ref().and_then(|j| j.name.clone()),
         user_email: jwt_id.as_ref().and_then(|j| j.email.clone()),
         api_key_hint,
+        app_url: profile.app_url.clone(),
+        api_url: profile.api_url.clone(),
         status: status_str.to_string(),
         error,
     }
@@ -2418,20 +2631,8 @@ fn build_verification(
 
 async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerification {
     let app_url = profile.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
-    let auth_kind = auth_kind_label(profile.auth_kind);
     let mk = |status, jwt_id: Option<JwtIdentity>, hint: Option<String>| {
-        build_verification(
-            name,
-            auth_kind,
-            profile.org_name.clone(),
-            profile
-                .org_id
-                .clone()
-                .filter(|org_id| !org_id.trim().is_empty()),
-            jwt_id,
-            hint,
-            status,
-        )
+        build_verification(name, profile, jwt_id, hint, status)
     };
 
     let credential = match load_credential_for_profile(name, profile) {
@@ -2455,7 +2656,7 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
     match fetch_login_orgs(&credential, app_url).await {
         Ok(orgs) => {
             let mut verification = mk(ProfileStatus::Ok, jwt_id, hint);
-            if !is_cross_org_oauth_profile(profile) {
+            if profile.auth_kind == AuthKind::ApiKey {
                 if let Some(org) = profile
                     .org_id
                     .as_deref()
@@ -2470,8 +2671,6 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
                     verification.org = Some(org.name.clone());
                     verification.org_id = Some(org.id.clone());
                 }
-            }
-            if profile.auth_kind == AuthKind::ApiKey {
                 verification.slot_hash = Some(api_key_hash(&credential));
             }
             verification
@@ -2532,11 +2731,13 @@ fn reconcile_verified_auth_slots(
             continue;
         };
 
-        if let Some(org_id) = verification.org_id.as_deref() {
-            profile.org_id = Some(org_id.to_string());
-            profile.org_name = verification.org.clone();
-        } else if is_cross_org_oauth_profile(&profile) {
-            profile.org_id = Some(String::new());
+        if profile.auth_kind == AuthKind::ApiKey {
+            if let Some(org_id) = verification.org_id.as_deref() {
+                profile.org_id = Some(org_id.to_string());
+                profile.org_name = verification.org.clone();
+            }
+        } else {
+            profile.org_id = None;
             profile.org_name = None;
         }
 
@@ -2573,10 +2774,14 @@ fn reconcile_verified_auth_slots(
 }
 
 fn format_verification_line(v: &ProfileVerification) -> String {
-    let mut parts = vec![
-        config::display_org(v.org.as_deref().unwrap_or("")).to_string(),
-        v.auth.clone(),
-    ];
+    let subject = if v.auth == "oauth" {
+        v.app_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_APP_URL.to_string())
+    } else {
+        v.org.clone().unwrap_or_else(|| "(unknown org)".to_string())
+    };
+    let mut parts = vec![subject, v.auth.clone()];
     match v.status.as_str() {
         "ok" => {
             if let Some(id) = identity_label(
@@ -2628,6 +2833,8 @@ fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
                     "user_name": p.user_name,
                     "user_email": p.email,
                     "api_key_hint": p.api_key_hint,
+                    "app_url": p.app_url,
+                    "api_url": p.api_url,
                     "status": "unchecked"
                 })
             })
@@ -2676,17 +2883,12 @@ fn select_login_org(
     default_org_name: Option<&str>,
     interactive: bool,
     verbose: bool,
-    allow_cross_org: bool,
     quiet_requested: bool,
 ) -> Result<Option<LoginOrgInfo>> {
     if orgs.is_empty() {
         bail!("no organizations found for this credential");
     }
     sort_login_orgs(&mut orgs);
-
-    if requested_org_name == Some("") {
-        return Ok(None);
-    }
 
     if let Some(name) = requested_org_name {
         return find_login_org(&orgs, name)
@@ -2700,44 +2902,30 @@ fn select_login_org(
     }
 
     if !interactive {
-        if allow_cross_org {
-            bail!(
-                "organization selection required in non-interactive mode; pass --org <ORG> or rerun interactively to choose cross-org mode"
-            );
-        }
         return Ok(None);
     }
 
-    let default_org_matched = move_default_login_org_first(&mut orgs, default_org_name);
-    let offset = if allow_cross_org { 1 } else { 0 };
-    let mut labels: Vec<String> = Vec::new();
-    if allow_cross_org {
-        labels.push(
-            "No default org (cross-org mode; pass --org or BRAINTRUST_ORG_NAME when needed)"
-                .to_string(),
-        );
-    }
-    labels.extend(orgs.iter().map(|org| {
-        if verbose {
-            let api_url = org.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
-            format!("{} [{}] ({})", org.name, org.id, api_url)
-        } else {
-            org.name.clone()
-        }
-    }));
+    move_default_login_org_first(&mut orgs, default_org_name);
+    let labels: Vec<String> = orgs
+        .iter()
+        .map(|org| {
+            if verbose {
+                let api_url = org.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
+                format!("{} [{}] ({})", org.name, org.id, api_url)
+            } else {
+                org.name.clone()
+            }
+        })
+        .collect();
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     if !quiet_requested {
         eprintln!("\n\nA Braintrust organization is usually a team or a company.");
     }
-    let default = if default_org_matched { offset } else { 0 };
-    let selection = ui::fuzzy_select("Select organization", &label_refs, default)?;
-    if allow_cross_org && selection == 0 {
-        return Ok(None);
-    }
+    let selection = ui::fuzzy_select("Select organization", &label_refs, 0)?;
 
     Ok(Some(
         orgs.into_iter()
-            .nth(selection - offset)
+            .nth(selection)
             .expect("selected index should be in range"),
     ))
 }
@@ -2855,8 +3043,11 @@ fn resolve_profile_api_url(
     if let Some(api_url) = explicit_api_url {
         return Ok(api_url);
     }
-    if let Some(api_url) = selected_org.and_then(|org| org.api_url.clone()) {
-        return Ok(api_url);
+    if let Some(selected_org) = selected_org {
+        return Ok(selected_org
+            .api_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_API_URL.to_string()));
     }
 
     let mut api_urls = orgs
@@ -2873,8 +3064,6 @@ fn resolve_profile_api_url(
             .unwrap_or_else(|| DEFAULT_API_URL.to_string()));
     }
 
-    // A cross-org login spans orgs on different data planes. Let the user pick
-    // which API URL to store rather than failing outright.
     if can_prompt {
         let idx = ui::fuzzy_select("Select API URL", &api_urls, 0)?;
         return Ok(api_urls
@@ -3980,8 +4169,8 @@ fn api_key_hash(api_key: &str) -> String {
     sha256_hex(api_key)
 }
 
-fn oauth_slot_key(org_id: &str, email: &str) -> String {
-    format!("{org_id}::{email}")
+fn oauth_slot_key(app_url: &str) -> String {
+    format!("oauth::{}", sha256_hex(canonical_url(app_url)))
 }
 
 fn api_key_slot_key(api_key_hash: &str, org_id: &str) -> String {
@@ -4030,29 +4219,38 @@ fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
 
 fn migrate_auth_store(store: AuthStore) -> AuthStore {
     let mut migrated = AuthStore::default();
+    let mut oauth_refresh_usable = BTreeMap::<String, bool>::new();
     for (old_key, mut profile) in store.profiles {
         normalize_profile_cached_fields_from_key(&old_key, &mut profile);
-        if profile.auth_kind == AuthKind::Oauth
-            && profile.org_id.is_none()
-            && profile
-                .org_name
-                .as_deref()
-                .is_none_or(|org| org.trim().is_empty())
-        {
-            profile.org_id = Some(String::new());
+        let refresh_usable = profile.auth_kind == AuthKind::Oauth
+            && matches!(
+                load_profile_oauth_refresh_token_for_profile(&old_key, &profile),
+                Ok(Some(_))
+            );
+        if profile.auth_kind == AuthKind::Oauth {
+            profile.org_id = None;
             profile.org_name = None;
+            profile.app_url = Some(canonical_url(profile_app_url(&profile)).to_string());
         }
         let new_key = canonical_profile_key(&old_key, &profile);
         if new_key != old_key && profile.legacy_secret_key.is_none() {
             profile.legacy_secret_key = Some(old_key.clone());
         }
-        if migrated
-            .profiles
-            .get(&new_key)
-            .is_some_and(|existing| !should_replace_migrated_profile(existing, &profile))
-        {
-            continue;
+        if let Some(existing) = migrated.profiles.get(&new_key) {
+            let existing_usable = oauth_refresh_usable.get(&new_key).copied().unwrap_or(false);
+            let replace = match (existing.auth_kind, profile.auth_kind) {
+                (AuthKind::Oauth, AuthKind::Oauth) => {
+                    (refresh_usable && !existing_usable)
+                        || (refresh_usable == existing_usable
+                            && should_replace_migrated_profile(existing, &profile))
+                }
+                _ => false,
+            };
+            if !replace {
+                continue;
+            }
         }
+        oauth_refresh_usable.insert(new_key.clone(), refresh_usable);
         migrated.profiles.insert(new_key, profile);
     }
     migrated
@@ -4166,17 +4364,7 @@ fn normalize_profile_cached_fields_from_key(current_key: &str, profile: &mut Aut
 
 fn canonical_profile_key(current_key: &str, profile: &AuthProfile) -> String {
     match profile.auth_kind {
-        AuthKind::Oauth => {
-            let Some(email) = profile.email.as_deref().filter(|value| !value.is_empty()) else {
-                return current_key.to_string();
-            };
-            let org_id = profile.org_id.as_deref().unwrap_or_default();
-            if profile.org_id.is_some() || profile.org_name.is_none() {
-                oauth_slot_key(org_id, email)
-            } else {
-                current_key.to_string()
-            }
-        }
+        AuthKind::Oauth => oauth_slot_key(profile_app_url(profile)),
         AuthKind::ApiKey => match (
             profile
                 .api_key_hash
@@ -4537,6 +4725,13 @@ mod tests {
         crate::config::save_global(&cfg).expect("save global config");
     }
 
+    fn set_global_config_urls(app_url: &str, api_url: Option<&str>) {
+        let mut cfg = crate::config::load_global().expect("load global config");
+        cfg.app_url = Some(app_url.to_string());
+        cfg.api_url = api_url.map(str::to_string);
+        crate::config::save_global(&cfg).expect("save global config URLs");
+    }
+
     fn org_profile(kind: AuthKind, org_id: &str, org_name: &str) -> AuthProfile {
         AuthProfile {
             auth_kind: kind,
@@ -4612,7 +4807,10 @@ mod tests {
     fn invalid_grant_refresh_error_is_treated_as_recoverable() {
         let profile = org_profile(AuthKind::Oauth, "org_test", "BT Staging");
         let command = oauth_reauth_command(&profile);
-        assert_eq!(command, "bt auth login --oauth --org 'BT Staging'");
+        assert_eq!(
+            command,
+            "bt auth login --oauth --app-url https://www.braintrust.dev"
+        );
         let err = map_refresh_oauth_error(
             "https://api.example.com",
             &profile,
@@ -4751,62 +4949,20 @@ mod tests {
         assert_eq!(DEFAULT_APP_URL, "https://www.braintrust.dev");
     }
 
-    #[tokio::test]
-    async fn active_auth_info_without_org_uses_cross_org_oauth_only() {
-        let _env = TestEnv::new(None, None).await;
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            api_key_slot_key(&api_key_hash("test-api-key"), "org_fake"),
-            AuthProfile {
-                api_key_hint: Some("sk-****abcde".to_string()),
-                ..org_profile(AuthKind::ApiKey, "org_fake", "test-org")
-            },
-        );
-        store.profiles.insert(
-            oauth_slot_key("", "user@example.test"),
-            AuthProfile {
-                auth_kind: AuthKind::Oauth,
-                org_id: Some(String::new()),
-                org_name: None,
-                user_name: Some("Test User".to_string()),
-                email: Some("user@example.test".to_string()),
-                ..Default::default()
-            },
-        );
-        save_auth_store(&store).expect("save auth store");
-
-        let info = active_auth_info(&make_base(), None)
-            .expect("resolve active auth")
-            .expect("active auth info");
-
-        assert_eq!(info.auth_method, "oauth");
-        assert_eq!(info.email.as_deref(), Some("user@example.test"));
-        assert_eq!(info.org_name, None);
-
-        let mut base = make_base();
-        base.prefer_api_key = true;
-        assert!(resolve_auth(&base)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("cross-org"));
-        assert!(active_auth_info(&base, None)
-            .unwrap_err()
-            .to_string()
-            .contains("cross-org"));
-    }
-
-    fn save_cached_oauth_login(store: &mut AuthStore, org_id: &str, org_name: &str) -> String {
-        let slot_key = oauth_slot_key(org_id, "user@example.test");
+    fn save_cached_oauth_login(store: &mut AuthStore, app_url: &str) -> String {
+        let slot_key = oauth_slot_key(app_url);
         store.profiles.insert(
             slot_key.clone(),
             AuthProfile {
                 api_url: Some("https://api.example.test".to_string()),
-                app_url: Some("https://www.example.test".to_string()),
+                app_url: Some(app_url.to_string()),
                 oauth_access_expires_at: Some(current_unix_timestamp() + 3600),
                 user_name: Some("Test User".to_string()),
                 email: Some("user@example.test".to_string()),
-                ..org_profile(AuthKind::Oauth, org_id, org_name)
+                auth_kind: AuthKind::Oauth,
+                org_id: None,
+                org_name: None,
+                ..Default::default()
             },
         );
         save_profile_secret_plaintext(
@@ -4821,10 +4977,12 @@ mod tests {
     async fn auth_precedence_keeps_env_api_key_below_oauth() {
         let _env = TestEnv::new(None, None).await;
         let mut store = AuthStore::default();
-        save_cached_oauth_login(&mut store, "org_fake", "test-org");
+        let app_url = spawn_api_key_login_server("test-org");
+        save_cached_oauth_login(&mut store, &app_url);
         save_auth_store(&store).expect("save auth store");
         let mut base = make_base();
         base.org_name = Some("test-org".to_string());
+        base.app_url = Some(app_url);
         base.api_key = Some("environment-api-key".to_string());
         base.api_key_source = Some(crate::args::ArgValueSource::EnvVariable);
 
@@ -4841,13 +4999,14 @@ mod tests {
     async fn auth_precedence_cli_api_key_overrides_oauth() {
         let _env = TestEnv::new(None, None).await;
         let mut store = AuthStore::default();
-        save_cached_oauth_login(&mut store, "org_fake", "test-org");
+        let app_url = spawn_api_key_login_server("test-org");
+        save_cached_oauth_login(&mut store, &app_url);
         save_auth_store(&store).expect("save auth store");
         let mut base = make_base();
         base.org_name = Some("test-org".to_string());
         base.api_key = Some("command-line-api-key".to_string());
         base.api_key_source = Some(crate::args::ArgValueSource::CommandLine);
-        base.app_url = Some(spawn_api_key_login_server("test-org"));
+        base.app_url = Some(app_url);
 
         let resolved = resolve_auth(&base).await.expect("resolve auth");
 
@@ -4899,14 +5058,15 @@ mod tests {
     async fn auth_precedence_prefer_api_key_promotes_env_api_key() {
         let _env = TestEnv::new(None, None).await;
         let mut store = AuthStore::default();
-        save_cached_oauth_login(&mut store, "org_fake", "test-org");
+        let app_url = spawn_api_key_login_server("test-org");
+        save_cached_oauth_login(&mut store, &app_url);
         save_auth_store(&store).expect("save auth store");
         let mut base = make_base();
         base.org_name = Some("test-org".to_string());
         base.api_key = Some("environment-api-key".to_string());
         base.api_key_source = Some(crate::args::ArgValueSource::EnvVariable);
         base.prefer_api_key = true;
-        base.app_url = Some(spawn_api_key_login_server("test-org"));
+        base.app_url = Some(app_url);
 
         let resolved = resolve_auth(&base).await.expect("resolve auth");
 
@@ -4918,10 +5078,12 @@ mod tests {
     async fn auth_precedence_prefer_api_key_falls_back_to_oauth_without_key() {
         let _env = TestEnv::new(None, None).await;
         let mut store = AuthStore::default();
-        save_cached_oauth_login(&mut store, "org_fake", "test-org");
+        let app_url = spawn_api_key_login_server("test-org");
+        save_cached_oauth_login(&mut store, &app_url);
         save_auth_store(&store).expect("save auth store");
         let mut base = make_base();
         base.org_name = Some("test-org".to_string());
+        base.app_url = Some(app_url);
         base.prefer_api_key = true;
 
         let resolved = resolve_auth(&base).await.expect("resolve auth");
@@ -4960,11 +5122,13 @@ mod tests {
         let _env = TestEnv::new(None, None).await;
         let mut store = AuthStore::default();
         store.profiles.insert(
-            oauth_slot_key("org_fake", "user@example.test"),
+            oauth_slot_key(DEFAULT_APP_URL),
             AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                app_url: Some(DEFAULT_APP_URL.to_string()),
                 user_name: Some("Test User".to_string()),
                 email: Some("user@example.test".to_string()),
-                ..org_profile(AuthKind::Oauth, "org_fake", "test-org")
+                ..Default::default()
             },
         );
         store.profiles.insert(
@@ -5051,20 +5215,23 @@ mod tests {
         );
 
         let migrated = migrate_auth_store(store);
-        let key = oauth_slot_key("org_fake", "user@example.test");
+        let key = oauth_slot_key(DEFAULT_APP_URL);
         let profile = migrated.profiles.get(&key).expect("migrated profile");
 
         assert_eq!(profile.legacy_secret_key.as_deref(), Some("work"));
+        assert_eq!(profile.org_id, None);
+        assert_eq!(profile.org_name, None);
     }
 
     #[test]
-    fn migrate_auth_store_rekeys_cross_org_oauth_with_empty_org_id() {
+    fn migrate_auth_store_purges_old_oauth_org_scope() {
         let mut store = AuthStore::default();
         store.profiles.insert(
-            "legacy-cross-org".to_string(),
+            "legacy-login".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::Oauth,
-                org_name: None,
+                org_id: Some("org_old".to_string()),
+                org_name: Some("old-org".to_string()),
                 email: Some("user@example.test".to_string()),
                 ..Default::default()
             },
@@ -5073,14 +5240,12 @@ mod tests {
         let migrated = migrate_auth_store(store);
         let profile = migrated
             .profiles
-            .get(&oauth_slot_key("", "user@example.test"))
-            .expect("cross-org OAuth slot");
+            .get(&oauth_slot_key(DEFAULT_APP_URL))
+            .expect("instance OAuth slot");
 
-        assert_eq!(profile.org_id.as_deref(), Some(""));
-        assert_eq!(
-            profile.legacy_secret_key.as_deref(),
-            Some("legacy-cross-org")
-        );
+        assert_eq!(profile.org_id, None);
+        assert_eq!(profile.org_name, None);
+        assert_eq!(profile.legacy_secret_key.as_deref(), Some("legacy-login"));
     }
 
     #[test]
@@ -5134,7 +5299,7 @@ mod tests {
         let persisted: AuthStore =
             serde_json::from_str(&fs::read_to_string(&path).expect("read migrated store"))
                 .expect("parse migrated store");
-        let slot_key = oauth_slot_key("org_fake", "user@example.test");
+        let slot_key = oauth_slot_key(DEFAULT_APP_URL);
 
         for migrated in [&loaded, &persisted] {
             let profile = migrated
@@ -5179,6 +5344,8 @@ mod tests {
                 user_name: Some("Test User".to_string()),
                 user_email: Some("user@example.test".to_string()),
                 api_key_hint: None,
+                app_url: Some(DEFAULT_APP_URL.to_string()),
+                api_url: None,
                 status: "ok".to_string(),
                 error: None,
             },
@@ -5191,6 +5358,8 @@ mod tests {
                 user_name: None,
                 user_email: None,
                 api_key_hint: Some("sk-****abcde".to_string()),
+                app_url: None,
+                api_url: None,
                 status: "ok".to_string(),
                 error: None,
             },
@@ -5201,7 +5370,7 @@ mod tests {
 
         let oauth = store
             .profiles
-            .get(&oauth_slot_key("org_fake", "user@example.test"))
+            .get(&oauth_slot_key(DEFAULT_APP_URL))
             .expect("canonical OAuth slot");
         assert_eq!(oauth.legacy_secret_key.as_deref(), Some("legacy-oauth"));
         let api_key = store
@@ -5229,10 +5398,38 @@ mod tests {
         }
 
         let migrated = migrate_auth_store(store);
-        let key = oauth_slot_key("org_fake", "user@example.test");
+        let key = oauth_slot_key(DEFAULT_APP_URL);
         assert_eq!(migrated.profiles.len(), 1);
         let profile = migrated.profiles.get(&key).expect("migrated profile");
         assert_eq!(profile.legacy_secret_key.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn migrate_auth_store_prefers_loadable_refresh_token_before_expiry() {
+        let _env = TestEnv::new(None, None).await;
+        let mut store = AuthStore::default();
+        for (name, expires_at) in [("usable-old", 10), ("missing-new", 20)] {
+            store.profiles.insert(
+                name.to_string(),
+                AuthProfile {
+                    auth_kind: AuthKind::Oauth,
+                    oauth_access_expires_at: Some(expires_at),
+                    ..Default::default()
+                },
+            );
+        }
+        save_profile_secret_plaintext(
+            &oauth_refresh_secret_key("usable-old"),
+            "test-refresh-token",
+        )
+        .expect("save refresh token");
+
+        let migrated = migrate_auth_store(store);
+        let profile = migrated
+            .profiles
+            .get(&oauth_slot_key(DEFAULT_APP_URL))
+            .expect("migrated OAuth profile");
+        assert_eq!(profile.legacy_secret_key.as_deref(), Some("usable-old"));
     }
 
     #[test]
@@ -5293,6 +5490,12 @@ mod tests {
         let org = config_auth_context_from_config(&base, &cfg);
 
         assert_eq!(org.as_deref(), Some("local-org"));
+
+        let other_instance = BaseArgs {
+            app_url: Some("https://other.example.test".into()),
+            ..base
+        };
+        assert_eq!(config_auth_context_from_config(&other_instance, &cfg), None);
     }
 
     #[test]
@@ -5430,80 +5633,143 @@ mod tests {
         assert!(err.to_string().contains("multiple oauth logins"));
     }
 
-    fn login_filter_store() -> AuthStore {
+    #[tokio::test]
+    async fn available_instances_dedupes_logins_by_app_url() {
+        let _env = TestEnv::new(None, None).await;
         let mut store = AuthStore::default();
-        for (slot, kind, suffix, hint) in [
-            ("oauth-a", AuthKind::Oauth, "a", None),
-            ("key-a", AuthKind::ApiKey, "a", Some("sk-****aaaaa")),
-            ("key-b", AuthKind::ApiKey, "b", Some("sk-****bbbbb")),
+        for (slot, kind, app_url) in [
+            ("oauth-a", AuthKind::Oauth, "https://one.example.test/"),
+            ("key-a", AuthKind::ApiKey, "https://one.example.test"),
+            ("key-b", AuthKind::ApiKey, "https://two.example.test"),
         ] {
             store.profiles.insert(
                 slot.into(),
                 AuthProfile {
-                    api_key_hint: hint.map(str::to_string),
-                    ..org_profile(
-                        kind,
-                        &format!("org_test_{suffix}"),
-                        &format!("test-org-{suffix}"),
-                    )
+                    auth_kind: kind,
+                    app_url: Some(app_url.into()),
+                    org_id: (kind == AuthKind::ApiKey).then(|| format!("org_{slot}")),
+                    org_name: (kind == AuthKind::ApiKey).then(|| format!("org-{slot}")),
+                    ..Default::default()
                 },
             );
         }
+        save_auth_store(&store).expect("save auth store");
+
+        let instances = available_instances(&BaseArgs::default()).expect("list instances");
+        assert_eq!(
+            instances
+                .iter()
+                .map(|instance| instance.app_url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://one.example.test", "https://two.example.test"]
+        );
+
+        let filtered = available_instances(&BaseArgs {
+            app_url: Some("https://two.example.test/".into()),
+            app_url_source: Some(crate::args::ArgValueSource::CommandLine),
+            ..Default::default()
+        })
+        .expect("filter instances");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].app_url, "https://two.example.test");
+    }
+
+    #[tokio::test]
+    async fn org_filter_includes_oauth_login_when_discovered_membership_matches() {
+        let _env = TestEnv::new(None, None).await;
+        let app_url = spawn_api_key_login_server("test-org");
+        let mut store = AuthStore::default();
+        let oauth_slot = save_cached_oauth_login(&mut store, &app_url);
         store.profiles.insert(
-            "cross".into(),
+            "other-key".into(),
             AuthProfile {
-                auth_kind: AuthKind::Oauth,
-                org_id: Some(String::new()),
-                ..Default::default()
+                app_url: Some(app_url.clone()),
+                api_url: Some("https://api.example.test".into()),
+                ..org_profile(AuthKind::ApiKey, "org_other", "other-org")
             },
         );
-        store
+        save_auth_store(&store).expect("save auth store");
+        let base = BaseArgs::default();
+        let candidates = filter_auth_store(&base, &store, None, None);
+        let filtered = filter_auth_store_for_org(&base, &mut store, candidates, Some("test-org"))
+            .await
+            .expect("filter by org");
+        assert_eq!(
+            filtered.profiles.into_keys().collect::<Vec<_>>(),
+            [oauth_slot]
+        );
     }
 
     #[test]
-    fn login_and_logout_filters_compose() {
-        let store = login_filter_store();
-        let matches = |org, kind, hint| {
-            filter_auth_store(&store, org, kind, hint)
-                .profiles
-                .into_keys()
-                .collect::<Vec<_>>()
+    fn command_auth_uses_builtin_url_defaults_when_urls_are_unset() {
+        let default_oauth = AuthProfile {
+            auth_kind: AuthKind::Oauth,
+            app_url: Some(DEFAULT_APP_URL.into()),
+            ..Default::default()
         };
-        assert_eq!(
-            matches(Some("test-org-a"), None, None),
-            ["key-a", "oauth-a"]
-        );
-        assert_eq!(matches(Some("org_test_b"), None, None), ["key-b"]);
-        assert_eq!(
-            matches(Some("test-org-a"), Some(AuthKind::ApiKey), None),
-            ["key-a"]
-        );
-        assert_eq!(matches(Some(""), None, None), ["cross"]);
-        assert!(matches(Some(""), Some(AuthKind::ApiKey), None).is_empty());
-        assert_eq!(matches(None, None, None).len(), 4);
-        assert_eq!(
-            matches(Some("test-org-a"), Some(AuthKind::Oauth), None),
-            ["oauth-a"]
-        );
-        assert_eq!(matches(None, None, Some("sk-****bbbbb")), ["key-b"]);
+        let custom_oauth = AuthProfile {
+            auth_kind: AuthKind::Oauth,
+            app_url: Some("https://www.example.test".into()),
+            ..Default::default()
+        };
+        assert!(profile_matches_urls(&BaseArgs::default(), &default_oauth));
+        assert!(!profile_matches_urls(&BaseArgs::default(), &custom_oauth));
+        assert!(profile_matches_url_filters(
+            &BaseArgs::default(),
+            &custom_oauth
+        ));
+    }
 
-        let mut picker_store = store.clone();
-        picker_store.profiles.insert(
-            "oauth-a-duplicate".into(),
-            picker_store.profiles["oauth-a"].clone(),
+    #[test]
+    fn login_filter_matches_instance_and_auth_kind() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "oauth".into(),
+            AuthProfile {
+                auth_kind: AuthKind::Oauth,
+                app_url: Some("https://www.example.test".into()),
+                ..Default::default()
+            },
         );
-        assert_eq!(saved_login_names(&picker_store, true).len(), 4);
-        assert_eq!(saved_login_names(&picker_store, false).len(), 3);
+        store.profiles.insert(
+            "key".into(),
+            AuthProfile {
+                app_url: Some("https://www.example.test".into()),
+                api_url: Some("https://api.example.test".into()),
+                api_key_hint: Some("sk-****abcde".into()),
+                ..org_profile(AuthKind::ApiKey, "org_test", "test-org")
+            },
+        );
+        let base = BaseArgs {
+            app_url: Some("https://www.example.test/".into()),
+            api_url: Some("https://api.example.test/".into()),
+            ..Default::default()
+        };
+        let filtered = filter_auth_store(&base, &store, None, None);
+        assert_eq!(filtered.profiles.len(), 2);
+        let filtered = filter_auth_store(&base, &store, Some(AuthKind::ApiKey), None);
+        assert_eq!(filtered.profiles.into_keys().collect::<Vec<_>>(), ["key"]);
+
+        let mismatched_api = BaseArgs {
+            app_url: base.app_url.clone(),
+            api_url: Some("https://other-api.example.test".into()),
+            ..Default::default()
+        };
+        let filtered = filter_auth_store(&mismatched_api, &store, None, None);
+        assert_eq!(filtered.profiles.into_keys().collect::<Vec<_>>(), ["oauth"]);
     }
 
     #[tokio::test]
     async fn post_login_context_preserves_only_same_org_projects() {
         let _env = TestEnv::new(None, None).await;
-        let save = |org: &str| {
+        let save = |org: &str, org_id: &str| {
             crate::config::save_global(&crate::config::Config {
                 org: Some(org.into()),
+                org_id: Some(org_id.into()),
                 project: Some("test-project".into()),
                 project_id: Some("proj_test".into()),
+                app_url: Some("https://www.example.test".into()),
+                api_url: Some("https://api.example.test".into()),
                 ..Default::default()
             })
             .unwrap();
@@ -5525,27 +5791,20 @@ mod tests {
             crate::config::load_global().unwrap()
         };
 
-        save("old-org");
+        save("old-org", "org_old");
         let cfg = persist(Some(login_org("org_test", "test-org"))).await;
         assert_eq!((cfg.org.as_deref(), cfg.project), (Some("test-org"), None));
 
-        save("test-org");
+        save("test-org", "org_test");
         let cfg = persist(Some(login_org("org_test", "test-org"))).await;
         assert_eq!(
             (cfg.project.as_deref(), cfg.project_id.as_deref()),
             (Some("test-project"), Some("proj_test"))
         );
-
-        save("");
-        let cfg = persist(None).await;
-        assert_eq!(
-            (cfg.org.as_deref(), cfg.project, cfg.project_id),
-            (Some(""), None, None)
-        );
     }
 
     #[tokio::test]
-    async fn resolve_post_login_project_rejects_cross_org_default_project() {
+    async fn resolve_post_login_project_requires_an_org() {
         let mut base = make_base();
         base.project = Some("demo-project".to_string());
 
@@ -5557,11 +5816,9 @@ mod tests {
             None,
         )
         .await
-        .expect_err("cross-org project selection should fail");
+        .expect_err("missing org should fail");
 
-        assert!(err
-            .to_string()
-            .contains("cannot set a default project in cross-org mode"));
+        assert!(err.to_string().contains("organization is required"));
     }
 
     #[test]
@@ -5654,6 +5911,8 @@ mod tests {
             user_name: None,
             user_email: None,
             api_key_hint: None,
+            app_url: Some(DEFAULT_APP_URL.to_string()),
+            api_url: None,
             status: "ok".into(),
             error: None,
         };
@@ -5747,6 +6006,8 @@ mod tests {
             user_name: identity.map(str::to_string),
             user_email: identity.map(|_| "user@example.test".into()),
             api_key_hint: hint.map(str::to_string),
+            app_url: (auth == "oauth").then(|| DEFAULT_APP_URL.to_string()),
+            api_url: None,
             status: status.into(),
             error: error.map(str::to_string),
         };
@@ -5760,7 +6021,7 @@ mod tests {
                     "ok",
                     None,
                 ),
-                "test-org — oauth — Test User (user@example.test)",
+                "https://www.braintrust.dev — oauth — Test User (user@example.test)",
             ),
             (
                 verification(
@@ -5775,7 +6036,7 @@ mod tests {
             ),
             (
                 verification("oauth", None, None, None, "expired", None),
-                "cross-org — oauth — token expired",
+                "https://www.braintrust.dev — oauth — token expired",
             ),
             (
                 verification(
@@ -5868,13 +6129,16 @@ mod tests {
     #[tokio::test]
     async fn login_read_only_cached_project_id_and_org_uses_fast_path() {
         let env = TestEnv::new(Some("proj_123"), Some("test-org")).await;
+        let mut base = base_args_for_path_probe(Some("test-org"));
+        base.app_url = Some(spawn_api_key_login_server("test-org"));
+        set_global_config_urls(base.app_url.as_deref().unwrap(), None);
         let ctx = env
-            .login_read_only_probe(Some("test-org"))
+            .login_read_only_with_base(base)
             .await
             .expect("fast path should succeed");
 
         assert_eq!(ctx.login.org_name().as_deref(), Some("test-org"));
-        assert_eq!(ctx.login.org_id().as_deref(), Some(""));
+        assert_eq!(ctx.login.org_id().as_deref(), Some("org_test"));
         assert_eq!(ctx.api_url, "not-a-valid-url");
     }
 
@@ -5882,16 +6146,6 @@ mod tests {
     async fn login_read_only_cached_project_id_but_missing_org_falls_back_to_login() {
         let env = TestEnv::new(Some("proj_123"), None).await;
         assert_invalid_api_url(env.login_read_only_probe(None).await);
-    }
-
-    #[tokio::test]
-    async fn login_read_only_cached_project_id_but_whitespace_org_is_cross_org() {
-        let env = TestEnv::new(Some("proj_123"), None).await;
-        let err = match env.login_read_only_probe(Some("     ")).await {
-            Ok(_) => panic!("whitespace org should be canonical cross-org"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("concrete org"));
     }
 
     #[tokio::test]
@@ -5919,9 +6173,12 @@ mod tests {
         ]);
         save_profile_secret_plaintext("acme-profile", "acme-secret").expect("save acme secret");
         save_profile_secret_plaintext("other-profile", "other-secret").expect("save other secret");
+        set_global_config_urls("https://www.acme.example", Some("https://api.acme.example"));
+        let mut base = make_base();
+        crate::config::apply_base_config(&mut base);
 
         let ctx = env
-            .login_read_only_with_base(make_base())
+            .login_read_only_with_base(base)
             .await
             .expect("fast path should succeed with cfg org");
 
@@ -5939,6 +6196,7 @@ mod tests {
         base.org_name = Some("test-org".into());
         let app_url = spawn_api_key_login_server("test-org");
         base.app_url = Some(app_url.clone());
+        set_global_config_urls(&app_url, None);
 
         let ctx = env
             .login_read_only_with_base(base)

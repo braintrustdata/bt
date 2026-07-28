@@ -1179,6 +1179,10 @@ fn should_print_agent_selection_intro(
 
 fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
     let cfg = config::load().unwrap_or_default();
+    let same_instance = config::urls_equal(
+        base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL),
+        cfg.app_url.as_deref().unwrap_or(DEFAULT_APP_URL),
+    );
 
     if base
         .org_name
@@ -1186,11 +1190,16 @@ fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        base.org_name = cfg
-            .org
-            .as_deref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        if same_instance {
+            base.org_name = cfg
+                .org
+                .as_deref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            base.org_id = base.org_name.as_ref().and(cfg.org_id.clone());
+        } else {
+            base.org_id = None;
+        }
     }
 
     if base
@@ -1692,7 +1701,8 @@ async fn ensure_org_or_setup_browser_auth(
         auth_base.org_name = Some(org_name.to_string());
         let has_saved_auth_for_org = profiles
             .iter()
-            .any(|profile| profile.org_name.as_deref() == Some(org_name));
+            .any(|profile| profile.org_name.as_deref() == Some(org_name))
+            || auth::has_oauth_login_for_instance(&auth_base)?;
 
         if has_saved_auth_for_org {
             match auth::login(&auth_base).await {

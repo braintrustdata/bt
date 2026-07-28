@@ -45,6 +45,10 @@ pub struct BaseArgs {
     #[arg(skip)]
     pub org_name_source: Option<ArgValueSource>,
 
+    /// Stable org ID resolved from config or internal context selection.
+    #[arg(skip)]
+    pub org_id: Option<String>,
+
     /// Override active project
     #[arg(
         short = 'p',
@@ -65,10 +69,6 @@ pub struct BaseArgs {
     #[arg(skip)]
     pub api_key_source: Option<ArgValueSource>,
 
-    /// Exact auth slot selected internally by switch/init.
-    #[arg(skip)]
-    pub pinned_auth_slot: Option<String>,
-
     /// Prefer API key credentials for the selected org when available.
     #[arg(long = "prefer-api-key", env = "BRAINTRUST_PREFER_API_KEY", global = true, value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
     pub prefer_api_key: bool,
@@ -82,6 +82,9 @@ pub struct BaseArgs {
     )]
     pub api_url: Option<String>,
 
+    #[arg(skip)]
+    pub api_url_source: Option<ArgValueSource>,
+
     /// Override app URL (or via BRAINTRUST_APP_URL)
     #[arg(
         long,
@@ -90,6 +93,9 @@ pub struct BaseArgs {
         global = true
     )]
     pub app_url: Option<String>,
+
+    #[arg(skip)]
+    pub app_url_source: Option<ArgValueSource>,
 
     /// Path to a PEM-encoded CA bundle used for HTTPS requests.
     #[arg(
@@ -120,7 +126,11 @@ pub struct CLIArgs<T: Args> {
 }
 
 fn parse_org_name(value: &str) -> Result<String, String> {
-    Ok(crate::config::normalize_org(value).to_string())
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("organization cannot be empty".to_string());
+    }
+    Ok(value.to_string())
 }
 
 pub(crate) fn custom_api_without_app_url(api_url: Option<&str>, app_url: Option<&str>) -> bool {
@@ -149,13 +159,13 @@ mod tests {
     #[test]
     fn org_normalization() {
         for (input, expected) in [
-            ("cross-org", ""),
-            ("   ", ""),
+            ("cross-org", "cross-org"),
             (" test-org ", "test-org"),
             (" org_test_123 ", "org_test_123"),
         ] {
             assert_eq!(parse_org_name(input).unwrap(), expected);
         }
+        assert!(parse_org_name("   ").is_err());
         assert!(custom_api_without_app_url(
             Some("https://api.example.test"),
             None

@@ -5728,14 +5728,11 @@ fn apply_url_hints_to_base(mut base: BaseArgs, parsed_url: Option<&ParsedTraceUr
         return base;
     };
 
-    let has_org_override = base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
+    let has_org_override = base.org_name_source.is_some();
 
     if !has_org_override {
         base.org_name = Some(url_org.to_string());
+        base.org_id = None;
     }
     base
 }
@@ -6925,19 +6922,23 @@ mod tests {
     }
 
     #[test]
-    fn apply_url_hints_infers_org_from_url() {
-        let base = base_args();
+    fn apply_url_hints_override_config_org_and_clear_its_id() {
+        let mut base = base_args();
+        base.org_name = Some("config-org".to_string());
+        base.org_id = Some("org_config".to_string());
         let parsed = parsed_url_with_org("Lovable");
 
         let updated = apply_url_hints_for_test(base, Some(&parsed));
 
         assert_eq!(updated.org_name.as_deref(), Some("Lovable"));
+        assert_eq!(updated.org_id, None);
     }
 
     #[test]
     fn apply_url_hints_preserves_explicit_org() {
         let mut base = base_args();
         base.org_name = Some("explicit-org".to_string());
+        base.org_name_source = Some(crate::args::ArgValueSource::CommandLine);
         let parsed = parsed_url_with_org("Lovable");
 
         let updated = apply_url_hints_for_test(base, Some(&parsed));
