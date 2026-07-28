@@ -17,6 +17,7 @@ pub(crate) mod create;
 mod delete;
 mod invoke;
 mod list;
+mod model_capabilities;
 pub(crate) mod prompt_config;
 mod pull;
 mod push;

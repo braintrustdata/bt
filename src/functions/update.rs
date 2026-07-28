@@ -164,7 +164,11 @@ pub async fn run(
     let body = build_patch_body(args)?;
 
     let function = resolve_target_function(ctx, args, ft).await?;
-    validate_prompt_data_patch(function.prompt_data.as_ref(), &body)?;
+    with_spinner(
+        "Validating model parameters...",
+        validate_prompt_data_patch(ctx, function.prompt_data.as_ref(), &body),
+    )
+    .await?;
 
     // LLM scorer/classifier output flags only apply to prompt-based scorers and
     // classifiers. Reject them on other function kinds (for example tools) so an

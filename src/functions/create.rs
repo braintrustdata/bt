@@ -11,8 +11,8 @@ use crate::{
 use super::{
     api,
     prompt_config::{
-        parse_choice_scores_source, parse_classifications_source, validate_unit_interval,
-        PromptConfigArgs,
+        parse_choice_scores_source, parse_classifications_source, validate_prompt_data_patch,
+        validate_unit_interval, PromptConfigArgs,
     },
     IfExistsMode, ResolvedContext,
 };
@@ -119,6 +119,11 @@ pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: b
     let name = resolve_name(args)?;
     let slug = resolve_slug(args, &name)?;
     let definition = build_scorer_definition(args, &ctx.project.id, &name, &slug)?;
+    with_spinner(
+        "Validating model parameters...",
+        validate_prompt_data_patch(ctx, None, &definition),
+    )
+    .await?;
 
     let result = match with_spinner(
         "Creating scorer...",

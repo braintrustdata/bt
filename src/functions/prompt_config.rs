@@ -4,7 +4,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Map, Number, Value};
 
-use crate::utils::{merge_json_objects, read_text_source};
+use crate::{
+    project_context::ProjectContext,
+    utils::{merge_json_objects, read_text_source},
+};
+
+use super::model_capabilities::{resolve_model_spec, ModelSpec};
 
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct PromptConfigArgs {
@@ -21,11 +26,11 @@ pub(crate) struct PromptConfigArgs {
     #[arg(long, value_name = "NUMBER")]
     top_p: Option<f64>,
 
-    /// Frequency penalty, between -2 and 2.
+    /// Frequency penalty. Availability and range depend on the model.
     #[arg(long, value_name = "NUMBER", allow_hyphen_values = true)]
     frequency_penalty: Option<f64>,
 
-    /// Presence penalty, between -2 and 2.
+    /// Presence penalty. Availability and range depend on the model.
     #[arg(long, value_name = "NUMBER", allow_hyphen_values = true)]
     presence_penalty: Option<f64>,
 
@@ -177,7 +182,8 @@ impl PromptConfigArgs {
         }
 
         let effective_model = options.get("model").and_then(Value::as_str);
-        validate_model_params(effective_model, &params)?;
+        let changed_params = params.keys().cloned().collect();
+        validate_model_params(effective_model, &params, &changed_params, None)?;
 
         if !params.is_empty() {
             options.insert("params".to_string(), Value::Object(params));
@@ -197,21 +203,53 @@ impl PromptConfigArgs {
 }
 
 /// Validate the effective model configuration produced by deep-merging a patch
-/// into an existing prompt definition.
-///
-/// The API accepts partial prompt updates without checking provider-specific
-/// model constraints. Validate whenever an update touches the model or its
-/// parameters so a successful PATCH cannot leave a scorer or prompt unusable.
-pub(crate) fn validate_prompt_data_patch(
+/// into an existing prompt definition. Model metadata comes from the same
+/// catalog and custom-model configuration used by the web UI. If metadata is
+/// unavailable for an arbitrary model name, validation deliberately falls back
+/// to provider-independent type and range checks.
+pub(crate) async fn validate_prompt_data_patch(
+    ctx: &ProjectContext,
     existing_prompt_data: Option<&Value>,
     patch: &Value,
 ) -> Result<()> {
-    let Some(patch_prompt_data) = patch.get("prompt_data").and_then(Value::as_object) else {
+    let Some(update) = prepare_model_params_update(existing_prompt_data, patch)? else {
         return Ok(());
     };
-    if !patch_prompt_data.contains_key("options") {
-        return Ok(());
+    let spec = match update.model.as_deref() {
+        Some(model) => resolve_model_spec(ctx, model).await,
+        None => None,
+    };
+    validate_model_params(
+        update.model.as_deref(),
+        &update.params,
+        &update.changed_params,
+        spec.as_ref(),
+    )
+}
+
+#[derive(Debug)]
+struct ModelParamsUpdate {
+    model: Option<String>,
+    params: Map<String, Value>,
+    changed_params: HashSet<String>,
+}
+
+fn prepare_model_params_update(
+    existing_prompt_data: Option<&Value>,
+    patch: &Value,
+) -> Result<Option<ModelParamsUpdate>> {
+    let Some(patch_prompt_data) = patch.get("prompt_data").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(patch_options_value) = patch_prompt_data.get("options") else {
+        return Ok(None);
+    };
+    if patch_options_value.is_null() {
+        return Ok(None);
     }
+    let patch_options = patch_options_value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("prompt_data.options must be a JSON object"))?;
 
     let mut effective_prompt_data = existing_prompt_data
         .and_then(Value::as_object)
@@ -219,50 +257,77 @@ pub(crate) fn validate_prompt_data_patch(
         .unwrap_or_default();
     merge_json_objects(&mut effective_prompt_data, patch_prompt_data);
 
-    let Some(options) = effective_prompt_data.get("options") else {
-        return Ok(());
-    };
-    if options.is_null() {
-        return Ok(());
-    }
-    let options = options
-        .as_object()
+    let options = effective_prompt_data
+        .get("options")
+        .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("prompt_data.options must be a JSON object"))?;
-
     let model = match options.get("model") {
-        Some(Value::String(model)) if !model.trim().is_empty() => Some(model.trim()),
+        Some(Value::String(model)) if !model.trim().is_empty() => Some(model.trim().to_string()),
         Some(Value::String(_)) => bail!("model cannot be empty"),
         Some(Value::Null) | None => None,
         Some(_) => bail!("prompt_data.options.model must be a string"),
     };
     let params = match options.get("params") {
-        Some(Value::Object(params)) => params,
-        Some(Value::Null) | None => return Ok(()),
+        Some(Value::Object(params)) => params.clone(),
+        Some(Value::Null) | None => Map::new(),
         Some(_) => bail!("prompt_data.options.params must be a JSON object"),
     };
 
-    validate_model_params(model, params)
+    let model_changed = patch_options.contains_key("model");
+    let mut changed_params = if model_changed {
+        params.keys().cloned().collect()
+    } else {
+        match patch_options.get("params") {
+            Some(Value::Object(params)) => params.keys().cloned().collect(),
+            Some(Value::Null) | None => HashSet::new(),
+            Some(_) => bail!("prompt_data.options.params must be a JSON object"),
+        }
+    };
+
+    // Temperature support can depend on reasoning effort, so changing either
+    // side of that relationship must validate the effective temperature.
+    if changed_params.contains("reasoning_effort") && params.contains_key("temperature") {
+        changed_params.insert("temperature".to_string());
+    }
+
+    if changed_params.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ModelParamsUpdate {
+        model,
+        params,
+        changed_params,
+    }))
 }
 
-fn validate_model_params(model: Option<&str>, params: &Map<String, Value>) -> Result<()> {
-    let temperature = optional_number(params, "temperature", "--temperature")?;
-    if let Some(temperature) = temperature {
-        let max = if model.is_some_and(uses_anthropic_temperature_range) {
-            1.0
-        } else {
-            2.0
-        };
-        validate_number_range(temperature, 0.0, max, "--temperature")?;
-
-        if let Some(model) = model {
-            validate_temperature_support(model, params)?;
+fn validate_model_params(
+    model: Option<&str>,
+    params: &Map<String, Value>,
+    changed_params: &HashSet<String>,
+    spec: Option<&ModelSpec>,
+) -> Result<()> {
+    if changed_params.contains("temperature") {
+        ensure_parameter_supported(spec, model, "--temperature", TEMPERATURE_FORMATS)?;
+        if let Some(temperature) = optional_number(params, "temperature", "--temperature")? {
+            let max = match spec.map(|spec| spec.format.as_str()) {
+                Some("anthropic" | "converse") => 1.0,
+                _ => 2.0,
+            };
+            validate_number_range(temperature, 0.0, max, "--temperature")?;
+            if let Some(model) = model {
+                validate_temperature_support(model, params)?;
+            }
         }
     }
 
-    if let Some(top_p) = optional_number(params, "top_p", "--top-p")? {
-        validate_number_range(top_p, 0.0, 1.0, "--top-p")?;
-        if let Some(model) = model.filter(|model| has_unsupported_opus_sampling_params(model)) {
-            bail!("--top-p is not supported by model '{model}'");
+    if changed_params.contains("top_p") {
+        ensure_parameter_supported(spec, model, "--top-p", TOP_P_FORMATS)?;
+        if let Some(top_p) = optional_number(params, "top_p", "--top-p")? {
+            validate_number_range(top_p, 0.0, 1.0, "--top-p")?;
+            if let Some(model) = model.filter(|model| has_unsupported_opus_sampling_params(model)) {
+                bail!("--top-p is not supported by model '{model}'");
+            }
         }
     }
 
@@ -270,19 +335,179 @@ fn validate_model_params(model: Option<&str>, params: &Map<String, Value>) -> Re
         ("frequency_penalty", "--frequency-penalty"),
         ("presence_penalty", "--presence-penalty"),
     ] {
-        if let Some(value) = optional_number(params, key, label)? {
-            validate_number_range(value, -2.0, 2.0, label)?;
+        if changed_params.contains(key) {
+            ensure_parameter_supported(spec, model, label, PENALTY_FORMATS)?;
+            if let Some(value) = optional_number(params, key, label)? {
+                // The web UI exposes 0..=1. For an unknown/custom model whose
+                // metadata could not be loaded, retain the provider API's
+                // broader OpenAI-compatible range rather than guessing.
+                let (min, max) = if spec.is_some_and(|spec| spec.format == "openai") {
+                    (0.0, 1.0)
+                } else {
+                    (-2.0, 2.0)
+                };
+                validate_number_range(value, min, max, label)?;
+            }
         }
     }
 
-    if let Some(max_tokens) = params.get("max_tokens") {
-        match max_tokens {
-            Value::Null => {}
-            Value::Number(number) if number.as_u64().is_some_and(|value| value > 0) => {}
-            _ => bail!("--max-tokens must be a positive integer"),
+    if changed_params.contains("max_tokens") {
+        ensure_parameter_supported(spec, model, "--max-tokens", MAX_TOKENS_FORMATS)?;
+        if let Some(max_tokens) = params.get("max_tokens") {
+            match max_tokens {
+                Value::Null => {}
+                Value::Number(number) if number.as_u64().is_some_and(|value| value > 0) => {
+                    if let (Some(spec), Some(value)) = (spec, number.as_u64()) {
+                        let max = spec
+                            .max_output_tokens
+                            .filter(|max| *max > 0)
+                            .unwrap_or(32_768);
+                        if value > max {
+                            bail!(
+                                "--max-tokens must be between 1 and {max} for model '{}'",
+                                model.unwrap_or("<unknown>")
+                            );
+                        }
+                    }
+                }
+                _ => bail!("--max-tokens must be a positive integer"),
+            }
         }
     }
 
+    if changed_params.contains("stop") {
+        match params.get("stop") {
+            Some(Value::Null) | None => {}
+            Some(Value::Array(values)) if values.iter().all(Value::is_string) => {}
+            _ => bail!("--stop-sequence values must be strings"),
+        }
+    }
+
+    if changed_params.contains("tool_choice") {
+        if let Some(value) = params.get("tool_choice").filter(|value| !value.is_null()) {
+            ensure_parameter_supported(spec, model, "--tool-choice", TOOL_FORMATS)?;
+            validate_tool_choice(value)?;
+        }
+    }
+
+    if changed_params.contains("reasoning_effort") {
+        validate_reasoning_effort(model, params, spec)?;
+    }
+
+    if changed_params.contains("verbosity") {
+        if let Some(value) = params.get("verbosity").filter(|value| !value.is_null()) {
+            let verbosity = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("--verbosity must be a string"))?;
+            if !["low", "medium", "high"].contains(&verbosity) {
+                bail!("--verbosity must be one of low, medium, high");
+            }
+            if let (Some(model), Some(spec)) = (model, spec) {
+                let display_name = spec.display_name.as_deref().unwrap_or(model);
+                if !display_name.to_ascii_lowercase().contains("gpt-5") {
+                    bail!("--verbosity is not supported by model '{model}'");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Keep these in sync with `defaultModelParamSettings`, `getSliderSpecs`, and
+// `modelProviderHasTools` in `proxy/packages/proxy/schema/index.ts`.
+const KNOWN_FORMATS: &[&str] = &["openai", "anthropic", "google", "js", "window", "converse"];
+const TEMPERATURE_FORMATS: &[&str] = &["openai", "anthropic", "google", "window", "converse"];
+const MAX_TOKENS_FORMATS: &[&str] = &["openai", "anthropic", "google", "converse"];
+const TOP_P_FORMATS: &[&str] = &["openai", "anthropic", "google", "converse"];
+const PENALTY_FORMATS: &[&str] = &["openai"];
+const TOOL_FORMATS: &[&str] = &["openai", "anthropic", "google", "converse"];
+
+fn ensure_parameter_supported(
+    spec: Option<&ModelSpec>,
+    model: Option<&str>,
+    label: &str,
+    supported_formats: &[&str],
+) -> Result<()> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    if KNOWN_FORMATS.contains(&spec.format.as_str())
+        && !supported_formats.contains(&spec.format.as_str())
+    {
+        bail!(
+            "{label} is not supported by model '{}' (format: {})",
+            model.unwrap_or("<unknown>"),
+            spec.format,
+        );
+    }
+    Ok(())
+}
+
+fn validate_tool_choice(value: &Value) -> Result<()> {
+    match value {
+        Value::String(choice) if ["auto", "none", "required"].contains(&choice.as_str()) => Ok(()),
+        Value::Object(choice)
+            if choice.get("type").and_then(Value::as_str) == Some("function")
+                && choice
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.trim().is_empty()) =>
+        {
+            Ok(())
+        }
+        _ => bail!("--tool-choice must be auto, none, required, or a non-empty function name"),
+    }
+}
+
+fn validate_reasoning_effort(
+    model: Option<&str>,
+    params: &Map<String, Value>,
+    spec: Option<&ModelSpec>,
+) -> Result<()> {
+    let Some(effort) = params.get("reasoning_effort") else {
+        return Ok(());
+    };
+    if effort.is_null() {
+        return Ok(());
+    }
+    let effort = effort
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("--reasoning-effort must be a string"))?;
+    let (Some(model), Some(spec)) = (model, spec) else {
+        return Ok(());
+    };
+    if !KNOWN_FORMATS.contains(&spec.format.as_str()) {
+        return Ok(());
+    }
+    if !spec.supports_reasoning(model) {
+        bail!("--reasoning-effort is not supported by model '{model}'");
+    }
+
+    let gemini_thinking_level = spec.format == "google" && is_gemini_3_model(model);
+    if spec.format != "openai" && spec.reasoning_budget.unwrap_or(false) && !gemini_thinking_level {
+        bail!(
+            "--reasoning-effort is not supported by model '{model}'; this model uses a reasoning budget"
+        );
+    }
+
+    let options: &[&str] = if is_gpt_5_pro_model(model) {
+        &["high"]
+    } else if is_gpt_5_1_or_later(model) {
+        &["none", "low", "medium", "high"]
+    } else if is_gpt_5_model(model) || gemini_thinking_level {
+        &["minimal", "low", "medium", "high"]
+    } else {
+        &["low", "medium", "high"]
+    };
+    if !options.contains(&effort) {
+        bail!(
+            "--reasoning-effort must be one of {} for model '{model}'",
+            options.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -338,12 +563,31 @@ fn has_unsupported_opus_sampling_params(model: &str) -> bool {
     model.to_ascii_lowercase().contains("claude-opus-4-7")
 }
 
-fn uses_anthropic_temperature_range(model: &str) -> bool {
+fn is_gpt_5_pro_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("gpt-5-pro")
+}
+
+fn is_gpt_5_1_or_later(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.contains("claude")
-        || lower.starts_with("anthropic.")
-        || lower.contains(".anthropic.")
-        || lower.contains("/anthropic/")
+    let Some(start) = lower.find("gpt-5.") else {
+        return false;
+    };
+    let version = lower[start + "gpt-5.".len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    version.parse::<u64>().is_ok_and(|version| version >= 1)
+}
+
+fn is_gpt_5_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("gpt-5")
+        && !is_gpt_5_1_or_later(model)
+        && !is_gpt_5_pro_model(model)
+}
+
+fn is_gemini_3_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.starts_with("gemini-3") || lower.contains("/gemini-3")
 }
 
 fn insert_optional_number(
@@ -438,6 +682,39 @@ mod tests {
     struct Harness {
         #[command(flatten)]
         config: PromptConfigArgs,
+    }
+
+    fn model_spec(
+        format: &str,
+        reasoning: bool,
+        reasoning_budget: bool,
+        max_output_tokens: Option<u64>,
+    ) -> ModelSpec {
+        ModelSpec {
+            format: format.to_string(),
+            _flavor: "chat".to_string(),
+            display_name: None,
+            o1_like: None,
+            reasoning: Some(reasoning),
+            reasoning_budget: Some(reasoning_budget),
+            max_output_tokens,
+        }
+    }
+
+    fn validate_patch(
+        existing_prompt_data: Option<&Value>,
+        patch: &Value,
+        spec: Option<&ModelSpec>,
+    ) -> Result<()> {
+        let Some(update) = prepare_model_params_update(existing_prompt_data, patch)? else {
+            return Ok(());
+        };
+        validate_model_params(
+            update.model.as_deref(),
+            &update.params,
+            &update.changed_params,
+            spec,
+        )
     }
 
     #[test]
@@ -561,7 +838,7 @@ mod tests {
                 "options": { "params": { "temperature": 0.2 } }
             }
         });
-        let error = validate_prompt_data_patch(Some(&existing), &patch)
+        let error = validate_patch(Some(&existing), &patch, None)
             .expect_err("effective model does not support temperature");
         assert!(error.to_string().contains("--reasoning-effort none"));
 
@@ -571,34 +848,125 @@ mod tests {
                 "params": { "reasoning_effort": "none" }
             }
         });
-        validate_prompt_data_patch(Some(&existing), &patch)
+        validate_patch(Some(&existing), &patch, None)
             .expect("existing reasoning effort makes temperature valid");
     }
 
     #[test]
-    fn rejects_anthropic_temperature_above_one_in_arbitrary_patch() {
+    fn applies_format_ranges_without_model_name_heuristics() {
         let patch = json!({
             "prompt_data": {
                 "options": {
-                    "model": "claude-sonnet-4-5",
+                    "model": "test-custom-model",
                     "params": { "temperature": 1.5 }
                 }
             }
         });
-        let error = validate_prompt_data_patch(None, &patch)
+        let anthropic = model_spec("anthropic", false, false, None);
+        let error = validate_patch(None, &patch, Some(&anthropic))
             .expect_err("Anthropic temperature should use the smaller range");
         assert_eq!(error.to_string(), "--temperature must be between 0 and 1");
+
+        validate_patch(None, &patch, None)
+            .expect("unknown custom models should not be assigned a format by name");
     }
 
     #[test]
-    fn ignores_unrelated_updates_to_existing_model_configuration() {
+    fn applies_web_ui_parameter_availability_and_model_token_limit() {
+        let window = model_spec("window", false, false, None);
+        let tool_patch = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "test-window-model",
+                    "params": { "tool_choice": "auto" }
+                }
+            }
+        });
+        let error = validate_patch(None, &tool_patch, Some(&window))
+            .expect_err("Window models do not expose tool choice in the UI");
+        assert!(error.to_string().contains("--tool-choice is not supported"));
+
+        let openai = model_spec("openai", false, false, Some(4096));
+        let token_patch = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "test-limited-model",
+                    "params": { "max_tokens": 4097 }
+                }
+            }
+        });
+        let error = validate_patch(None, &token_patch, Some(&openai))
+            .expect_err("model output token limit should be enforced");
+        assert!(error.to_string().contains("between 1 and 4096"));
+    }
+
+    #[test]
+    fn applies_web_ui_reasoning_options() {
+        let reasoning = model_spec("openai", true, false, None);
+        let invalid = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "o3",
+                    "params": { "reasoning_effort": "minimal" }
+                }
+            }
+        });
+        let error = validate_patch(None, &invalid, Some(&reasoning))
+            .expect_err("generic reasoning models accept low, medium, or high");
+        assert!(error.to_string().contains("low, medium, high"));
+
+        let non_reasoning = model_spec("openai", false, false, None);
+        let non_reasoning_patch = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "gpt-4.1",
+                    "params": { "reasoning_effort": "low" }
+                }
+            }
+        });
+        let error = validate_patch(None, &non_reasoning_patch, Some(&non_reasoning))
+            .expect_err("non-reasoning models should reject reasoning effort");
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn validates_existing_parameters_when_switching_models() {
         let existing = json!({
             "options": {
-                "model": "gpt-4.1-mini",
+                "model": "gpt-4.1",
+                "params": { "temperature": 0.5 }
+            }
+        });
+        let patch = json!({
+            "prompt_data": {
+                "options": { "model": "o3" }
+            }
+        });
+        let error = validate_patch(
+            Some(&existing),
+            &patch,
+            Some(&model_spec("openai", true, false, None)),
+        )
+        .expect_err("switching models must validate retained parameters");
+        assert!(error.to_string().contains("--temperature is not supported"));
+    }
+
+    #[test]
+    fn validates_only_parameters_touched_by_an_update() {
+        let existing = json!({
+            "options": {
+                "model": "test-model",
                 "params": { "temperature": 99 }
             }
         });
-        validate_prompt_data_patch(Some(&existing), &json!({"description": "Updated"}))
+        validate_patch(
+            Some(&existing),
+            &json!({"prompt_data": {"options": {"params": {"top_p": 0.5}}}}),
+            Some(&model_spec("openai", false, false, None)),
+        )
+        .expect("an unrelated stale parameter should not block an update");
+
+        validate_patch(Some(&existing), &json!({"description": "Updated"}), None)
             .expect("an unrelated metadata update should remain possible");
     }
 

@@ -91,7 +91,11 @@ pub async fn run(ctx: &ResolvedContext, args: &UpdateArgs, json_output: bool) ->
         }
     };
 
-    validate_prompt_data_patch(prompt.prompt_data.as_ref(), &body)?;
+    with_spinner(
+        "Validating model parameters...",
+        validate_prompt_data_patch(ctx, prompt.prompt_data.as_ref(), &body),
+    )
+    .await?;
 
     if !args.yes && is_interactive() {
         let confirm = Confirm::new()
