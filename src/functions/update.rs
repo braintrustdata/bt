@@ -107,6 +107,30 @@ pub struct UpdateArgs {
 }
 
 impl UpdateArgs {
+    /// Flags that only make sense for LLM scorers and classifiers.
+    ///
+    /// Returns the flag names that were set so callers can reject them on other
+    /// function kinds (for example tools) with an actionable message.
+    fn scorer_output_flags(&self) -> Vec<&'static str> {
+        let mut flags = Vec::new();
+        if self.choice_scores.is_some() {
+            flags.push("--choice-scores");
+        }
+        if self.classifications.is_some() {
+            flags.push("--classifications");
+        }
+        if self.allow_no_match.is_some() {
+            flags.push("--allow-no-match");
+        }
+        if self.use_cot.is_some() {
+            flags.push("--use-cot");
+        }
+        if self.pass_threshold.is_some() {
+            flags.push("--pass-threshold");
+        }
+        flags
+    }
+
     fn selector(&self) -> Result<UpdateSelector<'_>> {
         match (
             self.id.as_deref(),
@@ -140,6 +164,41 @@ pub async fn run(
     let body = build_patch_body(args)?;
 
     let function = resolve_target_function(ctx, args, ft).await?;
+
+    // LLM scorer/classifier output flags only apply to prompt-based scorers and
+    // classifiers. Reject them on other function kinds (for example tools) so an
+    // unrelated function is not silently patched with a parser it cannot use.
+    let is_scorer_like = matches!(
+        function.function_type.as_deref(),
+        Some("scorer") | Some("classifier")
+    );
+    let scorer_flags = args.scorer_output_flags();
+    if !scorer_flags.is_empty() && !is_scorer_like {
+        bail!(
+            "{} apply to LLM scorers and classifiers, not {} '{}'. \
+             Run `bt scorers update` on a scorer instead.",
+            scorer_flags.join(", "),
+            label(ft),
+            function.name,
+        );
+    }
+
+    // Switching output mode updates function_type, but the API deep-merges
+    // prompt_data.parser and will not drop the previous mode's keys. Warn so the
+    // user can review or recreate for a clean switch.
+    if !crate::ui::is_quiet() {
+        match function.function_type.as_deref() {
+            Some("classifier") if args.choice_scores.is_some() => print_command_status(
+                CommandStatus::Warning,
+                "Switching to score output; previous classification labels may remain in the definition. Review with `bt scorers view`.",
+            ),
+            Some("scorer") if args.classifications.is_some() => print_command_status(
+                CommandStatus::Warning,
+                "Switching to classification output; previous choice scores may remain in the definition. Review with `bt scorers view`.",
+            ),
+            _ => {}
+        }
+    }
 
     if !args.yes && is_interactive() {
         let confirm = Confirm::new()
@@ -417,6 +476,29 @@ mod tests {
             patch: None,
             yes: true,
         }
+    }
+
+    #[test]
+    fn scorer_output_flags_reported_only_when_set() {
+        let base = args(None, None);
+        assert!(base.scorer_output_flags().is_empty());
+
+        let mut scored = args(None, None);
+        scored.choice_scores = Some(r#"{"pass":1}"#.to_string());
+        scored.pass_threshold = Some(0.5);
+        assert_eq!(
+            scored.scorer_output_flags(),
+            vec!["--choice-scores", "--pass-threshold"]
+        );
+
+        let mut labeled = args(None, None);
+        labeled.classifications = Some(r#"["a"]"#.to_string());
+        labeled.allow_no_match = Some(true);
+        labeled.use_cot = Some(false);
+        assert_eq!(
+            labeled.scorer_output_flags(),
+            vec!["--classifications", "--allow-no-match", "--use-cot"]
+        );
     }
 
     #[test]
