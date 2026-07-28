@@ -4,7 +4,7 @@ use dialoguer::Confirm;
 use serde_json::{json, Map, Value};
 
 use crate::{
-    functions::prompt_config::PromptConfigArgs,
+    functions::prompt_config::{validate_prompt_data_patch, PromptConfigArgs},
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
     utils::{merge_json_objects, read_text_source, read_yaml_object_source},
 };
@@ -90,6 +90,8 @@ pub async fn run(ctx: &ResolvedContext, args: &UpdateArgs, json_output: bool) ->
             super::delete::select_prompt_interactive(&ctx.client, project_name).await?
         }
     };
+
+    validate_prompt_data_patch(prompt.prompt_data.as_ref(), &body)?;
 
     if !args.yes && is_interactive() {
         let confirm = Confirm::new()

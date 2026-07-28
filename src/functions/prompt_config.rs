@@ -4,27 +4,28 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use serde_json::{json, Map, Number, Value};
 
-use crate::utils::read_text_source;
+use crate::utils::{merge_json_objects, read_text_source};
 
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct PromptConfigArgs {
-    /// Sampling temperature.
+    /// Sampling temperature, between 0 and 2. Some models support a smaller
+    /// range or do not support custom temperatures.
     #[arg(long, value_name = "NUMBER")]
     temperature: Option<f64>,
 
-    /// Maximum number of generated tokens.
+    /// Maximum number of generated tokens. Must be greater than 0.
     #[arg(long, value_name = "N")]
     max_tokens: Option<u64>,
 
-    /// Nucleus sampling probability.
+    /// Nucleus sampling probability, between 0 and 1.
     #[arg(long, value_name = "NUMBER")]
     top_p: Option<f64>,
 
-    /// Frequency penalty.
+    /// Frequency penalty, between -2 and 2.
     #[arg(long, value_name = "NUMBER", allow_hyphen_values = true)]
     frequency_penalty: Option<f64>,
 
-    /// Presence penalty.
+    /// Presence penalty, between -2 and 2.
     #[arg(long, value_name = "NUMBER", allow_hyphen_values = true)]
     presence_penalty: Option<f64>,
 
@@ -175,6 +176,9 @@ impl PromptConfigArgs {
             );
         }
 
+        let effective_model = options.get("model").and_then(Value::as_str);
+        validate_model_params(effective_model, &params)?;
+
         if !params.is_empty() {
             options.insert("params".to_string(), Value::Object(params));
         }
@@ -190,6 +194,156 @@ impl PromptConfigArgs {
 
         Ok(prompt_data)
     }
+}
+
+/// Validate the effective model configuration produced by deep-merging a patch
+/// into an existing prompt definition.
+///
+/// The API accepts partial prompt updates without checking provider-specific
+/// model constraints. Validate whenever an update touches the model or its
+/// parameters so a successful PATCH cannot leave a scorer or prompt unusable.
+pub(crate) fn validate_prompt_data_patch(
+    existing_prompt_data: Option<&Value>,
+    patch: &Value,
+) -> Result<()> {
+    let Some(patch_prompt_data) = patch.get("prompt_data").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if !patch_prompt_data.contains_key("options") {
+        return Ok(());
+    }
+
+    let mut effective_prompt_data = existing_prompt_data
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    merge_json_objects(&mut effective_prompt_data, patch_prompt_data);
+
+    let Some(options) = effective_prompt_data.get("options") else {
+        return Ok(());
+    };
+    if options.is_null() {
+        return Ok(());
+    }
+    let options = options
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("prompt_data.options must be a JSON object"))?;
+
+    let model = match options.get("model") {
+        Some(Value::String(model)) if !model.trim().is_empty() => Some(model.trim()),
+        Some(Value::String(_)) => bail!("model cannot be empty"),
+        Some(Value::Null) | None => None,
+        Some(_) => bail!("prompt_data.options.model must be a string"),
+    };
+    let params = match options.get("params") {
+        Some(Value::Object(params)) => params,
+        Some(Value::Null) | None => return Ok(()),
+        Some(_) => bail!("prompt_data.options.params must be a JSON object"),
+    };
+
+    validate_model_params(model, params)
+}
+
+fn validate_model_params(model: Option<&str>, params: &Map<String, Value>) -> Result<()> {
+    let temperature = optional_number(params, "temperature", "--temperature")?;
+    if let Some(temperature) = temperature {
+        let max = if model.is_some_and(uses_anthropic_temperature_range) {
+            1.0
+        } else {
+            2.0
+        };
+        validate_number_range(temperature, 0.0, max, "--temperature")?;
+
+        if let Some(model) = model {
+            validate_temperature_support(model, params)?;
+        }
+    }
+
+    if let Some(top_p) = optional_number(params, "top_p", "--top-p")? {
+        validate_number_range(top_p, 0.0, 1.0, "--top-p")?;
+        if let Some(model) = model.filter(|model| has_unsupported_opus_sampling_params(model)) {
+            bail!("--top-p is not supported by model '{model}'");
+        }
+    }
+
+    for (key, label) in [
+        ("frequency_penalty", "--frequency-penalty"),
+        ("presence_penalty", "--presence-penalty"),
+    ] {
+        if let Some(value) = optional_number(params, key, label)? {
+            validate_number_range(value, -2.0, 2.0, label)?;
+        }
+    }
+
+    if let Some(max_tokens) = params.get("max_tokens") {
+        match max_tokens {
+            Value::Null => {}
+            Value::Number(number) if number.as_u64().is_some_and(|value| value > 0) => {}
+            _ => bail!("--max-tokens must be a positive integer"),
+        }
+    }
+
+    Ok(())
+}
+
+fn optional_number(params: &Map<String, Value>, key: &str, label: &str) -> Result<Option<f64>> {
+    match params.get(key) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("{label} must be a finite number")),
+        Some(_) => bail!("{label} must be a number"),
+    }
+}
+
+fn validate_number_range(value: f64, min: f64, max: f64, label: &str) -> Result<()> {
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        bail!("{label} must be between {min} and {max}");
+    }
+    Ok(())
+}
+
+/// Keep this in sync with `modelSupportsCustomTemperature` in the backend's
+/// `typespecs/src/model-capabilities.ts`.
+fn validate_temperature_support(model: &str, params: &Map<String, Value>) -> Result<()> {
+    let lower = model.to_ascii_lowercase();
+
+    if lower.contains("claude-opus-4-7") {
+        bail!("--temperature is not supported by model '{model}'");
+    }
+
+    if lower.contains("gpt-5") {
+        let has_no_reasoning_effort = params
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .is_some_and(|effort| effort == "none");
+        if !has_no_reasoning_effort {
+            bail!(
+                "--temperature is not supported by model '{model}' unless reasoning effort is 'none'; pass `--reasoning-effort none` or omit `--temperature`"
+            );
+        }
+    } else if ["o1", "o2", "o3", "o4"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        bail!("--temperature is not supported by model '{model}'");
+    }
+
+    Ok(())
+}
+
+fn has_unsupported_opus_sampling_params(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude-opus-4-7")
+}
+
+fn uses_anthropic_temperature_range(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("claude")
+        || lower.starts_with("anthropic.")
+        || lower.contains(".anthropic.")
+        || lower.contains("/anthropic/")
 }
 
 fn insert_optional_number(
@@ -333,6 +487,119 @@ mod tests {
         assert_eq!(patch["options"]["params"]["reasoning_effort"], "high");
         assert_eq!(patch["options"]["params"]["verbosity"], "low");
         assert_eq!(patch["template_format"], "nunjucks");
+    }
+
+    #[test]
+    fn rejects_model_parameters_outside_provider_ranges() {
+        for (arguments, expected) in [
+            (
+                vec!["--temperature", "99"],
+                "--temperature must be between 0 and 2",
+            ),
+            (
+                vec!["--max-tokens", "0"],
+                "--max-tokens must be a positive integer",
+            ),
+            (
+                vec!["--frequency-penalty", "-2.1"],
+                "--frequency-penalty must be between -2 and 2",
+            ),
+            (
+                vec!["--presence-penalty", "2.1"],
+                "--presence-penalty must be between -2 and 2",
+            ),
+        ] {
+            let parsed =
+                Harness::try_parse_from(std::iter::once("test").chain(arguments.iter().copied()))
+                    .expect("parse arguments");
+            let error = parsed
+                .config
+                .build_prompt_data_patch(Some("gpt-4.1-mini"))
+                .expect_err("out-of-range parameter should fail");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn enforces_model_specific_temperature_support() {
+        let parsed =
+            Harness::try_parse_from(["test", "--temperature", "0.2"]).expect("parse arguments");
+
+        for model in ["gpt-5.4-nano", "o3", "claude-opus-4-7"] {
+            let error = parsed
+                .config
+                .build_prompt_data_patch(Some(model))
+                .expect_err("unsupported temperature should fail");
+            assert!(error.to_string().contains("not supported by model"));
+        }
+    }
+
+    #[test]
+    fn allows_gpt5_temperature_when_reasoning_effort_is_none() {
+        let parsed =
+            Harness::try_parse_from(["test", "--temperature", "0.2", "--reasoning-effort", "none"])
+                .expect("parse arguments");
+
+        let patch = parsed
+            .config
+            .build_prompt_data_patch(Some("gpt-5.4-nano"))
+            .expect("compatible parameters");
+        assert_eq!(patch["options"]["params"]["temperature"], 0.2);
+        assert_eq!(patch["options"]["params"]["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn validates_update_against_the_existing_model_and_params() {
+        let existing = json!({
+            "options": {
+                "model": "gpt-5.4-nano",
+                "params": { "reasoning_effort": "medium" }
+            }
+        });
+        let patch = json!({
+            "prompt_data": {
+                "options": { "params": { "temperature": 0.2 } }
+            }
+        });
+        let error = validate_prompt_data_patch(Some(&existing), &patch)
+            .expect_err("effective model does not support temperature");
+        assert!(error.to_string().contains("--reasoning-effort none"));
+
+        let existing = json!({
+            "options": {
+                "model": "gpt-5.4-nano",
+                "params": { "reasoning_effort": "none" }
+            }
+        });
+        validate_prompt_data_patch(Some(&existing), &patch)
+            .expect("existing reasoning effort makes temperature valid");
+    }
+
+    #[test]
+    fn rejects_anthropic_temperature_above_one_in_arbitrary_patch() {
+        let patch = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "claude-sonnet-4-5",
+                    "params": { "temperature": 1.5 }
+                }
+            }
+        });
+        let error = validate_prompt_data_patch(None, &patch)
+            .expect_err("Anthropic temperature should use the smaller range");
+        assert_eq!(error.to_string(), "--temperature must be between 0 and 1");
+    }
+
+    #[test]
+    fn ignores_unrelated_updates_to_existing_model_configuration() {
+        let existing = json!({
+            "options": {
+                "model": "gpt-4.1-mini",
+                "params": { "temperature": 99 }
+            }
+        });
+        validate_prompt_data_patch(Some(&existing), &json!({"description": "Updated"}))
+            .expect("an unrelated metadata update should remain possible");
     }
 
     #[test]
