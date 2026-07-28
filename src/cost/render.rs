@@ -16,6 +16,7 @@ use crate::{
 
 use super::query::Dimension;
 use super::rows::{CostRow, Totals};
+use super::users::{User, UserMap};
 use super::ResolvedContext;
 
 /// Everything needed to render a cost report.
@@ -29,6 +30,7 @@ pub(super) struct Report<'a> {
     pub offset: FixedOffset,
     pub timezone: &'a str,
     pub display_dims: &'a [Dimension],
+    pub users: &'a UserMap,
     pub sources: &'a [String],
     pub rows: &'a [CostRow],
     pub totals: &'a Totals,
@@ -46,6 +48,14 @@ fn key_display(value: Option<&String>) -> String {
         Some(value) if !value.is_empty() => value.clone(),
         _ => "—".to_string(),
     }
+}
+
+fn resolved_user<'a>(value: Option<&String>, users: &'a UserMap) -> Option<&'a User> {
+    value.and_then(|id| users.get(id))
+}
+
+fn value_or_null(value: Option<String>) -> Value {
+    value.map(Value::String).unwrap_or(Value::Null)
 }
 
 /// A dimension value for display: day/hour buckets are converted into the
@@ -81,11 +91,14 @@ fn csv_field(value: &str) -> String {
 /// the total and window metadata are omitted — the rows are the data, and
 /// consumers aggregate. Day/hour values are in the report's time zone.
 pub(super) fn print_csv(report: &Report) -> Result<()> {
-    let mut headers: Vec<String> = report
-        .display_dims
-        .iter()
-        .map(|dim| dim.alias().to_string())
-        .collect();
+    let mut headers = Vec::new();
+    for dim in report.display_dims {
+        headers.push(dim.alias().to_string());
+        if matches!(dim, Dimension::User) {
+            headers.push("user_name".to_string());
+            headers.push("user_email".to_string());
+        }
+    }
     headers.push("cost".to_string());
     headers.push("priced_spans".to_string());
     headers.push("unpriced_spans".to_string());
@@ -104,14 +117,20 @@ pub(super) fn print_csv(report: &Report) -> Result<()> {
     out.push('\n');
 
     for row in report.rows {
-        let mut fields: Vec<String> = report
-            .display_dims
-            .iter()
-            .zip(row.keys.iter())
-            .map(|(dim, value)| {
-                dimension_value(*dim, value.as_ref(), report.offset).unwrap_or_default()
-            })
-            .collect();
+        let mut fields = Vec::new();
+        for (dim, value) in report.display_dims.iter().zip(row.keys.iter()) {
+            let value = dimension_value(*dim, value.as_ref(), report.offset);
+            fields.push(value.clone().unwrap_or_default());
+            if matches!(dim, Dimension::User) {
+                let user = resolved_user(value.as_ref(), report.users);
+                fields.push(user.and_then(User::name).unwrap_or_default());
+                fields.push(
+                    user.and_then(User::email)
+                        .map(str::to_string)
+                        .unwrap_or_default(),
+                );
+            }
+        }
         fields.push(
             row.cost()
                 .map(|cost| format!("{cost:.6}"))
@@ -144,10 +163,18 @@ pub(super) fn print_json(report: &Report) -> Result<()> {
             let mut object = Map::new();
             for (dim, value) in report.display_dims.iter().zip(row.keys.iter()) {
                 let value = dimension_value(*dim, value.as_ref(), report.offset);
-                object.insert(
-                    dim.alias().to_string(),
-                    value.map(Value::String).unwrap_or(Value::Null),
-                );
+                object.insert(dim.alias().to_string(), value_or_null(value.clone()));
+                if matches!(dim, Dimension::User) {
+                    let user = resolved_user(value.as_ref(), report.users);
+                    object.insert(
+                        "user_name".to_string(),
+                        value_or_null(user.and_then(User::name)),
+                    );
+                    object.insert(
+                        "user_email".to_string(),
+                        value_or_null(user.and_then(User::email).map(str::to_string)),
+                    );
+                }
             }
             object.insert("cost".to_string(), cost_to_json(row.cost()));
             object.insert("cost_source".to_string(), json!(cost_source(row)));
@@ -269,11 +296,16 @@ pub(super) fn print_table(report: &Report) -> Result<()> {
     // The pricing-file column only appears when a pricing file is set, so the
     // common case never shows a column of zeros.
     let show_file_column = report.pricing_file.is_some();
-    let mut headers: Vec<_> = report
-        .display_dims
-        .iter()
-        .map(|dim| header(dim.header()))
-        .collect();
+    let mut headers = Vec::new();
+    for dim in report.display_dims {
+        if matches!(dim, Dimension::User) {
+            headers.push(header("User name"));
+            headers.push(header("User email"));
+            headers.push(header("User ID"));
+        } else {
+            headers.push(header(dim.header()));
+        }
+    }
     headers.push(header("Cost"));
     if show_file_column {
         headers.push(header("Pricing file"));
@@ -287,15 +319,20 @@ pub(super) fn print_table(report: &Report) -> Result<()> {
     apply_column_padding(&mut table, (0, 4));
 
     for row in report.rows {
-        let mut cells: Vec<String> = report
-            .display_dims
-            .iter()
-            .zip(row.keys.iter())
-            .map(|(dim, value)| {
-                let value = dimension_value(*dim, value.as_ref(), report.offset);
-                truncate(&key_display(value.as_ref()), 50)
-            })
-            .collect();
+        let mut cells = Vec::new();
+        for (dim, value) in report.display_dims.iter().zip(row.keys.iter()) {
+            let value = dimension_value(*dim, value.as_ref(), report.offset);
+            if matches!(dim, Dimension::User) {
+                let user = resolved_user(value.as_ref(), report.users);
+                let name = user.and_then(User::name);
+                let email = user.and_then(User::email).map(str::to_string);
+                cells.push(truncate(&key_display(name.as_ref()), 50));
+                cells.push(truncate(&key_display(email.as_ref()), 50));
+                cells.push(truncate(&key_display(value.as_ref()), 50));
+            } else {
+                cells.push(truncate(&key_display(value.as_ref()), 50));
+            }
+        }
         cells.push(cost_cell(row));
         if show_file_column {
             cells.push(format_cost(row.file_cost));

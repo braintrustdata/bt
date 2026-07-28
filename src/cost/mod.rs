@@ -1,10 +1,12 @@
 //! `bt cost` — estimate LLM spend across a project's logs, topics, experiments,
 //! and playgrounds.
 //!
-//! Cost is one query: `SUM(cost) GROUP BY <dims> WHERE <filters> AND <time>`.
-//! Logs, topics, and experiments share the `project()` amalgam (one query, no
-//! experiment enumeration); playgrounds are a separate `playground_logs(...)`
-//! table that needs a prompt-session enumeration first.
+//! Cost is aggregated with `SUM(cost) GROUP BY <dims> WHERE <filters> AND
+//! <time>`. Logs, topics, and experiments share the `project()` amalgam (one
+//! aggregate query, no experiment enumeration); playgrounds are a separate
+//! `playground_logs(...)` table that needs a prompt-session enumeration first.
+//! User breakdowns may add root-bounded lookups to attribute spans whose direct
+//! user ID is missing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ mod render;
 mod rows;
 mod sessions;
 mod termimage;
+mod users;
 
 use termimage::ImageMode;
 
@@ -38,13 +41,15 @@ use pricing::{format_timestamp, format_timestamp_in_offset, parse_timestamp_in_o
 #[cfg(test)]
 use pricing::parse_timestamp;
 use query::{
-    build_query, internal_dimensions, playground_from, project_from, Dimension, Filters, Source,
-    TableKind, TimeRange, TimeSegment,
+    build_query, build_trace_owner_query, internal_dimensions, playground_from, project_from,
+    Dimension, Filters, Source, TableKind, TimeRange, TimeSegment,
 };
 
 /// Default backend row cap for grouped queries (mirrors `DEFAULT_LIMIT` in
 /// `api-ts/src/btql.ts`). Used to detect truncation.
 const BACKEND_DEFAULT_LIMIT: usize = 1000;
+/// Keep root-ID lookup queries well below common parser and request-size limits.
+const TRACE_OWNER_IDS_PER_QUERY: usize = 250;
 
 /// High-resolution fallback for inline images when the terminal doesn't report
 /// its pixel size. Rendering large and letting the terminal downscale stays
@@ -143,7 +148,7 @@ pub struct CostArgs {
     )]
     sources: Vec<Source>,
 
-    /// Break cost down by these dimensions (comma-separated or repeated)
+    /// Break cost down by these dimensions (comma-separated or repeated); user breakdowns also show source
     #[arg(
         long = "group-by",
         value_enum,
@@ -270,20 +275,36 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
         .iter()
         .any(|source| !matches!(source, Source::Playgrounds))
     {
+        let from_clause = project_from(&ctx.project.id);
         let query = build_query(
             TableKind::Project,
-            &project_from(&ctx.project.id),
+            &from_clause,
             range,
             &segments,
             &internal_dims,
             &filters,
         );
-        let result = with_spinner(
+        let mut result = with_spinner(
             "Estimating cost...",
             run_btql_rows_with_limit(&ctx.client, &query, "default", row_limit, tz_offset),
         )
         .await?;
         truncated |= is_truncated(result.len(), row_limit);
+        if display_dims.contains(&Dimension::User) {
+            if let Err(err) = with_spinner(
+                "Attributing users...",
+                attribute_missing_users(&ctx.client, &from_clause, &mut result),
+            )
+            .await
+            {
+                print_command_status(
+                    CommandStatus::Warning,
+                    &format!(
+                        "Could not attribute spans from originating traces; leaving them unattributed: {err:#}"
+                    ),
+                );
+            }
+        }
         candidate_spans = candidate_spans.saturating_add(rows::accumulate_rows(
             &mut accumulator,
             &result,
@@ -302,20 +323,36 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
         )
         .await?;
         if !session_ids.is_empty() {
+            let from_clause = playground_from(&session_ids);
             let query = build_query(
                 TableKind::Playground,
-                &playground_from(&session_ids),
+                &from_clause,
                 range,
                 &segments,
                 &internal_dims,
                 &filters,
             );
-            let result = with_spinner(
+            let mut result = with_spinner(
                 "Estimating playground cost...",
                 run_btql_rows_with_limit(&ctx.client, &query, "default", row_limit, tz_offset),
             )
             .await?;
             truncated |= is_truncated(result.len(), row_limit);
+            if display_dims.contains(&Dimension::User) {
+                if let Err(err) = with_spinner(
+                    "Attributing playground users...",
+                    attribute_missing_users(&ctx.client, &from_clause, &mut result),
+                )
+                .await
+                {
+                    print_command_status(
+                        CommandStatus::Warning,
+                        &format!(
+                            "Could not attribute playground spans from originating traces; leaving them unattributed: {err:#}"
+                        ),
+                    );
+                }
+            }
             candidate_spans = candidate_spans.saturating_add(rows::accumulate_rows(
                 &mut accumulator,
                 &result,
@@ -331,6 +368,50 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
     rows::sort_rows(&mut cost_rows, &display_dims);
     let totals = rows::totals_from_rows(&cost_rows, candidate_spans);
 
+    // Keep the raw user/service-account ID as the grouping key, and enrich only
+    // the returned groups. Human users come from the filtered user endpoint.
+    // That endpoint intentionally omits service accounts, so resolve any IDs it
+    // did not return through the service-token directory.
+    let user_ids = user_ids_from_rows(&cost_rows, &display_dims);
+    let mut resolved_users = if user_ids.is_empty() {
+        users::UserMap::new()
+    } else {
+        match with_spinner(
+            "Resolving users...",
+            users::list_users_by_ids(&ctx.client, &user_ids),
+        )
+        .await
+        {
+            Ok(users) => users::user_map(users),
+            Err(err) => {
+                print_command_status(
+                    CommandStatus::Warning,
+                    &format!("Could not resolve users; showing user IDs only: {err:#}"),
+                );
+                users::UserMap::new()
+            }
+        }
+    };
+    let unresolved_user_ids: Vec<String> = user_ids
+        .iter()
+        .filter(|id| !resolved_users.contains_key(id.as_str()))
+        .cloned()
+        .collect();
+    if !unresolved_user_ids.is_empty() {
+        match with_spinner(
+            "Resolving service accounts...",
+            users::list_service_accounts_by_ids(&ctx.client, &unresolved_user_ids),
+        )
+        .await
+        {
+            Ok(accounts) => resolved_users.extend(users::user_map(accounts)),
+            Err(err) => print_command_status(
+                CommandStatus::Warning,
+                &format!("Could not resolve service accounts; showing their IDs only: {err:#}"),
+            ),
+        }
+    }
+
     let source_labels: Vec<String> = sources
         .iter()
         .map(|source| source.label().to_string())
@@ -338,8 +419,14 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
 
     // A saved figure is a file action, independent of the console chart/JSON.
     if let Some(path) = args.save_fig.as_deref() {
-        let (points, title) =
-            chart_points(&cost_rows, &display_dims, range, offset, args.skip_gaps);
+        let (points, title) = chart_points(
+            &cost_rows,
+            &display_dims,
+            &resolved_users,
+            range,
+            offset,
+            args.skip_gaps,
+        );
         let written = plot::save_cost_chart(&title, &points, path)?;
         print_command_status(
             CommandStatus::Success,
@@ -352,8 +439,14 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
     let mut chart: Option<String> = None;
     let mut image: Option<String> = None;
     if args.plot {
-        let (points, title) =
-            chart_points(&cost_rows, &display_dims, range, offset, args.skip_gaps);
+        let (points, title) = chart_points(
+            &cost_rows,
+            &display_dims,
+            &resolved_users,
+            range,
+            offset,
+            args.skip_gaps,
+        );
         if matches!(args.image, ImageMode::Auto) {
             image = inline_chart_image(&title, &points)?;
         }
@@ -371,6 +464,7 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
         offset,
         timezone: &timezone_label,
         display_dims: &display_dims,
+        users: &resolved_users,
         sources: &source_labels,
         rows: &cost_rows,
         totals: &totals,
@@ -390,6 +484,32 @@ pub async fn run(base: BaseArgs, args: CostArgs) -> Result<()> {
     } else {
         render::print_table(&report)
     }
+}
+
+/// Attribute missing span-level users from a unique non-scorer user on the
+/// originating trace. Lookups are chunked and uncapped so an ambiguous trace
+/// cannot appear unique merely because the backend truncated the owner rows.
+async fn attribute_missing_users(
+    client: &crate::http::ApiClient,
+    from_clause: &str,
+    result_rows: &mut [serde_json::Map<String, serde_json::Value>],
+) -> Result<()> {
+    let trace_ids = rows::unattributed_trace_ids(result_rows);
+    if trace_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut owner_rows = Vec::new();
+    for trace_ids in trace_ids.chunks(TRACE_OWNER_IDS_PER_QUERY) {
+        let query = build_trace_owner_query(from_clause, trace_ids);
+        let rows = run_btql_rows_with_limit(client, &query, "default", RowLimit::Disabled, None)
+            .await
+            .context("failed to look up users on originating traces")?;
+        owner_rows.extend(rows);
+    }
+    let owners = rows::unique_trace_owners(&owner_rows);
+    rows::apply_trace_owner_fallback(result_rows, &owners);
+    Ok(())
 }
 
 /// Render the chart as an inline terminal image, when supported. Returns `None`
@@ -429,6 +549,7 @@ fn image_pixel_size(cols: u16) -> (u32, u32) {
 fn chart_points(
     rows: &[rows::CostRow],
     display_dims: &[Dimension],
+    resolved_users: &users::UserMap,
     range: TimeRange,
     offset: FixedOffset,
     skip_gaps: bool,
@@ -459,7 +580,12 @@ fn chart_points(
         // Categorical breakdowns keep the table's cost-ranked order.
         None => rows
             .iter()
-            .map(|row| (chart_label(&row.keys), row.cost().unwrap_or(0.0)))
+            .map(|row| {
+                (
+                    chart_label(&row.keys, display_dims, resolved_users),
+                    row.cost().unwrap_or(0.0),
+                )
+            })
             .collect(),
     };
 
@@ -474,14 +600,33 @@ fn chart_points(
     (points, title)
 }
 
-fn chart_label(keys: &[Option<String>]) -> String {
-    keys.iter()
-        .map(|value| match value {
-            Some(value) if !value.is_empty() => value.as_str(),
-            _ => "—",
+fn chart_label(
+    keys: &[Option<String>],
+    display_dims: &[Dimension],
+    resolved_users: &users::UserMap,
+) -> String {
+    display_dims
+        .iter()
+        .zip(keys)
+        .map(|(dim, value)| match (dim, value.as_deref()) {
+            (Dimension::User, Some(id)) => user_chart_label(id, resolved_users),
+            (_, Some(value)) if !value.is_empty() => value.to_string(),
+            _ => "—".to_string(),
         })
         .collect::<Vec<_>>()
         .join(" / ")
+}
+
+fn user_chart_label(id: &str, resolved_users: &users::UserMap) -> String {
+    let Some(user) = resolved_users.get(id) else {
+        return id.to_string();
+    };
+    match (user.name(), user.email()) {
+        (Some(name), Some(email)) => format!("{name} <{email}>"),
+        (Some(name), None) => name,
+        (None, Some(email)) => email.to_string(),
+        (None, None) => id.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,6 +820,20 @@ fn chart_size() -> (u32, u32) {
     (cols.clamp(60, 160), (rows.saturating_sub(4)).clamp(14, 30))
 }
 
+/// Collect user IDs from the returned breakdown rows. Only rows that survived
+/// the backend limit need enrichment.
+fn user_ids_from_rows(rows: &[rows::CostRow], display_dims: &[Dimension]) -> Vec<String> {
+    let Some(user_index) = display_dims
+        .iter()
+        .position(|dim| matches!(dim, Dimension::User))
+    else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| row.keys.get(user_index).and_then(Clone::clone))
+        .collect()
+}
+
 /// All sources when none are specified; otherwise the deduped request.
 fn resolve_sources(requested: &[Source]) -> Vec<Source> {
     if requested.is_empty() {
@@ -707,6 +866,12 @@ fn dedup_dimensions(requested: &[Dimension]) -> Result<Vec<Dimension>> {
     }
     if seen.is_empty() {
         seen.push(Dimension::Model);
+    }
+    // Keep the cost pool visible when trace-inferred spans are attributed to a
+    // user, so topics and other non-log sources are not silently merged into
+    // the user's log activity.
+    if seen.contains(&Dimension::User) && !seen.contains(&Dimension::Source) {
+        seen.push(Dimension::Source);
     }
     Ok(seen)
 }
@@ -1092,6 +1257,18 @@ mod tests {
         assert_eq!(
             dedup_dimensions(&[Dimension::Source, Dimension::Model]).unwrap(),
             vec![Dimension::Source, Dimension::Model]
+        );
+    }
+
+    #[test]
+    fn user_grouping_always_preserves_source() {
+        assert_eq!(
+            dedup_dimensions(&[Dimension::User]).unwrap(),
+            vec![Dimension::User, Dimension::Source]
+        );
+        assert_eq!(
+            dedup_dimensions(&[Dimension::Source, Dimension::User]).unwrap(),
+            vec![Dimension::Source, Dimension::User]
         );
     }
 
