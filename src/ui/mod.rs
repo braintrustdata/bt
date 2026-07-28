@@ -56,7 +56,7 @@ pub use ratatui_table::{
     box_with_title, render_experiment_summary_table, summary_metric_unit, SummaryExperimentColumn,
     SummaryMetricCell, SummaryMetricKind, SummaryMetricRow, SummaryTableOptions,
 };
-pub use select::{fuzzy_select, select_project, ProjectSelectMode};
+pub use select::{fuzzy_select, fuzzy_select_opt, select_project, ProjectSelectMode};
 
 pub use spinner::{with_spinner, with_spinner_visible};
 pub use status::{print_command_status, CommandStatus};

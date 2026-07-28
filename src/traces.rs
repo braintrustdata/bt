@@ -302,6 +302,18 @@ struct ProjectSelection {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ProjectLogTraceSeed {
+    pub(crate) created: Option<String>,
+    pub(crate) root_span_id: String,
+    pub(crate) span_id: Option<String>,
+    pub(crate) row_id: Option<String>,
+    pub(crate) input: Option<String>,
+    pub(crate) duration_seconds: Option<f64>,
+    pub(crate) total_tokens: f64,
+    pub(crate) estimated_cost: f64,
+}
+
+#[derive(Debug, Clone)]
 struct ParsedTraceUrl {
     org: Option<String>,
     project: Option<String>,
@@ -1635,6 +1647,125 @@ async fn run_interactive_trace_target(
         client,
     )
     .await
+}
+
+pub(crate) async fn run_interactive_project_log_trace_list(
+    client: ApiClient,
+    project_id: &str,
+    project_name: Option<&str>,
+    traces: Vec<ProjectLogTraceSeed>,
+    selected_root_span_id: &str,
+    print_queries: bool,
+) -> Result<()> {
+    let selected_root_span_id = selected_root_span_id.trim();
+    if selected_root_span_id.is_empty() {
+        bail!("selected trace is missing root_span_id");
+    }
+
+    let object_ref = ObjectRef {
+        object_type: "project_logs".to_string(),
+        object_name: project_id.to_string(),
+    };
+    let source_expr = btql_source_expr(&object_ref)?;
+    let base_filter = root_span_filter_for_trace_seeds(&traces, selected_root_span_id);
+    let startup_trace_url = ParsedTraceUrl {
+        org: Some(client.org_name().to_string()),
+        project: Some(project_id.to_string()),
+        page: Some("logs".to_string()),
+        experiment: None,
+        comparison_experiment: None,
+        row_ref: Some(selected_root_span_id.to_string()),
+        span_id: Some(selected_root_span_id.to_string()),
+        trace_view_type: detail_view_trace_url_value(DetailView::Span).map(ToString::to_string),
+    };
+
+    run_interactive(
+        InteractiveRunArgs {
+            init: TraceViewerInit {
+                project: ProjectSelection {
+                    id: project_id.to_string(),
+                    name: project_name.map(ToString::to_string),
+                },
+                source_expr,
+                list_mode: ListMode::Summary,
+                base_filter,
+                traces: trace_seed_summary_rows(traces),
+                limit: 100,
+                preview_length: 125,
+                print_queries,
+            },
+            initial_search_query: String::new(),
+            startup_trace_url: Some(startup_trace_url),
+        },
+        client,
+    )
+    .await
+}
+
+fn root_span_filter_for_trace_seeds(
+    traces: &[ProjectLogTraceSeed],
+    selected_root_span_id: &str,
+) -> String {
+    let mut root_span_ids = BTreeSet::new();
+    root_span_ids.insert(selected_root_span_id.to_string());
+    for trace in traces {
+        let root_span_id = trace.root_span_id.trim();
+        if !root_span_id.is_empty() {
+            root_span_ids.insert(root_span_id.to_string());
+        }
+    }
+
+    let clauses = root_span_ids
+        .into_iter()
+        .map(|root_span_id| format!("root_span_id = {}", sql_quote(&root_span_id)))
+        .collect::<Vec<_>>();
+    match clauses.as_slice() {
+        [] => "root_span_id = ''".to_string(),
+        [single] => single.clone(),
+        _ => format!("({})", clauses.join(" OR ")),
+    }
+}
+
+fn trace_seed_summary_rows(traces: Vec<ProjectLogTraceSeed>) -> Vec<TraceSummaryRow> {
+    traces.into_iter().map(trace_seed_summary_row).collect()
+}
+
+fn trace_seed_summary_row(seed: ProjectLogTraceSeed) -> TraceSummaryRow {
+    let mut row = Map::new();
+    insert_string_if_present(&mut row, "created", seed.created);
+    insert_string_if_present(&mut row, "root_span_id", Some(seed.root_span_id.clone()));
+    insert_string_if_present(&mut row, "span_id", seed.span_id);
+    insert_string_if_present(&mut row, "id", seed.row_id);
+    insert_string_if_present(&mut row, "input", seed.input);
+
+    let mut metrics = Map::new();
+    if let Some(duration) = seed.duration_seconds {
+        insert_number_if_finite(&mut metrics, "duration", duration);
+    }
+    insert_number_if_finite(&mut metrics, "total_tokens", seed.total_tokens);
+    insert_number_if_finite(&mut metrics, "estimated_cost", seed.estimated_cost);
+    if !metrics.is_empty() {
+        row.insert("metrics".to_string(), Value::Object(metrics));
+    }
+
+    TraceSummaryRow {
+        root_span_id: seed.root_span_id,
+        row,
+    }
+}
+
+fn insert_string_if_present(row: &mut Map<String, Value>, key: &str, value: Option<String>) {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    row.insert(key.to_string(), Value::String(value));
+}
+
+fn insert_number_if_finite(row: &mut Map<String, Value>, key: &str, value: f64) {
+    let Some(number) = serde_json::Number::from_f64(value).filter(|_| value.is_finite()) else {
+        return;
+    };
+    row.insert(key.to_string(), Value::Number(number));
 }
 
 async fn resolve_object_ref_for_view(
@@ -6753,6 +6884,36 @@ mod tests {
             span_id: None,
             trace_view_type: None,
         }
+    }
+
+    #[test]
+    fn project_log_trace_seed_rows_keep_topic_trace_context() {
+        let seeds = vec![ProjectLogTraceSeed {
+            created: Some("2026-07-27T12:00:00Z".to_string()),
+            root_span_id: "root-topic".to_string(),
+            span_id: Some("span-topic".to_string()),
+            row_id: Some("row-topic".to_string()),
+            input: Some("topic trace input".to_string()),
+            duration_seconds: Some(1.25),
+            total_tokens: 42.0,
+            estimated_cost: 0.002,
+        }];
+
+        let filter = root_span_filter_for_trace_seeds(&seeds, "root-selected");
+        assert!(filter.contains("root_span_id = 'root-selected'"));
+        assert!(filter.contains("root_span_id = 'root-topic'"));
+
+        let rows = trace_seed_summary_rows(seeds);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].root_span_id, "root-topic");
+        assert_eq!(
+            value_as_string(rows[0].row.get("input")).as_deref(),
+            Some("topic trace input")
+        );
+        assert_eq!(
+            extract_duration_seconds(rows[0].row.get("metrics")),
+            Some(1.25)
+        );
     }
 
     fn draw_messages_once(messages: &[Value], expanded: bool) -> bool {
