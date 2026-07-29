@@ -31,8 +31,7 @@ use tokio::sync::oneshot;
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
     config,
-    http::{build_http_client, build_http_client_from_builder, ApiClient},
-    projects::api,
+    http::{build_http_client, build_http_client_from_builder},
     ui,
     utils::shell_quote_arg,
 };
@@ -413,8 +412,8 @@ struct OAuthErrorResponse {
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
-  bt auth login --global
-  bt auth login --oauth --org test-org --local
+  bt auth login
+  bt auth login --oauth --org test-org
   bt auth refresh --org test-org
   bt auth logout
   bt auth logout --org test-org --oauth
@@ -443,9 +442,6 @@ struct AuthLoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
-
-    #[command(flatten)]
-    scope: config::ScopeArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -463,17 +459,9 @@ struct AuthLogoutArgs {
     force: bool,
 }
 
-struct PostLoginContextUpdate {
-    display: String,
-    path: PathBuf,
-}
-
 pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     match args.command {
-        AuthCommand::Login(login_args) => {
-            login_args.scope.preflight(ui::can_prompt())?;
-            run_login_set(&base, login_args).await
-        }
+        AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
         AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args).await,
     }
@@ -1838,17 +1826,6 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         selected_org.id.clone(),
         selected_org.name.clone(),
     )?;
-    let context_update = persist_post_login_context(
-        base,
-        &api_key,
-        &selected_api_url,
-        &login_app_url,
-        Some(&selected_org),
-        &args.scope,
-    )
-    .await
-    .context("login succeeded, but failed to update active context")?;
-
     let human = format_login_success(Some(&selected_org), &selected_api_url);
     emit_result(
         base.json,
@@ -1863,13 +1840,6 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         }),
         || {
             ui::print_command_status(ui::CommandStatus::Success, &human);
-            ui::print_command_status(
-                ui::CommandStatus::Success,
-                &format!("Switched to {}", context_update.display),
-            );
-            if base.verbose {
-                eprintln!("Wrote to {}", context_update.path.display());
-            }
         },
     )
 }
@@ -1949,17 +1919,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     )?;
 
     commit_oauth_profile(&oauth_tokens, api_url.clone(), app_url.clone())?;
-    let context_update = persist_post_login_context(
-        base,
-        &oauth_tokens.access_token,
-        &selected_api_url,
-        &app_url,
-        Some(&selected_org),
-        &args.scope,
-    )
-    .await
-    .context("login succeeded, but failed to update active context")?;
-
     let human = format_login_success(Some(&selected_org), &selected_api_url);
     emit_result(
         base.json,
@@ -1973,13 +1932,6 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         }),
         || {
             ui::print_command_status(ui::CommandStatus::Success, &human);
-            ui::print_command_status(
-                ui::CommandStatus::Success,
-                &format!("Switched to {}", context_update.display),
-            );
-            if base.verbose {
-                eprintln!("Wrote to {}", context_update.path.display());
-            }
         },
     )
 }
@@ -2177,105 +2129,6 @@ fn format_login_success(selected_org: Option<&LoginOrgInfo>, api_url: &str) -> S
     selected_org
         .map(|org| format!("Logged in as {} (api: {api_url})", org.name))
         .unwrap_or_else(|| format!("Logged in (api: {api_url})"))
-}
-
-fn build_login_context_for_selected_org(
-    credential: &str,
-    api_url: &str,
-    app_url: &str,
-    selected_org: Option<&LoginOrgInfo>,
-) -> LoginContext {
-    let login = LoginState::new();
-    let _ = login.set(
-        credential.to_string(),
-        selected_org.map(|org| org.id.clone()).unwrap_or_default(),
-        selected_org.map(|org| org.name.clone()).unwrap_or_default(),
-        api_url.to_string(),
-        app_url.to_string(),
-    );
-    LoginContext {
-        login,
-        api_url: api_url.to_string(),
-        app_url: app_url.to_string(),
-    }
-}
-
-fn format_post_login_context(
-    selected_org: Option<&LoginOrgInfo>,
-    project: Option<&api::Project>,
-) -> String {
-    match (selected_org, project) {
-        (Some(org), Some(project)) => format!("{}/{}", org.name, project.name),
-        (Some(org), None) => org.name.clone(),
-        (None, _) => "Braintrust".to_string(),
-    }
-}
-
-async fn resolve_post_login_project(
-    base: &BaseArgs,
-    credential: &str,
-    api_url: &str,
-    app_url: &str,
-    selected_org: Option<&LoginOrgInfo>,
-) -> Result<Option<api::Project>> {
-    let Some(project_name) = config::trimmed_option(base.project.as_deref()) else {
-        return Ok(None);
-    };
-
-    let selected_org = selected_org
-        .ok_or_else(|| anyhow::anyhow!("an organization is required to select a project"))?;
-    let ctx =
-        build_login_context_for_selected_org(credential, api_url, app_url, Some(selected_org));
-    let client = ApiClient::new(&ctx)?;
-    ui::select_or_create_project(&client, Some(project_name), None, None)
-        .await
-        .map(Some)
-}
-
-async fn persist_post_login_context(
-    base: &BaseArgs,
-    credential: &str,
-    api_url: &str,
-    app_url: &str,
-    selected_org: Option<&LoginOrgInfo>,
-    scope: &config::ScopeArgs,
-) -> Result<PostLoginContextUpdate> {
-    // Scope is prompted last, after org (during login) and project.
-    let project =
-        resolve_post_login_project(base, credential, api_url, app_url, selected_org).await?;
-    let (path, _) = scope.resolve(ui::can_prompt(), "Where to use this login")?;
-    let mut cfg = config::load_file(&path);
-    let selected_org = selected_org
-        .ok_or_else(|| anyhow::anyhow!("an organization is required to update config"))?;
-    let preserve_project = project.is_none()
-        && config::org_option(cfg.org.as_deref()) == Some(selected_org.name.as_str())
-        && cfg.org_id.as_deref() == Some(selected_org.id.as_str())
-        && cfg
-            .app_url
-            .as_deref()
-            .is_some_and(|url| config::urls_equal(url, app_url));
-    let selected_project = if preserve_project {
-        cfg.project.clone().zip(cfg.project_id.clone())
-    } else {
-        project
-            .as_ref()
-            .map(|project| (project.name.clone(), project.id.clone()))
-    };
-    cfg.set_context(
-        (selected_org.name.as_str(), selected_org.id.as_str()),
-        selected_project
-            .as_ref()
-            .map(|(name, id)| (name.as_str(), id.as_str())),
-        app_url,
-        api_url,
-    );
-    config::save_file(&path, &cfg)
-        .with_context(|| format!("Could not save config to {}", path.display()))?;
-
-    Ok(PostLoginContextUpdate {
-        display: format_post_login_context(Some(selected_org), project.as_ref()),
-        path,
-    })
 }
 
 /// Emit a machine-readable JSON payload on stdout when `--json` is set,
@@ -5719,68 +5572,6 @@ mod tests {
         };
         let filtered = filter_auth_store(&mismatched_api, &store, None, None);
         assert_eq!(filtered.profiles.into_keys().collect::<Vec<_>>(), ["oauth"]);
-    }
-
-    #[tokio::test]
-    async fn post_login_context_preserves_only_same_org_projects() {
-        let _env = TestEnv::new(None, None).await;
-        let save = |org: &str, org_id: &str| {
-            crate::config::save_global(&crate::config::Config {
-                org: Some(org.into()),
-                org_id: Some(org_id.into()),
-                project: Some("test-project".into()),
-                project_id: Some("proj_test".into()),
-                app_url: Some("https://www.example.test".into()),
-                api_url: Some("https://api.example.test".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        };
-        let persist = |org: Option<LoginOrgInfo>| async move {
-            persist_post_login_context(
-                &make_base(),
-                "test-credential",
-                "https://api.example.test",
-                "https://www.example.test",
-                org.as_ref(),
-                &config::ScopeArgs {
-                    global: true,
-                    local: false,
-                },
-            )
-            .await
-            .unwrap();
-            crate::config::load_global().unwrap()
-        };
-
-        save("old-org", "org_old");
-        let cfg = persist(Some(login_org("org_test", "test-org"))).await;
-        assert_eq!((cfg.org.as_deref(), cfg.project), (Some("test-org"), None));
-
-        save("test-org", "org_test");
-        let cfg = persist(Some(login_org("org_test", "test-org"))).await;
-        assert_eq!(
-            (cfg.project.as_deref(), cfg.project_id.as_deref()),
-            (Some("test-project"), Some("proj_test"))
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_post_login_project_requires_an_org() {
-        let mut base = make_base();
-        base.project = Some("demo-project".to_string());
-
-        let err = resolve_post_login_project(
-            &base,
-            "test-api-key",
-            "https://api.example.test",
-            "https://www.example.test",
-            None,
-        )
-        .await
-        .expect_err("missing org should fail");
-
-        assert!(err.to_string().contains("organization is required"));
     }
 
     #[test]

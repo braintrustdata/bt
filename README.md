@@ -314,11 +314,10 @@ Local version and pagination-key conversion helpers:
 
 - Authenticate interactively:
   - `bt auth login`
-  - First choose `OAuth (browser)` (default) or `API key`, then choose an organization and config scope.
+  - First choose `OAuth (browser)` (default) or `API key`, then choose an organization.
   - OAuth is stored once per Braintrust instance, identified by app URL, and can authenticate every organization available to that user in the instance.
   - API-key logins remain organization-scoped; multiple keys for one organization remain distinct.
-  - Login writes `org`, `org_id`, `project`, `project_id`, `app_url`, and `api_url` to the selected config scope. A same-context login preserves the existing project when no project is requested.
-  - Use `--global` or `--local` to choose the config scope. Without either flag, an existing local config causes an interactive scope picker (default: local); non-interactive runs must pass a scope. `--local` never creates `.bt`.
+  - Login only saves credentials; use `bt init` or `bt switch` to configure the active org and project.
 - Login with OAuth:
   - `bt auth login --oauth --org test-org`
   - You can pass `--no-browser` to print the URL without opening it automatically.
