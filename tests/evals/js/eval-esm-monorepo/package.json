@@ -11,6 +11,6 @@
   },
   "devDependencies": {
     "tsx": "^4.16.2",
-    "vite-node": "^2.1.8"
+    "vite-node": "^6.0.0"
   }
 }

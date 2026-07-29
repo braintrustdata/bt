@@ -10,6 +10,6 @@
     "braintrust": "^2.2.0"
   },
   "devDependencies": {
-    "vite-node": "^5.3.0"
+    "vite-node": "^6.0.0"
   }
 }
