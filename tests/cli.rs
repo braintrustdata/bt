@@ -110,6 +110,26 @@ fn top_level_help_shows_update_not_self() {
 }
 
 #[test]
+fn daemon_help_exposes_embedded_tracing_commands() {
+    bt_command()
+        .args(["daemon", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("serve"))
+        .stdout(predicate::str::contains("hook"))
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("replay"));
+
+    bt_command()
+        .args(["daemon", "hook", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--source"))
+        .stdout(predicate::str::contains("--flush-on-turn-end"))
+        .stdout(predicate::str::contains("--experiment-id"));
+}
+
+#[test]
 fn topics_report_help_accepts_global_org_short_conflict_free() {
     bt_command()
         .args([
