@@ -445,6 +445,9 @@ struct AuthLoginArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+To choose an OAuth login to remove without using the interactive picker, use `--oauth --app-url ...` or `--org org-name` if the org name is unique accross logins
+")]
 struct AuthLogoutArgs {
     /// Only consider OAuth logins
     #[arg(long, conflicts_with = "api_key_hint")]
