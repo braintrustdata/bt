@@ -190,10 +190,6 @@ fn sanitized_env_keys() -> &'static [&'static str] {
     ]
 }
 
-fn auth_logins_command(cwd: &Path, config_dir: &Path) -> Command {
-    auth_sub_command(cwd, config_dir, &["logins"])
-}
-
 #[derive(Debug, Clone)]
 struct MockProject {
     id: String,
@@ -703,52 +699,46 @@ fn functions_help_lists_push_and_pull() {
     assert!(stdout.contains("pull"));
 }
 
-#[test]
-fn auth_logins_ignores_api_key_env_override() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_api_key_uses_urls_but_not_context_from_config() {
+    let server = MockServer::start(Arc::new(MockServerState::default())).await;
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
+    let bt_dir = config_dir.path().join("bt");
+    fs::create_dir_all(&bt_dir).expect("create bt config dir");
+    fs::write(
+        bt_dir.join("config.json"),
+        serde_json::json!({
+            "org": "stale-org",
+            "project": "stale-project",
+            "app_url": server.base_url.clone(),
+            "api_url": server.base_url.clone(),
+        })
+        .to_string(),
+    )
+    .expect("write active config");
 
-    let output = auth_logins_command(cwd.path(), config_dir.path())
-        .env("BRAINTRUST_API_KEY", "test-key")
+    let output = Command::new(bt_binary_path())
+        .args(["status", "--api-key", "test-key", "--json"])
+        .current_dir(cwd.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
+        .env_remove("BRAINTRUST_ORG_NAME")
+        .env_remove("BRAINTRUST_DEFAULT_PROJECT")
+        .env_remove("BRAINTRUST_APP_URL")
+        .env_remove("BRAINTRUST_API_URL")
         .output()
-        .expect("run bt auth logins with api key env");
+        .expect("run bt status");
+    server.stop().await;
 
     assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("No saved auth logins. Run `bt auth login` to create one."));
-    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
-}
-
-#[test]
-fn auth_logins_ignores_api_key_from_dotenv() {
-    let cwd = tempdir().expect("create temp cwd");
-    let config_dir = tempdir().expect("create temp config dir");
-    fs::write(cwd.path().join(".env"), "BRAINTRUST_API_KEY=test-key\n").expect("write .env");
-
-    let output = auth_logins_command(cwd.path(), config_dir.path())
-        .env_remove("BRAINTRUST_API_KEY")
-        .output()
-        .expect("run bt auth logins with dotenv api key");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("No saved auth logins. Run `bt auth login` to create one."));
-    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
-}
-
-#[test]
-fn auth_logins_json_with_no_profiles_emits_empty_array() {
-    let cwd = tempdir().expect("create temp cwd");
-    let config_dir = tempdir().expect("create temp config dir");
-
-    let output = auth_logins_command(cwd.path(), config_dir.path())
-        .arg("--json")
-        .output()
-        .expect("run bt auth logins --json");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    assert_eq!(stdout, "[]");
+    let status: Value = serde_json::from_slice(&output.stdout).expect("parse status JSON");
+    assert_eq!(status["org"], "test-org");
+    assert_eq!(status["org_id"], "org_mock");
+    assert!(status["project"].is_null());
+    assert!(status["project_id"].is_null());
+    assert_eq!(status["auth_method"], "api_key");
+    assert_eq!(status["source"], "cli");
 }
 
 /// Seed a synthetic API-key auth login so refresh can fail before touching the
@@ -764,7 +754,7 @@ fn seed_api_key_profile(config_dir: &Path) {
 
 fn auth_sub_command(cwd: &Path, config_dir: &Path, sub: &[&str]) -> Command {
     // Shared builder for `bt auth <sub>` so each auth subcommand inherits the
-    // same isolated config dir / env scrubbing as `auth logins`.
+    // same isolated config dir and environment scrubbing.
     let mut cmd = Command::new(bt_binary_path());
     cmd.arg("auth")
         .args(sub)

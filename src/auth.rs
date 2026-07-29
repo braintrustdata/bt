@@ -415,7 +415,6 @@ struct OAuthErrorResponse {
 Examples:
   bt auth login --global
   bt auth login --oauth --org test-org --local
-  bt auth logins --org test-org --prefer-api-key
   bt auth refresh --org test-org
   bt auth logout
   bt auth logout --org test-org --oauth
@@ -431,14 +430,9 @@ enum AuthCommand {
     Login(AuthLoginArgs),
     /// Force-refresh the OAuth access token for the selected instance
     Refresh,
-    /// List saved auth logins and check connection status
-    Logins(AuthLoginsArgs),
     /// Log out by removing a saved auth login
     Logout(AuthLogoutArgs),
 }
-
-#[derive(Debug, Clone, Args)]
-struct AuthLoginsArgs {}
 
 #[derive(Debug, Clone, Args)]
 struct AuthLoginArgs {
@@ -481,7 +475,6 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
             run_login_set(&base, login_args).await
         }
         AuthCommand::Refresh => run_login_refresh(&base).await,
-        AuthCommand::Logins(logins_args) => run_logins(&base, logins_args).await,
         AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args).await,
     }
 }
@@ -1126,9 +1119,7 @@ async fn resolve_saved_auth_slot(
         .get(slot)
         .map(|profile| profile.auth_kind)
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "saved auth login not found; run `bt auth logins` to see available logins"
-            )
+            anyhow::anyhow!("saved auth login not found; run `bt status` to see available logins")
         })?;
     match kind {
         AuthKind::ApiKey => resolve_api_key_profile_auth(base, store, cfg_org, slot),
@@ -1146,7 +1137,7 @@ fn resolve_api_key_profile_auth(
         .profiles
         .get(profile_name)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("saved auth login not found; run `bt auth logins`"))?;
+        .ok_or_else(|| anyhow::anyhow!("saved auth login not found; run `bt status`"))?;
     if let Some(requested_org) = effective_org_name(base, cfg_org) {
         if !profile_matches_org_identifier(&profile, requested_org) {
             bail!(
@@ -1310,7 +1301,7 @@ async fn load_oauth_access_token(
         .profiles
         .get(profile_name)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("saved OAuth login not found; run `bt auth logins`"))?;
+        .ok_or_else(|| anyhow::anyhow!("saved OAuth login not found; run `bt status`"))?;
     if let Some(cached) = load_valid_cached_oauth_access_token(
         profile_name,
         &profile,
@@ -1367,7 +1358,7 @@ async fn resolve_oauth_profile_auth(
         .profiles
         .get(profile_name)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("saved OAuth login not found; run `bt auth logins`"))?;
+        .ok_or_else(|| anyhow::anyhow!("saved OAuth login not found; run `bt status`"))?;
     let access_token = load_oauth_access_token(base, store, profile_name).await?;
     let auth = ResolvedAuth {
         api_key: Some(access_token),
@@ -1792,6 +1783,15 @@ async fn run_login_set(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         None => prompt_api_key()?,
     };
 
+    if matches!(
+        base.api_key_source,
+        Some(crate::args::ArgValueSource::EnvVariable)
+    ) {
+        eprintln!(
+            "Using BRAINTRUST_API_KEY to log in\nUse `bt auth login --oauth` to log in with OAuth in a web browser"
+        );
+    }
+
     let login_app_url = base
         .app_url
         .clone()
@@ -2082,7 +2082,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     )?
     .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OAuth login selected; pass --app-url <URL> or run `bt auth logins` to see available logins"
+                "no OAuth login selected; pass --app-url <URL> or run `bt status` to see available logins"
             )
         })?;
     let profile = store
@@ -2090,7 +2090,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
         .get(profile_name.as_str())
         .cloned()
         .ok_or_else(|| {
-            anyhow::anyhow!("OAuth login not found; run `bt auth logins` to see available logins")
+            anyhow::anyhow!("OAuth login not found; run `bt status` to see available logins")
         })?;
 
     let api_url = base
@@ -2338,77 +2338,66 @@ async fn filter_auth_store_for_org(
     Ok(filtered)
 }
 
-async fn run_logins(base: &BaseArgs, _args: AuthLoginsArgs) -> Result<()> {
+pub(crate) struct SavedLoginStatus {
+    pub logins: Vec<ProfileVerification>,
+    pub credentials_path: PathBuf,
+}
+
+/// Load and verify the saved logins shown at the top of `bt status`.
+pub(crate) async fn saved_login_status() -> Result<SavedLoginStatus> {
     let mut store = load_auth_store()?;
-    let requested_org = matches!(
-        base.org_name_source,
-        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
-    )
-    .then(|| base.org_name.as_deref())
-    .flatten();
-    let has_url_filter = matches!(
-        base.app_url_source,
-        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
-    ) || matches!(
-        base.api_url_source,
-        Some(crate::args::ArgValueSource::CommandLine | crate::args::ArgValueSource::EnvVariable)
-    );
-    let has_filter = requested_org.is_some() || base.prefer_api_key || has_url_filter;
-    let mut filter_base = base.clone();
-    if filter_base.app_url_source.is_none() {
-        filter_base.app_url = None;
-    }
-    if filter_base.api_url_source.is_none() {
-        filter_base.api_url = None;
-    }
-    let candidates = filter_auth_store(
-        &filter_base,
-        &store,
-        base.prefer_api_key.then_some(AuthKind::ApiKey),
-        None,
-    );
-    let filtered =
-        filter_auth_store_for_org(&filter_base, &mut store, candidates, requested_org).await?;
-    if filtered.profiles.is_empty() {
-        return emit_result(base.json, serde_json::json!([]), || {
-            if store.profiles.is_empty() && !has_filter {
-                println!("No saved auth logins. Run `bt auth login` to create one.");
-            }
+    let credentials_path = auth_store_path()?;
+    if store.profiles.is_empty() {
+        return Ok(SavedLoginStatus {
+            logins: Vec::new(),
+            credentials_path,
         });
     }
 
-    let verifications = verify_all_profiles_from_store(&filtered).await;
-    reconcile_verified_auth_slots(&mut store, &verifications)?;
-    let all_network_errors = verifications
+    let mut logins = verify_all_profiles_from_store(&store).await;
+    reconcile_verified_auth_slots(&mut store, &logins)?;
+    if logins
         .iter()
-        .all(|v| v.status == "error" && !v.error.as_deref().unwrap_or("").contains("invalid"));
-    if all_network_errors {
-        eprintln!("Could not reach Braintrust API. Showing saved auth logins:");
-        print_saved_profiles(&filtered, base.json)?;
-        return Ok(());
-    }
-
-    if base.json {
-        println!("{}", serde_json::to_string(&verifications)?);
-        return Ok(());
-    }
-
-    for v in &verifications {
-        let cmd_status = match v.status.as_str() {
-            "ok" => crate::ui::CommandStatus::Success,
-            "expired" => crate::ui::CommandStatus::Warning,
-            _ => crate::ui::CommandStatus::Error,
-        };
-        crate::ui::print_command_status(cmd_status, &format_verification_line(v));
-    }
-
-    if base.verbose {
-        if let Ok(path) = auth_store_path() {
-            eprintln!("\nCredentials: {}", path.display());
+        .all(|login| login.status == "error" && login.error.as_deref() != Some("invalid API key"))
+    {
+        for login in &mut logins {
+            login.status = "unchecked".to_string();
+            login.error = None;
         }
     }
 
-    Ok(())
+    Ok(SavedLoginStatus {
+        logins,
+        credentials_path,
+    })
+}
+
+pub(crate) fn print_saved_login_status(base: &BaseArgs, status: &SavedLoginStatus) {
+    if status.logins.is_empty() {
+        println!("No saved auth logins. Run `bt auth login` to create one.");
+    } else if status
+        .logins
+        .iter()
+        .all(|login| login.status == "unchecked")
+    {
+        eprintln!("Could not reach Braintrust API. Showing saved auth logins:");
+        for login in &status.logins {
+            eprintln!("  {}", format_verification_line(login));
+        }
+    } else {
+        for login in &status.logins {
+            let cmd_status = match login.status.as_str() {
+                "ok" => crate::ui::CommandStatus::Success,
+                "expired" => crate::ui::CommandStatus::Warning,
+                _ => crate::ui::CommandStatus::Error,
+            };
+            crate::ui::print_command_status(cmd_status, &format_verification_line(login));
+        }
+    }
+
+    if base.verbose {
+        eprintln!("\nCredentials: {}\n", status.credentials_path.display());
+    }
 }
 
 fn auth_profile_json(profile: &AuthProfile, status: &str) -> serde_json::Value {
@@ -2433,7 +2422,7 @@ fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<
 
     let mut store = load_auth_store()?;
     let profile = store.profiles.get(profile_name).cloned().ok_or_else(|| {
-        anyhow::anyhow!("auth login not found; run `bt auth logins` to see available logins")
+        anyhow::anyhow!("auth login not found; run `bt status` to see available logins")
     })?;
     let label = auth_slot_label(&profile);
 
@@ -2514,7 +2503,7 @@ async fn run_login_logout(base: BaseArgs, args: AuthLogoutArgs) -> Result<()> {
     let cfg_org = config_auth_context(&base);
     let current_org = effective_org_name(&base, &cfg_org);
     let profile_name = match candidates.len() {
-        0 => bail!("no matching auth login found; run `bt auth logins` to see available logins"),
+        0 => bail!("no matching auth login found; run `bt status` to see available logins"),
         1 => candidates[0].to_string(),
         _ if ui::can_prompt() => select_profile_from_store(
             "Select auth login to log out",
@@ -2619,8 +2608,14 @@ fn build_verification(
             .org_id
             .clone()
             .filter(|org_id| !org_id.trim().is_empty()),
-        user_name: jwt_id.as_ref().and_then(|j| j.name.clone()),
-        user_email: jwt_id.as_ref().and_then(|j| j.email.clone()),
+        user_name: jwt_id
+            .as_ref()
+            .and_then(|j| j.name.clone())
+            .or_else(|| profile.user_name.clone()),
+        user_email: jwt_id
+            .as_ref()
+            .and_then(|j| j.email.clone())
+            .or_else(|| profile.email.clone()),
         api_key_hint,
         app_url: profile.app_url.clone(),
         api_url: profile.api_url.clone(),
@@ -2685,7 +2680,7 @@ async fn verify_profile_full(name: &str, profile: &AuthProfile) -> ProfileVerifi
             } else {
                 ProfileStatus::Error(e.to_string())
             };
-            mk(status, None, hint)
+            mk(status, jwt_id, hint)
         }
     }
 }
@@ -2797,6 +2792,15 @@ fn format_verification_line(v: &ProfileVerification) -> String {
             Some(hint) => parts.push(format!("{hint} credential missing")),
             None => parts.push("credential missing".into()),
         },
+        "unchecked" => {
+            if let Some(id) = identity_label(
+                v.user_name.as_deref(),
+                v.user_email.as_deref(),
+                v.api_key_hint.as_deref(),
+            ) {
+                parts.push(id);
+            }
+        }
         _ => {
             if let Some(ref e) = v.error {
                 parts.push(e.clone());
@@ -2804,48 +2808,6 @@ fn format_verification_line(v: &ProfileVerification) -> String {
         }
     }
     parts.join(" — ")
-}
-
-fn profiles_grouped_by_org(store: &AuthStore) -> Vec<(&str, &AuthProfile)> {
-    let mut profiles = store
-        .profiles
-        .iter()
-        .map(|(name, profile)| (name.as_str(), profile))
-        .collect::<Vec<_>>();
-    profiles.sort_by(|(a_name, a), (b_name, b)| {
-        profile_org(a)
-            .cmp(profile_org(b))
-            .then_with(|| a_name.cmp(b_name))
-    });
-    profiles
-}
-
-fn print_saved_profiles(store: &AuthStore, json: bool) -> Result<()> {
-    let profiles = profiles_grouped_by_org(store);
-    if json {
-        let output: Vec<serde_json::Value> = profiles
-            .into_iter()
-            .map(|(_, p)| {
-                serde_json::json!({
-                    "auth": auth_kind_label(p.auth_kind),
-                    "org": p.org_name,
-                    "org_id": p.org_id,
-                    "user_name": p.user_name,
-                    "user_email": p.email,
-                    "api_key_hint": p.api_key_hint,
-                    "app_url": p.app_url,
-                    "api_url": p.api_url,
-                    "status": "unchecked"
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string(&output)?);
-    } else {
-        for (_, profile) in profiles {
-            println!("  {}", auth_slot_label(profile));
-        }
-    }
-    Ok(())
 }
 
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
@@ -4201,7 +4163,7 @@ fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
     let migrated = migrate_auth_store(store.clone());
     if migrated != store {
         // The migrated store is already usable in memory, so a failed write-back
-        // must not break read-only commands (`bt status`, `bt auth logins`). Warn
+        // must not break read-only commands such as `bt status`. Warn
         // and proceed; the next writable run retries the migration.
         match save_auth_store_to_path(path, &migrated) {
             // Only prune once the collapsed store is durably on disk; otherwise
@@ -5936,37 +5898,6 @@ mod tests {
                 (Some("test-org-a"), "profile-m"),
                 (Some("test-org-a"), "profile-z"),
                 (Some("test-org-b"), "profile-a"),
-            ]
-        );
-    }
-
-    #[test]
-    fn saved_auth_logins_are_grouped_by_org() {
-        let mut store = AuthStore::default();
-        for (name, org) in [
-            ("profile-z", "test-org-a"),
-            ("profile-a", "test-org-b"),
-            ("profile-m", "test-org-a"),
-        ] {
-            store.profiles.insert(
-                name.into(),
-                AuthProfile {
-                    org_name: Some(org.into()),
-                    ..Default::default()
-                },
-            );
-        }
-
-        let order = profiles_grouped_by_org(&store)
-            .into_iter()
-            .map(|(name, profile)| (profile_org(profile), name))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            order,
-            vec![
-                ("test-org-a", "profile-m"),
-                ("test-org-a", "profile-z"),
-                ("test-org-b", "profile-a"),
             ]
         );
     }

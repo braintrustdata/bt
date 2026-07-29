@@ -1,8 +1,8 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Args;
 use serde::Serialize;
 
-use crate::args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
+use crate::args::{ArgValueSource, BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL};
 use crate::auth;
 use crate::config;
 
@@ -17,6 +17,8 @@ pub struct StatusArgs {}
 
 #[derive(Serialize)]
 struct StatusOutput {
+    logins: Vec<auth::ProfileVerification>,
+    credentials: String,
     org: Option<String>,
     org_id: Option<String>,
     project: Option<String>,
@@ -45,6 +47,7 @@ fn format_auth(p: &auth::ProfileInfo) -> String {
 }
 
 pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
+    let saved_logins = auth::saved_login_status().await?;
     let global_path = config::global_path().ok();
     let global_cfg = config::load_global().unwrap_or_default();
     let local_path = config::local_path();
@@ -54,7 +57,7 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         .unwrap_or_default();
 
     let overrides = ConfigOverrides::from_base(&base);
-    let (org, mut project, source) = resolve_config(
+    let (mut org, mut project, mut source) = resolve_config(
         overrides,
         &global_cfg,
         &local_cfg,
@@ -62,49 +65,97 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         &global_path,
     );
     let merged_cfg = global_cfg.merge(&local_cfg);
+    let app_url = base
+        .app_url
+        .clone()
+        .or_else(|| merged_cfg.app_url.clone())
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let api_url = base
+        .api_url
+        .clone()
+        .or_else(|| merged_cfg.api_url.clone())
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let auth_info = auth::active_auth_info(&base, org.as_deref())?;
+    let ad_hoc_api_key_source = base.api_key_source.filter(|_| {
+        base.api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+            && auth_info
+                .as_ref()
+                .is_some_and(|info| info.auth_method == "api_key")
+    });
 
-    if base
-        .project
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty)
-    {
-        project = config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
-    }
-
-    let org_id = if base.org_name_source.is_some() {
-        None
+    let (org_id, project_id) = if let Some(api_key_source) = ad_hoc_api_key_source {
+        let requested_org = base
+            .org_name_source
+            .and_then(|_| config::org_option(base.org_name.as_deref()));
+        let mut orgs = auth::list_available_orgs_for_api_key(
+            base.api_key.as_deref().expect("non-empty API key checked"),
+            &app_url,
+        )
+        .await?;
+        orgs.retain(|org| {
+            org.api_url
+                .as_deref()
+                .is_none_or(|url| config::urls_equal(url, &api_url))
+        });
+        let selected_org = match requested_org {
+            Some(requested) => orgs.into_iter().find(|org| {
+                org.id == requested
+                    || org.name == requested
+                    || org.name.eq_ignore_ascii_case(requested)
+            }),
+            None if orgs.is_empty() => None,
+            None if orgs.len() == 1 => orgs.pop(),
+            None => bail!("API key belongs to multiple organizations; pass --org <ORG>"),
+        }
+        .ok_or_else(|| anyhow::anyhow!("API key has no matching organization"))?;
+        org = Some(selected_org.name.clone());
+        project = None;
+        source = Some(
+            if api_key_source == ArgValueSource::CommandLine {
+                "cli"
+            } else {
+                "env"
+            }
+            .to_string(),
+        );
+        (Some(selected_org.id), None)
     } else {
-        base.org_id.clone()
+        if base
+            .project
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            project = config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
+        }
+
+        let org_id = if base.org_name_source.is_some() {
+            None
+        } else {
+            base.org_id.clone()
+        };
+        let configured_project =
+            config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
+        let project_id = (base.project_source.is_none()
+            && configured_project.is_some()
+            && configured_project == project)
+            .then(|| merged_cfg.project_id.clone())
+            .flatten();
+        (org_id, project_id)
     };
-    let configured_project =
-        config::project_from_config_for_context(&base, &merged_cfg, org.as_deref());
-    let project_id = (base.project_source.is_none()
-        && configured_project.is_some()
-        && configured_project == project)
-        .then(|| merged_cfg.project_id.clone())
-        .flatten();
-    let app_url = Some(
-        base.app_url
-            .clone()
-            .or_else(|| merged_cfg.app_url.clone())
-            .unwrap_or_else(|| DEFAULT_APP_URL.to_string()),
-    );
-    let api_url = Some(
-        base.api_url
-            .clone()
-            .or_else(|| merged_cfg.api_url.clone())
-            .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
-    );
+
     if base.json {
         let output = StatusOutput {
+            logins: saved_logins.logins,
+            credentials: saved_logins.credentials_path.display().to_string(),
             org: org.clone(),
             org_id,
             project,
             project_id,
-            app_url,
-            api_url,
+            app_url: Some(app_url),
+            api_url: Some(api_url),
             user_name: auth_info.as_ref().and_then(|p| p.user_name.clone()),
             user_email: auth_info.as_ref().and_then(|p| p.email.clone()),
             api_key_hint: auth_info.as_ref().and_then(|p| p.api_key_hint.clone()),
@@ -115,19 +166,22 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
+    auth::print_saved_login_status(&base, &saved_logins);
     if base.verbose {
         println!("org: {}", org.as_deref().unwrap_or("(unset)"));
         println!("org_id: {}", org_id.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
         println!("project_id: {}", project_id.as_deref().unwrap_or("(unset)"));
-        println!("app_url: {}", app_url.as_deref().unwrap_or(DEFAULT_APP_URL));
-        println!("api_url: {}", api_url.as_deref().unwrap_or(DEFAULT_API_URL));
-        if let Some(ref p) = auth_info {
-            println!("auth: {}", format_auth(p));
-        }
-        if let Some(src) = source {
-            println!("source: {src}");
-        }
+        println!("app_url: {app_url}");
+        println!("api_url: {api_url}");
+        println!(
+            "auth: {}",
+            auth_info
+                .as_ref()
+                .map(format_auth)
+                .unwrap_or_else(|| "(unset)".to_string())
+        );
+        println!("source: {}", source.as_deref().unwrap_or("(unset)"));
     } else {
         let header = match org.as_deref() {
             Some(org) => match project.as_deref() {

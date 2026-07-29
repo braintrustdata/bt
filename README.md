@@ -140,7 +140,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt init`     | Initialize `.bt/` config directory and link to a project           |
 | `bt auth`     | Authenticate with Braintrust                                       |
 | `bt switch`   | Switch instance, org, and project context                          |
-| `bt status`   | Show current org and project context                               |
+| `bt status`   | Show saved logins and current org/project context                  |
 | `bt datasets` | Manage datasets and dataset pipelines                              |
 | `bt eval`     | Run eval files (Unix only)                                         |
 | `bt sql`      | Run SQL queries against Braintrust                                 |
@@ -323,10 +323,7 @@ Local version and pagination-key conversion helpers:
   - `bt auth login --oauth --org test-org`
   - You can pass `--no-browser` to print the URL without opening it automatically.
   - On remote/SSH hosts, paste the final callback URL if the localhost callback cannot be delivered.
-- List saved auth logins:
-  - `bt auth logins`
-  - `bt auth logins --org test-org` dynamically lists only credentials that can use that organization.
-  - `bt auth logins --prefer-api-key` lists API-key logins only.
+- Inspect saved auth logins and the active context with `bt status`.
 - Log out:
   - `bt auth logout` — choose from all saved logins interactively
   - `bt auth logout --app-url https://www.example.test --oauth`
@@ -375,11 +372,12 @@ Global config is `~/.config/bt/config.json`; local config is the first discovere
 
 ## `bt status`
 
-Show current org and project context:
+Show saved auth logins and the current org/project context:
 
-- `bt status` — display current org, project, selected auth method, and config source
-- `bt status --verbose` — show detailed config and auth resolution
-- `bt status -j` — JSON output
+- `bt status` — check saved login status, then display the active org, project, auth method, URLs, credential path, and config source
+- `bt status --api-key sk-...` — identify the key's org using the active app/API URLs; config org/project values are ignored
+- `bt status --quiet` — show compact context output
+- `bt status --json` — emit the saved logins and active context as JSON
 
 ## `bt setup` and `bt docs`
 

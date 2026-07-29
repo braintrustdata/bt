@@ -80,7 +80,7 @@ Data & evaluation
 Additional
   docs         Manage workflow docs for coding agents
   setup        Configure Braintrust setup flows
-  status       Show current org and project context
+  status       Show saved logins and current context
   update       Update bt in-place
 
 Flags
@@ -163,7 +163,7 @@ enum Commands {
     Util(CLIArgs<util_cmd::UtilArgs>),
     /// Switch instance, org, and project context
     Switch(CLIArgs<switch::SwitchArgs>),
-    /// Show current org and project context
+    /// Show saved auth logins and current org/project context
     Status(CLIArgs<status::StatusArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
@@ -509,7 +509,7 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
 fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
     eprintln!("error: {err}");
     if code == ExitCode::Auth && !missing_credential {
-        eprintln!("Your credentials may be expired or invalid. For OAuth login, try `bt auth refresh --org <ORG>`; if refresh fails, re-run `bt auth login --oauth --org <ORG>`. Run `bt auth logins` and `bt status` to inspect auth status.");
+        eprintln!("Your credentials may be expired or invalid. For OAuth login, try `bt auth refresh --org <ORG>`; if refresh fails, re-run `bt auth login --oauth --org <ORG>`. Run `bt status` to inspect auth status.");
     }
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
