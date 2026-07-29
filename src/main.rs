@@ -79,7 +79,7 @@ Data & evaluation
 
 Additional
   docs         Manage workflow docs for coding agents
-  setup        Configure Braintrust setup flows
+  setup        Configure Braintrust setup flows (deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh)
   status       Show current org and project context
   update       Update bt in-place
 
