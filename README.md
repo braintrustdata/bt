@@ -139,8 +139,8 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | ------------- | ------------------------------------------------------------------ |
 | `bt init`     | Initialize `.bt/` config directory and link to a project           |
 | `bt auth`     | Authenticate with Braintrust                                       |
-| `bt switch`   | Switch org and project context                                     |
-| `bt status`   | Show current org and project context                               |
+| `bt switch`   | Switch instance, org, and project context                          |
+| `bt status`   | Show saved logins and current org/project context                  |
 | `bt datasets` | Manage datasets and dataset pipelines                              |
 | `bt eval`     | Run eval files (Unix only)                                         |
 | `bt sql`      | Run SQL queries against Braintrust                                 |
@@ -312,54 +312,71 @@ Local version and pagination-key conversion helpers:
 
 ## `bt auth`
 
-- Authenticate interactively (prompts for auth method, profile name defaults to org name):
+- Authenticate interactively:
   - `bt auth login`
-  - First prompt chooses: `OAuth (browser)` (default) or `API key`.
-  - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
-  - After login, `bt` updates the active profile/org context immediately. If `--project` is set, it also switches that project; otherwise it clears any stale default project for the new login.
-  - `bt` confirms the resolved API URL before saving.
-- Login with OAuth (browser-based, stores refresh token in secure credential store):
-  - `bt auth login --oauth --profile work`
-  - You can pass `--no-browser` to print the URL without auto-opening.
-  - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
-- List profiles:
-  - `bt auth profiles`
-- Log out (remove a saved profile):
-  - `bt auth logout`
-  - `bt auth logout --force` (skip confirmation)
-- Show current auth source/profile:
-  - `bt auth status`
-- Force-refresh OAuth access token for debugging:
-  - `bt auth refresh --profile work`
+  - First choose `OAuth (browser)` (default) or `API key`, then choose an organization.
+  - OAuth is stored once per Braintrust instance, identified by app URL, and can authenticate every organization available to that user in the instance.
+  - API-key logins remain organization-scoped; multiple keys for one organization remain distinct.
+  - Login only saves credentials; use `bt init` or `bt switch` to configure the active org and project.
+- Login with OAuth:
+  - `bt auth login --oauth --org test-org`
+  - You can pass `--no-browser` to print the URL without opening it automatically.
+  - On remote/SSH hosts, paste the final callback URL if the localhost callback cannot be delivered.
+- Inspect saved auth logins and the active context with `bt status`.
+- Log out:
+  - `bt auth logout` — choose from all saved logins interactively
+  - `bt auth logout --app-url https://www.example.test --oauth`
+  - `bt auth logout --org test-org --api-key-hint sk-****abcde`
+  - `bt auth logout --force` — skip confirmation
+- Force-refresh the OAuth login for the selected instance:
+  - `bt auth refresh --app-url https://www.example.test`
 
 Auth resolution order for commands is:
 
-1. Explicit `--profile`
-2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
-3. `BRAINTRUST_PROFILE`
-4. Org-based profile match (profile whose org matches `--org`/config org)
-5. Single-profile auto-select (if only one profile exists)
-6. Interactive profile picker (if multiple profiles exist and a TTY is available)
+1. Explicit `--api-key sk-...`
+2. `--prefer-api-key` / `BRAINTRUST_PREFER_API_KEY` (`BRAINTRUST_API_KEY`, then a matching stored API key, then matching OAuth)
+3. OAuth for the selected Braintrust instance when it can access the selected organization
+4. `BRAINTRUST_API_KEY`
+5. A matching stored API key
 
-On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
+OAuth credentials are matched by app URL. API-key credentials are matched by app URL, API URL, and organization. Explicit flags override environment variables, which override local config, global config, and finally the built-in Braintrust URLs.
+
+On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If secure storage is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
+
+## `bt init`
+
+`bt init` creates a project-local `.bt/config.json`. It walks upward to the first `.bt`, `.git`, home, or filesystem-root boundary. A git marker (directory or file) selects that repository root; reaching home/root or an existing `.bt` is an error.
+
+- `bt init --org test-org --project test-project` — initialize the containing repository
+- `bt init --here` — create in the current directory without walking (including at home or `/`)
+- `bt init --force` — overwrite an existing discovered `.bt/config.json`; it does not change discovery
+
+The saved context includes the Braintrust instance URLs, organization name and ID, and project name and ID.
 
 ## `bt switch`
 
-Interactively switch org and project context:
+`bt switch` changes context without selecting a credential. It chooses a Braintrust instance, discovers the organizations available through that instance's credentials, and then chooses a project.
 
-- `bt switch` — interactive picker for org and project
-- `bt switch myproject` — switch to a project by name
-- `bt switch myorg/myproject` — switch to a specific org and project
+- `bt switch`
+- `bt switch test-project`
+- `bt switch test-org/test-project`
 - `bt switch --global` — persist to global config (`~/.config/bt/config.json`)
-- `bt switch --local` — persist to local config (`.bt/config.json`)
+- `bt switch --local` — update an existing local config (`.bt/config.json`); it never creates one
+
+A sole instance, organization, or project is selected automatically. With an existing local config and no scope flag, interactive mode asks for global/local (default: local); non-interactive mode requires `--global` or `--local`.
+
+## Config context merging
+
+Global config is `~/.config/bt/config.json`; local config is the first discovered `.bt/config.json`. Both use the fields `org`, `org_id`, `project`, `project_id`, `app_url`, and `api_url`. Local values win. Organization IDs stay coupled to organization names, and organization/project context is inherited only within the same app URL. Legacy `profile` fields and obsolete empty cross-org contexts are ignored; unknown extra keys are preserved during updates.
 
 ## `bt status`
 
-Show current org and project context:
+Show saved auth logins and the current org/project context:
 
-- `bt status` — display current org, project, and config source
-- `bt status --verbose` — show detailed config resolution
-- `bt status -j` — JSON output
+- `bt status` — check saved login status, then display the active org, project, auth method, URLs, credential path, and config source
+- `bt status --api-key sk-...` — identify the key's org using the active app/API URLs; config org/project values are ignored
+- `bt status --quiet` — show compact context output
+- `bt status --json` — emit the saved logins and active context as JSON
 
 ## `bt setup` and `bt docs`
 

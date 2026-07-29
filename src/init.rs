@@ -1,93 +1,105 @@
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use clap::Args;
 
 use crate::{
-    args::BaseArgs,
-    auth::{self, login},
-    config,
-    http::ApiClient,
-    ui::{is_interactive, print_command_status, select_project, CommandStatus, ProjectSelectMode},
+    args::{ArgValueSource, BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
+    config, switch,
+    ui::{print_command_status, CommandStatus},
 };
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
   bt init
-  bt init --org acme --project my-app
+  bt init --org test-org --project test-project
+  bt init --here
+  bt init --here --force
 ")]
-pub struct InitArgs {}
+pub struct InitArgs {
+    /// Create .bt/config.json in the current directory without searching upward.
+    ///
+    /// Bypasses the normal home and filesystem-root search boundaries, so it
+    /// also applies when the current directory is ~ or /.
+    #[arg(long)]
+    here: bool,
 
-pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
-    let config_path = config::local_save_path()?;
-    if config_path.exists() {
-        if base.json {
-            let existing = config::load_file(&config_path);
-            let payload = serde_json::json!({
-                "initialized": false,
-                "status": "already-initialized",
-                "org": existing.org,
-                "project": existing.project,
-                "path": config_path.display().to_string(),
-            });
-            println!("{}", serde_json::to_string(&payload)?);
-        } else {
-            print_command_status(CommandStatus::Warning, "Already Initialized");
-        }
-        return Ok(());
-    }
+    /// Overwrite an existing .bt/config.json. Does not change discovery.
+    #[arg(long, short = 'f')]
+    force: bool,
+}
 
-    eprintln!("Link to a Braintrust project...");
-
-    let (org, project) = if let (Some(o), Some(p)) = (&base.org_name, &base.project) {
-        (o.clone(), p.clone())
-    } else if !is_interactive() {
-        bail!("--org and --project required in non-interactive mode");
+pub async fn run(base: BaseArgs, args: InitArgs) -> Result<()> {
+    let config_path = config::init_target(args.here, args.force)?;
+    let current_cfg = config::load().unwrap_or_default();
+    let requested_org = matches!(
+        base.org_name_source,
+        Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
+    )
+    .then(|| base.org_name.as_deref())
+    .flatten();
+    let (instance, org, project) = switch::select_context(
+        &base,
+        requested_org,
+        base.project.as_deref(),
+        &current_cfg,
+        Some("Link to project"),
+    )
+    .await?;
+    let api_url = if matches!(
+        base.api_url_source,
+        Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
+    ) {
+        base.api_url.clone()
     } else {
-        let mut login_base = base.clone();
-        if login_base.org_name.is_none() && login_base.profile.is_none() {
-            if let Some(profile) = auth::select_profile_interactive(None)? {
-                login_base.profile = Some(profile);
-            }
-        }
-        let ctx = login(&login_base).await?;
-        let client = ApiClient::new(&ctx)?;
+        org.api_url.clone().or_else(|| {
+            config::urls_equal(
+                current_cfg.app_url.as_deref().unwrap_or(DEFAULT_APP_URL),
+                &instance.app_url,
+            )
+            .then(|| current_cfg.api_url.clone())
+            .flatten()
+        })
+    }
+    .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
-        let org = client.org_name().to_string();
-        let project = select_project(
-            &client,
-            None,
-            Some("Link to project"),
-            ProjectSelectMode::ExistingOnly,
+    // With --force, preserve unknown passthrough keys from the old file.
+    let mut cfg = config::load_file(&config_path);
+    cfg.set_context(
+        (org.name.as_str(), org.id.as_str()),
+        Some((project.name.as_str(), project.id.as_str())),
+        &instance.app_url,
+        &api_url,
+    );
+
+    config::save_file(&config_path, &cfg).with_context(|| {
+        format!(
+            "authentication succeeded, but initialization failed: could not create or write {}; any credential updates remain saved",
+            config_path.display()
         )
-        .await?
-        .name;
-
-        (org, project)
-    };
-
-    let cfg = config::Config {
-        org: Some(org.clone()),
-        project: Some(project.clone()),
-        ..Default::default()
-    };
-
-    let written_path = config::save_local(&cfg, true)?;
+    })?;
 
     if base.json {
         let payload = serde_json::json!({
             "initialized": true,
             "status": "created",
-            "org": org,
-            "project": project,
-            "path": written_path.display().to_string(),
+            "org": org.name,
+            "org_id": org.id,
+            "project": project.name,
+            "project_id": project.id,
+            "app_url": instance.app_url,
+            "api_url": api_url,
+            "path": config_path.display().to_string(),
         });
         println!("{}", serde_json::to_string(&payload)?);
     } else {
         print_command_status(
             CommandStatus::Success,
-            &format!("Project linked to {org}/{project}"),
+            &format!("Project linked to {}/{}", org.name, project.name),
         );
-        print_command_status(CommandStatus::Success, "Created .bt/config.json");
+        print_command_status(
+            CommandStatus::Success,
+            &format!("Created {}", config_path.display()),
+        );
     }
 
     Ok(())

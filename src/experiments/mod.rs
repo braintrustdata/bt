@@ -219,17 +219,8 @@ fn apply_experiment_url_hints_to_base(
         }
     }
 
-    let has_profile_override = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
-    let has_org_override = base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
-    if !has_profile_override && !has_org_override {
+    let has_org_override = base.org_name_source.is_some();
+    if !has_org_override {
         if let Some(org) = parsed_url
             .org
             .as_deref()
@@ -237,6 +228,7 @@ fn apply_experiment_url_hints_to_base(
             .filter(|v| !v.is_empty())
         {
             base.org_name = Some(org.to_string());
+            base.org_id = None;
         }
     }
 
@@ -380,6 +372,32 @@ mod tests {
                 comparison_experiment: Some("challenger".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn comparison_url_org_overrides_config_but_not_cli() {
+        let parsed = ParsedExperimentCompareUrl {
+            org: Some("url-org".to_string()),
+            project: None,
+            base_experiment: None,
+            comparison_experiment: None,
+        };
+        let config_base = BaseArgs {
+            org_name: Some("config-org".to_string()),
+            org_id: Some("org_config".to_string()),
+            ..Default::default()
+        };
+        let updated = apply_experiment_url_hints_to_base(config_base, Some(&parsed));
+        assert_eq!(updated.org_name.as_deref(), Some("url-org"));
+        assert_eq!(updated.org_id, None);
+
+        let cli_base = BaseArgs {
+            org_name: Some("cli-org".to_string()),
+            org_name_source: Some(crate::args::ArgValueSource::CommandLine),
+            ..Default::default()
+        };
+        let updated = apply_experiment_url_hints_to_base(cli_base, Some(&parsed));
+        assert_eq!(updated.org_name.as_deref(), Some("cli-org"));
     }
 
     #[test]

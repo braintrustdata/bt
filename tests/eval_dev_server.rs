@@ -71,7 +71,7 @@ fn start_mock_auth_server() -> (u16, thread::JoinHandle<()>) {
         .expect("set mock listener blocking");
 
     let handle = thread::spawn(move || {
-        let response_body = r#"{"org_info": [{"name": "test-org"}]}"#;
+        let response_body = r#"{"org_info": [{"id": "org_test", "name": "test-org"}]}"#;
         let http_response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             response_body.len(),
