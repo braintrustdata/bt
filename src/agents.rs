@@ -7,9 +7,12 @@
 //! `../plugin-monorepo/bt-daemon/DESIGN.md` ("Dual consumption", auth handoff).
 
 use std::ffi::OsString;
+use std::process::Command;
 use std::sync::Arc;
 
+use anyhow::{bail, Context};
 use clap::{Args, Subcommand};
+use serde_json::Value;
 
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
@@ -28,6 +31,8 @@ pub struct AgentsArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum AgentsCommand {
+    /// Install the published Braintrust tracing plugin for a coding agent.
+    Setup(SetupArgs),
     /// Run the tracing daemon (foreground).
     Daemon(ServeArgs),
     /// Forward one coding-agent hook event (read from stdin) to the daemon.
@@ -37,6 +42,27 @@ enum AgentsCommand {
     /// Replay a journal file through the translators + sink.
     Replay(ReplayArgs),
 }
+
+#[derive(Debug, Clone, Args)]
+struct SetupArgs {
+    #[command(subcommand)]
+    agent: SetupAgent,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum SetupAgent {
+    /// Install the published Codex tracing plugin.
+    Codex,
+    /// Install the published Claude Code tracing plugin.
+    Claude,
+}
+
+const CODEX_MARKETPLACE: &str = "braintrust-codex-plugins";
+const CODEX_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-codex-plugin";
+const CODEX_PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
+const CLAUDE_MARKETPLACE: &str = "braintrust-claude-plugin";
+const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin";
+const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
 
 /// How the shim (re)launches the daemon: `bt agents daemon` from this same
 /// binary.
@@ -66,6 +92,117 @@ fn serve_options() -> ServeOptions {
     )
 }
 
+fn command_json(program: &str, args: &[&str]) -> anyhow::Result<Value> {
+    let output = Command::new(program).args(args).output().with_context(|| {
+        format!("failed to run `{program}`; install {program} and ensure it is on PATH")
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("`{program} {}` failed: {}", args.join(" "), stderr.trim());
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("`{program} {}` returned invalid JSON", args.join(" ")))
+}
+
+fn run_command(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    let status = Command::new(program).args(args).status().with_context(|| {
+        format!("failed to run `{program}`; install {program} and ensure it is on PATH")
+    })?;
+    if !status.success() {
+        bail!("`{program} {}` failed with {status}", args.join(" "));
+    }
+    Ok(())
+}
+
+fn codex_marketplace_installed(value: &Value) -> bool {
+    value
+        .get("marketplaces")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("name").and_then(Value::as_str) == Some(CODEX_MARKETPLACE))
+        })
+}
+
+fn codex_plugin_installed(value: &Value) -> bool {
+    value
+        .get("installed")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("pluginId").and_then(Value::as_str) == Some(CODEX_PLUGIN))
+        })
+}
+
+fn claude_marketplace_installed(value: &Value) -> bool {
+    value.as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.get("name").and_then(Value::as_str) == Some(CLAUDE_MARKETPLACE))
+    })
+}
+
+fn claude_plugin(value: &Value) -> Option<&Value> {
+    value
+        .as_array()?
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(CLAUDE_PLUGIN))
+}
+
+fn setup_codex() -> anyhow::Result<()> {
+    let marketplaces = command_json("codex", &["plugin", "marketplace", "list", "--json"])?;
+    if !codex_marketplace_installed(&marketplaces) {
+        run_command(
+            "codex",
+            &["plugin", "marketplace", "add", CODEX_MARKETPLACE_SOURCE],
+        )?;
+    }
+
+    let plugins = command_json("codex", &["plugin", "list", "--json"])?;
+    if !codex_plugin_installed(&plugins) {
+        run_command("codex", &["plugin", "add", CODEX_PLUGIN])?;
+    }
+    Ok(())
+}
+
+fn setup_claude() -> anyhow::Result<()> {
+    let marketplaces = command_json("claude", &["plugin", "marketplace", "list", "--json"])?;
+    if !claude_marketplace_installed(&marketplaces) {
+        run_command(
+            "claude",
+            &["plugin", "marketplace", "add", CLAUDE_MARKETPLACE_SOURCE],
+        )?;
+    }
+
+    let plugins = command_json("claude", &["plugin", "list", "--json"])?;
+    match claude_plugin(&plugins) {
+        None => run_command("claude", &["plugin", "install", CLAUDE_PLUGIN])?,
+        Some(plugin) if plugin.get("enabled").and_then(Value::as_bool) == Some(false) => {
+            run_command("claude", &["plugin", "enable", CLAUDE_PLUGIN])?;
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
+    match args.agent {
+        SetupAgent::Codex => setup_codex()?,
+        SetupAgent::Claude => setup_claude()?,
+    }
+    println!(
+        "The Braintrust tracing plugin is installed for {}.",
+        match args.agent {
+            SetupAgent::Codex => "Codex",
+            SetupAgent::Claude => "Claude Code",
+        }
+    );
+    println!("Restart the coding agent to load the tracing plugin.");
+    Ok(())
+}
+
 /// Resolve `bt`'s auth into the daemon's per-session config.
 async fn session_config(base: &BaseArgs) -> anyhow::Result<SessionConfig> {
     let auth = crate::auth::resolve_auth(base)
@@ -89,6 +226,7 @@ async fn session_config(base: &BaseArgs) -> anyhow::Result<SessionConfig> {
 
 pub async fn run(base: BaseArgs, args: AgentsArgs) -> anyhow::Result<()> {
     match args.command {
+        AgentsCommand::Setup(setup_args) => run_setup(setup_args),
         AgentsCommand::Daemon(serve_args) => run_serve(serve_args, serve_options()).await,
         AgentsCommand::Hook(hook_args) => {
             // A hook must NEVER fail the agent's turn. Resolve auth and forward;

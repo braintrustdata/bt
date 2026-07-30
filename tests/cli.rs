@@ -29,6 +29,28 @@ fn write_executable(path: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn write_agent_cli(path: &Path, marketplace_json: &str, plugin_json: &str) {
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$AGENT_SETUP_LOG"
+case "$*" in
+  "plugin marketplace list --json")
+    printf '%s\n' '{marketplace_json}'
+    ;;
+  "plugin list --json")
+    printf '%s\n' '{plugin_json}'
+    ;;
+esac
+"#
+    );
+    fs::write(path, script).expect("write fake agent CLI");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod");
+}
+
 fn make_git_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::write(dir.path().join(".git"), "gitdir: /tmp/fake").expect("write .git");
@@ -117,6 +139,7 @@ fn agents_help_exposes_embedded_tracing_commands() {
         .args(["agents", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("setup"))
         .stdout(predicate::str::contains("daemon"))
         .stdout(predicate::str::contains("serve").not())
         .stdout(predicate::str::contains("hook"))
@@ -138,6 +161,106 @@ fn agents_help_exposes_embedded_tracing_commands() {
         .stdout(predicate::str::contains("--source"))
         .stdout(predicate::str::contains("--flush-on-turn-end"))
         .stdout(predicate::str::contains("--experiment-id"));
+
+    bt_command()
+        .args(["agents", "setup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("claude"));
+}
+
+#[cfg(unix)]
+#[test]
+fn agents_setup_codex_installs_the_published_plugin_only() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("codex.log");
+    let config = state_dir.path().join("config.json");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .env("BT_DAEMON_CONFIG", &config)
+        .args(["agents", "setup", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The Braintrust tracing plugin is installed for Codex",
+        ));
+
+    let calls = fs::read_to_string(log).expect("read fake CLI calls");
+    assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-codex-plugin"));
+    assert!(calls.contains("plugin add trace-codex@braintrust-codex-plugins"));
+    assert!(
+        !config.exists(),
+        "setup must not configure the unreleased daemon"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn agents_setup_claude_installs_the_published_plugin_only() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("claude.log");
+    let config = state_dir.path().join("config.json");
+    write_agent_cli(&bin_dir.path().join("claude"), "[]", "[]");
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .env("BT_DAEMON_CONFIG", &config)
+        .args(["agents", "setup", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The Braintrust tracing plugin is installed for Claude Code",
+        ));
+
+    let calls = fs::read_to_string(log).expect("read fake CLI calls");
+    assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-claude-plugin"));
+    assert!(calls.contains("plugin install trace-claude-code@braintrust-claude-plugin"));
+    assert!(
+        !config.exists(),
+        "setup must not configure the unreleased daemon"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn agents_setup_claude_enables_an_existing_disabled_plugin() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("claude.log");
+    write_agent_cli(
+        &bin_dir.path().join("claude"),
+        r#"[{"name":"braintrust-claude-plugin"}]"#,
+        r#"[{"id":"trace-claude-code@braintrust-claude-plugin","enabled":false}]"#,
+    );
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .args(["agents", "setup", "claude"])
+        .assert()
+        .success();
+
+    let calls = fs::read_to_string(log).expect("read fake CLI calls");
+    assert!(calls.contains("plugin enable trace-claude-code@braintrust-claude-plugin"));
+    assert!(!calls.contains("plugin marketplace add"));
+    assert!(!calls.contains("plugin install"));
 }
 
 #[test]
