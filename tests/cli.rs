@@ -172,7 +172,7 @@ fn agents_help_exposes_embedded_tracing_commands() {
 
 #[cfg(unix)]
 #[test]
-fn agents_setup_codex_installs_the_published_plugin_only() {
+fn agents_setup_codex_installs_plugin_and_preserves_existing_settings() {
     let home = tempfile::tempdir().expect("home tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
@@ -183,13 +183,24 @@ fn agents_setup_codex_installs_the_published_plugin_only() {
         r#"{"marketplaces":[]}"#,
         r#"{"installed":[]}"#,
     );
+    fs::write(
+        &config,
+        r#"{
+          "flushOnTurnEnd": true,
+          "additionalMetadata": {"team": "sdk"},
+          "apiKey": "legacy-secret",
+          "apiUrl": "https://legacy.example",
+          "auth": {"type": "legacy"}
+        }"#,
+    )
+    .expect("seed config");
 
     bt_command()
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .env("BT_DAEMON_CONFIG", &config)
-        .args(["agents", "setup", "codex"])
+        .args(["agents", "setup", "codex", "--project", "agent-traces"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -199,15 +210,21 @@ fn agents_setup_codex_installs_the_published_plugin_only() {
     let calls = fs::read_to_string(log).expect("read fake CLI calls");
     assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-codex-plugin"));
     assert!(calls.contains("plugin add trace-codex@braintrust-codex-plugins"));
-    assert!(
-        !config.exists(),
-        "setup must not configure the unreleased daemon"
-    );
+
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
+    assert_eq!(settings["traceToBraintrust"], true);
+    assert_eq!(settings["project"], "agent-traces");
+    assert_eq!(settings["flushOnTurnEnd"], true);
+    assert_eq!(settings["additionalMetadata"]["team"], "sdk");
+    assert_eq!(settings["apiKey"], "legacy-secret");
+    assert_eq!(settings["apiUrl"], "https://legacy.example");
+    assert_eq!(settings["auth"]["type"], "legacy");
 }
 
 #[cfg(unix)]
 #[test]
-fn agents_setup_claude_installs_the_published_plugin_only() {
+fn agents_setup_claude_installs_plugin_and_creates_default_settings() {
     let home = tempfile::tempdir().expect("home tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
@@ -230,10 +247,11 @@ fn agents_setup_claude_installs_the_published_plugin_only() {
     let calls = fs::read_to_string(log).expect("read fake CLI calls");
     assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-claude-plugin"));
     assert!(calls.contains("plugin install trace-claude-code@braintrust-claude-plugin"));
-    assert!(
-        !config.exists(),
-        "setup must not configure the unreleased daemon"
-    );
+
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
+    assert_eq!(settings["traceToBraintrust"], true);
+    assert_eq!(settings["project"], "coding-agents");
 }
 
 #[cfg(unix)]

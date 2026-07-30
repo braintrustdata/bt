@@ -7,12 +7,13 @@
 //! `../plugin-monorepo/bt-daemon/DESIGN.md` ("Dual consumption", auth handoff).
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use clap::{Args, Subcommand};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
@@ -187,17 +188,65 @@ fn setup_claude() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_setup(args: SetupArgs) -> anyhow::Result<()> {
+fn load_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
+    match std::fs::read(path) {
+        Ok(raw) => {
+            let value: Value = serde_json::from_slice(&raw)
+                .with_context(|| format!("invalid shared agent settings: {}", path.display()))?;
+            value.as_object().cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shared agent settings must be a JSON object: {}",
+                    path.display()
+                )
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to read shared agent settings: {}", path.display())),
+    }
+}
+
+fn enable_tracing(project: Option<&str>) -> anyhow::Result<PathBuf> {
+    let path = paths::settings_path(None);
+    let mut settings = load_settings(&path)?;
+    settings.insert("traceToBraintrust".into(), Value::Bool(true));
+
+    let existing_project = settings
+        .get("project")
+        .and_then(Value::as_str)
+        .filter(|project| !project.is_empty());
+    let project = project
+        .filter(|project| !project.is_empty())
+        .or(existing_project)
+        .unwrap_or("coding-agents");
+    settings.insert("project".into(), Value::String(project.to_string()));
+
+    let mut encoded = serde_json::to_string_pretty(&Value::Object(settings))?;
+    encoded.push('\n');
+    crate::utils::write_text_atomic(&path, &encoded)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect shared settings: {}", path.display()))?;
+    }
+    Ok(path)
+}
+
+fn run_setup(base: &BaseArgs, args: SetupArgs) -> anyhow::Result<()> {
     match args.agent {
         SetupAgent::Codex => setup_codex()?,
         SetupAgent::Claude => setup_claude()?,
     }
+    let settings_path = enable_tracing(base.project.as_deref())?;
     println!(
-        "The Braintrust tracing plugin is installed for {}.",
+        "The Braintrust tracing plugin is installed for {} and configured in {}.",
         match args.agent {
             SetupAgent::Codex => "Codex",
             SetupAgent::Claude => "Claude Code",
-        }
+        },
+        settings_path.display()
     );
     println!("Restart the coding agent to load the tracing plugin.");
     Ok(())
@@ -226,7 +275,7 @@ async fn session_config(base: &BaseArgs) -> anyhow::Result<SessionConfig> {
 
 pub async fn run(base: BaseArgs, args: AgentsArgs) -> anyhow::Result<()> {
     match args.command {
-        AgentsCommand::Setup(setup_args) => run_setup(setup_args),
+        AgentsCommand::Setup(setup_args) => run_setup(&base, setup_args),
         AgentsCommand::Daemon(serve_args) => run_serve(serve_args, serve_options()).await,
         AgentsCommand::Hook(hook_args) => {
             // A hook must NEVER fail the agent's turn. Resolve auth and forward;
