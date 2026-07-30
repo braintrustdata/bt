@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
+mod agents;
 mod args;
 mod auth;
 #[allow(dead_code)]
 mod config;
-mod daemon;
 mod datasets;
 mod env;
 #[cfg(unix)]
@@ -80,7 +80,7 @@ Data & evaluation
 
 Additional
   docs         Manage workflow docs for coding agents
-  daemon       Run the coding-agent tracing daemon
+  agents       Manage coding-agent integrations
   setup        Configure Braintrust setup flows
   status       Show current org and project context
   update       Update bt in-place
@@ -167,8 +167,8 @@ enum Commands {
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
     Status(CLIArgs<status::StatusArgs>),
-    /// Run the coding-agent tracing daemon (serve/hook/status/replay)
-    Daemon(CLIArgs<daemon::DaemonArgs>),
+    /// Manage coding-agent integrations (daemon/hook/status/replay)
+    Agents(CLIArgs<agents::AgentsArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
@@ -198,7 +198,7 @@ impl Commands {
             Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
             Commands::Status(cmd) => &cmd.base,
-            Commands::Daemon(cmd) => &cmd.base,
+            Commands::Agents(cmd) => &cmd.base,
         }
     }
 
@@ -226,7 +226,7 @@ impl Commands {
             Commands::Util(cmd) => &mut cmd.base,
             Commands::Switch(cmd) => &mut cmd.base,
             Commands::Status(cmd) => &mut cmd.base,
-            Commands::Daemon(cmd) => &mut cmd.base,
+            Commands::Agents(cmd) => &mut cmd.base,
         }
     }
 
@@ -343,7 +343,7 @@ fn try_main() -> Result<()> {
             Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
-            Commands::Daemon(cmd) => daemon::run(cmd.base, cmd.args).await?,
+            Commands::Agents(cmd) => agents::run(cmd.base, cmd.args).await?,
         }
         Ok(())
     });

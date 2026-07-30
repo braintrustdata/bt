@@ -110,18 +110,29 @@ fn top_level_help_shows_update_not_self() {
 }
 
 #[test]
-fn daemon_help_exposes_embedded_tracing_commands() {
+fn agents_help_exposes_embedded_tracing_commands() {
+    bt_command().args(["daemon", "--help"]).assert().failure();
+
     bt_command()
-        .args(["daemon", "--help"])
+        .args(["agents", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("serve"))
+        .stdout(predicate::str::contains("daemon"))
+        .stdout(predicate::str::contains("serve").not())
         .stdout(predicate::str::contains("hook"))
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("replay"));
 
     bt_command()
-        .args(["daemon", "hook", "--help"])
+        .args(["agents", "daemon", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Run the tracing daemon"))
+        .stdout(predicate::str::contains("--socket"))
+        .stdout(predicate::str::contains("--idle-timeout-secs"));
+
+    bt_command()
+        .args(["agents", "hook", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--source"))
