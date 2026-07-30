@@ -92,7 +92,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         _ => {
             let mut b = base.clone();
             if !has_api_key_override && b.org_name.is_none() && b.profile.is_none() {
-                b.org_name = current_cfg.org.clone();
+                apply_current_switch_auth_context(&mut b, &current_cfg);
             }
             if !has_api_key_override && b.org_name.is_none() && b.profile.is_none() {
                 let profiles = auth::list_profiles()?;
@@ -227,6 +227,14 @@ pub(crate) fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
         Ok((global, "global"))
     } else {
         Ok((local, "local"))
+    }
+}
+
+fn apply_current_switch_auth_context(base: &mut BaseArgs, current_cfg: &config::Config) {
+    if let Some(profile) = config::trimmed_option(current_cfg.profile.as_deref()) {
+        base.profile = Some(profile.to_string());
+    } else {
+        base.org_name = current_cfg.org.clone();
     }
 }
 
@@ -534,6 +542,21 @@ mod tests {
 
         assert_eq!(login_base.profile, Some("staging".into()));
         assert_eq!(login_base.org_name, Some("custom-org".into()));
+    }
+
+    #[test]
+    fn current_switch_auth_context_prefers_profile_over_stale_org() {
+        let mut base = base_args(None, Some("project"));
+        let current_cfg = config::Config {
+            profile: Some("BT Staging".to_string()),
+            org: Some("braintrustdata.com".to_string()),
+            ..Default::default()
+        };
+
+        apply_current_switch_auth_context(&mut base, &current_cfg);
+
+        assert_eq!(base.profile.as_deref(), Some("BT Staging"));
+        assert_eq!(base.org_name, None);
     }
 
     #[test]
