@@ -4093,7 +4093,7 @@ fn format_u64_with_commas(value: u64) -> String {
     for (idx, ch) in digits.chars().enumerate() {
         out.push(ch);
         let remaining = len.saturating_sub(idx + 1);
-        if remaining > 0 && remaining % 3 == 0 {
+        if remaining > 0 && remaining.is_multiple_of(3) {
             out.push(',');
         }
     }
