@@ -835,9 +835,14 @@ pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
         }
     }
 
-    if let Some(profile_name) =
-        maybe_select_profile_for_auth(&auth_base, &mut store, cfg_org.as_deref(), ui::can_prompt())
-            .await?
+    if let Some(profile_name) = maybe_select_profile_for_auth(
+        &auth_base,
+        &mut store,
+        cfg_org.as_deref(),
+        ui::can_prompt(),
+        None,
+    )
+    .await?
     {
         auth_base.profile = Some(profile_name);
     }
@@ -999,6 +1004,7 @@ async fn maybe_select_profile_for_auth(
     store: &mut AuthStore,
     cfg_org: Option<&str>,
     can_prompt: bool,
+    current_profile: Option<&str>,
 ) -> Result<Option<String>> {
     if resolve_api_key_override(base).is_some() {
         return Ok(None);
@@ -1064,7 +1070,25 @@ async fn maybe_select_profile_for_auth(
         );
     }
 
-    select_profile_from_store("Select profile", &name_refs, None, store).map(Some)
+    select_profile_from_store("Select profile", &name_refs, current_profile, store).map(Some)
+}
+
+pub(crate) async fn select_compatible_profile_interactive(
+    base: &BaseArgs,
+    current_profile: Option<&str>,
+) -> Result<Option<String>> {
+    let mut selection_base = base.clone();
+    selection_base.profile = None;
+    selection_base.profile_explicit = false;
+    let mut store = load_auth_store()?;
+    maybe_select_profile_for_auth(
+        &selection_base,
+        &mut store,
+        None,
+        ui::can_prompt(),
+        current_profile,
+    )
+    .await
 }
 
 async fn profile_can_access_org(
@@ -4511,7 +4535,7 @@ mod tests {
             },
         );
 
-        let err = maybe_select_profile_for_auth(&base, &mut store, None, false)
+        let err = maybe_select_profile_for_auth(&base, &mut store, None, false, None)
             .await
             .expect_err("selection should be required");
 
@@ -4544,7 +4568,7 @@ mod tests {
             },
         );
 
-        let err = maybe_select_profile_for_auth(&base, &mut store, None, false)
+        let err = maybe_select_profile_for_auth(&base, &mut store, None, false, None)
             .await
             .expect_err("profile selection should be required");
 
@@ -4572,7 +4596,7 @@ mod tests {
             );
         }
 
-        let selected = maybe_select_profile_for_auth(&base, &mut store, None, false)
+        let selected = maybe_select_profile_for_auth(&base, &mut store, None, false, None)
             .await
             .expect("select compatible profile");
         assert_eq!(selected.as_deref(), Some("target"));
@@ -4589,7 +4613,7 @@ mod tests {
             .insert("alpha".into(), AuthProfile::default());
         store.profiles.insert("beta".into(), AuthProfile::default());
 
-        let selection = maybe_select_profile_for_auth(&base, &mut store, None, false)
+        let selection = maybe_select_profile_for_auth(&base, &mut store, None, false, None)
             .await
             .expect("api key override should skip profile selection");
 
@@ -4616,7 +4640,7 @@ mod tests {
             },
         );
 
-        let selected = maybe_select_profile_for_auth(&base, &mut store, None, false)
+        let selected = maybe_select_profile_for_auth(&base, &mut store, None, false, None)
             .await
             .expect("select");
         assert_eq!(selected.as_deref(), Some("two"));

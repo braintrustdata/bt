@@ -256,6 +256,10 @@ pub async fn select_project(
     let mut projects = with_spinner("Loading projects...", api::list_projects(client)).await?;
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 
+    if let Some(project) = take_only_existing_project(&mut projects, mode) {
+        return Ok(project);
+    }
+
     let label = select_label.unwrap_or("Select project");
 
     if mode_allows_create(mode) {
@@ -358,6 +362,14 @@ fn mode_allows_create(mode: ProjectSelectMode) -> bool {
     matches!(mode, ProjectSelectMode::AllowCreateWithDefaultProjectNote)
 }
 
+fn take_only_existing_project(
+    projects: &mut Vec<api::Project>,
+    mode: ProjectSelectMode,
+) -> Option<api::Project> {
+    (matches!(mode, ProjectSelectMode::ExistingOnly) && projects.len() == 1)
+        .then(|| projects.remove(0))
+}
+
 fn default_new_project_name() -> String {
     let output = std::process::Command::new("whoami").output();
     let user = output
@@ -374,7 +386,7 @@ fn default_new_project_name() -> String {
 mod tests {
     use super::{
         default_new_project_name, default_project_selection, project_display_names,
-        project_selection_labels, ProjectSelectMode,
+        project_selection_labels, take_only_existing_project, ProjectSelectMode,
     };
     use crate::projects::api::Project;
 
@@ -412,6 +424,27 @@ mod tests {
         let err = default_project_selection(&[], None, ProjectSelectMode::ExistingOnly)
             .expect_err("empty projects should fail");
         assert!(err.to_string().contains("no projects found"));
+    }
+
+    #[test]
+    fn existing_only_auto_selects_a_sole_project() {
+        let mut projects = vec![project("only")];
+        let selected = take_only_existing_project(&mut projects, ProjectSelectMode::ExistingOnly)
+            .expect("sole project");
+
+        assert_eq!(selected.name, "only");
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn create_mode_keeps_a_sole_project_in_the_picker() {
+        let mut projects = vec![project("only")];
+        assert!(take_only_existing_project(
+            &mut projects,
+            ProjectSelectMode::AllowCreateWithDefaultProjectNote
+        )
+        .is_none());
+        assert_eq!(projects.len(), 1);
     }
 
     #[test]

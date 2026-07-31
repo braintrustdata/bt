@@ -3,12 +3,12 @@ use clap::Args;
 use dialoguer::{console, theme::ColorfulTheme, Select};
 
 use crate::args::BaseArgs;
-use crate::auth::login;
+use crate::auth::{self, login};
 use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
 use crate::ui::{
-    is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
+    fuzzy_select, is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
 };
 
 #[derive(Debug, Clone, Args)]
@@ -64,15 +64,31 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     }
     let requested_profile = if has_api_key_override {
         None
+    } else if base.profile.is_some() {
+        base.profile.clone()
+    } else if interactive {
+        let mut profile_base = base.clone();
+        profile_base.org_name = resolved_org.clone();
+        auth::select_compatible_profile_interactive(&profile_base, current_cfg.profile.as_deref())
+            .await?
     } else {
-        config::trimmed_option(base.profile.as_deref())
-            .or_else(|| config::trimmed_option(current_cfg.profile.as_deref()))
-            .map(str::to_string)
+        config::trimmed_option(current_cfg.profile.as_deref()).map(str::to_string)
+    };
+
+    let selected_org = if resolved_org.is_some() {
+        resolved_org.clone()
+    } else if interactive {
+        let mut org_base = base.clone();
+        org_base.profile = requested_profile.clone();
+        org_base.org_name = None;
+        Some(select_org_for_switch(&org_base, current_cfg.org.as_deref()).await?)
+    } else {
+        current_cfg.org.clone()
     };
 
     let mut login_base = base.clone();
     login_base.profile = requested_profile;
-    login_base.org_name = resolved_org.clone().or_else(|| current_cfg.org.clone());
+    login_base.org_name = selected_org;
     login_base.project = resolved_project.clone();
 
     let ctx = login(&login_base).await?;
@@ -144,6 +160,30 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn select_org_for_switch(base: &BaseArgs, current_org: Option<&str>) -> Result<String> {
+    let orgs = auth::list_available_orgs(base).await?;
+    if orgs.len() == 1 {
+        return Ok(orgs[0].name.clone());
+    }
+    if orgs.is_empty() {
+        bail!("no organizations available for the selected profile");
+    }
+
+    let labels = orgs.iter().map(|org| org.name.as_str()).collect::<Vec<_>>();
+    let default = default_org_selection(&orgs, current_org);
+    let selected = fuzzy_select("Select organization", &labels, default)?;
+    Ok(orgs[selected].name.clone())
+}
+
+fn default_org_selection(orgs: &[auth::AvailableOrg], current_org: Option<&str>) -> usize {
+    current_org
+        .and_then(|current| {
+            orgs.iter()
+                .position(|org| org.name.eq_ignore_ascii_case(current))
+        })
+        .unwrap_or(0)
 }
 
 pub(crate) fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
@@ -247,12 +287,32 @@ pub(crate) fn apply_switch_config(
 mod tests {
     use super::*;
 
+    fn available_org(name: &str) -> auth::AvailableOrg {
+        auth::AvailableOrg {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            api_url: None,
+        }
+    }
+
     fn switch_args(target: Option<&str>) -> SwitchArgs {
         SwitchArgs {
             global: false,
             local: false,
             target: target.map(String::from),
         }
+    }
+
+    #[test]
+    fn org_picker_defaults_to_current_org() {
+        let orgs = vec![available_org("alpha"), available_org("beta")];
+        assert_eq!(default_org_selection(&orgs, Some("BETA")), 1);
+    }
+
+    #[test]
+    fn org_picker_defaults_to_first_when_current_org_is_unavailable() {
+        let orgs = vec![available_org("alpha"), available_org("beta")];
+        assert_eq!(default_org_selection(&orgs, Some("missing")), 0);
     }
 
     fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
