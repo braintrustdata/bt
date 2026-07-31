@@ -21,4 +21,4 @@ Use the Braintrust `bt` CLI for projects, traces, prompts, and sync workflows.
 ## Guardrails
 
 - Prefer `bt` commands over direct API calls when both can accomplish the task.
-- Respect existing login/profile settings from `bt auth`.
+- Respect existing login/profile settings from `bt login`.

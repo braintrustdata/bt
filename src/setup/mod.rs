@@ -41,7 +41,13 @@ const SETUP_WIZARD_POLL_PATH: &str = "/api/cli/wizard-session/poll";
 const SETUP_WIZARD_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES: usize = 30;
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
-    "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
+    "bt eval",
+    "bt sql",
+    "bt view",
+    "bt login",
+    "bt logout",
+    "bt setup",
+    "bt docs",
 ];
 const ALL_AGENTS: [Agent; 7] = [
     Agent::Claude,
@@ -1535,7 +1541,7 @@ fn resolve_profile_name_for_setup(
             return Ok(Some(profile_name.to_string()));
         }
         bail!(
-            "profile '{profile_name}' not found; run `bt auth profiles` to see available profiles"
+            "profile '{profile_name}' not found; run `bt status --all` to see available profiles"
         );
     }
 
@@ -5742,6 +5748,9 @@ mod tests {
         let profiles = vec![
             auth::ProfileInfo {
                 name: "zeta".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Zeta Org".to_string()),
                 user_name: None,
                 email: None,
@@ -5749,6 +5758,9 @@ mod tests {
             },
             auth::ProfileInfo {
                 name: "alpha".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Alpha Org".to_string()),
                 user_name: None,
                 email: None,
@@ -5777,6 +5789,9 @@ mod tests {
         base.profile = Some("missing".to_string());
         let profiles = vec![auth::ProfileInfo {
             name: "work".to_string(),
+            auth: "api_key".to_string(),
+            app_url: "https://app.test.example".to_string(),
+            oauth_api_url: None,
             org_name: Some("Acme".to_string()),
             user_name: None,
             email: None,
@@ -5793,6 +5808,9 @@ mod tests {
         let profiles = vec![
             auth::ProfileInfo {
                 name: "Acme".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Acme".to_string()),
                 user_name: None,
                 email: None,
@@ -5800,6 +5818,9 @@ mod tests {
             },
             auth::ProfileInfo {
                 name: "Acme-2".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Acme".to_string()),
                 user_name: None,
                 email: None,

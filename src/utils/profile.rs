@@ -101,6 +101,9 @@ mod tests {
     ) -> ProfileInfo {
         ProfileInfo {
             name: name.to_string(),
+            auth: "oauth".to_string(),
+            app_url: "https://app.test.example".to_string(),
+            oauth_api_url: None,
             org_name: org_name.map(ToOwned::to_owned),
             user_name: user_name.map(ToOwned::to_owned),
             email: email.map(ToOwned::to_owned),
