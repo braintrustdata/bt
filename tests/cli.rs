@@ -145,6 +145,7 @@ fn trace_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("serve").not())
         .stdout(predicate::str::contains("\n  hook").not())
         .stdout(predicate::str::contains("\n  status").not())
+        .stdout(predicate::str::contains("\n  stop").not())
         .stdout(predicate::str::contains("\n  replay").not());
 
     bt_command()
@@ -170,6 +171,12 @@ fn trace_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("--socket"));
 
     bt_command()
+        .args(["trace", "stop", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--socket"));
+
+    bt_command()
         .args(["trace", "replay", "--help"])
         .assert()
         .success()
@@ -181,6 +188,77 @@ fn trace_help_hides_internal_commands_but_keeps_them_callable() {
         .success()
         .stdout(predicate::str::contains("codex"))
         .stdout(predicate::str::contains("claude"));
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_stop_gracefully_stops_an_isolated_daemon() {
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::Duration;
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let socket = state.path().join("daemon.sock");
+    let bin = env!("CARGO_BIN_EXE_bt");
+    let mut daemon = std::process::Command::new(bin)
+        .args([
+            "trace",
+            "daemon",
+            "--socket",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--data-dir",
+            state.path().to_str().expect("UTF-8 state path"),
+            "--idle-timeout-secs",
+            "0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tracing daemon");
+
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if !socket.exists() {
+        let _ = daemon.kill();
+        panic!("tracing daemon did not create its socket");
+    }
+
+    bt_command()
+        .args([
+            "trace",
+            "stop",
+            "--socket",
+            socket.to_str().expect("UTF-8 socket path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tracing daemon stopped."));
+
+    for _ in 0..100 {
+        if let Some(status) = daemon.try_wait().expect("poll tracing daemon") {
+            assert!(status.success(), "tracing daemon exited unsuccessfully");
+
+            bt_command()
+                .args([
+                    "trace",
+                    "stop",
+                    "--socket",
+                    socket.to_str().expect("UTF-8 socket path"),
+                ])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("No tracing daemon is running."));
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = daemon.kill();
+    panic!("tracing daemon did not stop");
 }
 
 #[cfg(unix)]

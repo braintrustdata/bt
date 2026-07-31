@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_replay, run_serve, run_status,
+    braintrust_serve_options, paths, run_hook, run_replay, run_serve, run_status, shutdown_daemon,
     BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo, Registry, ReplayArgs, ServeArgs,
     ServeOptions, StatusArgs,
 };
@@ -43,9 +43,19 @@ enum TraceCommand {
     /// Print daemon/session status.
     #[command(hide = true)]
     Status(StatusArgs),
+    /// Gracefully stop the tracing daemon.
+    #[command(hide = true)]
+    Stop(StopArgs),
     /// Replay a journal file through the translators + sink.
     #[command(hide = true)]
     Replay(ReplayArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct StopArgs {
+    /// Socket path override (default: see the daemon protocol documentation).
+    #[arg(long)]
+    socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -319,6 +329,20 @@ pub async fn run(base: BaseArgs, args: TraceArgs) -> anyhow::Result<()> {
                 Ok(())
             }
         },
+        TraceCommand::Stop(stop_args) => {
+            let socket = paths::socket_path(stop_args.socket.as_deref());
+            let status_args = StatusArgs {
+                socket: Some(socket.clone()),
+                session_id: None,
+            };
+            if run_status(status_args).await?.is_none() {
+                println!("No tracing daemon is running.");
+                return Ok(());
+            }
+            shutdown_daemon(&socket).await?;
+            println!("Tracing daemon stopped.");
+            Ok(())
+        }
         TraceCommand::Replay(replay_args) => {
             // Replay through the real translators into the debug sink (no
             // network): useful for inspecting what a journal produces.
