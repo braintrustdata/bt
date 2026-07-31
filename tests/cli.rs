@@ -132,11 +132,12 @@ fn top_level_help_shows_update_not_self() {
 }
 
 #[test]
-fn agents_help_hides_internal_commands_but_keeps_them_callable() {
+fn trace_help_hides_internal_commands_but_keeps_them_callable() {
     bt_command().args(["daemon", "--help"]).assert().failure();
+    bt_command().args(["agents", "--help"]).assert().failure();
 
     bt_command()
-        .args(["agents", "--help"])
+        .args(["trace", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("setup"))
@@ -147,7 +148,7 @@ fn agents_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("\n  replay").not());
 
     bt_command()
-        .args(["agents", "daemon", "--help"])
+        .args(["trace", "daemon", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Run the tracing daemon"))
@@ -155,7 +156,7 @@ fn agents_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("--idle-timeout-secs"));
 
     bt_command()
-        .args(["agents", "hook", "--help"])
+        .args(["trace", "hook", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--source"))
@@ -163,19 +164,19 @@ fn agents_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("--experiment-id"));
 
     bt_command()
-        .args(["agents", "status", "--help"])
+        .args(["trace", "status", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--socket"));
 
     bt_command()
-        .args(["agents", "replay", "--help"])
+        .args(["trace", "replay", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("<FILE>"));
 
     bt_command()
-        .args(["agents", "setup", "--help"])
+        .args(["trace", "setup", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("codex"))
@@ -184,7 +185,7 @@ fn agents_help_hides_internal_commands_but_keeps_them_callable() {
 
 #[cfg(unix)]
 #[test]
-fn agents_setup_codex_installs_plugin_and_preserves_existing_settings() {
+fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
     let home = tempfile::tempdir().expect("home tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
@@ -212,7 +213,7 @@ fn agents_setup_codex_installs_plugin_and_preserves_existing_settings() {
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .env("BT_DAEMON_CONFIG", &config)
-        .args(["agents", "setup", "codex", "--project", "agent-traces"])
+        .args(["trace", "setup", "codex", "--project", "agent-traces"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -236,7 +237,7 @@ fn agents_setup_codex_installs_plugin_and_preserves_existing_settings() {
 
 #[cfg(unix)]
 #[test]
-fn agents_setup_claude_installs_plugin_and_creates_default_settings() {
+fn trace_setup_claude_installs_plugin_and_creates_default_settings() {
     let home = tempfile::tempdir().expect("home tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
@@ -249,7 +250,7 @@ fn agents_setup_claude_installs_plugin_and_creates_default_settings() {
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .env("BT_DAEMON_CONFIG", &config)
-        .args(["agents", "setup", "claude"])
+        .args(["trace", "setup", "claude"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -268,7 +269,7 @@ fn agents_setup_claude_installs_plugin_and_creates_default_settings() {
 
 #[cfg(unix)]
 #[test]
-fn agents_setup_claude_enables_an_existing_disabled_plugin() {
+fn trace_setup_claude_enables_an_existing_disabled_plugin() {
     let home = tempfile::tempdir().expect("home tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
@@ -283,7 +284,7 @@ fn agents_setup_claude_enables_an_existing_disabled_plugin() {
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
-        .args(["agents", "setup", "claude"])
+        .args(["trace", "setup", "claude"])
         .assert()
         .success();
 

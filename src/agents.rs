@@ -1,8 +1,8 @@
-//! `bt agents` — manages coding-agent tracing integrations.
+//! `bt trace` — manages coding-agent tracing integrations.
 //!
 //! The daemon library is credential-passive: it receives a resolved
 //! `BackendAuth` with each session's config. Here `bt` fills that from its own
-//! `resolve_auth` (profiles / OAuth refresh / keychain), so a `bt agents hook`
+//! `resolve_auth` (profiles / OAuth refresh / keychain), so a `bt trace hook`
 //! invocation traces to whatever profile the user is on. See
 //! `../plugin-monorepo/bt-daemon/DESIGN.md` ("Dual consumption", auth handoff).
 
@@ -25,13 +25,13 @@ use bt_daemon::{
 use crate::args::BaseArgs;
 
 #[derive(Debug, Clone, Args)]
-pub struct AgentsArgs {
+pub struct TraceArgs {
     #[command(subcommand)]
-    command: AgentsCommand,
+    command: TraceCommand,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum AgentsCommand {
+enum TraceCommand {
     /// Install the published Braintrust tracing plugin for a coding agent.
     Setup(SetupArgs),
     /// Run the tracing daemon (foreground).
@@ -69,14 +69,14 @@ const CLAUDE_MARKETPLACE: &str = "braintrust-claude-plugin";
 const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin";
 const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
 
-/// How the shim (re)launches the daemon: `bt agents daemon` from this same
+/// How the shim (re)launches the daemon: `bt trace daemon` from this same
 /// binary.
 fn host_info() -> HostInfo {
     let exe = std::env::current_exe()
         .map(OsString::from)
         .unwrap_or_else(|_| OsString::from("bt"));
     HostInfo {
-        serve_argv: vec![exe, OsString::from("agents"), OsString::from("daemon")],
+        serve_argv: vec![exe, OsString::from("trace"), OsString::from("daemon")],
         version: crate::CLI_VERSION.to_string(),
     }
 }
@@ -105,7 +105,7 @@ fn init_daemon_logging(verbose: bool) {
         .with_writer(std::io::stderr)
         .try_init()
     {
-        eprintln!("bt agents daemon logging unavailable: {error}");
+        eprintln!("bt trace daemon logging unavailable: {error}");
     }
 }
 
@@ -289,27 +289,27 @@ async fn session_config(base: &BaseArgs) -> anyhow::Result<SessionConfig> {
     })
 }
 
-pub async fn run(base: BaseArgs, args: AgentsArgs) -> anyhow::Result<()> {
+pub async fn run(base: BaseArgs, args: TraceArgs) -> anyhow::Result<()> {
     match args.command {
-        AgentsCommand::Setup(setup_args) => run_setup(&base, setup_args),
-        AgentsCommand::Daemon(serve_args) => {
+        TraceCommand::Setup(setup_args) => run_setup(&base, setup_args),
+        TraceCommand::Daemon(serve_args) => {
             init_daemon_logging(base.verbose);
             run_serve(serve_args, serve_options()).await
         }
-        AgentsCommand::Hook(hook_args) => {
+        TraceCommand::Hook(hook_args) => {
             // A hook must NEVER fail the agent's turn. Resolve auth and forward;
             // log and swallow any error, exit 0.
             match session_config(&base).await {
                 Ok(config) => {
                     if let Err(e) = run_hook(hook_args, config, host_info()).await {
-                        eprintln!("bt agents hook (non-fatal): {e}");
+                        eprintln!("bt trace hook (non-fatal): {e}");
                     }
                 }
-                Err(e) => eprintln!("bt agents hook (non-fatal): {e}"),
+                Err(e) => eprintln!("bt trace hook (non-fatal): {e}"),
             }
             Ok(())
         }
-        AgentsCommand::Status(status_args) => match run_status(status_args).await? {
+        TraceCommand::Status(status_args) => match run_status(status_args).await? {
             Some(status) => {
                 println!("{}", serde_json::to_string_pretty(&status)?);
                 Ok(())
@@ -319,7 +319,7 @@ pub async fn run(base: BaseArgs, args: AgentsArgs) -> anyhow::Result<()> {
                 Ok(())
             }
         },
-        AgentsCommand::Replay(replay_args) => {
+        TraceCommand::Replay(replay_args) => {
             // Replay through the real translators into the debug sink (no
             // network): useful for inspecting what a journal produces.
             let data_dir = paths::data_dir(None);

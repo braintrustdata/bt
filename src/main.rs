@@ -80,7 +80,7 @@ Data & evaluation
 
 Additional
   docs         Manage workflow docs for coding agents
-  agents       Manage coding-agent integrations
+  trace        Manage coding-agent tracing
   setup        Configure Braintrust setup flows
   status       Show current org and project context
   update       Update bt in-place
@@ -167,8 +167,8 @@ enum Commands {
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
     Status(CLIArgs<status::StatusArgs>),
-    /// Manage coding-agent integrations
-    Agents(CLIArgs<agents::AgentsArgs>),
+    /// Manage coding-agent tracing
+    Trace(CLIArgs<agents::TraceArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
@@ -198,7 +198,7 @@ impl Commands {
             Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
             Commands::Status(cmd) => &cmd.base,
-            Commands::Agents(cmd) => &cmd.base,
+            Commands::Trace(cmd) => &cmd.base,
         }
     }
 
@@ -226,7 +226,7 @@ impl Commands {
             Commands::Util(cmd) => &mut cmd.base,
             Commands::Switch(cmd) => &mut cmd.base,
             Commands::Status(cmd) => &mut cmd.base,
-            Commands::Agents(cmd) => &mut cmd.base,
+            Commands::Trace(cmd) => &mut cmd.base,
         }
     }
 
@@ -343,7 +343,7 @@ fn try_main() -> Result<()> {
             Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
-            Commands::Agents(cmd) => agents::run(cmd.base, cmd.args).await?,
+            Commands::Trace(cmd) => agents::run(cmd.base, cmd.args).await?,
         }
         Ok(())
     });
