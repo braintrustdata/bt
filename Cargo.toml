@@ -19,7 +19,7 @@ actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "43ba73edbf5220b57090e049feb094b60a92fcd4" }
-bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "3e019e47290318b1332c81311e64647b964c21b8" }
+bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "3ab5195ec8d87edcc5f175d041c7eaec98557033" }
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 futures-util = "0.3.31"
@@ -33,6 +33,7 @@ toml = "0.8"
 sha2 = "0.10.8"
 strip-ansi-escapes = "0.2.0"
 tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "process", "net", "signal", "sync"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.1.13"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 fuzzy-matcher = "0.3"

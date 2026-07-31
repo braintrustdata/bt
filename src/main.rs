@@ -167,7 +167,7 @@ enum Commands {
     Switch(CLIArgs<switch::SwitchArgs>),
     /// Show current org and project context
     Status(CLIArgs<status::StatusArgs>),
-    /// Manage coding-agent integrations (daemon/hook/status/replay)
+    /// Manage coding-agent integrations
     Agents(CLIArgs<agents::AgentsArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),

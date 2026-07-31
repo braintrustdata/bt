@@ -35,8 +35,10 @@ enum AgentsCommand {
     /// Install the published Braintrust tracing plugin for a coding agent.
     Setup(SetupArgs),
     /// Run the tracing daemon (foreground).
+    #[command(hide = true)]
     Daemon(ServeArgs),
     /// Forward one coding-agent hook event (read from stdin) to the daemon.
+    #[command(hide = true)]
     Hook(HookArgs),
     /// Print daemon/session status.
     Status(StatusArgs),
@@ -91,6 +93,18 @@ fn serve_options() -> ServeOptions {
         cfg,
         Arc::new(Registry::default_agents()),
     )
+}
+
+fn init_daemon_logging(verbose: bool) {
+    let fallback = if verbose { "debug" } else { "info" };
+    let filter = tracing_subscriber::EnvFilter::new(fallback);
+    if let Err(error) = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init()
+    {
+        eprintln!("bt agents daemon logging unavailable: {error}");
+    }
 }
 
 fn command_json(program: &str, args: &[&str]) -> anyhow::Result<Value> {
@@ -276,7 +290,10 @@ async fn session_config(base: &BaseArgs) -> anyhow::Result<SessionConfig> {
 pub async fn run(base: BaseArgs, args: AgentsArgs) -> anyhow::Result<()> {
     match args.command {
         AgentsCommand::Setup(setup_args) => run_setup(&base, setup_args),
-        AgentsCommand::Daemon(serve_args) => run_serve(serve_args, serve_options()).await,
+        AgentsCommand::Daemon(serve_args) => {
+            init_daemon_logging(base.verbose);
+            run_serve(serve_args, serve_options()).await
+        }
         AgentsCommand::Hook(hook_args) => {
             // A hook must NEVER fail the agent's turn. Resolve auth and forward;
             // log and swallow any error, exit 0.
