@@ -260,12 +260,11 @@ struct SecretStore {
 struct AuthProfile {
     #[serde(default)]
     auth_kind: AuthKind,
-    // Legacy API URL. For OAuth profiles this is also the token endpoint used
-    // to refresh credentials. It must not be used to infer an app URL or as a
-    // data-plane default for commands; that URL is resolved from app_url,
-    // credential, and org at login time.
-    #[serde(default)]
-    api_url: Option<String>,
+    // OAuth API base used to refresh credentials. Keep the legacy serialized
+    // key for compatibility with existing profiles. This must not be used as
+    // a command data-plane default or to infer an app URL.
+    #[serde(default, rename = "api_url")]
+    oauth_api_url: Option<String>,
     #[serde(default)]
     app_url: Option<String>,
     // An org constraint for API-key profiles. Older versions also populated
@@ -910,7 +909,7 @@ async fn resolve_oauth_profile_credential(
     })?;
     let api_url = api_url_override
         .map(str::to_string)
-        .or_else(|| profile.api_url.clone())
+        .or_else(|| profile.oauth_api_url.clone())
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let refreshed =
         refresh_oauth_access_token(&api_url, &refresh_token, client_id, profile_name).await?;
@@ -1481,7 +1480,7 @@ pub(crate) fn commit_api_key_profile(
         profile_name.to_string(),
         AuthProfile {
             auth_kind: AuthKind::ApiKey,
-            api_url: None,
+            oauth_api_url: None,
             app_url: Some(app_url.unwrap_or_else(|| DEFAULT_APP_URL.to_string())),
             org_name,
             org_bound: Some(org_bound),
@@ -1520,7 +1519,7 @@ fn commit_oauth_profile(
         profile_name.to_string(),
         AuthProfile {
             auth_kind: AuthKind::Oauth,
-            api_url: Some(api_url),
+            oauth_api_url: Some(api_url),
             app_url: Some(app_url),
             org_name: None,
             org_bound: Some(false),
@@ -1549,7 +1548,7 @@ async fn run_login_refresh(base: &BaseArgs) -> Result<()> {
     }
 
     let api_url = profile
-        .api_url
+        .oauth_api_url
         .clone()
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
     let client_id = profile.oauth_client_id.clone().ok_or_else(|| {
@@ -4003,7 +4002,7 @@ mod tests {
                 (*profile_name).to_string(),
                 AuthProfile {
                     auth_kind: AuthKind::ApiKey,
-                    api_url: Some((*api_url).to_string()),
+                    oauth_api_url: Some((*api_url).to_string()),
                     app_url: Some((*app_url).to_string()),
                     org_name: Some((*org_name).to_string()),
                     org_bound: Some(true),
@@ -4189,7 +4188,7 @@ mod tests {
             "work".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
+                oauth_api_url: Some("https://api.example.com".to_string()),
                 app_url: Some("https://www.example.com".to_string()),
                 org_name: Some("Example Org".to_string()),
                 org_bound: Some(true),
@@ -4217,7 +4216,7 @@ mod tests {
             "work".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
+                oauth_api_url: Some("https://api.example.com".to_string()),
                 app_url: Some("https://www.example.com".to_string()),
                 org_name: Some("Example Org".to_string()),
                 org_bound: Some(true),
@@ -4274,7 +4273,7 @@ mod tests {
             "work".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
+                oauth_api_url: Some("https://api.example.com".to_string()),
                 app_url: None,
                 org_name: None,
                 oauth_client_id: None,
@@ -4310,7 +4309,7 @@ mod tests {
             "work".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
+                oauth_api_url: Some("https://api.example.com".to_string()),
                 app_url: None,
                 org_name: Some("Example Org".to_string()),
                 org_bound: Some(true),
@@ -4344,7 +4343,7 @@ mod tests {
             "work".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
+                oauth_api_url: Some("https://api.example.com".to_string()),
                 app_url: None,
                 org_name: Some("Example Org".to_string()),
                 org_bound: Some(true),
@@ -4377,7 +4376,7 @@ mod tests {
             "work".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::ApiKey,
-                api_url: Some("https://api.example.com".to_string()),
+                oauth_api_url: Some("https://api.example.com".to_string()),
                 app_url: None,
                 org_name: Some("Example Org".to_string()),
                 org_bound: Some(true),
@@ -4409,7 +4408,7 @@ mod tests {
             "work".to_string(),
             AuthProfile {
                 auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.example.com".to_string()),
+                oauth_api_url: Some("https://api.example.com".to_string()),
                 app_url: Some("https://www.example.com".to_string()),
                 org_name: Some("Example Org".to_string()),
                 oauth_client_id: Some("bt_cli_work".to_string()),
@@ -4634,7 +4633,7 @@ mod tests {
             "work".into(),
             AuthProfile {
                 org_name: Some("acme-corp".into()),
-                api_url: Some("https://api.acme.com".into()),
+                oauth_api_url: Some("https://api.acme.com".into()),
                 ..Default::default()
             },
         );
@@ -4659,7 +4658,7 @@ mod tests {
             "work".into(),
             AuthProfile {
                 org_name: Some("acme-corp".into()),
-                api_url: Some("https://api.acme.com".into()),
+                oauth_api_url: Some("https://api.acme.com".into()),
                 ..Default::default()
             },
         );
@@ -4764,7 +4763,7 @@ mod tests {
             AuthProfile {
                 org_name: Some("other-org".into()),
                 org_bound: Some(true),
-                api_url: Some("https://api.other.com".into()),
+                oauth_api_url: Some("https://api.other.com".into()),
                 ..Default::default()
             },
         );
@@ -4928,7 +4927,7 @@ mod tests {
             "older".into(),
             AuthProfile {
                 auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.acme.example".into()),
+                oauth_api_url: Some("https://api.acme.example".into()),
                 app_url: Some("https://www.acme.example".into()),
                 org_name: Some("acme".into()),
                 oauth_access_expires_at: Some(100),
@@ -4941,7 +4940,7 @@ mod tests {
             "newer".into(),
             AuthProfile {
                 auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.acme.example".into()),
+                oauth_api_url: Some("https://api.acme.example".into()),
                 app_url: Some("https://www.acme.example".into()),
                 org_name: Some("acme".into()),
                 oauth_access_expires_at: Some(200),
@@ -4977,7 +4976,7 @@ mod tests {
             "work".into(),
             AuthProfile {
                 auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.test.example".into()),
+                oauth_api_url: Some("https://api.test.example".into()),
                 app_url: Some("https://app.test.example".into()),
                 org_name: Some("test-org".into()),
                 user_name: Some("Test User".into()),
@@ -5012,7 +5011,7 @@ mod tests {
             "work".into(),
             AuthProfile {
                 auth_kind: AuthKind::Oauth,
-                api_url: Some("https://api.test.example".into()),
+                oauth_api_url: Some("https://api.test.example".into()),
                 app_url: Some("https://app.test.example".into()),
                 org_name: Some("test-org".into()),
                 user_name: Some("Test User".into()),
@@ -5061,6 +5060,28 @@ mod tests {
             "https://app.test.example",
             &other_user
         ));
+    }
+
+    #[test]
+    fn oauth_api_url_keeps_legacy_serialized_key() {
+        let profile: AuthProfile = serde_json::from_value(serde_json::json!({
+            "auth_kind": "oauth",
+            "api_url": "https://api.test.example"
+        }))
+        .expect("deserialize legacy profile");
+        assert_eq!(
+            profile.oauth_api_url.as_deref(),
+            Some("https://api.test.example")
+        );
+
+        let serialized = serde_json::to_value(profile).expect("serialize profile");
+        assert_eq!(
+            serialized
+                .get("api_url")
+                .and_then(serde_json::Value::as_str),
+            Some("https://api.test.example")
+        );
+        assert!(serialized.get("oauth_api_url").is_none());
     }
 
     fn login_org(id: &str, name: &str) -> LoginOrgInfo {
