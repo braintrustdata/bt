@@ -135,21 +135,96 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Commands
 
-| Command       | Description                                                        |
-| ------------- | ------------------------------------------------------------------ |
-| `bt init`     | Initialize `.bt/` config directory and link to a project           |
-| `bt auth`     | Authenticate with Braintrust                                       |
-| `bt switch`   | Switch org and project context                                     |
-| `bt status`   | Show current org and project context                               |
-| `bt datasets` | Manage datasets and dataset pipelines                              |
-| `bt eval`     | Run eval files (Unix only)                                         |
-| `bt sql`      | Run SQL queries against Braintrust                                 |
-| `bt view`     | View logs, traces, and spans                                       |
-| `bt projects` | Manage projects (list, create, view, delete)                       |
-| `bt datasets` | Manage remote datasets (list, create, update, view, delete)        |
-| `bt prompts`  | Manage prompts (list, view, delete)                                |
-| `bt sync`     | Synchronize project logs between Braintrust and local NDJSON files |
-| `bt update`   | Update bt in-place                                                 |
+| Command        | Description                                                        |
+| -------------- | ------------------------------------------------------------------ |
+| `bt init`      | Initialize `.bt/` config directory and link to a project           |
+| `bt auth`      | Authenticate with Braintrust                                       |
+| `bt switch`    | Switch org and project context                                     |
+| `bt status`    | Show current org and project context                               |
+| `bt datasets`  | Manage datasets and dataset pipelines                              |
+| `bt eval`      | Run eval files (Unix only)                                         |
+| `bt sql`       | Run SQL queries against Braintrust                                 |
+| `bt view`      | View logs, traces, and spans                                       |
+| `bt projects`  | Manage projects (list, create, view, delete)                       |
+| `bt datasets`  | Manage remote datasets (list, create, update, view, delete)        |
+| `bt prompts`   | Manage prompts (list, view, update, delete)                        |
+| `bt functions` | Manage functions (list, view, invoke, update, push, pull, delete)  |
+| `bt tools`     | Manage tools (list, view, invoke, update, delete)                  |
+| `bt scorers`   | Manage scorers (list, create, view, invoke, update, delete)        |
+| `bt sync`      | Synchronize project logs between Braintrust and local NDJSON files |
+| `bt update`    | Update bt in-place                                                 |
+
+## `bt scorers`
+
+Create and update prompt-based LLM scorers in the current project:
+
+```bash
+bt scorers create "Helpfulness" \
+  --model gpt-5.4-nano \
+  --messages @messages.json \
+  --choice-scores '{"A":1,"B":0}'
+
+bt scorers update helpfulness --messages @messages.json
+bt scorers update helpfulness --model gpt-5.4-nano
+```
+
+`@PATH` and `-` are CLI-only source notation, not scorer settings in the web UI. For example, `--messages @messages.json` reads chat messages from `messages.json`, while `--messages -` reads them from stdin.
+
+LLM scorer configuration mirrors the web UI:
+
+```bash
+bt scorers create "Quality judge" \
+  --model gpt-5.4-nano \
+  --messages @messages.json \
+  --choice-scores '{"pass":1,"fail":0}' \
+  --temperature 0.1 \
+  --max-tokens 512 \
+  --top-p 0.9 \
+  --frequency-penalty 0 \
+  --presence-penalty 0 \
+  --stop-sequence END \
+  --tool-choice auto \
+  --reasoning-effort none \
+  --verbosity low \
+  --template-format mustache \
+  --pass-threshold 0.7 \
+  --metadata @metadata.yaml
+```
+
+Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja. Repeat `--stop-sequence` for multiple values. Tool choice accepts `auto`, `none`, `required`, or a function name. Model parameters are validated against the same model catalog and custom-model metadata used by the web UI, including parameter availability, provider-specific ranges, reasoning options, and output-token limits. Unknown custom models receive only provider-independent validation instead of being assigned capabilities based on their names.
+
+For classification output instead of a numeric score, use classifications in place of choice scores:
+
+```bash
+bt scorers create "Safety label" \
+  --model gpt-5.4-nano \
+  --messages @messages.json \
+  --classifications '["safe","unsafe"]' \
+  --allow-no-match
+```
+
+Use `--if-exists error|ignore|replace` when creating a scorer. Text and structured input flags accept an inline value, `@PATH` to read from a file, or `-` for stdin. For fields without a dedicated update flag, use `--patch` with a JSON object.
+
+For code scorers, use the Braintrust SDK for your language and push the source file:
+
+```ts
+// TypeScript
+import { projects } from "braintrust";
+const project = projects.create({ name: "test-project" });
+project.scorers.create({ name: "Test scorer", handler: ({ output }) => 1 });
+```
+
+```python
+# Python
+from braintrust import projects
+project = projects.create("test-project")
+project.scorers.create(name="Test scorer", handler=test_scorer, parameters=ScorerInput)
+```
+
+```bash
+bt functions push scorer.ts
+bt functions push scorer.py
+```
 
 ## `bt eval`
 

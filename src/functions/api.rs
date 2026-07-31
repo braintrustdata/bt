@@ -68,17 +68,29 @@ pub async fn list_functions(
     project_id: &str,
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
-    let pid = escape_sql(project_id);
-    let query = match function_type {
-        Some(ft) => {
-            let ft = escape_sql(ft);
-            format!("SELECT * FROM project_functions('{pid}') WHERE function_type = '{ft}'")
-        }
-        None => format!("SELECT * FROM project_functions('{pid}')"),
-    };
+    let query = list_functions_query(project_id, function_type);
     let response = client.btql::<Function>(&query).await?;
 
     Ok(response.data)
+}
+
+fn list_functions_query(project_id: &str, function_type: Option<&str>) -> String {
+    let pid = escape_sql(project_id);
+    let type_filter = match function_type {
+        // The Braintrust UI lists score-producing scorers and label-producing
+        // classifiers together in the Scorers section.
+        Some("scorer") => " AND function_type IN ('scorer', 'classifier')".to_string(),
+        Some(ft) => {
+            let ft = escape_sql(ft);
+            format!(" AND function_type = '{ft}'")
+        }
+        None => String::new(),
+    };
+    // Function definitions can be arbitrarily old, but retain an explicit
+    // timestamp constraint to keep every BTQL query bounded.
+    format!(
+        "SELECT * FROM project_functions('{pid}') WHERE created >= '1970-01-01T00:00:00Z'{type_filter}"
+    )
 }
 
 pub async fn get_function_by_slug(
@@ -142,6 +154,20 @@ pub async fn invoke_function(
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
     let path = format!("/v1/function/{}", encode(function_id));
     client.delete(&path).await
+}
+
+/// Partially update a function (scorer/tool/prompt/...) by id.
+///
+/// The Braintrust API deep-merges object fields, so callers can send only the
+/// nested fields they want to change (for example `prompt_data.prompt`) without
+/// sending the complete function definition.
+pub async fn patch_function(
+    client: &ApiClient,
+    function_id: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let path = format!("/v1/function/{}", encode(function_id));
+    client.patch(&path, body).await
 }
 
 pub async fn list_functions_page(
@@ -276,6 +302,14 @@ fn ignored_count(raw: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scorer_list_query_includes_classifiers_and_a_timestamp_bound() {
+        let query = list_functions_query("test-project-id", Some("scorer"));
+
+        assert!(query.contains("created >= '1970-01-01T00:00:00Z'"));
+        assert!(query.contains("function_type IN ('scorer', 'classifier')"));
+    }
 
     #[test]
     fn ignored_count_extracts_canonical_shape() {
