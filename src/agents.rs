@@ -18,8 +18,8 @@ use serde_json::{Map, Value};
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
     braintrust_serve_options, paths, run_hook, run_replay, run_serve, run_status, shutdown_daemon,
-    BraintrustSinkConfig, DebugSinkFactory, HookArgs, HostInfo, Registry, ReplayArgs, ServeArgs,
-    ServeOptions, StatusArgs,
+    BraintrustSinkConfig, HookArgs, HostInfo, Registry, ReplayArgs, ServeArgs, ServeOptions,
+    StatusArgs,
 };
 
 use crate::args::BaseArgs;
@@ -46,7 +46,7 @@ enum TraceCommand {
     /// Gracefully stop the tracing daemon.
     #[command(hide = true)]
     Stop(StopArgs),
-    /// Replay a journal file through the translators + sink.
+    /// Import a native Codex or Claude Code transcript.
     #[command(hide = true)]
     Replay(ReplayArgs),
 }
@@ -344,17 +344,8 @@ pub async fn run(base: BaseArgs, args: TraceArgs) -> anyhow::Result<()> {
             Ok(())
         }
         TraceCommand::Replay(replay_args) => {
-            // Replay through the real translators into the debug sink (no
-            // network): useful for inspecting what a journal produces.
-            let data_dir = paths::data_dir(None);
-            let opts = ServeOptions {
-                version: crate::CLI_VERSION.to_string(),
-                translators: Arc::new(Registry::default_agents()),
-                sink_factory: Arc::new(DebugSinkFactory {
-                    dir: data_dir.join("spans"),
-                }),
-            };
-            run_replay(replay_args, opts).await
+            let config = session_config(&base).await?;
+            run_replay(replay_args, serve_options(), Some(config)).await
         }
     }
 }

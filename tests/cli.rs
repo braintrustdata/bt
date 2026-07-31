@@ -180,7 +180,10 @@ fn trace_help_hides_internal_commands_but_keeps_them_callable() {
         .args(["trace", "replay", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("<FILE>"));
+        .stdout(predicate::str::contains("<FILE>"))
+        .stdout(predicate::str::contains("--source <SOURCE>"))
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("claude"));
 
     bt_command()
         .args(["trace", "setup", "--help"])
