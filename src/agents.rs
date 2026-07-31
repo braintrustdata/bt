@@ -41,8 +41,10 @@ enum AgentsCommand {
     #[command(hide = true)]
     Hook(HookArgs),
     /// Print daemon/session status.
+    #[command(hide = true)]
     Status(StatusArgs),
     /// Replay a journal file through the translators + sink.
+    #[command(hide = true)]
     Replay(ReplayArgs),
 }
 

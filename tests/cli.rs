@@ -143,8 +143,8 @@ fn agents_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("\n  daemon").not())
         .stdout(predicate::str::contains("serve").not())
         .stdout(predicate::str::contains("\n  hook").not())
-        .stdout(predicate::str::contains("status"))
-        .stdout(predicate::str::contains("replay"));
+        .stdout(predicate::str::contains("\n  status").not())
+        .stdout(predicate::str::contains("\n  replay").not());
 
     bt_command()
         .args(["agents", "daemon", "--help"])
@@ -161,6 +161,18 @@ fn agents_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("--source"))
         .stdout(predicate::str::contains("--flush-on-turn-end"))
         .stdout(predicate::str::contains("--experiment-id"));
+
+    bt_command()
+        .args(["agents", "status", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--socket"));
+
+    bt_command()
+        .args(["agents", "replay", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<FILE>"));
 
     bt_command()
         .args(["agents", "setup", "--help"])
