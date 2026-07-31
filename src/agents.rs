@@ -17,8 +17,8 @@ use serde_json::{Map, Value};
 
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
-    braintrust_serve_options, paths, run_hook, run_replay, run_serve, run_status, shutdown_daemon,
-    BraintrustSinkConfig, HookArgs, HostInfo, Registry, ReplayArgs, ServeArgs, ServeOptions,
+    braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, shutdown_daemon,
+    BraintrustSinkConfig, HookArgs, HostInfo, ImportArgs, Registry, ServeArgs, ServeOptions,
     StatusArgs,
 };
 
@@ -46,9 +46,9 @@ enum TraceCommand {
     /// Gracefully stop the tracing daemon.
     #[command(hide = true)]
     Stop(StopArgs),
-    /// Import a native Codex or Claude Code transcript.
+    /// Import a past Codex or Claude Code session by its resume id.
     #[command(hide = true)]
-    Replay(ReplayArgs),
+    Import(ImportArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -343,9 +343,9 @@ pub async fn run(base: BaseArgs, args: TraceArgs) -> anyhow::Result<()> {
             println!("Tracing daemon stopped.");
             Ok(())
         }
-        TraceCommand::Replay(replay_args) => {
+        TraceCommand::Import(import_args) => {
             let config = session_config(&base).await?;
-            run_replay(replay_args, serve_options(), Some(config)).await
+            run_import(import_args, serve_options(), Some(config)).await
         }
     }
 }

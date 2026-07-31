@@ -146,6 +146,7 @@ fn trace_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("\n  hook").not())
         .stdout(predicate::str::contains("\n  status").not())
         .stdout(predicate::str::contains("\n  stop").not())
+        .stdout(predicate::str::contains("\n  import").not())
         .stdout(predicate::str::contains("\n  replay").not());
 
     bt_command()
@@ -177,13 +178,18 @@ fn trace_help_hides_internal_commands_but_keeps_them_callable() {
         .stdout(predicate::str::contains("--socket"));
 
     bt_command()
-        .args(["trace", "replay", "--help"])
+        .args(["trace", "import", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("<FILE>"))
-        .stdout(predicate::str::contains("--source <SOURCE>"))
+        .stdout(predicate::str::contains("<SOURCE>"))
+        .stdout(predicate::str::contains("<SESSION_ID>"))
         .stdout(predicate::str::contains("codex"))
         .stdout(predicate::str::contains("claude"));
+
+    bt_command()
+        .args(["trace", "replay", "--help"])
+        .assert()
+        .failure();
 
     bt_command()
         .args(["trace", "setup", "--help"])
