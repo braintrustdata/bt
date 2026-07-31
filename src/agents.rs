@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use clap::{Args, Subcommand};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use bt_daemon::wire::{BackendAuth, FlushMode, SessionConfig};
 use bt_daemon::{
@@ -71,12 +71,57 @@ enum SetupAgent {
     Claude,
 }
 
-const CODEX_MARKETPLACE: &str = "braintrust-codex-plugins";
-const CODEX_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-codex-plugin";
-const CODEX_PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
-const CLAUDE_MARKETPLACE: &str = "braintrust-claude-plugin";
-const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin";
-const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
+const GENERATED_MARKETPLACE: &str = "braintrust-bt-trace";
+const GENERATED_CODEX_PLUGIN: &str = "trace-codex@braintrust-bt-trace";
+const GENERATED_CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-bt-trace";
+const LEGACY_CODEX_PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
+const LEGACY_CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
+
+const CODEX_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+];
+
+const CLAUDE_HOOK_EVENTS: &[&str] = &[
+    "ConfigChange",
+    "CwdChanged",
+    "Elicitation",
+    "ElicitationResult",
+    "FileChanged",
+    "InstructionsLoaded",
+    "MessageDisplay",
+    "Notification",
+    "PermissionDenied",
+    "PermissionRequest",
+    "PostCompact",
+    "PostToolBatch",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PreCompact",
+    "PreToolUse",
+    "SessionEnd",
+    "SessionStart",
+    "Setup",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "TaskCompleted",
+    "TaskCreated",
+    "TeammateIdle",
+    "UserPromptExpansion",
+    "UserPromptSubmit",
+    "WorktreeCreate",
+    "WorktreeRemove",
+];
 
 /// How the shim (re)launches the daemon: `bt trace daemon` from this same
 /// binary.
@@ -140,76 +185,194 @@ fn run_command(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn codex_marketplace_installed(value: &Value) -> bool {
+fn codex_marketplace_installed(value: &Value, name: &str) -> bool {
     value
         .get("marketplaces")
         .and_then(Value::as_array)
         .is_some_and(|items| {
             items
                 .iter()
-                .any(|item| item.get("name").and_then(Value::as_str) == Some(CODEX_MARKETPLACE))
+                .any(|item| item.get("name").and_then(Value::as_str) == Some(name))
         })
 }
 
-fn codex_plugin_installed(value: &Value) -> bool {
+fn codex_plugin_installed(value: &Value, id: &str) -> bool {
     value
         .get("installed")
         .and_then(Value::as_array)
         .is_some_and(|items| {
             items
                 .iter()
-                .any(|item| item.get("pluginId").and_then(Value::as_str) == Some(CODEX_PLUGIN))
+                .any(|item| item.get("pluginId").and_then(Value::as_str) == Some(id))
         })
 }
 
-fn claude_marketplace_installed(value: &Value) -> bool {
+fn claude_marketplace_installed(value: &Value, name: &str) -> bool {
     value.as_array().is_some_and(|items| {
         items
             .iter()
-            .any(|item| item.get("name").and_then(Value::as_str) == Some(CLAUDE_MARKETPLACE))
+            .any(|item| item.get("name").and_then(Value::as_str) == Some(name))
     })
 }
 
-fn claude_plugin(value: &Value) -> Option<&Value> {
+fn claude_plugin<'a>(value: &'a Value, id: &str) -> Option<&'a Value> {
     value
         .as_array()?
         .iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(CLAUDE_PLUGIN))
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create plugin directory {}", parent.display()))?;
+    }
+    let mut encoded = serde_json::to_string_pretty(value)?;
+    encoded.push('\n');
+    crate::utils::write_text_atomic(path, &encoded)
+}
+
+fn hook_config(source: &str, events: &[&str], codex: bool) -> Value {
+    let command = format!(
+        "bt trace hook --source {source} --source-version {}",
+        crate::CLI_VERSION
+    );
+    let hooks = events
+        .iter()
+        .map(|event| {
+            let hook = if codex {
+                json!({
+                    "type": "command",
+                    "command": command,
+                    "commandWindows": command,
+                    "statusMessage": "Braintrust tracing"
+                })
+            } else {
+                json!({
+                    "type": "command",
+                    "command": command,
+                    "async": false
+                })
+            };
+            ((*event).to_owned(), json!([{ "hooks": [hook] }]))
+        })
+        .collect::<Map<_, _>>();
+    json!({ "hooks": hooks })
+}
+
+fn generate_codex_plugin() -> anyhow::Result<PathBuf> {
+    let root = crate::config::global_config_dir()?.join("trace-plugins/codex");
+    write_json(
+        &root.join(".agents/plugins/marketplace.json"),
+        &json!({
+            "name": GENERATED_MARKETPLACE,
+            "plugins": [{
+                "name": "trace-codex",
+                "source": {
+                    "source": "local",
+                    "path": "./plugins/trace-codex"
+                }
+            }]
+        }),
+    )?;
+    let plugin = root.join("plugins/trace-codex");
+    write_json(
+        &plugin.join(".codex-plugin/plugin.json"),
+        &json!({
+            "name": "trace-codex",
+            "version": crate::CLI_VERSION,
+            "description": "Trace Codex sessions through the Braintrust bt daemon",
+            "hooks": "./hooks/hooks.json"
+        }),
+    )?;
+    write_json(
+        &plugin.join("hooks/hooks.json"),
+        &hook_config("codex", CODEX_HOOK_EVENTS, true),
+    )?;
+    Ok(root)
+}
+
+fn generate_claude_plugin() -> anyhow::Result<PathBuf> {
+    let root = crate::config::global_config_dir()?.join("trace-plugins/claude");
+    write_json(
+        &root.join(".claude-plugin/marketplace.json"),
+        &json!({
+            "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+            "name": GENERATED_MARKETPLACE,
+            "version": crate::CLI_VERSION,
+            "description": "Braintrust tracing through the bt daemon",
+            "owner": { "name": "Braintrust" },
+            "plugins": [{
+                "name": "trace-claude-code",
+                "description": "Trace Claude Code sessions through the Braintrust bt daemon",
+                "source": "./plugins/trace-claude-code",
+                "category": "observability"
+            }]
+        }),
+    )?;
+    let plugin = root.join("plugins/trace-claude-code");
+    write_json(
+        &plugin.join(".claude-plugin/plugin.json"),
+        &json!({
+            "name": "trace-claude-code",
+            "version": crate::CLI_VERSION,
+            "description": "Trace Claude Code sessions through the Braintrust bt daemon"
+        }),
+    )?;
+    write_json(
+        &plugin.join("hooks/hooks.json"),
+        &hook_config("claude-code", CLAUDE_HOOK_EVENTS, false),
+    )?;
+    Ok(root)
 }
 
 fn setup_codex() -> anyhow::Result<()> {
+    let marketplace = generate_codex_plugin()?;
+    let marketplace = marketplace
+        .to_str()
+        .context("generated Codex plugin path is not UTF-8")?;
     let marketplaces = command_json("codex", &["plugin", "marketplace", "list", "--json"])?;
-    if !codex_marketplace_installed(&marketplaces) {
-        run_command(
-            "codex",
-            &["plugin", "marketplace", "add", CODEX_MARKETPLACE_SOURCE],
-        )?;
-    }
 
     let plugins = command_json("codex", &["plugin", "list", "--json"])?;
-    if !codex_plugin_installed(&plugins) {
-        run_command("codex", &["plugin", "add", CODEX_PLUGIN])?;
+    for plugin in [LEGACY_CODEX_PLUGIN, GENERATED_CODEX_PLUGIN] {
+        if codex_plugin_installed(&plugins, plugin) {
+            run_command("codex", &["plugin", "remove", plugin])?;
+        }
     }
+    if codex_marketplace_installed(&marketplaces, GENERATED_MARKETPLACE) {
+        run_command(
+            "codex",
+            &["plugin", "marketplace", "remove", GENERATED_MARKETPLACE],
+        )?;
+    }
+    run_command("codex", &["plugin", "marketplace", "add", marketplace])?;
+    run_command("codex", &["plugin", "add", GENERATED_CODEX_PLUGIN])?;
     Ok(())
 }
 
 fn setup_claude() -> anyhow::Result<()> {
+    let marketplace = generate_claude_plugin()?;
+    let marketplace = marketplace
+        .to_str()
+        .context("generated Claude plugin path is not UTF-8")?;
     let marketplaces = command_json("claude", &["plugin", "marketplace", "list", "--json"])?;
-    if !claude_marketplace_installed(&marketplaces) {
+    let plugins = command_json("claude", &["plugin", "list", "--json"])?;
+    if claude_plugin(&plugins, LEGACY_CLAUDE_PLUGIN)
+        .is_some_and(|plugin| plugin.get("enabled").and_then(Value::as_bool) != Some(false))
+    {
+        run_command("claude", &["plugin", "disable", LEGACY_CLAUDE_PLUGIN])?;
+    }
+    if claude_plugin(&plugins, GENERATED_CLAUDE_PLUGIN).is_some() {
+        run_command("claude", &["plugin", "uninstall", GENERATED_CLAUDE_PLUGIN])?;
+    }
+    if claude_marketplace_installed(&marketplaces, GENERATED_MARKETPLACE) {
         run_command(
             "claude",
-            &["plugin", "marketplace", "add", CLAUDE_MARKETPLACE_SOURCE],
+            &["plugin", "marketplace", "remove", GENERATED_MARKETPLACE],
         )?;
     }
-
-    let plugins = command_json("claude", &["plugin", "list", "--json"])?;
-    match claude_plugin(&plugins) {
-        None => run_command("claude", &["plugin", "install", CLAUDE_PLUGIN])?,
-        Some(plugin) if plugin.get("enabled").and_then(Value::as_bool) == Some(false) => {
-            run_command("claude", &["plugin", "enable", CLAUDE_PLUGIN])?;
-        }
-        Some(_) => {}
-    }
+    run_command("claude", &["plugin", "marketplace", "add", marketplace])?;
+    run_command("claude", &["plugin", "install", GENERATED_CLAUDE_PLUGIN])?;
     Ok(())
 }
 

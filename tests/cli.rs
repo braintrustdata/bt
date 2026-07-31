@@ -297,6 +297,7 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
 
     bt_command()
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", state_dir.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .env("BT_DAEMON_CONFIG", &config)
@@ -308,8 +309,25 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
         ));
 
     let calls = fs::read_to_string(log).expect("read fake CLI calls");
-    assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-codex-plugin"));
-    assert!(calls.contains("plugin add trace-codex@braintrust-codex-plugins"));
+    let marketplace = state_dir.path().join("bt/trace-plugins/codex");
+    assert!(calls.contains(&format!("plugin marketplace add {}", marketplace.display())));
+    assert!(calls.contains("plugin add trace-codex@braintrust-bt-trace"));
+    assert!(!calls.contains("braintrustdata/braintrust-codex-plugin"));
+
+    let hooks: serde_json::Value = serde_json::from_slice(
+        &fs::read(marketplace.join("plugins/trace-codex/hooks/hooks.json"))
+            .expect("read Codex hooks"),
+    )
+    .expect("parse Codex hooks");
+    let codex_command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("Codex hook command");
+    assert!(codex_command.starts_with("bt trace hook --source codex --source-version "));
+    assert!(!codex_command.ends_with("--source-version "));
+    assert_eq!(
+        hooks["hooks"]["Stop"][0]["hooks"][0]["commandWindows"],
+        codex_command
+    );
 
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
@@ -334,6 +352,7 @@ fn trace_setup_claude_installs_plugin_and_creates_default_settings() {
 
     bt_command()
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", state_dir.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .env("BT_DAEMON_CONFIG", &config)
@@ -345,8 +364,22 @@ fn trace_setup_claude_installs_plugin_and_creates_default_settings() {
         ));
 
     let calls = fs::read_to_string(log).expect("read fake CLI calls");
-    assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-claude-plugin"));
-    assert!(calls.contains("plugin install trace-claude-code@braintrust-claude-plugin"));
+    let marketplace = state_dir.path().join("bt/trace-plugins/claude");
+    assert!(calls.contains(&format!("plugin marketplace add {}", marketplace.display())));
+    assert!(calls.contains("plugin install trace-claude-code@braintrust-bt-trace"));
+    assert!(!calls.contains("braintrustdata/braintrust-claude-plugin"));
+
+    let hooks: serde_json::Value = serde_json::from_slice(
+        &fs::read(marketplace.join("plugins/trace-claude-code/hooks/hooks.json"))
+            .expect("read Claude hooks"),
+    )
+    .expect("parse Claude hooks");
+    let claude_command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("Claude hook command");
+    assert!(claude_command.starts_with("bt trace hook --source claude-code --source-version "));
+    assert!(!claude_command.ends_with("--source-version "));
+    assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["async"], false);
 
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
@@ -356,19 +389,20 @@ fn trace_setup_claude_installs_plugin_and_creates_default_settings() {
 
 #[cfg(unix)]
 #[test]
-fn trace_setup_claude_enables_an_existing_disabled_plugin() {
+fn trace_setup_claude_replaces_generated_plugin_and_disables_legacy_tracing() {
     let home = tempfile::tempdir().expect("home tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let log = state_dir.path().join("claude.log");
     write_agent_cli(
         &bin_dir.path().join("claude"),
-        r#"[{"name":"braintrust-claude-plugin"}]"#,
-        r#"[{"id":"trace-claude-code@braintrust-claude-plugin","enabled":false}]"#,
+        r#"[{"name":"braintrust-claude-plugin"},{"name":"braintrust-bt-trace"}]"#,
+        r#"[{"id":"trace-claude-code@braintrust-claude-plugin","enabled":true},{"id":"trace-claude-code@braintrust-bt-trace","enabled":true}]"#,
     );
 
     bt_command()
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", state_dir.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .args(["trace", "setup", "claude"])
@@ -376,9 +410,41 @@ fn trace_setup_claude_enables_an_existing_disabled_plugin() {
         .success();
 
     let calls = fs::read_to_string(log).expect("read fake CLI calls");
-    assert!(calls.contains("plugin enable trace-claude-code@braintrust-claude-plugin"));
-    assert!(!calls.contains("plugin marketplace add"));
-    assert!(!calls.contains("plugin install"));
+    assert!(calls.contains("plugin disable trace-claude-code@braintrust-claude-plugin"));
+    assert!(calls.contains("plugin uninstall trace-claude-code@braintrust-bt-trace"));
+    assert!(calls.contains("plugin marketplace remove braintrust-bt-trace"));
+    assert!(calls.contains("plugin marketplace add"));
+    assert!(calls.contains("plugin install trace-claude-code@braintrust-bt-trace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_setup_codex_replaces_generated_plugin_and_removes_legacy_tracing() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("codex.log");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[{"name":"braintrust-codex-plugins"},{"name":"braintrust-bt-trace"}]}"#,
+        r#"{"installed":[{"pluginId":"trace-codex@braintrust-codex-plugins"},{"pluginId":"trace-codex@braintrust-bt-trace"}]}"#,
+    );
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", state_dir.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .args(["trace", "setup", "codex"])
+        .assert()
+        .success();
+
+    let calls = fs::read_to_string(log).expect("read fake CLI calls");
+    assert!(calls.contains("plugin remove trace-codex@braintrust-codex-plugins"));
+    assert!(calls.contains("plugin remove trace-codex@braintrust-bt-trace"));
+    assert!(calls.contains("plugin marketplace remove braintrust-bt-trace"));
+    assert!(calls.contains("plugin marketplace add"));
+    assert!(calls.contains("plugin add trace-codex@braintrust-bt-trace"));
 }
 
 #[test]
