@@ -24,6 +24,22 @@ use crate::http::ApiClient;
 use crate::ui::{self, with_spinner};
 use crate::utils::app_project_url;
 
+/// One-line deprecation notice shown in `bt setup` / `bt docs` help text.
+const SETUP_DEPRECATED_HELP: &str =
+    "Deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh";
+
+/// Multi-line deprecation warning printed to stderr when `bt setup` / `bt docs` run.
+const SETUP_DEPRECATED_WARNING: &str = "\
+bt setup has been deprecated, use the command below instead:\n\n    curl -fsSL https://braintrust.dev/wizard/setup.sh | sh";
+
+fn print_setup_deprecation_warning(base: &BaseArgs) {
+    if base.json {
+        return;
+    }
+    eprintln!("{}", SETUP_DEPRECATED_WARNING);
+    eprintln!();
+}
+
 mod agent_stream;
 mod docs;
 mod sdk_install_docs;
@@ -61,12 +77,15 @@ const ALL_WORKFLOWS: [WorkflowArg; 5] = [
 ];
 
 #[derive(Debug, Clone, Args)]
-#[command(after_help = "\
+#[command(
+    before_help = SETUP_DEPRECATED_HELP,
+    after_help = "\
 Examples:
   bt setup --agent cursor --workflow observe
   bt setup skills --agent codex --global
   bt setup mcp --agent codex
-")]
+"
+)]
 pub struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupSubcommand>,
@@ -136,12 +155,16 @@ pub struct SetupArgs {
 #[derive(Debug, Clone, Subcommand)]
 enum SetupSubcommand {
     /// Configure coding-agent skills to use Braintrust
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Skills(AgentsSetupArgs),
     /// Download instrumentation docs and run a coding agent to instrument this repo
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Instrument(InstrumentSetupArgs),
     /// Configure MCP server settings for coding agents
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Mcp(AgentsMcpSetupArgs),
     /// Diagnose coding-agent setup for Braintrust
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Doctor(AgentsDoctorArgs),
 }
 
@@ -566,6 +589,7 @@ struct SkillsAliasResult {
 }
 
 pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
+    print_setup_deprecation_warning(&base);
     // Deprecated flag: --no-mcp-skill is equivalent to --no-skills --no-mcp
     if args.no_mcp_skill {
         args.no_skills = true;
