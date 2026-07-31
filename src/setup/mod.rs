@@ -1469,13 +1469,14 @@ async fn run_setup_browser_auth(
     };
     let stored_profiles = auth::list_profiles()?;
     let profile_name = setup_browser_profile_name(profile_name, &org.name, &stored_profiles);
+    let org_constraint = (completed.api_key.trim().starts_with("sk-") && available_orgs.len() == 1)
+        .then(|| org.name.clone());
 
     auth::commit_api_key_profile(
         &profile_name,
         &completed.api_key,
-        login.api_url.clone(),
         Some(login.app_url.clone()),
-        Some(org.name.clone()),
+        org_constraint,
     )
     .context("failed to save Braintrust auth profile after browser setup")?;
 
@@ -1522,7 +1523,7 @@ fn setup_browser_profile_name(
 fn resolve_profile_name_for_setup(
     base: &BaseArgs,
     profiles: &[auth::ProfileInfo],
-    prompt_for_choice: bool,
+    _prompt_for_choice: bool,
 ) -> Result<Option<String>> {
     if let Some(profile_name) = base
         .profile
@@ -1538,46 +1539,10 @@ fn resolve_profile_name_for_setup(
         );
     }
 
-    if let Some(org_name) = base.org_name.as_deref() {
-        if let Some(profile_name) = profiles
-            .iter()
-            .find(|profile| profile.name == org_name)
-            .map(|profile| profile.name.clone())
-        {
-            return Ok(Some(profile_name));
-        }
-
-        let mut matches = profiles
-            .iter()
-            .filter(|profile| profile.org_name.as_deref() == Some(org_name))
-            .map(|profile| profile.name.clone())
-            .collect::<Vec<_>>();
-        matches.sort();
-
-        return match matches.len() {
-            0 => Ok(None),
-            1 => Ok(Some(matches.remove(0))),
-            _ if prompt_for_choice => auth::select_profile_interactive(Some(org_name))?
-                .map(Some)
-                .ok_or_else(|| anyhow!("no profile selected")),
-            _ => bail!(
-                "multiple profiles for org '{org_name}': {}. Use --profile to disambiguate.",
-                matches.join(", ")
-            ),
-        };
-    }
-
     if profiles.len() == 1 {
         return Ok(Some(profiles[0].name.clone()));
     }
-
-    if prompt_for_choice && !profiles.is_empty() {
-        auth::select_profile_interactive(None)?
-            .map(Some)
-            .ok_or_else(|| anyhow!("no profile selected"))
-    } else {
-        Ok(None)
-    }
+    Ok(None)
 }
 
 fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
@@ -1646,6 +1611,7 @@ fn build_api_key_login_context(
         login,
         api_url,
         app_url,
+        profile: None,
     }
 }
 
@@ -1758,13 +1724,17 @@ async fn ensure_profile_or_setup_browser_auth(
     auth_base.api_key = None;
     auth_base.api_key_source = None;
 
-    if let Some(profile_name) = selected_profile {
+    if let Some(profile_name) = selected_profile.as_ref() {
         auth_base.profile = Some(profile_name.clone());
+    }
 
+    if selected_profile.is_some() || !profiles.is_empty() {
         match auth::login(&auth_base).await {
             Ok(ctx) => {
-                base.profile = auth_base.profile.clone();
-                let is_oauth = auth::resolve_auth(&auth_base).await?.is_oauth;
+                base.profile = ctx.profile.clone();
+                let mut resolved_base = auth_base.clone();
+                resolved_base.profile = ctx.profile.clone();
+                let is_oauth = auth::resolve_auth(&resolved_base).await?.is_oauth;
                 return Ok(SetupAuthLogin {
                     login: ctx,
                     is_oauth,
@@ -1773,10 +1743,8 @@ async fn ensure_profile_or_setup_browser_auth(
             }
             Err(err) if auth::is_missing_credential_error(&err) => {
                 if base.verbose {
-                    eprintln!(
-                        "   Profile '{}' credentials inaccessible ({}). Re-authenticating in the browser...",
-                        profile_name, err
-                    );
+                    let profile = selected_profile.as_deref().unwrap_or("selected profile");
+                    eprintln!("   Profile '{profile}' credentials inaccessible ({err}). Re-authenticating in the browser...");
                 }
                 if !can_prompt {
                     bail!(
@@ -1785,7 +1753,7 @@ async fn ensure_profile_or_setup_browser_auth(
                 }
                 return run_setup_browser_auth(
                     base,
-                    Some(&profile_name),
+                    selected_profile.as_deref(),
                     project_name,
                     project_was_explicit,
                     requested_org,
@@ -2043,17 +2011,12 @@ async fn ensure_setup_auth(
                     &[],
                 )?;
                 let client = build_api_key_client(base, api_key, &org).await?;
-                let api_url = base
-                    .api_url
-                    .clone()
-                    .or_else(|| org.api_url.clone())
-                    .unwrap_or_else(|| DEFAULT_API_URL.to_string());
                 auth::commit_api_key_profile(
                     &org.name,
                     api_key,
-                    api_url,
                     base.app_url.clone(),
-                    Some(org.name.clone()),
+                    (api_key.trim().starts_with("sk-") && available_orgs.len() == 1)
+                        .then(|| org.name.clone()),
                 )?;
                 return build_setup_auth_context(base, client, false, needs_api_key, None).await;
             }
@@ -5474,6 +5437,7 @@ mod tests {
             login,
             api_url,
             app_url,
+            profile: None,
         }
     }
 

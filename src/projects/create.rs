@@ -189,6 +189,7 @@ mod tests {
             login,
             api_url: server.base_url.clone(),
             app_url: "https://app.example.com".to_string(),
+            profile: None,
         })
         .expect("build client");
         (server, client)

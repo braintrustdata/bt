@@ -24,12 +24,6 @@ fn resolve_profile_info_from_profiles(
     }
 
     if let Some(org_name) = org {
-        if profiles.iter().any(|profile| profile.name == org_name) {
-            return profiles
-                .into_iter()
-                .find(|profile| profile.name == org_name);
-        }
-
         let org_matches: Vec<&ProfileInfo> = profiles
             .iter()
             .filter(|profile| profile.org_name.as_deref() == Some(org_name))
@@ -40,7 +34,9 @@ fn resolve_profile_info_from_profiles(
                 .into_iter()
                 .find(|profile| profile.name == profile_name);
         }
-        return None;
+        if profiles.len() != 1 {
+            return None;
+        }
     }
 
     if profiles.len() == 1 {
