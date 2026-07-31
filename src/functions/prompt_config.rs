@@ -692,7 +692,6 @@ mod tests {
     ) -> ModelSpec {
         ModelSpec {
             format: format.to_string(),
-            _flavor: "chat".to_string(),
             display_name: None,
             o1_like: None,
             reasoning: Some(reasoning),
