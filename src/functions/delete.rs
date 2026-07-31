@@ -12,13 +12,6 @@ pub async fn run(
     force: bool,
     ft: Option<FunctionTypeFilter>,
 ) -> Result<()> {
-    if force && slug.is_none() {
-        bail!(
-            "slug required when using --force. Use: bt {} delete <slug> --force",
-            label_plural(ft),
-        );
-    }
-
     let project_id = &ctx.project.id;
 
     let function = match slug {
