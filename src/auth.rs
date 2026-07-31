@@ -1396,28 +1396,15 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
     .await?;
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
     let store = load_auth_store()?;
-    let default_org_name =
-        default_login_org_name(&store, base.profile.as_deref(), base.org_name.as_deref());
-    let selected_org = select_login_org(
-        login_orgs.clone(),
-        base.org_name.as_deref(),
-        default_org_name.as_deref(),
-        ui::can_prompt(),
-        base.verbose,
-        true,
-        explicitly_quiet(base),
-    )?;
-    let selected_api_url =
-        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?;
+    let selected_org = select_explicit_oauth_login_org(&login_orgs, base.org_name.as_deref())?;
+    let selected_api_url = if selected_org.is_some() {
+        resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?
+    } else {
+        api_url.clone()
+    };
     let jwt_id = decode_jwt_identity(&oauth_tokens.access_token);
-    let (profile_name, should_confirm_overwrite) = resolve_oauth_login_profile_name(
-        base.profile.as_deref(),
-        selected_org.as_ref().map(|org| org.name.as_str()),
-        &selected_api_url,
-        &app_url,
-        &jwt_id,
-        &store,
-    )?;
+    let (profile_name, should_confirm_overwrite) =
+        resolve_oauth_login_profile_name(base.profile.as_deref(), &app_url, &jwt_id, &store)?;
     if should_confirm_overwrite {
         confirm_profile_overwrite(&profile_name)?;
     }
@@ -1429,15 +1416,20 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         app_url.clone(),
         client_id.clone(),
     )?;
-    let context_update = persist_post_login_context(
-        base,
-        &profile_name,
-        &oauth_tokens.access_token,
-        &selected_api_url,
-        &app_url,
-        selected_org.as_ref(),
-    )
-    .await
+    let context_update = match selected_org.as_ref() {
+        Some(org) => {
+            persist_post_login_context(
+                base,
+                &profile_name,
+                &oauth_tokens.access_token,
+                &selected_api_url,
+                &app_url,
+                Some(org),
+            )
+            .await
+        }
+        None => persist_identity_login_context(&profile_name),
+    }
     .context("login succeeded, but failed to update active context")?;
 
     let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
@@ -1453,10 +1445,12 @@ async fn run_login_oauth(base: &BaseArgs, args: AuthLoginArgs) -> Result<()> {
         }),
         || {
             ui::print_command_status(ui::CommandStatus::Success, &human);
-            ui::print_command_status(
-                ui::CommandStatus::Success,
-                &format!("Switched to {}", context_update.display),
-            );
+            let context_status = if selected_org.is_some() {
+                format!("Switched to {}", context_update.display)
+            } else {
+                format!("Using profile '{profile_name}' (organization unchanged)")
+            };
+            ui::print_command_status(ui::CommandStatus::Success, &context_status);
             if base.verbose {
                 eprintln!("Wrote to {}", context_update.path.display());
             }
@@ -1747,8 +1741,6 @@ fn resolve_api_key_login_profile_name(
 
 fn resolve_oauth_login_profile_name(
     explicit_profile: Option<&str>,
-    _suggested_org_name: Option<&str>,
-    _selected_api_url: &str,
     app_url: &str,
     jwt_id: &JwtIdentity,
     store: &AuthStore,
@@ -1851,7 +1843,7 @@ fn format_login_success(
             "Logged in as {} (profile: {profile_name}, api: {api_url})",
             org.name
         ),
-        None => format!("Logged in (cross-org, profile: {profile_name}, api: {api_url})"),
+        None => format!("Logged in (profile: {profile_name}, api: {api_url})"),
     }
 }
 
@@ -1940,6 +1932,24 @@ async fn persist_post_login_context(
 
     Ok(PostLoginContextUpdate {
         display: format_post_login_context(selected_org, project.as_ref()),
+        path,
+    })
+}
+
+fn persist_identity_login_context(profile_name: &str) -> Result<PostLoginContextUpdate> {
+    let path = if ui::can_prompt() && config::local_path().is_some() {
+        switch::select_scope()?.0
+    } else {
+        config::global_path()?
+    };
+
+    let mut cfg = config::load_file(&path);
+    cfg.profile = Some(profile_name.to_string());
+    config::save_file(&path, &cfg)
+        .context(format!("Could not save config to {}", path.display()))?;
+
+    Ok(PostLoginContextUpdate {
+        display: profile_name.to_string(),
         path,
     })
 }
@@ -2364,6 +2374,19 @@ fn single_org_api_key_constraint<'a>(
     orgs: &'a [LoginOrgInfo],
 ) -> Option<&'a LoginOrgInfo> {
     (credential.trim().starts_with("sk-") && orgs.len() == 1).then(|| &orgs[0])
+}
+
+fn select_explicit_oauth_login_org(
+    orgs: &[LoginOrgInfo],
+    requested_org_name: Option<&str>,
+) -> Result<Option<LoginOrgInfo>> {
+    requested_org_name
+        .map(|org_name| {
+            find_login_org(orgs, org_name)
+                .cloned()
+                .ok_or_else(|| missing_requested_org_error(orgs, org_name))
+        })
+        .transpose()
 }
 
 fn select_login_org(
@@ -4955,15 +4978,9 @@ mod tests {
             name: Some("Alice".into()),
             email: Some("alice@example.com".into()),
         };
-        let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
-            None,
-            Some("acme"),
-            "https://api.acme.example",
-            "https://www.acme.example",
-            &jwt_id,
-            &store,
-        )
-        .expect("resolve");
+        let (profile_name, should_confirm) =
+            resolve_oauth_login_profile_name(None, "https://www.acme.example", &jwt_id, &store)
+                .expect("resolve");
 
         assert_eq!(profile_name, "newer");
         assert!(!should_confirm);
@@ -4992,8 +5009,6 @@ mod tests {
 
         let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
             Some("work"),
-            Some("test-org"),
-            "https://api.test.example",
             "https://app.test.example",
             &jwt_id,
             &store,
@@ -5027,8 +5042,6 @@ mod tests {
 
         let (profile_name, should_confirm) = resolve_oauth_login_profile_name(
             Some("work"),
-            Some("other-org"),
-            "https://api.test.example",
             "https://app.test.example",
             &jwt_id,
             &store,
@@ -5106,6 +5119,45 @@ mod tests {
             login_org("org_2", "other-org"),
         ];
         assert!(single_org_api_key_constraint("sk-test-key", &multiple_orgs).is_none());
+    }
+
+    #[test]
+    fn oauth_login_only_selects_an_explicit_org() {
+        let orgs = vec![
+            login_org("org_1", "test-org"),
+            login_org("org_2", "other-org"),
+        ];
+
+        assert!(select_explicit_oauth_login_org(&orgs, None)
+            .expect("no org selection")
+            .is_none());
+        assert_eq!(
+            select_explicit_oauth_login_org(&orgs, Some("other-org"))
+                .expect("explicit org selection")
+                .map(|org| org.id),
+            Some("org_2".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_login_preserves_existing_org_and_project() {
+        let _env = TestEnv::new(None, None).await;
+        crate::config::save_global(&crate::config::Config {
+            profile: Some("old-profile".to_string()),
+            org: Some("test-org".to_string()),
+            project: Some("test-project".to_string()),
+            project_id: Some("proj_test".to_string()),
+            ..Default::default()
+        })
+        .expect("save initial config");
+
+        persist_identity_login_context("new-profile").expect("persist identity");
+        let cfg = crate::config::load_global().expect("load global config");
+
+        assert_eq!(cfg.profile.as_deref(), Some("new-profile"));
+        assert_eq!(cfg.org.as_deref(), Some("test-org"));
+        assert_eq!(cfg.project.as_deref(), Some("test-project"));
+        assert_eq!(cfg.project_id.as_deref(), Some("proj_test"));
     }
 
     #[tokio::test]
