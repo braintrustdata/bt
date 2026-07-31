@@ -519,15 +519,13 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     }
     let login = builder.build().await?.wait_for_login().await?;
 
-    let api_url = login
-        .api_url()
-        .or(auth.api_url.clone())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let api_url = resolve_login_api_url(auth.api_url.clone(), login.api_url());
 
     let app_url = auth
         .app_url
         .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let login = normalize_login_state(login, api_key, &api_url, &app_url);
 
     let ctx = LoginContext {
         login,
@@ -537,6 +535,35 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     };
     maybe_warn_ai_provider_key_staleness(base, &ctx).await;
     Ok(ctx)
+}
+
+fn resolve_login_api_url(configured: Option<String>, discovered: Option<String>) -> String {
+    // The configured CLI/env/profile URL is the request target. Do not let a
+    // cached or server-returned login URL silently replace it.
+    configured
+        .or(discovered)
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string())
+}
+
+fn normalize_login_state(
+    login: LoginState,
+    api_key: String,
+    api_url: &str,
+    app_url: &str,
+) -> LoginState {
+    // Keep LoginContext's two URL sources consistent. Most commands use
+    // LoginContext::api_url through ApiClient, but SDK-backed paths may inspect
+    // LoginState directly.
+    let normalized = LoginState::new();
+    let did_set = normalized.set(
+        api_key,
+        login.org_id().unwrap_or_default(),
+        login.org_name().unwrap_or_default(),
+        api_url.to_string(),
+        app_url.to_string(),
+    );
+    debug_assert!(did_set, "new login state should be unset");
+    normalized
 }
 
 #[derive(Debug, Deserialize)]
@@ -3625,6 +3652,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn configured_urls_override_discovered_login_state() {
+        let discovered = LoginState::new();
+        assert!(discovered.set(
+            "test-api-key".to_string(),
+            "org_test".to_string(),
+            "test-org".to_string(),
+            DEFAULT_API_URL.to_string(),
+            DEFAULT_APP_URL.to_string(),
+        ));
+        let api_url = resolve_login_api_url(
+            Some("https://api.test.example".to_string()),
+            discovered.api_url(),
+        );
+
+        let normalized = normalize_login_state(
+            discovered,
+            "test-api-key".to_string(),
+            &api_url,
+            "https://app.test.example",
+        );
+
+        assert_eq!(
+            normalized.api_url().as_deref(),
+            Some("https://api.test.example")
+        );
+        assert_eq!(
+            normalized.app_url().as_deref(),
+            Some("https://app.test.example")
+        );
+        assert_eq!(normalized.org_id().as_deref(), Some("org_test"));
+        assert_eq!(normalized.org_name().as_deref(), Some("test-org"));
     }
 
     fn assert_invalid_api_url<T>(result: Result<T>) {

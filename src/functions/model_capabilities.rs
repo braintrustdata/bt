@@ -12,9 +12,8 @@ const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
 /// can extend the catalog without breaking older CLI versions.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ModelSpec {
+    #[serde(default)]
     pub(crate) format: String,
-    #[serde(rename = "flavor")]
-    pub(crate) _flavor: String,
     #[serde(default, rename = "displayName")]
     pub(crate) display_name: Option<String>,
     #[serde(default)]
@@ -157,7 +156,6 @@ mod tests {
     fn spec(format: &str, display_name: Option<&str>) -> ModelSpec {
         ModelSpec {
             format: format.to_string(),
-            _flavor: "chat".to_string(),
             display_name: display_name.map(ToOwned::to_owned),
             o1_like: None,
             reasoning: None,
