@@ -29,6 +29,28 @@ fn write_executable(path: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn write_agent_cli(path: &Path, marketplace_json: &str, plugin_json: &str) {
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$AGENT_SETUP_LOG"
+case "$*" in
+  "plugin marketplace list --json")
+    printf '%s\n' '{marketplace_json}'
+    ;;
+  "plugin list --json")
+    printf '%s\n' '{plugin_json}'
+    ;;
+esac
+"#
+    );
+    fs::write(path, script).expect("write fake agent CLI");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod");
+}
+
 fn make_git_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::write(dir.path().join(".git"), "gitdir: /tmp/fake").expect("write .git");
@@ -107,6 +129,256 @@ fn top_level_help_shows_update_not_self() {
         .success()
         .stdout(predicate::str::contains("update       Update bt in-place"))
         .stdout(predicate::str::contains("self         Self-management commands").not());
+}
+
+#[test]
+fn trace_help_exposes_user_commands_and_hides_internal_commands() {
+    bt_command().args(["daemon", "--help"]).assert().failure();
+    bt_command().args(["agents", "--help"]).assert().failure();
+
+    bt_command()
+        .args(["trace", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("setup"))
+        .stdout(predicate::str::contains("\n  import"))
+        .stdout(predicate::str::contains("\n  daemon").not())
+        .stdout(predicate::str::contains("serve").not())
+        .stdout(predicate::str::contains("\n  hook").not())
+        .stdout(predicate::str::contains("\n  status").not())
+        .stdout(predicate::str::contains("\n  stop").not())
+        .stdout(predicate::str::contains("\n  replay").not());
+
+    bt_command()
+        .args(["trace", "daemon", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Run the tracing daemon"))
+        .stdout(predicate::str::contains("--socket"))
+        .stdout(predicate::str::contains("--idle-timeout-secs"));
+
+    bt_command()
+        .args(["trace", "hook", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--source"))
+        .stdout(predicate::str::contains("--flush-on-turn-end"))
+        .stdout(predicate::str::contains("--experiment-id"));
+
+    bt_command()
+        .args(["trace", "status", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--socket"));
+
+    bt_command()
+        .args(["trace", "stop", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--socket"));
+
+    bt_command()
+        .args(["trace", "import", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<SOURCE>"))
+        .stdout(predicate::str::contains("<SESSION_ID>"))
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("claude"));
+
+    bt_command()
+        .args(["trace", "replay", "--help"])
+        .assert()
+        .failure();
+
+    bt_command()
+        .args(["trace", "setup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("claude"));
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_stop_gracefully_stops_an_isolated_daemon() {
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::Duration;
+
+    let state = tempfile::tempdir().expect("state tempdir");
+    let socket = state.path().join("daemon.sock");
+    let bin = env!("CARGO_BIN_EXE_bt");
+    let mut daemon = std::process::Command::new(bin)
+        .args([
+            "trace",
+            "daemon",
+            "--socket",
+            socket.to_str().expect("UTF-8 socket path"),
+            "--data-dir",
+            state.path().to_str().expect("UTF-8 state path"),
+            "--idle-timeout-secs",
+            "0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tracing daemon");
+
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if !socket.exists() {
+        let _ = daemon.kill();
+        panic!("tracing daemon did not create its socket");
+    }
+
+    bt_command()
+        .args([
+            "trace",
+            "stop",
+            "--socket",
+            socket.to_str().expect("UTF-8 socket path"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tracing daemon stopped."));
+
+    for _ in 0..100 {
+        if let Some(status) = daemon.try_wait().expect("poll tracing daemon") {
+            assert!(status.success(), "tracing daemon exited unsuccessfully");
+
+            bt_command()
+                .args([
+                    "trace",
+                    "stop",
+                    "--socket",
+                    socket.to_str().expect("UTF-8 socket path"),
+                ])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("No tracing daemon is running."));
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = daemon.kill();
+    panic!("tracing daemon did not stop");
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("codex.log");
+    let config = state_dir.path().join("config.json");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+    fs::write(
+        &config,
+        r#"{
+          "flushOnTurnEnd": true,
+          "additionalMetadata": {"team": "sdk"},
+          "apiKey": "legacy-secret",
+          "apiUrl": "https://legacy.example",
+          "auth": {"type": "legacy"}
+        }"#,
+    )
+    .expect("seed config");
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .env("BT_DAEMON_CONFIG", &config)
+        .args(["trace", "setup", "codex", "--project", "agent-traces"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The Braintrust tracing plugin is installed for Codex",
+        ));
+
+    let calls = fs::read_to_string(log).expect("read fake CLI calls");
+    assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-codex-plugin"));
+    assert!(calls.contains("plugin add trace-codex@braintrust-codex-plugins"));
+
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
+    assert_eq!(settings["traceToBraintrust"], true);
+    assert_eq!(settings["project"], "agent-traces");
+    assert_eq!(settings["flushOnTurnEnd"], true);
+    assert_eq!(settings["additionalMetadata"]["team"], "sdk");
+    assert_eq!(settings["apiKey"], "legacy-secret");
+    assert_eq!(settings["apiUrl"], "https://legacy.example");
+    assert_eq!(settings["auth"]["type"], "legacy");
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_setup_claude_installs_plugin_and_creates_default_settings() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("claude.log");
+    let config = state_dir.path().join("config.json");
+    write_agent_cli(&bin_dir.path().join("claude"), "[]", "[]");
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .env("BT_DAEMON_CONFIG", &config)
+        .args(["trace", "setup", "claude"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The Braintrust tracing plugin is installed for Claude Code",
+        ));
+
+    let calls = fs::read_to_string(log).expect("read fake CLI calls");
+    assert!(calls.contains("plugin marketplace add braintrustdata/braintrust-claude-plugin"));
+    assert!(calls.contains("plugin install trace-claude-code@braintrust-claude-plugin"));
+
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
+    assert_eq!(settings["traceToBraintrust"], true);
+    assert_eq!(settings["project"], "coding-agents");
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_setup_claude_enables_an_existing_disabled_plugin() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("claude.log");
+    write_agent_cli(
+        &bin_dir.path().join("claude"),
+        r#"[{"name":"braintrust-claude-plugin"}]"#,
+        r#"[{"id":"trace-claude-code@braintrust-claude-plugin","enabled":false}]"#,
+    );
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .args(["trace", "setup", "claude"])
+        .assert()
+        .success();
+
+    let calls = fs::read_to_string(log).expect("read fake CLI calls");
+    assert!(calls.contains("plugin enable trace-claude-code@braintrust-claude-plugin"));
+    assert!(!calls.contains("plugin marketplace add"));
+    assert!(!calls.contains("plugin install"));
 }
 
 #[test]
