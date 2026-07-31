@@ -132,7 +132,7 @@ fn top_level_help_shows_update_not_self() {
 }
 
 #[test]
-fn trace_help_hides_internal_commands_but_keeps_them_callable() {
+fn trace_help_exposes_user_commands_and_hides_internal_commands() {
     bt_command().args(["daemon", "--help"]).assert().failure();
     bt_command().args(["agents", "--help"]).assert().failure();
 
@@ -141,12 +141,12 @@ fn trace_help_hides_internal_commands_but_keeps_them_callable() {
         .assert()
         .success()
         .stdout(predicate::str::contains("setup"))
+        .stdout(predicate::str::contains("\n  import"))
         .stdout(predicate::str::contains("\n  daemon").not())
         .stdout(predicate::str::contains("serve").not())
         .stdout(predicate::str::contains("\n  hook").not())
         .stdout(predicate::str::contains("\n  status").not())
         .stdout(predicate::str::contains("\n  stop").not())
-        .stdout(predicate::str::contains("\n  import").not())
         .stdout(predicate::str::contains("\n  replay").not());
 
     bt_command()

@@ -47,7 +47,6 @@ enum TraceCommand {
     #[command(hide = true)]
     Stop(StopArgs),
     /// Import a past Codex or Claude Code session by its resume id.
-    #[command(hide = true)]
     Import(ImportArgs),
 }
 
