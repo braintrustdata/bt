@@ -29,10 +29,8 @@ use tokio::sync::oneshot;
 
 use crate::{
     args::{BaseArgs, DEFAULT_API_URL, DEFAULT_APP_URL},
-    config,
-    http::{build_http_client, build_http_client_from_builder, ApiClient},
-    projects::api,
-    switch, ui,
+    http::{build_http_client, build_http_client_from_builder},
+    ui,
 };
 
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
@@ -339,6 +337,21 @@ enum ApiKeyOrgMismatchAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OauthOrgMismatchAction {
+    SelectAvailableOrg,
+    SaveWithoutOrg,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OauthRequestedOrgResolution {
+    NoRequest,
+    UseRequested,
+    SelectAvailable,
+    SaveWithoutSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestedOrgResolution {
     NoRequestedOrg,
     UseRequestedOrg,
@@ -387,11 +400,6 @@ pub struct LogoutArgs {
     /// Skip confirmation prompt
     #[arg(long, short = 'f')]
     force: bool,
-}
-
-struct PostLoginContextUpdate {
-    display: String,
-    path: PathBuf,
 }
 
 pub async fn run_login_command(base: BaseArgs, args: LoginArgs) -> Result<()> {
@@ -1301,16 +1309,6 @@ async fn run_login_set(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         Some(login_app_url.clone()),
         org_constraint.as_ref().map(|org| org.name.clone()),
     )?;
-    let context_update = persist_post_login_context(
-        base,
-        &profile_name,
-        &api_key,
-        &selected_api_url,
-        &login_app_url,
-        selected_org.as_ref(),
-    )
-    .await
-    .context("login succeeded, but failed to update active context")?;
 
     let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
     emit_result(
@@ -1325,13 +1323,6 @@ async fn run_login_set(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         }),
         || {
             ui::print_command_status(ui::CommandStatus::Success, &human);
-            ui::print_command_status(
-                ui::CommandStatus::Success,
-                &format!("Switched to {}", context_update.display),
-            );
-            if base.verbose {
-                eprintln!("Wrote to {}", context_update.path.display());
-            }
         },
     )
 }
@@ -1406,7 +1397,30 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     .await?;
     let login_orgs = fetch_login_orgs(&oauth_tokens.access_token, &app_url).await?;
     let store = load_auth_store()?;
-    let selected_org = select_explicit_oauth_login_org(&login_orgs, base.org_name.as_deref())?;
+    let requested_org_resolution = resolve_requested_org_for_oauth_login(
+        &login_orgs,
+        base.org_name.as_deref(),
+        ui::can_prompt(),
+        prompt_for_oauth_org_mismatch,
+    )?;
+    let selected_org = match requested_org_resolution {
+        OauthRequestedOrgResolution::NoRequest
+        | OauthRequestedOrgResolution::SaveWithoutSelection => None,
+        OauthRequestedOrgResolution::UseRequested => base
+            .org_name
+            .as_deref()
+            .and_then(|name| find_login_org(&login_orgs, name))
+            .cloned(),
+        OauthRequestedOrgResolution::SelectAvailable => select_login_org(
+            login_orgs.clone(),
+            None,
+            None,
+            true,
+            base.verbose,
+            false,
+            explicitly_quiet(base),
+        )?,
+    };
     let selected_api_url = if selected_org.is_some() {
         resolve_profile_api_url(base.api_url.clone(), selected_org.as_ref(), &login_orgs)?
     } else {
@@ -1426,21 +1440,6 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         app_url.clone(),
         client_id.clone(),
     )?;
-    let context_update = match selected_org.as_ref() {
-        Some(org) => {
-            persist_post_login_context(
-                base,
-                &profile_name,
-                &oauth_tokens.access_token,
-                &selected_api_url,
-                &app_url,
-                Some(org),
-            )
-            .await
-        }
-        None => persist_identity_login_context(&profile_name),
-    }
-    .context("login succeeded, but failed to update active context")?;
 
     let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
     emit_result(
@@ -1455,15 +1454,6 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         }),
         || {
             ui::print_command_status(ui::CommandStatus::Success, &human);
-            let context_status = if selected_org.is_some() {
-                format!("Switched to {}", context_update.display)
-            } else {
-                format!("Using profile '{profile_name}' (organization unchanged)")
-            };
-            ui::print_command_status(ui::CommandStatus::Success, &context_status);
-            if base.verbose {
-                eprintln!("Wrote to {}", context_update.path.display());
-            }
         },
     )
 }
@@ -1857,113 +1847,6 @@ fn format_login_success(
     }
 }
 
-fn build_login_context_for_selected_org(
-    credential: &str,
-    api_url: &str,
-    app_url: &str,
-    selected_org: Option<&LoginOrgInfo>,
-) -> LoginContext {
-    let login = LoginState::new();
-    let _ = login.set(
-        credential.to_string(),
-        selected_org.map(|org| org.id.clone()).unwrap_or_default(),
-        selected_org.map(|org| org.name.clone()).unwrap_or_default(),
-        api_url.to_string(),
-        app_url.to_string(),
-    );
-    LoginContext {
-        login,
-        api_url: api_url.to_string(),
-        app_url: app_url.to_string(),
-        profile: None,
-    }
-}
-
-fn format_post_login_context(
-    selected_org: Option<&LoginOrgInfo>,
-    project: Option<&api::Project>,
-) -> String {
-    match (selected_org, project) {
-        (Some(org), Some(project)) => format!("{}/{}", org.name, project.name),
-        (Some(org), None) => org.name.clone(),
-        (None, _) => "cross-org mode".to_string(),
-    }
-}
-
-async fn resolve_post_login_project(
-    base: &BaseArgs,
-    credential: &str,
-    api_url: &str,
-    app_url: &str,
-    selected_org: Option<&LoginOrgInfo>,
-) -> Result<Option<api::Project>> {
-    let Some(project_name) = config::trimmed_option(base.project.as_deref()) else {
-        return Ok(None);
-    };
-
-    let selected_org = selected_org.ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot set a default project in cross-org mode; rerun `bt login --org <ORG> --project <PROJECT>`"
-        )
-    })?;
-    let ctx =
-        build_login_context_for_selected_org(credential, api_url, app_url, Some(selected_org));
-    let client = ApiClient::new(&ctx)?;
-    switch::validate_or_create_project(&client, project_name)
-        .await
-        .map(Some)
-}
-
-async fn persist_post_login_context(
-    base: &BaseArgs,
-    profile_name: &str,
-    credential: &str,
-    api_url: &str,
-    app_url: &str,
-    selected_org: Option<&LoginOrgInfo>,
-) -> Result<PostLoginContextUpdate> {
-    let project =
-        resolve_post_login_project(base, credential, api_url, app_url, selected_org).await?;
-    let path = if ui::can_prompt() && config::local_path().is_some() {
-        switch::select_scope()?.0
-    } else {
-        config::global_path()?
-    };
-
-    let mut cfg = config::load_file(&path);
-    switch::apply_switch_config(
-        &mut cfg,
-        Some(profile_name),
-        selected_org.map(|org| org.name.as_str()),
-        project.as_ref(),
-    );
-    config::save_file(&path, &cfg)
-        .context(format!("Could not save config to {}", path.display()))?;
-
-    Ok(PostLoginContextUpdate {
-        display: format_post_login_context(selected_org, project.as_ref()),
-        path,
-    })
-}
-
-fn persist_identity_login_context(profile_name: &str) -> Result<PostLoginContextUpdate> {
-    let path = if ui::can_prompt() && config::local_path().is_some() {
-        switch::select_scope()?.0
-    } else {
-        config::global_path()?
-    };
-
-    let mut cfg = config::load_file(&path);
-    cfg.profile = Some(profile_name.to_string());
-    config::save_file(&path, &cfg)
-        .context(format!("Could not save config to {}", path.display()))?;
-
-    Ok(PostLoginContextUpdate {
-        display: profile_name.to_string(),
-        path,
-    })
-}
-
 /// Build an actionable "profile not found" error that lists the available
 /// profiles, so non-interactive callers can see what they can pick from.
 fn profile_not_found_err(name: &str, store: &AuthStore) -> anyhow::Error {
@@ -2301,17 +2184,58 @@ fn single_org_api_key_constraint<'a>(
     (credential.trim().starts_with("sk-") && orgs.len() == 1).then(|| &orgs[0])
 }
 
-fn select_explicit_oauth_login_org(
+fn resolve_requested_org_for_oauth_login<F>(
     orgs: &[LoginOrgInfo],
     requested_org_name: Option<&str>,
-) -> Result<Option<LoginOrgInfo>> {
-    requested_org_name
-        .map(|org_name| {
-            find_login_org(orgs, org_name)
-                .cloned()
-                .ok_or_else(|| missing_requested_org_error(orgs, org_name))
-        })
-        .transpose()
+    can_prompt: bool,
+    choose_action: F,
+) -> Result<OauthRequestedOrgResolution>
+where
+    F: FnOnce(&str, &[LoginOrgInfo]) -> Result<OauthOrgMismatchAction>,
+{
+    let Some(requested_org_name) = requested_org_name else {
+        return Ok(OauthRequestedOrgResolution::NoRequest);
+    };
+
+    if find_login_org(orgs, requested_org_name).is_some() {
+        return Ok(OauthRequestedOrgResolution::UseRequested);
+    }
+
+    if !can_prompt {
+        return Err(missing_requested_org_error(orgs, requested_org_name));
+    }
+
+    match choose_action(requested_org_name, orgs)? {
+        OauthOrgMismatchAction::SelectAvailableOrg => {
+            Ok(OauthRequestedOrgResolution::SelectAvailable)
+        }
+        OauthOrgMismatchAction::SaveWithoutOrg => {
+            Ok(OauthRequestedOrgResolution::SaveWithoutSelection)
+        }
+        OauthOrgMismatchAction::Cancel => bail!("login cancelled"),
+    }
+}
+
+fn prompt_for_oauth_org_mismatch(
+    requested_org_name: &str,
+    _orgs: &[LoginOrgInfo],
+) -> Result<OauthOrgMismatchAction> {
+    let actions = [
+        "Select a valid organization",
+        "Save login without selecting an organization",
+        "Cancel",
+    ];
+    let selection = ui::fuzzy_select(
+        &format!("Org '{requested_org_name}' is not available. Continue with"),
+        &actions,
+        0,
+    )?;
+    Ok(match selection {
+        0 => OauthOrgMismatchAction::SelectAvailableOrg,
+        1 => OauthOrgMismatchAction::SaveWithoutOrg,
+        2 => OauthOrgMismatchAction::Cancel,
+        _ => unreachable!("fuzzy_select returned out-of-range index"),
+    })
 }
 
 fn select_login_org(
@@ -5047,93 +4971,54 @@ mod tests {
     }
 
     #[test]
-    fn oauth_login_only_selects_an_explicit_org() {
+    fn oauth_login_org_resolution_handles_valid_missing_and_cancelled_requests() {
         let orgs = vec![
             login_org("org_1", "test-org"),
             login_org("org_2", "other-org"),
         ];
 
-        assert!(select_explicit_oauth_login_org(&orgs, None)
-            .expect("no org selection")
-            .is_none());
         assert_eq!(
-            select_explicit_oauth_login_org(&orgs, Some("other-org"))
-                .expect("explicit org selection")
-                .map(|org| org.id),
-            Some("org_2".to_string())
+            resolve_requested_org_for_oauth_login(&orgs, None, false, |_, _| {
+                panic!("prompt should not be called")
+            })
+            .expect("no org selection"),
+            OauthRequestedOrgResolution::NoRequest
         );
-    }
-
-    #[tokio::test]
-    async fn identity_login_preserves_existing_org_and_project() {
-        let _env = TestEnv::new(None, None).await;
-        crate::config::save_global(&crate::config::Config {
-            profile: Some("old-profile".to_string()),
-            org: Some("test-org".to_string()),
-            project: Some("test-project".to_string()),
-            project_id: Some("proj_test".to_string()),
-            ..Default::default()
-        })
-        .expect("save initial config");
-
-        persist_identity_login_context("new-profile").expect("persist identity");
-        let cfg = crate::config::load_global().expect("load global config");
-
-        assert_eq!(cfg.profile.as_deref(), Some("new-profile"));
-        assert_eq!(cfg.org.as_deref(), Some("test-org"));
-        assert_eq!(cfg.project.as_deref(), Some("test-project"));
-        assert_eq!(cfg.project_id.as_deref(), Some("proj_test"));
-    }
-
-    #[tokio::test]
-    async fn persist_post_login_context_clears_stale_project_for_org_only_login() {
-        let _env = TestEnv::new(None, None).await;
-        crate::config::save_global(&crate::config::Config {
-            profile: Some("old-profile".to_string()),
-            org: Some("old-org".to_string()),
-            project: Some("stale-project".to_string()),
-            project_id: Some("proj_stale".to_string()),
-            ..Default::default()
-        })
-        .expect("save initial config");
-
-        let update = persist_post_login_context(
-            &make_base(),
-            "work",
-            "test-api-key",
-            "https://api.example.test",
-            "https://www.example.test",
-            Some(&login_org("org_123", "acme")),
-        )
-        .await
-        .expect("persist context");
-        let cfg = crate::config::load_global().expect("load global config");
-
-        assert_eq!(update.display, "acme");
-        assert_eq!(cfg.profile.as_deref(), Some("work"));
-        assert_eq!(cfg.org.as_deref(), Some("acme"));
-        assert_eq!(cfg.project, None);
-        assert_eq!(cfg.project_id, None);
-    }
-
-    #[tokio::test]
-    async fn resolve_post_login_project_rejects_cross_org_default_project() {
-        let mut base = make_base();
-        base.project = Some("demo-project".to_string());
-
-        let err = resolve_post_login_project(
-            &base,
-            "test-api-key",
-            "https://api.example.test",
-            "https://www.example.test",
-            None,
-        )
-        .await
-        .expect_err("cross-org project selection should fail");
-
+        assert_eq!(
+            resolve_requested_org_for_oauth_login(&orgs, Some("other-org"), false, |_, _| {
+                panic!("prompt should not be called")
+            })
+            .expect("matching org"),
+            OauthRequestedOrgResolution::UseRequested
+        );
+        let err =
+            resolve_requested_org_for_oauth_login(&orgs, Some("missing-org"), false, |_, _| {
+                panic!("prompt should not be called")
+            })
+            .expect_err("non-interactive mismatch should fail");
         assert!(err
             .to_string()
-            .contains("cannot set a default project in cross-org mode"));
+            .contains("org 'missing-org' not found. Available: test-org, other-org"));
+        assert_eq!(
+            resolve_requested_org_for_oauth_login(&orgs, Some("missing-org"), true, |_, _| {
+                Ok(OauthOrgMismatchAction::SelectAvailableOrg)
+            })
+            .expect("select another org"),
+            OauthRequestedOrgResolution::SelectAvailable
+        );
+        assert_eq!(
+            resolve_requested_org_for_oauth_login(&orgs, Some("missing-org"), true, |_, _| {
+                Ok(OauthOrgMismatchAction::SaveWithoutOrg)
+            })
+            .expect("save without org"),
+            OauthRequestedOrgResolution::SaveWithoutSelection
+        );
+        let err =
+            resolve_requested_org_for_oauth_login(&orgs, Some("missing-org"), true, |_, _| {
+                Ok(OauthOrgMismatchAction::Cancel)
+            })
+            .expect_err("cancel login");
+        assert_eq!(err.to_string(), "login cancelled");
     }
 
     #[test]
