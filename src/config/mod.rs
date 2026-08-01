@@ -427,24 +427,12 @@ mod tests {
 
     fn base_with_profile(profile: Option<&str>) -> BaseArgs {
         BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: profile.map(str::to_string),
-            profile_explicit: profile.is_some(),
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
+            login: crate::args::LoginBaseArgs {
+                profile: profile.map(str::to_string),
+                profile_explicit: profile.is_some(),
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
