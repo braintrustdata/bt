@@ -25,9 +25,9 @@ Examples:
   bt topics status --full
   bt topics status --watch
   bt topics facets --window 7d
-  bt topics classifications --facet Task --sort cost
-  bt topics traces --facet Task --topic-id <topic-id> --sort tokens
-  bt topics explore
+  bt topics classifications --facet Task --repo test-org/test-repo --sort cost
+  bt topics traces --facet Task --topic-id <topic-id> --repo test-org/test-repo --sort tokens
+  bt topics explore --repo test-org/test-repo
   bt topics config
   bt topics config <automation-or-topic-map-id>
   bt topics config enable
@@ -107,6 +107,10 @@ struct ExploreTimeArgs {
     /// Additional BTQL filter expression
     #[arg(long, env = "BT_TOPICS_FILTER")]
     filter: Option<String>,
+
+    /// Git repository origin filter, for example owner/repo or github.com/owner/repo
+    #[arg(long, env = "BT_TOPICS_REPO", value_name = "REPO")]
+    repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -143,7 +147,12 @@ struct ExploreSortLimitArgs {
     limit: usize,
 
     /// Sort topic labels by metric
-    #[arg(long, env = "BT_TOPICS_SORT", value_enum, default_value = "count")]
+    #[arg(
+        long,
+        env = "BT_TOPICS_LABEL_SORT",
+        value_enum,
+        default_value = "count"
+    )]
     sort: api::TopicExploreSort,
 }
 
@@ -154,7 +163,12 @@ struct TraceSortLimitArgs {
     limit: usize,
 
     /// Sort trace rows by metric
-    #[arg(long, env = "BT_TOPICS_SORT", value_enum, default_value = "recent")]
+    #[arg(
+        long,
+        env = "BT_TOPICS_TRACE_SORT",
+        value_enum,
+        default_value = "recent"
+    )]
     sort: api::TopicTraceSort,
 }
 
@@ -803,6 +817,8 @@ mod tests {
             "25",
             "--window",
             "6h",
+            "--repo",
+            "test-org/test-repo",
             "--filter",
             "metadata.environment = 'test'",
             "--print-queries",
@@ -823,6 +839,7 @@ mod tests {
             args.time.filter.as_deref(),
             Some("metadata.environment = 'test'")
         );
+        assert_eq!(args.time.repo.as_deref(), Some("test-org/test-repo"));
         assert!(args.output.print_queries);
 
         let parsed = parse(&[

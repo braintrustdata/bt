@@ -21,6 +21,8 @@ const DEFAULT_TOPIC_SAMPLING_RATE: f64 = 1.0;
 const DEFAULT_TOPIC_EMBEDDING_MODEL: &str = "brain-embedding-1";
 const MAX_STATUS_PROGRESS_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const ORG_USERS_PAGE_LIMIT: usize = 1000;
+const TOPIC_REPO_ROOT_SPAN_PAGE_LIMIT: usize = 1000;
+const TOPIC_REPO_ROOT_SPAN_MAX_IDS: usize = 5000;
 const TOPIC_TRACE_CURSOR_PREFIX: &str = "bt-topic-traces-v1:";
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +177,8 @@ pub struct TopicTraceRow {
     pub created_by_user_id: Option<String>,
     pub created_by_user_name: Option<String>,
     pub created_by_user_email: Option<String>,
+    pub git_origin_url: Option<String>,
+    pub repo: Option<String>,
     pub topic: Option<String>,
     pub topic_id: Option<String>,
     pub tokens: f64,
@@ -215,10 +219,8 @@ struct OrgUser {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OrgUsersListResponse {
-    Envelope { objects: Vec<OrgUser> },
-    Bare(Vec<OrgUser>),
+struct OrgUsersListResponse {
+    objects: Vec<OrgUser>,
 }
 
 #[derive(Debug, Default)]
@@ -284,15 +286,6 @@ impl OrgUsersCache {
             .users_by_id
             .as_ref()
             .expect("org users cache initialized"))
-    }
-}
-
-impl OrgUsersListResponse {
-    fn into_objects(self) -> Vec<OrgUser> {
-        match self {
-            Self::Envelope { objects } => objects,
-            Self::Bare(objects) => objects,
-        }
     }
 }
 
@@ -639,28 +632,40 @@ pub async fn fetch_topics_status(
     })
 }
 
-pub fn topic_explore_time_filter_clause(
+pub async fn topic_explore_filter_clause(
+    ctx: &ProjectContext,
     since: Option<&str>,
     window: &str,
     extra_filter: Option<&str>,
+    repo: Option<&str>,
+    print_queries: bool,
 ) -> Result<String> {
-    let time_clause = if let Some(ts) = since.map(str::trim).filter(|value| !value.is_empty()) {
-        format!("created >= {}", btql_string_literal(ts))
-    } else {
-        let seconds = crate::utils::parse_duration_to_seconds(window)?;
-        if seconds == 0 {
-            bail!("--window must be greater than zero");
-        }
-        format!("created >= NOW() - INTERVAL {seconds} SECOND")
-    };
+    let time_clause = topic_explore_time_filter_clause(since, window)?;
+    let repo_filter =
+        topic_repo_root_span_filter_clause(ctx, repo, &time_clause, print_queries).await?;
 
     Ok(combine_filter_clauses([
         Some(time_clause),
+        repo_filter,
         extra_filter
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string),
     ]))
+}
+
+fn topic_explore_time_filter_clause(since: Option<&str>, window: &str) -> Result<String> {
+    Ok(
+        if let Some(ts) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            format!("created >= {}", btql_string_literal(ts))
+        } else {
+            let seconds = crate::utils::parse_duration_to_seconds(window)?;
+            if seconds == 0 {
+                bail!("--window must be greater than zero");
+            }
+            format!("created >= NOW() - INTERVAL {seconds} SECOND")
+        },
+    )
 }
 
 pub async fn fetch_topics_explore_facets(
@@ -880,18 +885,17 @@ pub(super) async fn fetch_topic_traces_with_user_cache(
     if traces.len() > limit {
         traces.truncate(limit);
     }
-    hydrate_trace_root_created_by_user_ids(
-        &ctx.client,
-        &ctx.project.id,
-        &mut traces,
-        print_queries,
-    )
-    .await
-    .context("failed to resolve trace root users")?;
-    users_cache
+    if let Err(err) =
+        hydrate_trace_root_metadata(&ctx.client, &ctx.project.id, &mut traces, print_queries).await
+    {
+        eprintln!("warning: failed to resolve trace root metadata: {err}");
+    }
+    if let Err(err) = users_cache
         .hydrate_trace_users(&ctx.client, &mut traces)
         .await
-        .context("failed to resolve trace users")?;
+    {
+        eprintln!("warning: failed to resolve trace users: {err}");
+    }
 
     Ok(TopicTracesReport {
         project: topics_project_summary(ctx),
@@ -2510,6 +2514,251 @@ fn topic_filter_clause(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoOrigin {
+    host: String,
+    owner_path: String,
+    repo: String,
+}
+
+impl RepoOrigin {
+    fn canonical_slug(&self) -> String {
+        format!("{}/{}/{}", self.host, self.owner_path, self.repo)
+    }
+}
+
+async fn topic_repo_root_span_filter_clause(
+    ctx: &ProjectContext,
+    repo: Option<&str>,
+    time_clause: &str,
+    print_queries: bool,
+) -> Result<Option<String>> {
+    let Some(raw) = repo.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let origin = parse_repo_origin_selector(raw)?;
+    let root_span_ids = fetch_topic_repo_root_span_ids(
+        &ctx.client,
+        &ctx.project.id,
+        time_clause,
+        &origin,
+        raw,
+        print_queries,
+    )
+    .await?;
+    Ok(Some(root_span_id_filter_clause(&root_span_ids)))
+}
+
+async fn fetch_topic_repo_root_span_ids(
+    client: &ApiClient,
+    project_id: &str,
+    time_clause: &str,
+    origin: &RepoOrigin,
+    raw: &str,
+    print_queries: bool,
+) -> Result<Vec<String>> {
+    let origin_filter = topic_repo_origin_filter_clause(origin, Some(raw));
+    let mut root_span_ids = BTreeSet::new();
+    let mut cursor = None::<String>;
+
+    loop {
+        if root_span_ids.len() >= TOPIC_REPO_ROOT_SPAN_MAX_IDS {
+            bail!(
+                "--repo matched at least {} traces; narrow the search with --window or --since before exploring",
+                TOPIC_REPO_ROOT_SPAN_MAX_IDS
+            );
+        }
+
+        let remaining = TOPIC_REPO_ROOT_SPAN_MAX_IDS - root_span_ids.len();
+        let limit = remaining.min(TOPIC_REPO_ROOT_SPAN_PAGE_LIMIT);
+        let query = build_topic_repo_root_spans_query(
+            project_id,
+            time_clause,
+            &origin_filter,
+            limit,
+            cursor.as_deref(),
+        );
+        maybe_print_topic_query(print_queries, "repo-roots", &query);
+        let response = execute_btql_value(client, &query).await?;
+        let returned_rows = btql_data_len(&response);
+        for row in btql_data_rows(&response) {
+            if let Some(root_span_id) = value_as_string(row.get("root_span_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                root_span_ids.insert(root_span_id);
+            }
+        }
+
+        let next_cursor = next_cursor_if_full_page(btql_cursor(&response), returned_rows, limit);
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(root_span_ids.into_iter().collect())
+}
+
+fn topic_repo_origin_filter_clause(origin: &RepoOrigin, raw: Option<&str>) -> String {
+    let mut variants = repo_origin_url_variants(origin);
+    if let Some(raw) = raw
+        .map(trim_repo_selector)
+        .filter(|value| !value.is_empty())
+    {
+        variants.insert(raw.to_string());
+    }
+    let values = variants
+        .into_iter()
+        .map(|value| btql_string_literal(&value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let path = escape_btql_ident_path(&["metadata", "git_origin_url"]);
+    format!("{path} IN [{values}]")
+}
+
+fn build_topic_repo_root_spans_query(
+    project_id: &str,
+    time_clause: &str,
+    origin_filter: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> String {
+    let cursor_clause = cursor
+        .filter(|cursor| !cursor.trim().is_empty())
+        .map(|cursor| format!(" | cursor: {}", btql_json_string_literal(cursor)))
+        .unwrap_or_default();
+    format!(
+        "select: root_span_id, metadata.git_origin_url as git_origin_url | from: project_logs({}) spans | filter: ({time_clause}) AND (span_id = root_span_id) AND ({origin_filter}) | preview_length: 1 | sort: created DESC | limit: {limit}{cursor_clause}",
+        btql_string_literal(project_id),
+    )
+}
+
+fn repo_origin_url_variants(origin: &RepoOrigin) -> BTreeSet<String> {
+    let mut variants = BTreeSet::new();
+    for owner_repo_path in repo_owner_repo_path_variants(origin) {
+        variants.insert(format!("{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("{}/{}", origin.host, owner_repo_path));
+        variants.insert(format!("{}.git", owner_repo_path));
+        variants.insert(owner_repo_path.clone());
+        variants.insert(format!("https://{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("https://{}/{}", origin.host, owner_repo_path));
+        variants.insert(format!("http://{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("http://{}/{}", origin.host, owner_repo_path));
+        variants.insert(format!("git@{}:{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("git@{}:{}", origin.host, owner_repo_path));
+        variants.insert(format!("ssh://git@{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("ssh://git@{}/{}", origin.host, owner_repo_path));
+    }
+    variants
+}
+
+fn repo_owner_repo_path_variants(origin: &RepoOrigin) -> BTreeSet<String> {
+    let mut variants = BTreeSet::new();
+    variants.insert(format!("{}/{}", origin.owner_path, origin.repo));
+    let lower = format!(
+        "{}/{}",
+        origin.owner_path.to_ascii_lowercase(),
+        origin.repo.to_ascii_lowercase()
+    );
+    variants.insert(lower);
+    variants
+}
+
+fn repo_slug_from_origin_url(value: &str) -> Option<String> {
+    parse_repo_origin_selector(value)
+        .ok()
+        .map(|origin| origin.canonical_slug())
+}
+
+fn parse_repo_origin_selector(value: &str) -> Result<RepoOrigin> {
+    let value = trim_repo_selector(value);
+    if value.is_empty() {
+        bail!("--repo cannot be empty");
+    }
+
+    if let Some(rest) = value.strip_prefix("git@") {
+        let Some((host, path)) = rest.split_once(':') else {
+            bail!("invalid --repo git origin; expected git@host:owner/repo");
+        };
+        return repo_origin_from_host_path(host, path);
+    }
+
+    if let Some((_, rest)) = value.split_once("://") {
+        let rest = rest.trim_start_matches('/');
+        let rest = rest
+            .rsplit_once('@')
+            .map(|(_, without_credentials)| without_credentials)
+            .unwrap_or(rest);
+        let Some((authority, path)) = rest.split_once('/') else {
+            bail!("invalid --repo URL; expected host/owner/repo");
+        };
+        return repo_origin_from_host_path(authority, path);
+    }
+
+    if let Some((host, path)) = value.split_once(':') {
+        if host.contains('.') {
+            return repo_origin_from_host_path(host, path);
+        }
+    }
+
+    let parts = repo_path_parts(value);
+    match parts.len() {
+        2 => repo_origin_from_parts("github.com", &parts),
+        3.. => repo_origin_from_parts(parts[0], &parts[1..]),
+        _ => bail!("invalid --repo; use owner/repo, host/owner/repo, or a full git origin URL"),
+    }
+}
+
+fn trim_repo_selector(value: &str) -> &str {
+    value
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/')
+}
+
+fn repo_origin_from_host_path(host: &str, path: &str) -> Result<RepoOrigin> {
+    let host = host.split(':').next().unwrap_or(host);
+    let parts = repo_path_parts(path);
+    repo_origin_from_parts(host, &parts)
+}
+
+fn repo_path_parts(value: &str) -> Vec<&str> {
+    value
+        .trim_matches('/')
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn repo_origin_from_parts(host: &str, parts: &[&str]) -> Result<RepoOrigin> {
+    let host = host.trim().trim_end_matches('/').to_ascii_lowercase();
+    if host.is_empty() {
+        bail!("invalid --repo; repository host cannot be empty");
+    }
+    if parts.len() < 2 {
+        bail!("invalid --repo; expected owner/repo after the host");
+    }
+    let owner_path = parts[..parts.len() - 1].join("/");
+    let repo = parts[parts.len() - 1]
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(parts[parts.len() - 1])
+        .to_string();
+    if owner_path.trim().is_empty() || repo.trim().is_empty() {
+        bail!("invalid --repo; expected owner/repo after the host");
+    }
+
+    Ok(RepoOrigin {
+        host,
+        owner_path,
+        repo,
+    })
+}
+
 fn build_topic_classifications_query(
     project_id: &str,
     topic_map_name: &str,
@@ -2550,15 +2799,15 @@ fn build_topic_traces_query(
         .map(|cursor| format!(" | cursor: {}", btql_json_string_literal(cursor)))
         .unwrap_or_default();
     format!(
-        "select: created, root_span_id, span_id, id, _pagination_key, span_attributes.created_by_user_id as created_by_user_id, {topic_id_path} as topic_id, {topic_expr} as topic, {sort_expr} as sort_value, metrics, input | from: project_logs({}) summary | filter: {filter_clause} | preview_length: 125 | sort: {sort_expr} DESC, _pagination_key DESC | limit: {limit}{cursor_clause}",
+        "select: created, root_span_id, span_id, id, _pagination_key, span_attributes.created_by_user_id as created_by_user_id, metadata.git_origin_url as git_origin_url, {topic_id_path} as topic_id, {topic_expr} as topic, {sort_expr} as sort_value, metrics, input | from: project_logs({}) summary | filter: {filter_clause} | preview_length: 125 | sort: {sort_expr} DESC, _pagination_key DESC | limit: {limit}{cursor_clause}",
         btql_string_literal(project_id),
     )
 }
 
-fn build_topic_trace_root_users_query(project_id: &str, root_span_ids: &[String]) -> String {
+fn build_topic_trace_root_metadata_query(project_id: &str, root_span_ids: &[String]) -> String {
     let root_filter = root_span_id_filter_clause(root_span_ids);
     format!(
-        "select: root_span_id, span_attributes.created_by_user_id as created_by_user_id | from: project_logs({}) spans | filter: ({root_filter}) AND (span_id = root_span_id) | preview_length: 1 | limit: {}",
+        "select: root_span_id, span_attributes.created_by_user_id as created_by_user_id, metadata.git_origin_url as git_origin_url | from: project_logs({}) spans | filter: ({root_filter}) AND (span_id = root_span_id) | preview_length: 1 | limit: {}",
         btql_string_literal(project_id),
         root_span_ids.len().max(1),
     )
@@ -2694,6 +2943,10 @@ fn topic_trace_row_from_btql(
         app_url.push_str("&s=");
         app_url.push_str(&encode(span_id));
     }
+    let git_origin_url = trace_git_origin_url(row);
+    let repo = git_origin_url
+        .as_deref()
+        .and_then(repo_slug_from_origin_url);
 
     TopicTraceRow {
         created: value_as_string(row.get("created")),
@@ -2703,6 +2956,8 @@ fn topic_trace_row_from_btql(
         created_by_user_id: trace_created_by_user_id(row),
         created_by_user_name: None,
         created_by_user_email: None,
+        git_origin_url,
+        repo,
         topic: value_as_string(row.get("topic")),
         topic_id: value_as_string(row.get("topic_id")),
         tokens: metrics_total_tokens(row.get("metrics")).unwrap_or(0.0),
@@ -2837,7 +3092,15 @@ fn trace_created_by_user_id(row: &serde_json::Map<String, Value>) -> Option<Stri
         .filter(|value| !value.is_empty())
 }
 
-async fn hydrate_trace_root_created_by_user_ids(
+fn trace_git_origin_url(row: &serde_json::Map<String, Value>) -> Option<String> {
+    value_as_string(row.get("git_origin_url"))
+        .or_else(|| value_as_string(row.get("metadata.git_origin_url")))
+        .or_else(|| nested_value_as_string(row, &["metadata", "git_origin_url"]))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn hydrate_trace_root_metadata(
     client: &ApiClient,
     project_id: &str,
     traces: &mut [TopicTraceRow],
@@ -2845,7 +3108,7 @@ async fn hydrate_trace_root_created_by_user_ids(
 ) -> Result<()> {
     let root_span_ids = traces
         .iter()
-        .filter(|trace| trace.created_by_user_id.is_none())
+        .filter(|trace| trace.created_by_user_id.is_none() || trace.git_origin_url.is_none())
         .filter_map(|trace| {
             let root_span_id = trace.root_span_id.trim();
             (!root_span_id.is_empty()).then(|| root_span_id.to_string())
@@ -2857,24 +3120,32 @@ async fn hydrate_trace_root_created_by_user_ids(
         return Ok(());
     }
 
-    let query = build_topic_trace_root_users_query(project_id, &root_span_ids);
-    maybe_print_topic_query(print_queries, "trace-users", &query);
+    let query = build_topic_trace_root_metadata_query(project_id, &root_span_ids);
+    maybe_print_topic_query(print_queries, "trace-root-metadata", &query);
     let response = execute_btql_value(client, &query).await?;
-    let users_by_root_span_id = btql_data_rows(&response)
+    let metadata_by_root_span_id = btql_data_rows(&response)
         .into_iter()
         .filter_map(|row| {
             let root_span_id = value_as_string(row.get("root_span_id"))?;
-            let user_id = trace_created_by_user_id(row)?;
-            Some((root_span_id, user_id))
+            Some((
+                root_span_id,
+                (trace_created_by_user_id(row), trace_git_origin_url(row)),
+            ))
         })
         .collect::<HashMap<_, _>>();
 
     for trace in traces {
-        if trace.created_by_user_id.is_some() {
-            continue;
-        }
-        if let Some(user_id) = users_by_root_span_id.get(&trace.root_span_id) {
-            trace.created_by_user_id = Some(user_id.clone());
+        if let Some((user_id, git_origin_url)) = metadata_by_root_span_id.get(&trace.root_span_id) {
+            if trace.created_by_user_id.is_none() {
+                trace.created_by_user_id = user_id.clone();
+            }
+            if trace.git_origin_url.is_none() {
+                trace.git_origin_url = git_origin_url.clone();
+                trace.repo = trace
+                    .git_origin_url
+                    .as_deref()
+                    .and_then(repo_slug_from_origin_url);
+            }
         }
     }
 
@@ -2896,7 +3167,7 @@ async fn fetch_org_users(client: &ApiClient) -> Result<HashMap<String, OrgUser>>
         }
 
         let response: OrgUsersListResponse = client.get(&path).await?;
-        let objects = response.into_objects();
+        let objects = response.objects;
         let page_len = objects.len();
         let next_cursor = objects.last().map(|user| user.id.clone());
         for user in objects {
@@ -3745,14 +4016,64 @@ mod tests {
 
     #[test]
     fn topic_explore_time_filter_combines_window_and_extra_filter() {
-        let filter =
-            topic_explore_time_filter_clause(None, "6h", Some("metadata.environment = 'test'"))
-                .expect("filter");
+        let filter = combine_filter_clauses([
+            Some(topic_explore_time_filter_clause(None, "6h").expect("time filter")),
+            Some("metadata.environment = 'test'".to_string()),
+        ]);
 
         assert_eq!(
             filter,
             "(created >= NOW() - INTERVAL 21600 SECOND) AND (metadata.environment = 'test')"
         );
+    }
+
+    #[test]
+    fn topic_explore_filter_accepts_repo_shortcut_and_origin_urls() {
+        let origin = parse_repo_origin_selector("test-org/test-repo").expect("origin");
+        let filter = topic_repo_origin_filter_clause(&origin, Some("test-org/test-repo"));
+        assert!(filter.contains("\"metadata\".\"git_origin_url\" IN ["));
+        assert!(filter.contains("'github.com/test-org/test-repo'"));
+        assert!(filter.contains("'test-org/test-repo'"));
+        assert!(filter.contains("'https://github.com/test-org/test-repo.git'"));
+        assert!(filter.contains("'https://github.com/test-org/test-repo'"));
+        assert!(filter.contains("'git@github.com:test-org/test-repo.git'"));
+        assert!(filter.contains("'ssh://git@github.com/test-org/test-repo.git'"));
+
+        let query = build_topic_repo_root_spans_query(
+            "test-project",
+            "created >= NOW() - INTERVAL 604800 SECOND",
+            &filter,
+            25,
+            Some("cursor-test"),
+        );
+        assert!(query.contains("from: project_logs('test-project') spans"));
+        assert!(query.contains("created >= NOW() - INTERVAL 604800 SECOND"));
+        assert!(query.contains("span_id = root_span_id"));
+        assert!(query.contains("metadata.git_origin_url as git_origin_url"));
+        assert!(query.contains("cursor: \"cursor-test\""));
+
+        let https =
+            parse_repo_origin_selector("https://github.com/test-org/test-repo.git").expect("https");
+        let ssh = parse_repo_origin_selector("git@github.com:test-org/test-repo.git")
+            .expect("ssh origin");
+        let host_path =
+            parse_repo_origin_selector("github.com/test-org/test-repo").expect("host path");
+        assert_eq!(https.canonical_slug(), "github.com/test-org/test-repo");
+        assert_eq!(https, ssh);
+        assert_eq!(https, host_path);
+    }
+
+    #[test]
+    fn topic_explore_filter_accepts_non_github_host() {
+        let origin = parse_repo_origin_selector("gitlab.example.com/platform/agent/runtime.git")
+            .expect("origin");
+
+        assert_eq!(
+            origin.canonical_slug(),
+            "gitlab.example.com/platform/agent/runtime"
+        );
+        assert!(repo_origin_url_variants(&origin)
+            .contains("git@gitlab.example.com:platform/agent/runtime.git"));
     }
 
     #[test]
@@ -3821,6 +4142,7 @@ mod tests {
         assert!(query.contains("_pagination_key"));
         assert!(query.contains("as sort_value"));
         assert!(query.contains("span_attributes.created_by_user_id as created_by_user_id"));
+        assert!(query.contains("metadata.git_origin_url as git_origin_url"));
         assert!(query.contains("\"classifications\".\"Task\".\"id\" = 'topic-test'"));
         assert!(query.contains("sort: COALESCE(metrics.total_tokens, metrics.tokens"));
         assert!(query.contains(", _pagination_key DESC"));
@@ -3839,6 +4161,8 @@ mod tests {
                 created_by_user_id: None,
                 created_by_user_name: None,
                 created_by_user_email: None,
+                git_origin_url: None,
+                repo: None,
                 topic: Some("Support".to_string()),
                 topic_id: Some("topic-test".to_string()),
                 tokens: (100 - index) as f64,
@@ -3896,7 +4220,8 @@ mod tests {
                 "input_tokens": 10,
                 "output_tokens": 5,
                 "cost": 0.01
-            }
+            },
+            "git_origin_url": "git@github.com:test-org/test-repo.git"
         });
         let row = row.as_object().expect("row object");
 
@@ -3904,6 +4229,11 @@ mod tests {
 
         assert_eq!(trace.created_by_user_id.as_deref(), Some("user-test"));
         assert_eq!(trace.created_by_user_name, None);
+        assert_eq!(
+            trace.git_origin_url.as_deref(),
+            Some("git@github.com:test-org/test-repo.git")
+        );
+        assert_eq!(trace.repo.as_deref(), Some("github.com/test-org/test-repo"));
         assert_eq!(
             trace.pagination_key.as_deref(),
             Some("p00000000000000000010")
@@ -3928,8 +4258,8 @@ mod tests {
     }
 
     #[test]
-    fn topic_trace_root_users_query_is_root_span_bounded() {
-        let query = build_topic_trace_root_users_query(
+    fn topic_trace_root_metadata_query_is_root_span_bounded() {
+        let query = build_topic_trace_root_metadata_query(
             "test-project",
             &["root-one".to_string(), "root-two".to_string()],
         );
@@ -3938,6 +4268,7 @@ mod tests {
         assert!(query.contains("root_span_id IN ['root-one', 'root-two']"));
         assert!(query.contains("span_id = root_span_id"));
         assert!(query.contains("span_attributes.created_by_user_id as created_by_user_id"));
+        assert!(query.contains("metadata.git_origin_url as git_origin_url"));
     }
 
     #[test]

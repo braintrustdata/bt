@@ -14,15 +14,12 @@ use crate::{
 use super::{
     api::{self, TopicClassificationRow, TopicExploreFacet, TopicTraceRow},
     formatting::{format_count, format_project_header, format_timestamp_with_relative},
-    ClassificationsArgs, ExploreArgs, FacetsArgs, ResolvedContext, TopicTracesArgs,
+    ClassificationsArgs, ExploreArgs, ExploreTimeArgs, FacetsArgs, ResolvedContext,
+    TopicTracesArgs,
 };
 
 pub async fn run_facets(ctx: &ResolvedContext, args: &FacetsArgs, json: bool) -> Result<()> {
-    let filter_clause = api::topic_explore_time_filter_clause(
-        args.time.since.as_deref(),
-        &args.time.window,
-        args.time.filter.as_deref(),
-    )?;
+    let filter_clause = resolve_filter_clause(ctx, &args.time, args.output.print_queries).await?;
     let report = with_spinner(
         "Loading facets and topic maps...",
         api::fetch_topics_explore_facets(
@@ -48,11 +45,7 @@ pub async fn run_classifications(
     args: &ClassificationsArgs,
     json: bool,
 ) -> Result<()> {
-    let filter_clause = api::topic_explore_time_filter_clause(
-        args.time.since.as_deref(),
-        &args.time.window,
-        args.time.filter.as_deref(),
-    )?;
+    let filter_clause = resolve_filter_clause(ctx, &args.time, args.output.print_queries).await?;
     let report = with_spinner(
         "Loading topic labels...",
         api::fetch_topic_classifications(
@@ -78,11 +71,7 @@ pub async fn run_classifications(
 }
 
 pub async fn run_traces(ctx: &ResolvedContext, args: &TopicTracesArgs, json: bool) -> Result<()> {
-    let filter_clause = api::topic_explore_time_filter_clause(
-        args.time.since.as_deref(),
-        &args.time.window,
-        args.time.filter.as_deref(),
-    )?;
+    let filter_clause = resolve_filter_clause(ctx, &args.time, args.output.print_queries).await?;
     let report = with_spinner(
         "Loading traces for topic label...",
         api::fetch_topic_traces(
@@ -121,11 +110,7 @@ pub async fn run_explore(ctx: &ResolvedContext, args: &ExploreArgs, json: bool) 
         bail!("--trace-page-size must be greater than 0");
     }
 
-    let filter_clause = api::topic_explore_time_filter_clause(
-        args.time.since.as_deref(),
-        &args.time.window,
-        args.time.filter.as_deref(),
-    )?;
+    let filter_clause = resolve_filter_clause(ctx, &args.time, args.output.print_queries).await?;
     let facets_report = with_spinner(
         "Loading facets and topic maps...",
         api::fetch_topics_explore_facets(
@@ -247,6 +232,31 @@ pub async fn run_explore(ctx: &ResolvedContext, args: &ExploreArgs, json: bool) 
     Ok(())
 }
 
+async fn resolve_filter_clause(
+    ctx: &ResolvedContext,
+    time: &ExploreTimeArgs,
+    print_queries: bool,
+) -> Result<String> {
+    let filter = api::topic_explore_filter_clause(
+        ctx,
+        time.since.as_deref(),
+        &time.window,
+        time.filter.as_deref(),
+        time.repo.as_deref(),
+        print_queries,
+    );
+    if time
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|repo| !repo.is_empty())
+    {
+        with_spinner("Resolving repo filter...", filter).await
+    } else {
+        filter.await
+    }
+}
+
 async fn run_trace_picker(
     ctx: &ResolvedContext,
     args: &ExploreArgs,
@@ -259,7 +269,7 @@ async fn run_trace_picker(
     loop {
         let trace_labels = trace_picker_labels(traces_report);
         let Some(trace_index) = fuzzy_select_opt(
-            "Select trace: created / user / cost / tokens / duration / root / input (Esc to topic labels)",
+            "Select trace: created / user / repo / cost / tokens / duration / root / input (Esc to topic labels)",
             &trace_labels,
             default_trace_index.min(trace_labels.len().saturating_sub(1)),
         )? else {
@@ -466,7 +476,7 @@ fn render_facets_report(report: &api::TopicsExploreFacetsReport) -> String {
         header("Processing"),
         header("Errors"),
     ]);
-    apply_column_padding(&mut table, (0, 3));
+    apply_column_padding(&mut table, (0, 6));
 
     for row in &report.facets {
         table.add_row(vec![
@@ -523,7 +533,7 @@ fn render_classifications_report(report: &api::TopicClassificationsReport) -> St
         header("Avg cost"),
         header("Latest"),
     ]);
-    apply_column_padding(&mut table, (0, 3));
+    apply_column_padding(&mut table, (0, 6));
 
     for row in &report.classifications {
         table.add_row(vec![
@@ -577,13 +587,14 @@ fn render_traces_report(report: &api::TopicTracesReport) -> String {
         header("Created"),
         header("Root span ID"),
         header("User"),
+        header("Repo"),
         header("Topic"),
         header("Tokens"),
         header("Cost"),
         header("Duration"),
         header("Input"),
     ]);
-    apply_column_padding(&mut table, (0, 3));
+    apply_column_padding(&mut table, (0, 6));
 
     for row in &report.traces {
         table.add_row(vec![
@@ -594,6 +605,9 @@ fn render_traces_report(report: &api::TopicTracesReport) -> String {
             truncate(&row.root_span_id, 24),
             trace_user_label(row)
                 .map(|user| truncate(&user, 28))
+                .unwrap_or_else(|| "-".to_string()),
+            trace_repo_label(row)
+                .map(|repo| truncate(&repo, 28))
                 .unwrap_or_else(|| "-".to_string()),
             truncate(row.topic.as_deref().unwrap_or("-"), 28),
             format_tokens(row.tokens),
@@ -625,13 +639,15 @@ fn trace_picker_labels(report: &api::TopicTracesReport) -> Vec<String> {
         .collect::<Vec<_>>();
     if report.next_cursor.is_some() {
         labels.push(format!(
-            "{}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  {}  {}",
             left_cell("Load more traces", 16),
-            left_cell("", 26),
+            left_cell("", 24),
+            left_cell("", 24),
             right_cell("", 9),
             right_cell("", 10),
             right_cell("", 8),
             left_cell("", 24),
+            left_cell("", 60),
         ));
     }
     labels
@@ -663,11 +679,15 @@ fn format_classification_choice(row: &TopicClassificationRow) -> String {
 
 fn format_trace_choice(row: &TopicTraceRow) -> String {
     format!(
-        "{}  {}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}  {}  {}",
         left_cell(&format_compact_timestamp(row.created.as_deref()), 16),
         left_cell(
             &trace_user_label(row).unwrap_or_else(|| "-".to_string()),
-            26
+            24
+        ),
+        left_cell(
+            &trace_repo_label(row).unwrap_or_else(|| "-".to_string()),
+            24
         ),
         right_cell(&format_cost(row.cost), 9),
         right_cell(&format_tokens(row.tokens), 10),
@@ -742,6 +762,12 @@ fn render_selected_trace(trace: &TopicTraceRow) -> String {
     if let Some(user) = trace_user_label_with_id(trace) {
         writeln!(output, "user: {user}").expect("write to string");
     }
+    if let Some(repo) = trace_repo_label(trace) {
+        writeln!(output, "repo: {repo}").expect("write to string");
+    }
+    if let Some(origin) = trace.git_origin_url.as_deref() {
+        writeln!(output, "origin: {origin}").expect("write to string");
+    }
     writeln!(output, "url: {}", trace.app_url).expect("write to string");
     if !trace.root_span_id.is_empty() {
         writeln!(output).expect("write to string");
@@ -777,6 +803,13 @@ fn trace_user_label_with_id(row: &TopicTraceRow) -> Option<String> {
     } else {
         Some(format!("{label} ({user_id})"))
     }
+}
+
+fn trace_repo_label(row: &TopicTraceRow) -> Option<String> {
+    row.repo
+        .as_deref()
+        .or(row.git_origin_url.as_deref())
+        .map(ToString::to_string)
 }
 
 fn format_tokens(value: f64) -> String {
