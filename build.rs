@@ -1,5 +1,22 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
+
+const PREVIEW_ASSETS: &[(&str, &str)] = &[
+    (
+        "node_modules/react/umd/react.development.js",
+        "views-preview-react.js",
+    ),
+    (
+        "node_modules/react-dom/umd/react-dom.development.js",
+        "views-preview-react-dom.js",
+    ),
+    (
+        "node_modules/@tailwindcss/browser/dist/index.global.js",
+        "views-preview-tailwindcss-browser.js",
+    ),
+];
 
 fn non_empty_env(name: &str) -> Option<String> {
     env::var(name)
@@ -46,7 +63,36 @@ fn compute_default_version() -> String {
     }
 }
 
+fn copy_preview_assets() {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"));
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+
+    println!("cargo:rerun-if-changed=package.json");
+    println!("cargo:rerun-if-changed=pnpm-lock.yaml");
+    for (source, output) in PREVIEW_ASSETS {
+        let source_path = manifest_dir.join(source);
+        println!("cargo:rerun-if-changed={}", source_path.display());
+        if !source_path.is_file() {
+            panic!(
+                "missing preview asset {}; run `pnpm install --ignore-scripts` before building bt",
+                source_path.display()
+            );
+        }
+        let output_path = out_dir.join(output);
+        fs::copy(&source_path, &output_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to copy preview asset {} to {}: {err}",
+                source_path.display(),
+                output_path.display()
+            )
+        });
+    }
+}
+
 fn main() {
+    copy_preview_assets();
+
     let version = non_empty_env("BT_VERSION_STRING").unwrap_or_else(compute_default_version);
     println!("cargo:rustc-env=BT_VERSION_STRING={version}");
 

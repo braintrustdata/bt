@@ -23,7 +23,7 @@ clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
 futures-util = "0.3.31"
 indicatif = "0.17.8"
-ratatui = "0.29.0"
+ratatui = "0.30.2"
 reqwest = { version = "0.12.7", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"
@@ -52,6 +52,17 @@ glob = "0.3"
 flate2 = "1.1.2"
 tempfile = "3"
 uuid = { version = "1.21.0", features = ["v4"] }
+swc_atoms = "9.0.1"
+swc_bundler = "49.0.0"
+swc_common = "21.0.2"
+swc_ecma_ast = "23.0.1"
+swc_ecma_codegen = "26.0.1"
+swc_ecma_loader = { version = "22.0.0", features = ["node"] }
+swc_ecma_parser = "39.1.0"
+swc_ecma_transforms_base = "42.0.1"
+swc_ecma_transforms_react = "47.0.0"
+swc_ecma_transforms_typescript = "47.0.0"
+swc_ecma_visit = "22.0.0"
 
 [profile.dist]
 inherits = "release"

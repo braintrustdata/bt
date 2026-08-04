@@ -1,0 +1,210 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>__HTML_TITLE__</title>
+  <script src="/preview-assets/tailwindcss-browser.js"></script>
+  <script src="/preview-assets/react.js"></script>
+  <script src="/preview-assets/react-dom.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "braintrust/custom-views": "/preview-virtual/custom-views.js",
+        "@braintrust/local/custom-views": "/preview-virtual/custom-views.js",
+        "react": "/preview-virtual/react.js",
+        "react/jsx-runtime": "/preview-virtual/react-jsx-runtime.js",
+        "react/jsx-dev-runtime": "/preview-virtual/react-jsx-runtime.js"
+      }
+    }
+  </script>
+  <style>
+    html, body, #root { min-height: 100%; margin: 0; }
+    body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module">
+    const previewConfig = __PREVIEW_CONFIG__;
+    const previewTitle = previewConfig.title;
+    const previewVersion = previewConfig.version;
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    let trace = null;
+    let span = null;
+    let datasetProps = null;
+    let Component = null;
+
+    function showError(error) {
+      root.render(React.createElement("pre", {
+        style: { padding: "16px", color: "#b91c1c", whiteSpace: "pre-wrap" }
+      }, `${previewTitle}\n\n${error?.stack || error}`));
+    }
+
+    async function fetchJson(url, options) {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        let message = await response.text();
+        try {
+          const parsed = JSON.parse(message);
+          message = parsed.error || message;
+        } catch (_error) {}
+        throw new Error(message || `${response.status} ${response.statusText}`);
+      }
+      return response.json();
+    }
+
+    function validateView(view) {
+      if (!view || (view.kind !== "trace" && view.kind !== "dataset")) {
+        throw new Error("Custom view file must default-export customTraceView(...) or customDatasetView(...)");
+      }
+      if (view.kind !== previewConfig.viewType) {
+        throw new Error(`Selected view is ${view.kind}, but this preview expects ${previewConfig.viewType}`);
+      }
+      if (previewConfig.viewSelector && view.slug !== previewConfig.viewSelector && view.name !== previewConfig.viewSelector) {
+        throw new Error(`${view.kind} custom view '${previewConfig.viewSelector}' not found in selected file`);
+      }
+      if (typeof view.component !== "function") {
+        throw new Error(`Custom view '${view.slug || view.name || previewConfig.sourcePath}' component must be a function`);
+      }
+      return view;
+    }
+
+    function viewMetadata(view) {
+      const project = view.project;
+      const dataset = view.dataset;
+      const metadata = {
+        view_type: view.kind,
+        name: view.name,
+        slug: view.slug,
+        project_id: null,
+        project_name: null,
+        dataset_id: null,
+        dataset_name: null,
+      };
+      if (typeof project === "string") metadata.project_name = project;
+      else if (project?.id) metadata.project_id = project.id;
+      else if (project?.name) metadata.project_name = project.name;
+      if (dataset?.id) metadata.dataset_id = dataset.id;
+      else if (dataset?.name) metadata.dataset_name = dataset.name;
+      return metadata;
+    }
+
+    async function buildView() {
+      const loaded = await import(previewConfig.sourceModuleUrl);
+      return validateView(loaded.default);
+    }
+
+    function resolveSpan(id) {
+      if (!trace?.spans) return null;
+      if (trace.spans[id]) return trace.spans[id];
+      return Object.values(trace.spans).find((candidate) => candidate.id === id) || null;
+    }
+
+    async function fetchSpanFields(spanIds, fields) {
+      const ids = Array.isArray(spanIds) ? spanIds : [spanIds];
+      const response = await fetch("/span-fields", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ spanIds: ids, fields }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "fetchSpanFields failed");
+      }
+      return response.json();
+    }
+
+    function update(fieldOrPatch, value) {
+      if (typeof fieldOrPatch === "string") {
+        if (span) {
+          span = {
+            ...span,
+            data: {
+              ...span.data,
+              metadata: { ...(span.data?.metadata || {}), [fieldOrPatch]: value },
+            },
+          };
+          if (trace?.spans?.[span.span_id]) {
+            trace = {
+              ...trace,
+              spans: { ...trace.spans, [span.span_id]: span },
+            };
+          }
+        }
+        console.info("Preview update only:", fieldOrPatch, value);
+      } else {
+        const patch = fieldOrPatch || {};
+        if (patch.metadata && span) {
+          span = {
+            ...span,
+            data: {
+              ...span.data,
+              metadata: { ...(span.data?.metadata || {}), ...patch.metadata },
+            },
+          };
+          if (trace?.spans?.[span.span_id]) {
+            trace = {
+              ...trace,
+              spans: { ...trace.spans, [span.span_id]: span },
+            };
+          }
+        }
+        console.info("Preview update only:", patch);
+      }
+      render();
+    }
+
+    function selectSpan(spanId) {
+      const next = resolveSpan(spanId);
+      if (!next) {
+        console.warn("Span not found:", spanId);
+        return;
+      }
+      trace = { ...trace, selectedSpanId: next.span_id };
+      span = next;
+      render();
+    }
+
+    function render() {
+      try {
+        const props = trace && span
+          ? { trace: { ...trace, fetchSpanFields }, span, update, selectSpan }
+          : datasetProps;
+        root.render(React.createElement(Component, props));
+      } catch (error) {
+        showError(error);
+      }
+    }
+
+    async function main() {
+      root.render(React.createElement("pre", {
+        style: { padding: "16px", color: "#475569", whiteSpace: "pre-wrap" }
+      }, `Loading ${previewTitle}...`));
+      const view = await buildView();
+      Component = view.component;
+      const data = await fetchJson("/preview-data", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(viewMetadata(view)),
+      });
+      trace = data.trace || null;
+      span = data.span || null;
+      datasetProps = data.props || null;
+      render();
+    }
+
+    main().catch(showError);
+    setInterval(async () => {
+      try {
+        const response = await fetch("/preview-version", { cache: "no-store" });
+        if (!response.ok) return;
+        const payload = await response.json();
+        if (payload.version && payload.version !== previewVersion) {
+          window.location.reload();
+        }
+      } catch (_error) {}
+    }, 1000);
+  </script>
+</body>
+</html>

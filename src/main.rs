@@ -34,6 +34,7 @@ mod traces;
 mod ui;
 mod util_cmd;
 mod utils;
+mod views;
 
 use crate::args::{has_explicit_profile_arg, ArgValueSource, BaseArgs, CLIArgs};
 
@@ -60,6 +61,7 @@ Core
   auth         Authenticate bt with Braintrust
   switch       Switch org and project context
   view         View logs, traces, and spans
+  views        Push and preview custom views
 
 Projects & resources
   projects     Manage projects
@@ -133,6 +135,8 @@ enum Commands {
     Auth(CLIArgs<auth::AuthArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
+    /// Push and preview custom views
+    Views(CLIArgs<views::ViewsArgs>),
     #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
@@ -178,6 +182,7 @@ impl Commands {
             Commands::Sql(cmd) => &cmd.base,
             Commands::Auth(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
+            Commands::Views(cmd) => &cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
@@ -205,6 +210,7 @@ impl Commands {
             Commands::Sql(cmd) => &mut cmd.base,
             Commands::Auth(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
+            Commands::Views(cmd) => &mut cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
@@ -309,6 +315,7 @@ fn try_main() -> Result<()> {
         match cli.command {
             Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
+            Commands::Views(cmd) => views::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
             Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
