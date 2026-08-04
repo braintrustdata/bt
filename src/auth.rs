@@ -15,7 +15,7 @@ use actix_web::{dev::ServerHandle, web, App, HttpResponse, HttpServer};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use braintrust_sdk_rust::{BraintrustClient, LoginState};
-use chrono::{DateTime, Months, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Months, Utc};
 use clap::{Args, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
@@ -37,6 +37,7 @@ use crate::{
 
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
+const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
 const AI_PROVIDER_KEY_STALENESS_CHECK_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
@@ -376,6 +377,25 @@ struct OAuthTokenResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct OrgScopedTokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OrgScopedTokenRequest<'a> {
+    grant_type: &'a str,
+    org_id: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedBearerToken {
+    token: String,
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OAuthErrorResponse {
     #[serde(default)]
     error: Option<String>,
@@ -389,6 +409,7 @@ Examples:
   bt auth login
   bt auth profiles
   bt auth refresh
+  bt auth token --header
   bt auth logout --profile work
 ")]
 pub struct AuthArgs {
@@ -402,6 +423,8 @@ enum AuthCommand {
     Login(AuthLoginArgs),
     /// Force-refresh OAuth access token for a profile
     Refresh,
+    /// Print a short-lived org-scoped bearer token for the current auth context
+    Token(AuthTokenArgs),
     /// List auth profiles and check connection status
     Profiles(AuthProfilesArgs),
     /// Log out by removing a saved profile
@@ -413,6 +436,13 @@ struct AuthProfilesArgs {
     /// Only show the profile with this name
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct AuthTokenArgs {
+    /// Print a full Authorization header instead of only the token
+    #[arg(long)]
+    header: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -450,9 +480,148 @@ pub async fn run(base: BaseArgs, args: AuthArgs) -> Result<()> {
     match args.command {
         AuthCommand::Login(login_args) => run_login_set(&base, login_args).await,
         AuthCommand::Refresh => run_login_refresh(&base).await,
+        AuthCommand::Token(token_args) => run_token(&base, token_args).await,
         AuthCommand::Profiles(profile_args) => run_profiles(&base, profile_args).await,
         AuthCommand::Logout(logout_args) => run_login_logout(base, logout_args),
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthTokenOutput {
+    token: String,
+    authorization_header: String,
+    api_url: Option<String>,
+    app_url: Option<String>,
+    org_name: Option<String>,
+    expires_at: Option<String>,
+}
+
+async fn run_token(base: &BaseArgs, args: AuthTokenArgs) -> Result<()> {
+    let auth = resolve_auth(base).await?;
+    let token = resolve_short_lived_bearer_token(&auth).await?;
+
+    if base.json {
+        println!(
+            "{}",
+            serde_json::to_string(&build_auth_token_output(&token, &auth))?
+        );
+        return Ok(());
+    }
+
+    if args.header {
+        println!("{}", format_authorization_header(&token.token));
+    } else {
+        println!("{}", token.token);
+    }
+    Ok(())
+}
+
+fn format_authorization_header(token: &str) -> String {
+    format!("Authorization: Bearer {token}")
+}
+
+fn build_auth_token_output(token: &ResolvedBearerToken, auth: &ResolvedAuth) -> AuthTokenOutput {
+    AuthTokenOutput {
+        token: token.token.clone(),
+        authorization_header: format_authorization_header(&token.token),
+        api_url: auth.api_url.clone(),
+        app_url: auth.app_url.clone(),
+        org_name: auth.org_name.clone(),
+        expires_at: token.expires_at.clone(),
+    }
+}
+
+async fn resolve_api_bearer_token(auth: &ResolvedAuth) -> Result<ResolvedBearerToken> {
+    let token = auth.api_key.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
+        )
+    })?;
+    if !auth.is_oauth {
+        return Ok(ResolvedBearerToken {
+            token,
+            expires_at: None,
+        });
+    }
+
+    resolve_short_lived_bearer_token(auth).await
+}
+
+async fn resolve_short_lived_bearer_token(auth: &ResolvedAuth) -> Result<ResolvedBearerToken> {
+    let token = auth.api_key.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
+        )
+    })?;
+    let app_url = auth
+        .app_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_APP_URL);
+    let orgs = fetch_login_orgs(&token, app_url).await?;
+    let requested_org_name = auth
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let org = match requested_org_name {
+        Some(org_name) => find_login_org(&orgs, org_name).ok_or_else(|| {
+            anyhow::anyhow!("credential does not have access to organization '{org_name}'")
+        })?,
+        None if orgs.len() == 1 => &orgs[0],
+        None => {
+            bail!("an active org is required to mint a short-lived token; pass --org or select a profile with an org")
+        }
+    };
+
+    exchange_credential_for_org_scoped_token(&token, app_url, &org.id).await
+}
+
+async fn exchange_credential_for_org_scoped_token(
+    login_token: &str,
+    app_url: &str,
+    org_id: &str,
+) -> Result<ResolvedBearerToken> {
+    let token_url = format!("{}/api/oauth/token", app_url.trim_end_matches('/'));
+    let client = build_http_client(crate::http::DEFAULT_HTTP_TIMEOUT)
+        .context("failed to initialize HTTP client")?;
+    let requested_at = Utc::now();
+    let response = client
+        .post(&token_url)
+        .bearer_auth(login_token)
+        .json(&OrgScopedTokenRequest {
+            grant_type: TOKEN_EXCHANGE_GRANT,
+            org_id,
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to call OAuth token endpoint {token_url}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(crate::http::HttpError { status, body }.into());
+    }
+
+    let payload: OrgScopedTokenResponse = response
+        .json()
+        .await
+        .context("failed to parse OAuth token response")?;
+    if !payload.token_type.eq_ignore_ascii_case("Bearer") {
+        bail!("OAuth token endpoint returned unsupported token type");
+    }
+    let expires_in = i64::try_from(payload.expires_in)
+        .context("OAuth token expiration exceeds supported range")?;
+    let expires_at = requested_at
+        .checked_add_signed(ChronoDuration::seconds(expires_in))
+        .context("OAuth token expiration exceeds supported range")?
+        .to_rfc3339();
+
+    Ok(ResolvedBearerToken {
+        token: payload.access_token,
+        expires_at: Some(expires_at),
+    })
 }
 
 pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
@@ -473,11 +642,7 @@ pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
 pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
     maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
-    let api_key = auth.api_key.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
-        )
-    })?;
+    let api_key = resolve_api_bearer_token(&auth).await?.token;
     let org_name = auth.org_name.clone().unwrap_or_default();
     let api_url = auth
         .api_url
@@ -507,11 +672,7 @@ pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
 pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
-    let api_key = auth.api_key.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt auth login`"
-        )
-    })?;
+    let api_key = resolve_api_bearer_token(&auth).await?.token;
 
     let mut builder = BraintrustClient::builder()
         .blocking_login(true)
@@ -972,8 +1133,10 @@ pub async fn resolved_auth_env(base: &BaseArgs) -> Result<Vec<(String, String)>>
     let auth = resolve_auth(base).await?;
     let mut envs = Vec::new();
 
-    if let Some(api_key) = auth.api_key {
-        envs.push(("BRAINTRUST_API_KEY".to_string(), api_key));
+    let token = resolve_api_bearer_token(&auth).await?;
+    envs.push(("BRAINTRUST_API_KEY".to_string(), token.token));
+    if let Some(expires_at) = token.expires_at {
+        envs.push(("BRAINTRUST_TOKEN_EXPIRES_AT".to_string(), expires_at));
     }
     if let Some(api_url) = auth.api_url {
         envs.push(("BRAINTRUST_API_URL".to_string(), api_url));
@@ -3664,6 +3827,7 @@ fn auth_store_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use actix_web::HttpRequest;
     use futures_util::lock::Mutex;
     use tempfile::TempDir;
 
@@ -3673,9 +3837,83 @@ mod tests {
         ffi::OsString,
         fs,
         path::PathBuf,
-        sync::OnceLock,
+        sync::{Arc, Mutex as StdMutex, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[derive(Debug, Default)]
+    struct MockTokenExchangeState {
+        login_authorization: StdMutex<Option<String>>,
+        token_authorization: StdMutex<Option<String>>,
+        token_request: StdMutex<Option<OrgScopedTokenRequestBody>>,
+    }
+
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+    struct OrgScopedTokenRequestBody {
+        grant_type: String,
+        org_id: String,
+    }
+
+    async fn mock_login_orgs(
+        state: web::Data<Arc<MockTokenExchangeState>>,
+        request: HttpRequest,
+    ) -> HttpResponse {
+        *state
+            .login_authorization
+            .lock()
+            .expect("login_authorization lock") = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        HttpResponse::Ok().json(serde_json::json!({
+            "org_info": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "name": "Acme",
+                "api_url": "https://api.example.com"
+            }]
+        }))
+    }
+
+    async fn mock_token_exchange(
+        state: web::Data<Arc<MockTokenExchangeState>>,
+        request: HttpRequest,
+        body: web::Json<OrgScopedTokenRequestBody>,
+    ) -> HttpResponse {
+        *state
+            .token_authorization
+            .lock()
+            .expect("token_authorization lock") = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        *state.token_request.lock().expect("token_request lock") = Some(body.into_inner());
+        HttpResponse::Ok().json(serde_json::json!({
+            "access_token": "scoped-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }))
+    }
+
+    fn start_mock_token_exchange_server() -> (String, Arc<MockTokenExchangeState>) {
+        let state = Arc::new(MockTokenExchangeState::default());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let server_state = state.clone();
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(server_state.clone()))
+                .route("/api/apikey/login", web::post().to(mock_login_orgs))
+                .route("/api/oauth/token", web::post().to(mock_token_exchange))
+        })
+        .listen(listener)
+        .expect("listen mock server")
+        .run();
+        tokio::spawn(server);
+        std::thread::sleep(Duration::from_millis(25));
+        (format!("http://{addr}"), state)
+    }
 
     fn make_base() -> BaseArgs {
         BaseArgs {
@@ -3712,6 +3950,81 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .expect("timestamp")
             .with_timezone(&Utc)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_api_bearer_token_uses_oauth_token_exchange_endpoint() {
+        let (app_url, state) = start_mock_token_exchange_server();
+        let started_at = Utc::now();
+        let token = resolve_api_bearer_token(&ResolvedAuth {
+            api_key: Some("oauth-access-token".to_string()),
+            api_url: Some("https://api.example.com".to_string()),
+            app_url: Some(app_url),
+            org_name: Some("acme".to_string()),
+            is_oauth: true,
+        })
+        .await
+        .expect("resolve bearer token");
+
+        assert_eq!(token.token, "scoped-token");
+        let expires_at =
+            DateTime::parse_from_rfc3339(token.expires_at.as_deref().expect("token expiration"))
+                .expect("valid token expiration")
+                .with_timezone(&Utc);
+        assert!(expires_at >= started_at + ChronoDuration::seconds(3599));
+        assert!(expires_at <= Utc::now() + ChronoDuration::seconds(3601));
+        assert_eq!(
+            state
+                .login_authorization
+                .lock()
+                .expect("login_authorization lock")
+                .as_deref(),
+            Some("Bearer oauth-access-token")
+        );
+        assert_eq!(
+            state
+                .token_authorization
+                .lock()
+                .expect("token_authorization lock")
+                .as_deref(),
+            Some("Bearer oauth-access-token")
+        );
+        assert_eq!(
+            state
+                .token_request
+                .lock()
+                .expect("token_request lock")
+                .as_ref(),
+            Some(&OrgScopedTokenRequestBody {
+                grant_type: TOKEN_EXCHANGE_GRANT.to_string(),
+                org_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_short_lived_bearer_token_exchanges_api_keys() {
+        let (app_url, state) = start_mock_token_exchange_server();
+        let token = resolve_short_lived_bearer_token(&ResolvedAuth {
+            api_key: Some("permanent-api-key".to_string()),
+            api_url: Some("https://api.example.com".to_string()),
+            app_url: Some(app_url),
+            org_name: None,
+            is_oauth: false,
+        })
+        .await
+        .expect("resolve short-lived bearer token");
+
+        assert_eq!(token.token, "scoped-token");
+        assert!(token.expires_at.is_some());
+        assert_eq!(
+            state
+                .token_authorization
+                .lock()
+                .expect("token_authorization lock")
+                .as_deref(),
+            Some("Bearer permanent-api-key")
+        );
     }
 
     fn ai_provider_secret(

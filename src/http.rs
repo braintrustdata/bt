@@ -12,6 +12,18 @@ use crate::auth::LoginContext;
 pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub const BT_USER_AGENT: &str = concat!("bt-cli/", env!("CARGO_PKG_VERSION"));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceBase {
+    Api,
+    App,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawRequestBody {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
 pub fn build_http_client(timeout: std::time::Duration) -> Result<Client> {
     build_http_client_from_builder(Client::builder().timeout(timeout))
 }
@@ -30,7 +42,8 @@ pub fn build_http_client_from_builder(mut builder: ClientBuilder) -> Result<Clie
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
-    base_url: String,
+    api_url: String,
+    app_url: String,
     api_key: String,
     org_id: String,
     org_name: String,
@@ -158,7 +171,8 @@ impl ApiClient {
 
         Ok(Self {
             http,
-            base_url: ctx.api_url.trim_end_matches('/').to_string(),
+            api_url: ctx.api_url.trim_end_matches('/').to_string(),
+            app_url: ctx.app_url.trim_end_matches('/').to_string(),
             api_key: ctx.login.api_key().context("login state missing API key")?,
             org_id: ctx.login.org_id().unwrap_or_default(),
             org_name: ctx.login.org_name().unwrap_or_default(),
@@ -166,8 +180,16 @@ impl ApiClient {
     }
 
     pub fn url(&self, path: &str) -> String {
+        self.url_for_service(ServiceBase::Api, path)
+    }
+
+    pub fn url_for_service(&self, service: ServiceBase, path: &str) -> String {
         let path = path.trim_start_matches('/');
-        format!("{}/{}", self.base_url, path)
+        let base_url = match service {
+            ServiceBase::Api => &self.api_url,
+            ServiceBase::App => &self.app_url,
+        };
+        format!("{}/{}", base_url, path)
     }
 
     pub fn api_key(&self) -> &str {
@@ -175,7 +197,7 @@ impl ApiClient {
     }
 
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        &self.api_url
     }
 
     pub fn org_id(&self) -> &str {
@@ -184,6 +206,30 @@ impl ApiClient {
 
     pub fn org_name(&self) -> &str {
         &self.org_name
+    }
+
+    pub async fn request_raw(
+        &self,
+        method: reqwest::Method,
+        service: ServiceBase,
+        path: &str,
+        headers: &[(String, String)],
+        body: Option<RawRequestBody>,
+    ) -> Result<reqwest::Response> {
+        let url = self.url_for_service(service, path);
+        let mut request = self.http.request(method, &url).bearer_auth(&self.api_key);
+
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        if let Some(body) = body {
+            if let Some(content_type) = body.content_type {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            request = request.body(body.bytes);
+        }
+
+        request.send().await.context("request failed")
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {

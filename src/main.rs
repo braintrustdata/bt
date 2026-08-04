@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
+mod api;
 mod args;
 mod auth;
 #[allow(dead_code)]
@@ -72,6 +73,7 @@ Projects & resources
   experiments  Manage experiments
 
 Data & evaluation
+  api          Send authenticated HTTP requests
   datasets     Manage datasets
   eval         Run eval files
   sql          Run SQL queries against Braintrust
@@ -127,6 +129,8 @@ enum Commands {
     Setup(CLIArgs<setup::SetupArgs>),
     /// Manage workflow docs for coding agents
     Docs(CLIArgs<setup::DocsArgs>),
+    /// Send authenticated HTTP requests
+    Api(CLIArgs<api::ApiArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
     /// Authenticate bt with Braintrust
@@ -175,6 +179,7 @@ impl Commands {
             Commands::Init(cmd) => &cmd.base,
             Commands::Setup(cmd) => &cmd.base,
             Commands::Docs(cmd) => &cmd.base,
+            Commands::Api(cmd) => &cmd.base,
             Commands::Sql(cmd) => &cmd.base,
             Commands::Auth(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
@@ -202,6 +207,7 @@ impl Commands {
             Commands::Init(cmd) => &mut cmd.base,
             Commands::Setup(cmd) => &mut cmd.base,
             Commands::Docs(cmd) => &mut cmd.base,
+            Commands::Api(cmd) => &mut cmd.base,
             Commands::Sql(cmd) => &mut cmd.base,
             Commands::Auth(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
@@ -310,6 +316,7 @@ fn try_main() -> Result<()> {
             Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
+            Commands::Api(cmd) => api::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
             Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,
             Commands::Docs(cmd) => setup::run_docs_top(cmd.base, cmd.args).await?,
