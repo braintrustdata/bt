@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use clap::{Args, Subcommand};
+use clap::{builder::BoolishValueParser, Args, Subcommand};
 use std::path::PathBuf;
 
 use crate::{args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode};
@@ -7,6 +7,7 @@ use crate::{args::BaseArgs, project_context::resolve_project_command_context_wit
 pub(crate) mod api;
 mod btmap;
 mod config;
+mod explore;
 mod formatting;
 mod open;
 mod poke;
@@ -23,6 +24,10 @@ Examples:
   bt topics status
   bt topics status --full
   bt topics status --watch
+  bt topics facets --window 7d
+  bt topics classifications --facet Task --repo test-org/test-repo --sort cost
+  bt topics traces --facet Task --topic-id <topic-id> --repo test-org/test-repo --sort tokens
+  bt topics explore --repo test-org/test-repo
   bt topics config
   bt topics config <automation-or-topic-map-id>
   bt topics config enable
@@ -49,6 +54,15 @@ enum TopicsCommands {
     Status(StatusArgs),
     /// View or edit Topics automation config
     Config(Box<ConfigArgs>),
+    /// List active facets and topic maps for exploration
+    Facets(FacetsArgs),
+    /// List topic labels for a facet or topic map
+    #[command(visible_alias = "labels", alias = "classes")]
+    Classifications(ClassificationsArgs),
+    /// List traces matching a topic label
+    Traces(TopicTracesArgs),
+    /// Guided Topics exploration flow
+    Explore(ExploreArgs),
     /// Queue Topics to run on the next executor pass
     Poke,
     /// Rewind recent Topics history and queue it to reprocess
@@ -78,6 +92,172 @@ struct StatusArgs {
     /// Refresh every 2 seconds until interrupted
     #[arg(long)]
     watch: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ExploreTimeArgs {
+    /// Relative time window, for example 1h or 7d
+    #[arg(long, env = "BT_TOPICS_WINDOW", default_value = "7d")]
+    window: String,
+
+    /// Absolute lower bound timestamp (overrides --window)
+    #[arg(long, env = "BT_TOPICS_SINCE")]
+    since: Option<String>,
+
+    /// Additional BTQL filter expression
+    #[arg(long, env = "BT_TOPICS_FILTER")]
+    filter: Option<String>,
+
+    /// Git repository origin filter, for example owner/repo or github.com/owner/repo
+    #[arg(long, env = "BT_TOPICS_REPO", value_name = "REPO")]
+    repo: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ExploreSelectionArgs {
+    /// Specific automation ID to search within
+    #[arg(long = "automation-id", env = "BT_TOPICS_AUTOMATION_ID")]
+    automation_id: Option<String>,
+
+    /// Source facet name, for example Task
+    #[arg(long, env = "BT_TOPICS_FACET")]
+    facet: Option<String>,
+
+    /// Topic map name or function ID
+    #[arg(long = "topic-map", env = "BT_TOPICS_TOPIC_MAP")]
+    topic_map: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ExploreOutputArgs {
+    /// Print each BTQL query before execution
+    #[arg(
+        long = "print-queries",
+        env = "BT_TOPICS_PRINT_QUERIES",
+        value_parser = BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    print_queries: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ExploreSortLimitArgs {
+    /// Number of rows to fetch
+    #[arg(long, env = "BT_TOPICS_LIMIT", default_value_t = 50)]
+    limit: usize,
+
+    /// Sort topic labels by metric
+    #[arg(
+        long,
+        env = "BT_TOPICS_LABEL_SORT",
+        value_enum,
+        default_value = "count"
+    )]
+    sort: api::TopicExploreSort,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TraceSortLimitArgs {
+    /// Number of rows to fetch
+    #[arg(long, env = "BT_TOPICS_LIMIT", default_value_t = 50)]
+    limit: usize,
+
+    /// Sort trace rows by metric
+    #[arg(
+        long,
+        env = "BT_TOPICS_TRACE_SORT",
+        value_enum,
+        default_value = "recent"
+    )]
+    sort: api::TopicTraceSort,
+}
+
+#[derive(Debug, Clone, Args)]
+struct FacetsArgs {
+    /// Specific automation ID to search within
+    #[arg(long = "automation-id", env = "BT_TOPICS_AUTOMATION_ID")]
+    automation_id: Option<String>,
+
+    #[command(flatten)]
+    time: ExploreTimeArgs,
+
+    #[command(flatten)]
+    output: ExploreOutputArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ClassificationsArgs {
+    #[command(flatten)]
+    selection: ExploreSelectionArgs,
+
+    #[command(flatten)]
+    sort_limit: ExploreSortLimitArgs,
+
+    #[command(flatten)]
+    time: ExploreTimeArgs,
+
+    #[command(flatten)]
+    output: ExploreOutputArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TopicSelectorArgs {
+    /// Topic label to match
+    #[arg(long, env = "BT_TOPICS_TOPIC", conflicts_with = "topic_id")]
+    topic: Option<String>,
+
+    /// Stable topic ID to match
+    #[arg(
+        long = "topic-id",
+        env = "BT_TOPICS_TOPIC_ID",
+        conflicts_with = "topic"
+    )]
+    topic_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct TopicTracesArgs {
+    #[command(flatten)]
+    selection: ExploreSelectionArgs,
+
+    #[command(flatten)]
+    topic: TopicSelectorArgs,
+
+    #[command(flatten)]
+    sort_limit: TraceSortLimitArgs,
+
+    /// Cursor returned from a previous trace page
+    #[arg(long, env = "BT_TOPICS_CURSOR")]
+    cursor: Option<String>,
+
+    #[command(flatten)]
+    time: ExploreTimeArgs,
+
+    #[command(flatten)]
+    output: ExploreOutputArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ExploreArgs {
+    #[command(flatten)]
+    selection: ExploreSelectionArgs,
+
+    #[command(flatten)]
+    sort_limit: ExploreSortLimitArgs,
+
+    /// Number of traces to fetch per page in the guided trace picker
+    #[arg(
+        long = "trace-page-size",
+        env = "BT_TOPICS_TRACE_PAGE_SIZE",
+        default_value_t = 10
+    )]
+    trace_page_size: usize,
+
+    #[command(flatten)]
+    time: ExploreTimeArgs,
+
+    #[command(flatten)]
+    output: ExploreOutputArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -366,7 +546,13 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
     }
 
     let read_only = match args.command.as_ref() {
-        None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
+        None
+        | Some(TopicsCommands::Status(_))
+        | Some(TopicsCommands::Facets(_))
+        | Some(TopicsCommands::Classifications(_))
+        | Some(TopicsCommands::Traces(_))
+        | Some(TopicsCommands::Explore(_))
+        | Some(TopicsCommands::Open) => true,
         Some(TopicsCommands::Config(config_args)) => match config_args.command.as_ref() {
             None => true,
             Some(ConfigCommands::TopicMap(topic_map_args)) => {
@@ -401,6 +587,18 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
         }
         Some(TopicsCommands::Status(status_args)) => {
             status::run(&ctx, status_args, base.json).await
+        }
+        Some(TopicsCommands::Facets(facets_args)) => {
+            explore::run_facets(&ctx, &facets_args, base.json).await
+        }
+        Some(TopicsCommands::Classifications(classifications_args)) => {
+            explore::run_classifications(&ctx, &classifications_args, base.json).await
+        }
+        Some(TopicsCommands::Traces(traces_args)) => {
+            explore::run_traces(&ctx, &traces_args, base.json).await
+        }
+        Some(TopicsCommands::Explore(explore_args)) => {
+            explore::run_explore(&ctx, &explore_args, base.json).await
         }
         Some(TopicsCommands::Config(config_args)) => {
             let parent_automation_id = config_args.automation_id;
@@ -518,7 +716,13 @@ mod tests {
 
     fn topics_command_is_read_only(command: Option<&TopicsCommands>) -> bool {
         match command {
-            None | Some(TopicsCommands::Status(_)) | Some(TopicsCommands::Open) => true,
+            None
+            | Some(TopicsCommands::Status(_))
+            | Some(TopicsCommands::Facets(_))
+            | Some(TopicsCommands::Classifications(_))
+            | Some(TopicsCommands::Traces(_))
+            | Some(TopicsCommands::Explore(_))
+            | Some(TopicsCommands::Open) => true,
             Some(TopicsCommands::Config(config_args)) => match config_args.command.as_ref() {
                 None => true,
                 Some(ConfigCommands::TopicMap(topic_map_args)) => {
@@ -564,6 +768,109 @@ mod tests {
 
         let parsed = parse(&["topics", "report", "fn_123"]).expect("parse");
         assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let parsed = parse(&["topics", "facets"]).expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let parsed = parse(&[
+            "topics",
+            "classifications",
+            "--facet",
+            "Task",
+            "--sort",
+            "cost",
+        ])
+        .expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let parsed = parse(&[
+            "topics",
+            "traces",
+            "--topic-map",
+            "fn_test_topic_map",
+            "--topic-id",
+            "topic-test",
+        ])
+        .expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+
+        let parsed = parse(&["topics", "explore"]).expect("parse");
+        assert!(topics_command_is_read_only(parsed.command.as_ref()));
+    }
+
+    #[test]
+    fn topics_explore_commands_parse_flags_and_aliases() {
+        let parsed = parse(&["topics", "facets"]).expect("parse");
+        let Some(TopicsCommands::Facets(args)) = parsed.command.as_ref() else {
+            panic!("expected facets command");
+        };
+        assert_eq!(args.time.window, "7d");
+
+        let parsed = parse(&[
+            "topics",
+            "labels",
+            "--automation-id",
+            "auto_test_topics",
+            "--facet",
+            "Task",
+            "--limit",
+            "25",
+            "--window",
+            "6h",
+            "--repo",
+            "test-org/test-repo",
+            "--filter",
+            "metadata.environment = 'test'",
+            "--print-queries",
+        ])
+        .expect("parse");
+
+        let Some(TopicsCommands::Classifications(args)) = parsed.command.as_ref() else {
+            panic!("expected classifications command");
+        };
+        assert_eq!(
+            args.selection.automation_id.as_deref(),
+            Some("auto_test_topics")
+        );
+        assert_eq!(args.selection.facet.as_deref(), Some("Task"));
+        assert_eq!(args.sort_limit.limit, 25);
+        assert_eq!(args.time.window, "6h");
+        assert_eq!(
+            args.time.filter.as_deref(),
+            Some("metadata.environment = 'test'")
+        );
+        assert_eq!(args.time.repo.as_deref(), Some("test-org/test-repo"));
+        assert!(args.output.print_queries);
+
+        let parsed = parse(&[
+            "topics",
+            "traces",
+            "--topic-map",
+            "fn_test_topic_map",
+            "--topic",
+            "Support",
+            "--sort",
+            "tokens",
+            "--cursor",
+            "cursor-test",
+        ])
+        .expect("parse");
+        let Some(TopicsCommands::Traces(args)) = parsed.command.as_ref() else {
+            panic!("expected traces command");
+        };
+        assert_eq!(
+            args.selection.topic_map.as_deref(),
+            Some("fn_test_topic_map")
+        );
+        assert_eq!(args.topic.topic.as_deref(), Some("Support"));
+        assert_eq!(args.sort_limit.sort, api::TopicTraceSort::Tokens);
+        assert_eq!(args.cursor.as_deref(), Some("cursor-test"));
+
+        let parsed = parse(&["topics", "explore", "--trace-page-size", "15"]).expect("parse");
+        let Some(TopicsCommands::Explore(args)) = parsed.command.as_ref() else {
+            panic!("expected explore command");
+        };
+        assert_eq!(args.trace_page_size, 15);
     }
 
     #[test]

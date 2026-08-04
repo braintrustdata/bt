@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +20,10 @@ const DEFAULT_TOPIC_IDLE_SECONDS: i64 = 10 * 60;
 const DEFAULT_TOPIC_SAMPLING_RATE: f64 = 1.0;
 const DEFAULT_TOPIC_EMBEDDING_MODEL: &str = "brain-embedding-1";
 const MAX_STATUS_PROGRESS_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+const ORG_USERS_PAGE_LIMIT: usize = 1000;
+const TOPIC_REPO_ROOT_SPAN_PAGE_LIMIT: usize = 1000;
+const TOPIC_REPO_ROOT_SPAN_MAX_IDS: usize = 5000;
+const TOPIC_TRACE_CURSOR_PREFIX: &str = "bt-topic-traces-v1:";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicsStatusReport {
@@ -54,6 +59,234 @@ pub struct TopicsDeleteReport {
 pub struct TopicMapConfigUpdate {
     pub automation: TopicAutomationConfig,
     pub topic_map_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicExploreSort {
+    Count,
+    Tokens,
+    Cost,
+    AvgTokens,
+    AvgCost,
+    Recent,
+}
+
+impl Default for TopicExploreSort {
+    fn default() -> Self {
+        Self::Count
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicTraceSort {
+    Recent,
+    Tokens,
+    Cost,
+}
+
+impl Default for TopicTraceSort {
+    fn default() -> Self {
+        Self::Recent
+    }
+}
+
+impl From<TopicTraceSort> for TopicExploreSort {
+    fn from(sort: TopicTraceSort) -> Self {
+        match sort {
+            TopicTraceSort::Recent => Self::Recent,
+            TopicTraceSort::Tokens => Self::Tokens,
+            TopicTraceSort::Cost => Self::Cost,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicsExploreFacetsReport {
+    pub project: TopicsProjectSummary,
+    pub facets: Vec<TopicExploreFacet>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicClassificationsReport {
+    pub project: TopicsProjectSummary,
+    pub topic_map: TopicExploreTopicMap,
+    pub classifications: Vec<TopicClassificationRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicTracesReport {
+    pub project: TopicsProjectSummary,
+    pub topic_map: TopicExploreTopicMap,
+    pub topic: TopicTraceSelection,
+    pub traces: Vec<TopicTraceRow>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicExploreFacet {
+    pub automation_id: String,
+    pub automation_name: String,
+    pub facet: Option<String>,
+    pub topic_map: String,
+    pub topic_map_id: String,
+    pub version: Option<String>,
+    pub eligible: usize,
+    pub labeled: usize,
+    pub processing: usize,
+    pub errors: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicExploreTopicMap {
+    pub automation_id: String,
+    pub automation_name: String,
+    pub facet: Option<String>,
+    pub topic_map: String,
+    pub topic_map_id: String,
+    pub version: Option<String>,
+    pub classification_path: String,
+    pub btql_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicClassificationRow {
+    pub topic: String,
+    pub topic_id: String,
+    pub traces: usize,
+    pub tokens: f64,
+    pub cost: f64,
+    pub avg_tokens: f64,
+    pub avg_cost: f64,
+    pub latest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicTraceSelection {
+    pub topic: Option<String>,
+    pub topic_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicTraceRow {
+    pub created: Option<String>,
+    pub root_span_id: String,
+    pub span_id: Option<String>,
+    pub row_id: Option<String>,
+    pub created_by_user_id: Option<String>,
+    pub created_by_user_name: Option<String>,
+    pub created_by_user_email: Option<String>,
+    pub git_origin_url: Option<String>,
+    pub repo: Option<String>,
+    pub topic: Option<String>,
+    pub topic_id: Option<String>,
+    pub tokens: f64,
+    pub cost: f64,
+    pub duration_seconds: Option<f64>,
+    pub input: Option<String>,
+    pub app_url: String,
+    #[serde(skip_serializing)]
+    pagination_key: Option<String>,
+    #[serde(skip_serializing)]
+    sort_value: Option<TopicTraceCursorValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TopicTracePaginationCursor {
+    version: u8,
+    sort: TopicExploreSort,
+    sort_value: TopicTraceCursorValue,
+    pagination_key: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum TopicTraceCursorValue {
+    Number(f64),
+    String(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OrgUser {
+    id: String,
+    #[serde(default)]
+    given_name: Option<String>,
+    #[serde(default)]
+    family_name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrgUsersListResponse {
+    objects: Vec<OrgUser>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct OrgUsersCache {
+    users_by_id: Option<HashMap<String, OrgUser>>,
+}
+
+impl OrgUser {
+    fn display_name(&self) -> Option<String> {
+        let given = self.given_name.as_deref().unwrap_or_default().trim();
+        let family = self.family_name.as_deref().unwrap_or_default().trim();
+        let name = match (given.is_empty(), family.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(given.to_string()),
+            (true, false) => Some(family.to_string()),
+            (false, false) => Some(format!("{given} {family}")),
+        };
+        name.or_else(|| {
+            self.email
+                .as_deref()
+                .map(str::trim)
+                .filter(|email| !email.is_empty())
+                .map(ToString::to_string)
+        })
+    }
+}
+
+impl OrgUsersCache {
+    async fn hydrate_trace_users(
+        &mut self,
+        client: &ApiClient,
+        traces: &mut [TopicTraceRow],
+    ) -> Result<()> {
+        let user_ids = traces
+            .iter()
+            .filter_map(|trace| trace.created_by_user_id.as_deref())
+            .collect::<HashSet<_>>();
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        let users = self.users_by_id(client).await?;
+        for trace in traces {
+            let Some(user_id) = trace.created_by_user_id.as_deref() else {
+                continue;
+            };
+            let Some(user) = users.get(user_id) else {
+                continue;
+            };
+            trace.created_by_user_name = user.display_name();
+            trace.created_by_user_email = user.email.clone();
+        }
+
+        Ok(())
+    }
+
+    async fn users_by_id(&mut self, client: &ApiClient) -> Result<&HashMap<String, OrgUser>> {
+        if self.users_by_id.is_none() {
+            self.users_by_id = Some(fetch_org_users(client).await?);
+        }
+
+        Ok(self
+            .users_by_id
+            .as_ref()
+            .expect("org users cache initialized"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -396,6 +629,283 @@ pub async fn fetch_topics_status(
             topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
         },
         automations,
+    })
+}
+
+pub async fn topic_explore_filter_clause(
+    ctx: &ProjectContext,
+    since: Option<&str>,
+    window: &str,
+    extra_filter: Option<&str>,
+    repo: Option<&str>,
+    print_queries: bool,
+) -> Result<String> {
+    let time_clause = topic_explore_time_filter_clause(since, window)?;
+    let repo_filter =
+        topic_repo_root_span_filter_clause(ctx, repo, &time_clause, print_queries).await?;
+
+    Ok(combine_filter_clauses([
+        Some(time_clause),
+        repo_filter,
+        extra_filter
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+    ]))
+}
+
+fn topic_explore_time_filter_clause(since: Option<&str>, window: &str) -> Result<String> {
+    Ok(
+        if let Some(ts) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            format!("created >= {}", btql_string_literal(ts))
+        } else {
+            let seconds = crate::utils::parse_duration_to_seconds(window)?;
+            if seconds == 0 {
+                bail!("--window must be greater than zero");
+            }
+            format!("created >= NOW() - INTERVAL {seconds} SECOND")
+        },
+    )
+}
+
+pub async fn fetch_topics_explore_facets(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+    base_filter_clause: &str,
+    print_queries: bool,
+) -> Result<TopicsExploreFacetsReport> {
+    let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    let rows = filter_or_resolve_topic_automation_rows(rows, automation_id)?;
+    let mut function_cache = HashMap::new();
+    let mut facets = Vec::new();
+
+    for row in &rows {
+        let config = row
+            .get("config")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let automation_id = stringish_value(row.get("id")).unwrap_or_default();
+        let automation_name = string_value(row.get("name")).unwrap_or_else(|| "Topics".to_string());
+        let automation_filter = combine_filter_clauses([
+            Some(base_filter_clause.to_string()),
+            string_value(config.get("btql_filter")),
+        ]);
+
+        let cursor = fetch_cursor_snapshot(&ctx.client, &ctx.project.id, &automation_id).await?;
+        let topic_bars = build_topic_status_bars(&ctx.client, &mut function_cache, &config).await?;
+        let facet_bars =
+            build_facet_status_bars(&ctx.client, &mut function_cache, &config, &topic_bars).await?;
+        let progress = fetch_topic_automation_progress(
+            &ctx.client,
+            &ctx.project.id,
+            &automation_filter,
+            &cursor,
+            &facet_bars,
+            &topic_bars,
+            print_queries,
+        )
+        .await?;
+        let topic_progress_by_name = progress
+            .topics
+            .into_iter()
+            .map(|item| (item.name.clone(), item))
+            .collect::<HashMap<_, _>>();
+        let topic_maps = summarize_topic_map_functions(
+            &ctx.client,
+            &mut function_cache,
+            config.get("topic_map_functions"),
+        )
+        .await?;
+
+        for topic_map in topic_maps {
+            let counts = topic_progress_by_name.get(&topic_map.name);
+            facets.push(TopicExploreFacet {
+                automation_id: automation_id.clone(),
+                automation_name: automation_name.clone(),
+                facet: topic_map.source_facet.clone(),
+                topic_map: topic_map.name.clone(),
+                topic_map_id: topic_map.id.clone().unwrap_or_default(),
+                version: topic_map.version.clone(),
+                eligible: counts.map(|item| item.matched_count).unwrap_or(0),
+                labeled: counts.map(|item| item.completed_count).unwrap_or(0),
+                processing: counts.map(|item| item.processing_count).unwrap_or(0),
+                errors: counts.map(|item| item.error_count).unwrap_or(0),
+            });
+        }
+    }
+
+    facets.sort_by(|left, right| {
+        left.facet
+            .cmp(&right.facet)
+            .then(left.topic_map.cmp(&right.topic_map))
+            .then(left.topic_map_id.cmp(&right.topic_map_id))
+    });
+
+    Ok(TopicsExploreFacetsReport {
+        project: topics_project_summary(ctx),
+        facets,
+    })
+}
+
+pub async fn fetch_topic_classifications(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+    facet: Option<&str>,
+    topic_map: Option<&str>,
+    sort: TopicExploreSort,
+    limit: usize,
+    base_filter_clause: &str,
+    print_queries: bool,
+) -> Result<TopicClassificationsReport> {
+    if limit == 0 {
+        bail!("--limit must be greater than 0");
+    }
+    let topic_map = resolve_topic_explore_topic_map(ctx, automation_id, facet, topic_map).await?;
+    let filter_clause = topic_map_filter_clause(&topic_map, base_filter_clause);
+    let query = build_topic_classifications_query(
+        &ctx.project.id,
+        &topic_map.topic_map,
+        &topic_map.topic_map_id,
+        &filter_clause,
+        sort,
+        limit,
+    );
+    maybe_print_topic_query(print_queries, "classifications", &query);
+    let response = execute_btql_value(&ctx.client, &query).await?;
+    let classifications = btql_data_rows(&response)
+        .into_iter()
+        .map(topic_classification_row_from_btql)
+        .collect();
+
+    Ok(TopicClassificationsReport {
+        project: topics_project_summary(ctx),
+        topic_map,
+        classifications,
+    })
+}
+
+pub async fn fetch_topic_traces(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+    facet: Option<&str>,
+    topic_map: Option<&str>,
+    topic: Option<&str>,
+    topic_id: Option<&str>,
+    sort: TopicExploreSort,
+    limit: usize,
+    cursor: Option<&str>,
+    base_filter_clause: &str,
+    print_queries: bool,
+) -> Result<TopicTracesReport> {
+    let mut users_cache = OrgUsersCache::default();
+    fetch_topic_traces_with_user_cache(
+        ctx,
+        automation_id,
+        facet,
+        topic_map,
+        topic,
+        topic_id,
+        sort,
+        limit,
+        cursor,
+        base_filter_clause,
+        print_queries,
+        &mut users_cache,
+    )
+    .await
+}
+
+pub(super) async fn fetch_topic_traces_with_user_cache(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+    facet: Option<&str>,
+    topic_map: Option<&str>,
+    topic: Option<&str>,
+    topic_id: Option<&str>,
+    sort: TopicExploreSort,
+    limit: usize,
+    cursor: Option<&str>,
+    base_filter_clause: &str,
+    print_queries: bool,
+    users_cache: &mut OrgUsersCache,
+) -> Result<TopicTracesReport> {
+    if limit == 0 {
+        bail!("--limit must be greater than 0");
+    }
+    if topic.is_none() && topic_id.is_none() {
+        bail!("topic label selection required; pass --topic-id or --topic after choosing a row from `bt topics classifications`");
+    }
+
+    let topic_map = resolve_topic_explore_topic_map(ctx, automation_id, facet, topic_map).await?;
+    let topic_cursor = parse_topic_trace_cursor(cursor, sort)?;
+    let backend_cursor = if topic_cursor.is_some() {
+        None
+    } else {
+        cursor.filter(|cursor| !cursor.trim().is_empty())
+    };
+    let mut filter_clause = topic_map_filter_clause(&topic_map, base_filter_clause);
+    filter_clause = combine_filter_clauses([
+        Some(filter_clause),
+        topic_filter_clause(&topic_map, topic, topic_id)?,
+        topic_cursor
+            .as_ref()
+            .map(|cursor| topic_trace_cursor_filter_clause(sort, cursor))
+            .transpose()?,
+    ]);
+    let fetch_limit = if backend_cursor.is_some() {
+        limit
+    } else {
+        limit.saturating_add(1)
+    };
+    let query = build_topic_traces_query(
+        &ctx.project.id,
+        &topic_map.topic_map,
+        &topic_map.topic_map_id,
+        &filter_clause,
+        sort,
+        fetch_limit,
+        backend_cursor,
+    );
+    maybe_print_topic_query(print_queries, "traces", &query);
+    let response = execute_btql_value(&ctx.client, &query).await?;
+    let returned_rows = btql_data_len(&response);
+    let project_url = app_project_url(
+        &ctx.app_url,
+        ctx.client.org_name(),
+        &ctx.project.name,
+        &["logs"],
+    );
+    let mut traces = btql_data_rows(&response)
+        .into_iter()
+        .map(|row| topic_trace_row_from_btql(row, &project_url))
+        .collect::<Vec<_>>();
+    let next_cursor = topic_trace_next_cursor(&traces, sort, limit)?
+        .or_else(|| next_cursor_if_full_page(btql_cursor(&response), returned_rows, limit));
+    if traces.len() > limit {
+        traces.truncate(limit);
+    }
+    if let Err(err) =
+        hydrate_trace_root_metadata(&ctx.client, &ctx.project.id, &mut traces, print_queries).await
+    {
+        eprintln!("warning: failed to resolve trace root metadata: {err}");
+    }
+    if let Err(err) = users_cache
+        .hydrate_trace_users(&ctx.client, &mut traces)
+        .await
+    {
+        eprintln!("warning: failed to resolve trace users: {err}");
+    }
+
+    Ok(TopicTracesReport {
+        project: topics_project_summary(ctx),
+        topic_map,
+        topic: TopicTraceSelection {
+            topic: topic.map(ToString::to_string),
+            topic_id: topic_id.map(ToString::to_string),
+        },
+        traces,
+        next_cursor,
     })
 }
 
@@ -1273,6 +1783,7 @@ async fn build_topic_automation_status(
                 &cursor,
                 &facet_bars,
                 &topic_bars,
+                false,
             )
             .await?;
             total_traces = progress.total_traces;
@@ -1835,6 +2346,959 @@ fn ensure_facet_bar(
     }
 }
 
+async fn resolve_topic_explore_topic_map(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+    facet: Option<&str>,
+    topic_map: Option<&str>,
+) -> Result<TopicExploreTopicMap> {
+    let topic_maps = list_topic_explore_topic_maps(ctx, automation_id).await?;
+    if topic_maps.is_empty() {
+        bail!("no configured topic maps found; run `bt topics config` to inspect Topics setup");
+    }
+
+    let matches = topic_maps
+        .into_iter()
+        .filter(|candidate| {
+            facet
+                .map(|facet| {
+                    candidate
+                        .facet
+                        .as_deref()
+                        .map(|candidate| selector_matches(candidate, facet))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true)
+        })
+        .filter(|candidate| {
+            topic_map
+                .map(|topic_map| {
+                    selector_matches(&candidate.topic_map, topic_map)
+                        || selector_matches(&candidate.topic_map_id, topic_map)
+                })
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.len() {
+        0 => bail!(
+            "topic map selection did not match any configured topic map; run `bt topics facets` to list available facets and topic maps"
+        ),
+        1 => Ok(matches.into_iter().next().expect("single topic map match")),
+        _ => {
+            let choices = matches
+                .iter()
+                .take(5)
+                .map(format_topic_map_choice)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if matches.len() > 5 { ", ..." } else { "" };
+            bail!(
+                "topic map selection matched multiple entries ({choices}{suffix}); re-run with --facet or --topic-map"
+            )
+        }
+    }
+}
+
+async fn list_topic_explore_topic_maps(
+    ctx: &ProjectContext,
+    automation_id: Option<&str>,
+) -> Result<Vec<TopicExploreTopicMap>> {
+    let rows = list_topic_automation_rows(&ctx.client, &ctx.project.id).await?;
+    let rows = filter_or_resolve_topic_automation_rows(rows, automation_id)?;
+    let mut function_cache = HashMap::new();
+    let mut topic_maps = Vec::new();
+
+    for row in &rows {
+        let automation =
+            build_topic_automation_config(&ctx.client, row, &mut function_cache).await?;
+        for topic_map in &automation.topic_map_functions {
+            let Some(topic_map_id) = topic_map.id.clone() else {
+                continue;
+            };
+            let combined_filter = combine_optional_filter_clauses([
+                automation.btql_filter.clone(),
+                topic_map.btql_filter.clone(),
+            ]);
+            topic_maps.push(TopicExploreTopicMap {
+                automation_id: automation.id.clone(),
+                automation_name: automation.name.clone(),
+                facet: topic_map.source_facet.clone(),
+                topic_map: topic_map.name.clone(),
+                topic_map_id,
+                version: topic_map.version.clone(),
+                classification_path: escape_btql_ident_path(&[
+                    "classifications",
+                    topic_map.name.as_str(),
+                ]),
+                btql_filter: combined_filter,
+            });
+        }
+    }
+
+    topic_maps.sort_by(|left, right| {
+        left.facet
+            .cmp(&right.facet)
+            .then(left.topic_map.cmp(&right.topic_map))
+            .then(left.topic_map_id.cmp(&right.topic_map_id))
+    });
+    Ok(topic_maps)
+}
+
+fn selector_matches(candidate: &str, selector: &str) -> bool {
+    candidate == selector || candidate.eq_ignore_ascii_case(selector)
+}
+
+fn format_topic_map_choice(topic_map: &TopicExploreTopicMap) -> String {
+    format!(
+        "{} / {} (topic map id: {}, automation: {} [{}])",
+        topic_map.facet.as_deref().unwrap_or("Ungrouped"),
+        topic_map.topic_map,
+        topic_map.topic_map_id,
+        topic_map.automation_name,
+        topic_map.automation_id
+    )
+}
+
+fn topic_map_filter_clause(topic_map: &TopicExploreTopicMap, base_filter_clause: &str) -> String {
+    let source_type_path = escape_btql_ident_path(&[
+        "classifications",
+        topic_map.topic_map.as_str(),
+        "source",
+        "type",
+    ]);
+    let source_id_path = escape_btql_ident_path(&[
+        "classifications",
+        topic_map.topic_map.as_str(),
+        "source",
+        "id",
+    ]);
+    combine_filter_clauses([
+        Some(base_filter_clause.to_string()),
+        topic_map.btql_filter.clone(),
+        Some(format!("{} IS NOT NULL", topic_map.classification_path)),
+        Some(format!("{source_type_path} = 'function'")),
+        Some(format!(
+            "{source_id_path} = {}",
+            btql_string_literal(&topic_map.topic_map_id)
+        )),
+    ])
+}
+
+fn topic_filter_clause(
+    topic_map: &TopicExploreTopicMap,
+    topic: Option<&str>,
+    topic_id: Option<&str>,
+) -> Result<Option<String>> {
+    match (topic, topic_id) {
+        (Some(_), Some(_)) => bail!("use either --topic-id or --topic, not both"),
+        (None, None) => Ok(None),
+        (None, Some(topic_id)) => {
+            let id_path =
+                escape_btql_ident_path(&["classifications", topic_map.topic_map.as_str(), "id"]);
+            Ok(Some(format!(
+                "{id_path} = {}",
+                btql_string_literal(topic_id)
+            )))
+        }
+        (Some(topic), None) => {
+            let id_path =
+                escape_btql_ident_path(&["classifications", topic_map.topic_map.as_str(), "id"]);
+            let label_path =
+                escape_btql_ident_path(&["classifications", topic_map.topic_map.as_str(), "label"]);
+            Ok(Some(format!(
+                "COALESCE({label_path}, {id_path}) = {}",
+                btql_string_literal(topic)
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoOrigin {
+    host: String,
+    owner_path: String,
+    repo: String,
+}
+
+impl RepoOrigin {
+    fn canonical_slug(&self) -> String {
+        format!("{}/{}/{}", self.host, self.owner_path, self.repo)
+    }
+}
+
+async fn topic_repo_root_span_filter_clause(
+    ctx: &ProjectContext,
+    repo: Option<&str>,
+    time_clause: &str,
+    print_queries: bool,
+) -> Result<Option<String>> {
+    let Some(raw) = repo.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let origin = parse_repo_origin_selector(raw)?;
+    let root_span_ids = fetch_topic_repo_root_span_ids(
+        &ctx.client,
+        &ctx.project.id,
+        time_clause,
+        &origin,
+        raw,
+        print_queries,
+    )
+    .await?;
+    Ok(Some(root_span_id_filter_clause(&root_span_ids)))
+}
+
+async fn fetch_topic_repo_root_span_ids(
+    client: &ApiClient,
+    project_id: &str,
+    time_clause: &str,
+    origin: &RepoOrigin,
+    raw: &str,
+    print_queries: bool,
+) -> Result<Vec<String>> {
+    let origin_filter = topic_repo_origin_filter_clause(origin, Some(raw));
+    let mut root_span_ids = BTreeSet::new();
+    let mut cursor = None::<String>;
+
+    loop {
+        if root_span_ids.len() >= TOPIC_REPO_ROOT_SPAN_MAX_IDS {
+            bail!(
+                "--repo matched at least {} traces; narrow the search with --window or --since before exploring",
+                TOPIC_REPO_ROOT_SPAN_MAX_IDS
+            );
+        }
+
+        let remaining = TOPIC_REPO_ROOT_SPAN_MAX_IDS - root_span_ids.len();
+        let limit = remaining.min(TOPIC_REPO_ROOT_SPAN_PAGE_LIMIT);
+        let query = build_topic_repo_root_spans_query(
+            project_id,
+            time_clause,
+            &origin_filter,
+            limit,
+            cursor.as_deref(),
+        );
+        maybe_print_topic_query(print_queries, "repo-roots", &query);
+        let response = execute_btql_value(client, &query).await?;
+        let returned_rows = btql_data_len(&response);
+        for row in btql_data_rows(&response) {
+            if let Some(root_span_id) = value_as_string(row.get("root_span_id"))
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                root_span_ids.insert(root_span_id);
+            }
+        }
+
+        let next_cursor = next_cursor_if_full_page(btql_cursor(&response), returned_rows, limit);
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(root_span_ids.into_iter().collect())
+}
+
+fn topic_repo_origin_filter_clause(origin: &RepoOrigin, raw: Option<&str>) -> String {
+    let mut variants = repo_origin_url_variants(origin);
+    if let Some(raw) = raw
+        .map(trim_repo_selector)
+        .filter(|value| !value.is_empty())
+    {
+        variants.insert(raw.to_string());
+    }
+    let values = variants
+        .into_iter()
+        .map(|value| btql_string_literal(&value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let path = escape_btql_ident_path(&["metadata", "git_origin_url"]);
+    format!("{path} IN [{values}]")
+}
+
+fn build_topic_repo_root_spans_query(
+    project_id: &str,
+    time_clause: &str,
+    origin_filter: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> String {
+    let cursor_clause = cursor
+        .filter(|cursor| !cursor.trim().is_empty())
+        .map(|cursor| format!(" | cursor: {}", btql_json_string_literal(cursor)))
+        .unwrap_or_default();
+    format!(
+        "select: root_span_id, metadata.git_origin_url as git_origin_url | from: project_logs({}) spans | filter: ({time_clause}) AND (span_id = root_span_id) AND ({origin_filter}) | preview_length: 1 | sort: created DESC | limit: {limit}{cursor_clause}",
+        btql_string_literal(project_id),
+    )
+}
+
+fn repo_origin_url_variants(origin: &RepoOrigin) -> BTreeSet<String> {
+    let mut variants = BTreeSet::new();
+    for owner_repo_path in repo_owner_repo_path_variants(origin) {
+        variants.insert(format!("{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("{}/{}", origin.host, owner_repo_path));
+        variants.insert(format!("{}.git", owner_repo_path));
+        variants.insert(owner_repo_path.clone());
+        variants.insert(format!("https://{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("https://{}/{}", origin.host, owner_repo_path));
+        variants.insert(format!("http://{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("http://{}/{}", origin.host, owner_repo_path));
+        variants.insert(format!("git@{}:{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("git@{}:{}", origin.host, owner_repo_path));
+        variants.insert(format!("ssh://git@{}/{}.git", origin.host, owner_repo_path));
+        variants.insert(format!("ssh://git@{}/{}", origin.host, owner_repo_path));
+    }
+    variants
+}
+
+fn repo_owner_repo_path_variants(origin: &RepoOrigin) -> BTreeSet<String> {
+    let mut variants = BTreeSet::new();
+    variants.insert(format!("{}/{}", origin.owner_path, origin.repo));
+    let lower = format!(
+        "{}/{}",
+        origin.owner_path.to_ascii_lowercase(),
+        origin.repo.to_ascii_lowercase()
+    );
+    variants.insert(lower);
+    variants
+}
+
+fn repo_slug_from_origin_url(value: &str) -> Option<String> {
+    parse_repo_origin_selector(value)
+        .ok()
+        .map(|origin| origin.canonical_slug())
+}
+
+fn parse_repo_origin_selector(value: &str) -> Result<RepoOrigin> {
+    let value = trim_repo_selector(value);
+    if value.is_empty() {
+        bail!("--repo cannot be empty");
+    }
+
+    if let Some(rest) = value.strip_prefix("git@") {
+        let Some((host, path)) = rest.split_once(':') else {
+            bail!("invalid --repo git origin; expected git@host:owner/repo");
+        };
+        return repo_origin_from_host_path(host, path);
+    }
+
+    if let Some((_, rest)) = value.split_once("://") {
+        let rest = rest.trim_start_matches('/');
+        let rest = rest
+            .rsplit_once('@')
+            .map(|(_, without_credentials)| without_credentials)
+            .unwrap_or(rest);
+        let Some((authority, path)) = rest.split_once('/') else {
+            bail!("invalid --repo URL; expected host/owner/repo");
+        };
+        return repo_origin_from_host_path(authority, path);
+    }
+
+    if let Some((host, path)) = value.split_once(':') {
+        if host.contains('.') {
+            return repo_origin_from_host_path(host, path);
+        }
+    }
+
+    let parts = repo_path_parts(value);
+    match parts.len() {
+        2 => repo_origin_from_parts("github.com", &parts),
+        3.. => repo_origin_from_parts(parts[0], &parts[1..]),
+        _ => bail!("invalid --repo; use owner/repo, host/owner/repo, or a full git origin URL"),
+    }
+}
+
+fn trim_repo_selector(value: &str) -> &str {
+    value
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/')
+}
+
+fn repo_origin_from_host_path(host: &str, path: &str) -> Result<RepoOrigin> {
+    let host = host.split(':').next().unwrap_or(host);
+    let parts = repo_path_parts(path);
+    repo_origin_from_parts(host, &parts)
+}
+
+fn repo_path_parts(value: &str) -> Vec<&str> {
+    value
+        .trim_matches('/')
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn repo_origin_from_parts(host: &str, parts: &[&str]) -> Result<RepoOrigin> {
+    let host = host.trim().trim_end_matches('/').to_ascii_lowercase();
+    if host.is_empty() {
+        bail!("invalid --repo; repository host cannot be empty");
+    }
+    if parts.len() < 2 {
+        bail!("invalid --repo; expected owner/repo after the host");
+    }
+    let owner_path = parts[..parts.len() - 1].join("/");
+    let repo = parts[parts.len() - 1]
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(parts[parts.len() - 1])
+        .to_string();
+    if owner_path.trim().is_empty() || repo.trim().is_empty() {
+        bail!("invalid --repo; expected owner/repo after the host");
+    }
+
+    Ok(RepoOrigin {
+        host,
+        owner_path,
+        repo,
+    })
+}
+
+fn build_topic_classifications_query(
+    project_id: &str,
+    topic_map_name: &str,
+    _topic_map_id: &str,
+    filter_clause: &str,
+    sort: TopicExploreSort,
+    limit: usize,
+) -> String {
+    let topic_id_path = escape_btql_ident_path(&["classifications", topic_map_name, "id"]);
+    let topic_label_path = escape_btql_ident_path(&["classifications", topic_map_name, "label"]);
+    let topic_expr = format!("COALESCE({topic_label_path}, {topic_id_path})");
+    format!(
+        "from: project_logs({}) summary | dimensions: {topic_id_path} as topic_id, {topic_expr} as topic | measures: count_distinct(root_span_id) as traces, sum({}) as tokens, sum({}) as cost, avg({}) as avg_tokens, avg({}) as avg_cost, max(created) as latest | filter: {filter_clause} | sort: {} DESC | limit: {limit}",
+        btql_string_literal(project_id),
+        topic_tokens_expr(),
+        topic_cost_expr(),
+        topic_tokens_expr(),
+        topic_cost_expr(),
+        classification_sort_alias(sort),
+    )
+}
+
+fn build_topic_traces_query(
+    project_id: &str,
+    topic_map_name: &str,
+    _topic_map_id: &str,
+    filter_clause: &str,
+    sort: TopicExploreSort,
+    limit: usize,
+    cursor: Option<&str>,
+) -> String {
+    let topic_id_path = escape_btql_ident_path(&["classifications", topic_map_name, "id"]);
+    let topic_label_path = escape_btql_ident_path(&["classifications", topic_map_name, "label"]);
+    let topic_expr = format!("COALESCE({topic_label_path}, {topic_id_path})");
+    let sort_expr = trace_sort_expr(sort);
+    let cursor_clause = cursor
+        .filter(|cursor| !cursor.trim().is_empty())
+        .map(|cursor| format!(" | cursor: {}", btql_json_string_literal(cursor)))
+        .unwrap_or_default();
+    format!(
+        "select: created, root_span_id, span_id, id, _pagination_key, span_attributes.created_by_user_id as created_by_user_id, metadata.git_origin_url as git_origin_url, {topic_id_path} as topic_id, {topic_expr} as topic, {sort_expr} as sort_value, metrics, input | from: project_logs({}) summary | filter: {filter_clause} | preview_length: 125 | sort: {sort_expr} DESC, _pagination_key DESC | limit: {limit}{cursor_clause}",
+        btql_string_literal(project_id),
+    )
+}
+
+fn build_topic_trace_root_metadata_query(project_id: &str, root_span_ids: &[String]) -> String {
+    let root_filter = root_span_id_filter_clause(root_span_ids);
+    format!(
+        "select: root_span_id, span_attributes.created_by_user_id as created_by_user_id, metadata.git_origin_url as git_origin_url | from: project_logs({}) spans | filter: ({root_filter}) AND (span_id = root_span_id) | preview_length: 1 | limit: {}",
+        btql_string_literal(project_id),
+        root_span_ids.len().max(1),
+    )
+}
+
+fn root_span_id_filter_clause(root_span_ids: &[String]) -> String {
+    match root_span_ids {
+        [] => "root_span_id = ''".to_string(),
+        [single] => format!("root_span_id = {}", btql_string_literal(single)),
+        _ => {
+            let ids = root_span_ids
+                .iter()
+                .map(|root_span_id| btql_string_literal(root_span_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("root_span_id IN [{ids}]")
+        }
+    }
+}
+
+fn classification_sort_alias(sort: TopicExploreSort) -> &'static str {
+    match sort {
+        TopicExploreSort::Count => "traces",
+        TopicExploreSort::Tokens => "tokens",
+        TopicExploreSort::Cost => "cost",
+        TopicExploreSort::AvgTokens => "avg_tokens",
+        TopicExploreSort::AvgCost => "avg_cost",
+        TopicExploreSort::Recent => "latest",
+    }
+}
+
+fn normalize_trace_sort(sort: TopicExploreSort) -> TopicExploreSort {
+    match sort {
+        TopicExploreSort::AvgTokens => TopicExploreSort::Tokens,
+        TopicExploreSort::AvgCost => TopicExploreSort::Cost,
+        _ => sort,
+    }
+}
+
+fn trace_sort_expr(sort: TopicExploreSort) -> &'static str {
+    let sort = normalize_trace_sort(sort);
+    match sort {
+        TopicExploreSort::Tokens => topic_tokens_expr(),
+        TopicExploreSort::Cost => topic_cost_expr(),
+        TopicExploreSort::Count | TopicExploreSort::Recent => "created",
+        TopicExploreSort::AvgTokens | TopicExploreSort::AvgCost => {
+            unreachable!("normalized above")
+        }
+    }
+}
+
+fn topic_explore_sort_name(sort: TopicExploreSort) -> &'static str {
+    match sort {
+        TopicExploreSort::Count => "count",
+        TopicExploreSort::Tokens => "tokens",
+        TopicExploreSort::Cost => "cost",
+        TopicExploreSort::AvgTokens => "avg-tokens",
+        TopicExploreSort::AvgCost => "avg-cost",
+        TopicExploreSort::Recent => "recent",
+    }
+}
+
+fn topic_tokens_expr() -> &'static str {
+    "COALESCE(metrics.total_tokens, metrics.tokens, metrics.prompt_tokens + metrics.completion_tokens, metrics.input_tokens + metrics.output_tokens, 0)"
+}
+
+fn topic_cost_expr() -> &'static str {
+    "COALESCE(metrics.estimated_cost, metrics.cost, 0)"
+}
+
+fn topics_project_summary(ctx: &ProjectContext) -> TopicsProjectSummary {
+    TopicsProjectSummary {
+        id: ctx.project.id.clone(),
+        name: ctx.project.name.clone(),
+        org_name: ctx.client.org_name().to_string(),
+        topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+    }
+}
+
+fn btql_data_rows(response: &Value) -> Vec<&serde_json::Map<String, Value>> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .collect()
+}
+
+fn btql_data_len(response: &Value) -> usize {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn btql_cursor(response: &Value) -> Option<String> {
+    value_as_string(response.get("cursor")).filter(|cursor| !cursor.is_empty())
+}
+
+fn next_cursor_if_full_page(
+    cursor: Option<String>,
+    returned_rows: usize,
+    requested_limit: usize,
+) -> Option<String> {
+    cursor.filter(|_| requested_limit > 0 && returned_rows >= requested_limit)
+}
+
+fn topic_classification_row_from_btql(
+    row: &serde_json::Map<String, Value>,
+) -> TopicClassificationRow {
+    TopicClassificationRow {
+        topic: value_as_string(row.get("topic")).unwrap_or_else(|| "<unknown>".to_string()),
+        topic_id: value_as_string(row.get("topic_id")).unwrap_or_default(),
+        traces: read_btql_count_metric(Some(row), "traces"),
+        tokens: read_btql_f64_metric(row, "tokens"),
+        cost: read_btql_f64_metric(row, "cost"),
+        avg_tokens: read_btql_f64_metric(row, "avg_tokens"),
+        avg_cost: read_btql_f64_metric(row, "avg_cost"),
+        latest: value_as_string(row.get("latest")),
+    }
+}
+
+fn topic_trace_row_from_btql(
+    row: &serde_json::Map<String, Value>,
+    project_url: &str,
+) -> TopicTraceRow {
+    let root_span_id = value_as_string(row.get("root_span_id")).unwrap_or_default();
+    let span_id = value_as_string(row.get("span_id")).filter(|value| !value.is_empty());
+    let mut app_url = format!("{project_url}?r={}", encode(&root_span_id));
+    if let Some(span_id) = span_id.as_deref() {
+        app_url.push_str("&s=");
+        app_url.push_str(&encode(span_id));
+    }
+    let git_origin_url = trace_git_origin_url(row);
+    let repo = git_origin_url
+        .as_deref()
+        .and_then(repo_slug_from_origin_url);
+
+    TopicTraceRow {
+        created: value_as_string(row.get("created")),
+        root_span_id,
+        span_id,
+        row_id: value_as_string(row.get("id")),
+        created_by_user_id: trace_created_by_user_id(row),
+        created_by_user_name: None,
+        created_by_user_email: None,
+        git_origin_url,
+        repo,
+        topic: value_as_string(row.get("topic")),
+        topic_id: value_as_string(row.get("topic_id")),
+        tokens: metrics_total_tokens(row.get("metrics")).unwrap_or(0.0),
+        cost: metrics_cost(row.get("metrics")).unwrap_or(0.0),
+        duration_seconds: metrics_duration_seconds(row.get("metrics")),
+        input: row.get("input").map(format_preview_value),
+        app_url,
+        pagination_key: value_as_string(row.get("_pagination_key")),
+        sort_value: topic_trace_cursor_value_from_btql(row.get("sort_value")),
+    }
+}
+
+fn topic_trace_cursor_value_from_btql(value: Option<&Value>) -> Option<TopicTraceCursorValue> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(TopicTraceCursorValue::Number),
+        Some(Value::String(value)) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(TopicTraceCursorValue::Number)
+            .or_else(|| Some(TopicTraceCursorValue::String(value.clone()))),
+        Some(Value::Bool(value)) => Some(TopicTraceCursorValue::String(value.to_string())),
+        _ => None,
+    }
+}
+
+fn topic_trace_next_cursor(
+    traces: &[TopicTraceRow],
+    sort: TopicExploreSort,
+    requested_limit: usize,
+) -> Result<Option<String>> {
+    if requested_limit == 0 || traces.len() <= requested_limit {
+        return Ok(None);
+    }
+
+    let Some(last_visible) = traces.get(requested_limit.saturating_sub(1)) else {
+        return Ok(None);
+    };
+    let Some(sort_value) = last_visible.sort_value.clone() else {
+        return Ok(None);
+    };
+    let Some(pagination_key) = last_visible
+        .pagination_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    encode_topic_trace_cursor(&TopicTracePaginationCursor {
+        version: 1,
+        sort,
+        sort_value,
+        pagination_key: pagination_key.to_string(),
+    })
+    .map(Some)
+}
+
+fn encode_topic_trace_cursor(cursor: &TopicTracePaginationCursor) -> Result<String> {
+    let payload = serde_json::to_vec(cursor)?;
+    Ok(format!(
+        "{TOPIC_TRACE_CURSOR_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(payload)
+    ))
+}
+
+fn parse_topic_trace_cursor(
+    cursor: Option<&str>,
+    expected_sort: TopicExploreSort,
+) -> Result<Option<TopicTracePaginationCursor>> {
+    let Some(cursor) = cursor.map(str::trim).filter(|cursor| !cursor.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(encoded) = cursor.strip_prefix(TOPIC_TRACE_CURSOR_PREFIX) else {
+        return Ok(None);
+    };
+
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("failed to decode topics trace cursor")?;
+    let decoded: TopicTracePaginationCursor =
+        serde_json::from_slice(&payload).context("failed to parse topics trace cursor")?;
+    if decoded.version != 1 {
+        bail!(
+            "unsupported topics trace cursor version {}",
+            decoded.version
+        );
+    }
+    if decoded.sort != expected_sort {
+        bail!(
+            "cursor was created with --sort {}; this request uses --sort {}",
+            topic_explore_sort_name(decoded.sort),
+            topic_explore_sort_name(expected_sort)
+        );
+    }
+    if decoded.pagination_key.trim().is_empty() {
+        bail!("topics trace cursor is missing its pagination key");
+    }
+
+    Ok(Some(decoded))
+}
+
+fn topic_trace_cursor_filter_clause(
+    sort: TopicExploreSort,
+    cursor: &TopicTracePaginationCursor,
+) -> Result<String> {
+    let sort_expr = trace_sort_expr(sort);
+    let pagination_key = btql_string_literal(&cursor.pagination_key);
+    let sort_value = match &cursor.sort_value {
+        TopicTraceCursorValue::Number(value) => {
+            if !value.is_finite() {
+                bail!("topics trace cursor has a non-finite sort value");
+            }
+            value.to_string()
+        }
+        TopicTraceCursorValue::String(value) => btql_string_literal(value),
+    };
+
+    Ok(format!(
+        "({sort_expr} < {sort_value}) OR (({sort_expr} = {sort_value}) AND (_pagination_key < {pagination_key}))"
+    ))
+}
+
+fn trace_created_by_user_id(row: &serde_json::Map<String, Value>) -> Option<String> {
+    value_as_string(row.get("created_by_user_id"))
+        .or_else(|| value_as_string(row.get("span_attributes.created_by_user_id")))
+        .or_else(|| nested_value_as_string(row, &["span_attributes", "created_by_user_id"]))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn trace_git_origin_url(row: &serde_json::Map<String, Value>) -> Option<String> {
+    value_as_string(row.get("git_origin_url"))
+        .or_else(|| value_as_string(row.get("metadata.git_origin_url")))
+        .or_else(|| nested_value_as_string(row, &["metadata", "git_origin_url"]))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn hydrate_trace_root_metadata(
+    client: &ApiClient,
+    project_id: &str,
+    traces: &mut [TopicTraceRow],
+    print_queries: bool,
+) -> Result<()> {
+    let root_span_ids = traces
+        .iter()
+        .filter(|trace| trace.created_by_user_id.is_none() || trace.git_origin_url.is_none())
+        .filter_map(|trace| {
+            let root_span_id = trace.root_span_id.trim();
+            (!root_span_id.is_empty()).then(|| root_span_id.to_string())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if root_span_ids.is_empty() {
+        return Ok(());
+    }
+
+    let query = build_topic_trace_root_metadata_query(project_id, &root_span_ids);
+    maybe_print_topic_query(print_queries, "trace-root-metadata", &query);
+    let response = execute_btql_value(client, &query).await?;
+    let metadata_by_root_span_id = btql_data_rows(&response)
+        .into_iter()
+        .filter_map(|row| {
+            let root_span_id = value_as_string(row.get("root_span_id"))?;
+            Some((
+                root_span_id,
+                (trace_created_by_user_id(row), trace_git_origin_url(row)),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for trace in traces {
+        if let Some((user_id, git_origin_url)) = metadata_by_root_span_id.get(&trace.root_span_id) {
+            if trace.created_by_user_id.is_none() {
+                trace.created_by_user_id = user_id.clone();
+            }
+            if trace.git_origin_url.is_none() {
+                trace.git_origin_url = git_origin_url.clone();
+                trace.repo = trace
+                    .git_origin_url
+                    .as_deref()
+                    .and_then(repo_slug_from_origin_url);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_org_users(client: &ApiClient) -> Result<HashMap<String, OrgUser>> {
+    let mut users = HashMap::new();
+    let mut starting_after = None::<String>;
+
+    loop {
+        let mut path = format!(
+            "/v1/user?org_name={}&limit={ORG_USERS_PAGE_LIMIT}",
+            encode(client.org_name())
+        );
+        if let Some(cursor) = starting_after.as_deref() {
+            path.push_str("&starting_after=");
+            path.push_str(&encode(cursor));
+        }
+
+        let response: OrgUsersListResponse = client.get(&path).await?;
+        let objects = response.objects;
+        let page_len = objects.len();
+        let next_cursor = objects.last().map(|user| user.id.clone());
+        for user in objects {
+            users.insert(user.id.clone(), user);
+        }
+
+        if page_len < ORG_USERS_PAGE_LIMIT {
+            break;
+        }
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if starting_after.as_deref() == Some(next_cursor.as_str()) {
+            break;
+        }
+        starting_after = Some(next_cursor);
+    }
+
+    Ok(users)
+}
+
+fn read_btql_f64_metric(row: &serde_json::Map<String, Value>, alias: &str) -> f64 {
+    value_as_f64(row.get(alias)).unwrap_or(0.0)
+}
+
+fn metrics_total_tokens(metrics: Option<&Value>) -> Option<f64> {
+    let metrics = metrics?.as_object()?;
+    value_as_f64(metrics.get("total_tokens"))
+        .or_else(|| value_as_f64(metrics.get("tokens")))
+        .or_else(|| {
+            let prompt = value_as_f64(metrics.get("prompt_tokens"))
+                .or_else(|| value_as_f64(metrics.get("input_tokens")))?;
+            let completion = value_as_f64(metrics.get("completion_tokens"))
+                .or_else(|| value_as_f64(metrics.get("output_tokens")))?;
+            Some(prompt + completion)
+        })
+}
+
+fn metrics_cost(metrics: Option<&Value>) -> Option<f64> {
+    let metrics = metrics?.as_object()?;
+    value_as_f64(metrics.get("estimated_cost")).or_else(|| value_as_f64(metrics.get("cost")))
+}
+
+fn metrics_duration_seconds(metrics: Option<&Value>) -> Option<f64> {
+    let metrics = metrics?.as_object()?;
+    value_as_f64(metrics.get("duration")).or_else(|| {
+        let start = value_as_f64(metrics.get("start"))?;
+        let end = value_as_f64(metrics.get("end"))?;
+        Some((end - start).max(0.0))
+    })
+}
+
+fn value_as_f64(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(value)) => value.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_string(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::Number(value)) => Some(value.to_string()),
+        Some(Value::Bool(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn nested_value_as_string(row: &serde_json::Map<String, Value>, path: &[&str]) -> Option<String> {
+    let (first, rest) = path.split_first()?;
+    let mut value = row.get(*first)?;
+    for key in rest {
+        value = value.as_object()?.get(*key)?;
+    }
+    value_as_string(Some(value))
+}
+
+fn format_preview_value(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Null => String::new(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+    }
+}
+
+fn combine_filter_clauses<I>(clauses: I) -> String
+where
+    I: IntoIterator<Item = Option<String>>,
+{
+    let parts = clauses
+        .into_iter()
+        .flatten()
+        .map(|clause| clause.trim().to_string())
+        .filter(|clause| !clause.is_empty())
+        .map(|clause| format!("({clause})"))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "true".to_string()
+    } else {
+        parts.join(" AND ")
+    }
+}
+
+fn combine_optional_filter_clauses<I>(clauses: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<String>>,
+{
+    let combined = combine_filter_clauses(clauses);
+    if combined == "true" {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+fn btql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn btql_json_string_literal(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")))
+}
+
+fn maybe_print_topic_query(enabled: bool, label: &str, query: &str) {
+    if enabled {
+        eprintln!("bt topics [{label}] BTQL:\n{query}\n");
+    }
+}
+
 async fn fetch_topic_automation_progress(
     client: &ApiClient,
     project_id: &str,
@@ -1842,6 +3306,7 @@ async fn fetch_topic_automation_progress(
     cursor_status: &AutomationCursorSnapshot,
     facet_bars: &[FacetStatusBar],
     topic_bars: &[TopicStatusBar],
+    print_queries: bool,
 ) -> Result<TopicAutomationProgressSummary> {
     let pending_min_executed_xact_id = cursor_status.pending_min_executed_xact_id.as_deref();
     let mut measure_expressions = Vec::<String>::new();
@@ -1932,6 +3397,7 @@ async fn fetch_topic_automation_progress(
     let total_query = format!(
         "from: project_logs('{escaped_project_id}') spans | measures: count_distinct(root_span_id) as total_traces | filter: {time_filter_clause}"
     );
+    maybe_print_topic_query(print_queries, "progress-total", &total_query);
     let total_response = execute_btql_value(client, &total_query).await?;
     let total_row = first_btql_row(&total_response);
     let aggregate_row = if measure_expressions.is_empty() {
@@ -1941,6 +3407,7 @@ async fn fetch_topic_automation_progress(
             "from: project_logs('{escaped_project_id}') spans | measures: {} | filter: {time_filter_clause}",
             measure_expressions.join(", ")
         );
+        maybe_print_topic_query(print_queries, "progress-counts", &aggregate_query);
         let aggregate_response = execute_btql_value(client, &aggregate_query).await?;
         first_btql_row(&aggregate_response).cloned()
     };
@@ -2545,5 +4012,284 @@ mod tests {
             "emergent-issues-2026-04-14"
         );
         assert_eq!(slugify_topic_map_name("   "), "topic-map");
+    }
+
+    #[test]
+    fn topic_explore_time_filter_combines_window_and_extra_filter() {
+        let filter = combine_filter_clauses([
+            Some(topic_explore_time_filter_clause(None, "6h").expect("time filter")),
+            Some("metadata.environment = 'test'".to_string()),
+        ]);
+
+        assert_eq!(
+            filter,
+            "(created >= NOW() - INTERVAL 21600 SECOND) AND (metadata.environment = 'test')"
+        );
+    }
+
+    #[test]
+    fn topic_explore_filter_accepts_repo_shortcut_and_origin_urls() {
+        let origin = parse_repo_origin_selector("test-org/test-repo").expect("origin");
+        let filter = topic_repo_origin_filter_clause(&origin, Some("test-org/test-repo"));
+        assert!(filter.contains("\"metadata\".\"git_origin_url\" IN ["));
+        assert!(filter.contains("'github.com/test-org/test-repo'"));
+        assert!(filter.contains("'test-org/test-repo'"));
+        assert!(filter.contains("'https://github.com/test-org/test-repo.git'"));
+        assert!(filter.contains("'https://github.com/test-org/test-repo'"));
+        assert!(filter.contains("'git@github.com:test-org/test-repo.git'"));
+        assert!(filter.contains("'ssh://git@github.com/test-org/test-repo.git'"));
+
+        let query = build_topic_repo_root_spans_query(
+            "test-project",
+            "created >= NOW() - INTERVAL 604800 SECOND",
+            &filter,
+            25,
+            Some("cursor-test"),
+        );
+        assert!(query.contains("from: project_logs('test-project') spans"));
+        assert!(query.contains("created >= NOW() - INTERVAL 604800 SECOND"));
+        assert!(query.contains("span_id = root_span_id"));
+        assert!(query.contains("metadata.git_origin_url as git_origin_url"));
+        assert!(query.contains("cursor: \"cursor-test\""));
+
+        let https =
+            parse_repo_origin_selector("https://github.com/test-org/test-repo.git").expect("https");
+        let ssh = parse_repo_origin_selector("git@github.com:test-org/test-repo.git")
+            .expect("ssh origin");
+        let host_path =
+            parse_repo_origin_selector("github.com/test-org/test-repo").expect("host path");
+        assert_eq!(https.canonical_slug(), "github.com/test-org/test-repo");
+        assert_eq!(https, ssh);
+        assert_eq!(https, host_path);
+    }
+
+    #[test]
+    fn topic_explore_filter_accepts_non_github_host() {
+        let origin = parse_repo_origin_selector("gitlab.example.com/platform/agent/runtime.git")
+            .expect("origin");
+
+        assert_eq!(
+            origin.canonical_slug(),
+            "gitlab.example.com/platform/agent/runtime"
+        );
+        assert!(repo_origin_url_variants(&origin)
+            .contains("git@gitlab.example.com:platform/agent/runtime.git"));
+    }
+
+    #[test]
+    fn topic_classifications_query_is_bounded_and_topic_source_scoped() {
+        let topic_map = TopicExploreTopicMap {
+            automation_id: "auto_test_topics".to_string(),
+            automation_name: "Topics".to_string(),
+            facet: Some("Task".to_string()),
+            topic_map: "Task".to_string(),
+            topic_map_id: "fn_test_topic_map".to_string(),
+            version: Some("123".to_string()),
+            classification_path: escape_btql_ident_path(&["classifications", "Task"]),
+            btql_filter: None,
+        };
+        let filter =
+            topic_map_filter_clause(&topic_map, "created >= NOW() - INTERVAL 86400 SECOND");
+        let query = build_topic_classifications_query(
+            "test-project",
+            "Task",
+            "fn_test_topic_map",
+            &filter,
+            TopicExploreSort::Cost,
+            25,
+        );
+
+        assert!(query.contains("from: project_logs('test-project') summary"));
+        assert!(query.contains("created >= NOW() - INTERVAL 86400 SECOND"));
+        assert!(query.contains("\"classifications\".\"Task\" IS NOT NULL"));
+        assert!(
+            query.contains("\"classifications\".\"Task\".\"source\".\"id\" = 'fn_test_topic_map'")
+        );
+        assert!(query.contains("sum(COALESCE(metrics.estimated_cost, metrics.cost, 0)) as cost"));
+        assert!(query.contains("sort: cost DESC"));
+        assert!(query.contains("limit: 25"));
+    }
+
+    #[test]
+    fn topic_traces_query_filters_topic_id_and_sorts_tokens() {
+        let topic_map = TopicExploreTopicMap {
+            automation_id: "auto_test_topics".to_string(),
+            automation_name: "Topics".to_string(),
+            facet: Some("Task".to_string()),
+            topic_map: "Task".to_string(),
+            topic_map_id: "fn_test_topic_map".to_string(),
+            version: None,
+            classification_path: escape_btql_ident_path(&["classifications", "Task"]),
+            btql_filter: None,
+        };
+        let mut filter =
+            topic_map_filter_clause(&topic_map, "created >= NOW() - INTERVAL 86400 SECOND");
+        filter = combine_filter_clauses([
+            Some(filter),
+            topic_filter_clause(&topic_map, None, Some("topic-test")).expect("topic filter"),
+        ]);
+        let query = build_topic_traces_query(
+            "test-project",
+            "Task",
+            "fn_test_topic_map",
+            &filter,
+            TopicExploreSort::Tokens,
+            10,
+            Some("cursor-test"),
+        );
+
+        assert!(query.contains("select: created, root_span_id"));
+        assert!(query.contains("_pagination_key"));
+        assert!(query.contains("as sort_value"));
+        assert!(query.contains("span_attributes.created_by_user_id as created_by_user_id"));
+        assert!(query.contains("metadata.git_origin_url as git_origin_url"));
+        assert!(query.contains("\"classifications\".\"Task\".\"id\" = 'topic-test'"));
+        assert!(query.contains("sort: COALESCE(metrics.total_tokens, metrics.tokens"));
+        assert!(query.contains(", _pagination_key DESC"));
+        assert!(query.contains("limit: 10"));
+        assert!(query.contains("cursor: \"cursor-test\""));
+    }
+
+    #[test]
+    fn topic_trace_cursor_filters_after_last_visible_row() {
+        let traces = (0..11)
+            .map(|index| TopicTraceRow {
+                created: Some(format!("2026-07-27T12:{index:02}:00Z")),
+                root_span_id: format!("root-{index}"),
+                span_id: None,
+                row_id: None,
+                created_by_user_id: None,
+                created_by_user_name: None,
+                created_by_user_email: None,
+                git_origin_url: None,
+                repo: None,
+                topic: Some("Support".to_string()),
+                topic_id: Some("topic-test".to_string()),
+                tokens: (100 - index) as f64,
+                cost: 0.0,
+                duration_seconds: None,
+                input: None,
+                app_url: "https://example.com/app/org/p/project/logs".to_string(),
+                pagination_key: Some(format!("p{index:020}")),
+                sort_value: Some(TopicTraceCursorValue::Number((100 - index) as f64)),
+            })
+            .collect::<Vec<_>>();
+
+        let cursor = topic_trace_next_cursor(&traces, TopicExploreSort::Tokens, 10)
+            .expect("cursor")
+            .expect("full page has cursor");
+        let decoded = parse_topic_trace_cursor(Some(&cursor), TopicExploreSort::Tokens)
+            .expect("parse cursor")
+            .expect("topic cursor");
+        assert_eq!(decoded.pagination_key, "p00000000000000000009");
+        assert_eq!(decoded.sort_value, TopicTraceCursorValue::Number(91.0));
+
+        let filter =
+            topic_trace_cursor_filter_clause(TopicExploreSort::Tokens, &decoded).expect("filter");
+        assert!(filter.contains(
+            "COALESCE(metrics.total_tokens, metrics.tokens, metrics.prompt_tokens + metrics.completion_tokens, metrics.input_tokens + metrics.output_tokens, 0) < 91"
+        ));
+        assert!(filter.contains("_pagination_key < 'p00000000000000000009'"));
+    }
+
+    #[test]
+    fn topic_trace_cursor_rejects_sort_mismatch() {
+        let cursor = encode_topic_trace_cursor(&TopicTracePaginationCursor {
+            version: 1,
+            sort: TopicExploreSort::Cost,
+            sort_value: TopicTraceCursorValue::Number(0.42),
+            pagination_key: "p00000000000000000009".to_string(),
+        })
+        .expect("encode cursor");
+
+        let err =
+            parse_topic_trace_cursor(Some(&cursor), TopicExploreSort::Tokens).expect_err("err");
+        assert!(err.to_string().contains("created with --sort cost"));
+    }
+
+    #[test]
+    fn topic_trace_row_reads_created_by_user_id() {
+        let row = serde_json::json!({
+            "created": "2026-07-27T12:00:00Z",
+            "root_span_id": "root-test",
+            "span_id": "span-test",
+            "created_by_user_id": "user-test",
+            "_pagination_key": "p00000000000000000010",
+            "sort_value": "15",
+            "metrics": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cost": 0.01
+            },
+            "git_origin_url": "git@github.com:test-org/test-repo.git"
+        });
+        let row = row.as_object().expect("row object");
+
+        let trace = topic_trace_row_from_btql(row, "https://example.com/app/org/p/project/logs");
+
+        assert_eq!(trace.created_by_user_id.as_deref(), Some("user-test"));
+        assert_eq!(trace.created_by_user_name, None);
+        assert_eq!(
+            trace.git_origin_url.as_deref(),
+            Some("git@github.com:test-org/test-repo.git")
+        );
+        assert_eq!(trace.repo.as_deref(), Some("github.com/test-org/test-repo"));
+        assert_eq!(
+            trace.pagination_key.as_deref(),
+            Some("p00000000000000000010")
+        );
+        assert_eq!(trace.sort_value, Some(TopicTraceCursorValue::Number(15.0)));
+        assert_eq!(trace.tokens, 15.0);
+    }
+
+    #[test]
+    fn topic_trace_row_reads_nested_created_by_user_id() {
+        let row = serde_json::json!({
+            "root_span_id": "root-test",
+            "span_attributes": {
+                "created_by_user_id": "user-nested"
+            }
+        });
+        let row = row.as_object().expect("row object");
+
+        let trace = topic_trace_row_from_btql(row, "https://example.com/app/org/p/project/logs");
+
+        assert_eq!(trace.created_by_user_id.as_deref(), Some("user-nested"));
+    }
+
+    #[test]
+    fn topic_trace_root_metadata_query_is_root_span_bounded() {
+        let query = build_topic_trace_root_metadata_query(
+            "test-project",
+            &["root-one".to_string(), "root-two".to_string()],
+        );
+
+        assert!(query.contains("from: project_logs('test-project') spans"));
+        assert!(query.contains("root_span_id IN ['root-one', 'root-two']"));
+        assert!(query.contains("span_id = root_span_id"));
+        assert!(query.contains("span_attributes.created_by_user_id as created_by_user_id"));
+        assert!(query.contains("metadata.git_origin_url as git_origin_url"));
+    }
+
+    #[test]
+    fn org_user_display_name_prefers_name_then_email() {
+        let named = OrgUser {
+            id: "user-named".to_string(),
+            given_name: Some("Ada".to_string()),
+            family_name: Some("Lovelace".to_string()),
+            email: Some("ada@example.com".to_string()),
+        };
+        let emailed = OrgUser {
+            id: "user-emailed".to_string(),
+            given_name: Some(" ".to_string()),
+            family_name: None,
+            email: Some("trace-user@example.com".to_string()),
+        };
+
+        assert_eq!(named.display_name().as_deref(), Some("Ada Lovelace"));
+        assert_eq!(
+            emailed.display_name().as_deref(),
+            Some("trace-user@example.com")
+        );
     }
 }
