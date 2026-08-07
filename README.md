@@ -138,7 +138,8 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | Command       | Description                                                        |
 | ------------- | ------------------------------------------------------------------ |
 | `bt init`     | Initialize `.bt/` config directory and link to a project           |
-| `bt auth`     | Authenticate with Braintrust                                       |
+| `bt login`    | Log in to Braintrust or refresh an OAuth login                     |
+| `bt logout`   | Remove a saved Braintrust login                                    |
 | `bt switch`   | Switch org and project context                                     |
 | `bt status`   | Show current org and project context                               |
 | `bt datasets` | Manage datasets and dataset pipelines                              |
@@ -310,36 +311,33 @@ Local version and pagination-key conversion helpers:
   - `bt util version inspect p07639577379371417602`
   - `bt util version inspect p07639577379371417602 --utc`
 
-## `bt auth`
+## `bt login` and `bt logout`
 
-- Authenticate interactively (prompts for auth method, profile name defaults to org name):
-  - `bt auth login`
+- Authenticate interactively:
+  - `bt login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
-  - If your API key can access multiple orgs, `bt` uses a searchable picker (alphabetized) and lets you choose a specific org or no default org (cross-org mode).
-  - After login, `bt` updates the active profile/org context immediately. If `--project` is set, it also switches that project; otherwise it clears any stale default project for the new login.
-  - `bt` confirms the resolved API URL before saving.
+  - Login stores an identity and its app URL. OAuth login does not select an organization unless `--org` is passed explicitly.
+  - Use `bt switch` to select the active profile, organization, and project context.
 - Login with OAuth (browser-based, stores refresh token in secure credential store):
-  - `bt auth login --oauth --profile work`
+  - `bt login --oauth --profile work`
   - You can pass `--no-browser` to print the URL without auto-opening.
   - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
-- List profiles:
-  - `bt auth profiles`
+- List profiles and the current context:
+  - `bt status --all`
 - Log out (remove a saved profile):
-  - `bt auth logout`
-  - `bt auth logout --force` (skip confirmation)
-- Show current auth source/profile:
-  - `bt auth status`
+  - `bt logout`
+  - `bt logout --force` (skip confirmation)
 - Force-refresh OAuth access token for debugging:
-  - `bt auth refresh --profile work`
+  - `bt login --refresh --profile work`
 
 Auth resolution order for commands is:
 
 1. Explicit `--profile`
 2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
 3. `BRAINTRUST_PROFILE`
-4. Org-based profile match (profile whose org matches `--org`/config org)
-5. Single-profile auto-select (if only one profile exists)
-6. Interactive profile picker (if multiple profiles exist and a TTY is available)
+4. Compatible profile for the selected app URL and organization
+5. Single-profile auto-select (if only one compatible profile exists)
+6. Interactive profile picker (if multiple compatible profiles exist and a TTY is available)
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
 

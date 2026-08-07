@@ -180,21 +180,13 @@ pub(crate) fn project_from_config_for_context(
         .flatten()
 }
 
-fn config_matches_context(base: &BaseArgs, cfg: &Config, resolved_org: Option<&str>) -> bool {
-    let selected_profile = trimmed_option(base.profile.as_deref());
-    let cfg_profile = trimmed_option(cfg.profile.as_deref());
+fn config_matches_context(_base: &BaseArgs, cfg: &Config, resolved_org: Option<&str>) -> bool {
     let cfg_org = trimmed_option(cfg.org.as_deref());
     let resolved_org = trimmed_option(resolved_org);
 
-    match selected_profile {
-        Some(profile) => {
-            cfg_profile == Some(profile)
-                || (cfg_profile.is_none() && cfg_org.is_some() && cfg_org == resolved_org)
-        }
-        None => cfg_org
-            .zip(resolved_org)
-            .is_none_or(|(cfg, resolved)| cfg == resolved),
-    }
+    cfg_org
+        .zip(resolved_org)
+        .is_none_or(|(cfg, resolved)| cfg == resolved)
 }
 
 pub(crate) fn trimmed_option(value: Option<&str>) -> Option<&str> {
@@ -435,24 +427,12 @@ mod tests {
 
     fn base_with_profile(profile: Option<&str>) -> BaseArgs {
         BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: profile.map(str::to_string),
-            profile_explicit: profile.is_some(),
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
+            login: crate::args::LoginBaseArgs {
+                profile: profile.map(str::to_string),
+                profile_explicit: profile.is_some(),
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
@@ -466,13 +446,16 @@ mod tests {
     }
 
     #[test]
-    fn project_config_matches_explicit_profile_or_legacy_org() {
+    fn project_config_matches_org_independently_of_profile() {
         let base = base_with_profile(Some("work"));
         let cases = [
             (config(None, Some("acme"), Some("demo")), Some("demo")),
             (config(None, Some("other"), Some("demo")), None),
-            (config(None, None, Some("demo")), None),
-            (config(Some("other"), Some("acme"), Some("demo")), None),
+            (config(None, None, Some("demo")), Some("demo")),
+            (
+                config(Some("other"), Some("acme"), Some("demo")),
+                Some("demo"),
+            ),
             (
                 config(Some("work"), Some("acme"), Some("demo")),
                 Some("demo"),

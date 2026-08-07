@@ -110,6 +110,33 @@ fn top_level_help_shows_update_not_self() {
 }
 
 #[test]
+fn status_all_json_includes_profile_urls() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"oauth","api_url":"https://oauth-api.test.example","app_url":"https://app.test.example","oauth_client_id":"bt_cli_test"}}}"#,
+    )
+    .expect("write auth store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status", "--all", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"app_url\":\"https://app.test.example\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"api_url\":\"https://oauth-api.test.example\"",
+        ));
+}
+
+#[test]
 fn topics_report_help_accepts_global_org_short_conflict_free() {
     bt_command()
         .args([

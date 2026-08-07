@@ -8,7 +8,7 @@ use crate::config;
 use crate::http::ApiClient;
 use crate::projects::api;
 use crate::ui::{
-    is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
+    fuzzy_select, is_interactive, print_command_status, select_project, with_spinner, CommandStatus,
 };
 
 #[derive(Debug, Clone, Args)]
@@ -59,54 +59,37 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         .as_ref()
         .is_some_and(|value| !value.trim().is_empty());
 
-    let profile_name = match &resolved_org {
-        Some(org_or_profile) => {
-            if base.profile.is_some() {
-                None
-            } else {
-                let profiles = auth::list_profiles()?;
-                Some(auth::resolve_org_to_profile(org_or_profile, &profiles)?)
-            }
-        }
-        None => resolve_profile_for_switch(
-            has_api_key_override,
-            resolved_project.is_none(),
-            is_interactive(),
-            || auth::select_profile_interactive(current_cfg.org.as_deref()),
-            &mut interactive,
-        )?,
+    if resolved_project.is_none() && is_interactive() {
+        interactive = true;
+    }
+    let requested_profile = if has_api_key_override {
+        None
+    } else if base.profile.is_some() {
+        base.profile.clone()
+    } else if interactive {
+        let mut profile_base = base.clone();
+        profile_base.org_name = resolved_org.clone();
+        auth::select_compatible_profile_interactive(&profile_base, current_cfg.profile.as_deref())
+            .await?
+    } else {
+        config::trimmed_option(current_cfg.profile.as_deref()).map(str::to_string)
     };
 
-    // When we resolved a profile from an org identifier, clear org_name — the raw identifier
-    // (e.g. "staging") may differ from the profile's actual org (e.g. "staging-org"). Letting
-    // org_name stay would override the profile's stored org_name in resolve_auth_from_store.
-    //
-    // When no org was specified (project-only switch), load the current config org so
-    // resolve_auth can find the right profile for authentication.
-    let login_base = match &profile_name {
-        Some(profile) if base.profile.is_none() => BaseArgs {
-            profile: Some(profile.clone()),
-            org_name: None,
-            ..base.clone()
-        },
-        _ => {
-            let mut b = base.clone();
-            if !has_api_key_override && b.org_name.is_none() && b.profile.is_none() {
-                b.org_name = current_cfg.org.clone();
-            }
-            if !has_api_key_override && b.org_name.is_none() && b.profile.is_none() {
-                let profiles = auth::list_profiles()?;
-                if profiles.len() > 1 {
-                    let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
-                    bail!(
-                        "multiple auth profiles found: {}. Use --profile to disambiguate.",
-                        names.join(", ")
-                    );
-                }
-            }
-            b
-        }
+    let selected_org = if resolved_org.is_some() {
+        resolved_org.clone()
+    } else if interactive {
+        let mut org_base = base.clone();
+        org_base.profile = requested_profile.clone();
+        org_base.org_name = None;
+        Some(select_org_for_switch(&org_base, current_cfg.org.as_deref()).await?)
+    } else {
+        current_cfg.org.clone()
     };
+
+    let mut login_base = base.clone();
+    login_base.profile = requested_profile;
+    login_base.org_name = selected_org;
+    login_base.project = resolved_project.clone();
 
     let ctx = login(&login_base).await?;
     let client = ApiClient::new(&ctx)?;
@@ -147,9 +130,7 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     };
 
     let mut cfg = config::load_file(&path);
-    let config_profile =
-        config::trimmed_option(profile_name.as_deref().or(base.profile.as_deref()))
-            .map(str::to_string);
+    let config_profile = ctx.profile.as_deref().map(str::to_string);
     apply_switch_config(
         &mut cfg,
         config_profile.as_deref(),
@@ -179,6 +160,30 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn select_org_for_switch(base: &BaseArgs, current_org: Option<&str>) -> Result<String> {
+    let orgs = auth::list_available_orgs(base).await?;
+    if orgs.len() == 1 {
+        return Ok(orgs[0].name.clone());
+    }
+    if orgs.is_empty() {
+        bail!("no organizations available for the selected profile");
+    }
+
+    let labels = orgs.iter().map(|org| org.name.as_str()).collect::<Vec<_>>();
+    let default = default_org_selection(&orgs, current_org);
+    let selected = fuzzy_select("Select organization", &labels, default)?;
+    Ok(orgs[selected].name.clone())
+}
+
+fn default_org_selection(orgs: &[auth::AvailableOrg], current_org: Option<&str>) -> usize {
+    current_org
+        .and_then(|current| {
+            orgs.iter()
+                .position(|org| org.name.eq_ignore_ascii_case(current))
+        })
+        .unwrap_or(0)
 }
 
 pub(crate) fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
@@ -278,35 +283,17 @@ pub(crate) fn apply_switch_config(
     }
 }
 
-fn resolve_profile_for_switch<F>(
-    has_api_key_override: bool,
-    prompting_for_project_only: bool,
-    is_interactive: bool,
-    select_profile_interactive: F,
-    interactive: &mut bool,
-) -> Result<Option<String>>
-where
-    F: FnOnce() -> Result<Option<String>>,
-{
-    if has_api_key_override {
-        if prompting_for_project_only && is_interactive {
-            *interactive = true;
-        }
-        return Ok(None);
-    }
-
-    if prompting_for_project_only && is_interactive {
-        *interactive = true;
-        select_profile_interactive()
-    } else {
-        Ok(None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{resolve_org_to_profile, ProfileInfo};
+
+    fn available_org(name: &str) -> auth::AvailableOrg {
+        auth::AvailableOrg {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            api_url: None,
+        }
+    }
 
     fn switch_args(target: Option<&str>) -> SwitchArgs {
         SwitchArgs {
@@ -316,36 +303,23 @@ mod tests {
         }
     }
 
-    fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: None,
-            profile_explicit: false,
-            org_name: org.map(String::from),
-            project: project.map(String::from),
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
+    #[test]
+    fn org_picker_defaults_to_current_org() {
+        let orgs = vec![available_org("alpha"), available_org("beta")];
+        assert_eq!(default_org_selection(&orgs, Some("BETA")), 1);
     }
 
-    fn profile_info(name: &str, org_name: Option<&str>) -> ProfileInfo {
-        ProfileInfo {
-            name: name.to_string(),
-            org_name: org_name.map(String::from),
-            user_name: None,
-            email: None,
-            api_key_hint: None,
+    #[test]
+    fn org_picker_defaults_to_first_when_current_org_is_unavailable() {
+        let orgs = vec![available_org("alpha"), available_org("beta")];
+        assert_eq!(default_org_selection(&orgs, Some("missing")), 0);
+    }
+
+    fn base_args(org: Option<&str>, project: Option<&str>) -> BaseArgs {
+        BaseArgs {
+            org_name: org.map(String::from),
+            project: project.map(String::from),
+            ..Default::default()
         }
     }
 
@@ -443,99 +417,6 @@ mod tests {
         );
     }
 
-    // --- resolve_org_to_profile tests ---
-
-    #[test]
-    fn resolve_by_exact_profile_name() {
-        let profiles = vec![profile_info("acme", Some("acme-corp"))];
-        assert_eq!(resolve_org_to_profile("acme", &profiles).unwrap(), "acme");
-    }
-
-    #[test]
-    fn resolve_by_org_name_when_profile_name_differs() {
-        let profiles = vec![profile_info("work", Some("acme-corp"))];
-        assert_eq!(
-            resolve_org_to_profile("acme-corp", &profiles).unwrap(),
-            "work"
-        );
-    }
-
-    #[test]
-    fn resolve_no_match_errors() {
-        let profiles = vec![profile_info("work", Some("acme-corp"))];
-        assert!(resolve_org_to_profile("unknown", &profiles).is_err());
-    }
-
-    #[test]
-    fn resolve_empty_profiles_errors() {
-        let profiles: Vec<ProfileInfo> = vec![];
-        let err = resolve_org_to_profile("anything", &profiles).unwrap_err();
-        assert!(err.to_string().contains("no auth profiles found"));
-    }
-
-    #[test]
-    fn resolve_prefers_profile_name_over_org_name() {
-        let profiles = vec![
-            profile_info("acme", Some("other")),
-            profile_info("x", Some("acme")),
-        ];
-        assert_eq!(resolve_org_to_profile("acme", &profiles).unwrap(), "acme");
-    }
-
-    #[test]
-    fn resolve_profile_without_org() {
-        let profiles = vec![profile_info("default", None)];
-        assert_eq!(
-            resolve_org_to_profile("default", &profiles).unwrap(),
-            "default"
-        );
-    }
-
-    // --- login_base org_name clearing tests ---
-
-    #[test]
-    fn login_base_clears_org_name_when_profile_resolved() {
-        let base = BaseArgs {
-            org_name: Some("staging".into()),
-            ..base_args(None, Some("foobar"))
-        };
-        let profile_name = Some("staging".to_string());
-
-        let login_base = match &profile_name {
-            Some(profile) if base.profile.is_none() => BaseArgs {
-                profile: Some(profile.clone()),
-                org_name: None,
-                ..base.clone()
-            },
-            _ => base.clone(),
-        };
-
-        assert_eq!(login_base.profile, Some("staging".into()));
-        assert_eq!(login_base.org_name, None);
-    }
-
-    #[test]
-    fn login_base_preserves_org_when_explicit_profile_flag() {
-        let base = BaseArgs {
-            profile: Some("staging".into()),
-            org_name: Some("custom-org".into()),
-            ..base_args(None, Some("foobar"))
-        };
-        let profile_name: Option<String> = None;
-
-        let login_base = match &profile_name {
-            Some(profile) if base.profile.is_none() => BaseArgs {
-                profile: Some(profile.clone()),
-                org_name: None,
-                ..base.clone()
-            },
-            _ => base.clone(),
-        };
-
-        assert_eq!(login_base.profile, Some("staging".into()));
-        assert_eq!(login_base.org_name, Some("custom-org".into()));
-    }
-
     #[test]
     fn apply_switch_config_sets_project_id_with_project_name_and_org() {
         let mut cfg = config::Config::default();
@@ -589,53 +470,5 @@ mod tests {
         assert_eq!(cfg.org, None);
         assert_eq!(cfg.project, None);
         assert_eq!(cfg.project_id, None);
-    }
-
-    #[test]
-    fn resolve_profile_for_switch_skips_org_prompt_when_api_key_infers_profile() {
-        let mut interactive = false;
-        let profile = resolve_profile_for_switch(
-            true,
-            true,
-            true,
-            || panic!("org picker should not be called"),
-            &mut interactive,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile, None);
-        assert!(interactive);
-    }
-
-    #[test]
-    fn resolve_profile_for_switch_prompts_when_no_inferred_profile() {
-        let mut interactive = false;
-        let profile = resolve_profile_for_switch(
-            false,
-            true,
-            true,
-            || Ok(Some("picked-profile".to_string())),
-            &mut interactive,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile.as_deref(), Some("picked-profile"));
-        assert!(interactive);
-    }
-
-    #[test]
-    fn resolve_profile_for_switch_skips_org_prompt_when_api_key_override_has_no_profile_match() {
-        let mut interactive = false;
-        let profile = resolve_profile_for_switch(
-            true,
-            true,
-            true,
-            || panic!("org picker should not be called"),
-            &mut interactive,
-        )
-        .expect("resolve");
-
-        assert_eq!(profile, None);
-        assert!(interactive);
     }
 }

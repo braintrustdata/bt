@@ -33,7 +33,7 @@ use unicode_width::UnicodeWidthStr;
 use urlencoding::{decode, encode};
 
 use crate::args::BaseArgs;
-use crate::auth::{self, login};
+use crate::auth::login;
 use crate::experiments::api as experiments_api;
 use crate::http::ApiClient;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
@@ -5715,21 +5715,7 @@ fn parse_startup_trace_url_from_view_args(args: &ViewArgs) -> Result<Option<Pars
     startup_url.as_deref().map(parse_trace_url).transpose()
 }
 
-fn apply_url_hints_to_base(base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
-    apply_url_hints_with_profile_resolver(base, parsed_url, |org| {
-        let profiles = auth::list_profiles().ok()?;
-        auth::resolve_org_to_profile(org, &profiles).ok()
-    })
-}
-
-fn apply_url_hints_with_profile_resolver<F>(
-    mut base: BaseArgs,
-    parsed_url: Option<&ParsedTraceUrl>,
-    resolve_profile_for_org: F,
-) -> BaseArgs
-where
-    F: Fn(&str) -> Option<String>,
-{
+fn apply_url_hints_to_base(mut base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
     let Some(parsed) = parsed_url else {
         return base;
     };
@@ -5755,11 +5741,6 @@ where
 
     if !has_org_override && !has_profile_override {
         base.org_name = Some(url_org.to_string());
-    }
-    if !has_profile_override && !has_org_override {
-        if let Some(profile_name) = resolve_profile_for_org(url_org) {
-            base.profile = Some(profile_name);
-        }
     }
     base
 }
@@ -6720,26 +6701,7 @@ mod tests {
     use serde_json::json;
 
     fn base_args() -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: None,
-            profile_explicit: false,
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
+        BaseArgs::default()
     }
 
     fn parsed_url_with_org(org: &str) -> ParsedTraceUrl {
@@ -6963,16 +6925,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_url_hints_infers_profile_from_url_org() {
+    fn apply_url_hints_keeps_profile_independent_from_url_org() {
         let base = base_args();
         let parsed = parsed_url_with_org("Lovable");
 
-        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |org| {
-            (org == "Lovable").then(|| "lovable-profile".to_string())
-        });
+        let updated = apply_url_hints_to_base(base, Some(&parsed));
 
         assert_eq!(updated.org_name.as_deref(), Some("Lovable"));
-        assert_eq!(updated.profile.as_deref(), Some("lovable-profile"));
+        assert_eq!(updated.profile, None);
     }
 
     #[test]
@@ -6981,9 +6941,7 @@ mod tests {
         base.profile = Some("explicit-profile".to_string());
         let parsed = parsed_url_with_org("Lovable");
 
-        let updated = apply_url_hints_with_profile_resolver(base, Some(&parsed), |_| {
-            Some("other".to_string())
-        });
+        let updated = apply_url_hints_to_base(base, Some(&parsed));
 
         assert_eq!(updated.profile.as_deref(), Some("explicit-profile"));
         assert!(updated.org_name.is_none());
