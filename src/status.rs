@@ -109,17 +109,7 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        let mut project_base = base.clone();
-        if project_base
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            project_base.profile = selected_profile.clone();
-        }
-        project =
-            config::project_from_config_for_context(&project_base, &merged_cfg, org.as_deref());
+        project = config::project_from_config_for_context(&merged_cfg, org.as_deref());
     }
 
     let project_id = (project.as_deref() == merged_cfg.project.as_deref())

@@ -6,9 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::args::BaseArgs;
 use crate::ui::{print_command_status, CommandStatus};
-
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -101,34 +99,30 @@ pub fn load() -> Result<Config> {
     Ok(global.merge(&local))
 }
 
-pub fn configured_project_for_context(
-    base: &BaseArgs,
-    resolved_org: Option<&str>,
-) -> Option<String> {
+pub fn configured_project_for_context(resolved_org: Option<&str>) -> Option<String> {
     load()
         .ok()
-        .and_then(|cfg| project_from_config_for_context(base, &cfg, resolved_org))
+        .and_then(|cfg| project_from_config_for_context(&cfg, resolved_org))
 }
 
-pub fn configured_project_id_for_base(base: &BaseArgs) -> Option<String> {
+pub fn configured_project_id() -> Option<String> {
     load().ok().and_then(|cfg| {
-        config_matches_context(base, &cfg, None)
+        config_matches_context(&cfg, None)
             .then(|| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
             .flatten()
     })
 }
 
 pub(crate) fn project_from_config_for_context(
-    base: &BaseArgs,
     cfg: &Config,
     resolved_org: Option<&str>,
 ) -> Option<String> {
-    config_matches_context(base, cfg, resolved_org)
+    config_matches_context(cfg, resolved_org)
         .then(|| trimmed_option(cfg.project.as_deref()).map(str::to_string))
         .flatten()
 }
 
-fn config_matches_context(_base: &BaseArgs, cfg: &Config, resolved_org: Option<&str>) -> bool {
+fn config_matches_context(cfg: &Config, resolved_org: Option<&str>) -> bool {
     let cfg_org = trimmed_option(cfg.org.as_deref());
     let resolved_org = trimmed_option(resolved_org);
 
@@ -300,17 +294,6 @@ mod tests {
         assert_eq!(merged.project, Some("other-proj".into()));
     }
 
-    fn base_with_profile(profile: Option<&str>) -> BaseArgs {
-        BaseArgs {
-            login: crate::args::LoginBaseArgs {
-                profile: profile.map(str::to_string),
-                profile_explicit: profile.is_some(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
     fn config(profile: Option<&str>, org: Option<&str>, project: Option<&str>) -> Config {
         Config {
             profile: profile.map(str::to_string),
@@ -322,7 +305,6 @@ mod tests {
 
     #[test]
     fn project_config_matches_org_independently_of_profile() {
-        let base = base_with_profile(Some("work"));
         let cases = [
             (config(None, Some("acme"), Some("demo")), Some("demo")),
             (config(None, Some("other"), Some("demo")), None),
@@ -339,7 +321,7 @@ mod tests {
 
         for (cfg, expected) in cases {
             assert_eq!(
-                project_from_config_for_context(&base, &cfg, Some("acme")).as_deref(),
+                project_from_config_for_context(&cfg, Some("acme")).as_deref(),
                 expected
             );
         }

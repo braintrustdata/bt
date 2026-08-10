@@ -439,7 +439,7 @@ pub fn run_logout_command(base: BaseArgs, args: LogoutArgs) -> Result<()> {
 }
 
 pub async fn login_read_only(base: &BaseArgs) -> Result<LoginContext> {
-    if !has_cached_project_id(base) || base.api_url.is_none() {
+    if !has_cached_project_id() || base.api_url.is_none() {
         return login(base).await;
     }
 
@@ -513,7 +513,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     let project = base
         .project
         .clone()
-        .or_else(|| crate::config::configured_project_for_context(base, auth.org_name.as_deref()));
+        .or_else(|| crate::config::configured_project_for_context(auth.org_name.as_deref()));
     if let Some(project) = &project {
         builder = builder.default_project(project);
     }
@@ -756,9 +756,8 @@ async fn warn_ai_provider_key_staleness(ctx: &LoginContext) -> Result<()> {
     Ok(())
 }
 
-fn has_cached_project_id(base: &BaseArgs) -> bool {
-    crate::config::configured_project_id_for_base(base)
-        .is_some_and(|project_id| !project_id.trim().is_empty())
+fn has_cached_project_id() -> bool {
+    crate::config::configured_project_id().is_some_and(|project_id| !project_id.trim().is_empty())
 }
 
 fn maybe_warn_api_key_override(base: &BaseArgs) {
