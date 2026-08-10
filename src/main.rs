@@ -35,7 +35,7 @@ mod ui;
 mod util_cmd;
 mod utils;
 
-use crate::args::{has_explicit_profile_arg, ArgValueSource, BaseArgs, CLIArgs};
+use crate::args::{has_explicit_profile_arg, ArgValueSource, CLIArgs, LoginBaseArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 pub(crate) const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -57,7 +57,8 @@ const HELP_TEMPLATE: &str = "\
 
 Core
   init         Initialize .bt config directory and files
-  auth         Authenticate bt with Braintrust
+  login        Log in to Braintrust
+  logout       Remove a saved Braintrust login
   switch       Switch org and project context
   view         View logs, traces, and spans
 
@@ -80,7 +81,7 @@ Data & evaluation
 Additional
   docs         Manage workflow docs for coding agents
   setup        Configure Braintrust setup flows
-  status       Show current org and project context
+  status       Show current identity, org, and project context
   update       Update bt in-place
 
 Flags
@@ -129,8 +130,10 @@ enum Commands {
     Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
-    /// Authenticate bt with Braintrust
-    Auth(CLIArgs<auth::AuthArgs>),
+    /// Log in to Braintrust
+    Login(CLIArgs<auth::LoginArgs, LoginBaseArgs>),
+    /// Remove a saved Braintrust login
+    Logout(CLIArgs<auth::LogoutArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
@@ -163,20 +166,21 @@ enum Commands {
     Util(CLIArgs<util_cmd::UtilArgs>),
     /// Switch org and project context
     Switch(CLIArgs<switch::SwitchArgs>),
-    /// Show current org and project context
+    /// Show current identity, org, and project context
     Status(CLIArgs<status::StatusArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
 
 impl Commands {
-    fn base(&self) -> &BaseArgs {
+    fn base(&self) -> &LoginBaseArgs {
         match self {
             Commands::Init(cmd) => &cmd.base,
             Commands::Setup(cmd) => &cmd.base,
             Commands::Docs(cmd) => &cmd.base,
             Commands::Sql(cmd) => &cmd.base,
-            Commands::Auth(cmd) => &cmd.base,
+            Commands::Login(cmd) => &cmd.base,
+            Commands::Logout(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
@@ -197,13 +201,14 @@ impl Commands {
         }
     }
 
-    fn base_mut(&mut self) -> &mut BaseArgs {
+    fn base_mut(&mut self) -> &mut LoginBaseArgs {
         match self {
             Commands::Init(cmd) => &mut cmd.base,
             Commands::Setup(cmd) => &mut cmd.base,
             Commands::Docs(cmd) => &mut cmd.base,
             Commands::Sql(cmd) => &mut cmd.base,
-            Commands::Auth(cmd) => &mut cmd.base,
+            Commands::Login(cmd) => &mut cmd.base,
+            Commands::Logout(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
@@ -276,7 +281,7 @@ fn handle_version_json(argv: &[OsString]) -> Result<bool> {
     Ok(true)
 }
 
-fn apply_runtime_env_overrides(base: &BaseArgs) {
+fn apply_runtime_env_overrides(base: &LoginBaseArgs) {
     // Apply the CLI-owned override once so reqwest and inherited child
     // commands consistently observe BRAINTRUST_CA_CERT/--ca-cert precedence
     // over any ambient SSL_CERT_FILE.
@@ -307,7 +312,8 @@ fn try_main() -> Result<()> {
 
     let command_result: Result<()> = runtime.block_on(async move {
         match cli.command {
-            Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
+            Commands::Login(cmd) => auth::run_login_command(cmd.base.into(), cmd.args).await?,
+            Commands::Logout(cmd) => auth::run_logout_command(cmd.base, cmd.args)?,
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
@@ -344,7 +350,7 @@ fn try_main() -> Result<()> {
     command_result
 }
 
-fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
+fn apply_base_arg_sources(matches: &ArgMatches, base: &mut LoginBaseArgs) {
     base.verbose_source = find_value_source(matches, "verbose").and_then(map_value_source);
     base.quiet_source = find_value_source(matches, "quiet").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
@@ -380,7 +386,7 @@ fn map_value_source(source: ValueSource) -> Option<ArgValueSource> {
     }
 }
 
-fn configure_output(base: &BaseArgs) {
+fn configure_output(base: &LoginBaseArgs) {
     let mut disable_color = base.no_color || std::env::var_os("NO_COLOR").is_some();
 
     // TERM is a terminal capability signal; it isn't a user-facing config knob.
@@ -500,7 +506,7 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
 fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
     eprintln!("error: {err}");
     if code == ExitCode::Auth && !missing_credential {
-        eprintln!("Your credentials may be expired or invalid. For OAuth profiles, try `bt auth refresh --profile <NAME>`; if refresh fails, re-run `bt auth login --oauth --profile <NAME>`. Run `bt auth profiles` and `bt status` to inspect profile status.");
+        eprintln!("Your credentials may be expired or invalid. For OAuth profiles, try `bt login --refresh --profile <NAME>`; if refresh fails, re-run `bt login --oauth --profile <NAME>`. Run `bt status --all` to inspect profile status.");
     }
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
@@ -579,6 +585,17 @@ mod tests {
             Some(ArgValueSource::CommandLine)
         );
         assert!(cli.command.base().verbose_explicit());
+    }
+
+    #[test]
+    fn login_rejects_context_selection_flags() {
+        for args in [
+            ["bt", "login", "--org", "test-org"],
+            ["bt", "login", "--project", "test-project"],
+        ] {
+            let err = Cli::try_parse_from(args).expect_err("context flag should be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     #[test]

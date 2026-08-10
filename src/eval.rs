@@ -2905,7 +2905,7 @@ impl EvalUi {
                     self.record_deferred_error(message);
                 }
                 if show_hint {
-                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt auth login`/`bt auth login --oauth`, or use --no-send-logs for local evals.";
+                    let hint = "Hint: pass --api-key, set BRAINTRUST_API_KEY, run `bt login`/`bt login --oauth`, or use --no-send-logs for local evals.";
                     if self.verbose {
                         let _ = self.progress.println(hint.dark_grey().to_string());
                     } else {

@@ -11,8 +11,8 @@ pub enum ArgValueSource {
     EnvVariable,
 }
 
-#[derive(Debug, Clone, Args)]
-pub struct BaseArgs {
+#[derive(Debug, Clone, Args, Default)]
+pub struct LoginBaseArgs {
     /// Output as JSON
     #[arg(long, global = true)]
     pub json: bool,
@@ -45,20 +45,6 @@ pub struct BaseArgs {
 
     #[arg(skip = false)]
     pub profile_explicit: bool,
-
-    /// Override active org (or via BRAINTRUST_ORG_NAME)
-    #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
-    pub org_name: Option<String>,
-
-    /// Override active project
-    #[arg(
-        short = 'p',
-        long,
-        env = "BRAINTRUST_DEFAULT_PROJECT",
-        hide_env_values = true,
-        global = true
-    )]
-    pub project: Option<String>,
 
     /// Override stored API key (or via BRAINTRUST_API_KEY)
     #[arg(long, env = "BRAINTRUST_API_KEY", global = true, hide = true)]
@@ -108,22 +94,66 @@ pub struct BaseArgs {
     pub env_file: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Args, Default)]
+pub struct BaseArgs {
+    #[command(flatten)]
+    pub login: LoginBaseArgs,
+
+    /// Override active org (or via BRAINTRUST_ORG_NAME)
+    #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
+    pub org_name: Option<String>,
+
+    /// Override active project
+    #[arg(
+        short = 'p',
+        long,
+        env = "BRAINTRUST_DEFAULT_PROJECT",
+        hide_env_values = true,
+        global = true
+    )]
+    pub project: Option<String>,
+}
+
 #[derive(Debug, Clone, Args)]
-pub struct CLIArgs<T: Args> {
+pub struct CLIArgs<T: Args, B: Args = BaseArgs> {
     #[command(flatten)]
     pub args: T,
 
     #[command(flatten, next_help_heading = "Global options")]
-    pub base: BaseArgs,
+    pub base: B,
 }
 
-impl BaseArgs {
+impl LoginBaseArgs {
     pub fn ca_cert(&self) -> Option<&Path> {
         self.ca_cert.as_deref()
     }
 
     pub fn verbose_explicit(&self) -> bool {
         self.verbose && self.verbose_source.is_some()
+    }
+}
+
+impl std::ops::Deref for BaseArgs {
+    type Target = LoginBaseArgs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.login
+    }
+}
+
+impl std::ops::DerefMut for BaseArgs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.login
+    }
+}
+
+impl From<LoginBaseArgs> for BaseArgs {
+    fn from(login: LoginBaseArgs) -> Self {
+        Self {
+            login,
+            org_name: None,
+            project: None,
+        }
     }
 }
 

@@ -38,8 +38,8 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
 
     eprintln!("Link to a Braintrust project...");
 
-    let (org, project) = if let (Some(o), Some(p)) = (&base.org_name, &base.project) {
-        (o.clone(), p.clone())
+    let (org, project, profile) = if let (Some(o), Some(p)) = (&base.org_name, &base.project) {
+        (o.clone(), p.clone(), base.profile.clone())
     } else if !is_interactive() {
         bail!("--org and --project required in non-interactive mode");
     } else {
@@ -62,10 +62,11 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         .await?
         .name;
 
-        (org, project)
+        (org, project, ctx.profile)
     };
 
     let cfg = config::Config {
+        profile,
         org: Some(org.clone()),
         project: Some(project.clone()),
         ..Default::default()
