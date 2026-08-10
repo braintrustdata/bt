@@ -20,7 +20,8 @@ use bt_daemon::wire::{
 use bt_daemon::{
     braintrust_serve_options, paths, run_hook, run_import, run_serve, run_status, run_traced,
     shutdown_daemon, AuthLease, AuthProvider, AuthResolveReason, BraintrustSinkConfig, HookArgs,
-    HostInfo, ImportArgs, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions, StatusArgs,
+    HostInfo, ImportArgs, OutputFormat, Registry, RunArgs, RunHookCommand, ServeArgs, ServeOptions,
+    StatusArgs, TraceCommandOutput,
 };
 
 use crate::args::BaseArgs;
@@ -75,6 +76,11 @@ enum SetupAgent {
     Codex,
     /// Install the published Claude Code tracing plugin.
     Claude,
+    /// Configure the published OpenCode tracing plugin.
+    #[command(name = "opencode", alias = "open-code")]
+    OpenCode,
+    /// Install the published Pi tracing extension.
+    Pi,
 }
 
 const CODEX_MARKETPLACE: &str = "braintrust-codex-plugins";
@@ -83,6 +89,8 @@ const CODEX_PLUGIN: &str = "trace-codex@braintrust-codex-plugins";
 const CLAUDE_MARKETPLACE: &str = "braintrust-claude-plugin";
 const CLAUDE_MARKETPLACE_SOURCE: &str = "braintrustdata/braintrust-claude-plugin";
 const CLAUDE_PLUGIN: &str = "trace-claude-code@braintrust-claude-plugin";
+const OPENCODE_PLUGIN: &str = "@braintrust/trace-opencode@^1";
+const PI_PLUGIN: &str = "npm:@braintrust/pi-extension@^1";
 
 /// How the shim (re)launches the daemon: `bt trace daemon` from this same
 /// binary.
@@ -342,29 +350,68 @@ fn setup_claude() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn opencode_config_path() -> PathBuf {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    config_home.join("opencode").join("opencode.json")
+}
+
+fn setup_opencode() -> anyhow::Result<()> {
+    let path = opencode_config_path();
+    let mut config = load_settings(&path)?;
+    let plugins = config
+        .entry("plugin")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenCode `plugin` config must be an array: {}",
+                path.display()
+            )
+        })?;
+    plugins.retain(|plugin| {
+        plugin.as_str().is_none_or(|plugin| {
+            plugin != "@braintrust/trace-opencode"
+                && !plugin.starts_with("@braintrust/trace-opencode@")
+        })
+    });
+    plugins.push(Value::String(OPENCODE_PLUGIN.into()));
+
+    let mut encoded = serde_json::to_string_pretty(&Value::Object(config))?;
+    encoded.push('\n');
+    crate::utils::write_text_atomic(&path, &encoded)?;
+    Ok(())
+}
+
+fn setup_pi() -> anyhow::Result<()> {
+    run_command("pi", &["install", PI_PLUGIN])
+}
+
 fn load_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
     match std::fs::read(path) {
         Ok(raw) => {
             let value: Value = serde_json::from_slice(&raw)
-                .with_context(|| format!("invalid shared agent settings: {}", path.display()))?;
+                .with_context(|| format!("invalid JSON configuration: {}", path.display()))?;
             value.as_object().cloned().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "shared agent settings must be a JSON object: {}",
-                    path.display()
-                )
+                anyhow::anyhow!("configuration must be a JSON object: {}", path.display())
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to read shared agent settings: {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to read configuration: {}", path.display()))
+        }
     }
 }
 
-fn enable_tracing(route: SessionRoute) -> anyhow::Result<PathBuf> {
-    let path = paths::settings_path(None);
+fn enable_tracing(source: &str, route: SessionRoute) -> anyhow::Result<PathBuf> {
+    let path = paths::agent_settings_path(source, None);
     let mut settings = load_settings(&path)?;
-    settings.insert("traceToBraintrust".into(), Value::Bool(true));
+    settings.insert("trace_to_braintrust".into(), Value::Bool(true));
     settings.insert("route".into(), serde_json::to_value(route)?);
+    settings.remove("traceToBraintrust");
     settings.remove("project");
 
     let mut encoded = serde_json::to_string_pretty(&Value::Object(settings))?;
@@ -375,28 +422,37 @@ fn enable_tracing(route: SessionRoute) -> anyhow::Result<PathBuf> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to protect shared settings: {}", path.display()))?;
+            .with_context(|| format!("failed to protect agent settings: {}", path.display()))?;
     }
     Ok(path)
 }
 
-async fn run_setup(base: BaseArgs, args: SetupArgs) -> anyhow::Result<()> {
+async fn run_setup(base: BaseArgs, args: SetupArgs, format: OutputFormat) -> anyhow::Result<()> {
     let base = resolve_trace_project(base).await?;
 
-    match args.agent {
-        SetupAgent::Codex => setup_codex()?,
-        SetupAgent::Claude => setup_claude()?,
-    }
-    let settings_path = enable_tracing(session_route(&base))?;
+    let (source, label) = match args.agent {
+        SetupAgent::Codex => {
+            setup_codex()?;
+            ("codex", "Codex")
+        }
+        SetupAgent::Claude => {
+            setup_claude()?;
+            ("claude", "Claude Code")
+        }
+        SetupAgent::OpenCode => {
+            setup_opencode()?;
+            ("opencode", "OpenCode")
+        }
+        SetupAgent::Pi => {
+            setup_pi()?;
+            ("pi", "Pi")
+        }
+    };
+    let settings_path = enable_tracing(source, session_route(&base))?;
     println!(
-        "The Braintrust tracing plugin is installed for {} and configured in {}.",
-        match args.agent {
-            SetupAgent::Codex => "Codex",
-            SetupAgent::Claude => "Claude Code",
-        },
-        settings_path.display()
+        "{}",
+        TraceCommandOutput::setup(source, label, settings_path).render(format)?
     );
-    println!("Restart the coding agent to load the tracing plugin.");
     Ok(())
 }
 
@@ -420,8 +476,9 @@ async fn session_config(base: &BaseArgs) -> anyhow::Result<SessionConfig> {
 }
 
 pub async fn run(base: BaseArgs, args: TraceArgs) -> anyhow::Result<()> {
+    let format = OutputFormat::from(base.login.json);
     match args.command {
-        TraceCommand::Setup(setup_args) => run_setup(base, setup_args).await,
+        TraceCommand::Setup(setup_args) => run_setup(base, setup_args, format).await,
         TraceCommand::Daemon(serve_args) => {
             init_daemon_logging(base.verbose);
             run_serve(serve_args, serve_options(base)).await
@@ -434,16 +491,11 @@ pub async fn run(base: BaseArgs, args: TraceArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        TraceCommand::Status(status_args) => match run_status(status_args).await? {
-            Some(status) => {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
-            None => {
-                println!("bt-daemon is not running");
-                Ok(())
-            }
-        },
+        TraceCommand::Status(status_args) => {
+            let output = TraceCommandOutput::status(run_status(status_args).await?);
+            println!("{}", output.render(format)?);
+            Ok(())
+        }
         TraceCommand::Stop(stop_args) => {
             let socket = paths::socket_path(stop_args.socket.as_deref());
             let status_args = StatusArgs {
@@ -451,11 +503,11 @@ pub async fn run(base: BaseArgs, args: TraceArgs) -> anyhow::Result<()> {
                 session_id: None,
             };
             if run_status(status_args).await?.is_none() {
-                println!("No tracing daemon is running.");
+                println!("{}", TraceCommandOutput::stop(false, false).render(format)?);
                 return Ok(());
             }
             shutdown_daemon(&socket).await?;
-            println!("Tracing daemon stopped.");
+            println!("{}", TraceCommandOutput::stop(true, true).render(format)?);
             Ok(())
         }
         TraceCommand::Import(import_args) => {

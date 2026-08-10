@@ -55,7 +55,7 @@ esac
 fn write_run_agent(path: &Path) {
     fs::write(
         path,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n",
     )
     .expect("write fake run agent");
     use std::os::unix::fs::PermissionsExt;
@@ -237,7 +237,9 @@ fn trace_help_exposes_user_commands_and_hides_internal_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("codex"))
-        .stdout(predicate::str::contains("claude"));
+        .stdout(predicate::str::contains("claude"))
+        .stdout(predicate::str::contains("opencode"))
+        .stdout(predicate::str::contains("pi"));
 
     bt_command()
         .args(["trace", "run", "--help"])
@@ -245,7 +247,9 @@ fn trace_help_exposes_user_commands_and_hides_internal_commands() {
         .success()
         .stdout(predicate::str::contains("<SOURCE>"))
         .stdout(predicate::str::contains("codex"))
-        .stdout(predicate::str::contains("claude"));
+        .stdout(predicate::str::contains("claude"))
+        .stdout(predicate::str::contains("opencode"))
+        .stdout(predicate::str::contains("pi"));
 }
 
 #[test]
@@ -323,6 +327,106 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
 
 #[cfg(unix)]
 #[test]
+fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let run_log = state_dir.path().join("run.log");
+    let run_settings = state_dir.path().join("run-settings.json");
+    let run_config = state_dir.path().join("run-config.json");
+    let global_config = home.path().join(".config/opencode/braintrust.json");
+    fs::create_dir_all(global_config.parent().expect("config parent"))
+        .expect("create config parent");
+    fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
+    write_run_agent(&bin_dir.path().join("opencode"));
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("OPENCODE_BIN", bin_dir.path().join("opencode"))
+        .env("AGENT_RUN_LOG", &run_log)
+        .env("AGENT_RUN_SETTINGS", &run_settings)
+        .env("AGENT_RUN_CONFIG", &run_config)
+        .args([
+            "trace",
+            "run",
+            "opencode",
+            "--project",
+            "isolated-opencode",
+            "--",
+            "--version",
+        ])
+        .assert()
+        .success();
+
+    let inline: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_config).expect("read OpenCode inline config"))
+            .expect("parse OpenCode inline config");
+    assert_eq!(
+        inline["plugin"],
+        serde_json::json!(["@braintrust/trace-opencode@^1"])
+    );
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_settings).expect("read invocation settings"))
+            .expect("parse invocation settings");
+    assert_eq!(
+        settings["route"]["destination"]["project_name"],
+        "isolated-opencode"
+    );
+    assert_eq!(
+        fs::read_to_string(global_config).expect("read global config"),
+        r#"{"trace_to_braintrust":true}"#
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let run_log = state_dir.path().join("run.log");
+    let run_settings = state_dir.path().join("run-settings.json");
+    let global_config = home.path().join(".pi/agent/braintrust.json");
+    fs::create_dir_all(global_config.parent().expect("config parent"))
+        .expect("create config parent");
+    fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
+    write_run_agent(&bin_dir.path().join("pi"));
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PI_BIN", bin_dir.path().join("pi"))
+        .env("AGENT_RUN_LOG", &run_log)
+        .env("AGENT_RUN_SETTINGS", &run_settings)
+        .args([
+            "trace",
+            "run",
+            "pi",
+            "--project",
+            "isolated-pi",
+            "--",
+            "--version",
+        ])
+        .assert()
+        .success();
+
+    assert!(fs::read_to_string(run_log)
+        .expect("read Pi arguments")
+        .contains("-e npm:@braintrust/pi-extension@^1 --version"));
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_settings).expect("read invocation settings"))
+            .expect("parse invocation settings");
+    assert_eq!(
+        settings["route"]["destination"]["project_name"],
+        "isolated-pi"
+    );
+    assert_eq!(
+        fs::read_to_string(global_config).expect("read global config"),
+        r#"{"trace_to_braintrust":true}"#
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn trace_stop_gracefully_stops_an_isolated_daemon() {
     use std::process::Stdio;
     use std::thread;
@@ -392,6 +496,46 @@ fn trace_stop_gracefully_stops_an_isolated_daemon() {
     panic!("tracing daemon did not stop");
 }
 
+#[test]
+fn trace_status_and_stop_honor_global_json_when_daemon_is_absent() {
+    let state = tempfile::tempdir().expect("state tempdir");
+    #[cfg(unix)]
+    let socket = state.path().join("missing.sock");
+    #[cfg(windows)]
+    let socket = std::path::PathBuf::from(format!(
+        r"\\.\pipe\missing-bt-trace-{}",
+        uuid::Uuid::new_v4()
+    ));
+
+    for (command, expected) in [
+        (
+            "status",
+            serde_json::json!({"command":"status","running":false,"sessions":[]}),
+        ),
+        (
+            "stop",
+            serde_json::json!({"command":"stop","running":false,"stopped":false}),
+        ),
+    ] {
+        let stdout = bt_command()
+            .args([
+                "trace",
+                command,
+                "--json",
+                "--socket",
+                socket.to_str().expect("UTF-8 socket path"),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let output: serde_json::Value =
+            serde_json::from_slice(&stdout).expect("trace command emits JSON");
+        assert_eq!(output, expected);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
@@ -445,7 +589,8 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
 
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
-    assert_eq!(settings["traceToBraintrust"], true);
+    assert_eq!(settings["trace_to_braintrust"], true);
+    assert!(settings.get("traceToBraintrust").is_none());
     assert_eq!(
         settings["route"]["destination"]["project_name"],
         "agent-traces"
@@ -487,7 +632,7 @@ fn trace_setup_claude_installs_plugin_and_writes_selected_project() {
 
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
-    assert_eq!(settings["traceToBraintrust"], true);
+    assert_eq!(settings["trace_to_braintrust"], true);
     assert_eq!(
         settings["route"]["destination"]["project_name"],
         "coding-agents"
@@ -519,6 +664,181 @@ fn trace_setup_claude_enables_an_existing_disabled_plugin() {
     assert!(calls.contains("plugin enable trace-claude-code@braintrust-claude-plugin"));
     assert!(!calls.contains("plugin marketplace add"));
     assert!(!calls.contains("plugin install"));
+}
+
+#[test]
+fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let opencode_dir = config_home.path().join("opencode");
+    fs::create_dir_all(&opencode_dir).expect("create OpenCode config dir");
+    fs::write(
+        opencode_dir.join("opencode.json"),
+        r#"{"plugin":["other-plugin","@braintrust/trace-opencode@0.9.0"],"model":"test/model"}"#,
+    )
+    .expect("seed OpenCode config");
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args([
+            "trace",
+            "setup",
+            "open-code",
+            "--profile",
+            "work",
+            "--org",
+            "acme",
+            "--project",
+            "agent-traces",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("installed for OpenCode"));
+
+    let opencode: serde_json::Value = serde_json::from_slice(
+        &fs::read(opencode_dir.join("opencode.json")).expect("read OpenCode config"),
+    )
+    .expect("parse OpenCode config");
+    assert_eq!(opencode["model"], "test/model");
+    assert_eq!(
+        opencode["plugin"],
+        serde_json::json!(["other-plugin", "@braintrust/trace-opencode@^1"])
+    );
+
+    let settings: serde_json::Value = serde_json::from_slice(
+        &fs::read(opencode_dir.join("braintrust.json")).expect("read OpenCode settings"),
+    )
+    .expect("parse OpenCode settings");
+    assert_eq!(settings["trace_to_braintrust"], true);
+    assert_eq!(settings["route"]["auth"]["profile"], "work");
+    assert_eq!(settings["route"]["auth"]["org_name"], "acme");
+    assert_eq!(
+        settings["route"]["destination"]["project_name"],
+        "agent-traces"
+    );
+}
+
+#[test]
+fn trace_setup_honors_global_json() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let stdout = bt_command()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args([
+            "trace",
+            "setup",
+            "opencode",
+            "--project",
+            "agent-traces",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("trace setup emits JSON");
+    assert_eq!(output["command"], "setup");
+    assert_eq!(output["source"], "opencode");
+    assert_eq!(output["display_name"], "OpenCode");
+    assert_eq!(output["restart_required"], true);
+    assert_eq!(
+        output["settings_path"],
+        config_home
+            .path()
+            .join("opencode/braintrust.json")
+            .to_string_lossy()
+            .as_ref()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_setup_pi_installs_the_npm_extension_and_selected_route() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let log = state_dir.path().join("pi.log");
+    write_agent_cli(&bin_dir.path().join("pi"), "{}", "{}");
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", &log)
+        .args(["trace", "setup", "pi", "--project", "pi-traces"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("installed for Pi"));
+
+    assert_eq!(
+        fs::read_to_string(log).expect("read Pi calls").trim(),
+        "install npm:@braintrust/pi-extension@^1"
+    );
+    let settings: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join(".pi/agent/braintrust.json")).expect("read Pi settings"),
+    )
+    .expect("parse Pi settings");
+    assert_eq!(settings["trace_to_braintrust"], true);
+    assert_eq!(
+        settings["route"]["destination"]["project_name"],
+        "pi-traces"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_setup_keeps_each_agents_persistent_selection_independent() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let log = tempfile::NamedTempFile::new().expect("setup log");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+
+    bt_command()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", log.path())
+        .args(["trace", "setup", "codex", "--project", "codex-project"])
+        .assert()
+        .success();
+    bt_command()
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args([
+            "trace",
+            "setup",
+            "opencode",
+            "--project",
+            "opencode-project",
+        ])
+        .assert()
+        .success();
+
+    let codex: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.path().join(".codex/braintrust.json")).expect("read Codex settings"),
+    )
+    .expect("parse Codex settings");
+    let opencode: serde_json::Value = serde_json::from_slice(
+        &fs::read(config_home.path().join("opencode/braintrust.json"))
+            .expect("read OpenCode settings"),
+    )
+    .expect("parse OpenCode settings");
+    assert_eq!(
+        codex["route"]["destination"]["project_name"],
+        "codex-project"
+    );
+    assert_eq!(
+        opencode["route"]["destination"]["project_name"],
+        "opencode-project"
+    );
 }
 
 #[test]

@@ -488,11 +488,11 @@ dependencies = [
  "chrono",
  "crossbeam",
  "futures",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "regex",
  "reqwest",
  "serde",
- "serde_json 1.0.149",
+ "serde_json 1.0.151",
  "serde_repr",
  "thiserror 1.0.69",
  "tokio",
@@ -594,7 +594,7 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=96f452780b4c3b1aea2325853817721e777d3c48#96f452780b4c3b1aea2325853817721e777d3c48"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=30e4b53f373940ea26c7ca943bd56c51fa431e13#30e4b53f373940ea26c7ca943bd56c51fa431e13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -603,9 +603,9 @@ dependencies = [
  "clap",
  "regex",
  "serde",
- "serde_json 1.0.149",
+ "serde_json 1.0.151",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
  "uuid",
@@ -1871,12 +1871,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "leb128fmt"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
