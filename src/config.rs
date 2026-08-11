@@ -106,11 +106,9 @@ pub fn configured_project_for_context(resolved_org: Option<&str>) -> Option<Stri
 }
 
 pub fn configured_project_id() -> Option<String> {
-    load().ok().and_then(|cfg| {
-        config_matches_context(&cfg, None)
-            .then(|| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
-            .flatten()
-    })
+    load()
+        .ok()
+        .and_then(|cfg| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
 }
 
 pub(crate) fn project_from_config_for_context(
