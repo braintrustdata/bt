@@ -1483,28 +1483,7 @@ async function serializeEvaluatorParameters(
 
   if (helpers?.sdkSerializeParameters) {
     try {
-      const serialized = helpers.sdkSerializeParameters(resolved);
-      // Older SDK serializers omit the marker the dev UI uses to select typed editors.
-      if (
-        isObject(serialized) &&
-        serialized.type === "braintrust.staticParameters" &&
-        isObject(serialized.schema)
-      ) {
-        const schema = Object.fromEntries(
-          Object.entries(serialized.schema).map(([name, parameter]) => {
-            if (
-              isObject(parameter) &&
-              (parameter.type === "model" || parameter.type === "prompt") &&
-              parameter["x-bt-type"] === undefined
-            ) {
-              return [name, { ...parameter, "x-bt-type": parameter.type }];
-            }
-            return [name, parameter];
-          }),
-        );
-        return { ...serialized, schema };
-      }
-      return serialized;
+      return helpers.sdkSerializeParameters(resolved);
     } catch {
       // Fallback to legacy serialization below when SDK internals are unavailable.
     }
@@ -1547,7 +1526,6 @@ async function serializeEvaluatorParameters(
       }
       schema[name] = {
         type: value.type,
-        "x-bt-type": value.type,
         ...(defaultValue !== undefined ? { default: defaultValue } : {}),
         ...(typeof value.description === "string"
           ? { description: value.description }

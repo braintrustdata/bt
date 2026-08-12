@@ -425,10 +425,6 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         .expect("model parameter should exist");
     assert_eq!(model.get("type").and_then(Value::as_str), Some("model"));
     assert_eq!(
-        model.get("x-bt-type").and_then(Value::as_str),
-        Some("model")
-    );
-    assert_eq!(
         model.get("default").and_then(Value::as_str),
         Some("test-model")
     );
@@ -442,10 +438,6 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         .and_then(Value::as_object)
         .expect("prompt parameter should exist");
     assert_eq!(prompt.get("type").and_then(Value::as_str), Some("prompt"));
-    assert_eq!(
-        prompt.get("x-bt-type").and_then(Value::as_str),
-        Some("prompt")
-    );
     assert_eq!(
         prompt.get("description").and_then(Value::as_str),
         Some("Prompt used by the evaluator")
