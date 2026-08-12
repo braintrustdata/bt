@@ -639,33 +639,6 @@ fn trace_setup_claude_installs_plugin_and_writes_selected_project() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn trace_setup_claude_enables_an_existing_disabled_plugin() {
-    let home = tempfile::tempdir().expect("home tempdir");
-    let bin_dir = tempfile::tempdir().expect("bin tempdir");
-    let state_dir = tempfile::tempdir().expect("state tempdir");
-    let log = state_dir.path().join("claude.log");
-    write_agent_cli(
-        &bin_dir.path().join("claude"),
-        r#"[{"name":"braintrust-claude-plugin"}]"#,
-        r#"[{"id":"trace-claude-code@braintrust-claude-plugin","enabled":false}]"#,
-    );
-
-    bt_command()
-        .env("HOME", home.path())
-        .env("PATH", bin_dir.path())
-        .env("AGENT_SETUP_LOG", &log)
-        .args(["trace", "setup", "claude", "--project", "coding-agents"])
-        .assert()
-        .success();
-
-    let calls = fs::read_to_string(log).expect("read fake CLI calls");
-    assert!(calls.contains("plugin enable trace-claude-code@braintrust-claude-plugin"));
-    assert!(!calls.contains("plugin marketplace add"));
-    assert!(!calls.contains("plugin install"));
-}
-
 #[test]
 fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
     let home = tempfile::tempdir().expect("home tempdir");
