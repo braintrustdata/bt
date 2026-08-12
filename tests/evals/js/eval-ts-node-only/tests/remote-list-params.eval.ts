@@ -18,6 +18,15 @@ Eval("test-cli-remote-list-params", {
   task: async (input: string) => input,
   scores: [exactMatch],
   parameters: {
+    model: {
+      type: "model",
+      default: "test-model",
+      description: "Model used by the evaluator",
+    },
+    prompt: {
+      type: "prompt",
+      description: "Prompt used by the evaluator",
+    },
     optional_no_default: z
       .string()
       .optional()

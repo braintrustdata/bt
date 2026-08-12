@@ -1483,7 +1483,28 @@ async function serializeEvaluatorParameters(
 
   if (helpers?.sdkSerializeParameters) {
     try {
-      return helpers.sdkSerializeParameters(resolved);
+      const serialized = helpers.sdkSerializeParameters(resolved);
+      // Older SDK serializers omit the marker the dev UI uses to select typed editors.
+      if (
+        isObject(serialized) &&
+        serialized.type === "braintrust.staticParameters" &&
+        isObject(serialized.schema)
+      ) {
+        const schema = Object.fromEntries(
+          Object.entries(serialized.schema).map(([name, parameter]) => {
+            if (
+              isObject(parameter) &&
+              (parameter.type === "model" || parameter.type === "prompt") &&
+              parameter["x-bt-type"] === undefined
+            ) {
+              return [name, { ...parameter, "x-bt-type": parameter.type }];
+            }
+            return [name, parameter];
+          }),
+        );
+        return { ...serialized, schema };
+      }
+      return serialized;
     } catch {
       // Fallback to legacy serialization below when SDK internals are unavailable.
     }
@@ -1508,21 +1529,26 @@ async function serializeEvaluatorParameters(
 
   const schema: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(resolved)) {
-    if (isObject(value) && value.type === "prompt") {
-      let promptDefault = value.default;
+    if (
+      isObject(value) &&
+      (value.type === "prompt" || value.type === "model")
+    ) {
+      let defaultValue = value.default;
       if (
-        promptDefault !== undefined &&
+        value.type === "prompt" &&
+        defaultValue !== undefined &&
         helpers?.promptDefinitionToPromptData
       ) {
         try {
-          promptDefault = helpers.promptDefinitionToPromptData(promptDefault);
+          defaultValue = helpers.promptDefinitionToPromptData(defaultValue);
         } catch {
           // Keep raw prompt default when conversion utility is unavailable.
         }
       }
       schema[name] = {
-        type: "prompt",
-        ...(promptDefault !== undefined ? { default: promptDefault } : {}),
+        type: value.type,
+        "x-bt-type": value.type,
+        ...(defaultValue !== undefined ? { default: defaultValue } : {}),
         ...(typeof value.description === "string"
           ? { description: value.description }
           : {}),

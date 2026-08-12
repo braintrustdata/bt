@@ -419,6 +419,42 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         .get("schema")
         .and_then(Value::as_object)
         .expect("parameters schema should be object");
+    let model = schema
+        .get("model")
+        .and_then(Value::as_object)
+        .expect("model parameter should exist");
+    assert_eq!(model.get("type").and_then(Value::as_str), Some("model"));
+    assert_eq!(
+        model.get("x-bt-type").and_then(Value::as_str),
+        Some("model")
+    );
+    assert_eq!(
+        model.get("default").and_then(Value::as_str),
+        Some("test-model")
+    );
+    assert_eq!(
+        model.get("description").and_then(Value::as_str),
+        Some("Model used by the evaluator")
+    );
+
+    let prompt = schema
+        .get("prompt")
+        .and_then(Value::as_object)
+        .expect("prompt parameter should exist");
+    assert_eq!(prompt.get("type").and_then(Value::as_str), Some("prompt"));
+    assert_eq!(
+        prompt.get("x-bt-type").and_then(Value::as_str),
+        Some("prompt")
+    );
+    assert_eq!(
+        prompt.get("description").and_then(Value::as_str),
+        Some("Prompt used by the evaluator")
+    );
+    assert!(
+        prompt.get("default").is_none(),
+        "prompt parameter should not gain a default"
+    );
+
     let optional = schema
         .get("optional_no_default")
         .and_then(Value::as_object)
