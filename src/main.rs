@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
-mod agents;
 mod args;
 mod auth;
 #[allow(dead_code)]
@@ -31,6 +30,7 @@ mod switch;
 mod sync;
 mod tools;
 mod topics;
+mod trace_host;
 mod traces;
 mod ui;
 mod util_cmd;
@@ -171,7 +171,7 @@ enum Commands {
     /// Show current identity, org, and project context
     Status(CLIArgs<status::StatusArgs>),
     /// Manage coding-agent tracing
-    Trace(CLIArgs<agents::TraceArgs>),
+    Trace(CLIArgs<bt_daemon::TraceArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
@@ -349,7 +349,9 @@ fn try_main() -> Result<()> {
             Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
-            Commands::Trace(cmd) => agents::run(cmd.base, cmd.args).await?,
+            Commands::Trace(cmd) => {
+                bt_daemon::run_trace(cmd.args, trace_host::context(cmd.base)).await?
+            }
         }
         Ok(())
     });

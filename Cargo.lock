@@ -594,7 +594,7 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=30e4b53f373940ea26c7ca943bd56c51fa431e13#30e4b53f373940ea26c7ca943bd56c51fa431e13"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=5fbfb5e2f322522a2b50cf0e089081b42a9b1559#5fbfb5e2f322522a2b50cf0e089081b42a9b1559"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -605,9 +605,11 @@ dependencies = [
  "serde",
  "serde_json 1.0.151",
  "sha2",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1180,7 +1182,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2678,7 +2680,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2691,7 +2693,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
