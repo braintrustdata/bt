@@ -205,6 +205,46 @@ fn eval_fixtures() {
 }
 
 #[test]
+fn eval_auto_instrumentation_failure_warns_and_continues() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but not installed");
+        }
+        eprintln!("Skipping auto-instrumentation failure test (node not installed).");
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-sample-init-dataset");
+    ensure_dependencies(&fixture_dir);
+
+    let output = Command::new(bt_binary_path(&root))
+        .args(["eval", "--sample", "5", "sample-init-dataset.eval.cjs"])
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_TEST_AUTO_INSTRUMENTATION_FAILURE", "1")
+        .output()
+        .expect("run eval with synthetic auto-instrumentation failure");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auto-instrumentation failure should not fail the eval\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Warning: Failed to apply Braintrust auto-instrumentation; continuing without it:"
+        ),
+        "auto-instrumentation failure should be logged\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn eval_watch_js_dependency_retriggers() {
     let _guard = test_lock();
     if !command_exists("node") {

@@ -121,6 +121,7 @@ type RunnerConfig = {
   jsonl: boolean;
   list: boolean;
   terminateOnFailure: boolean;
+  autoInstrumentation: boolean;
   filters: EvalFilter[];
   first: number | null;
   sample: number | null;
@@ -420,6 +421,7 @@ function readRunnerConfig(): RunnerConfig {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
+    autoInstrumentation: !envFlag("BT_EVAL_NO_AUTO_INSTRUMENTATION"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
     first: parsePositiveIntegerEnv("BT_EVAL_FIRST"),
     sample: parsePositiveIntegerEnv("BT_EVAL_SAMPLE"),
@@ -953,6 +955,21 @@ function initRegistry() {
 
 function ensureBraintrustAvailable() {
   resolveBraintrustPath();
+}
+
+function applyAutoInstrumentation() {
+  try {
+    const braintrustPath = resolveBraintrustPath();
+    const requireFromBraintrust = createRequire(
+      pathToFileURL(braintrustPath).href,
+    );
+    requireFromBraintrust("braintrust/apply-auto-instrumentation");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(
+      `Warning: Failed to apply Braintrust auto-instrumentation; continuing without it: ${message}`,
+    );
+  }
 }
 
 function resolveBraintrustPath(): string {
@@ -2437,6 +2454,11 @@ export async function main() {
   }
   collectStaticLocalDependencies(normalized);
   ensureBraintrustAvailable();
+  // Install loader hooks before the SDK or eval modules can load instrumented
+  // dependencies, including clients constructed inside third-party packages.
+  if (config.autoInstrumentation) {
+    applyAutoInstrumentation();
+  }
   injectRuntimeValues(config);
   const braintrust = await loadBraintrust();
   propagateInheritedBraintrustState(braintrust);

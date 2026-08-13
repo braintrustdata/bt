@@ -1,4 +1,5 @@
 {
-  "files": ["sample-init-dataset.eval.cjs"],
+  "files": ["auto-instrumentation.eval.mjs", "sample-init-dataset.eval.cjs"],
+  "runners": ["tsx", "vite-node"],
   "args": ["--sample", "5"]
 }

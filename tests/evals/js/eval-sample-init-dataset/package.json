@@ -2,9 +2,11 @@
   "name": "bt-eval-sample-init-dataset",
   "private": true,
   "dependencies": {
-    "braintrust": "link:./local-braintrust"
+    "braintrust": "link:./local-braintrust",
+    "esm-instrumentation-target": "file:./esm-instrumentation-target"
   },
   "devDependencies": {
-    "tsx": "^4.16.2"
+    "tsx": "^4.16.2",
+    "vite-node": "^6.0.0"
   }
 }

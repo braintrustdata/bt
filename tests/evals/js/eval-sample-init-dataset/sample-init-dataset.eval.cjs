@@ -1,5 +1,14 @@
 const { Eval, initDataset } = require("braintrust");
 
+if (
+  !globalThis.__btAutoInstrumentationApplied &&
+  !process.env.BT_TEST_AUTO_INSTRUMENTATION_FAILURE
+) {
+  throw new Error(
+    "Braintrust auto-instrumentation was not applied before loading the eval file",
+  );
+}
+
 function exactMatch({ output, expected }) {
   return { name: "exact_match", score: output === expected ? 1 : 0 };
 }
