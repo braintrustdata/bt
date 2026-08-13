@@ -2,7 +2,7 @@
   "name": "bt-eval-sample-init-dataset",
   "private": true,
   "dependencies": {
-    "braintrust": "link:./local-braintrust",
+    "braintrust": "file:./local-braintrust",
     "esm-instrumentation-target": "file:./esm-instrumentation-target"
   },
   "devDependencies": {
