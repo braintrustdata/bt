@@ -22,7 +22,7 @@ use crate::auth::LoginContext;
 use crate::config;
 use crate::http::ApiClient;
 use crate::ui::{self, with_spinner};
-use crate::utils::app_project_url;
+use crate::utils::{app_project_url, write_json_atomic, write_text_atomic};
 
 mod agent_stream;
 mod docs;
@@ -5008,45 +5008,19 @@ fn load_toml_table_or_default(path: &Path) -> Result<toml::map::Map<String, Toml
 }
 
 fn write_json_object(path: &Path, object: &Map<String, Value>) -> Result<()> {
-    let data = serde_json::to_string_pretty(&Value::Object(object.clone()))
-        .with_context(|| format!("failed to serialize JSON for {}", path.display()))?;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, format!("{data}\n"))
-        .with_context(|| format!("failed to finalize temp JSON file {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
-
-    Ok(())
+    write_json_atomic(path, object)
 }
 
 fn write_toml_table(path: &Path, table: &toml::map::Map<String, TomlValue>) -> Result<()> {
     let data = toml::to_string_pretty(&TomlValue::Table(table.clone()))
         .with_context(|| format!("failed to serialize TOML for {}", path.display()))?;
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, format!("{data}\n"))
-        .with_context(|| format!("failed to finalize temp TOML file {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
-
-    Ok(())
+    write_text_atomic(path, &format!("{data}\n"))
 }
 
 pub(super) fn write_text_file(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    fs::write(path, format!("{}\n", content.trim_end()))
+    let normalized = format!("{}\n", content.trim_end());
+    write_text_atomic(path, &normalized)
         .with_context(|| format!("failed to write {}", path.display()))
 }
 

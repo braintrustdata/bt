@@ -1,8 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 use std::{
-    env, fs,
-    io::{self, Write as _},
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -194,17 +193,7 @@ pub(crate) fn trimmed_option(value: Option<&str>) -> Option<&str> {
 }
 
 pub fn save_file(path: &Path, config: &Config) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-
-    let json = serde_json::to_string_pretty(config)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(json.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.as_file().sync_all()?;
-    file.persist(path)?;
-
-    Ok(())
+    crate::utils::write_json_atomic(path, config)
 }
 
 pub fn save_global(config: &Config) -> Result<()> {

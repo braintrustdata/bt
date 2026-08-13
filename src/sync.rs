@@ -26,7 +26,7 @@ use crate::experiments::api::create_experiment;
 use crate::http::ApiClient;
 use crate::projects::api::{create_project, list_projects, Project};
 use crate::ui::{animations_enabled, fuzzy_select, is_quiet};
-use crate::utils::{app_project_url, parse_duration_to_seconds};
+use crate::utils::{app_project_url, parse_duration_to_seconds, write_json_atomic};
 
 pub(crate) mod discovery;
 
@@ -4594,25 +4594,6 @@ fn value_as_string(value: Option<&Value>) -> Option<String> {
         Some(Value::Number(n)) => Some(n.to_string()),
         _ => None,
     }
-}
-
-pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-
-    let bytes = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "failed to move temporary file {} to {}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
 }
 
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {

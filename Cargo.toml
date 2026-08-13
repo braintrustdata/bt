@@ -66,6 +66,3 @@ members = ["."]
 [dev-dependencies]
 assert_cmd = "2.2.0"
 predicates = "3.1.4"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

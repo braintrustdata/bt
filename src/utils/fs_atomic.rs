@@ -1,12 +1,50 @@
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
+use tempfile::Builder;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    Default,
+    Private,
+}
+
+#[cfg(unix)]
+impl Visibility {
+    fn mode(self) -> u32 {
+        match self {
+            Visibility::Default => 0o644,
+            Visibility::Private => 0o600,
+        }
+    }
+}
 
 pub fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
     write_bytes_atomic(path, contents.as_bytes())
 }
 
+pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json(path, value, Visibility::Default)
+}
+
+pub fn write_json_atomic_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json(path, value, Visibility::Private)
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T, visibility: Visibility) -> Result<()> {
+    let mut json = serde_json::to_string_pretty(value)
+        .with_context(|| format!("failed to serialize {}", path.display()))?;
+    json.push('\n');
+    write_atomic(path, json.as_bytes(), visibility)
+}
+
 pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomic(path, contents, Visibility::Default)
+}
+
+fn write_atomic(path: &Path, contents: &[u8], visibility: Visibility) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "cannot atomically write {} because it has no parent directory",
@@ -17,104 +55,25 @@ pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
 
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("failed to read system time for atomic write")?
-        .as_nanos();
-    let pid = std::process::id();
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid target file name: {}", path.display()))?;
-
-    let tmp = parent.join(format!(".{file_name}.tmp.{pid}.{nonce}"));
-
-    std::fs::write(&tmp, contents)
-        .with_context(|| format!("failed to write temporary file {}", tmp.display()))?;
-
-    replace_file_atomic(&tmp, path)?;
-
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_file_atomic(tmp: &Path, path: &Path) -> Result<()> {
-    std::fs::rename(tmp, path).with_context(|| {
-        format!(
-            "failed to replace {} with temporary file {}",
-            path.display(),
-            tmp.display()
-        )
-    })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file_atomic(tmp: &Path, path: &Path) -> Result<()> {
-    if path.exists() {
-        replace_existing_file_windows(tmp, path)?;
-        return Ok(());
+    let mut builder = Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(visibility.mode()));
     }
+    #[cfg(not(unix))]
+    let _ = visibility;
 
-    let rename_attempt = std::fs::rename(tmp, path);
-    if rename_attempt.is_ok() {
-        return Ok(());
-    }
+    let mut file = builder
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
 
-    if path.exists() {
-        replace_existing_file_windows(tmp, path)?;
-        return Ok(());
-    }
+    file.write_all(contents)
+        .with_context(|| format!("failed to write temporary file for {}", path.display()))?;
 
-    rename_attempt.with_context(|| {
-        format!(
-            "failed to replace {} with temporary file {}",
-            path.display(),
-            tmp.display()
-        )
-    })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_existing_file_windows(tmp: &Path, path: &Path) -> Result<()> {
-    use std::iter;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    let target = path
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<u16>>();
-    let replacement = tmp
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<u16>>();
-
-    // SAFETY: Both paths are null-terminated UTF-16 strings with stable backing
-    // storage for the duration of the call, and optional pointers are null.
-    let replaced = unsafe {
-        ReplaceFileW(
-            target.as_ptr(),
-            replacement.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if replaced == 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "failed to replace {} with temporary file {}",
-                path.display(),
-                tmp.display()
-            )
-        });
-    }
+    file.persist(path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
 
     Ok(())
 }
@@ -127,21 +86,45 @@ mod tests {
     #[test]
     fn write_text_atomic_creates_file() {
         let tmp = tempdir().expect("tempdir");
-        let path = tmp.path().join("file.txt");
+        let path = tmp.path().join("nested").join("out.txt");
 
         write_text_atomic(&path, "hello").expect("write");
-        let contents = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(contents, "hello");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "hello");
     }
 
     #[test]
     fn write_text_atomic_overwrites_existing_file() {
         let tmp = tempdir().expect("tempdir");
-        let path = tmp.path().join("file.txt");
+        let path = tmp.path().join("out.txt");
         std::fs::write(&path, "old").expect("seed file");
 
-        write_text_atomic(&path, "new").expect("overwrite");
-        let contents = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(contents, "new");
+        write_text_atomic(&path, "new").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_atomic_private_tightens_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join("secrets.json");
+        std::fs::write(&path, "{}").expect("seed file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("seed permissions");
+
+        write_json_atomic_private(&path, &serde_json::json!({"secrets": {}})).expect("write");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "{\n  \"secrets\": {}\n}\n"
+        );
     }
 }

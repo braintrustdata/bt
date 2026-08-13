@@ -28,9 +28,9 @@ use crate::sync::discovery::{
 };
 use crate::sync::{
     artifact_base_dir, artifact_spec_dir, create_jsonl_file_writer, epoch_seconds, read_json_file,
-    read_jsonl_values, stable_spec_hash, write_json_atomic, write_jsonl_value, SyncPushFileArgs,
+    read_jsonl_values, stable_spec_hash, write_jsonl_value, SyncPushFileArgs,
 };
-use crate::utils::parse_duration_to_seconds;
+use crate::utils::{parse_duration_to_seconds, write_json_atomic};
 use tokio::sync::mpsc;
 
 use super::{api as datasets_api, records, utils, ResolvedContext};
