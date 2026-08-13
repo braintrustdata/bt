@@ -161,7 +161,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 - `bt eval "tests/**/*.eval.ts"` — glob pattern
 - `bt eval a.eval.ts b.eval.ts` — one or more explicit files
 
-Files inside `node_modules`, `.venv`, `venv`, `site-packages`, `dist-packages`, and `__pycache__` are excluded from automatic discovery. Explicit paths and globs bypass these exclusions.
+Files inside `node_modules`, `.venv`, `venv`, `site-packages`, `dist-packages`, `__pycache__`, and `vendor` are excluded from automatic discovery. Explicit paths and globs bypass these exclusions.
 
 **Runners:**
 
@@ -172,6 +172,25 @@ Files inside `node_modules`, `.venv`, `venv`, `site-packages`, `dist-packages`, 
 - `bt` resolves local `node_modules/.bin` entries automatically — no need for a full path.
 - If eval execution fails with ESM/top-level-await related errors, retry with:
   - `bt eval --runner vite-node tutorial.eval.ts`
+
+**Go evals:**
+
+Go works differently from JavaScript and Python. There is no runtime loading in Go, so `bt` does not
+supply the program — your compiled package _is_ the eval runner. Write it with the
+[Go SDK](https://github.com/braintrustdata/braintrust-sdk-go)'s `evalrunner` package, then:
+
+- `bt eval --language go ./cmd/evals` — point `bt` at the **package directory**. Go's compilation
+  unit is a directory, not a file, so all inputs must resolve to a single package.
+- `bt eval ./cmd/evals` — works without `--language` when the package contains a conventionally
+  named `*_eval.go` file, which `bt` uses as a discovery marker.
+- `bt eval --language go --runner ./bin/evals` — run a prebuilt binary instead of compiling. The
+  binary is spawned with no arguments; the Go runner takes all its input from the environment.
+- `BT_EVAL_GO_BIN` / `BT_EVAL_GO` override which `go` toolchain is used; otherwise `bt` looks at
+  `GOROOT` and then `PATH`.
+
+Two caveats. The first `go run` of a package with real dependencies pays compile time before
+anything is reported. And `--watch` re-runs on changes to `*.go` files in the package directory
+only — `bt` cannot follow Go imports into other packages.
 
 **Passing arguments to the eval file:**
 

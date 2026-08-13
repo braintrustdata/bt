@@ -12,6 +12,8 @@ mod env;
 mod eval;
 mod experiments;
 mod functions;
+#[cfg(unix)]
+mod go_runner;
 mod http;
 mod init;
 mod js_runner;
