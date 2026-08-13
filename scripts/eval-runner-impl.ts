@@ -1508,21 +1508,25 @@ async function serializeEvaluatorParameters(
 
   const schema: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(resolved)) {
-    if (isObject(value) && value.type === "prompt") {
-      let promptDefault = value.default;
+    if (
+      isObject(value) &&
+      (value.type === "prompt" || value.type === "model")
+    ) {
+      let defaultValue = value.default;
       if (
-        promptDefault !== undefined &&
+        value.type === "prompt" &&
+        defaultValue !== undefined &&
         helpers?.promptDefinitionToPromptData
       ) {
         try {
-          promptDefault = helpers.promptDefinitionToPromptData(promptDefault);
+          defaultValue = helpers.promptDefinitionToPromptData(defaultValue);
         } catch {
           // Keep raw prompt default when conversion utility is unavailable.
         }
       }
       schema[name] = {
-        type: "prompt",
-        ...(promptDefault !== undefined ? { default: promptDefault } : {}),
+        type: value.type,
+        ...(defaultValue !== undefined ? { default: defaultValue } : {}),
         ...(typeof value.description === "string"
           ? { description: value.description }
           : {}),
