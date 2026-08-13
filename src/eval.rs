@@ -1021,7 +1021,10 @@ where
                 });
             }
             EvalEvent::Console { stream, message } => {
-                if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr) {
+                if stream == "stderr"
+                    && !message.starts_with("Warning:")
+                    && matches!(console_policy, ConsolePolicy::BufferStderr)
+                {
                     stderr_lines.push(message);
                 } else {
                     on_event(EvalEvent::Console { stream, message });
@@ -2898,9 +2901,11 @@ impl EvalUi {
             }
             EvalEvent::Dependencies { .. } => {}
             EvalEvent::Console { stream, message } => {
-                if stream == "stdout" && (self.list || self.jsonl) {
+                if stream == "stderr" && message.starts_with("Warning:") {
+                    self.print_persistent_line(message);
+                } else if stream == "stdout" && (self.list || self.jsonl) {
                     println!("{message}");
-                } else if stream == "stderr" && !self.verbose && !message.starts_with("Warning:") {
+                } else if stream == "stderr" && !self.verbose {
                     self.suppressed_stderr_lines += 1;
                 } else {
                     let _ = self.progress.println(message);
