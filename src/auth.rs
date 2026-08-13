@@ -204,11 +204,22 @@ fn select_profile_for_app_interactive(
 }
 
 pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
-    let resolved = resolve_auth(base).await?;
-    let app_url = resolved
+    Ok(resolve_org_options(base).await?.orgs)
+}
+
+pub(crate) struct OrgOptions {
+    auth: ResolvedAuth,
+    api_key: String,
+    pub orgs: Vec<AvailableOrg>,
+}
+
+pub(crate) async fn resolve_org_options(base: &BaseArgs) -> Result<OrgOptions> {
+    let auth = resolve_auth(base).await?;
+    let app_url = auth
         .app_url
+        .clone()
         .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
-    let api_key = match resolved.api_key {
+    let api_key = match auth.api_key.clone() {
         Some(api_key) => api_key,
         None => login(base)
             .await?
@@ -225,14 +236,54 @@ pub async fn list_available_orgs(base: &BaseArgs) -> Result<Vec<AvailableOrg>> {
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    Ok(orgs
-        .into_iter()
-        .map(|org| AvailableOrg {
-            id: org.id,
-            name: org.name,
-            api_url: org.api_url,
-        })
-        .collect())
+    Ok(OrgOptions {
+        auth,
+        api_key,
+        orgs: orgs
+            .into_iter()
+            .map(|org| AvailableOrg {
+                id: org.id,
+                name: org.name,
+                api_url: org.api_url,
+            })
+            .collect(),
+    })
+}
+
+impl OrgOptions {
+    /// `/api/apikey/login` returned the whole login state alongside the org
+    /// list, so this needs no request.
+    pub(crate) async fn login_context(&self, base: &BaseArgs, org: &AvailableOrg) -> LoginContext {
+        maybe_warn_api_key_override(base);
+        let app_url = self
+            .auth
+            .app_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+        let api_url = org
+            .api_url
+            .clone()
+            .or_else(|| self.auth.api_url.clone())
+            .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+
+        let login = LoginState::new();
+        login.set(
+            self.api_key.clone(),
+            org.id.clone(),
+            org.name.clone(),
+            api_url.clone(),
+            app_url.clone(),
+        );
+
+        let ctx = LoginContext {
+            login,
+            api_url,
+            app_url,
+            profile: self.auth.profile.clone(),
+        };
+        maybe_warn_ai_provider_key_staleness(base, &ctx).await;
+        ctx
+    }
 }
 
 pub(crate) async fn list_available_orgs_for_api_key(
@@ -4953,6 +5004,61 @@ mod tests {
         assert_eq!(params.code.as_deref(), Some("next-code"));
         assert_eq!(params.state.as_deref(), Some("next-state"));
         assert!(response.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    fn org_options(api_url: Option<&str>) -> OrgOptions {
+        OrgOptions {
+            auth: ResolvedAuth {
+                api_key: Some("sk-test".to_string()),
+                api_url: api_url.map(String::from),
+                app_url: None,
+                org_name: None,
+                is_oauth: false,
+                profile: Some("test-profile".to_string()),
+            },
+            api_key: "sk-test".to_string(),
+            orgs: Vec::new(),
+        }
+    }
+
+    fn available_org(api_url: Option<&str>) -> AvailableOrg {
+        AvailableOrg {
+            id: "org_123".to_string(),
+            name: "test-org".to_string(),
+            api_url: api_url.map(String::from),
+        }
+    }
+
+    /// Must fill the same fields the SDK's `perform_login` does.
+    #[tokio::test]
+    async fn login_context_matches_a_real_login() {
+        // `json` suppresses the interactive warnings the call would otherwise emit.
+        let base: BaseArgs = crate::args::LoginBaseArgs {
+            json: true,
+            ..Default::default()
+        }
+        .into();
+        let profile_url = Some("https://api.profile.example");
+
+        let ctx = org_options(profile_url)
+            .login_context(&base, &available_org(Some("https://api.org.example")))
+            .await;
+        assert_eq!(ctx.api_url, "https://api.org.example");
+        assert_eq!(ctx.app_url, DEFAULT_APP_URL);
+        assert_eq!(ctx.profile.as_deref(), Some("test-profile"));
+        assert_eq!(ctx.login.api_key().as_deref(), Some("sk-test"));
+        assert_eq!(ctx.login.org_id().as_deref(), Some("org_123"));
+        assert_eq!(ctx.login.org_name().as_deref(), Some("test-org"));
+
+        let from_profile = org_options(profile_url)
+            .login_context(&base, &available_org(None))
+            .await;
+        assert_eq!(from_profile.api_url, "https://api.profile.example");
+
+        let from_default = org_options(None)
+            .login_context(&base, &available_org(None))
+            .await;
+        assert_eq!(from_default.api_url, DEFAULT_API_URL);
     }
 
     #[tokio::test]

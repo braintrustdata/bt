@@ -36,8 +36,7 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Create and test the local config directory before profile/project discovery.
-    config::preflight_config_write(&config_path, true)?;
+    config::preflight_config_write(&config_path)?;
 
     eprintln!("Link to a Braintrust project...");
 
@@ -52,11 +51,13 @@ pub async fn run(base: BaseArgs, _args: InitArgs) -> Result<()> {
                 login_base.profile = Some(profile);
             }
         }
-        if login_base.org_name.is_none() {
-            login_base.org_name =
-                Some(crate::switch::select_org_for_switch(&login_base, None).await?);
-        }
-        let ctx = login(&login_base).await?;
+        let ctx = if login_base.org_name.is_none() {
+            let (options, org) = crate::switch::select_org_for_switch(&login_base, None).await?;
+            login_base.org_name = Some(org.name.clone());
+            options.login_context(&login_base, &org).await
+        } else {
+            login(&login_base).await?
+        };
         let client = ApiClient::new(&ctx)?;
 
         let org = client.org_name().to_string();

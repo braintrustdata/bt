@@ -269,20 +269,56 @@ pub fn local_save_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".bt").join("config.json"))
 }
 
-/// Verify that a config can be written before doing slower work such as API calls.
-pub fn preflight_config_write(path: &Path, create_parent: bool) -> Result<()> {
+/// Creates nothing, so an aborted command leaves no config directory behind.
+pub fn preflight_config_write(path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if create_parent {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Could not create config directory {}", parent.display()))?;
+    // `save_file` creates missing parents, so permissions hinge on this one.
+    let existing = nearest_existing_dir(parent);
+
+    if !existing.is_dir() {
+        bail!(
+            "Could not create config directory {}: {} is not a directory",
+            parent.display(),
+            existing.display()
+        );
     }
 
-    let probe = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("Could not write to config directory {}", parent.display()))?;
+    let probe = tempfile::NamedTempFile::new_in(&existing)
+        .with_context(|| format!("Could not write to config directory {}", existing.display()))?;
     probe
         .close()
-        .with_context(|| format!("Could not clean up write test in {}", parent.display()))?;
+        .with_context(|| format!("Could not clean up write test in {}", existing.display()))?;
+
+    // Unix renames over a read-only target fine; Windows does not.
+    #[cfg(windows)]
+    if path
+        .metadata()
+        .is_ok_and(|meta| meta.permissions().readonly())
+    {
+        bail!(
+            "Could not write config file {}: it is read-only",
+            path.display()
+        );
+    }
+
     Ok(())
+}
+
+fn nearest_existing_dir(dir: &Path) -> PathBuf {
+    let mut current = if dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        dir.to_path_buf()
+    };
+    loop {
+        if current.exists() {
+            return current;
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent.to_path_buf(),
+            _ => return PathBuf::from("."),
+        }
+    }
 }
 
 pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
@@ -572,27 +608,46 @@ mod tests {
     }
 
     #[test]
-    fn preflight_config_write_creates_and_tests_parent() {
+    fn preflight_config_write_checks_parent_without_creating_it() {
         let tmp = TempDir::new().unwrap();
-        let parent = tmp.path().join(".bt");
-        let path = parent.join("config.json");
+        let missing = tmp.path().join(".bt");
+        let existing = tmp.path().join("config.json");
+        save_file(&existing, &Config::default()).unwrap();
 
-        preflight_config_write(&path, true).unwrap();
+        preflight_config_write(&missing.join("config.json")).unwrap();
+        preflight_config_write(&existing).unwrap();
+        assert!(!missing.exists());
 
-        assert!(parent.is_dir());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn preflight_config_write_fails_when_parent_cannot_be_created() {
-        let tmp = TempDir::new().unwrap();
-        let parent = tmp.path().join(".bt");
-        fs::write(&parent, "not a directory").unwrap();
-
-        let error = preflight_config_write(&parent.join("config.json"), true).unwrap_err();
-
+        let file_parent = tmp.path().join("not-a-dir");
+        fs::write(&file_parent, "").unwrap();
+        let error = preflight_config_write(&file_parent.join("config.json")).unwrap_err();
         assert!(error
             .to_string()
             .contains("Could not create config directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_config_write_fails_when_parent_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("locked");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the mode bits, so the probe would succeed there.
+        let permissions_enforced = fs::write(parent.join("root-check"), "").is_err();
+
+        let result = preflight_config_write(&parent.join(".bt").join("config.json"));
+
+        // Restore write access so cleanup can remove the temp dir.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if permissions_enforced {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not write to config directory"));
+        }
     }
 }
