@@ -1,12 +1,35 @@
 use std::io::Read;
+use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 
+/// Which label drained stdin, so a second `-` fails loudly instead of reading "".
+static STDIN_READER: Mutex<Option<String>> = Mutex::new(None);
+
 /// Resolve inline text, an `@PATH` file reference, or `-` for stdin.
 ///
-/// A leading literal `@` can be escaped as `@@`.
+/// A leading literal `@` can be escaped as `@@`. Only one source per invocation
+/// may read from stdin.
 pub(crate) fn read_text_source(value: &str, label: &str) -> Result<String> {
+    read_text_source_with_stdin_guard(value, label, &STDIN_READER)
+}
+
+fn read_text_source_with_stdin_guard(
+    value: &str,
+    label: &str,
+    stdin_reader: &Mutex<Option<String>>,
+) -> Result<String> {
     if value == "-" {
+        // The second reader would otherwise see "" and call it malformed input.
+        let mut reader = stdin_reader
+            .lock()
+            .map_err(|_| anyhow::anyhow!("stdin guard poisoned"))?;
+        if let Some(previous) = reader.as_deref() {
+            bail!("stdin was already read for {previous}; only one source can be '-'");
+        }
+        *reader = Some(label.to_string());
+        drop(reader);
+
         let mut content = String::new();
         std::io::stdin()
             .read_to_string(&mut content)
@@ -66,5 +89,19 @@ mod tests {
     fn rejects_empty_file_reference() {
         let error = read_text_source("@", "prompt").expect_err("empty path should fail");
         assert!(error.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_a_second_stdin_source() {
+        // A local guard avoids draining the suite's shared stdin; the rejection
+        // happens before any read.
+        let guard = Mutex::new(Some("metadata".to_string()));
+
+        let error = read_text_source_with_stdin_guard("-", "patch", &guard)
+            .expect_err("second stdin source should fail");
+        assert_eq!(
+            error.to_string(),
+            "stdin was already read for metadata; only one source can be '-'"
+        );
     }
 }

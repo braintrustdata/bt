@@ -6,13 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use urlencoding::encode;
 
-use crate::http::{ApiClient, HttpError};
+use crate::http::{ApiClient, HttpError, BTQL_EPOCH};
 
 use super::records::DATASET_RECORD_FIELDS;
 
 const MAX_DATASET_ROWS_PAGE_LIMIT: usize = 1000;
 const MAX_DATASET_ROWS_PAGES: usize = 10_000;
-const DATASET_ROWS_SINCE: &str = "1970-01-01T00:00:00Z";
 const MAX_ERROR_RESPONSE_BODY_CHARS: usize = 4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,7 +389,7 @@ fn build_dataset_rows_query(
         "filter": {
             "op": "ge",
             "left": {"op": "ident", "name": ["created"]},
-            "right": {"op": "literal", "value": DATASET_ROWS_SINCE}
+            "right": {"op": "literal", "value": BTQL_EPOCH}
         },
         "preview_length": preview_length.btql_value(),
         "limit": limit
@@ -427,7 +426,7 @@ fn build_dataset_head_xact_query(dataset_id: &str) -> Value {
         "filter": {
             "op": "ge",
             "left": {"op": "ident", "name": ["created"]},
-            "right": {"op": "literal", "value": DATASET_ROWS_SINCE}
+            "right": {"op": "literal", "value": BTQL_EPOCH}
         },
         "sort": [{
             "expr": {"op": "ident", "name": ["_xact_id"]},

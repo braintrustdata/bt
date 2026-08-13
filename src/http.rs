@@ -12,6 +12,12 @@ use crate::auth::LoginContext;
 pub const DEFAULT_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub const BT_USER_AGENT: &str = concat!("bt-cli/", env!("CARGO_PKG_VERSION"));
 
+/// Timestamp bound for BTQL queries over definition tables
+/// (`project_functions(...)`, `dataset(...)`), where listing means listing every
+/// row and no real window applies. Satisfies the filter that BTQL Safety in
+/// AGENTS.md requires. Log and span queries must use a real window instead.
+pub const BTQL_EPOCH: &str = "1970-01-01T00:00:00Z";
+
 pub fn build_http_client(timeout: std::time::Duration) -> Result<Client> {
     build_http_client_from_builder(Client::builder().timeout(timeout))
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::http::{ApiClient, BTQL_EPOCH};
 
 fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
@@ -86,11 +86,8 @@ fn list_functions_query(project_id: &str, function_type: Option<&str>) -> String
         }
         None => String::new(),
     };
-    // Function definitions can be arbitrarily old, but retain an explicit
-    // timestamp constraint to keep every BTQL query bounded.
-    format!(
-        "SELECT * FROM project_functions('{pid}') WHERE created >= '1970-01-01T00:00:00Z'{type_filter}"
-    )
+    // Definitions have no meaningful time window; see BTQL_EPOCH.
+    format!("SELECT * FROM project_functions('{pid}') WHERE created >= '{BTQL_EPOCH}'{type_filter}")
 }
 
 pub async fn get_function_by_slug(

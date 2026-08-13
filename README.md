@@ -142,7 +142,6 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt logout`    | Remove a saved Braintrust login                                    |
 | `bt switch`    | Switch org and project context                                     |
 | `bt status`    | Show current org and project context                               |
-| `bt datasets`  | Manage datasets and dataset pipelines                              |
 | `bt eval`      | Run eval files (Unix only)                                         |
 | `bt sql`       | Run SQL queries against Braintrust                                 |
 | `bt view`      | View logs, traces, and spans                                       |
@@ -192,7 +191,13 @@ bt scorers create "Quality judge" \
   --metadata @metadata.yaml
 ```
 
-Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja. Repeat `--stop-sequence` for multiple values. Tool choice accepts `auto`, `none`, `required`, or a function name. Model parameters are validated against the same model catalog and custom-model metadata used by the web UI, including parameter availability, provider-specific ranges, reasoning options, and output-token limits. Unknown custom models receive only provider-independent validation instead of being assigned capabilities based on their names.
+Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja. Repeat `--stop-sequence` for multiple values. Tool choice accepts `auto`, `none`, `required`, or a function name.
+
+Model parameters are validated against the same model catalog and custom-model metadata used by the web UI, including parameter availability, provider-specific ranges, reasoning options, and output-token limits. Note that the ranges follow the web UI rather than the raw provider APIs — for example `--frequency-penalty` and `--presence-penalty` accept `0` to `1`.
+
+Parameters are also stored under the names each provider's prompt editor expects, so a scorer created by `bt` shows the same populated fields as one created in the web UI. Google models, for example, use `maxOutputTokens` and `topP`.
+
+A model that appears in neither the catalog nor your org's or project's custom models is not assigned capabilities by format, so it receives only provider-independent range checks; a few parameters (notably `--temperature`) are still gated by well-known model-name patterns. The catalog is cached for 24 hours per app URL, org, and project, so most commands validate without any network request; a lookup miss refetches immediately, so a newly added custom model is picked up right away. Pass `--refresh-models` (or set `BRAINTRUST_REFRESH_MODELS=1`) to ignore the cache after editing a custom model in the web UI. If the metadata cannot be loaded at all, `bt` warns that it checked only basic ranges rather than failing or silently skipping the check.
 
 For classification output instead of a numeric score, use classifications in place of choice scores:
 
@@ -204,7 +209,9 @@ bt scorers create "Safety label" \
   --allow-no-match
 ```
 
-Use `--if-exists error|ignore|replace` when creating a scorer. Text and structured input flags accept an inline value, `@PATH` to read from a file, or `-` for stdin. For fields without a dedicated update flag, use `--patch` with a JSON object.
+Use `--if-exists error|ignore|replace` when creating a scorer. Text and structured input flags accept an inline value, `@PATH` to read from a file, or `-` for stdin; only one flag per command may read from stdin. For fields without a dedicated update flag, use `--patch` with a JSON object, which is deep-merged last and therefore wins over any overlapping flag.
+
+`update` only changes the fields you pass. Note that the API replaces `prompt_data` rather than merging into it, so `bt` reads the current definition and sends it back with your changes applied; a concurrent edit to the same scorer can therefore be overwritten.
 
 For code scorers, use the Braintrust SDK for your language and push the source file:
 
