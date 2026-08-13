@@ -62,6 +62,25 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     if resolved_project.is_none() && is_interactive() {
         interactive = true;
     }
+
+    // Test an explicit target before any API calls. An implicit scope isn't
+    // known until after project selection, so it is checked at write time.
+    let forced_scope = if args.local {
+        let path = config::local_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No local .bt directory found. Use bt init to initialize this directory."
+            )
+        })?;
+        config::preflight_config_write(&path)?;
+        Some((path, "local"))
+    } else if args.global {
+        let path = config::global_path()?;
+        config::preflight_config_write(&path)?;
+        Some((path, "global"))
+    } else {
+        None
+    };
+
     let requested_profile = if has_api_key_override {
         None
     } else if base.profile.is_some() {
@@ -75,23 +94,27 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         config::trimmed_option(current_cfg.profile.as_deref()).map(str::to_string)
     };
 
-    let selected_org = if resolved_org.is_some() {
-        resolved_org.clone()
-    } else if interactive {
+    let picked_org = if resolved_org.is_none() && interactive {
         let mut org_base = base.clone();
         org_base.profile = requested_profile.clone();
         org_base.org_name = None;
         Some(select_org_for_switch(&org_base, current_cfg.org.as_deref()).await?)
     } else {
-        current_cfg.org.clone()
+        None
     };
 
     let mut login_base = base.clone();
     login_base.profile = requested_profile;
-    login_base.org_name = selected_org;
+    login_base.org_name = match &picked_org {
+        Some((_, org)) => Some(org.name.clone()),
+        None => resolved_org.clone().or_else(|| current_cfg.org.clone()),
+    };
     login_base.project = resolved_project.clone();
 
-    let ctx = login(&login_base).await?;
+    let ctx = match &picked_org {
+        Some((options, org)) => options.login_context(&login_base, org).await,
+        None => login(&login_base).await?,
+    };
     let client = ApiClient::new(&ctx)?;
     let org_name = client.org_name().to_string();
 
@@ -112,17 +135,8 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    let (path, scope) = if args.local {
-        (
-            config::local_path().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No local .bt directory found. Use bt init to initialize this directory."
-                )
-            })?,
-            "local",
-        )
-    } else if args.global {
-        (config::global_path()?, "global")
+    let (path, scope) = if let Some(scope) = forced_scope {
+        scope
     } else if interactive && config::local_path().is_some() {
         select_scope()?
     } else {
@@ -162,19 +176,28 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     Ok(())
 }
 
-async fn select_org_for_switch(base: &BaseArgs, current_org: Option<&str>) -> Result<String> {
-    let orgs = auth::list_available_orgs(base).await?;
-    if orgs.len() == 1 {
-        return Ok(orgs[0].name.clone());
-    }
+/// Returns the [`auth::OrgOptions`] too, so the caller can build a login
+/// context from it.
+pub(crate) async fn select_org_for_switch(
+    base: &BaseArgs,
+    current_org: Option<&str>,
+) -> Result<(auth::OrgOptions, auth::AvailableOrg)> {
+    let options = auth::resolve_org_options(base).await?;
+    let orgs = &options.orgs;
     if orgs.is_empty() {
         bail!("no organizations available for the selected profile");
     }
 
-    let labels = orgs.iter().map(|org| org.name.as_str()).collect::<Vec<_>>();
-    let default = default_org_selection(&orgs, current_org);
-    let selected = fuzzy_select("Select organization", &labels, default)?;
-    Ok(orgs[selected].name.clone())
+    let selected = if orgs.len() == 1 {
+        0
+    } else {
+        let labels = orgs.iter().map(|org| org.name.as_str()).collect::<Vec<_>>();
+        let default = default_org_selection(orgs, current_org);
+        fuzzy_select("Select organization", &labels, default)?
+    };
+
+    let org = orgs[selected].clone();
+    Ok((options, org))
 }
 
 fn default_org_selection(orgs: &[auth::AvailableOrg], current_org: Option<&str>) -> usize {
