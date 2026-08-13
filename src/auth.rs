@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fs;
@@ -261,6 +262,15 @@ pub(crate) async fn list_available_orgs_for_api_key(
 struct AuthStore {
     #[serde(default)]
     profiles: BTreeMap<String, AuthProfile>,
+    #[serde(default)]
+    legacy_org_profiles_migrated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyProfileMerge {
+    source: String,
+    target: String,
+    removed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1675,10 +1685,7 @@ fn resolve_oauth_login_profile_name(
         .iter()
         .filter(|(_, profile)| profile_matches_oauth_login_target(profile, app_url, jwt_id))
         .max_by(|(left_name, left), (right_name, right)| {
-            left.oauth_access_expires_at
-                .unwrap_or_default()
-                .cmp(&right.oauth_access_expires_at.unwrap_or_default())
-                .then_with(|| left_name.cmp(right_name))
+            compare_oauth_profile_freshness((left_name, left), (right_name, right))
         })
         .map(|(name, _)| name.clone());
 
@@ -1688,6 +1695,17 @@ fn resolve_oauth_login_profile_name(
 
     let default_name = default_oauth_profile_name(jwt_id);
     Ok((next_available_profile_name(&default_name, store), false))
+}
+
+/// Orders OAuth profiles by remaining access-token life, name as a tiebreak.
+fn compare_oauth_profile_freshness(
+    (left_name, left): (&str, &AuthProfile),
+    (right_name, right): (&str, &AuthProfile),
+) -> std::cmp::Ordering {
+    left.oauth_access_expires_at
+        .unwrap_or_default()
+        .cmp(&right.oauth_access_expires_at.unwrap_or_default())
+        .then_with(|| left_name.cmp(right_name))
 }
 
 fn profile_matches_api_key_login_target(
@@ -3260,7 +3278,339 @@ fn current_unix_timestamp() -> u64 {
 
 fn load_auth_store() -> Result<AuthStore> {
     let path = auth_store_path()?;
-    load_auth_store_from_path(&path)
+    let store = load_auth_store_from_path(&path)?;
+    migrate_auth_store_if_needed(&path, store)
+}
+
+/// Renames org-shaped OAuth profiles to per-user ones, at most once per store.
+fn migrate_auth_store_if_needed(path: &Path, store: AuthStore) -> Result<AuthStore> {
+    if store.legacy_org_profiles_migrated {
+        return Ok(store);
+    }
+
+    let mut migrated = store.clone();
+    // Reading a secret can prompt, and each profile is asked twice.
+    let refresh_tokens: RefCell<BTreeMap<String, Option<String>>> = RefCell::new(BTreeMap::new());
+    let load_refresh_token = |name: &str| -> Option<String> {
+        if let Some(cached) = refresh_tokens.borrow().get(name) {
+            return cached.clone();
+        }
+        let loaded = load_profile_secret(&oauth_refresh_secret_key(name))
+            .ok()
+            .flatten();
+        refresh_tokens
+            .borrow_mut()
+            .insert(name.to_string(), loaded.clone());
+        loaded
+    };
+
+    let merges = merge_legacy_oauth_profile_metadata(&mut migrated, &|name| {
+        load_refresh_token(name).is_some()
+    });
+    migrated.legacy_org_profiles_migrated = true;
+    if path.exists() || !migrated.profiles.is_empty() {
+        // Save before touching the keychain: it stays writable when the
+        // config directory is not, and secrets copied first would outlive the
+        // discarded rename.
+        if let Err(err) = save_auth_store_to_path(path, &migrated) {
+            if !merges.is_empty() {
+                ui::print_command_status(
+                    ui::CommandStatus::Warning,
+                    &format!("Could not migrate org-bound profiles: {err:#}"),
+                );
+            }
+            return Ok(store);
+        }
+    }
+
+    let mut stranded = BTreeSet::new();
+    for merge in &merges {
+        if merge.source == merge.target {
+            continue;
+        }
+        // Keep the rename, but leave the old secrets as the only copy.
+        let Some(token) = load_refresh_token(&merge.source) else {
+            stranded.insert(merge.target.clone());
+            continue;
+        };
+        if save_profile_oauth_refresh_token(&merge.target, &token).is_err() {
+            stranded.insert(merge.target.clone());
+            continue;
+        }
+        if let Ok(Some(token)) = load_profile_oauth_access_token(&merge.source) {
+            let _ = save_profile_oauth_access_token(&merge.target, &token);
+        }
+    }
+
+    for (config_path, old_name, new_name) in update_merged_profile_config_references(&merges) {
+        ui::print_command_status(
+            ui::CommandStatus::Warning,
+            &format!(
+                "Could not update {}: change profile '{old_name}' to '{new_name}'.",
+                config_path.display()
+            ),
+        );
+    }
+
+    for merge in &merges {
+        if stranded.contains(&merge.target) {
+            continue;
+        }
+        for old_name in &merge.removed {
+            let _ = delete_profile_secret(old_name);
+            let _ = delete_profile_oauth_refresh_token(old_name);
+            let _ = delete_profile_oauth_access_token(old_name);
+        }
+    }
+
+    // Otherwise a later `--profile <old name>` just fails with "not found".
+    for merge in &merges {
+        for old_name in &merge.removed {
+            ui::print_command_status(
+                ui::CommandStatus::Success,
+                &format!(
+                    "Profiles are no longer tied to organizations: renamed '{old_name}' to '{}'.",
+                    merge.target
+                ),
+            );
+        }
+    }
+    for target in &stranded {
+        let profile = &migrated.profiles[target];
+        let mut command = format!("bt login --oauth --profile {target}");
+        if let Some(app_url) = profile.app_url.as_deref() {
+            command.push_str(&format!(" --app-url {app_url}"));
+        }
+        if let Some(api_url) = profile.oauth_api_url.as_deref() {
+            command.push_str(&format!(" --api-url {api_url}"));
+        }
+        ui::print_command_status(
+            ui::CommandStatus::Warning,
+            &format!(
+                "Could not read the stored credential for profile '{target}'; log in again with: {command}"
+            ),
+        );
+    }
+
+    Ok(migrated)
+}
+
+/// The identity two OAuth profiles must share to merge. `None` when the profile
+/// cannot merge at all.
+fn oauth_merge_key(profile: &AuthProfile) -> Option<(String, String, String, String)> {
+    if profile.auth_kind != AuthKind::Oauth {
+        return None;
+    }
+    let user_name = profile
+        .user_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    let email = profile
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    Some((
+        normalized_app_url(profile.app_url.as_deref()).to_string(),
+        profile
+            .oauth_api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(DEFAULT_API_URL)
+            .trim_end_matches('/')
+            .to_string(),
+        user_name.to_string(),
+        email.to_string(),
+    ))
+}
+
+fn merge_legacy_oauth_profile_metadata(
+    store: &mut AuthStore,
+    has_refresh_token: &dyn Fn(&str) -> bool,
+) -> Vec<LegacyProfileMerge> {
+    let mut groups: BTreeMap<(String, String, String, String), Vec<String>> = BTreeMap::new();
+    for (name, profile) in &store.profiles {
+        let Some(key) = oauth_merge_key(profile) else {
+            continue;
+        };
+        groups.entry(key).or_default().push(name.clone());
+    }
+
+    let mut merges = Vec::new();
+    for ((_, _, user_name, email), names) in groups {
+        if !names
+            .iter()
+            .any(|name| is_legacy_oauth_profile(&store.profiles[name]))
+        {
+            continue;
+        }
+
+        let user_ids = names
+            .iter()
+            .filter_map(|name| {
+                store.profiles[name]
+                    .user_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+            })
+            .collect::<BTreeSet<_>>();
+        if user_ids.len() > 1 {
+            // Different user ids: different accounts. Migrate each alone.
+            for name in names {
+                if is_legacy_oauth_profile(&store.profiles[&name]) {
+                    merges.push(merge_legacy_oauth_profile_group(
+                        store,
+                        &user_name,
+                        &email,
+                        vec![name],
+                        has_refresh_token,
+                    ));
+                }
+            }
+        } else {
+            merges.push(merge_legacy_oauth_profile_group(
+                store,
+                &user_name,
+                &email,
+                names,
+                has_refresh_token,
+            ));
+        }
+    }
+    merges
+}
+
+/// Whether an OAuth profile predates decoupling: `org_bound` did not exist then
+/// and every version since writes it.
+fn is_legacy_oauth_profile(profile: &AuthProfile) -> bool {
+    profile.auth_kind == AuthKind::Oauth && profile.org_bound.is_none()
+}
+
+/// Whether the name is one `bt` minted from an org: the org name, plus the
+/// `-<n>` collision suffix. Anything else came from `--profile`.
+fn is_generated_legacy_profile_name(name: &str, profile: &AuthProfile) -> bool {
+    let base = profile
+        .org_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|org| !org.is_empty())
+        .unwrap_or("profile");
+    name == base
+        || name
+            .strip_prefix(base)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn merge_legacy_oauth_profile_group(
+    store: &mut AuthStore,
+    user_name: &str,
+    email: &str,
+    names: Vec<String>,
+    has_refresh_token: &dyn Fn(&str) -> bool,
+) -> LegacyProfileMerge {
+    // The refresh token is the only part worth carrying over; expiry only
+    // breaks ties.
+    let candidates = names
+        .iter()
+        .filter(|name| has_refresh_token(name))
+        .collect::<Vec<_>>();
+    let candidates = if candidates.is_empty() {
+        names.iter().collect::<Vec<_>>()
+    } else {
+        candidates
+    };
+    let source = candidates
+        .into_iter()
+        .max_by(|left, right| {
+            compare_oauth_profile_freshness(
+                (left, &store.profiles[*left]),
+                (right, &store.profiles[*right]),
+            )
+        })
+        .expect("legacy profile group is non-empty")
+        .clone();
+    let existing_target = names
+        .iter()
+        .find(|name| !is_legacy_oauth_profile(&store.profiles[*name]))
+        .cloned();
+    // Keep the one name `bt` did not mint; two would make the pick arbitrary.
+    let chosen_name = {
+        let mut chosen = names
+            .iter()
+            .filter(|name| !is_generated_legacy_profile_name(name, &store.profiles[*name]));
+        let first = chosen.next().cloned();
+        chosen.next().is_none().then_some(first).flatten()
+    };
+
+    let mut profile = store.profiles[&source].clone();
+    profile.org_name = None;
+    profile.org_bound = Some(false);
+    for name in &names {
+        store.profiles.remove(name);
+    }
+
+    let target = existing_target.or(chosen_name).unwrap_or_else(|| {
+        let base_name = default_oauth_profile_name(&JwtIdentity {
+            subject: None,
+            name: Some(user_name.to_string()),
+            email: Some(email.to_string()),
+        });
+        next_available_profile_name(&base_name, store)
+    });
+    store.profiles.insert(target.clone(), profile);
+
+    LegacyProfileMerge {
+        source,
+        target: target.clone(),
+        removed: names.into_iter().filter(|name| name != &target).collect(),
+    }
+}
+
+/// Points config files at the merged profile names, returning `(path, old, new)`
+/// for the files it could not rewrite.
+fn update_merged_profile_config_references(
+    merges: &[LegacyProfileMerge],
+) -> Vec<(PathBuf, String, String)> {
+    let replacements: BTreeMap<&str, &str> = merges
+        .iter()
+        .flat_map(|merge| {
+            merge
+                .removed
+                .iter()
+                .map(move |old| (old.as_str(), merge.target.as_str()))
+        })
+        .collect();
+    let mut paths = Vec::new();
+    if let Ok(global) = crate::config::global_path() {
+        paths.push(global);
+    }
+    if let Some(local) = crate::config::local_path() {
+        paths.push(local);
+    }
+
+    let mut failures = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let mut config = crate::config::load_file(&path);
+        let Some((old_name, new_name)) = config
+            .profile
+            .as_deref()
+            .and_then(|name| Some((name.to_string(), (*replacements.get(name)?).to_string())))
+        else {
+            continue;
+        };
+        config.profile = Some(new_name.clone());
+        if crate::config::save_file(&path, &config).is_err() {
+            failures.push((path, old_name, new_name));
+        }
+    }
+    failures
 }
 
 fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
@@ -4543,6 +4893,307 @@ mod tests {
         assert!(!move_default_login_org_first(&mut orgs, Some("missing")));
         assert_eq!(orgs[0].name, "acme");
         assert_eq!(orgs[1].name, "beta");
+    }
+
+    fn legacy_oauth_profile(
+        org_name: &str,
+        api_url: &str,
+        app_url: &str,
+        user_name: &str,
+        email: &str,
+        expires_at: u64,
+    ) -> AuthProfile {
+        AuthProfile {
+            auth_kind: AuthKind::Oauth,
+            oauth_api_url: Some(api_url.into()),
+            app_url: Some(app_url.into()),
+            org_name: Some(org_name.into()),
+            org_bound: None,
+            oauth_access_expires_at: Some(expires_at),
+            user_name: Some(user_name.into()),
+            email: Some(email.into()),
+            ..Default::default()
+        }
+    }
+
+    fn every_profile_has_a_refresh_token(_name: &str) -> bool {
+        true
+    }
+
+    #[test]
+    fn merges_legacy_oauth_profiles_and_renames_them_for_the_user() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "test-org".into(),
+            legacy_oauth_profile(
+                "test-org",
+                "https://api.test.example",
+                "https://app.test.example",
+                "Test User",
+                "user@test.example",
+                100,
+            ),
+        );
+        store.profiles.insert(
+            "other-org".into(),
+            legacy_oauth_profile(
+                "other-org",
+                "https://api.test.example/",
+                "https://app.test.example/",
+                "Test User",
+                "user@test.example",
+                200,
+            ),
+        );
+
+        let merges =
+            merge_legacy_oauth_profile_metadata(&mut store, &every_profile_has_a_refresh_token);
+
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].source, "other-org");
+        assert_eq!(merges[0].target, "user");
+        assert_eq!(merges[0].removed, vec!["other-org", "test-org"]);
+        assert_eq!(store.profiles.keys().collect::<Vec<_>>(), vec!["user"]);
+        let merged = &store.profiles["user"];
+        assert_eq!(merged.oauth_access_expires_at, Some(200));
+        assert_eq!(merged.org_name, None);
+        assert_eq!(merged.org_bound, Some(false));
+    }
+
+    #[test]
+    fn legacy_oauth_merge_keeps_the_credential_that_still_exists() {
+        let mut store = AuthStore::default();
+        for (name, expires_at) in [("has-token", 100u64), ("no-token", 200)] {
+            store.profiles.insert(
+                name.into(),
+                legacy_oauth_profile(
+                    name,
+                    "https://api.test.example",
+                    "https://app.test.example",
+                    "Test User",
+                    "user@test.example",
+                    expires_at,
+                ),
+            );
+        }
+
+        let merges = merge_legacy_oauth_profile_metadata(&mut store, &|name| name == "has-token");
+
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].source, "has-token");
+        assert_eq!(merges[0].target, "user");
+        assert_eq!(store.profiles["user"].oauth_access_expires_at, Some(100));
+    }
+
+    #[test]
+    fn legacy_oauth_merge_falls_back_when_no_credential_can_be_read() {
+        let mut store = AuthStore::default();
+        for (name, expires_at) in [("older", 100u64), ("newer", 200)] {
+            store.profiles.insert(
+                name.into(),
+                legacy_oauth_profile(
+                    name,
+                    "https://api.test.example",
+                    "https://app.test.example",
+                    "Test User",
+                    "user@test.example",
+                    expires_at,
+                ),
+            );
+        }
+
+        let merges = merge_legacy_oauth_profile_metadata(&mut store, &|_| false);
+
+        // Nothing to prefer, so the group still merges on metadata alone.
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].source, "newer");
+        assert_eq!(merges[0].target, "user");
+    }
+
+    #[test]
+    fn merges_legacy_oauth_profiles_that_never_had_an_org() {
+        let mut store = AuthStore::default();
+        for (name, expires_at) in [("work", 100u64), ("personal", 200)] {
+            let mut profile = legacy_oauth_profile(
+                name,
+                "https://api.test.example",
+                "https://app.test.example",
+                "Test User",
+                "user@test.example",
+                expires_at,
+            );
+            profile.org_name = None;
+            store.profiles.insert(name.into(), profile);
+        }
+
+        let merges =
+            merge_legacy_oauth_profile_metadata(&mut store, &every_profile_has_a_refresh_token);
+
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].source, "personal");
+        assert_eq!(merges[0].target, "user");
+        assert_eq!(merges[0].removed, vec!["personal", "work"]);
+        assert_eq!(store.profiles.keys().collect::<Vec<_>>(), vec!["user"]);
+        assert_eq!(store.profiles["user"].org_bound, Some(false));
+    }
+
+    #[test]
+    fn legacy_oauth_merge_keeps_a_profile_name_the_user_already_chose() {
+        let mut store = AuthStore::default();
+        store.profiles.insert(
+            "test-org".into(),
+            legacy_oauth_profile(
+                "test-org",
+                "https://api.test.example",
+                "https://app.test.example",
+                "Test User",
+                "user@test.example",
+                100,
+            ),
+        );
+        let mut modern = legacy_oauth_profile(
+            "personal",
+            "https://api.test.example",
+            "https://app.test.example",
+            "Test User",
+            "user@test.example",
+            200,
+        );
+        modern.org_name = None;
+        modern.org_bound = Some(false);
+        store.profiles.insert("personal".into(), modern);
+
+        let merges =
+            merge_legacy_oauth_profile_metadata(&mut store, &every_profile_has_a_refresh_token);
+
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].target, "personal");
+        assert_eq!(merges[0].removed, vec!["test-org"]);
+        assert_eq!(store.profiles.keys().collect::<Vec<_>>(), vec!["personal"]);
+    }
+
+    #[test]
+    fn legacy_oauth_merge_keeps_the_one_name_the_user_passed_to_profile() {
+        let mut store = AuthStore::default();
+        // `bt` minted the first two names; the third came from `--profile`.
+        for (name, org_name, expires_at) in [
+            ("test-org", "test-org", 100u64),
+            ("other-org-2", "other-org", 200),
+            ("Test-User", "test-org", 300),
+        ] {
+            store.profiles.insert(
+                name.into(),
+                legacy_oauth_profile(
+                    org_name,
+                    "https://api.test.example",
+                    "https://app.test.example",
+                    "Test User",
+                    "user@test.example",
+                    expires_at,
+                ),
+            );
+        }
+
+        let merges =
+            merge_legacy_oauth_profile_metadata(&mut store, &every_profile_has_a_refresh_token);
+
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].target, "Test-User");
+        assert_eq!(merges[0].removed, vec!["other-org-2", "test-org"]);
+        assert_eq!(store.profiles.keys().collect::<Vec<_>>(), vec!["Test-User"]);
+
+        let mut two_chosen = AuthStore::default();
+        for (name, expires_at) in [("work", 100u64), ("play", 200)] {
+            two_chosen.profiles.insert(
+                name.into(),
+                legacy_oauth_profile(
+                    "test-org",
+                    "https://api.test.example",
+                    "https://app.test.example",
+                    "Test User",
+                    "user@test.example",
+                    expires_at,
+                ),
+            );
+        }
+        let merges = merge_legacy_oauth_profile_metadata(
+            &mut two_chosen,
+            &every_profile_has_a_refresh_token,
+        );
+        assert_eq!(merges[0].target, "user");
+    }
+
+    #[test]
+    fn legacy_oauth_merge_respects_migration_boundaries() {
+        let mut modern_store = AuthStore::default();
+        for name in ["work", "personal"] {
+            let mut profile = legacy_oauth_profile(
+                name,
+                "https://api.test.example",
+                "https://app.test.example",
+                "Test User",
+                "user@test.example",
+                100,
+            );
+            profile.org_name = None;
+            profile.org_bound = Some(false);
+            modern_store.profiles.insert(name.into(), profile);
+        }
+        assert!(merge_legacy_oauth_profile_metadata(
+            &mut modern_store,
+            &every_profile_has_a_refresh_token
+        )
+        .is_empty());
+
+        let mut different_accounts = AuthStore::default();
+        for (name, user_id) in [("one", "user-one"), ("two", "user-two")] {
+            let mut profile = legacy_oauth_profile(
+                name,
+                "https://api.test.example",
+                "https://app.test.example",
+                "Test User",
+                "user@test.example",
+                100,
+            );
+            profile.user_id = Some(user_id.into());
+            different_accounts.profiles.insert(name.into(), profile);
+        }
+        assert_eq!(
+            merge_legacy_oauth_profile_metadata(
+                &mut different_accounts,
+                &every_profile_has_a_refresh_token
+            )
+            .len(),
+            2
+        );
+        assert_eq!(different_accounts.profiles.len(), 2);
+
+        let mut different_apis = AuthStore::default();
+        for (name, api_url) in [
+            ("one", "https://api-one.test.example"),
+            ("two", "https://api-two.test.example"),
+        ] {
+            different_apis.profiles.insert(
+                name.into(),
+                legacy_oauth_profile(
+                    name,
+                    api_url,
+                    "https://app.test.example",
+                    "Test User",
+                    "user@test.example",
+                    100,
+                ),
+            );
+        }
+        assert_eq!(
+            merge_legacy_oauth_profile_metadata(
+                &mut different_apis,
+                &every_profile_has_a_refresh_token
+            )
+            .len(),
+            2
+        );
+        assert_eq!(different_apis.profiles.len(), 2);
     }
 
     #[test]
