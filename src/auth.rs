@@ -3313,7 +3313,9 @@ fn migrate_auth_store_if_needed(path: &Path, store: AuthStore) -> Result<AuthSto
         // config directory is not, and secrets copied first would outlive the
         // discarded rename.
         if let Err(err) = save_auth_store_to_path(path, &migrated) {
-            if !merges.is_empty() {
+            // Groups with nothing to rename only gain `org_bound`, so a failed
+            // save leaves nothing for the user to act on.
+            if merges.iter().any(|merge| !merge.removed.is_empty()) {
                 ui::print_command_status(
                     ui::CommandStatus::Warning,
                     &format!("Could not migrate org-bound profiles: {err:#}"),
@@ -3328,13 +3330,20 @@ fn migrate_auth_store_if_needed(path: &Path, store: AuthStore) -> Result<AuthSto
         if merge.source == merge.target {
             continue;
         }
-        // Keep the rename, but leave the old secrets as the only copy.
+        // Keep the rename, but leave the old secrets as the only copy. The
+        // target can already hold a usable credential — an interrupted or
+        // concurrent migration copied it, or it is a profile that predates
+        // this group — so only call it stranded once that is ruled out.
         let Some(token) = load_refresh_token(&merge.source) else {
-            stranded.insert(merge.target.clone());
+            if load_refresh_token(&merge.target).is_none() {
+                stranded.insert(merge.target.clone());
+            }
             continue;
         };
         if save_profile_oauth_refresh_token(&merge.target, &token).is_err() {
-            stranded.insert(merge.target.clone());
+            if load_refresh_token(&merge.target).is_none() {
+                stranded.insert(merge.target.clone());
+            }
             continue;
         }
         if let Ok(Some(token)) = load_profile_oauth_access_token(&merge.source) {
@@ -3537,13 +3546,15 @@ fn merge_legacy_oauth_profile_group(
         .iter()
         .find(|name| !is_legacy_oauth_profile(&store.profiles[*name]))
         .cloned();
-    // Keep the one name `bt` did not mint; two would make the pick arbitrary.
+    // Keep the names `bt` did not mint. Picking one of several would be
+    // arbitrary and dropping them all loses what the user typed, so join them.
     let chosen_name = {
-        let mut chosen = names
+        let chosen = names
             .iter()
-            .filter(|name| !is_generated_legacy_profile_name(name, &store.profiles[*name]));
-        let first = chosen.next().cloned();
-        chosen.next().is_none().then_some(first).flatten()
+            .filter(|name| !is_generated_legacy_profile_name(name, &store.profiles[*name]))
+            .cloned()
+            .collect::<Vec<_>>();
+        (!chosen.is_empty()).then(|| chosen.join("-"))
     };
 
     let mut profile = store.profiles[&source].clone();
@@ -3553,14 +3564,16 @@ fn merge_legacy_oauth_profile_group(
         store.profiles.remove(name);
     }
 
-    let target = existing_target.or(chosen_name).unwrap_or_else(|| {
-        let base_name = default_oauth_profile_name(&JwtIdentity {
+    let base_name = existing_target.or(chosen_name).unwrap_or_else(|| {
+        default_oauth_profile_name(&JwtIdentity {
             subject: None,
             name: Some(user_name.to_string()),
             email: Some(email.to_string()),
-        });
-        next_available_profile_name(&base_name, store)
+        })
     });
+    // The group's own names are gone by now, so they survive this unchanged;
+    // a name joined from several is new and can collide with another profile.
+    let target = next_available_profile_name(&base_name, store);
     store.profiles.insert(target.clone(), profile);
 
     LegacyProfileMerge {
@@ -5031,10 +5044,14 @@ mod tests {
 
         assert_eq!(merges.len(), 1);
         assert_eq!(merges[0].source, "personal");
-        assert_eq!(merges[0].target, "user");
+        // Both names came from `--profile`, so the merged profile keeps both.
+        assert_eq!(merges[0].target, "personal-work");
         assert_eq!(merges[0].removed, vec!["personal", "work"]);
-        assert_eq!(store.profiles.keys().collect::<Vec<_>>(), vec!["user"]);
-        assert_eq!(store.profiles["user"].org_bound, Some(false));
+        assert_eq!(
+            store.profiles.keys().collect::<Vec<_>>(),
+            vec!["personal-work"]
+        );
+        assert_eq!(store.profiles["personal-work"].org_bound, Some(false));
     }
 
     #[test]
@@ -5120,7 +5137,46 @@ mod tests {
             &mut two_chosen,
             &every_profile_has_a_refresh_token,
         );
-        assert_eq!(merges[0].target, "user");
+        assert_eq!(merges[0].target, "play-work");
+    }
+
+    #[test]
+    fn legacy_oauth_merge_avoids_colliding_with_an_unrelated_profile() {
+        let mut store = AuthStore::default();
+        for name in ["work", "play"] {
+            store.profiles.insert(
+                name.into(),
+                legacy_oauth_profile(
+                    "test-org",
+                    "https://api.test.example",
+                    "https://app.test.example",
+                    "Test User",
+                    "user@test.example",
+                    100,
+                ),
+            );
+        }
+        // A different account already holds the name the merge would mint.
+        let mut unrelated = legacy_oauth_profile(
+            "test-org",
+            "https://api.test.example",
+            "https://app.test.example",
+            "Other User",
+            "other@test.example",
+            100,
+        );
+        unrelated.org_bound = Some(false);
+        store.profiles.insert("play-work".into(), unrelated);
+
+        let merges =
+            merge_legacy_oauth_profile_metadata(&mut store, &every_profile_has_a_refresh_token);
+
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].target, "play-work-2");
+        assert_eq!(
+            store.profiles.keys().collect::<Vec<_>>(),
+            vec!["play-work", "play-work-2"]
+        );
     }
 
     #[test]
