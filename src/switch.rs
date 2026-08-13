@@ -62,6 +62,22 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     if resolved_project.is_none() && is_interactive() {
         interactive = true;
     }
+
+    // Resolve and test an explicitly requested filesystem target before any API calls.
+    let forced_scope = if args.local {
+        let path = config::local_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No local .bt directory found. Use bt init to initialize this directory."
+            )
+        })?;
+        config::preflight_config_write(&path, false)?;
+        Some((path, "local"))
+    } else if args.global {
+        Some((config::global_path()?, "global"))
+    } else {
+        None
+    };
+
     let requested_profile = if has_api_key_override {
         None
     } else if base.profile.is_some() {
@@ -112,17 +128,8 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
         }
     };
 
-    let (path, scope) = if args.local {
-        (
-            config::local_path().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No local .bt directory found. Use bt init to initialize this directory."
-                )
-            })?,
-            "local",
-        )
-    } else if args.global {
-        (config::global_path()?, "global")
+    let (path, scope) = if let Some(scope) = forced_scope {
+        scope
     } else if interactive && config::local_path().is_some() {
         select_scope()?
     } else {
@@ -162,7 +169,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     Ok(())
 }
 
-async fn select_org_for_switch(base: &BaseArgs, current_org: Option<&str>) -> Result<String> {
+pub(crate) async fn select_org_for_switch(
+    base: &BaseArgs,
+    current_org: Option<&str>,
+) -> Result<String> {
     let orgs = auth::list_available_orgs(base).await?;
     if orgs.len() == 1 {
         return Ok(orgs[0].name.clone());

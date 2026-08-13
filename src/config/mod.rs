@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::{
     env, fs,
@@ -267,6 +267,22 @@ pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
 
 pub fn local_save_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".bt").join("config.json"))
+}
+
+/// Verify that a config can be written before doing slower work such as API calls.
+pub fn preflight_config_write(path: &Path, create_parent: bool) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if create_parent {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create config directory {}", parent.display()))?;
+    }
+
+    let probe = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("Could not write to config directory {}", parent.display()))?;
+    probe
+        .close()
+        .with_context(|| format!("Could not clean up write test in {}", parent.display()))?;
+    Ok(())
 }
 
 pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
@@ -553,5 +569,30 @@ mod tests {
 
         save_file(&path, &config).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn preflight_config_write_creates_and_tests_parent() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join(".bt");
+        let path = parent.join("config.json");
+
+        preflight_config_write(&path, true).unwrap();
+
+        assert!(parent.is_dir());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn preflight_config_write_fails_when_parent_cannot_be_created() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join(".bt");
+        fs::write(&parent, "not a directory").unwrap();
+
+        let error = preflight_config_write(&parent.join("config.json"), true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Could not create config directory"));
     }
 }
