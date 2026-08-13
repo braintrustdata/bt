@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -593,17 +595,7 @@ fn load_ai_provider_warning_state() -> AiProviderKeyStalenessWarningState {
 }
 
 fn save_ai_provider_warning_state(state: &AiProviderKeyStalenessWarningState) -> Result<()> {
-    let path = ai_provider_warning_state_path()?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-
-    let json = serde_json::to_string_pretty(state)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(json.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.as_file().sync_all()?;
-    file.persist(path)?;
-    Ok(())
+    crate::utils::write_json_atomic(&ai_provider_warning_state_path()?, state)
 }
 
 fn stale_ai_provider_secrets(
@@ -2909,53 +2901,8 @@ fn load_secret_store() -> Result<SecretStore> {
 
 fn save_secret_store(store: &SecretStore) -> Result<()> {
     let path = secret_store_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
-    let data = serde_json::to_string_pretty(store).context("failed to serialize secret store")?;
-    let temp_path = path.with_extension("tmp");
-    let mut file = fs::File::create(&temp_path)
-        .with_context(|| format!("failed to write temp secret store {}", temp_path.display()))?;
-    file.write_all(data.as_bytes())
-        .with_context(|| format!("failed to write temp secret store {}", temp_path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to write temp secret store {}", temp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush temp secret store {}", temp_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)).with_context(|| {
-            format!(
-                "failed to set permissions on temp secret store {}",
-                temp_path.display()
-            )
-        })?;
-    }
-
-    fs::rename(&temp_path, &path).with_context(|| {
-        format!(
-            "failed to move temp secret store {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
-            format!(
-                "failed to set permissions on secret store {}",
-                path.display()
-            )
-        })?;
-    }
-
-    Ok(())
+    crate::utils::write_json_atomic_private(&path, store)
+        .with_context(|| format!("failed to write secret store {}", path.display()))
 }
 
 fn secret_store_path() -> Result<PathBuf> {
@@ -3331,53 +3278,8 @@ fn save_auth_store(store: &AuthStore) -> Result<()> {
 }
 
 fn save_auth_store_to_path(path: &Path, store: &AuthStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
-    let data = serde_json::to_string_pretty(store).context("failed to serialize auth config")?;
-    let temp_path = path.with_extension("tmp");
-    let mut file = fs::File::create(&temp_path)
-        .with_context(|| format!("failed to write temp auth config {}", temp_path.display()))?;
-    file.write_all(data.as_bytes())
-        .with_context(|| format!("failed to write temp auth config {}", temp_path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to write temp auth config {}", temp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush temp auth config {}", temp_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)).with_context(|| {
-            format!(
-                "failed to set permissions on temp auth config {}",
-                temp_path.display()
-            )
-        })?;
-    }
-
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to move temp auth config {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
-            format!(
-                "failed to set permissions on auth config {}",
-                path.display()
-            )
-        })?;
-    }
-
-    Ok(())
+    crate::utils::write_json_atomic_private(path, store)
+        .with_context(|| format!("failed to write auth config {}", path.display()))
 }
 
 fn auth_store_path() -> Result<PathBuf> {
