@@ -4,7 +4,7 @@ use dialoguer::Confirm;
 use serde_json::{json, Map, Value};
 
 use crate::{
-    functions::prompt_config::{validate_prompt_data_patch, PromptConfigArgs},
+    functions::prompt_config::{prepare_prompt_data_patch, PromptConfigArgs},
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
     utils::{merge_json_objects, read_text_source, read_yaml_object_source},
 };
@@ -74,7 +74,7 @@ impl UpdateArgs {
 
 pub async fn run(ctx: &ResolvedContext, args: &UpdateArgs, json_output: bool) -> Result<()> {
     let project_name = &ctx.project.name;
-    let body = build_patch_body(args)?;
+    let mut body = build_patch_body(args)?;
 
     let prompt = match args.slug() {
         Some(slug) => with_spinner(
@@ -93,9 +93,15 @@ pub async fn run(ctx: &ResolvedContext, args: &UpdateArgs, json_output: bool) ->
 
     with_spinner(
         "Validating model parameters...",
-        validate_prompt_data_patch(ctx, prompt.prompt_data.as_ref(), &body),
+        prepare_prompt_data_patch(
+            ctx,
+            prompt.prompt_data.as_ref(),
+            &mut body,
+            args.prompt_config.refresh_models(),
+        ),
     )
-    .await?;
+    .await?
+    .warn_if_incomplete();
 
     if !args.yes && is_interactive() {
         let confirm = Confirm::new()
@@ -161,23 +167,18 @@ fn build_patch_body(args: &UpdateArgs) -> Result<Value> {
         );
     }
 
-    let messages_json = resolve_messages(args)?;
-
-    if let Some(messages) = messages_json {
-        let prompt_block = json!({
-            "type": "chat",
-            "messages": messages,
+    if let Some(messages) = resolve_messages(args)? {
+        let prompt_data_patch = json!({
+            "prompt_data": {
+                "prompt": { "type": "chat", "messages": messages },
+            },
         });
-
-        let prompt_data = match patch.get("prompt_data") {
-            Some(Value::Object(existing)) => {
-                let mut merged = existing.clone();
-                merged.insert("prompt".to_string(), prompt_block);
-                Value::Object(merged)
-            }
-            _ => json!({ "prompt": prompt_block }),
-        };
-        patch.insert("prompt_data".to_string(), prompt_data);
+        merge_json_objects(
+            &mut patch,
+            prompt_data_patch
+                .as_object()
+                .expect("prompt data patch is an object"),
+        );
     }
 
     let prompt_config = args

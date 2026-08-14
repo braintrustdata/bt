@@ -11,7 +11,7 @@ use crate::{
 use super::{
     api,
     prompt_config::{
-        parse_choice_scores_source, parse_classifications_source, validate_prompt_data_patch,
+        parse_choice_scores_source, parse_classifications_source, prepare_prompt_data_patch,
         validate_unit_interval, PromptConfigArgs,
     },
     IfExistsMode, ResolvedContext,
@@ -118,12 +118,18 @@ pub(crate) struct CreateArgs {
 pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: bool) -> Result<()> {
     let name = resolve_name(args)?;
     let slug = resolve_slug(args, &name)?;
-    let definition = build_scorer_definition(args, &ctx.project.id, &name, &slug)?;
+    let mut definition = build_scorer_definition(args, &ctx.project.id, &name, &slug)?;
     with_spinner(
         "Validating model parameters...",
-        validate_prompt_data_patch(ctx, None, &definition),
+        prepare_prompt_data_patch(
+            ctx,
+            None,
+            &mut definition,
+            args.prompt_config.refresh_models(),
+        ),
     )
-    .await?;
+    .await?
+    .warn_if_incomplete();
 
     let result = match with_spinner(
         "Creating scorer...",
@@ -472,7 +478,7 @@ mod tests {
             "--top-p",
             "0.8",
             "--frequency-penalty",
-            "-0.25",
+            "0.25",
             "--presence-penalty",
             "0.5",
             "--stop-sequence",
@@ -499,7 +505,7 @@ mod tests {
         assert_eq!(params["temperature"], 0.1);
         assert_eq!(params["max_tokens"], 256);
         assert_eq!(params["top_p"], 0.8);
-        assert_eq!(params["frequency_penalty"], -0.25);
+        assert_eq!(params["frequency_penalty"], 0.25);
         assert_eq!(params["presence_penalty"], 0.5);
         assert_eq!(params["stop"], json!(["END"]));
         assert_eq!(params["tool_choice"], "required");

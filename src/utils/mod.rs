@@ -1,4 +1,5 @@
 mod app_url;
+mod cache;
 mod duration;
 mod fs_atomic;
 mod git;
@@ -10,6 +11,7 @@ mod structured_source;
 mod text_source;
 
 pub(crate) use app_url::{app_project_url, app_project_url_with_encoded_path};
+pub(crate) use cache::bt_cache_root;
 pub use duration::parse_duration_to_seconds;
 pub use fs_atomic::{
     write_bytes_atomic, write_json_atomic, write_json_atomic_private, write_text_atomic,

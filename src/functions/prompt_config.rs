@@ -6,10 +6,11 @@ use serde_json::{json, Map, Number, Value};
 
 use crate::{
     project_context::ProjectContext,
+    ui::{print_command_status, CommandStatus},
     utils::{merge_json_objects, read_text_source},
 };
 
-use super::model_capabilities::{resolve_model_spec, ModelSpec};
+use super::model_capabilities::{resolve_model_lookup, ModelLookup, ModelSpec};
 
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct PromptConfigArgs {
@@ -54,6 +55,11 @@ pub(crate) struct PromptConfigArgs {
     /// format; `nunjucks` and `jinja2` are accepted aliases.
     #[arg(long, value_enum, value_name = "FORMAT")]
     template_format: Option<TemplateFormat>,
+
+    /// Refetch the model catalog instead of using the local 24h cache. Use this
+    /// after editing custom models in the web UI.
+    #[arg(long, env = "BRAINTRUST_REFRESH_MODELS")]
+    refresh_models: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -113,6 +119,10 @@ impl TemplateFormat {
 }
 
 impl PromptConfigArgs {
+    pub(crate) fn refresh_models(&self) -> bool {
+        self.refresh_models
+    }
+
     /// Build a partial `prompt_data` object matching the app's prompt schema.
     pub(crate) fn build_prompt_data_patch(
         &self,
@@ -202,29 +212,134 @@ impl PromptConfigArgs {
     }
 }
 
-/// Validate the effective model configuration produced by deep-merging a patch
-/// into an existing prompt definition. Model metadata comes from the same
-/// catalog and custom-model configuration used by the web UI. If metadata is
-/// unavailable for an arbitrary model name, validation deliberately falls back
-/// to provider-independent type and range checks.
-pub(crate) async fn validate_prompt_data_patch(
+/// Whether the model-specific half of validation ran. Capability metadata comes
+/// over the network, so it can be missing — not an error, but worth reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ValidationOutcome {
+    /// Capabilities were resolved and checked, or nothing needed checking.
+    Checked,
+    /// Only provider-independent type and range checks ran.
+    CapabilitiesUnavailable { model: String },
+    /// Checks ran, but against a cached spec the fetch could not refresh.
+    CapabilitiesStale { model: String },
+}
+
+impl ValidationOutcome {
+    /// Call after any spinner finishes, or its repainting overwrites this.
+    pub(crate) fn warn_if_incomplete(&self) {
+        let message = match self {
+            Self::Checked => return,
+            Self::CapabilitiesUnavailable { model } => format!(
+                "Could not load model metadata for '{model}'; checked only basic value ranges. \
+                 Confirm this model supports the parameters you set."
+            ),
+            Self::CapabilitiesStale { model } => format!(
+                "Could not refresh model metadata; checked '{model}' against the cached catalog. \
+                 Custom models added or edited since then are not reflected."
+            ),
+        };
+        print_command_status(CommandStatus::Warning, &message);
+    }
+}
+
+/// Validate `patch` against the model it will apply to, then rewrite it into the
+/// form the API and the prompt editor expect.
+///
+/// Validation judges the effective configuration — `patch` merged over
+/// `existing_prompt_data` — not the patch alone. Without capability metadata,
+/// only provider-independent checks run and the outcome says so.
+pub(crate) async fn prepare_prompt_data_patch(
     ctx: &ProjectContext,
     existing_prompt_data: Option<&Value>,
-    patch: &Value,
-) -> Result<()> {
-    let Some(update) = prepare_model_params_update(existing_prompt_data, patch)? else {
-        return Ok(());
-    };
-    let spec = match update.model.as_deref() {
-        Some(model) => resolve_model_spec(ctx, model).await,
+    patch: &mut Value,
+    refresh_models: bool,
+) -> Result<ValidationOutcome> {
+    // Derived from the original patch: `changed_params` must reflect what the
+    // caller actually set, before `patch` is expanded below.
+    let update = prepare_model_params_update(existing_prompt_data, &*patch)?;
+    let lookup = match update.as_ref().and_then(|update| update.model.as_deref()) {
+        Some(model) => Some(resolve_model_lookup(ctx, model, refresh_models).await),
         None => None,
     };
-    validate_model_params(
-        update.model.as_deref(),
-        &update.params,
-        &update.changed_params,
-        spec.as_ref(),
-    )
+    let spec = lookup.as_ref().and_then(ModelLookup::spec);
+    let stale = lookup.as_ref().is_some_and(ModelLookup::is_stale);
+    if let Some(update) = &update {
+        // Validate before renaming; the checks are keyed by canonical name.
+        let checked = validate_model_params(
+            update.model.as_deref(),
+            &update.params,
+            &update.changed_params,
+            spec,
+        );
+        // The success path reports staleness through the outcome, but a
+        // rejection short-circuits it — and a rejection is exactly where an
+        // out-of-date limit misleads, so say so on the error too.
+        if stale {
+            checked.context(
+                "model metadata could not be refreshed; this limit comes from the cached catalog \
+                 and may predate changes made in the web UI",
+            )?;
+        } else {
+            checked?;
+        }
+    }
+
+    expand_prompt_data(patch, existing_prompt_data);
+    apply_provider_param_names(patch, spec);
+
+    // An error is its own signal; only report skipped checks otherwise.
+    match (lookup, update.and_then(|update| update.model)) {
+        (Some(lookup), Some(model)) if lookup.is_unavailable() => {
+            Ok(ValidationOutcome::CapabilitiesUnavailable { model })
+        }
+        (Some(lookup), Some(model)) if lookup.is_stale() => {
+            Ok(ValidationOutcome::CapabilitiesStale { model })
+        }
+        _ => Ok(ValidationOutcome::Checked),
+    }
+}
+
+/// Replace `patch`'s partial `prompt_data` with the full merged object.
+///
+/// PATCH deep-merges top-level fields but *replaces* `prompt_data` wholesale, so
+/// sending only the changed keys drops `prompt`, `parser`, and `options.model`.
+fn expand_prompt_data(patch: &mut Value, existing_prompt_data: Option<&Value>) {
+    let Some(patch_prompt_data) = patch.get("prompt_data").and_then(Value::as_object).cloned()
+    else {
+        return;
+    };
+    let mut merged = existing_prompt_data
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    merge_json_objects(&mut merged, &patch_prompt_data);
+    patch["prompt_data"] = Value::Object(merged);
+}
+
+/// Google prompts store these two under different keys. The proxy maps both
+/// spellings, but the prompt editor reads only these, so the canonical names
+/// leave its fields uninitialized.
+const GOOGLE_PARAM_NAMES: &[(&str, &str)] = &[("max_tokens", "maxOutputTokens"), ("top_p", "topP")];
+
+/// Rewrite parameter names to the spelling `spec`'s format expects. An unknown
+/// format keeps the canonical names.
+fn apply_provider_param_names(patch: &mut Value, spec: Option<&ModelSpec>) {
+    if spec.map(|spec| spec.format.as_str()) != Some("google") {
+        return;
+    }
+    let Some(params) = patch
+        .get_mut("prompt_data")
+        .and_then(|prompt_data| prompt_data.get_mut("options"))
+        .and_then(|options| options.get_mut("params"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (canonical, google) in GOOGLE_PARAM_NAMES {
+        if let Some(value) = params.remove(*canonical) {
+            params.insert((*google).to_string(), value);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -403,8 +518,13 @@ fn validate_model_params(
                 bail!("--verbosity must be one of low, medium, high");
             }
             if let (Some(model), Some(spec)) = (model, spec) {
-                let display_name = spec.display_name.as_deref().unwrap_or(model);
-                if !display_name.to_ascii_lowercase().contains("gpt-5") {
+                // Check the id too: a custom GPT-5 deployment can carry any
+                // display name.
+                let is_gpt_5 = [Some(model), spec.display_name.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|name| name.to_ascii_lowercase().contains("gpt-5"));
+                if !is_gpt_5 {
                     bail!("--verbosity is not supported by model '{model}'");
                 }
             }
@@ -493,15 +613,7 @@ fn validate_reasoning_effort(
         );
     }
 
-    let options: &[&str] = if is_gpt_5_pro_model(model) {
-        &["high"]
-    } else if is_gpt_5_1_or_later(model) {
-        &["none", "low", "medium", "high"]
-    } else if is_gpt_5_model(model) || gemini_thinking_level {
-        &["minimal", "low", "medium", "high"]
-    } else {
-        &["low", "medium", "high"]
-    };
+    let options = reasoning_effort_options(model, gemini_thinking_level);
     if !options.contains(&effort) {
         bail!(
             "--reasoning-effort must be one of {} for model '{model}'",
@@ -530,6 +642,18 @@ fn validate_number_range(value: f64, min: f64, max: f64, label: &str) -> Result<
     Ok(())
 }
 
+fn reasoning_effort_options(model: &str, gemini_thinking_level: bool) -> &'static [&'static str] {
+    if is_gpt_5_pro_model(model) {
+        &["high"]
+    } else if is_gpt_5_1_or_later(model) {
+        &["none", "low", "medium", "high"]
+    } else if is_gpt_5_model(model) || gemini_thinking_level {
+        &["minimal", "low", "medium", "high"]
+    } else {
+        &["low", "medium", "high"]
+    }
+}
+
 /// Keep this in sync with `modelSupportsCustomTemperature` in the backend's
 /// `typespecs/src/model-capabilities.ts`.
 fn validate_temperature_support(model: &str, params: &Map<String, Value>) -> Result<()> {
@@ -545,9 +669,14 @@ fn validate_temperature_support(model: &str, params: &Map<String, Value>) -> Res
             .and_then(Value::as_str)
             .is_some_and(|effort| effort == "none");
         if !has_no_reasoning_effort {
-            bail!(
-                "--temperature is not supported by model '{model}' unless reasoning effort is 'none'; pass `--reasoning-effort none` or omit `--temperature`"
-            );
+            // Only advise `--reasoning-effort none` on models that accept it;
+            // on the rest temperature is simply unusable.
+            if reasoning_effort_options(model, false).contains(&"none") {
+                bail!(
+                    "--temperature is not supported by model '{model}' unless reasoning effort is 'none'; pass `--reasoning-effort none` or omit `--temperature`"
+                );
+            }
+            bail!("--temperature is not supported by model '{model}'");
         }
     } else if ["o1", "o2", "o3", "o4"]
         .iter()
@@ -727,7 +856,7 @@ mod tests {
             "--top-p",
             "0.9",
             "--frequency-penalty",
-            "-0.5",
+            "0.5",
             "--presence-penalty",
             "0.25",
             "--stop-sequence",
@@ -753,7 +882,7 @@ mod tests {
         assert_eq!(patch["options"]["params"]["temperature"], 0.2);
         assert_eq!(patch["options"]["params"]["max_tokens"], 512);
         assert_eq!(patch["options"]["params"]["top_p"], 0.9);
-        assert_eq!(patch["options"]["params"]["frequency_penalty"], -0.5);
+        assert_eq!(patch["options"]["params"]["frequency_penalty"], 0.5);
         assert_eq!(patch["options"]["params"]["presence_penalty"], 0.25);
         assert_eq!(patch["options"]["params"]["stop"], json!(["END", "DONE"]));
         assert_eq!(
@@ -822,6 +951,21 @@ mod tests {
             .expect("compatible parameters");
         assert_eq!(patch["options"]["params"]["temperature"], 0.2);
         assert_eq!(patch["options"]["params"]["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn does_not_advise_reasoning_effort_none_when_the_model_rejects_it() {
+        for model in ["gpt-5", "gpt-5-mini", "gpt-5-pro"] {
+            let parsed =
+                Harness::try_parse_from(["test", "--temperature", "0.2"]).expect("parse arguments");
+            let error = parsed
+                .config
+                .build_prompt_data_patch(Some(model))
+                .expect_err("temperature is unsupported");
+            let error = error.to_string();
+            assert!(error.contains("not supported by model"), "{error}");
+            assert!(!error.contains("--reasoning-effort none"), "{error}");
+        }
     }
 
     #[test]
@@ -967,6 +1111,178 @@ mod tests {
 
         validate_patch(Some(&existing), &json!({"description": "Updated"}), None)
             .expect("an unrelated metadata update should remain possible");
+    }
+
+    #[test]
+    fn known_openai_models_use_the_web_ui_penalty_range() {
+        // `sliderSpecs` exposes 0..=1, so a negative value the OpenAI API would
+        // accept is still rejected.
+        let openai = model_spec("openai", false, false, None);
+        for (key, label) in [
+            ("frequency_penalty", "--frequency-penalty"),
+            ("presence_penalty", "--presence-penalty"),
+        ] {
+            let patch = json!({
+                "prompt_data": {
+                    "options": {
+                        "model": "gpt-4.1-mini",
+                        "params": { key: -0.5 }
+                    }
+                }
+            });
+            let error = validate_patch(None, &patch, Some(&openai))
+                .expect_err("negative penalty should fail for a catalog model");
+            assert_eq!(
+                error.to_string(),
+                format!("{label} must be between 0 and 1")
+            );
+
+            let in_range = json!({
+                "prompt_data": {
+                    "options": {
+                        "model": "gpt-4.1-mini",
+                        "params": { key: 0.5 }
+                    }
+                }
+            });
+            validate_patch(None, &in_range, Some(&openai)).expect("in-range penalty");
+        }
+    }
+
+    #[test]
+    fn unknown_models_retain_the_wider_provider_penalty_range() {
+        // Without metadata, keep the provider range rather than reject a
+        // possibly valid value.
+        let patch = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "test-custom-model",
+                    "params": { "frequency_penalty": -0.5 }
+                }
+            }
+        });
+        validate_patch(None, &patch, None).expect("unknown models keep the -2..2 range");
+    }
+
+    #[test]
+    fn verbosity_matches_the_model_id_or_its_display_name() {
+        let openai = model_spec("openai", false, false, None);
+        let mut renamed = model_spec("openai", false, false, None);
+        renamed.display_name = Some("Fast internal judge".to_string());
+
+        let patch = |model: &str| {
+            json!({
+                "prompt_data": {
+                    "options": {
+                        "model": model,
+                        "params": { "verbosity": "low" }
+                    }
+                }
+            })
+        };
+
+        // Matched on the id; the display name says nothing.
+        validate_patch(None, &patch("internal-gpt-5-deployment"), Some(&renamed))
+            .expect("a gpt-5 id should allow verbosity");
+
+        let error = validate_patch(None, &patch("gpt-4.1-mini"), Some(&openai))
+            .expect_err("non-gpt-5 models should reject verbosity");
+        assert!(error.to_string().contains("--verbosity is not supported"));
+    }
+
+    #[test]
+    fn expanding_prompt_data_keeps_fields_the_patch_does_not_mention() {
+        // PATCH replaces prompt_data, so a partial patch must be filled back out
+        // or the prompt, parser, and model are lost.
+        let existing = json!({
+            "prompt": { "type": "chat", "messages": [{ "role": "user", "content": "Judge" }] },
+            "parser": { "type": "llm_classifier", "choice_scores": { "pass": 1 } },
+            "options": { "model": "gpt-4.1-mini", "params": { "max_tokens": 500, "top_p": 0.9 } },
+        });
+        let mut patch = json!({
+            "prompt_data": { "options": { "params": { "max_tokens": 600 } } }
+        });
+
+        expand_prompt_data(&mut patch, Some(&existing));
+
+        let prompt_data = &patch["prompt_data"];
+        assert_eq!(prompt_data["prompt"], existing["prompt"]);
+        assert_eq!(prompt_data["parser"], existing["parser"]);
+        assert_eq!(prompt_data["options"]["model"], "gpt-4.1-mini");
+        assert_eq!(prompt_data["options"]["params"]["max_tokens"], 600);
+        assert_eq!(prompt_data["options"]["params"]["top_p"], 0.9);
+    }
+
+    #[test]
+    fn expanding_prompt_data_leaves_other_patches_alone() {
+        let existing = json!({ "options": { "model": "gpt-4.1-mini" } });
+
+        // No prompt_data to expand: a description-only patch must stay minimal.
+        let mut patch = json!({ "description": "desc only" });
+        expand_prompt_data(&mut patch, Some(&existing));
+        assert_eq!(patch, json!({ "description": "desc only" }));
+
+        // No existing definition (create): the patch is already complete.
+        let mut patch = json!({ "prompt_data": { "options": { "model": "gpt-4.1-mini" } } });
+        let original = patch.clone();
+        expand_prompt_data(&mut patch, None);
+        assert_eq!(patch, original);
+    }
+
+    #[test]
+    fn google_models_get_the_parameter_names_the_prompt_editor_reads() {
+        let mut patch = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "gemini-2.5-pro",
+                    "params": { "max_tokens": 1000, "top_p": 0.9, "temperature": 0.2 }
+                }
+            }
+        });
+        apply_provider_param_names(
+            &mut patch,
+            Some(&model_spec("google", true, true, Some(65535))),
+        );
+
+        let params = &patch["prompt_data"]["options"]["params"];
+        assert_eq!(params["maxOutputTokens"], 1000);
+        assert_eq!(params["topP"], 0.9);
+        // Temperature keeps its name in every format.
+        assert_eq!(params["temperature"], 0.2);
+        assert!(params.get("max_tokens").is_none());
+        assert!(params.get("top_p").is_none());
+    }
+
+    #[test]
+    fn other_formats_keep_canonical_parameter_names() {
+        let original = json!({
+            "prompt_data": {
+                "options": {
+                    "model": "gpt-4.1-mini",
+                    "params": { "max_tokens": 1000, "top_p": 0.9 }
+                }
+            }
+        });
+
+        for spec in [
+            Some(model_spec("openai", false, false, None)),
+            Some(model_spec("anthropic", false, false, None)),
+            Some(model_spec("converse", false, false, None)),
+            // An unresolved model: the format is unknown, so do not guess.
+            None,
+        ] {
+            let mut patch = original.clone();
+            apply_provider_param_names(&mut patch, spec.as_ref());
+            assert_eq!(patch, original);
+        }
+    }
+
+    #[test]
+    fn renaming_tolerates_a_patch_without_params() {
+        let mut patch = json!({ "description": "no prompt data at all" });
+        let original = patch.clone();
+        apply_provider_param_names(&mut patch, Some(&model_spec("google", false, false, None)));
+        assert_eq!(patch, original);
     }
 
     #[test]

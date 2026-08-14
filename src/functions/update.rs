@@ -11,7 +11,7 @@ use crate::{
 use super::{api, label, label_plural, select_function_interactive};
 use super::{
     prompt_config::{
-        parse_choice_scores_source, parse_classifications_source, validate_prompt_data_patch,
+        parse_choice_scores_source, parse_classifications_source, prepare_prompt_data_patch,
         validate_unit_interval, PromptConfigArgs,
     },
     FunctionTypeFilter, ResolvedContext,
@@ -161,14 +161,9 @@ pub async fn run(
     json_output: bool,
     ft: Option<FunctionTypeFilter>,
 ) -> Result<()> {
-    let body = build_patch_body(args)?;
+    let mut body = build_patch_body(args)?;
 
     let function = resolve_target_function(ctx, args, ft).await?;
-    with_spinner(
-        "Validating model parameters...",
-        validate_prompt_data_patch(ctx, function.prompt_data.as_ref(), &body),
-    )
-    .await?;
 
     // LLM scorer/classifier output flags only apply to prompt-based scorers and
     // classifiers. Reject them on other function kinds (for example tools) so an
@@ -187,6 +182,31 @@ pub async fn run(
             function.name,
         );
     }
+
+    // Mirrors `create`, where --allow-no-match requires --classifications: a
+    // score parser would never consult it.
+    let produces_classifications =
+        args.classifications.is_some() || function.function_type.as_deref() == Some("classifier");
+    if args.allow_no_match.is_some() && !produces_classifications {
+        bail!(
+            "--allow-no-match applies to classification output, but '{}' produces scores. \
+             Pass --classifications to switch it to labels.",
+            function.name,
+        );
+    }
+
+    // Last of the up-front checks because it may hit the network.
+    with_spinner(
+        "Validating model parameters...",
+        prepare_prompt_data_patch(
+            ctx,
+            function.prompt_data.as_ref(),
+            &mut body,
+            args.prompt_config.refresh_models(),
+        ),
+    )
+    .await?
+    .warn_if_incomplete();
 
     // Switching output mode updates function_type, but the API deep-merges
     // prompt_data.parser and will not drop the previous mode's keys. Warn so the
@@ -298,23 +318,18 @@ fn build_patch_body(args: &UpdateArgs) -> Result<Value> {
         patch.insert("metadata".to_string(), Value::Object(metadata));
     }
 
-    let messages_json = resolve_messages(args)?;
-
-    if let Some(messages) = messages_json {
-        let prompt_block = json!({
-            "type": "chat",
-            "messages": messages,
+    if let Some(messages) = resolve_messages(args)? {
+        let prompt_data_patch = json!({
+            "prompt_data": {
+                "prompt": { "type": "chat", "messages": messages },
+            },
         });
-
-        let prompt_data = match patch.get("prompt_data") {
-            Some(Value::Object(existing)) => {
-                let mut merged = existing.clone();
-                merged.insert("prompt".to_string(), prompt_block);
-                Value::Object(merged)
-            }
-            _ => json!({ "prompt": prompt_block }),
-        };
-        patch.insert("prompt_data".to_string(), prompt_data);
+        merge_json_objects(
+            &mut patch,
+            prompt_data_patch
+                .as_object()
+                .expect("prompt data patch is an object"),
+        );
     }
 
     let parser_patch = resolve_parser_patch(args)?;
@@ -560,7 +575,7 @@ mod tests {
             "--top-p",
             "0.9",
             "--frequency-penalty",
-            "-0.5",
+            "0.5",
             "--presence-penalty",
             "0.25",
             "--stop-sequence",
@@ -583,7 +598,7 @@ mod tests {
         assert_eq!(params["temperature"], 0.2);
         assert_eq!(params["max_tokens"], 128);
         assert_eq!(params["top_p"], 0.9);
-        assert_eq!(params["frequency_penalty"], -0.5);
+        assert_eq!(params["frequency_penalty"], 0.5);
         assert_eq!(params["presence_penalty"], 0.25);
         assert_eq!(params["stop"], json!(["END"]));
         assert_eq!(
