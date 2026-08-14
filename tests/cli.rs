@@ -18,6 +18,17 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
     }
 }
 
+/// Setup, managed run, and import resolve a Braintrust credential and org
+/// before writing a route, so those tests supply a synthetic one rather than
+/// depending on whatever auth the ambient environment happens to carry.
+fn bt_trace_command() -> Command {
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org");
+    cmd
+}
+
 fn write_executable(path: &Path) {
     fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
     #[cfg(unix)]
@@ -83,6 +94,31 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 
     let body = format!("{{\"profiles\":{{{}}}}}", entries.join(","));
     fs::write(auth_dir.join("auth.json"), body).expect("write auth store");
+}
+
+/// Record a default org the way `bt init` and `bt switch` do.
+fn write_config_org(config_home: &Path, org: &str) {
+    let config_dir = config_home.join("bt");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("config.json"),
+        format!("{{\"org\":\"{org}\"}}"),
+    )
+    .expect("write config");
+}
+
+/// Store a synthetic credential for each profile so commands that resolve a
+/// credential (rather than only listing profiles) can run offline.
+fn write_profile_secrets(config_home: &Path, profiles: &[&str]) {
+    let auth_dir = config_home.join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+
+    let entries: Vec<String> = profiles
+        .iter()
+        .map(|profile| format!("\"{profile}\":\"test-api-key\""))
+        .collect();
+    let body = format!("{{\"secrets\":{{{}}}}}", entries.join(","));
+    fs::write(auth_dir.join("secrets.json"), body).expect("write secret store");
 }
 
 #[test]
@@ -223,7 +259,8 @@ fn trace_help_exposes_user_commands_and_hides_internal_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("<SOURCE>"))
-        .stdout(predicate::str::contains("<SESSION_ID>"))
+        .stdout(predicate::str::contains("[SESSION_ID]..."))
+        .stdout(predicate::str::contains("--all"))
         .stdout(predicate::str::contains("codex"))
         .stdout(predicate::str::contains("claude"));
 
@@ -281,6 +318,89 @@ fn trace_commands_require_a_project_non_interactively() {
     }
 }
 
+/// A default org comes from `--org`/`BRAINTRUST_ORG_NAME`, the config file
+/// `bt init` and `bt switch` write, or an org-bound API key profile. A bare
+/// API key in the environment has none of those, so tracing has to ask.
+/// Non-interactively it says so instead of failing inside the trace runtime.
+#[test]
+fn trace_commands_require_an_org_when_the_credential_resolves_none() {
+    for args in [
+        vec![
+            "trace",
+            "setup",
+            "codex",
+            "--project",
+            "test-project",
+            "--no-input",
+        ],
+        vec![
+            "trace",
+            "run",
+            "codex",
+            "--project",
+            "test-project",
+            "--no-input",
+        ],
+    ] {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let config_home = tempfile::tempdir().expect("config tempdir");
+        let mut cmd = bt_command();
+        clear_braintrust_auth_env(&mut cmd);
+        cmd.env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .env("BRAINTRUST_API_KEY", "test-api-key")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "organization choice required in non-interactive mode",
+            ))
+            .stderr(predicate::str::contains("--org <NAME>"));
+    }
+}
+
+/// The other half: the org `bt init` and `bt switch` record in the config file
+/// is adopted without asking. `--no-input` makes any attempt to prompt a
+/// failure rather than a hang.
+#[cfg(unix)]
+#[test]
+fn trace_setup_adopts_the_configured_org_without_prompting() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let config = state_dir.path().join("config.json");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+    write_config_org(config_home.path(), "test-org");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("PATH", bin_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
+        .env("BT_DAEMON_CONFIG", &config)
+        .args([
+            "trace",
+            "setup",
+            "codex",
+            "--project",
+            "test-project",
+            "--no-input",
+        ])
+        .assert()
+        .success();
+
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
+    assert_eq!(settings["route"]["auth"]["org_name"], "test-org");
+}
+
 #[cfg(unix)]
 #[test]
 fn trace_run_uses_the_invocation_project_without_changing_setup() {
@@ -292,7 +412,7 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
     let setup_settings = state_dir.path().join("setup-settings.json");
     write_run_agent(&bin_dir.path().join("codex"));
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_RUN_LOG", &run_log)
@@ -340,7 +460,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("opencode"));
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("OPENCODE_BIN", bin_dir.path().join("opencode"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -392,7 +512,7 @@ fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("pi"));
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PI_BIN", bin_dir.path().join("pi"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -540,8 +660,11 @@ fn trace_status_and_stop_honor_global_json_when_daemon_is_absent() {
 #[test]
 fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["test-profile"]);
     let log = state_dir.path().join("codex.log");
     let config = state_dir.path().join("config.json");
     write_agent_cli(
@@ -561,8 +684,9 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
     )
     .expect("seed config");
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .env("BT_DAEMON_CONFIG", &config)
@@ -614,7 +738,7 @@ fn trace_setup_claude_installs_plugin_and_writes_selected_project() {
     let config = state_dir.path().join("config.json");
     write_agent_cli(&bin_dir.path().join("claude"), "[]", "[]");
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -650,8 +774,10 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
         r#"{"plugin":["other-plugin","@braintrust/trace-opencode@0.9.0"],"model":"test/model"}"#,
     )
     .expect("seed OpenCode config");
+    write_auth_store(config_home.path(), &[("work", "acme")]);
+    write_profile_secrets(config_home.path(), &["work"]);
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -696,7 +822,7 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
 fn trace_setup_honors_global_json() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
-    let stdout = bt_command()
+    let stdout = bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -737,7 +863,7 @@ fn trace_setup_pi_installs_the_npm_extension_and_selected_route() {
     let log = state_dir.path().join("pi.log");
     write_agent_cli(&bin_dir.path().join("pi"), "{}", "{}");
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -774,7 +900,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         r#"{"installed":[]}"#,
     );
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -782,7 +908,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         .args(["trace", "setup", "codex", "--project", "codex-project"])
         .assert()
         .success();
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([

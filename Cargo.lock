@@ -593,7 +593,7 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=5fbfb5e2f322522a2b50cf0e089081b42a9b1559#5fbfb5e2f322522a2b50cf0e089081b42a9b1559"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=1ca65d4381acbed0610797c4f8825556b9b6cf10#1ca65d4381acbed0610797c4f8825556b9b6cf10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2060,7 +2060,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2421,7 +2421,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2679,7 +2679,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3201,7 +3201,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
