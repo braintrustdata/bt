@@ -728,7 +728,7 @@ fn root_login_refresh_uses_selected_profile() {
 
     let output = cmd.output().expect("run bt login --refresh");
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout)
+    assert!(String::from_utf8_lossy(&output.stderr)
         .contains("`bt login --refresh` only applies to oauth profiles"));
 }
 

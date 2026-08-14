@@ -4,6 +4,7 @@ use dialoguer::Input;
 use serde_json::{json, Map, Value};
 
 use crate::{
+    error::UserError,
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
     utils::{merge_json_objects, read_text_source, read_yaml_object_source},
 };
@@ -49,10 +50,10 @@ TypeScript and Python code scorers:
 ")]
 pub(crate) struct CreateArgs {
     /// Scorer name.
-    #[arg(value_name = "NAME", conflicts_with = "name")]
+    #[arg(value_name = "NAME")]
     name_positional: Option<String>,
 
-    /// Scorer name (alternative to the positional name).
+    /// Scorer name (named form).
     #[arg(long, value_name = "NAME")]
     name: Option<String>,
 
@@ -116,9 +117,16 @@ pub(crate) struct CreateArgs {
 }
 
 pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: bool) -> Result<()> {
-    let name = resolve_name(args)?;
-    let slug = resolve_slug(args, &name)?;
-    let definition = build_scorer_definition(args, &ctx.project.id, &name, &slug)?;
+    let name = resolve_name(args).map_err(UserError::from)?;
+    let slug = resolve_slug(args, &name).map_err(UserError::from)?;
+    let definition =
+        build_scorer_definition(args, &ctx.project.id, &name, &slug).map_err(UserError::from)?;
+    let validation = with_spinner(
+        "Validating scorer...",
+        api::validate_functions(&ctx.client, std::slice::from_ref(&definition)),
+    )
+    .await?;
+    report_validation_issues(&validation).map_err(UserError::from)?;
 
     let result = match with_spinner(
         "Creating scorer...",
@@ -168,16 +176,62 @@ pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: b
     Ok(())
 }
 
+fn report_validation_issues(report: &api::FunctionValidationReport) -> Result<()> {
+    let mut blocking = Vec::new();
+    for result in &report.results {
+        for issue in &result.issues {
+            let path = issue
+                .path
+                .iter()
+                .map(|part| {
+                    part.as_str()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| part.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+            let location = if path.is_empty() {
+                issue.code.clone()
+            } else {
+                path
+            };
+            let suggestion = issue
+                .suggestion
+                .as_ref()
+                .map(
+                    |suggestion| match (suggestion.action.as_str(), &suggestion.value) {
+                        ("remove", _) => "; suggestion: remove this parameter".to_string(),
+                        ("set", Some(value)) => format!("; suggestion: set it to {value}"),
+                        _ => String::new(),
+                    },
+                )
+                .unwrap_or_default();
+            let message = format!("{location}: {}{suggestion}", issue.message);
+            if issue.blocking {
+                blocking.push(message);
+            } else {
+                print_command_status(CommandStatus::Warning, &message);
+            }
+        }
+    }
+    if blocking.is_empty() && report.valid {
+        Ok(())
+    } else if blocking.is_empty() {
+        bail!("the backend rejected the scorer definition")
+    } else {
+        bail!(blocking.join("; "))
+    }
+}
+
 fn resolve_name(args: &CreateArgs) -> Result<String> {
-    let name = match (&args.name_positional, &args.name) {
-        (Some(_), Some(_)) => bail!("use either a positional name or --name, not both"),
-        (Some(name), None) | (None, Some(name)) => name.trim().to_string(),
-        (None, None) if is_interactive() => Input::<String>::new()
+    let name = match args.name_positional.as_deref().or(args.name.as_deref()) {
+        Some(name) => name.trim().to_string(),
+        None if is_interactive() => Input::<String>::new()
             .with_prompt("Scorer name")
             .interact_text()?
             .trim()
             .to_string(),
-        (None, None) => bail!("scorer name required. Use: bt scorers create <name> ..."),
+        None => bail!("scorer name required. Use: bt scorers create <name> ..."),
     };
 
     if name.is_empty() {
@@ -395,20 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_chat_prompt_definition() {
-        let args = args();
-
-        let body =
-            build_scorer_definition(&args, "test-project", "Test", "test").expect("definition");
-
-        assert_eq!(body["prompt_data"]["prompt"]["type"], "chat");
-        assert_eq!(
-            body["prompt_data"]["prompt"]["messages"],
-            json!([{ "role": "user", "content": "Judge {{output}}." }])
-        );
-    }
-
-    #[test]
     fn rejects_non_array_messages() {
         let mut args = args();
         args.messages = r#"{"role":"user","content":"Judge {{output}}"}"#.to_string();
@@ -469,6 +509,84 @@ mod tests {
         assert_eq!(
             body["metadata"],
             json!({ "owner": "test-team", "__pass_threshold": 0.7 })
+        );
+    }
+
+    #[test]
+    fn builds_model_params_template_metadata_and_pass_threshold() {
+        let parsed = CreateArgsHarness::try_parse_from([
+            "bt-scorers-create",
+            "Test scorer",
+            "--model",
+            "gpt-test",
+            "--messages",
+            r#"[{"role":"user","content":"Judge {{output}}"}]"#,
+            "--choice-scores",
+            r#"{"yes":1,"no":0}"#,
+            "--temperature",
+            "0.1",
+            "--max-tokens",
+            "256",
+            "--top-p",
+            "0.8",
+            "--frequency-penalty",
+            "0.25",
+            "--presence-penalty",
+            "0.5",
+            "--stop-sequence",
+            "END",
+            "--tool-choice",
+            "required",
+            "--reasoning-effort",
+            "medium",
+            "--verbosity",
+            "high",
+            "--template-format",
+            "jinja",
+            "--pass-threshold",
+            "0.7",
+            "--metadata",
+            "owner: test-team",
+        ])
+        .expect("parse create args");
+
+        let body =
+            build_scorer_definition(&parsed.args, "test-project", "Test scorer", "test-scorer")
+                .expect("definition");
+        let params = &body["prompt_data"]["options"]["params"];
+        assert_eq!(params["temperature"], 0.1);
+        assert_eq!(params["max_tokens"], 256);
+        assert_eq!(params["top_p"], 0.8);
+        assert_eq!(params["frequency_penalty"], 0.25);
+        assert_eq!(params["presence_penalty"], 0.5);
+        assert_eq!(params["stop"], json!(["END"]));
+        assert_eq!(params["tool_choice"], "required");
+        assert_eq!(params["reasoning_effort"], "medium");
+        assert_eq!(params["verbosity"], "high");
+        assert_eq!(body["prompt_data"]["template_format"], "nunjucks");
+        assert_eq!(body["metadata"]["owner"], "test-team");
+        assert_eq!(body["metadata"]["__pass_threshold"], 0.7);
+    }
+
+    #[test]
+    fn positional_name_takes_precedence_over_named_form() {
+        let parsed = CreateArgsHarness::try_parse_from([
+            "bt-scorers-create",
+            "Positional name",
+            "--name",
+            "Named form",
+            "--model",
+            "gpt-test",
+            "--messages",
+            r#"[{"role":"user","content":"Judge {{output}}"}]"#,
+            "--choice-scores",
+            r#"{"yes":1,"no":0}"#,
+        ])
+        .expect("parse both name forms");
+
+        assert_eq!(
+            resolve_name(&parsed.args).expect("resolve name"),
+            "Positional name"
         );
     }
 
