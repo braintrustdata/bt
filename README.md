@@ -150,8 +150,30 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt projects` | Manage projects (list, create, view, delete)                       |
 | `bt datasets` | Manage remote datasets (list, create, update, view, delete)        |
 | `bt prompts`  | Manage prompts (list, view, delete)                                |
+| `bt scorers`  | Manage scorers (list, create, view, invoke, delete)                |
 | `bt sync`     | Synchronize project logs between Braintrust and local NDJSON files |
 | `bt update`   | Update bt in-place                                                 |
+
+## `bt scorers`
+
+Create prompt-based LLM scorers or classifiers in the current project:
+
+```bash
+bt scorers create "Helpfulness" \
+  --model gpt-5.4-nano \
+  --messages @messages.json \
+  --choice-scores '{"A":1,"B":0}'
+
+bt scorers create "Safety label" \
+  --model gpt-5.4-nano \
+  --messages @messages.json \
+  --classifications '["safe","unsafe"]' \
+  --allow-no-match
+```
+
+Use `--if-exists error|ignore|replace` to control slug conflicts. Text and structured input flags accept an inline value, `@PATH`, or `-` for stdin; only one flag per command may read stdin. Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja.
+
+For TypeScript and Python code scorers, use the Braintrust SDK and `bt functions push`.
 
 ## `bt eval`
 
