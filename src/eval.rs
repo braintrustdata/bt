@@ -394,6 +394,15 @@ pub struct EvalArgs {
     #[arg(last = true, value_name = "ARG")]
     pub extra_args: Vec<String>,
 
+    /// Disable automatic instrumentation of supported JavaScript LLM SDKs.
+    #[arg(
+        long,
+        env = "BT_EVAL_NO_AUTO_INSTRUMENTATION",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false
+    )]
+    pub no_auto_instrumentation: bool,
+
     /// Start the eval dev web server.
     #[arg(
         long,
@@ -443,6 +452,7 @@ struct EvalRunOptions {
     sampling: EvalSamplingMode,
     verbose: bool,
     extra_args: Vec<String>,
+    auto_instrumentation: bool,
     params: Vec<String>,
     matrix_axes: Vec<(String, Vec<serde_json::Value>)>,
 }
@@ -494,6 +504,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
         verbose: base.verbose,
         sampling,
         extra_args: args.extra_args,
+        auto_instrumentation: !args.no_auto_instrumentation,
         params: args.param,
         matrix_axes,
     };
@@ -878,6 +889,9 @@ async fn spawn_eval_runner(
             RunnerKind::Other => "other",
         };
         cmd.env("BT_EVAL_RUNNER_KIND", runner_name);
+        if !options.auto_instrumentation {
+            cmd.env("BT_EVAL_NO_AUTO_INSTRUMENTATION", "1");
+        }
     }
     if !options.extra_args.is_empty() {
         let serialized =
@@ -1007,7 +1021,10 @@ where
                 });
             }
             EvalEvent::Console { stream, message } => {
-                if stream == "stderr" && matches!(console_policy, ConsolePolicy::BufferStderr) {
+                if stream == "stderr"
+                    && !message.starts_with("Warning:")
+                    && matches!(console_policy, ConsolePolicy::BufferStderr)
+                {
                     stderr_lines.push(message);
                 } else {
                     on_event(EvalEvent::Console { stream, message });
@@ -2884,7 +2901,9 @@ impl EvalUi {
             }
             EvalEvent::Dependencies { .. } => {}
             EvalEvent::Console { stream, message } => {
-                if stream == "stdout" && (self.list || self.jsonl) {
+                if stream == "stderr" && message.starts_with("Warning:") {
+                    self.print_persistent_line(message);
+                } else if stream == "stdout" && (self.list || self.jsonl) {
                     println!("{message}");
                 } else if stream == "stderr" && !self.verbose {
                     self.suppressed_stderr_lines += 1;
@@ -4838,6 +4857,7 @@ mod tests {
             "BT_EVAL_SAMPLE",
             "BT_EVAL_SAMPLE_SEED",
             "BT_EVAL_WATCH",
+            "BT_EVAL_NO_AUTO_INSTRUMENTATION",
             "BT_EVAL_DEV",
             "BT_EVAL_DEV_HOST",
             "BT_EVAL_DEV_PORT",
@@ -4851,6 +4871,7 @@ mod tests {
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
         set_env_var("BT_EVAL_WATCH", "on");
+        set_env_var("BT_EVAL_NO_AUTO_INSTRUMENTATION", "true");
         set_env_var("BT_EVAL_DEV", "true");
         set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
         set_env_var("BT_EVAL_DEV_PORT", "9999");
@@ -4870,6 +4891,7 @@ mod tests {
             ]
         );
         assert!(parsed.eval.watch);
+        assert!(parsed.eval.no_auto_instrumentation);
         assert!(parsed.eval.dev);
         assert_eq!(parsed.eval.dev_host, "127.0.0.1");
         assert_eq!(parsed.eval.dev_port, 9999);

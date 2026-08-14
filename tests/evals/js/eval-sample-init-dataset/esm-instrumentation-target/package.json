@@ -1,0 +1,6 @@
+{
+  "name": "esm-instrumentation-target",
+  "version": "0.0.0-test",
+  "type": "module",
+  "exports": "./index.mjs"
+}

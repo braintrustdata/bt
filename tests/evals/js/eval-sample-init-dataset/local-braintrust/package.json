@@ -3,6 +3,7 @@
   "version": "0.0.0-local",
   "main": "./dist/index.js",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./apply-auto-instrumentation": "./dist/apply-auto-instrumentation.js"
   }
 }
