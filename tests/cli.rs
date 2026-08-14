@@ -96,6 +96,17 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
     fs::write(auth_dir.join("auth.json"), body).expect("write auth store");
 }
 
+/// Record a default org the way `bt init` and `bt switch` do.
+fn write_config_org(config_home: &Path, org: &str) {
+    let config_dir = config_home.join("bt");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("config.json"),
+        format!("{{\"org\":\"{org}\"}}"),
+    )
+    .expect("write config");
+}
+
 /// Store a synthetic credential for each profile so commands that resolve a
 /// credential (rather than only listing profiles) can run offline.
 fn write_profile_secrets(config_home: &Path, profiles: &[&str]) {
@@ -305,6 +316,89 @@ fn trace_commands_require_a_project_non_interactively() {
             ))
             .stderr(predicate::str::contains("--project <NAME>"));
     }
+}
+
+/// A default org comes from `--org`/`BRAINTRUST_ORG_NAME`, the config file
+/// `bt init` and `bt switch` write, or an org-bound API key profile. A bare
+/// API key in the environment has none of those, so tracing has to ask.
+/// Non-interactively it says so instead of failing inside the trace runtime.
+#[test]
+fn trace_commands_require_an_org_when_the_credential_resolves_none() {
+    for args in [
+        vec![
+            "trace",
+            "setup",
+            "codex",
+            "--project",
+            "test-project",
+            "--no-input",
+        ],
+        vec![
+            "trace",
+            "run",
+            "codex",
+            "--project",
+            "test-project",
+            "--no-input",
+        ],
+    ] {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let config_home = tempfile::tempdir().expect("config tempdir");
+        let mut cmd = bt_command();
+        clear_braintrust_auth_env(&mut cmd);
+        cmd.env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .env("BRAINTRUST_API_KEY", "test-api-key")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "organization choice required in non-interactive mode",
+            ))
+            .stderr(predicate::str::contains("--org <NAME>"));
+    }
+}
+
+/// The other half: the org `bt init` and `bt switch` record in the config file
+/// is adopted without asking. `--no-input` makes any attempt to prompt a
+/// failure rather than a hang.
+#[cfg(unix)]
+#[test]
+fn trace_setup_adopts_the_configured_org_without_prompting() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let config = state_dir.path().join("config.json");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+    write_config_org(config_home.path(), "test-org");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("PATH", bin_dir.path())
+        .env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
+        .env("BT_DAEMON_CONFIG", &config)
+        .args([
+            "trace",
+            "setup",
+            "codex",
+            "--project",
+            "test-project",
+            "--no-input",
+        ])
+        .assert()
+        .success();
+
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(config).expect("read config")).expect("parse config");
+    assert_eq!(settings["route"]["auth"]["org_name"], "test-org");
 }
 
 #[cfg(unix)]
