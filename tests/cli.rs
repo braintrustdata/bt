@@ -18,6 +18,17 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
     }
 }
 
+/// Setup, managed run, and import resolve a Braintrust credential and org
+/// before writing a route, so those tests supply a synthetic one rather than
+/// depending on whatever auth the ambient environment happens to carry.
+fn bt_trace_command() -> Command {
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org");
+    cmd
+}
+
 fn write_executable(path: &Path) {
     fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
     #[cfg(unix)]
@@ -83,6 +94,20 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 
     let body = format!("{{\"profiles\":{{{}}}}}", entries.join(","));
     fs::write(auth_dir.join("auth.json"), body).expect("write auth store");
+}
+
+/// Store a synthetic credential for each profile so commands that resolve a
+/// credential (rather than only listing profiles) can run offline.
+fn write_profile_secrets(config_home: &Path, profiles: &[&str]) {
+    let auth_dir = config_home.join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+
+    let entries: Vec<String> = profiles
+        .iter()
+        .map(|profile| format!("\"{profile}\":\"test-api-key\""))
+        .collect();
+    let body = format!("{{\"secrets\":{{{}}}}}", entries.join(","));
+    fs::write(auth_dir.join("secrets.json"), body).expect("write secret store");
 }
 
 #[test]
@@ -223,7 +248,8 @@ fn trace_help_exposes_user_commands_and_hides_internal_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("<SOURCE>"))
-        .stdout(predicate::str::contains("<SESSION_ID>"))
+        .stdout(predicate::str::contains("[SESSION_ID]..."))
+        .stdout(predicate::str::contains("--all"))
         .stdout(predicate::str::contains("codex"))
         .stdout(predicate::str::contains("claude"));
 
@@ -292,7 +318,7 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
     let setup_settings = state_dir.path().join("setup-settings.json");
     write_run_agent(&bin_dir.path().join("codex"));
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_RUN_LOG", &run_log)
@@ -307,8 +333,14 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
             "--",
             "--version",
         ])
+        // The fake agent emits no hook events, so the managed run reports an
+        // empty trace once it exits. Everything asserted below is written
+        // before that check.
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains(
+            "managed run produced no accepted trace events",
+        ));
 
     let args = fs::read_to_string(run_log).expect("read run args");
     assert!(args.contains("--version"));
@@ -340,7 +372,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("opencode"));
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("OPENCODE_BIN", bin_dir.path().join("opencode"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -356,7 +388,10 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
             "--version",
         ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains(
+            "managed run produced no accepted trace events",
+        ));
 
     let inline: serde_json::Value =
         serde_json::from_slice(&fs::read(run_config).expect("read OpenCode inline config"))
@@ -392,7 +427,7 @@ fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("pi"));
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PI_BIN", bin_dir.path().join("pi"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -407,7 +442,10 @@ fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
             "--version",
         ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains(
+            "managed run produced no accepted trace events",
+        ));
 
     assert!(fs::read_to_string(run_log)
         .expect("read Pi arguments")
@@ -540,8 +578,11 @@ fn trace_status_and_stop_honor_global_json_when_daemon_is_absent() {
 #[test]
 fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["test-profile"]);
     let log = state_dir.path().join("codex.log");
     let config = state_dir.path().join("config.json");
     write_agent_cli(
@@ -561,8 +602,9 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
     )
     .expect("seed config");
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
         .env("BT_DAEMON_CONFIG", &config)
@@ -614,7 +656,7 @@ fn trace_setup_claude_installs_plugin_and_writes_selected_project() {
     let config = state_dir.path().join("config.json");
     write_agent_cli(&bin_dir.path().join("claude"), "[]", "[]");
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -650,8 +692,10 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
         r#"{"plugin":["other-plugin","@braintrust/trace-opencode@0.9.0"],"model":"test/model"}"#,
     )
     .expect("seed OpenCode config");
+    write_auth_store(config_home.path(), &[("work", "acme")]);
+    write_profile_secrets(config_home.path(), &["work"]);
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -696,7 +740,7 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
 fn trace_setup_honors_global_json() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
-    let stdout = bt_command()
+    let stdout = bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -737,7 +781,7 @@ fn trace_setup_pi_installs_the_npm_extension_and_selected_route() {
     let log = state_dir.path().join("pi.log");
     write_agent_cli(&bin_dir.path().join("pi"), "{}", "{}");
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -774,7 +818,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         r#"{"installed":[]}"#,
     );
 
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -782,7 +826,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         .args(["trace", "setup", "codex", "--project", "codex-project"])
         .assert()
         .success();
-    bt_command()
+    bt_trace_command()
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([

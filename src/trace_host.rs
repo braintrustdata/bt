@@ -10,7 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bt_daemon::wire::{AuthSelection, BackendAuth, FlushMode, SessionRoute, TraceDestination};
 use bt_daemon::{
-    AuthLease, AuthResolveReason, OutputFormat, RunHookCommand, TraceHostContext, TraceHostServices,
+    AuthLease, AuthResolveReason, OutputFormat, RouteRequirements, RunHookCommand,
+    TraceHostContext, TraceHostServices,
 };
 
 use crate::args::BaseArgs;
@@ -93,8 +94,15 @@ async fn resolve_trace_project(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
 
 #[async_trait]
 impl TraceHostServices for BtTraceHost {
-    async fn resolve_route(&self, destination_required: bool) -> anyhow::Result<SessionRoute> {
-        let base = if destination_required {
+    async fn resolve_route(&self, requirements: RouteRequirements) -> anyhow::Result<SessionRoute> {
+        // Commands that run inside an agent's turn (hooks) leave this false so
+        // no missing profile or org can block the turn on a prompt. bt gates
+        // every prompt on this global, including the ones `resolve_auth`
+        // reaches later in the same process.
+        if !requirements.interactive_auth {
+            crate::ui::set_no_input(true);
+        }
+        let base = if requirements.destination_required {
             resolve_trace_project(self.base.clone()).await?
         } else {
             self.base.clone()
