@@ -72,9 +72,11 @@ pub async fn list_functions(
     let query = match function_type {
         Some(ft) => {
             let ft = escape_sql(ft);
-            format!("SELECT * FROM project_functions('{pid}') WHERE function_type = '{ft}'")
+            format!("SELECT * FROM project_functions('{pid}') WHERE created >= '1970-01-01T00:00:00Z' AND function_type = '{ft}'")
         }
-        None => format!("SELECT * FROM project_functions('{pid}')"),
+        None => format!(
+            "SELECT * FROM project_functions('{pid}') WHERE created >= '1970-01-01T00:00:00Z'"
+        ),
     };
     let response = client.btql::<Function>(&query).await?;
 
