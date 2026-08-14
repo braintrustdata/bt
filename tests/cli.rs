@@ -427,14 +427,8 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
             "--",
             "--version",
         ])
-        // The fake agent emits no hook events, so the managed run reports an
-        // empty trace once it exits. Everything asserted below is written
-        // before that check.
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "managed run produced no accepted trace events",
-        ));
+        .success();
 
     let args = fs::read_to_string(run_log).expect("read run args");
     assert!(args.contains("--version"));
@@ -482,10 +476,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
             "--version",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "managed run produced no accepted trace events",
-        ));
+        .success();
 
     let inline: serde_json::Value =
         serde_json::from_slice(&fs::read(run_config).expect("read OpenCode inline config"))
@@ -536,10 +527,7 @@ fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
             "--version",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "managed run produced no accepted trace events",
-        ));
+        .success();
 
     assert!(fs::read_to_string(run_log)
         .expect("read Pi arguments")
