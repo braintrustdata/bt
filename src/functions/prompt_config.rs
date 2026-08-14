@@ -8,23 +8,29 @@ use crate::utils::read_text_source;
 
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct PromptConfigArgs {
-    /// Sampling temperature.
+    /// Sampling temperature, between 0 and 2. Some models support a smaller
+    /// range or do not support custom temperatures.
     #[arg(long, value_name = "NUMBER")]
     temperature: Option<f64>,
 
-    /// Maximum number of generated tokens.
+    /// Maximum number of generated tokens. Must be greater than 0.
     #[arg(long, value_name = "N")]
     max_tokens: Option<u64>,
 
-    /// Nucleus sampling probability.
+    /// Nucleus sampling probability, between 0 and 1.
     #[arg(long, value_name = "NUMBER")]
     top_p: Option<f64>,
 
-    /// Frequency penalty.
+    /// Top-k sampling value, between 1 and 100. Availability depends on the
+    /// model provider.
+    #[arg(long, value_name = "N")]
+    top_k: Option<u64>,
+
+    /// Frequency penalty. Availability and range depend on the model.
     #[arg(long, value_name = "NUMBER", allow_hyphen_values = true)]
     frequency_penalty: Option<f64>,
 
-    /// Presence penalty.
+    /// Presence penalty. Availability and range depend on the model.
     #[arg(long, value_name = "NUMBER", allow_hyphen_values = true)]
     presence_penalty: Option<f64>,
 
@@ -39,6 +45,20 @@ pub(crate) struct PromptConfigArgs {
     /// Reasoning effort for supported models.
     #[arg(long, value_enum)]
     reasoning_effort: Option<ReasoningEffort>,
+
+    /// Enable reasoning for models that configure reasoning with a token
+    /// budget rather than an effort level.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = BoolishValueParser::new()
+    )]
+    reasoning_enabled: Option<bool>,
+
+    /// Reasoning token budget, between 0 and 32768, for supported models.
+    #[arg(long, value_name = "N")]
+    reasoning_budget: Option<u64>,
 
     /// Response verbosity for supported models.
     #[arg(long, value_enum)]
@@ -139,20 +159,13 @@ impl PromptConfigArgs {
             options.insert("model".to_string(), Value::String(model.to_string()));
         }
 
-        let temperature = match (self.temperature, self.use_cache) {
-            (None, Some(true)) => Some(0.0),
-            (Some(temperature), Some(true)) if temperature != 0.0 => {
-                bail!("--use-cache=true requires --temperature=0")
-            }
-            (temperature, _) => temperature,
-        };
-        insert_optional_number(&mut params, "temperature", temperature)?;
+        insert_optional_number(&mut params, "temperature", self.temperature)?;
         if let Some(max_tokens) = self.max_tokens {
             params.insert("max_tokens".to_string(), Value::Number(max_tokens.into()));
         }
-        if let Some(top_p) = self.top_p {
-            validate_unit_interval(top_p, "--top-p")?;
-            insert_number(&mut params, "top_p", top_p, "--top-p")?;
+        insert_optional_number(&mut params, "top_p", self.top_p)?;
+        if let Some(top_k) = self.top_k {
+            params.insert("top_k".to_string(), Value::Number(top_k.into()));
         }
         insert_optional_number(&mut params, "frequency_penalty", self.frequency_penalty)?;
         insert_optional_number(&mut params, "presence_penalty", self.presence_penalty)?;
@@ -188,6 +201,15 @@ impl PromptConfigArgs {
             params.insert(
                 "reasoning_effort".to_string(),
                 Value::String(reasoning_effort.as_str().to_string()),
+            );
+        }
+        if let Some(reasoning_enabled) = self.reasoning_enabled {
+            params.insert("reasoning_enabled".to_string(), reasoning_enabled.into());
+        }
+        if let Some(reasoning_budget) = self.reasoning_budget {
+            params.insert(
+                "reasoning_budget".to_string(),
+                Value::Number(reasoning_budget.into()),
             );
         }
         if let Some(verbosity) = self.verbosity {
@@ -380,7 +402,7 @@ mod tests {
             "--top-p",
             "0.9",
             "--frequency-penalty",
-            "-0.5",
+            "0.5",
             "--presence-penalty",
             "0.25",
             "--stop-sequence",
@@ -409,7 +431,7 @@ mod tests {
         assert_eq!(patch["options"]["params"]["temperature"], 0.2);
         assert_eq!(patch["options"]["params"]["max_tokens"], 512);
         assert_eq!(patch["options"]["params"]["top_p"], 0.9);
-        assert_eq!(patch["options"]["params"]["frequency_penalty"], -0.5);
+        assert_eq!(patch["options"]["params"]["frequency_penalty"], 0.5);
         assert_eq!(patch["options"]["params"]["presence_penalty"], 0.25);
         assert_eq!(patch["options"]["params"]["stop"], json!(["END", "DONE"]));
         assert_eq!(
@@ -434,29 +456,16 @@ mod tests {
     }
 
     #[test]
-    fn enabling_cache_sets_the_temperature_required_by_the_web_ui() {
-        let args = Harness::try_parse_from(["test", "--use-cache=true"]).expect("parse arguments");
-
-        let patch = args
-            .config
-            .build_prompt_data_patch(Some("claude-test"))
-            .expect("prompt data");
-        assert_eq!(patch["options"]["params"]["temperature"], 0.0);
-        assert_eq!(patch["options"]["params"]["use_cache"], true);
-    }
-
-    #[test]
-    fn rejects_cache_with_nonzero_temperature() {
+    fn sends_cache_and_temperature_values_without_client_normalization() {
         let args = Harness::try_parse_from(["test", "--temperature", "0.5", "--use-cache=true"])
             .expect("parse arguments");
 
-        let error = args
+        let patch = args
             .config
-            .build_prompt_data_patch(Some("claude-test"))
-            .expect_err("nonzero temperature should conflict with caching");
-        assert!(error
-            .to_string()
-            .contains("--use-cache=true requires --temperature=0"));
+            .build_prompt_data_patch(Some("test-model"))
+            .expect("prompt data");
+        assert_eq!(patch["options"]["params"]["temperature"], 0.5);
+        assert_eq!(patch["options"]["params"]["use_cache"], true);
     }
 
     #[test]

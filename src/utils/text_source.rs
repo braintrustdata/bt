@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
@@ -20,6 +20,8 @@ fn read_text_source_with_stdin_guard(
     stdin_reader: &Mutex<Option<String>>,
 ) -> Result<String> {
     if value == "-" {
+        ensure_stdin_is_piped(label, std::io::stdin().is_terminal())?;
+
         // The second reader would otherwise see "" and call it malformed input.
         let mut reader = stdin_reader
             .lock()
@@ -50,6 +52,15 @@ fn read_text_source_with_stdin_guard(
     }
 
     Ok(value.to_string())
+}
+
+fn ensure_stdin_is_piped(label: &str, stdin_is_terminal: bool) -> Result<()> {
+    if stdin_is_terminal {
+        bail!(
+            "cannot read {label} from interactive stdin; pipe input or use an inline value or @PATH"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -89,6 +100,17 @@ mod tests {
     fn rejects_empty_file_reference() {
         let error = read_text_source("@", "prompt").expect_err("empty path should fail");
         assert!(error.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn rejects_interactive_stdin_source() {
+        let error = ensure_stdin_is_piped("messages", true)
+            .expect_err("interactive stdin should not wait for EOF");
+
+        assert_eq!(
+            error.to_string(),
+            "cannot read messages from interactive stdin; pipe input or use an inline value or @PATH"
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod config;
 mod datasets;
 mod env;
 mod environments;
+mod error;
 #[cfg(unix)]
 mod eval;
 mod experiments;
@@ -472,9 +473,13 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
         return ExitCode::from_process_code(err.1);
     }
 
+    if has_user_error(err) {
+        return ExitCode::User;
+    }
+
     if let Some(http_error) = find_http_error(err) {
         let status = http_error.status.as_u16();
-        if (status == 401 || status == 403) && !is_upstream_provider_auth_error(http_error) {
+        if status == 401 || status == 403 {
             return ExitCode::Auth;
         }
         if (400..=499).contains(&status) {
@@ -507,22 +512,6 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
 fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
     err.chain()
         .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
-}
-
-fn is_upstream_provider_auth_error(error: &crate::http::HttpError) -> bool {
-    let Ok(body) = serde_json::from_str::<serde_json::Value>(&error.body) else {
-        return false;
-    };
-    let provider_error = body.get("error").unwrap_or(&body);
-    provider_error.get("code").and_then(|value| value.as_str()) == Some("invalid_api_key")
-        || provider_error
-            .get("message")
-            .and_then(|value| value.as_str())
-            .is_some_and(|message| {
-                let message = message.to_ascii_lowercase();
-                message.contains("incorrect api key provided")
-                    || message.contains("llm provider") && message.contains("credential")
-            })
 }
 
 fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
@@ -568,6 +557,11 @@ fn has_io_error(err: &anyhow::Error) -> bool {
         .any(|source| source.downcast_ref::<std::io::Error>().is_some())
 }
 
+fn has_user_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.downcast_ref::<crate::error::UserError>().is_some())
+}
+
 fn looks_like_user_error(err: &anyhow::Error) -> bool {
     let message = err.to_string().to_lowercase();
     message.contains("required")
@@ -577,14 +571,36 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
 }
 
 fn json_error_payload(err: &anyhow::Error) -> serde_json::Value {
-    find_http_error(err)
-        .and_then(|error| serde_json::from_str(&error.body).ok())
-        .unwrap_or_else(|| serde_json::json!({ "error": { "message": err.to_string() } }))
+    let details = find_http_error(err)
+        .and_then(|error| serde_json::from_str::<serde_json::Value>(&error.body).ok());
+    let message = details
+        .as_ref()
+        .and_then(json_error_message)
+        .unwrap_or_else(|| err.to_string());
+
+    match details {
+        Some(details) => serde_json::json!({
+            "error": {
+                "message": message,
+                "details": details,
+            }
+        }),
+        None => serde_json::json!({ "error": { "message": message } }),
+    }
+}
+
+fn json_error_message(details: &serde_json::Value) -> Option<String> {
+    details
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| details.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| details.get("error").and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
 }
 
 fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool, json_output: bool) {
     if json_output {
-        println!("{}", json_error_payload(err));
+        eprintln!("{}", json_error_payload(err));
         return;
     }
 
@@ -735,32 +751,76 @@ mod tests {
     }
 
     #[test]
-    fn provider_credential_errors_are_not_classified_as_bt_auth_errors() {
-        let err = anyhow::Error::new(crate::http::HttpError {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            body: serde_json::json!({
-                "error": {
-                    "message": "Incorrect API key provided: synthetic-key",
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key"
-                },
-                "status": 401
-            })
-            .to_string(),
-        });
+    fn typed_user_errors_use_the_user_exit_code() {
+        let err = anyhow::Error::new(crate::error::UserError::from(anyhow::anyhow!(
+            "--temperature must be between 0 and 2"
+        )));
 
         assert_eq!(classify_error(&err, false), ExitCode::User);
-        assert_eq!(json_error_payload(&err)["error"]["code"], "invalid_api_key");
+    }
+
+    #[test]
+    fn provider_credential_errors_are_not_classified_as_bt_auth_errors() {
+        let err = anyhow::Error::new(crate::error::UserError::from(anyhow::Error::new(
+            crate::http::HttpError {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                body: serde_json::json!({
+                    "error": {
+                        "message": "Incorrect API key provided: synthetic-key",
+                        "type": "invalid_request_error",
+                        "code": "invalid_api_key"
+                    },
+                    "status": 401
+                })
+                .to_string(),
+            },
+        )));
+
+        assert_eq!(classify_error(&err, false), ExitCode::User);
+        let payload = json_error_payload(&err);
+        assert_eq!(
+            payload["error"]["message"],
+            "Incorrect API key provided: synthetic-key"
+        );
+        assert_eq!(
+            payload["error"]["details"]["error"]["code"],
+            "invalid_api_key"
+        );
+    }
+
+    #[test]
+    fn json_http_errors_use_a_stable_envelope() {
+        let err = anyhow::Error::new(crate::http::HttpError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: serde_json::json!(["synthetic", "details"]).to_string(),
+        });
+
+        let payload = json_error_payload(&err);
+        assert!(payload["error"]["message"].is_string());
+        assert_eq!(
+            payload["error"]["details"],
+            serde_json::json!(["synthetic", "details"])
+        );
     }
 
     #[test]
     fn bt_unauthorized_errors_remain_auth_errors() {
-        let err = anyhow::Error::new(crate::http::HttpError {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            body: r#"{"error":"Unauthorized"}"#.to_string(),
-        });
+        for body in [
+            serde_json::json!({ "error": "Unauthorized" }),
+            serde_json::json!({
+                "error": {
+                    "message": "Invalid Braintrust API key",
+                    "code": "invalid_api_key"
+                }
+            }),
+        ] {
+            let err = anyhow::Error::new(crate::http::HttpError {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                body: body.to_string(),
+            });
 
-        assert_eq!(classify_error(&err, false), ExitCode::Auth);
+            assert_eq!(classify_error(&err, false), ExitCode::Auth);
+        }
     }
 
     #[test]
