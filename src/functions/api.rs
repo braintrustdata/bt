@@ -271,7 +271,8 @@ pub async fn insert_functions(
         .context("failed to insert functions")?;
 
     Ok(InsertFunctionsResult {
-        ignored_entries: ignored_count(&raw),
+        ignored_entries: ignored_count(&raw)
+            .or_else(|| ignored_count_from_function_results(&raw, functions)),
     })
 }
 
@@ -283,6 +284,26 @@ fn ignored_count(raw: &Value) -> Option<usize> {
     raw.get("ignored_count")
         .and_then(Value::as_u64)
         .and_then(|count| usize::try_from(count).ok())
+}
+
+fn ignored_count_from_function_results(raw: &Value, requests: &[Value]) -> Option<usize> {
+    let results = raw.get("functions")?.as_array()?;
+    if results.len() != requests.len() {
+        return None;
+    }
+
+    results
+        .iter()
+        .zip(requests)
+        .try_fold(0usize, |count, (result, request)| {
+            let should_ignore = request.get("if_exists").and_then(Value::as_str) == Some("ignore");
+            if !should_ignore {
+                return Some(count);
+            }
+
+            let found_existing = result.get("found_existing")?.as_bool()?;
+            Some(count + usize::from(found_existing))
+        })
 }
 
 #[cfg(test)]
@@ -319,6 +340,41 @@ mod tests {
         assert_eq!(ignored_count(&third), None);
 
         assert_eq!(ignored_count(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn derives_ignored_count_from_found_existing_results() {
+        let requests = vec![
+            serde_json::json!({ "slug": "first", "if_exists": "ignore" }),
+            serde_json::json!({ "slug": "second", "if_exists": "replace" }),
+            serde_json::json!({ "slug": "third", "if_exists": "ignore" }),
+        ];
+        let response = serde_json::json!({
+            "functions": [
+                { "slug": "first", "found_existing": true },
+                { "slug": "second", "found_existing": true },
+                { "slug": "third", "found_existing": false },
+            ]
+        });
+
+        assert_eq!(
+            ignored_count_from_function_results(&response, &requests),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ignored_count_fallback_rejects_mismatched_response_length() {
+        let requests = vec![serde_json::json!({
+            "slug": "first",
+            "if_exists": "ignore"
+        })];
+        let response = serde_json::json!({ "functions": [] });
+
+        assert_eq!(
+            ignored_count_from_function_results(&response, &requests),
+            None
+        );
     }
 
     #[test]
