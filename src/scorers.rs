@@ -47,11 +47,30 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+    use crate::args::CLIArgs;
 
     #[derive(Debug, Parser)]
     struct ScorersArgsHarness {
         #[command(flatten)]
         args: ScorersArgs,
+    }
+
+    #[test]
+    fn invoke_accepts_global_json_flag() {
+        #[derive(Debug, Parser)]
+        struct Harness {
+            #[command(flatten)]
+            command: CLIArgs<ScorersArgs>,
+        }
+
+        let parsed = Harness::try_parse_from(["bt-scorers", "invoke", "test-scorer", "--json"])
+            .expect("parse scorer invoke with global JSON output");
+
+        assert!(parsed.command.base.json);
+        assert!(matches!(
+            parsed.command.args.command,
+            Some(ScorersCommands::Function(FunctionCommands::Invoke(_)))
+        ));
     }
 
     #[test]

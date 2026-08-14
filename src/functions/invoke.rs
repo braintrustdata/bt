@@ -42,6 +42,10 @@ impl InvokeArgs {
     }
 }
 
+fn resolve_mode(mode: Option<&str>, json_output: bool) -> Option<&str> {
+    mode.or(json_output.then_some("json"))
+}
+
 fn resolve_input(input_arg: &Option<String>) -> Result<Option<Value>> {
     if let Some(raw) = input_arg {
         let parsed: Value = serde_json::from_str(raw).context("invalid JSON in --input")?;
@@ -97,7 +101,7 @@ pub async fn run(
             .collect();
         body["messages"] = json!(messages);
     }
-    if let Some(mode) = &args.mode {
+    if let Some(mode) = resolve_mode(args.mode.as_deref(), json_output) {
         body["mode"] = json!(mode);
     }
     if let Some(version) = &args.version {
@@ -117,4 +121,24 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_mode;
+
+    #[test]
+    fn json_output_requests_json_invoke_mode() {
+        assert_eq!(resolve_mode(None, true), Some("json"));
+    }
+
+    #[test]
+    fn explicit_invoke_mode_takes_precedence_over_json_output() {
+        assert_eq!(resolve_mode(Some("text"), true), Some("text"));
+    }
+
+    #[test]
+    fn default_output_does_not_set_invoke_mode() {
+        assert_eq!(resolve_mode(None, false), None);
+    }
 }

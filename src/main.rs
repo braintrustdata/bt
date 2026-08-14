@@ -256,13 +256,21 @@ enum ExitCode {
     User = 4,
 }
 
+static JSON_OUTPUT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn main() {
     let exit_code = match try_main() {
         Ok(()) => ExitCode::Success,
         Err(err) => {
             let missing_credential = crate::auth::is_missing_credential_error(&err);
             let code = classify_error(&err, missing_credential);
-            print_error(&err, code, missing_credential);
+            print_error(
+                &err,
+                code,
+                missing_credential,
+                JSON_OUTPUT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed),
+            );
             code
         }
     };
@@ -315,6 +323,10 @@ fn try_main() -> Result<()> {
     apply_base_arg_sources(&matches, cli.command.base_mut());
     cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     apply_base_output_defaults(&mut cli.command);
+    JSON_OUTPUT_REQUESTED.store(
+        cli.command.base().json,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     configure_output(cli.command.base());
     apply_runtime_env_overrides(cli.command.base());
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -433,7 +445,7 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
 
     if let Some(http_error) = find_http_error(err) {
         let status = http_error.status.as_u16();
-        if status == 401 || status == 403 {
+        if (status == 401 || status == 403) && !is_upstream_provider_auth_error(http_error) {
             return ExitCode::Auth;
         }
         if (400..=499).contains(&status) {
@@ -466,6 +478,22 @@ fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
 fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
     err.chain()
         .find_map(|source| source.downcast_ref::<crate::http::HttpError>())
+}
+
+fn is_upstream_provider_auth_error(error: &crate::http::HttpError) -> bool {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&error.body) else {
+        return false;
+    };
+    let provider_error = body.get("error").unwrap_or(&body);
+    provider_error.get("code").and_then(|value| value.as_str()) == Some("invalid_api_key")
+        || provider_error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .is_some_and(|message| {
+                let message = message.to_ascii_lowercase();
+                message.contains("incorrect api key provided")
+                    || message.contains("llm provider") && message.contains("credential")
+            })
 }
 
 fn classify_sdk_error(err: &anyhow::Error) -> Option<ExitCode> {
@@ -519,7 +547,18 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
         || message.contains("invalid")
 }
 
-fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
+fn json_error_payload(err: &anyhow::Error) -> serde_json::Value {
+    find_http_error(err)
+        .and_then(|error| serde_json::from_str(&error.body).ok())
+        .unwrap_or_else(|| serde_json::json!({ "error": { "message": err.to_string() } }))
+}
+
+fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool, json_output: bool) {
+    if json_output {
+        println!("{}", json_error_payload(err));
+        return;
+    }
+
     eprintln!("error: {err}");
     if code == ExitCode::Auth && !missing_credential {
         eprintln!("Your credentials may be expired or invalid. For OAuth profiles, try `bt login --refresh --profile <NAME>`; if refresh fails, re-run `bt login --oauth --profile <NAME>`. Run `bt status --all` to inspect profile status.");
@@ -685,6 +724,35 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn provider_credential_errors_are_not_classified_as_bt_auth_errors() {
+        let err = anyhow::Error::new(crate::http::HttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: serde_json::json!({
+                "error": {
+                    "message": "Incorrect API key provided: synthetic-key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key"
+                },
+                "status": 401
+            })
+            .to_string(),
+        });
+
+        assert_eq!(classify_error(&err, false), ExitCode::User);
+        assert_eq!(json_error_payload(&err)["error"]["code"], "invalid_api_key");
+    }
+
+    #[test]
+    fn bt_unauthorized_errors_remain_auth_errors() {
+        let err = anyhow::Error::new(crate::http::HttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: r#"{"error":"Unauthorized"}"#.to_string(),
+        });
+
+        assert_eq!(classify_error(&err, false), ExitCode::Auth);
     }
 
     #[test]
