@@ -68,17 +68,29 @@ pub async fn list_functions(
     project_id: &str,
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
-    let pid = escape_sql(project_id);
-    let query = match function_type {
-        Some(ft) => {
-            let ft = escape_sql(ft);
-            format!("SELECT * FROM project_functions('{pid}') WHERE function_type = '{ft}'")
-        }
-        None => format!("SELECT * FROM project_functions('{pid}')"),
-    };
+    let query = list_functions_query(project_id, function_type);
     let response = client.btql::<Function>(&query).await?;
 
     Ok(response.data)
+}
+
+fn list_functions_query(project_id: &str, function_type: Option<&str>) -> String {
+    let pid = escape_sql(project_id);
+    let type_filter = match function_type {
+        // Match the web UI's Scorers tab: label-producing classifiers appear
+        // alongside score-producing scorers, while topic maps do not.
+        Some("scorer") => "function_type IN ('scorer', 'classifier') \
+            AND COALESCE(function_data.type, '') != 'topic_map' \
+            AND (origin IS NULL OR NOT COALESCE(origin.internal, FALSE))"
+            .to_string(),
+        Some(ft) => {
+            let ft = escape_sql(ft);
+            format!("function_type = '{ft}'")
+        }
+        None => return format!("SELECT * FROM project_functions('{pid}')"),
+    };
+
+    format!("SELECT * FROM project_functions('{pid}') WHERE {type_filter}")
 }
 
 pub async fn get_function_by_slug(
@@ -276,6 +288,24 @@ fn ignored_count(raw: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scorer_list_query_matches_web_ui_filter() {
+        let query = list_functions_query("test-project-id", Some("scorer"));
+
+        assert!(query.contains("function_type IN ('scorer', 'classifier')"));
+        assert!(query.contains("COALESCE(function_data.type, '') != 'topic_map'"));
+        assert!(query.contains("origin IS NULL"));
+        assert!(query.contains("origin.internal"));
+    }
+
+    #[test]
+    fn non_scorer_list_query_keeps_exact_type_filter() {
+        let query = list_functions_query("test-project-id", Some("tool"));
+
+        assert!(query.contains("function_type = 'tool'"));
+        assert!(!query.contains("classifier"));
+    }
 
     #[test]
     fn ignored_count_extracts_canonical_shape() {
