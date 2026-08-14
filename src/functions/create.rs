@@ -136,10 +136,18 @@ pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: b
     let ignored = result.ignored_entries.is_some_and(|count| count > 0);
 
     if json_output {
+        let function = result
+            .functions
+            .first()
+            .context("insert-functions response did not include the scorer identity")?;
         println!(
             "{}",
             serde_json::to_string(&json!({
-                "scorer": definition,
+                "id": function.id,
+                "project_id": function.project_id,
+                "slug": function.slug,
+                "version": result.xact_id,
+                "found_existing": function.found_existing,
                 "ignored": ignored,
             }))?
         );

@@ -58,9 +58,27 @@ pub struct CodeUploadSlot {
     pub bundle_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct InsertedFunctionResult {
+    pub id: String,
+    pub project_id: String,
+    pub slug: String,
+    pub found_existing: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertFunctionsResult {
     pub ignored_entries: Option<usize>,
+    pub xact_id: Option<String>,
+    pub functions: Vec<InsertedFunctionResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InsertFunctionsResponse {
+    #[serde(default)]
+    xact_id: Option<String>,
+    #[serde(default)]
+    functions: Vec<InsertedFunctionResult>,
 }
 
 pub async fn list_functions(
@@ -270,9 +288,14 @@ pub async fn insert_functions(
         .await
         .context("failed to insert functions")?;
 
+    let response: InsertFunctionsResponse = serde_json::from_value(raw.clone())
+        .context("unexpected insert-functions response shape")?;
+
     Ok(InsertFunctionsResult {
         ignored_entries: ignored_count(&raw)
             .or_else(|| ignored_count_from_function_results(&raw, functions)),
+        xact_id: response.xact_id,
+        functions: response.functions,
     })
 }
 
@@ -375,6 +398,26 @@ mod tests {
             ignored_count_from_function_results(&response, &requests),
             None
         );
+    }
+
+    #[test]
+    fn parses_insert_function_operation_fields() {
+        let response: InsertFunctionsResponse = serde_json::from_value(serde_json::json!({
+            "xact_id": "1000000000000000001",
+            "functions": [{
+                "id": "fn_test_scorer",
+                "project_id": "test-project",
+                "slug": "test-scorer",
+                "found_existing": true
+            }]
+        }))
+        .expect("insert response");
+
+        assert_eq!(response.xact_id.as_deref(), Some("1000000000000000001"));
+        assert_eq!(response.functions[0].id, "fn_test_scorer");
+        assert_eq!(response.functions[0].project_id, "test-project");
+        assert_eq!(response.functions[0].slug, "test-scorer");
+        assert!(response.functions[0].found_existing);
     }
 
     #[test]
