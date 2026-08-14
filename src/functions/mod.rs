@@ -18,9 +18,11 @@ mod delete;
 mod invoke;
 mod list;
 pub(crate) mod prompt_config;
+pub(crate) mod prompt_patch;
 mod pull;
 mod push;
 pub(crate) mod report;
+mod update;
 mod view;
 
 use api::Function;
@@ -173,8 +175,7 @@ Examples:
   bt tools view my-tool
   bt tools view fn_123
   bt tools view --id fn_123
-  bt scorers list
-  bt scorers delete my-scorer
+  bt tools update my-tool --patch @tool-patch.json
 ")]
 pub struct FunctionArgs {
     #[command(subcommand)]
@@ -191,6 +192,8 @@ pub(crate) enum FunctionCommands {
     Delete(DeleteArgs),
     /// Invoke by slug
     Invoke(invoke::InvokeArgs),
+    /// Update a function in place (prompt configuration, metadata, or arbitrary patch)
+    Update(Box<update::UpdateArgs>),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -223,6 +226,8 @@ enum FunctionsCommands {
     Delete(FunctionsDeleteArgs),
     /// Invoke a function
     Invoke(FunctionsInvokeArgs),
+    /// Update a function in place (prompt configuration, metadata, or arbitrary patch)
+    Update(Box<FunctionsUpdateArgs>),
     /// Push local function definitions
     Push(PushArgs),
     /// Pull remote function definitions
@@ -267,6 +272,15 @@ impl FunctionsDeleteArgs {
 struct FunctionsInvokeArgs {
     #[command(flatten)]
     inner: invoke::InvokeArgs,
+    /// Filter by function type (for interactive selection)
+    #[arg(long = "type", short = 't', value_enum)]
+    function_type: Option<FunctionTypeFilter>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct FunctionsUpdateArgs {
+    #[command(flatten)]
+    inner: update::UpdateArgs,
     /// Filter by function type (for interactive selection)
     #[arg(long = "type", short = 't', value_enum)]
     function_type: Option<FunctionTypeFilter>,
@@ -657,6 +671,7 @@ pub(crate) async fn run_typed_command(
                 None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
                 Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
                 Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
+                Some(FunctionCommands::Update(u)) => update::run(&ctx, &u, base.json, ft).await,
                 Some(FunctionCommands::View(_)) => {
                     unreachable!("handled before context resolution")
                 }
@@ -719,6 +734,9 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
                 }
                 Some(FunctionsCommands::Invoke(i)) => {
                     invoke::run(&ctx, &i.inner, base.json, i.function_type.or(function_type)).await
+                }
+                Some(FunctionsCommands::Update(u)) => {
+                    update::run(&ctx, &u.inner, base.json, u.function_type.or(function_type)).await
                 }
                 Some(FunctionsCommands::Push(_))
                 | Some(FunctionsCommands::Pull(_))
@@ -1199,6 +1217,31 @@ mod tests {
             command,
             None | Some(FunctionsCommands::List(_)) | Some(FunctionsCommands::View(_))
         )
+    }
+
+    #[test]
+    fn typed_function_update_command_is_not_read_only() {
+        let _guard = test_lock();
+        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools", "update", "my-tool", "-y"])
+            .expect("parse");
+        assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
+    }
+
+    #[test]
+    fn functions_update_command_is_not_read_only() {
+        let _guard = test_lock();
+        let parsed = FunctionsArgsHarness::try_parse_from([
+            "bt-functions",
+            "update",
+            "my-fn",
+            "--description",
+            "x",
+            "-y",
+        ])
+        .expect("parse");
+        assert!(!functions_command_is_read_only(
+            parsed.args.command.as_ref()
+        ));
     }
 
     #[test]
