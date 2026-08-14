@@ -1243,6 +1243,20 @@ fn scorer_update_help_is_conflict_free() {
 }
 
 #[test]
+fn prompt_update_help_is_conflict_free() {
+    bt_command()
+        .args(["prompts", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--patch <SOURCE>"))
+        .stdout(predicate::str::contains("--patch-file").not())
+        .stdout(predicate::str::contains("--messages <SOURCE>"))
+        .stdout(predicate::str::contains("--temperature"))
+        .stdout(predicate::str::contains("--template-format"))
+        .stdout(predicate::str::contains("--metadata"));
+}
+
+#[test]
 fn topics_report_help_accepts_global_org_short_conflict_free() {
     bt_command()
         .args([

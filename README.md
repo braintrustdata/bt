@@ -149,7 +149,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt view`      | View logs, traces, and spans                                       |
 | `bt projects`  | Manage projects (list, create, view, delete)                       |
 | `bt datasets`  | Manage remote datasets (list, create, update, view, delete)        |
-| `bt prompts`   | Manage prompts (list, view, delete)                                |
+| `bt prompts`   | Manage prompts (list, view, update, delete)                        |
 | `bt functions` | Manage functions (list, view, invoke, update, push, pull, delete)  |
 | `bt tools`     | Manage tools (list, view, invoke, update, delete)                  |
 | `bt scorers`   | Manage scorers (list, create, view, invoke, update, delete)        |
@@ -184,6 +184,7 @@ bt scorers update helpfulness --messages @messages.json
 bt scorers update helpfulness --new-slug answer-helpfulness
 bt functions update my-function --name "Updated function" --description "Updated"
 bt tools update my-tool --prompt @prompt.txt --new-slug lookup-order
+bt prompts update my-prompt --messages @messages.json
 ```
 
 The API replaces `prompt_data` rather than merging it, so `bt` reads the current definition and sends a materialized replacement with your changes. A concurrent edit can therefore be overwritten.
