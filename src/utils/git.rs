@@ -144,7 +144,7 @@ mod tests {
         let file = root.join("tracked.txt");
         fs::write(&file, "v1\n").expect("write tracked file");
         run_git(&root, &["add", "tracked.txt"]);
-        run_git(&root, &["commit", "-m", "init"]);
+        run_git(&root, &["commit", "--no-gpg-sign", "-m", "init"]);
 
         fs::write(&file, "v2\n").expect("modify tracked file");
 
@@ -170,7 +170,7 @@ mod tests {
         let tracked = root.join("tracked.txt");
         fs::write(&tracked, "v1\n").expect("write tracked file");
         run_git(&root, &["add", "tracked.txt"]);
-        run_git(&root, &["commit", "-m", "init"]);
+        run_git(&root, &["commit", "--no-gpg-sign", "-m", "init"]);
 
         let untracked = root.join("untracked.txt");
         fs::write(&untracked, "local-only\n").expect("write untracked file");
