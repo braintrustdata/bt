@@ -157,15 +157,24 @@ fn default_profile(json: bool, args: DefaultArgs) -> Result<()> {
         );
     }
 
-    let path = config::resolve_write_path(args.global, args.local)?;
+    let (path, scope) = if args.local {
+        let path = config::local_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No local .bt directory found. Use bt init to initialize this directory."
+            )
+        })?;
+        (path, "local")
+    } else if args.global {
+        (config::global_path()?, "global")
+    } else if let Some(path) = config::local_path() {
+        (path, "local")
+    } else {
+        (config::global_path()?, "global")
+    };
+    config::preflight_config_write(&path)?;
     let mut selected_config = config::load_file(&path);
     selected_config.profile = Some(name.to_string());
     config::save_file(&path, &selected_config)?;
-    let scope = if path == config::global_path()? {
-        "global"
-    } else {
-        "local"
-    };
 
     if json {
         println!(

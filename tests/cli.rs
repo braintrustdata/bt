@@ -285,6 +285,32 @@ fn profiles_default_sets_and_shows_global_default_without_login() {
 }
 
 #[test]
+fn profiles_default_uses_current_worktree_config_when_available() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let worktree = tempfile::tempdir().expect("worktree tempdir");
+    fs::create_dir(worktree.path().join(".bt")).expect("create local config dir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(worktree.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "default", "test-profile", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"scope\":\"local\""));
+
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(worktree.path().join(".bt/config.json")).expect("read local config"),
+    )
+    .expect("parse local config");
+    assert_eq!(config["profile"], "test-profile");
+    assert!(!config_home.path().join("bt/config.json").exists());
+}
+
+#[test]
 fn status_verbose_explicitly_shows_unset_profile() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
