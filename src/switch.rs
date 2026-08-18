@@ -118,22 +118,10 @@ pub async fn run(base: BaseArgs, args: SwitchArgs) -> Result<()> {
     let client = ApiClient::new(&ctx)?;
     let org_name = client.org_name().to_string();
 
-    let project = match resolved_project {
-        Some(p) => validate_or_create_project(&client, &p).await?,
-        None => {
-            if !is_interactive() {
-                bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
-            }
-            interactive = true;
-            select_project(
-                &client,
-                None,
-                None,
-                crate::ui::ProjectSelectMode::ExistingOnly,
-            )
-            .await?
-        }
-    };
+    if resolved_project.is_none() && !is_interactive() {
+        bail!("target required. Use: bt switch <project> or bt switch <org>/<project>");
+    }
+    let project = resolve_project(&client, resolved_project.as_deref(), None).await?;
 
     let (path, scope) = if let Some(scope) = forced_scope {
         scope
@@ -258,10 +246,26 @@ pub(crate) fn select_scope() -> Result<(std::path::PathBuf, &'static str)> {
     }
 }
 
-pub(crate) async fn validate_or_create_project(
+pub(crate) async fn resolve_project(
     client: &ApiClient,
-    name: &str,
+    requested_project: Option<&str>,
+    select_label: Option<&str>,
 ) -> Result<api::Project> {
+    match requested_project {
+        Some(name) => validate_or_create_project(client, name).await,
+        None => {
+            select_project(
+                client,
+                None,
+                select_label,
+                crate::ui::ProjectSelectMode::ExistingOnly,
+            )
+            .await
+        }
+    }
+}
+
+async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<api::Project> {
     let exists = with_spinner("Loading project...", api::get_project_by_name(client, name)).await?;
 
     if let Some(project) = exists {
