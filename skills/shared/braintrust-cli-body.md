@@ -10,6 +10,8 @@ Use the Braintrust `bt` CLI for projects, traces, prompts, and sync workflows.
 
 1. Confirm auth and context:
    - `bt status`
+   - `bt profiles list`
+   - `bt profiles default`
    - `bt projects list`
 2. Run the smallest command that answers the question:
    - `bt prompts list --project <name>`

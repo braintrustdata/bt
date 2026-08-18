@@ -15,6 +15,7 @@ mod functions;
 mod http;
 mod init;
 mod js_runner;
+mod profiles;
 mod project_context;
 mod projects;
 mod prompts;
@@ -60,6 +61,7 @@ Core
   init         Initialize .bt config directory and files
   login        Log in to Braintrust
   logout       Remove a saved Braintrust login
+  profiles     Manage saved Braintrust login profiles
   switch       Switch org and project context
   view         View logs, traces, and spans
 
@@ -136,6 +138,8 @@ enum Commands {
     Login(CLIArgs<auth::LoginArgs, LoginBaseArgs>),
     /// Remove a saved Braintrust login
     Logout(CLIArgs<auth::LogoutArgs>),
+    /// Manage saved Braintrust login profiles
+    Profiles(CLIArgs<profiles::ProfilesArgs, LoginBaseArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
@@ -185,6 +189,7 @@ impl Commands {
             Commands::Sql(cmd) => &cmd.base,
             Commands::Login(cmd) => &cmd.base,
             Commands::Logout(cmd) => &cmd.base,
+            Commands::Profiles(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
@@ -214,6 +219,7 @@ impl Commands {
             Commands::Sql(cmd) => &mut cmd.base,
             Commands::Login(cmd) => &mut cmd.base,
             Commands::Logout(cmd) => &mut cmd.base,
+            Commands::Profiles(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
@@ -320,6 +326,7 @@ fn try_main() -> Result<()> {
         match cli.command {
             Commands::Login(cmd) => auth::run_login_command(cmd.base.into(), cmd.args).await?,
             Commands::Logout(cmd) => auth::run_logout_command(cmd.base, cmd.args)?,
+            Commands::Profiles(cmd) => profiles::run(cmd.base, cmd.args)?,
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,

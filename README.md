@@ -140,6 +140,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt init`     | Initialize `.bt/` config directory and link to a project           |
 | `bt login`    | Log in to Braintrust or refresh an OAuth login                     |
 | `bt logout`   | Remove a saved Braintrust login                                    |
+| `bt profiles` | List, select, delete, and rename saved login profiles              |
 | `bt switch`   | Switch org and project context                                     |
 | `bt status`   | Show current org and project context                               |
 | `bt datasets` | Manage datasets and dataset pipelines                              |
@@ -322,7 +323,14 @@ Local version and pagination-key conversion helpers:
   - `bt login --oauth --profile work`
   - You can pass `--no-browser` to print the URL without auto-opening.
   - On remote/SSH hosts, paste the final callback URL from your local browser if localhost callback cannot be delivered.
-- List profiles and the current context:
+- Manage saved profiles:
+  - `bt profiles` or `bt profiles list`
+  - `bt profiles default` (show the configured default)
+  - `bt profiles default work --global` (set the global default)
+  - `bt profiles default work --local` (set the default for the current working tree)
+  - `bt profiles delete work`
+  - `bt profiles rename work renamed-work`
+- Check every profile's connection status and the current context:
   - `bt status --all`
 - Log out (remove a saved profile):
   - `bt logout`

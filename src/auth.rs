@@ -1816,7 +1816,7 @@ fn profile_not_found_err(name: &str, store: &AuthStore) -> anyhow::Error {
         format!(": {}", available.join(", "))
     };
     anyhow::anyhow!(
-        "profile '{name}' not found; run `bt status --all` to see available profiles{suffix}"
+        "profile '{name}' not found; run `bt profiles list` to see available profiles{suffix}"
     )
 }
 
@@ -1831,7 +1831,7 @@ fn emit_result(json: bool, payload: serde_json::Value, human: impl FnOnce()) -> 
     Ok(())
 }
 
-fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<()> {
+pub(crate) fn delete_profile(profile_name: &str, force: bool, base_json: bool) -> Result<bool> {
     let profile_name = profile_name.trim();
     if profile_name.is_empty() {
         bail!("profile name cannot be empty");
@@ -1849,11 +1849,12 @@ fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<
                 .default(false)
                 .interact_on(&term)?;
             if !confirmed {
-                return emit_result(
+                emit_result(
                     base_json,
                     serde_json::json!({ "name": profile_name, "status": "cancelled" }),
                     || eprintln!("Cancelled"),
-                );
+                )?;
+                return Ok(false);
             }
         }
     }
@@ -1877,6 +1878,91 @@ fn run_login_delete(profile_name: &str, force: bool, base_json: bool) -> Result<
             ui::print_command_status(
                 ui::CommandStatus::Success,
                 &format!("Deleted profile '{profile_name}'"),
+            )
+        },
+    )?;
+    Ok(true)
+}
+
+pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) -> Result<()> {
+    let old_name = old_name.trim();
+    let new_name = new_name.trim();
+    if old_name.is_empty() || new_name.is_empty() {
+        bail!("profile names cannot be empty");
+    }
+    if old_name == new_name {
+        bail!("new profile name must differ from the current name");
+    }
+
+    let mut store = load_auth_store()?;
+    let profile = store
+        .profiles
+        .get(old_name)
+        .cloned()
+        .ok_or_else(|| profile_not_found_err(old_name, &store))?;
+    if store.profiles.contains_key(new_name) {
+        bail!("profile '{new_name}' already exists; choose a different name");
+    }
+
+    let credentials = match profile.auth_kind {
+        AuthKind::ApiKey => vec![(new_name.to_string(), load_profile_secret(old_name)?)],
+        AuthKind::Oauth => vec![
+            (
+                oauth_refresh_secret_key(new_name),
+                load_profile_oauth_refresh_token(old_name)?,
+            ),
+            (
+                oauth_access_secret_key(new_name),
+                load_profile_oauth_access_token(old_name)?,
+            ),
+        ],
+    };
+
+    let mut saved_credentials: Vec<String> = Vec::new();
+    for (key, credential) in &credentials {
+        let Some(credential) = credential else {
+            continue;
+        };
+        if let Err(err) = save_profile_secret(key, credential) {
+            for saved_key in &saved_credentials {
+                let _ = delete_profile_secret(saved_key);
+            }
+            return Err(err)
+                .with_context(|| format!("failed to move credentials to profile '{new_name}'"));
+        }
+        saved_credentials.push(key.clone());
+    }
+
+    store.profiles.remove(old_name);
+    store.profiles.insert(new_name.to_string(), profile);
+    if let Err(err) = save_auth_store(&store) {
+        for saved_key in &saved_credentials {
+            let _ = delete_profile_secret(saved_key);
+        }
+        return Err(err).context("failed to save renamed profile");
+    }
+
+    for old_key in [
+        old_name.to_string(),
+        oauth_refresh_secret_key(old_name),
+        oauth_access_secret_key(old_name),
+    ] {
+        if let Err(err) = delete_profile_secret(&old_key) {
+            eprintln!("warning: failed to delete old credential for '{old_name}': {err}");
+        }
+    }
+
+    emit_result(
+        base_json,
+        serde_json::json!({
+            "name": new_name,
+            "previous_name": old_name,
+            "status": "renamed",
+        }),
+        || {
+            ui::print_command_status(
+                ui::CommandStatus::Success,
+                &format!("Renamed profile '{old_name}' to '{new_name}'"),
             )
         },
     )
@@ -1907,7 +1993,7 @@ fn run_login_logout(base: BaseArgs, args: LogoutArgs) -> Result<()> {
         bail!("multiple profiles exist. Use --profile <NAME> to specify which one.");
     };
 
-    run_login_delete(&profile_name, args.force, base_json)
+    delete_profile(&profile_name, args.force, base_json).map(|_| ())
 }
 
 enum ProfileStatus {

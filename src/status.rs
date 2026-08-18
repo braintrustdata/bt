@@ -172,8 +172,11 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
         println!("org: {}", org.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
         println!("project_id: {}", project_id.as_deref().unwrap_or("(unset)"));
+        println!(
+            "profile: {}",
+            selected_profile.as_deref().unwrap_or("(unset)")
+        );
         if let Some(ref p) = profile_info {
-            println!("profile: {}", p.name);
             println!("app_url: {}", p.app_url);
             println!(
                 "api_url: {}",
