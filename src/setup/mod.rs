@@ -1229,8 +1229,7 @@ fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        base.project =
-            config::project_from_config_for_context(base, &cfg, base.org_name.as_deref());
+        base.project = config::project_from_config_for_context(&cfg, base.org_name.as_deref());
     }
 }
 

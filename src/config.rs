@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Subcommand};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -7,12 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::args::BaseArgs;
 use crate::ui::{print_command_status, CommandStatus};
-
-mod get;
-mod list;
-mod set;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -25,54 +19,7 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["profile", "org", "project", "project_id"];
-
 impl Config {
-    pub fn get_field(&self, key: &str) -> Option<&str> {
-        match key {
-            "profile" => self.profile.as_deref(),
-            "org" => self.org.as_deref(),
-            "project" => self.project.as_deref(),
-            "project_id" => self.project_id.as_deref(),
-            _ => None,
-        }
-    }
-
-    pub fn set_field(&mut self, key: &str, value: String) -> bool {
-        match key {
-            "profile" => self.profile = Some(value),
-            "org" => self.org = Some(value),
-            "project" => {
-                self.project = Some(value);
-                self.project_id = None;
-            }
-            "project_id" => self.project_id = Some(value),
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn unset_field(&mut self, key: &str) -> bool {
-        match key {
-            "profile" => self.profile = None,
-            "org" => self.org = None,
-            "project" => {
-                self.project = None;
-                self.project_id = None;
-            }
-            "project_id" => self.project_id = None,
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn non_empty_fields(&self) -> Vec<(&str, &str)> {
-        KNOWN_KEYS
-            .iter()
-            .filter_map(|&key| self.get_field(key).map(|v| (key, v)))
-            .collect()
-    }
-
     pub(crate) fn merge(&self, other: &Config) -> Config {
         let mut extra = self.extra.clone();
         extra.extend(other.extra.clone());
@@ -152,34 +99,28 @@ pub fn load() -> Result<Config> {
     Ok(global.merge(&local))
 }
 
-pub fn configured_project_for_context(
-    base: &BaseArgs,
-    resolved_org: Option<&str>,
-) -> Option<String> {
+pub fn configured_project_for_context(resolved_org: Option<&str>) -> Option<String> {
     load()
         .ok()
-        .and_then(|cfg| project_from_config_for_context(base, &cfg, resolved_org))
+        .and_then(|cfg| project_from_config_for_context(&cfg, resolved_org))
 }
 
-pub fn configured_project_id_for_base(base: &BaseArgs) -> Option<String> {
-    load().ok().and_then(|cfg| {
-        config_matches_context(base, &cfg, None)
-            .then(|| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
-            .flatten()
-    })
+pub fn configured_project_id() -> Option<String> {
+    load()
+        .ok()
+        .and_then(|cfg| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
 }
 
 pub(crate) fn project_from_config_for_context(
-    base: &BaseArgs,
     cfg: &Config,
     resolved_org: Option<&str>,
 ) -> Option<String> {
-    config_matches_context(base, cfg, resolved_org)
+    config_matches_context(cfg, resolved_org)
         .then(|| trimmed_option(cfg.project.as_deref()).map(str::to_string))
         .flatten()
 }
 
-fn config_matches_context(_base: &BaseArgs, cfg: &Config, resolved_org: Option<&str>) -> bool {
+fn config_matches_context(cfg: &Config, resolved_org: Option<&str>) -> bool {
     let cfg_org = trimmed_option(cfg.org.as_deref());
     let resolved_org = trimmed_option(resolved_org);
 
@@ -257,36 +198,6 @@ pub fn local_path() -> Option<PathBuf> {
     find_local_config_dir().map(|dir| dir.join("config.json"))
 }
 
-pub enum WriteTarget {
-    Global(PathBuf),
-    Local(PathBuf),
-}
-
-pub fn write_target() -> Result<WriteTarget> {
-    match local_path() {
-        Some(p) => Ok(WriteTarget::Local(p)),
-        None => Ok(WriteTarget::Global(global_path()?)),
-    }
-}
-
-/// Resolve which config file to write based on --global/--local flags.
-pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
-    if global {
-        global_path()
-    } else if local {
-        match local_path() {
-            Some(p) => Ok(p),
-            None => {
-                bail!("No local .bt directory found. Use bt init to initialize this directory.")
-            }
-        }
-    } else {
-        match write_target()? {
-            WriteTarget::Local(p) | WriteTarget::Global(p) => Ok(p),
-        }
-    }
-}
-
 pub fn local_save_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".bt").join("config.json"))
 }
@@ -353,91 +264,6 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-// --- CLI commands ---
-
-#[derive(Debug, Clone, Args)]
-pub struct ScopeArgs {
-    /// Apply to global config (~/.config/bt/config.json)
-    #[arg(long, short = 'g', conflicts_with = "local")]
-    global: bool,
-
-    /// Apply to local config (.bt/config.json)
-    #[arg(long, short = 'l')]
-    local: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ConfigArgs {
-    #[command(subcommand)]
-    command: Option<ConfigCommands>,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-enum ConfigCommands {
-    /// List config values
-    List {
-        #[command(flatten)]
-        scope: ScopeArgs,
-        /// Show config values grouped by source
-        #[arg(long)]
-        verbose: bool,
-    },
-    /// Get a config value
-    Get {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-    /// Set a config value
-    Set {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        /// Value to set
-        value: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-    /// Remove a config value
-    Unset {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-}
-
-fn validate_key(key: &str) -> Result<()> {
-    if !KNOWN_KEYS.contains(&key) {
-        bail!(
-            "Unknown config key: {key}\nValid keys: {}",
-            KNOWN_KEYS.join(", ")
-        );
-    }
-    Ok(())
-}
-
-pub fn run(base: BaseArgs, args: ConfigArgs) -> Result<()> {
-    match args.command {
-        None => list::run(base, false, false, false),
-        Some(ConfigCommands::List { scope, verbose }) => {
-            list::run(base, scope.global, scope.local, verbose)
-        }
-        Some(ConfigCommands::Get { key, scope }) => {
-            validate_key(&key)?;
-            get::run(base, &key, scope.global, scope.local)
-        }
-        Some(ConfigCommands::Set { key, value, scope }) => {
-            validate_key(&key)?;
-            set::run(&key, &value, scope.global, scope.local)
-        }
-        Some(ConfigCommands::Unset { key, scope }) => {
-            validate_key(&key)?;
-            set::unset(&key, scope.global, scope.local)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,17 +325,6 @@ mod tests {
         assert_eq!(merged.project, Some("other-proj".into()));
     }
 
-    fn base_with_profile(profile: Option<&str>) -> BaseArgs {
-        BaseArgs {
-            login: crate::args::LoginBaseArgs {
-                profile: profile.map(str::to_string),
-                profile_explicit: profile.is_some(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
     fn config(profile: Option<&str>, org: Option<&str>, project: Option<&str>) -> Config {
         Config {
             profile: profile.map(str::to_string),
@@ -521,7 +336,6 @@ mod tests {
 
     #[test]
     fn project_config_matches_org_independently_of_profile() {
-        let base = base_with_profile(Some("work"));
         let cases = [
             (config(None, Some("acme"), Some("demo")), Some("demo")),
             (config(None, Some("other"), Some("demo")), None),
@@ -538,7 +352,7 @@ mod tests {
 
         for (cfg, expected) in cases {
             assert_eq!(
-                project_from_config_for_context(&base, &cfg, Some("acme")).as_deref(),
+                project_from_config_for_context(&cfg, Some("acme")).as_deref(),
                 expected
             );
         }

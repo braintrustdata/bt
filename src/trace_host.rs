@@ -91,9 +91,7 @@ async fn resolve_trace_project(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
         return Ok(base);
     }
 
-    if let Some(project) =
-        crate::config::configured_project_for_context(&base, base.org_name.as_deref())
-    {
+    if let Some(project) = crate::config::configured_project_for_context(base.org_name.as_deref()) {
         base.project = Some(project);
         return Ok(base);
     }
@@ -115,9 +113,7 @@ async fn resolve_trace_project(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
     if base.org_name.is_none() {
         base.org_name = auth.org_name.clone();
     }
-    if let Some(project) =
-        crate::config::configured_project_for_context(&base, auth.org_name.as_deref())
-    {
+    if let Some(project) = crate::config::configured_project_for_context(auth.org_name.as_deref()) {
         base.project = Some(project);
         return Ok(base);
     }
