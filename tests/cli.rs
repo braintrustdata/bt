@@ -121,6 +121,32 @@ fn write_profile_secrets(config_home: &Path, profiles: &[&str]) {
     fs::write(auth_dir.join("secrets.json"), body).expect("write secret store");
 }
 
+#[cfg(unix)]
+fn use_fake_credential_store(cmd: &mut Command, bin_dir: &Path) {
+    fs::create_dir_all(bin_dir).expect("create fake credential bin dir");
+    let security = bin_dir.join("security");
+    write_executable(&security);
+    fs::write(
+        &security,
+        "#!/bin/sh\ncase \"$1\" in\n  find-generic-password|delete-generic-password) exit 44 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .expect("write fake security");
+
+    let secret_tool = bin_dir.join("secret-tool");
+    write_executable(&secret_tool);
+    fs::write(
+        &secret_tool,
+        "#!/bin/sh\nif [ \"$1\" = store ]; then cat >/dev/null; fi\nexit 1\n",
+    )
+    .expect("write fake secret-tool");
+
+    let mut paths = vec![bin_dir.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+}
+
 #[test]
 fn global_quiet_flag_still_parses_for_other_commands() {
     bt_command().args(["status", "--quiet"]).assert().success();
@@ -178,6 +204,230 @@ fn top_level_help_shows_update_not_self() {
         .success()
         .stdout(predicate::str::contains("update       Update bt in-place"))
         .stdout(predicate::str::contains("self         Self-management commands").not());
+}
+
+#[test]
+fn top_level_help_shows_profiles() {
+    bt_command()
+        .args(["--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "profiles     Manage saved Braintrust login profiles",
+        ));
+}
+
+#[test]
+fn profiles_list_json_reads_saved_profiles_without_login() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"oauth-profile":{"auth_kind":"oauth","api_url":"https://oauth-api.test.example","app_url":"https://app.test.example","user_name":"Test User","email":"user@test.example"},"test-profile":{"auth_kind":"api_key","app_url":"https://app.test.example","org_name":"test-org","org_bound":true,"api_key_hint":"sk-****test"}}}"#,
+    )
+    .expect("write auth store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"oauth-profile\""))
+        .stdout(predicate::str::contains("\"auth\":\"oauth\""))
+        .stdout(predicate::str::contains("\"name\":\"test-profile\""))
+        .stdout(predicate::str::contains("\"org\":\"test-org\""));
+}
+
+#[test]
+fn profiles_list_uses_email_column() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"oauth","app_url":"https://app.test.example","email":"user@test.example"}}}"#,
+    )
+    .expect("write auth store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("NO_COLOR", "1")
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Email"))
+        .stdout(predicate::str::contains("user@test.example"))
+        .stdout(predicate::str::contains("Identity / org").not());
+}
+
+#[test]
+fn status_verbose_explicitly_shows_unset_profile() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status", "--verbose"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("profile: (unset)"));
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_delete_removes_metadata_and_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(
+        config_home.path(),
+        &[("test-profile", "test-org"), ("other-profile", "other-org")],
+    );
+    write_profile_secrets(config_home.path(), &["test-profile", "other-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"test-profile","org":"test-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "delete", "test-profile", "--force", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            r#"{"name":"test-profile","status":"deleted"}"#,
+        ));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].get("test-profile").is_none());
+    assert!(auth["profiles"].get("other-profile").is_some());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert!(secrets["secrets"].get("test-profile").is_none());
+    assert!(secrets["secrets"].get("other-profile").is_some());
+
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read config"),
+    )
+    .expect("parse config");
+    assert!(config["profile"].is_null());
+    assert_eq!(config["org"], "test-org");
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_rename_moves_credentials_and_updates_config() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(config_home.path(), &[("old-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["old-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"old-profile","org":"test-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args([
+            "profiles",
+            "rename",
+            "old-profile",
+            "renamed-profile",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            r#"{"name":"renamed-profile","previous_name":"old-profile","status":"renamed"}"#,
+        ));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].get("old-profile").is_none());
+    assert!(auth["profiles"].get("renamed-profile").is_some());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert!(secrets["secrets"].get("old-profile").is_none());
+    assert_eq!(secrets["secrets"]["renamed-profile"], "test-api-key");
+
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read config"),
+    )
+    .expect("parse config");
+    assert_eq!(config["profile"], "renamed-profile");
+    assert_eq!(config["org"], "test-org");
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_rename_moves_oauth_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"old-oauth":{"auth_kind":"oauth","api_url":"https://oauth-api.test.example","app_url":"https://app.test.example","oauth_client_id":"bt_cli_test"}}}"#,
+    )
+    .expect("write auth store");
+    fs::write(
+        auth_dir.join("secrets.json"),
+        r#"{"secrets":{"oauth_refresh::old-oauth":"test-refresh-token","oauth_access::old-oauth":"test-access-token"}}"#,
+    )
+    .expect("write secret store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "rename", "old-oauth", "renamed-oauth", "--json"])
+        .assert()
+        .success();
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(auth_dir.join("secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert!(secrets["secrets"].get("oauth_refresh::old-oauth").is_none());
+    assert!(secrets["secrets"].get("oauth_access::old-oauth").is_none());
+    assert_eq!(
+        secrets["secrets"]["oauth_refresh::renamed-oauth"],
+        "test-refresh-token"
+    );
+    assert_eq!(
+        secrets["secrets"]["oauth_access::renamed-oauth"],
+        "test-access-token"
+    );
 }
 
 #[test]

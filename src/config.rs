@@ -141,6 +141,39 @@ pub fn save_global(config: &Config) -> Result<()> {
     save_file(&global_path()?, config)
 }
 
+/// Update the profile selected by the global config and the local config for
+/// the current working tree. Other working trees are intentionally untouched.
+pub(crate) fn replace_profile_references(
+    old_name: &str,
+    new_name: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = vec![global_path()?];
+    if let Some(local_path) = local_path() {
+        if !paths.contains(&local_path) {
+            paths.push(local_path);
+        }
+    }
+
+    let mut updated = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let data = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        let mut config: Config = serde_json::from_str(&data)
+            .with_context(|| format!("failed to parse config {}", path.display()))?;
+        if config.profile.as_deref() != Some(old_name) {
+            continue;
+        }
+        config.profile = new_name.map(str::to_string);
+        save_file(&path, &config)
+            .with_context(|| format!("failed to update config {}", path.display()))?;
+        updated.push(path);
+    }
+    Ok(updated)
+}
+
 pub fn find_local_config_dir() -> Option<PathBuf> {
     let home = dirs::home_dir();
     let mut current_dir = std::env::current_dir().ok()?;
