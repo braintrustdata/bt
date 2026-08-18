@@ -11,8 +11,6 @@ use crate::{auth, config, ui};
 #[command(after_help = "\
 Examples:
   bt profiles
-  bt profiles default
-  bt profiles default test-profile --global
   bt profiles list --json
   bt profiles delete test-profile
   bt profiles rename test-profile renamed-profile
@@ -26,28 +24,10 @@ pub struct ProfilesArgs {
 enum ProfilesCommand {
     /// List saved profiles
     List,
-    /// Show or set the default profile
-    #[command(visible_alias = "set-default")]
-    Default(DefaultArgs),
     /// Delete a saved profile and its credentials
     Delete(DeleteArgs),
     /// Rename a saved profile and move its credentials
     Rename(RenameArgs),
-}
-
-#[derive(Debug, Clone, Args)]
-struct DefaultArgs {
-    /// Profile name to make the default (omit to show the current default)
-    #[arg(value_name = "NAME")]
-    name: Option<String>,
-
-    /// Read or write the global default
-    #[arg(long, short = 'g', conflicts_with = "local")]
-    global: bool,
-
-    /// Read or write the current working tree's local default
-    #[arg(long, short = 'l')]
-    local: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -107,92 +87,9 @@ impl<'a> From<&'a auth::ProfileInfo> for ProfileOutput<'a> {
 pub fn run(base: LoginBaseArgs, args: ProfilesArgs) -> Result<()> {
     match args.command {
         None | Some(ProfilesCommand::List) => list(base.json),
-        Some(ProfilesCommand::Default(args)) => default_profile(base.json, args),
         Some(ProfilesCommand::Delete(args)) => delete(&base, args),
         Some(ProfilesCommand::Rename(args)) => rename(base.json, args),
     }
-}
-
-fn default_profile(json: bool, args: DefaultArgs) -> Result<()> {
-    let Some(name) = args.name else {
-        let config = if args.global {
-            config::load_global()?
-        } else if args.local {
-            config::local_path()
-                .as_deref()
-                .map(config::load_file)
-                .unwrap_or_default()
-        } else {
-            config::load()?
-        };
-        let name = config::trimmed_option(config.profile.as_deref());
-        if json {
-            println!("{}", serde_json::json!({ "name": name }));
-        } else if let Some(name) = name {
-            println!("{name}");
-        } else {
-            println!("No default profile set.");
-        }
-        return Ok(());
-    };
-
-    let name = name.trim();
-    if name.is_empty() {
-        bail!("profile name cannot be empty");
-    }
-    let profiles = auth::list_profiles()?;
-    if !profiles.iter().any(|profile| profile.name == name) {
-        let available = profiles
-            .iter()
-            .map(|profile| profile.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let suffix = if available.is_empty() {
-            String::new()
-        } else {
-            format!(": {available}")
-        };
-        bail!(
-            "profile '{name}' not found; run `bt profiles list` to see available profiles{suffix}"
-        );
-    }
-
-    let (path, scope) = if args.local {
-        let path = config::local_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No local .bt directory found. Use bt init to initialize this directory."
-            )
-        })?;
-        (path, "local")
-    } else if args.global {
-        (config::global_path()?, "global")
-    } else if let Some(path) = config::local_path() {
-        (path, "local")
-    } else {
-        (config::global_path()?, "global")
-    };
-    config::preflight_config_write(&path)?;
-    let mut selected_config = config::load_file(&path);
-    selected_config.profile = Some(name.to_string());
-    config::save_file(&path, &selected_config)?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "name": name,
-                "path": path,
-                "scope": scope,
-                "status": "default",
-            })
-        );
-    } else {
-        ui::print_command_status(
-            ui::CommandStatus::Success,
-            &format!("Set default profile to '{name}' ({scope})"),
-        );
-    }
-    Ok(())
 }
 
 fn list(json: bool) -> Result<()> {
@@ -213,22 +110,16 @@ fn list(json: bool) -> Result<()> {
     table.set_header(vec![
         ui::header("Name"),
         ui::header("Auth"),
-        ui::header("Identity / org"),
+        ui::header("Email"),
         ui::header("App URL"),
     ]);
     ui::apply_column_padding(&mut table, (0, 4));
     for profile in &profiles {
-        let identity = profile
-            .email
-            .as_deref()
-            .or(profile.user_name.as_deref())
-            .or(profile.org_name.as_deref())
-            .or(profile.api_key_hint.as_deref())
-            .unwrap_or("-");
+        let email = profile.email.as_deref().unwrap_or("-");
         table.add_row(vec![
             profile.name.as_str(),
             profile.auth.as_str(),
-            identity,
+            email,
             profile.app_url.as_str(),
         ]);
     }

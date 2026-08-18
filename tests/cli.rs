@@ -243,71 +243,28 @@ fn profiles_list_json_reads_saved_profiles_without_login() {
 }
 
 #[test]
-fn profiles_default_sets_and_shows_global_default_without_login() {
+fn profiles_list_uses_email_column() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
-    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
-
-    let mut set = bt_command();
-    clear_braintrust_auth_env(&mut set);
-    set.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .args(["profiles", "default", "test-profile", "--global", "--json"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"name\":\"test-profile\""))
-        .stdout(predicate::str::contains("\"scope\":\"global\""));
-
-    let config: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read config"),
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"oauth","app_url":"https://app.test.example","email":"user@test.example"}}}"#,
     )
-    .expect("parse config");
-    assert_eq!(config["profile"], "test-profile");
-
-    let mut show = bt_command();
-    clear_braintrust_auth_env(&mut show);
-    show.env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .args(["profiles", "default", "--global", "--json"])
-        .assert()
-        .success()
-        .stdout(predicate::eq("{\"name\":\"test-profile\"}\n"));
-
-    let mut status = bt_command();
-    clear_braintrust_auth_env(&mut status);
-    status
-        .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .args(["status", "--verbose"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("profile: test-profile"));
-}
-
-#[test]
-fn profiles_default_uses_current_worktree_config_when_available() {
-    let home = tempfile::tempdir().expect("home tempdir");
-    let config_home = tempfile::tempdir().expect("config tempdir");
-    let worktree = tempfile::tempdir().expect("worktree tempdir");
-    fs::create_dir(worktree.path().join(".bt")).expect("create local config dir");
-    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+    .expect("write auth store");
 
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
-    cmd.current_dir(worktree.path())
+    cmd.env("NO_COLOR", "1")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
-        .args(["profiles", "default", "test-profile", "--json"])
+        .args(["profiles", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"scope\":\"local\""));
-
-    let config: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(worktree.path().join(".bt/config.json")).expect("read local config"),
-    )
-    .expect("parse local config");
-    assert_eq!(config["profile"], "test-profile");
-    assert!(!config_home.path().join("bt/config.json").exists());
+        .stdout(predicate::str::contains("Email"))
+        .stdout(predicate::str::contains("user@test.example"))
+        .stdout(predicate::str::contains("Identity / org").not());
 }
 
 #[test]
