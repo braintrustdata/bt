@@ -1968,8 +1968,7 @@ async fn resolve_source_project(
             description: None,
         });
     }
-    let configured_project =
-        crate::config::configured_project_for_context(base, Some(client.org_name()));
+    let configured_project = crate::config::configured_project_for_context(Some(client.org_name()));
     let project_name = source
         .project_name
         .as_deref()

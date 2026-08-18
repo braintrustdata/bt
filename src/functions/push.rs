@@ -2531,7 +2531,7 @@ fn resolve_default_project_name(
     let configured = base
         .project
         .clone()
-        .or_else(|| config::configured_project_for_context(base, resolved_org));
+        .or_else(|| config::configured_project_for_context(resolved_org));
     let Some(configured) = configured else {
         return Ok(None);
     };

@@ -583,9 +583,10 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
 
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let project = base.project.clone().or_else(|| {
-        crate::config::configured_project_for_context(&base, ctx.login.org_name().as_deref())
-    });
+    let project = base
+        .project
+        .clone()
+        .or_else(|| crate::config::configured_project_for_context(ctx.login.org_name().as_deref()));
 
     match command {
         SyncCommand::Pull(pull) => {
@@ -603,9 +604,10 @@ pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> R
     let json_output = base.json;
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
-    let project = base.project.clone().or_else(|| {
-        crate::config::configured_project_for_context(&base, ctx.login.org_name().as_deref())
-    });
+    let project = base
+        .project
+        .clone()
+        .or_else(|| crate::config::configured_project_for_context(ctx.login.org_name().as_deref()));
 
     run_push(
         json_output,
