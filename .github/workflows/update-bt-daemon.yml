@@ -1,0 +1,86 @@
+name: Update bt-daemon dependency
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-bt-daemon-dependency
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: automation/update-bt-daemon
+      DEPENDENCY_REPOSITORY: braintrustdata/braintrust-coding-agent-plugins
+      DEPENDENCY_NAME: bt-daemon
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Resolve latest bt-daemon commit
+        id: dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "https://github.com/${DEPENDENCY_REPOSITORY}.git" refs/heads/main | awk 'NR == 1 { print $1 }')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve ${DEPENDENCY_REPOSITORY} main to a commit." >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Update manifest and lockfile
+        env:
+          DEPENDENCY_SHA: ${{ steps.dependency.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          manifest = Path("Cargo.toml")
+          text = manifest.read_text()
+          pattern = r'(bt-daemon\s*=\s*\{\s*git\s*=\s*"https://github\.com/braintrustdata/braintrust-coding-agent-plugins"\s*,\s*rev\s*=\s*")[0-9a-f]{40}("\s*\})'
+          updated, count = re.subn(pattern, rf'\g<1>{os.environ["DEPENDENCY_SHA"]}\g<2>', text)
+          if count != 1:
+              raise SystemExit("expected exactly one bt-daemon git dependency")
+          manifest.write_text(updated)
+          PY
+          cargo update -p "$DEPENDENCY_NAME"
+
+      - name: Commit and open pull request
+        env:
+          DEPENDENCY_SHA: ${{ steps.dependency.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.toml Cargo.lock; then
+            echo "bt-daemon is already pinned to ${DEPENDENCY_SHA}."
+            exit 0
+          fi
+
+          git fetch origin "refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" || true
+          git switch -C "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: update bt-daemon dependency"
+          git push --force-with-lease origin "HEAD:refs/heads/${BRANCH}"
+
+          body="Updates \`${DEPENDENCY_NAME}\` to [${DEPENDENCY_SHA}](https://github.com/${DEPENDENCY_REPOSITORY}/commit/${DEPENDENCY_SHA}), the commit at \`main\` when this workflow ran."
+          pr_number="$(gh pr list --repo "${{ github.repository }}" --head "$BRANCH" --state open --json number --jq '.[0].number')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --repo "${{ github.repository }}" --title "chore: update bt-daemon dependency" --body "$body"
+          else
+            gh pr create --repo "${{ github.repository }}" --base main --head "$BRANCH" --title "chore: update bt-daemon dependency" --body "$body"
+          fi
