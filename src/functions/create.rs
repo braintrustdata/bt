@@ -458,59 +458,18 @@ mod tests {
     }
 
     #[test]
-    fn builds_model_params_template_metadata_and_pass_threshold() {
-        let parsed = CreateArgsHarness::try_parse_from([
-            "bt-scorers-create",
-            "Test scorer",
-            "--model",
-            "gpt-test",
-            "--messages",
-            r#"[{"role":"user","content":"Judge {{output}}"}]"#,
-            "--choice-scores",
-            r#"{"yes":1,"no":0}"#,
-            "--temperature",
-            "0.1",
-            "--max-tokens",
-            "256",
-            "--top-p",
-            "0.8",
-            "--frequency-penalty",
-            "-0.25",
-            "--presence-penalty",
-            "0.5",
-            "--stop-sequence",
-            "END",
-            "--tool-choice",
-            "required",
-            "--reasoning-effort",
-            "medium",
-            "--verbosity",
-            "high",
-            "--template-format",
-            "jinja",
-            "--pass-threshold",
-            "0.7",
-            "--metadata",
-            "owner: test-team",
-        ])
-        .expect("parse create args");
+    fn builds_metadata_and_pass_threshold() {
+        let mut args = args();
+        args.metadata = Some("owner: test-team".to_string());
+        args.pass_threshold = Some(0.7);
 
-        let body =
-            build_scorer_definition(&parsed.args, "test-project", "Test scorer", "test-scorer")
-                .expect("definition");
-        let params = &body["prompt_data"]["options"]["params"];
-        assert_eq!(params["temperature"], 0.1);
-        assert_eq!(params["max_tokens"], 256);
-        assert_eq!(params["top_p"], 0.8);
-        assert_eq!(params["frequency_penalty"], -0.25);
-        assert_eq!(params["presence_penalty"], 0.5);
-        assert_eq!(params["stop"], json!(["END"]));
-        assert_eq!(params["tool_choice"], "required");
-        assert_eq!(params["reasoning_effort"], "medium");
-        assert_eq!(params["verbosity"], "high");
-        assert_eq!(body["prompt_data"]["template_format"], "nunjucks");
-        assert_eq!(body["metadata"]["owner"], "test-team");
-        assert_eq!(body["metadata"]["__pass_threshold"], 0.7);
+        let body = build_scorer_definition(&args, "test-project", "Test scorer", "test-scorer")
+            .expect("definition");
+
+        assert_eq!(
+            body["metadata"],
+            json!({ "owner": "test-team", "__pass_threshold": 0.7 })
+        );
     }
 
     #[test]

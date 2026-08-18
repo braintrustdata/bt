@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, ValueEnum};
+use clap::{builder::BoolishValueParser, Args, ValueEnum};
 use serde_json::{json, Map, Number, Value};
 
 use crate::utils::read_text_source;
@@ -43,6 +43,21 @@ pub(crate) struct PromptConfigArgs {
     /// Response verbosity for supported models.
     #[arg(long, value_enum)]
     verbosity: Option<Verbosity>,
+
+    /// Whether to use Braintrust's completion cache. Pass --use-cache=false to
+    /// bypass it.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = BoolishValueParser::new()
+    )]
+    use_cache: Option<bool>,
+
+    /// Model response format: text, json-object, or a response_format JSON
+    /// object supplied inline, from @PATH, or from stdin with -.
+    #[arg(long, value_name = "FORMAT|SOURCE")]
+    response_format: Option<String>,
 
     /// Prompt template syntax. Jinja is stored using Braintrust's `nunjucks`
     /// format; `nunjucks` and `jinja2` are accepted aliases.
@@ -124,7 +139,14 @@ impl PromptConfigArgs {
             options.insert("model".to_string(), Value::String(model.to_string()));
         }
 
-        insert_optional_number(&mut params, "temperature", self.temperature)?;
+        let temperature = match (self.temperature, self.use_cache) {
+            (None, Some(true)) => Some(0.0),
+            (Some(temperature), Some(true)) if temperature != 0.0 => {
+                bail!("--use-cache=true requires --temperature=0")
+            }
+            (temperature, _) => temperature,
+        };
+        insert_optional_number(&mut params, "temperature", temperature)?;
         if let Some(max_tokens) = self.max_tokens {
             params.insert("max_tokens".to_string(), Value::Number(max_tokens.into()));
         }
@@ -174,6 +196,15 @@ impl PromptConfigArgs {
                 Value::String(verbosity.as_str().to_string()),
             );
         }
+        if let Some(use_cache) = self.use_cache {
+            params.insert("use_cache".to_string(), Value::Bool(use_cache));
+        }
+        if let Some(source) = self.response_format.as_deref() {
+            params.insert(
+                "response_format".to_string(),
+                parse_response_format_source(source)?,
+            );
+        }
 
         if !params.is_empty() {
             options.insert("params".to_string(), Value::Object(params));
@@ -190,6 +221,58 @@ impl PromptConfigArgs {
 
         Ok(prompt_data)
     }
+}
+
+fn parse_response_format_source(source: &str) -> Result<Value> {
+    let value = match source {
+        "text" => json!({ "type": "text" }),
+        "json-object" | "json_object" => json!({ "type": "json_object" }),
+        _ => {
+            let raw = read_text_source(source, "response format")?;
+            serde_json::from_str(&raw)
+                .context("invalid response format; use text, json-object, or a JSON object")?
+        }
+    };
+
+    let Some(format) = value.as_object() else {
+        bail!("response format must be a JSON object");
+    };
+    match format.get("type").and_then(Value::as_str) {
+        Some("text" | "json_object") => {}
+        Some("json_schema") => validate_json_schema_response_format(format)?,
+        Some(other) => bail!(
+            "unsupported response format type '{other}'; expected text, json_object, or json_schema"
+        ),
+        None => bail!("response format must contain a string 'type' field"),
+    }
+
+    Ok(value)
+}
+
+fn validate_json_schema_response_format(format: &Map<String, Value>) -> Result<()> {
+    let Some(schema) = format.get("json_schema").and_then(Value::as_object) else {
+        bail!("json_schema response format must contain a 'json_schema' object");
+    };
+    match schema.get("name") {
+        Some(Value::String(_)) => {}
+        _ => bail!("json_schema response format must contain a string 'json_schema.name' field"),
+    }
+    if let Some(value) = schema.get("description") {
+        if !value.is_string() {
+            bail!("response format 'json_schema.description' must be a string");
+        }
+    }
+    if let Some(value) = schema.get("schema") {
+        if !value.is_object() && !value.is_string() {
+            bail!("response format 'json_schema.schema' must be an object or template string");
+        }
+    }
+    if let Some(value) = schema.get("strict") {
+        if !value.is_boolean() && !value.is_null() {
+            bail!("response format 'json_schema.strict' must be a boolean or null");
+        }
+    }
+    Ok(())
 }
 
 fn insert_optional_number(
@@ -310,6 +393,9 @@ mod tests {
             "high",
             "--verbosity",
             "low",
+            "--use-cache=false",
+            "--response-format",
+            r#"{"type":"json_schema","json_schema":{"name":"test_result","schema":{"type":"object"},"strict":true}}"#,
             "--template-format",
             "jinja",
         ])
@@ -332,7 +418,64 @@ mod tests {
         );
         assert_eq!(patch["options"]["params"]["reasoning_effort"], "high");
         assert_eq!(patch["options"]["params"]["verbosity"], "low");
+        assert_eq!(patch["options"]["params"]["use_cache"], false);
+        assert_eq!(
+            patch["options"]["params"]["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "test_result",
+                    "schema": { "type": "object" },
+                    "strict": true,
+                }
+            })
+        );
         assert_eq!(patch["template_format"], "nunjucks");
+    }
+
+    #[test]
+    fn enabling_cache_sets_the_temperature_required_by_the_web_ui() {
+        let args = Harness::try_parse_from(["test", "--use-cache=true"]).expect("parse arguments");
+
+        let patch = args
+            .config
+            .build_prompt_data_patch(Some("claude-test"))
+            .expect("prompt data");
+        assert_eq!(patch["options"]["params"]["temperature"], 0.0);
+        assert_eq!(patch["options"]["params"]["use_cache"], true);
+    }
+
+    #[test]
+    fn rejects_cache_with_nonzero_temperature() {
+        let args = Harness::try_parse_from(["test", "--temperature", "0.5", "--use-cache=true"])
+            .expect("parse arguments");
+
+        let error = args
+            .config
+            .build_prompt_data_patch(Some("claude-test"))
+            .expect_err("nonzero temperature should conflict with caching");
+        assert!(error
+            .to_string()
+            .contains("--use-cache=true requires --temperature=0"));
+    }
+
+    #[test]
+    fn supports_response_format_shorthands() {
+        assert_eq!(
+            parse_response_format_source("text").expect("text format"),
+            json!({ "type": "text" })
+        );
+        assert_eq!(
+            parse_response_format_source("json-object").expect("JSON object format"),
+            json!({ "type": "json_object" })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_json_schema_response_format() {
+        let error = parse_response_format_source(r#"{"type":"json_schema"}"#)
+            .expect_err("missing json_schema should fail");
+        assert!(error.to_string().contains("'json_schema' object"));
     }
 
     #[test]
