@@ -459,9 +459,7 @@ pub async fn fast_login(base: &BaseArgs) -> Result<LoginContext> {
     maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
     let api_key = auth.api_key.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt login`"
-        )
+        anyhow::anyhow!("no login credentials found; set BRAINTRUST_API_KEY or run `bt login`")
     })?;
     let org_name = auth.org_name.clone().unwrap_or_default();
     let api_url = auth
@@ -494,9 +492,7 @@ pub async fn login(base: &BaseArgs) -> Result<LoginContext> {
     maybe_warn_api_key_override(base);
     let auth = resolve_auth(base).await?;
     let api_key = auth.api_key.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no login credentials found; set BRAINTRUST_API_KEY, pass --api-key, or run `bt login`"
-        )
+        anyhow::anyhow!("no login credentials found; set BRAINTRUST_API_KEY or run `bt login`")
     })?;
 
     let mut builder = BraintrustClient::builder()
@@ -778,7 +774,7 @@ fn maybe_warn_api_key_override(base: &BaseArgs) {
 
     if let Some(profile_name) = ignored_profile {
         eprintln!(
-            "Info: using --api-key/BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY to use a profile with OAuth login.",
+            "Info: using BRAINTRUST_API_KEY credentials; selected profile '{profile_name}' is ignored for this command. Use --prefer-profile or unset BRAINTRUST_API_KEY to use a profile with OAuth login.",
         );
     }
 }
@@ -792,12 +788,7 @@ fn has_explicit_profile_selection(base: &BaseArgs) -> bool {
 }
 
 fn resolve_api_key_override(base: &BaseArgs) -> Option<String> {
-    if (base.prefer_profile || has_explicit_profile_selection(base))
-        && !matches!(
-            base.api_key_source,
-            Some(crate::args::ArgValueSource::CommandLine)
-        )
-    {
+    if base.prefer_profile || has_explicit_profile_selection(base) {
         return None;
     }
     let value = base.api_key.as_deref()?.trim();
@@ -2864,7 +2855,7 @@ fn build_oauth_client(
 
 fn prompt_api_key() -> Result<String> {
     let term = ui::prompt_term()
-        .ok_or_else(|| anyhow::anyhow!("--api-key is required in non-interactive mode"))?;
+        .ok_or_else(|| anyhow::anyhow!("BRAINTRUST_API_KEY is required in non-interactive mode"))?;
     let api_key = Password::new()
         .with_prompt("Braintrust API key")
         .allow_empty_password(false)
@@ -2882,7 +2873,7 @@ fn prompt_api_key() -> Result<String> {
 fn linux_secret_tool_exec_error(err: std::io::Error) -> anyhow::Error {
     if err.kind() == std::io::ErrorKind::NotFound {
         anyhow::anyhow!(
-            "`secret-tool` is not installed. Install `libsecret-tools` (Debian/Ubuntu) or your distro's equivalent package, or use BRAINTRUST_API_KEY/--api-key for non-persistent auth."
+            "`secret-tool` is not installed. Install `libsecret-tools` (Debian/Ubuntu) or your distro's equivalent package, or use BRAINTRUST_API_KEY for non-persistent auth."
         )
     } else {
         anyhow::anyhow!("failed to execute Linux keychain utility `secret-tool`: {err}")
@@ -2899,7 +2890,7 @@ fn linux_secret_service_unavailable(stderr: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn linux_secret_service_error() -> anyhow::Error {
     anyhow::anyhow!(
-        "no Secret Service provider is running. Start a Secret Service daemon (for example gnome-keyring or keepassxc with Secret Service enabled), or use BRAINTRUST_API_KEY/--api-key for non-persistent auth."
+        "no Secret Service provider is running. Start a Secret Service daemon (for example gnome-keyring or keepassxc with Secret Service enabled), or use BRAINTRUST_API_KEY for non-persistent auth."
     )
 }
 
@@ -4010,40 +4001,6 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.api_key.as_deref(), Some("profile-key"));
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
-    }
-
-    #[test]
-    fn resolve_auth_prefers_cli_api_key_even_with_prefer_profile() {
-        let mut base = make_base();
-        base.api_key = Some("explicit-key".to_string());
-        base.api_key_source = Some(crate::args::ArgValueSource::CommandLine);
-        base.prefer_profile = true;
-        base.profile = Some("work".to_string());
-
-        let mut store = AuthStore::default();
-        store.profiles.insert(
-            "work".to_string(),
-            AuthProfile {
-                auth_kind: AuthKind::ApiKey,
-                oauth_api_url: Some("https://api.example.com".to_string()),
-                app_url: None,
-                org_name: Some("Example Org".to_string()),
-                org_bound: Some(true),
-                oauth_client_id: None,
-                oauth_access_expires_at: None,
-                ..Default::default()
-            },
-        );
-
-        let resolved = resolve_auth_from_store_with_secret_lookup(
-            &base,
-            &store,
-            |_| Ok(Some("profile-key".to_string())),
-            &None,
-        )
-        .expect("resolve");
-        assert_eq!(resolved.api_key.as_deref(), Some("explicit-key"));
-        assert_eq!(resolved.org_name, None);
     }
 
     #[test]

@@ -1419,7 +1419,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run evals and emit SSE events for bt.")
     parser.add_argument("files", nargs="*", help="Eval files or directories to run.")
     parser.add_argument("--local", action="store_true", help="Do not send logs to Braintrust.")
-    parser.add_argument("--api-key", help="Specify a braintrust API key.")
     parser.add_argument("--org-name", help="Organization name.")
     parser.add_argument("--app-url", help="Braintrust app URL.")
     return parser
@@ -1442,7 +1441,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             if not local:
-                login(api_key=args.api_key, org_name=args.org_name, app_url=args.app_url)
+                login(org_name=args.org_name, app_url=args.app_url)
             success = asyncio.run(run_once(files, local, sse, config))
         except Exception as exc:
             stack = traceback.format_exc()
