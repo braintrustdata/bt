@@ -2,6 +2,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
+use std::fs;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Client;
@@ -37,6 +42,16 @@ pub struct UpdateArgs {
     /// Update channel (defaults to the build channel)
     #[arg(long, value_enum)]
     pub channel: Option<UpdateChannel>,
+
+    // Process-internal plumbing: on Windows a running executable cannot be
+    // replaced, so a signed copy of bt performs the update after its parent exits.
+    #[cfg(windows)]
+    #[arg(long, hide = true, requires = "windows_update_parent_pid")]
+    pub windows_update_worker: bool,
+
+    #[cfg(windows)]
+    #[arg(long, hide = true, requires = "windows_update_worker")]
+    pub windows_update_parent_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -92,10 +107,19 @@ pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
 }
 
 async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
-    ensure_installer_managed_install()?;
     let channel = args
         .channel
         .unwrap_or_else(|| inferred_update_channel(BUILD_UPDATE_CHANNEL));
+
+    #[cfg(windows)]
+    if args.windows_update_worker {
+        let parent_pid = args
+            .windows_update_parent_pid
+            .context("Windows update worker is missing its parent process ID")?;
+        return run_windows_update_worker(base, channel, parent_pid);
+    }
+
+    ensure_installer_managed_install()?;
 
     if args.check {
         check_for_update(base, channel).await?;
@@ -118,7 +142,19 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         }
     }
 
-    run_installer(base, channel)?;
+    #[cfg(windows)]
+    {
+        return launch_windows_update_worker(base, channel);
+    }
+
+    #[cfg(not(windows))]
+    {
+        run_installer(base, channel)?;
+        print_update_completed(base, channel)
+    }
+}
+
+fn print_update_completed(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     if base.json {
         let payload = serde_json::json!({
             "channel": channel.name(),
@@ -215,6 +251,123 @@ async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHu
         .json()
         .await
         .context("failed to parse GitHub release response")
+}
+
+#[cfg(windows)]
+fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+    let exe = env::current_exe().context("failed to resolve current executable path")?;
+    let parent = exe
+        .parent()
+        .context("current executable has no parent directory")?;
+    let parent_pid = std::process::id();
+    let worker = parent.join(format!("bt-update-{parent_pid}.exe"));
+
+    if worker.exists() {
+        fs::remove_file(&worker).with_context(|| {
+            format!(
+                "failed to remove stale Windows update helper {}",
+                worker.display()
+            )
+        })?;
+    }
+    fs::copy(&exe, &worker).with_context(|| {
+        format!(
+            "failed to create signed Windows update helper {}",
+            worker.display()
+        )
+    })?;
+
+    let parent_pid_arg = parent_pid.to_string();
+    let mut command = Command::new(&worker);
+    command.args([
+        "update",
+        "--channel",
+        channel.name(),
+        "--windows-update-worker",
+        "--windows-update-parent-pid",
+        &parent_pid_arg,
+    ]);
+    if base.json {
+        command.arg("--json");
+    }
+
+    if let Err(err) = command.spawn() {
+        let _ = fs::remove_file(&worker);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to launch signed Windows update helper {}",
+                worker.display()
+            )
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_windows_update_worker(
+    base: &BaseArgs,
+    channel: UpdateChannel,
+    parent_pid: u32,
+) -> Result<()> {
+    let worker = env::current_exe().context("failed to resolve Windows update helper path")?;
+    let expected_name = format!("bt-update-{parent_pid}.exe");
+    let is_update_helper = worker
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(&expected_name));
+    if !is_update_helper {
+        anyhow::bail!("refusing to run the Windows update worker from an unexpected path");
+    }
+
+    let wait_script = format!("Wait-Process -Id {parent_pid} -ErrorAction SilentlyContinue");
+    let wait_status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &wait_script,
+        ])
+        .status()
+        .context("failed to wait for the original bt process to exit")?;
+    if !wait_status.success() {
+        anyhow::bail!("failed waiting for the original bt process: {wait_status}");
+    }
+
+    let update_result =
+        run_installer(base, channel).and_then(|()| print_update_completed(base, channel));
+    if let Err(err) = schedule_windows_worker_cleanup(&worker) {
+        eprintln!(
+            "warning: failed to schedule cleanup of Windows update helper {}: {err}",
+            worker.display()
+        );
+    }
+    update_result
+}
+
+#[cfg(windows)]
+fn schedule_windows_worker_cleanup(worker: &Path) -> Result<()> {
+    // A Windows process cannot delete its own executable. Use the signed system
+    // PowerShell after this worker exits; this is process plumbing, not config.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let worker_pid = std::process::id();
+    let escaped_path = worker.to_string_lossy().replace('\'', "''");
+    let cleanup_script = format!(
+        "Wait-Process -Id {worker_pid} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '{escaped_path}' -Force -ErrorAction SilentlyContinue"
+    );
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &cleanup_script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .context("failed to launch Windows update-helper cleanup")?;
+    Ok(())
 }
 
 fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
