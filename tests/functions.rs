@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+#[cfg(unix)]
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -139,6 +141,7 @@ fn find_tsc() -> Option<PathBuf> {
     None
 }
 
+#[cfg(unix)]
 fn decode_uploaded_bundle(bundle: &[u8]) -> String {
     if bundle.starts_with(&[0x1f, 0x8b]) {
         let mut decoder = GzDecoder::new(bundle);

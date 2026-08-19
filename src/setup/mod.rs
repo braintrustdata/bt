@@ -7338,6 +7338,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_gemini_project_scope_for_local() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7392,6 +7393,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_gemini_user_scope_for_global() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7438,6 +7440,7 @@ mod tests {
         assert!(log.contains(&home.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_qwen_project_scope_for_local() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7492,6 +7495,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_qwen_user_scope_for_global() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7538,6 +7542,7 @@ mod tests {
         assert!(log.contains(&home.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_copilot_with_config_dir_for_local() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7593,6 +7598,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_copilot_without_config_dir_for_global() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");

@@ -61,6 +61,7 @@ pub enum UpdateChannel {
 }
 
 impl UpdateChannel {
+    #[cfg(not(windows))]
     fn installer_url(self) -> &'static str {
         match self {
             UpdateChannel::Stable => {
@@ -144,7 +145,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
 
     #[cfg(windows)]
     {
-        return launch_windows_update_worker(base, channel);
+        launch_windows_update_worker(base, channel)
     }
 
     #[cfg(not(windows))]
@@ -424,7 +425,7 @@ fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         }
 
         status_line("update completed");
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -563,14 +564,17 @@ mod tests {
 
     #[test]
     fn channel_urls_are_expected() {
-        assert_eq!(
-            UpdateChannel::Stable.installer_url(),
-            "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh"
-        );
-        assert_eq!(
-            UpdateChannel::Canary.installer_url(),
-            "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh"
-        );
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                UpdateChannel::Stable.installer_url(),
+                "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh"
+            );
+            assert_eq!(
+                UpdateChannel::Canary.installer_url(),
+                "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh"
+            );
+        }
         assert_eq!(
             UpdateChannel::Stable.github_release_api_url(),
             "https://api.github.com/repos/braintrustdata/bt/releases/latest"
