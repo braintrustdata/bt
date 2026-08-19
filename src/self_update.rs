@@ -262,6 +262,8 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
     let parent_pid = std::process::id();
     let worker = parent.join(format!("bt-update-{parent_pid}.exe"));
 
+    cleanup_stale_windows_update_workers(parent, &worker);
+
     if worker.exists() {
         fs::remove_file(&worker).with_context(|| {
             format!(
@@ -321,27 +323,94 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
         }
     };
 
-    if !exe.exists() {
-        fs::copy(&worker, &exe).with_context(|| {
+    if !status.success() {
+        restore_windows_executable(&worker, &exe).with_context(|| {
             format!(
-                "Windows update did not install an executable, and the original could not be restored to {}",
-                exe.display()
+                "Windows update helper exited with status {status}; failed to restore the original executable from {}",
+                worker.display()
+            )
+        })?;
+        schedule_windows_worker_cleanup_with_warning(&worker);
+        anyhow::bail!(
+            "Windows update helper exited with status {status}; restored the original executable"
+        );
+    }
+
+    if !exe.exists() {
+        restore_windows_executable(&worker, &exe).with_context(|| {
+            format!(
+                "Windows update did not install an executable; failed to restore the original executable from {}",
+                worker.display()
             )
         })?;
     }
 
-    if let Err(err) = schedule_windows_worker_cleanup(&worker) {
+    schedule_windows_worker_cleanup_with_warning(&worker);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_stale_windows_update_workers(parent: &Path, active_worker: &Path) {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to scan for stale Windows update helpers in {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == active_worker || !is_windows_update_worker_path(&path) {
+            continue;
+        }
+        if let Err(err) = fs::remove_file(&path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to remove stale Windows update helper {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_update_worker_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(pid) = name
+        .strip_prefix("bt-update-")
+        .and_then(|name| name.strip_suffix(".exe"))
+    else {
+        return false;
+    };
+    !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(windows)]
+fn restore_windows_executable(worker: &Path, exe: &Path) -> Result<()> {
+    fs::copy(worker, exe).with_context(|| {
+        format!(
+            "failed to copy the original executable to {}",
+            exe.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn schedule_windows_worker_cleanup_with_warning(worker: &Path) {
+    if let Err(err) = schedule_windows_worker_cleanup(worker) {
         eprintln!(
             "warning: failed to schedule cleanup of Windows update helper {}: {err}",
             worker.display()
         );
     }
-
-    if !status.success() {
-        anyhow::bail!("Windows update helper exited with status {status}");
-    }
-
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -387,13 +456,7 @@ fn schedule_windows_worker_cleanup(worker: &Path) -> Result<()> {
 }
 
 async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
-    let status_line = |msg: &str| {
-        if base.json {
-            eprintln!("{msg}");
-        } else {
-            println!("{msg}");
-        }
-    };
+    let status_line = |msg: &str| eprintln!("{msg}");
 
     #[cfg(not(windows))]
     {
