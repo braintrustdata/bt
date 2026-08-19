@@ -25,6 +25,12 @@ pub fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
     write_bytes_atomic(path, contents.as_bytes())
 }
 
+/// Atomically write text which contains credentials with owner-only permissions
+/// on platforms that support Unix-style file modes.
+pub fn write_text_atomic_private(path: &Path, contents: &str) -> Result<()> {
+    write_atomic(path, contents.as_bytes(), Visibility::Private)
+}
+
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_json(path, value, Visibility::Default)
 }

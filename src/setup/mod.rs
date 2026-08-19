@@ -1842,6 +1842,13 @@ async fn ensure_profile_or_setup_browser_auth_context(
     .await
 }
 
+/// Resolve setup credentials, creating a durable API key when the selected
+/// profile uses OAuth. Consumers write the returned key into static tool
+/// configuration, where an expiring OAuth access token would not work.
+pub(crate) async fn durable_setup_api_key(base: &mut BaseArgs) -> Result<String> {
+    Ok(ensure_setup_auth(base, false, true).await?.api_key)
+}
+
 async fn ensure_setup_auth(
     base: &mut BaseArgs,
     prompt_for_profile_choice: bool,

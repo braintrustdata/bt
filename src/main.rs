@@ -12,6 +12,7 @@ mod env;
 mod eval;
 mod experiments;
 mod functions;
+mod gateway;
 mod http;
 mod init;
 mod js_runner;
@@ -176,6 +177,8 @@ enum Commands {
     Status(CLIArgs<status::StatusArgs>),
     /// Manage coding-agent tracing
     Trace(CLIArgs<bt_daemon::TraceArgs>),
+    /// Configure coding agents to use Braintrust Gateway
+    Gateway(CLIArgs<gateway::GatewayArgs, gateway::GatewayBaseArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
@@ -208,6 +211,7 @@ impl Commands {
             Commands::Switch(cmd) => &cmd.base,
             Commands::Status(cmd) => &cmd.base,
             Commands::Trace(cmd) => &cmd.base,
+            Commands::Gateway(cmd) => &cmd.base.login,
         }
     }
 
@@ -238,6 +242,7 @@ impl Commands {
             Commands::Switch(cmd) => &mut cmd.base,
             Commands::Status(cmd) => &mut cmd.base,
             Commands::Trace(cmd) => &mut cmd.base,
+            Commands::Gateway(cmd) => &mut cmd.base.login,
         }
     }
 
@@ -371,6 +376,7 @@ fn try_main() -> Result<()> {
             Commands::Trace(cmd) => {
                 bt_daemon::run_trace(cmd.args, trace_host::context(cmd.base)).await?
             }
+            Commands::Gateway(cmd) => gateway::run(cmd.base, cmd.args).await?,
         }
         Ok(())
     });
