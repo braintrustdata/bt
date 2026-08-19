@@ -678,9 +678,9 @@ fn functions_push_requires_app_url_with_custom_api_url() {
         .expect("run push with custom API URL and no app URL");
 
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--app-url or BRAINTRUST_APP_URL"));
-    assert!(!stderr.contains("https://www.braintrust.dev/api/apikey/login"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--app-url or BRAINTRUST_APP_URL"));
+    assert!(!stdout.contains("https://www.braintrust.dev/api/apikey/login"));
 }
 
 #[test]
@@ -725,7 +725,7 @@ fn root_login_refresh_uses_selected_profile() {
 
     let output = cmd.output().expect("run bt login --refresh");
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
+    assert!(String::from_utf8_lossy(&output.stdout)
         .contains("`bt login --refresh` only applies to oauth profiles"));
 }
 

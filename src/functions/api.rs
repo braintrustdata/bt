@@ -58,9 +58,27 @@ pub struct CodeUploadSlot {
     pub bundle_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct InsertedFunctionResult {
+    pub id: String,
+    pub project_id: String,
+    pub slug: String,
+    pub found_existing: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct InsertFunctionsResult {
     pub ignored_entries: Option<usize>,
+    pub xact_id: Option<String>,
+    pub functions: Vec<InsertedFunctionResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InsertFunctionsResponse {
+    #[serde(default)]
+    xact_id: Option<String>,
+    #[serde(default)]
+    functions: Vec<InsertedFunctionResult>,
 }
 
 pub async fn list_functions(
@@ -68,17 +86,29 @@ pub async fn list_functions(
     project_id: &str,
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
-    let pid = escape_sql(project_id);
-    let query = match function_type {
-        Some(ft) => {
-            let ft = escape_sql(ft);
-            format!("SELECT * FROM project_functions('{pid}') WHERE function_type = '{ft}'")
-        }
-        None => format!("SELECT * FROM project_functions('{pid}')"),
-    };
+    let query = list_functions_query(project_id, function_type);
     let response = client.btql::<Function>(&query).await?;
 
     Ok(response.data)
+}
+
+fn list_functions_query(project_id: &str, function_type: Option<&str>) -> String {
+    let pid = escape_sql(project_id);
+    let type_filter = match function_type {
+        // Match the web UI's Scorers tab: label-producing classifiers appear
+        // alongside score-producing scorers, while topic maps do not.
+        Some("scorer") => "function_type IN ('scorer', 'classifier') \
+            AND COALESCE(function_data.type, '') != 'topic_map' \
+            AND (origin IS NULL OR NOT COALESCE(origin.internal, FALSE))"
+            .to_string(),
+        Some(ft) => {
+            let ft = escape_sql(ft);
+            format!("function_type = '{ft}'")
+        }
+        None => return format!("SELECT * FROM project_functions('{pid}')"),
+    };
+
+    format!("SELECT * FROM project_functions('{pid}') WHERE {type_filter}")
 }
 
 pub async fn get_function_by_slug(
@@ -258,8 +288,14 @@ pub async fn insert_functions(
         .await
         .context("failed to insert functions")?;
 
+    let response: InsertFunctionsResponse = serde_json::from_value(raw.clone())
+        .context("unexpected insert-functions response shape")?;
+
     Ok(InsertFunctionsResult {
-        ignored_entries: ignored_count(&raw),
+        ignored_entries: ignored_count(&raw)
+            .or_else(|| ignored_count_from_function_results(&raw, functions)),
+        xact_id: response.xact_id,
+        functions: response.functions,
     })
 }
 
@@ -273,9 +309,47 @@ fn ignored_count(raw: &Value) -> Option<usize> {
         .and_then(|count| usize::try_from(count).ok())
 }
 
+fn ignored_count_from_function_results(raw: &Value, requests: &[Value]) -> Option<usize> {
+    let results = raw.get("functions")?.as_array()?;
+    if results.len() != requests.len() {
+        return None;
+    }
+
+    results
+        .iter()
+        .zip(requests)
+        .try_fold(0usize, |count, (result, request)| {
+            let should_ignore = request.get("if_exists").and_then(Value::as_str) == Some("ignore");
+            if !should_ignore {
+                return Some(count);
+            }
+
+            let found_existing = result.get("found_existing")?.as_bool()?;
+            Some(count + usize::from(found_existing))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scorer_list_query_matches_web_ui_filter() {
+        let query = list_functions_query("test-project-id", Some("scorer"));
+
+        assert!(query.contains("function_type IN ('scorer', 'classifier')"));
+        assert!(query.contains("COALESCE(function_data.type, '') != 'topic_map'"));
+        assert!(query.contains("origin IS NULL"));
+        assert!(query.contains("origin.internal"));
+    }
+
+    #[test]
+    fn non_scorer_list_query_keeps_exact_type_filter() {
+        let query = list_functions_query("test-project-id", Some("tool"));
+
+        assert!(query.contains("function_type = 'tool'"));
+        assert!(!query.contains("classifier"));
+    }
 
     #[test]
     fn ignored_count_extracts_canonical_shape() {
@@ -289,6 +363,61 @@ mod tests {
         assert_eq!(ignored_count(&third), None);
 
         assert_eq!(ignored_count(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn derives_ignored_count_from_found_existing_results() {
+        let requests = vec![
+            serde_json::json!({ "slug": "first", "if_exists": "ignore" }),
+            serde_json::json!({ "slug": "second", "if_exists": "replace" }),
+            serde_json::json!({ "slug": "third", "if_exists": "ignore" }),
+        ];
+        let response = serde_json::json!({
+            "functions": [
+                { "slug": "first", "found_existing": true },
+                { "slug": "second", "found_existing": true },
+                { "slug": "third", "found_existing": false },
+            ]
+        });
+
+        assert_eq!(
+            ignored_count_from_function_results(&response, &requests),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ignored_count_fallback_rejects_mismatched_response_length() {
+        let requests = vec![serde_json::json!({
+            "slug": "first",
+            "if_exists": "ignore"
+        })];
+        let response = serde_json::json!({ "functions": [] });
+
+        assert_eq!(
+            ignored_count_from_function_results(&response, &requests),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_insert_function_operation_fields() {
+        let response: InsertFunctionsResponse = serde_json::from_value(serde_json::json!({
+            "xact_id": "1000000000000000001",
+            "functions": [{
+                "id": "fn_test_scorer",
+                "project_id": "test-project",
+                "slug": "test-scorer",
+                "found_existing": true
+            }]
+        }))
+        .expect("insert response");
+
+        assert_eq!(response.xact_id.as_deref(), Some("1000000000000000001"));
+        assert_eq!(response.functions[0].id, "fn_test_scorer");
+        assert_eq!(response.functions[0].project_id, "test-project");
+        assert_eq!(response.functions[0].slug, "test-scorer");
+        assert!(response.functions[0].found_existing);
     }
 
     #[test]

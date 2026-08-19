@@ -13,9 +13,11 @@ use crate::{
 };
 
 pub(crate) mod api;
+pub(crate) mod create;
 mod delete;
 mod invoke;
 mod list;
+pub(crate) mod prompt_config;
 mod pull;
 mod push;
 pub(crate) mod report;
@@ -114,6 +116,9 @@ fn build_web_path(function: &Function) -> String {
     match function.function_type.as_deref() {
         Some("tool") => format!("tools?pr={}", urlencoding::encode(id)),
         Some("scorer") => format!("scorers/{}", urlencoding::encode(id)),
+        Some("classifier") if function.prompt_data.is_some() => {
+            format!("scorers/{}", urlencoding::encode(id))
+        }
         Some("classifier") => {
             let xact_id = function._xact_id.as_deref().unwrap_or("");
             format!(
@@ -177,7 +182,7 @@ pub struct FunctionArgs {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum FunctionCommands {
+pub(crate) enum FunctionCommands {
     /// List all in the current project
     List,
     /// View a function's details
@@ -608,8 +613,16 @@ pub(crate) async fn select_function_interactive(
 }
 
 pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
+    run_typed_command(base, args.command, kind).await
+}
+
+pub(crate) async fn run_typed_command(
+    base: BaseArgs,
+    command: Option<FunctionCommands>,
+    kind: FunctionTypeFilter,
+) -> Result<()> {
     let ft = Some(kind);
-    match args.command {
+    match command {
         Some(FunctionCommands::View(v)) => match v.selector()? {
             ViewSelector::Id(id) => {
                 let auth_ctx = resolve_auth_context(&base).await?;
@@ -650,6 +663,12 @@ pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFil
             }
         }
     }
+}
+
+pub(crate) async fn run_scorer_create(base: BaseArgs, args: create::CreateArgs) -> Result<()> {
+    let json_output = base.json;
+    let ctx = resolve_context(&base).await?;
+    create::run(&ctx, &args, json_output).await
 }
 
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
@@ -1083,6 +1102,26 @@ mod tests {
         };
         let err = view.inner.selector().expect_err("id and slug conflict");
         assert!(err.to_string().contains("either --id or a slug"));
+    }
+
+    #[test]
+    fn prompt_classifier_web_path_uses_scorers_page() {
+        let function = Function {
+            id: "fn_test_classifier".to_string(),
+            name: "Test classifier".to_string(),
+            slug: "test-classifier".to_string(),
+            project_id: "test-project".to_string(),
+            description: None,
+            function_type: Some("classifier".to_string()),
+            prompt_data: Some(serde_json::json!({"parser": {"choice": ["a", "b"]}})),
+            function_data: Some(serde_json::json!({"type": "prompt"})),
+            tags: None,
+            metadata: None,
+            created: None,
+            _xact_id: None,
+        };
+
+        assert_eq!(build_web_path(&function), "scorers/fn_test_classifier");
     }
 
     #[test]
