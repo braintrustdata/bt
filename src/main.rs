@@ -84,6 +84,7 @@ Data & evaluation
 
 Additional
   docs         Manage workflow docs for coding agents
+  gateway      Configure coding agents to use Braintrust Gateway
   trace        Manage coding-agent tracing
   setup        Configure Braintrust setup flows (deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh)
   status       Show current identity, org, and project context

@@ -40,8 +40,13 @@ enum GatewayCommand {
 
 #[derive(Debug, Clone, Args)]
 struct GatewaySetupArgs {
+    /// Agent to configure (positional form)
     #[arg(value_enum)]
-    agent: GatewayAgent,
+    agent: Option<GatewayAgent>,
+
+    /// Agent to configure
+    #[arg(long = "agent", env = "BRAINTRUST_GATEWAY_AGENT", value_enum)]
+    agent_flag: Option<GatewayAgent>,
 
     /// Gateway URL to use for model requests
     #[arg(long, env = "BRAINTRUST_GATEWAY_URL", default_value = DEFAULT_GATEWAY_URL)]
@@ -58,16 +63,20 @@ enum GatewayAgent {
 
 pub async fn run(base: GatewayBaseArgs, args: GatewayArgs) -> Result<()> {
     let GatewayCommand::Setup(args) = args.command;
+    let gateway_url = normalize_gateway_url(&args.gateway_url)?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
+    let agent = args
+        .agent
+        .or(args.agent_flag)
+        .ok_or_else(|| anyhow!("an agent is required; pass `claude`/`codex` or --agent <AGENT>"))?;
     let mut auth_base = BaseArgs {
         login: base.login,
         org_name: base.org_name,
         project: None,
     };
     let api_key = setup::durable_setup_api_key(&mut auth_base).await?;
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve HOME/USERPROFILE"))?;
-    let gateway_url = normalize_gateway_url(&args.gateway_url)?;
 
-    let path = match args.agent {
+    let path = match agent {
         GatewayAgent::Claude => {
             let path = home.join(".claude/settings.json");
             configure_claude(&path, &gateway_url, &api_key)?;
@@ -84,7 +93,7 @@ pub async fn run(base: GatewayBaseArgs, args: GatewayArgs) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "agent": match args.agent { GatewayAgent::Claude => "claude", GatewayAgent::Codex => "codex" },
+                "agent": agent.as_str(),
                 "gateway_url": gateway_url,
                 "settings_path": path,
             }))?
@@ -92,7 +101,7 @@ pub async fn run(base: GatewayBaseArgs, args: GatewayArgs) -> Result<()> {
     } else if auth_base.verbose {
         eprintln!(
             "Configured {} to use Braintrust Gateway ({})",
-            args.agent.display_name(),
+            agent.display_name(),
             path.display()
         );
     }
@@ -101,6 +110,13 @@ pub async fn run(base: GatewayBaseArgs, args: GatewayArgs) -> Result<()> {
 }
 
 impl GatewayAgent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
     fn display_name(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
@@ -148,12 +164,48 @@ fn configure_codex(path: &Path, gateway_url: &str, api_key: &str) -> Result<()> 
         .as_table_mut()
         .ok_or_else(|| anyhow!("field 'env' in {} must be a TOML table", path.display()))?;
     env.insert(
-        "OPENAI_BASE_URL".to_string(),
+        "BRAINTRUST_GATEWAY_API_KEY".to_string(),
+        TomlValue::String(api_key.to_string()),
+    );
+    root.insert(
+        "model_provider".to_string(),
+        TomlValue::String("braintrust_gateway".to_string()),
+    );
+    let providers = root
+        .entry("model_providers".to_string())
+        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            anyhow!(
+                "field 'model_providers' in {} must be a TOML table",
+                path.display()
+            )
+        })?;
+    let provider = providers
+        .entry("braintrust_gateway".to_string())
+        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            anyhow!(
+                "field 'model_providers.braintrust_gateway' in {} must be a TOML table",
+                path.display()
+            )
+        })?;
+    provider.insert(
+        "name".to_string(),
+        TomlValue::String("Braintrust Gateway".to_string()),
+    );
+    provider.insert(
+        "base_url".to_string(),
         TomlValue::String(gateway_url.to_string()),
     );
-    env.insert(
-        "OPENAI_API_KEY".to_string(),
-        TomlValue::String(api_key.to_string()),
+    provider.insert(
+        "env_key".to_string(),
+        TomlValue::String("BRAINTRUST_GATEWAY_API_KEY".to_string()),
+    );
+    provider.insert(
+        "wire_api".to_string(),
+        TomlValue::String("responses".to_string()),
     );
     let content = format!("{}\n", toml::to_string_pretty(&TomlValue::Table(root))?);
     write_text_atomic_private(path, &content)
@@ -226,12 +278,20 @@ mod tests {
         assert_eq!(settings["model"].as_str(), Some("test-model"));
         assert_eq!(settings["env"]["KEEP"].as_str(), Some("yes"));
         assert_eq!(
-            settings["env"]["OPENAI_BASE_URL"].as_str(),
+            settings["model_provider"].as_str(),
+            Some("braintrust_gateway")
+        );
+        assert_eq!(
+            settings["env"]["BRAINTRUST_GATEWAY_API_KEY"].as_str(),
+            Some("sk-test-gateway-key")
+        );
+        assert_eq!(
+            settings["model_providers"]["braintrust_gateway"]["base_url"].as_str(),
             Some("https://gateway.test.example")
         );
         assert_eq!(
-            settings["env"]["OPENAI_API_KEY"].as_str(),
-            Some("sk-test-gateway-key")
+            settings["model_providers"]["braintrust_gateway"]["env_key"].as_str(),
+            Some("BRAINTRUST_GATEWAY_API_KEY")
         );
     }
 }
