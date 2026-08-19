@@ -45,7 +45,7 @@ pub struct UpdateArgs {
     pub channel: Option<UpdateChannel>,
 
     // Process-internal plumbing: on Windows a running executable cannot be
-    // replaced, so a signed copy of bt performs the update after its parent exits.
+    // replaced, so bt moves itself aside and a helper installs its replacement.
     #[cfg(windows)]
     #[arg(long, hide = true, requires = "windows_update_parent_pid")]
     pub windows_update_worker: bool,
@@ -272,12 +272,28 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
             )
         })?;
     }
-    fs::copy(&exe, &worker).with_context(|| {
+    // Windows permits renaming a running executable even though it cannot be
+    // overwritten. Moving this process to the helper path frees the install
+    // path while keeping the original process alive, so the invoking shell can
+    // wait for the update and does not redraw its prompt before output finishes.
+    fs::rename(&exe, &worker).with_context(|| {
         format!(
-            "failed to create signed Windows update helper {}",
+            "failed to move bt to Windows update helper {}",
             worker.display()
         )
     })?;
+    // Keep an unlocked fallback at the install path. The installer can replace
+    // this copy, while an interrupted update still leaves a usable bt.exe.
+    if let Err(copy_err) = fs::copy(&worker, &exe) {
+        if let Err(restore_err) = fs::rename(&worker, &exe) {
+            anyhow::bail!(
+                "failed to create update fallback at {}: {copy_err}; also failed to restore the original executable: {restore_err}",
+                exe.display()
+            );
+        }
+        return Err(copy_err)
+            .with_context(|| format!("failed to create update fallback at {}", exe.display()));
+    }
 
     let parent_pid_arg = parent_pid.to_string();
     let mut command = Command::new(&worker);
@@ -293,14 +309,42 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
         command.arg("--json");
     }
 
-    if let Err(err) = command.spawn() {
-        let _ = fs::remove_file(&worker);
-        return Err(err).with_context(|| {
+    let status = match command.status() {
+        Ok(status) => status,
+        Err(spawn_err) => {
+            if let Err(err) = schedule_windows_worker_cleanup(&worker) {
+                eprintln!(
+                    "warning: failed to schedule cleanup of Windows update helper {}: {err}",
+                    worker.display()
+                );
+            }
+            return Err(spawn_err).with_context(|| {
+                format!(
+                    "failed to launch Windows update helper {}",
+                    worker.display()
+                )
+            });
+        }
+    };
+
+    if !exe.exists() {
+        fs::copy(&worker, &exe).with_context(|| {
             format!(
-                "failed to launch signed Windows update helper {}",
-                worker.display()
+                "Windows update did not install an executable, and the original could not be restored to {}",
+                exe.display()
             )
-        });
+        })?;
+    }
+
+    if let Err(err) = schedule_windows_worker_cleanup(&worker) {
+        eprintln!(
+            "warning: failed to schedule cleanup of Windows update helper {}: {err}",
+            worker.display()
+        );
+    }
+
+    if !status.success() {
+        anyhow::bail!("Windows update helper exited with status {status}");
     }
 
     Ok(())
@@ -320,35 +364,6 @@ async fn run_windows_update_worker(
         .is_some_and(|name| name.eq_ignore_ascii_case(&expected_name));
     if !is_update_helper {
         anyhow::bail!("refusing to run the Windows update worker from an unexpected path");
-    }
-
-    // Schedule this before any fallible work so failed workers do not leave
-    // stale helper executables behind.
-    if let Err(err) = schedule_windows_worker_cleanup(&worker) {
-        eprintln!(
-            "warning: failed to schedule cleanup of Windows update helper {}: {err}",
-            worker.display()
-        );
-    }
-
-    // The parent can exit before PowerShell starts. Windows PowerShell reports
-    // that normal race as exit code 1 even with SilentlyContinue, so explicitly
-    // succeed after waiting (or discovering that the process is already gone).
-    let wait_script = format!(
-        "$parent = Get-Process -Id {parent_pid} -ErrorAction SilentlyContinue; if ($null -ne $parent) {{ $parent.WaitForExit() }}; exit 0"
-    );
-    let wait_status = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &wait_script,
-        ])
-        .status()
-        .context("failed to wait for the original bt process to exit")?;
-    if !wait_status.success() {
-        anyhow::bail!("failed waiting for the original bt process: {wait_status}");
     }
 
     run_installer(base, channel).await?;
