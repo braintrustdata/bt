@@ -152,17 +152,10 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         }
     }
 
-    let result = with_spinner("Updating bt...", async {
-        #[cfg(windows)]
-        {
-            launch_windows_update_worker(base, channel).await
-        }
-        #[cfg(not(windows))]
-        {
-            run_installer(base, channel).await
-        }
-    })
-    .await;
+    #[cfg(windows)]
+    let result = launch_windows_update_worker(base, channel).await;
+    #[cfg(not(windows))]
+    let result = with_spinner("Updating bt...", run_installer(base, channel)).await;
     if let Err(err) = result {
         print_command_status(
             CommandStatus::Error,
@@ -191,10 +184,13 @@ fn print_update_completed(base: &BaseArgs, channel: UpdateChannel) -> Result<()>
 
 fn ensure_installer_managed_install() -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
+    ensure_installer_managed_executable(&exe)
+}
 
+fn ensure_installer_managed_executable(exe: &Path) -> Result<()> {
     let receipt_exists = receipt_path().as_ref().is_some_and(|path| path.exists());
     let installer_bin_paths = installer_bin_paths();
-    if is_installer_managed_install(&exe, receipt_exists, &installer_bin_paths) {
+    if is_installer_managed_install(exe, receipt_exists, &installer_bin_paths) {
         return Ok(());
     }
 
@@ -352,6 +348,8 @@ async fn run_windows_update_worker(
     if !is_update_helper {
         anyhow::bail!("refusing to run the Windows update worker from an unexpected path");
     }
+    let installed_exe = worker.with_file_name(binary_name());
+    ensure_installer_managed_executable(&installed_exe)?;
 
     if let Err(err) = schedule_windows_worker_cleanup(&worker, Some(parent_pid)) {
         eprintln!("warning: failed to schedule update-helper cleanup: {err}");
@@ -412,21 +410,23 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
             }
         };
         // Avoid the `irm ... | iex` pattern flagged by Windows security tools.
-        let client = crate::http::build_http_client_from_builder(
-            Client::builder().timeout(DEFAULT_HTTP_TIMEOUT),
-        )
-        .context("failed to initialize installer HTTP client")?;
-        let response = client
-            .get(installer_url)
-            .send()
-            .await
-            .context("failed to download PowerShell installer")?
-            .error_for_status()
-            .context("failed to download PowerShell installer")?;
-        let script = response
-            .bytes()
-            .await
-            .context("failed to read PowerShell installer")?;
+        let script = with_spinner("Downloading installer...", async {
+            let client = crate::http::build_http_client_from_builder(
+                Client::builder().timeout(DEFAULT_HTTP_TIMEOUT),
+            )
+            .context("failed to initialize installer HTTP client")?;
+            client
+                .get(installer_url)
+                .send()
+                .await
+                .context("failed to download PowerShell installer")?
+                .error_for_status()
+                .context("failed to download PowerShell installer")?
+                .bytes()
+                .await
+                .context("failed to read PowerShell installer")
+        })
+        .await?;
         let temp_dir = tempfile::tempdir().context("failed to create installer directory")?;
         let script_path = temp_dir.path().join("bt-installer.ps1");
         fs::write(&script_path, script).context("failed to save PowerShell installer")?;
