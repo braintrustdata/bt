@@ -1846,7 +1846,9 @@ async fn ensure_profile_or_setup_browser_auth_context(
 /// profile uses OAuth. Consumers write the returned key into static tool
 /// configuration, where an expiring OAuth access token would not work.
 pub(crate) async fn durable_setup_api_key(base: &mut BaseArgs) -> Result<String> {
-    Ok(ensure_setup_auth(base, false, true).await?.api_key)
+    Ok(ensure_setup_auth_without_config_context(base, false, true)
+        .await?
+        .api_key)
 }
 
 async fn ensure_setup_auth(
@@ -1854,12 +1856,33 @@ async fn ensure_setup_auth(
     prompt_for_profile_choice: bool,
     needs_api_key: bool,
 ) -> Result<SetupAuthContext> {
+    ensure_setup_auth_with_config_context(base, prompt_for_profile_choice, needs_api_key, true)
+        .await
+}
+
+async fn ensure_setup_auth_without_config_context(
+    base: &mut BaseArgs,
+    prompt_for_profile_choice: bool,
+    needs_api_key: bool,
+) -> Result<SetupAuthContext> {
+    ensure_setup_auth_with_config_context(base, prompt_for_profile_choice, needs_api_key, false)
+        .await
+}
+
+async fn ensure_setup_auth_with_config_context(
+    base: &mut BaseArgs,
+    prompt_for_profile_choice: bool,
+    needs_api_key: bool,
+    use_config_context: bool,
+) -> Result<SetupAuthContext> {
     let project_was_explicit = base
         .project
         .as_deref()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
-    apply_setup_config_fallbacks(base);
+    if use_config_context {
+        apply_setup_config_fallbacks(base);
+    }
 
     let explicit_api_key = base
         .api_key
