@@ -22,7 +22,7 @@ use windows_sys::Win32::{
 
 use crate::args::BaseArgs;
 use crate::http::DEFAULT_HTTP_TIMEOUT;
-use crate::ui::{print_command_status, CommandStatus};
+use crate::ui::{print_command_status, with_spinner, CommandStatus};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -159,7 +159,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
     }
 
     if channel == UpdateChannel::Stable {
-        match fetch_release(base, channel).await {
+        match with_spinner("Checking for updates...", fetch_release(base, channel)).await {
             Ok(release) => {
                 if stable_is_up_to_date(env!("CARGO_PKG_VERSION"), &release.tag_name) {
                     print_check(base, channel, &release)?;
@@ -174,15 +174,28 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         }
     }
 
-    #[cfg(windows)]
-    {
-        launch_windows_update_worker(base, channel)
-    }
+    let result = with_spinner("Updating bt...", async {
+        #[cfg(windows)]
+        {
+            launch_windows_update_worker(base, channel).await
+        }
 
-    #[cfg(not(windows))]
-    {
-        run_installer(base, channel).await?;
-        print_update_completed(base, channel)
+        #[cfg(not(windows))]
+        {
+            run_installer(base, channel).await
+        }
+    })
+    .await;
+
+    match result {
+        Ok(()) => print_update_completed(base, channel),
+        Err(err) => {
+            print_command_status(
+                CommandStatus::Error,
+                &format!("Failed to update bt from the {} channel", channel.name()),
+            );
+            Err(err)
+        }
     }
 }
 
@@ -218,7 +231,7 @@ fn ensure_installer_managed_install() -> Result<()> {
 }
 
 async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
-    let release = fetch_release(base, channel).await?;
+    let release = with_spinner("Checking for updates...", fetch_release(base, channel)).await?;
     print_check(base, channel, &release)
 }
 
@@ -291,7 +304,7 @@ async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHu
 }
 
 #[cfg(windows)]
-fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
     let parent = exe
         .parent()
@@ -346,9 +359,9 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
     }
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(spawn_err) => {
+    let output = match tokio::task::spawn_blocking(move || command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(spawn_err)) => {
             if let Err(err) = schedule_windows_worker_cleanup(&worker) {
                 eprintln!(
                     "warning: failed to schedule cleanup of Windows update helper {}: {err}",
@@ -361,6 +374,10 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
                     worker.display()
                 )
             });
+        }
+        Err(join_err) => {
+            schedule_windows_worker_cleanup_with_warning(&worker);
+            return Err(join_err).context("Windows update helper task failed");
         }
     };
 
@@ -402,7 +419,7 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
     }
 
     schedule_windows_worker_cleanup_with_warning(&worker);
-    print_update_completed(base, channel)
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -577,7 +594,8 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
-        let status = run_installer_command(&mut command, installer_stdout(base))
+        let status = run_installer_command(command, installer_stdout(base))
+            .await
             .context("failed to execute installer")?;
 
         if !status.success() {
@@ -621,7 +639,8 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         let mut command = Command::new("powershell");
         command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
         command.arg(&script_path);
-        let status = run_installer_command(&mut command, installer_stdout(base))
+        let status = run_installer_command(command, installer_stdout(base))
+            .await
             .context("failed to execute PowerShell installer")?;
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
@@ -631,8 +650,11 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     }
 }
 
-fn run_installer_command(command: &mut Command, stdout: InstallerStdout) -> Result<ExitStatus> {
-    match stdout {
+async fn run_installer_command(
+    mut command: Command,
+    stdout: InstallerStdout,
+) -> Result<ExitStatus> {
+    tokio::task::spawn_blocking(move || match stdout {
         InstallerStdout::Inherit => command.status().context("failed to start installer"),
         InstallerStdout::Suppress => command
             .stdout(Stdio::null())
@@ -649,7 +671,9 @@ fn run_installer_command(command: &mut Command, stdout: InstallerStdout) -> Resu
             io::copy(&mut stdout, &mut stderr).context("failed to relay installer output")?;
             child.wait().context("failed to wait for installer")
         }
-    }
+    })
+    .await
+    .context("installer task failed")?
 }
 
 fn receipt_path() -> Option<PathBuf> {
