@@ -6,12 +6,16 @@ use std::process::{Command, ExitStatus, Stdio};
 #[cfg(windows)]
 use std::fs;
 #[cfg(windows)]
+use std::io::Read as _;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Client;
 use serde::Deserialize;
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 
 use crate::args::BaseArgs;
 use crate::http::DEFAULT_HTTP_TIMEOUT;
@@ -99,6 +103,30 @@ struct GitHubRelease {
     #[serde(default)]
     target_commitish: Option<String>,
 }
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct UpdateWorkerError {
+    message: String,
+    exit_code: Option<i32>,
+}
+
+#[cfg(windows)]
+impl UpdateWorkerError {
+    pub(crate) fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for UpdateWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for UpdateWorkerError {}
 
 pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
     match args.command {
@@ -256,6 +284,8 @@ async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHu
 #[cfg(windows)]
 fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
+    let original_digest = file_sha256(&exe)
+        .with_context(|| format!("failed to hash current executable {}", exe.display()))?;
     let parent = exe
         .parent()
         .context("current executable has no parent directory")?;
@@ -301,12 +331,16 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
         "--windows-update-parent-pid",
         &parent_pid_arg,
     ]);
-    if base.json {
-        command.arg("--json");
+    // Always capture the worker's JSON response so only this parent process
+    // renders the final success or error to the user's stdout.
+    command.arg("--json");
+    if base.quiet {
+        command.arg("--quiet");
     }
+    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
-    let status = match command.status() {
-        Ok(status) => status,
+    let output = match command.output() {
+        Ok(output) => output,
         Err(spawn_err) => {
             if let Err(err) = schedule_windows_worker_cleanup(&worker) {
                 eprintln!(
@@ -323,17 +357,19 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
         }
     };
 
-    if !status.success() {
+    if !output.status.success() {
         restore_windows_executable(&worker, &exe).with_context(|| {
             format!(
-                "Windows update helper exited with status {status}; failed to restore the original executable from {}",
+                "Windows update helper exited with status {}; failed to restore the original executable from {}",
+                output.status,
                 worker.display()
             )
         })?;
         schedule_windows_worker_cleanup_with_warning(&worker);
-        anyhow::bail!(
-            "Windows update helper exited with status {status}; restored the original executable"
-        );
+        return Err(anyhow::Error::new(UpdateWorkerError {
+            message: windows_worker_error_message(&output.stdout, &output.status),
+            exit_code: output.status.code(),
+        }));
     }
 
     if !exe.exists() {
@@ -343,10 +379,59 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
                 worker.display()
             )
         })?;
+        schedule_windows_worker_cleanup_with_warning(&worker);
+        anyhow::bail!(
+            "Windows update did not install an executable; restored the original executable"
+        );
+    }
+
+    let installed_digest = match file_sha256(&exe)
+        .with_context(|| format!("failed to verify updated executable {}", exe.display()))
+    {
+        Ok(digest) => digest,
+        Err(err) => {
+            schedule_windows_worker_cleanup_with_warning(&worker);
+            return Err(err);
+        }
+    };
+    if installed_digest == original_digest {
+        schedule_windows_worker_cleanup_with_warning(&worker);
+        anyhow::bail!(
+            "Windows installer completed without replacing {}; the original executable remains installed",
+            exe.display()
+        );
     }
 
     schedule_windows_worker_cleanup_with_warning(&worker);
-    Ok(())
+    print_update_completed(base, channel)
+}
+
+#[cfg(windows)]
+fn windows_worker_error_message(stdout: &[u8], status: &ExitStatus) -> String {
+    serde_json::from_slice::<serde_json::Value>(stdout)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(|message| message.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("Windows update helper exited with status {status}"))
+}
+
+#[cfg(windows)]
+fn file_sha256(path: &Path) -> Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(windows)]
@@ -455,8 +540,29 @@ fn schedule_windows_worker_cleanup(worker: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallerStdout {
+    Inherit,
+    Stderr,
+    Suppress,
+}
+
+fn installer_stdout(base: &BaseArgs) -> InstallerStdout {
+    if base.quiet {
+        InstallerStdout::Suppress
+    } else if base.json {
+        InstallerStdout::Stderr
+    } else {
+        InstallerStdout::Inherit
+    }
+}
+
 async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
-    let status_line = |msg: &str| eprintln!("{msg}");
+    let status_line = |msg: &str| {
+        if !base.quiet {
+            eprintln!("{msg}");
+        }
+    };
 
     #[cfg(not(windows))]
     {
@@ -465,7 +571,7 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
-        let status = run_installer_command(&mut command, base.json)
+        let status = run_installer_command(&mut command, installer_stdout(base))
             .context("failed to execute installer")?;
 
         if !status.success() {
@@ -511,7 +617,7 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         let mut command = Command::new("powershell");
         command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
         command.arg(&script_path);
-        let status = run_installer_command(&mut command, base.json)
+        let status = run_installer_command(&mut command, installer_stdout(base))
             .context("failed to execute PowerShell installer")?;
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
@@ -522,20 +628,25 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     }
 }
 
-fn run_installer_command(command: &mut Command, redirect_stdout: bool) -> Result<ExitStatus> {
-    if !redirect_stdout {
-        return command.status().context("failed to start installer");
+fn run_installer_command(command: &mut Command, stdout: InstallerStdout) -> Result<ExitStatus> {
+    match stdout {
+        InstallerStdout::Inherit => command.status().context("failed to start installer"),
+        InstallerStdout::Suppress => command
+            .stdout(Stdio::null())
+            .status()
+            .context("failed to start installer"),
+        InstallerStdout::Stderr => {
+            command.stdout(Stdio::piped());
+            let mut child = command.spawn().context("failed to start installer")?;
+            let mut stdout = child
+                .stdout
+                .take()
+                .context("failed to capture installer stdout")?;
+            let mut stderr = io::stderr().lock();
+            io::copy(&mut stdout, &mut stderr).context("failed to relay installer output")?;
+            child.wait().context("failed to wait for installer")
+        }
     }
-
-    command.stdout(Stdio::piped());
-    let mut child = command.spawn().context("failed to start installer")?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .context("failed to capture installer stdout")?;
-    let mut stderr = io::stderr().lock();
-    io::copy(&mut stdout, &mut stderr).context("failed to relay installer output")?;
-    child.wait().context("failed to wait for installer")
 }
 
 fn receipt_path() -> Option<PathBuf> {
@@ -810,5 +921,17 @@ mod tests {
             inferred_update_channel(Some("canary")),
             UpdateChannel::Canary
         );
+    }
+
+    #[test]
+    fn installer_stdout_respects_json_and_quiet() {
+        let mut base = BaseArgs::default();
+        assert_eq!(installer_stdout(&base), InstallerStdout::Inherit);
+
+        base.json = true;
+        assert_eq!(installer_stdout(&base), InstallerStdout::Stderr);
+
+        base.quiet = true;
+        assert_eq!(installer_stdout(&base), InstallerStdout::Suppress);
     }
 }

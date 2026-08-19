@@ -256,6 +256,18 @@ enum ExitCode {
     User = 4,
 }
 
+impl ExitCode {
+    #[cfg(windows)]
+    fn from_process_code(code: Option<i32>) -> Self {
+        match code {
+            Some(code) if code == Self::Auth as i32 => Self::Auth,
+            Some(code) if code == Self::Network as i32 => Self::Network,
+            Some(code) if code == Self::User as i32 => Self::User,
+            _ => Self::Error,
+        }
+    }
+}
+
 static JSON_OUTPUT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -441,6 +453,14 @@ fn configure_output(base: &LoginBaseArgs) {
 fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
     if missing_credential {
         return ExitCode::Auth;
+    }
+
+    #[cfg(windows)]
+    if let Some(worker_error) = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<crate::self_update::UpdateWorkerError>())
+    {
+        return ExitCode::from_process_code(worker_error.exit_code());
     }
 
     if let Some(http_error) = find_http_error(err) {
