@@ -281,11 +281,12 @@ async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -
     if worker.exists() {
         fs::remove_file(&worker)?;
     }
+    let fallback = prepare_windows_executable(&exe)?;
     fs::rename(&exe, &worker).context("failed to create Windows update helper")?;
-    if let Err(err) = fs::copy(&worker, &exe) {
+    if let Err(err) = fallback.persist(&exe) {
         fs::rename(&worker, &exe)
             .context("failed to restore bt after creating the update helper")?;
-        return Err(err).context("failed to create update fallback");
+        return Err(err.error).context("failed to create update fallback");
     }
 
     let mut command = Command::new(&worker);
@@ -314,7 +315,10 @@ async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -
     }
 
     if !output.status.success() {
-        fs::copy(&worker, &exe).context("failed to restore bt after update failure")?;
+        prepare_windows_executable(&worker)?
+            .persist(&exe)
+            .map_err(|err| err.error)
+            .context("failed to restore bt after update failure")?;
         let message = serde_json::from_slice::<serde_json::Value>(&output.stdout)
             .ok()
             .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_owned))
@@ -327,10 +331,27 @@ async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -
         )));
     }
     if !exe.exists() {
-        fs::copy(&worker, &exe).context("update installed no executable; failed to restore bt")?;
+        prepare_windows_executable(&worker)?
+            .persist(&exe)
+            .map_err(|err| err.error)
+            .context("update installed no executable; failed to restore bt")?;
         anyhow::bail!("update installed no executable; restored the original bt");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_windows_executable(source: &Path) -> Result<tempfile::NamedTempFile> {
+    let parent = source
+        .parent()
+        .context("Windows executable path has no parent directory")?;
+    let temp = tempfile::NamedTempFile::new_in(parent)
+        .context("failed to create temporary update fallback")?;
+    fs::copy(source, temp.path()).context("failed to copy update fallback")?;
+    temp.as_file()
+        .sync_all()
+        .context("failed to flush update fallback")?;
+    Ok(temp)
 }
 
 #[cfg(windows)]
