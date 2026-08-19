@@ -1,6 +1,7 @@
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 
 #[cfg(windows)]
 use std::fs;
@@ -379,16 +380,16 @@ fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
             println!("{msg}");
         }
     };
-    let redirect_stdout = if base.json { " 1>&2" } else { "" };
 
     #[cfg(not(windows))]
     {
         let installer_url = channel.installer_url();
         status_line(&format!("updating bt from {} channel...", channel.name()));
-        let cmd = format!("curl -fsSL '{installer_url}' | sh{redirect_stdout}");
+        let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
-        let status = command.status().context("failed to execute installer")?;
+        let status = run_installer_command(&mut command, base.json)
+            .context("failed to execute installer")?;
 
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
@@ -409,16 +410,16 @@ fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
             }
         };
         status_line(&format!("updating bt from {} channel...", channel.name()));
-        let script = format!("irm {installer_url} | iex{redirect_stdout}");
-        let status = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ])
-            .status()
+        let script = format!("irm {installer_url} | iex");
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ]);
+        let status = run_installer_command(&mut command, base.json)
             .context("failed to execute PowerShell installer")?;
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
@@ -427,6 +428,25 @@ fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         status_line("update completed");
         Ok(())
     }
+}
+
+/// Run the installer while keeping stdout reserved for the command's JSON payload.
+/// PowerShell 5.1 cannot parse the POSIX-style `1>&2`, so JSON mode relays the
+/// child's stdout to our stderr at the process level instead.
+fn run_installer_command(command: &mut Command, redirect_stdout: bool) -> Result<ExitStatus> {
+    if !redirect_stdout {
+        return command.status().context("failed to start installer");
+    }
+
+    command.stdout(Stdio::piped());
+    let mut child = command.spawn().context("failed to start installer")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("failed to capture installer stdout")?;
+    let mut stderr = io::stderr().lock();
+    io::copy(&mut stdout, &mut stderr).context("failed to relay installer output")?;
+    child.wait().context("failed to wait for installer")
 }
 
 fn receipt_path() -> Option<PathBuf> {
