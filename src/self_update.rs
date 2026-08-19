@@ -118,7 +118,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         let parent_pid = args
             .windows_update_parent_pid
             .context("Windows update worker is missing its parent process ID")?;
-        return run_windows_update_worker(base, channel, parent_pid);
+        return run_windows_update_worker(base, channel, parent_pid).await;
     }
 
     ensure_installer_managed_install()?;
@@ -151,7 +151,7 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
 
     #[cfg(not(windows))]
     {
-        run_installer(base, channel)?;
+        run_installer(base, channel).await?;
         print_update_completed(base, channel)
     }
 }
@@ -307,7 +307,7 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
 }
 
 #[cfg(windows)]
-fn run_windows_update_worker(
+async fn run_windows_update_worker(
     base: &BaseArgs,
     channel: UpdateChannel,
     parent_pid: u32,
@@ -351,7 +351,8 @@ fn run_windows_update_worker(
         anyhow::bail!("failed waiting for the original bt process: {wait_status}");
     }
 
-    run_installer(base, channel).and_then(|()| print_update_completed(base, channel))
+    run_installer(base, channel).await?;
+    print_update_completed(base, channel)
 }
 
 #[cfg(windows)]
@@ -378,7 +379,7 @@ fn schedule_windows_worker_cleanup(worker: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     let status_line = |msg: &str| {
         if base.json {
             eprintln!("{msg}");
@@ -416,15 +417,32 @@ fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
             }
         };
         status_line(&format!("updating bt from {} channel...", channel.name()));
-        let script = format!("irm {installer_url} | iex");
+
+        // Download in-process instead of using `irm ... | iex`. Besides being
+        // easier to audit, this avoids a command pattern commonly blocked by
+        // Windows security products.
+        let client = crate::http::build_http_client_from_builder(
+            Client::builder().timeout(DEFAULT_HTTP_TIMEOUT),
+        )
+        .context("failed to initialize installer HTTP client")?;
+        let response = client
+            .get(installer_url)
+            .send()
+            .await
+            .context("failed to download PowerShell installer")?
+            .error_for_status()
+            .context("failed to download PowerShell installer")?;
+        let script = response
+            .bytes()
+            .await
+            .context("failed to read PowerShell installer")?;
+        let temp_dir = tempfile::tempdir().context("failed to create installer directory")?;
+        let script_path = temp_dir.path().join("bt-installer.ps1");
+        fs::write(&script_path, script).context("failed to save PowerShell installer")?;
+
         let mut command = Command::new("powershell");
-        command.args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ]);
+        command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+        command.arg(&script_path);
         let status = run_installer_command(&mut command, base.json)
             .context("failed to execute PowerShell installer")?;
         if !status.success() {
