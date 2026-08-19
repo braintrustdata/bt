@@ -6,18 +6,16 @@ use serde_json::{json, Map, Value};
 use crate::{
     error::user_error,
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
-    utils::{merge_json_objects, read_text_source, read_yaml_object_source},
+    utils::{merge_json_objects, read_text_source},
 };
 
 use super::{
     api, create::report_validation_issues, label, label_plural, select_function_interactive,
 };
 use super::{
-    prompt_config::{
-        parse_choice_scores_source, parse_classifications_source, validate_unit_interval,
-        PromptConfigArgs,
-    },
+    prompt_config::PromptConfigArgs,
     prompt_patch::materialize_prompt_data_patch,
+    scorer_config::{build_scorer_config, ScorerConfig},
     FunctionTypeFilter, ResolvedContext,
 };
 
@@ -347,7 +345,21 @@ async fn resolve_target_function(
 }
 
 fn build_patch_body(args: &UpdateArgs) -> Result<Value> {
-    let mut patch: Map<String, Value> = Map::new();
+    let mut patch = build_scorer_config(
+        &ScorerConfig {
+            messages: args.messages.as_deref(),
+            model: args.model.as_deref(),
+            prompt_config: &args.prompt_config,
+            choice_scores: args.choice_scores.as_deref(),
+            classifications: args.classifications.as_deref(),
+            use_cot: args.use_cot,
+            allow_no_match: args.allow_no_match,
+            pass_threshold: args.pass_threshold,
+            metadata: args.metadata.as_deref(),
+            metadata_label: "function metadata",
+        },
+        false,
+    )?;
 
     if let Some(description) = args.description.as_deref() {
         patch.insert(
@@ -356,57 +368,7 @@ fn build_patch_body(args: &UpdateArgs) -> Result<Value> {
         );
     }
 
-    let metadata = resolve_metadata(args)?;
-    if !metadata.is_empty() {
-        patch.insert("metadata".to_string(), Value::Object(metadata));
-    }
-
-    if let Some(messages) = resolve_messages(args)? {
-        let prompt_data_patch = json!({
-            "prompt_data": {
-                "prompt": { "type": "chat", "messages": messages },
-            },
-        });
-        merge_json_objects(
-            &mut patch,
-            prompt_data_patch
-                .as_object()
-                .expect("prompt data patch is an object"),
-        );
-    }
-
-    let parser_patch = resolve_parser_patch(args)?;
-    if let Some((function_type, parser)) = parser_patch {
-        if let Some(function_type) = function_type {
-            patch.insert(
-                "function_type".to_string(),
-                Value::String(function_type.to_string()),
-            );
-        }
-        let prompt_data_patch = json!({ "prompt_data": { "parser": parser } });
-        merge_json_objects(
-            &mut patch,
-            prompt_data_patch
-                .as_object()
-                .expect("prompt data patch is an object"),
-        );
-    }
-
-    let prompt_config = args
-        .prompt_config
-        .build_prompt_data_patch(args.model.as_deref())?;
-    if !prompt_config.is_empty() {
-        let prompt_data_patch = json!({ "prompt_data": prompt_config });
-        merge_json_objects(
-            &mut patch,
-            prompt_data_patch
-                .as_object()
-                .expect("prompt data patch is an object"),
-        );
-    }
-
-    let extra = resolve_extra_patch(args)?;
-    if let Some(extra_obj) = extra {
+    if let Some(extra_obj) = resolve_extra_patch(args)? {
         merge_json_objects(&mut patch, &extra_obj);
     }
 
@@ -415,80 +377,6 @@ fn build_patch_body(args: &UpdateArgs) -> Result<Value> {
     }
 
     Ok(Value::Object(patch))
-}
-
-fn resolve_metadata(args: &UpdateArgs) -> Result<Map<String, Value>> {
-    if args.classifications.is_some() && args.pass_threshold.is_some() {
-        bail!("--pass-threshold applies to score output and cannot be used with --classifications");
-    }
-
-    let mut metadata = match args.metadata.as_deref() {
-        Some(source) => read_yaml_object_source(source, "function metadata")?,
-        None => Map::new(),
-    };
-    if let Some(pass_threshold) = args.pass_threshold {
-        validate_unit_interval(pass_threshold, "--pass-threshold")?;
-        metadata.insert("__pass_threshold".to_string(), json!(pass_threshold));
-    }
-    Ok(metadata)
-}
-
-fn resolve_parser_patch(args: &UpdateArgs) -> Result<Option<(Option<&'static str>, Value)>> {
-    if args.choice_scores.is_some() && args.allow_no_match.is_some() {
-        bail!("--allow-no-match applies to classification output, not --choice-scores");
-    }
-
-    let mut parser = Map::new();
-    let mut function_type = None;
-
-    if let Some(source) = args.choice_scores.as_deref() {
-        parser.insert(
-            "type".to_string(),
-            Value::String("llm_classifier".to_string()),
-        );
-        parser.insert(
-            "choice_scores".to_string(),
-            Value::Object(parse_choice_scores_source(source)?),
-        );
-        function_type = Some("scorer");
-    }
-    if let Some(source) = args.classifications.as_deref() {
-        parser.insert(
-            "type".to_string(),
-            Value::String("llm_classifier".to_string()),
-        );
-        parser.insert(
-            "choice".to_string(),
-            Value::Array(parse_classifications_source(source)?),
-        );
-        function_type = Some("classifier");
-    }
-    if let Some(use_cot) = args.use_cot {
-        parser.insert("use_cot".to_string(), Value::Bool(use_cot));
-    }
-    if let Some(allow_no_match) = args.allow_no_match {
-        parser.insert("allow_no_match".to_string(), Value::Bool(allow_no_match));
-    }
-
-    if parser.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some((function_type, Value::Object(parser))))
-    }
-}
-
-fn resolve_messages(args: &UpdateArgs) -> Result<Option<Value>> {
-    match args.messages.as_deref() {
-        Some(source) => {
-            let raw = read_text_source(source, "messages")?;
-            let parsed: Value = serde_json::from_str(&raw).context("invalid JSON in --messages")?;
-            match parsed {
-                Value::Array(_) => Ok(Some(parsed)),
-                _ => bail!("--messages must be a JSON array of chat messages"),
-            }
-        }
-        None => Ok(None),
-    }
 }
 
 fn resolve_extra_patch(args: &UpdateArgs) -> Result<Option<Map<String, Value>>> {

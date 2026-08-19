@@ -22,6 +22,7 @@ pub(crate) mod prompt_patch;
 mod pull;
 mod push;
 pub(crate) mod report;
+mod scorer_config;
 mod update;
 mod view;
 
