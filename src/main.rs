@@ -547,8 +547,7 @@ fn has_io_error(err: &anyhow::Error) -> bool {
 }
 
 fn has_user_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|source| source.downcast_ref::<crate::error::UserError>().is_some())
+    err.downcast_ref::<crate::error::UserError>().is_some()
 }
 
 fn looks_like_user_error(err: &anyhow::Error) -> bool {
@@ -762,29 +761,26 @@ mod tests {
 
     #[test]
     fn typed_user_errors_use_the_user_exit_code() {
-        let err = anyhow::Error::new(crate::error::UserError::from(anyhow::anyhow!(
-            "--temperature must be between 0 and 2"
-        )));
+        let err =
+            crate::error::user_error(anyhow::anyhow!("--temperature must be between 0 and 2"));
 
         assert_eq!(classify_error(&err, false), ExitCode::User);
     }
 
     #[test]
     fn provider_credential_errors_are_not_classified_as_bt_auth_errors() {
-        let err = anyhow::Error::new(crate::error::UserError::from(anyhow::Error::new(
-            crate::http::HttpError {
-                status: reqwest::StatusCode::UNAUTHORIZED,
-                body: serde_json::json!({
-                    "error": {
-                        "message": "Incorrect API key provided: synthetic-key",
-                        "type": "invalid_request_error",
-                        "code": "invalid_api_key"
-                    },
-                    "status": 401
-                })
-                .to_string(),
-            },
-        )));
+        let err = crate::error::user_error(anyhow::Error::new(crate::http::HttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: serde_json::json!({
+                "error": {
+                    "message": "Incorrect API key provided: synthetic-key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key"
+                },
+                "status": 401
+            })
+            .to_string(),
+        }));
 
         assert_eq!(classify_error(&err, false), ExitCode::User);
         let payload = json_error_payload(&err);

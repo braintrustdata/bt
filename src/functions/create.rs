@@ -4,7 +4,7 @@ use dialoguer::Input;
 use serde_json::{json, Map, Value};
 
 use crate::{
-    error::UserError,
+    error::user_error,
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
     utils::{merge_json_objects, read_text_source, read_yaml_object_source},
 };
@@ -117,16 +117,16 @@ pub(crate) struct CreateArgs {
 }
 
 pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: bool) -> Result<()> {
-    let name = resolve_name(args).map_err(UserError::from)?;
-    let slug = resolve_slug(args, &name).map_err(UserError::from)?;
+    let name = resolve_name(args).map_err(user_error)?;
+    let slug = resolve_slug(args, &name).map_err(user_error)?;
     let definition =
-        build_scorer_definition(args, &ctx.project.id, &name, &slug).map_err(UserError::from)?;
+        build_scorer_definition(args, &ctx.project.id, &name, &slug).map_err(user_error)?;
     let validation = with_spinner(
         "Validating scorer...",
         api::validate_functions(&ctx.client, std::slice::from_ref(&definition)),
     )
     .await?;
-    report_validation_issues(&validation).map_err(UserError::from)?;
+    report_validation_issues(&validation).map_err(user_error)?;
 
     let result = match with_spinner(
         "Creating scorer...",

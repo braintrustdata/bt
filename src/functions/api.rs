@@ -4,7 +4,7 @@ use serde_json::Value;
 use urlencoding::encode;
 
 use crate::{
-    error::UserError,
+    error::user_error,
     http::{ApiClient, HttpError},
 };
 
@@ -206,7 +206,7 @@ pub async fn invoke_function(
                 .downcast_ref::<HttpError>()
                 .is_some_and(is_provider_auth_response) =>
         {
-            Err(UserError::from(error).into())
+            Err(user_error(error))
         }
         Err(error) => Err(error),
     }
