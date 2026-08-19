@@ -2,8 +2,6 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-#[cfg(windows)]
-use std::time::{Duration, SystemTime};
 
 #[cfg(windows)]
 use std::fs;
@@ -14,11 +12,6 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Client;
 use serde::Deserialize;
-#[cfg(windows)]
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE},
-    System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
-};
 
 use crate::args::BaseArgs;
 use crate::http::DEFAULT_HTTP_TIMEOUT;
@@ -110,25 +103,13 @@ struct GitHubRelease {
 
 #[cfg(windows)]
 #[derive(Debug)]
-pub(crate) struct UpdateWorkerError {
-    message: String,
-    exit_code: Option<i32>,
-}
-
-#[cfg(windows)]
-impl UpdateWorkerError {
-    pub(crate) fn exit_code(&self) -> Option<i32> {
-        self.exit_code
-    }
-}
-
+pub(crate) struct UpdateWorkerError(String, pub(crate) Option<i32>);
 #[cfg(windows)]
 impl std::fmt::Display for UpdateWorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.0)
     }
 }
-
 #[cfg(windows)]
 impl std::error::Error for UpdateWorkerError {}
 
@@ -160,17 +141,14 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
 
     if channel == UpdateChannel::Stable {
         match with_spinner("Checking for updates...", fetch_release(base, channel)).await {
-            Ok(release) => {
-                if stable_is_up_to_date(env!("CARGO_PKG_VERSION"), &release.tag_name) {
-                    print_check(base, channel, &release)?;
-                    return Ok(());
-                }
+            Ok(release) if stable_is_up_to_date(env!("CARGO_PKG_VERSION"), &release.tag_name) => {
+                print_check(base, channel, &release)?;
+                return Ok(());
             }
-            Err(err) => {
-                eprintln!(
-                    "warning: failed to pre-check stable version ({err}); continuing with update"
-                );
-            }
+            Err(err) => eprintln!(
+                "warning: failed to pre-check stable version ({err}); continuing with update"
+            ),
+            _ => {}
         }
     }
 
@@ -179,24 +157,20 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         {
             launch_windows_update_worker(base, channel).await
         }
-
         #[cfg(not(windows))]
         {
             run_installer(base, channel).await
         }
     })
     .await;
-
-    match result {
-        Ok(()) => print_update_completed(base, channel),
-        Err(err) => {
-            print_command_status(
-                CommandStatus::Error,
-                &format!("Failed to update bt from the {} channel", channel.name()),
-            );
-            Err(err)
-        }
+    if let Err(err) = result {
+        print_command_status(
+            CommandStatus::Error,
+            &format!("Failed to update bt from the {} channel", channel.name()),
+        );
+        return Err(err);
     }
+    print_update_completed(base, channel)
 }
 
 fn print_update_completed(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
@@ -306,42 +280,18 @@ async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHu
 #[cfg(windows)]
 async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
-    let parent = exe
-        .parent()
-        .context("current executable has no parent directory")?;
     let parent_pid = std::process::id();
-    let worker = parent.join(format!("bt-update-{parent_pid}.exe"));
-
-    cleanup_stale_windows_update_workers(parent, &worker);
-
+    let worker = exe.with_file_name(format!("bt-update-{parent_pid}.exe"));
     if worker.exists() {
-        fs::remove_file(&worker).with_context(|| {
-            format!(
-                "failed to remove stale Windows update helper {}",
-                worker.display()
-            )
-        })?;
+        fs::remove_file(&worker)?;
     }
-    // Renaming frees the install path while this process waits for the helper.
-    fs::rename(&exe, &worker).with_context(|| {
-        format!(
-            "failed to move bt to Windows update helper {}",
-            worker.display()
-        )
-    })?;
-    // Preserve a usable bt.exe if the update is interrupted.
-    if let Err(copy_err) = fs::copy(&worker, &exe) {
-        if let Err(restore_err) = fs::rename(&worker, &exe) {
-            anyhow::bail!(
-                "failed to create update fallback at {}: {copy_err}; also failed to restore the original executable: {restore_err}",
-                exe.display()
-            );
-        }
-        return Err(copy_err)
-            .with_context(|| format!("failed to create update fallback at {}", exe.display()));
+    fs::rename(&exe, &worker).context("failed to create Windows update helper")?;
+    if let Err(err) = fs::copy(&worker, &exe) {
+        fs::rename(&worker, &exe)
+            .context("failed to restore bt after creating the update helper")?;
+        return Err(err).context("failed to create update fallback");
     }
 
-    let parent_pid_arg = parent_pid.to_string();
     let mut command = Command::new(&worker);
     command.args([
         "update",
@@ -349,184 +299,42 @@ async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -
         channel.name(),
         "--windows-update-worker",
         "--windows-update-parent-pid",
-        &parent_pid_arg,
+        &parent_pid.to_string(),
+        "--json",
     ]);
-    // Capture the worker's JSON error response so only this parent process
-    // renders the final success or error to the user's stdout.
-    command.arg("--json");
     if base.quiet {
         command.arg("--quiet");
     }
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
-
-    let output = match tokio::task::spawn_blocking(move || command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(spawn_err)) => {
-            if let Err(err) = schedule_windows_worker_cleanup(&worker) {
-                eprintln!(
-                    "warning: failed to schedule cleanup of Windows update helper {}: {err}",
-                    worker.display()
-                );
-            }
-            return Err(spawn_err).with_context(|| {
-                format!(
-                    "failed to launch Windows update helper {}",
-                    worker.display()
-                )
-            });
-        }
-        Err(join_err) => {
-            schedule_windows_worker_cleanup_with_warning(&worker);
-            return Err(join_err).context("Windows update helper task failed");
-        }
-    };
+    let output = tokio::task::spawn_blocking(move || command.output()).await;
+    if !matches!(output, Ok(Ok(_))) {
+        schedule_windows_worker_cleanup(&worker, None)?;
+    }
+    let output = output
+        .context("Windows update helper task failed")?
+        .context("failed to launch Windows update helper")?;
+    if let Err(err) = schedule_windows_worker_cleanup(&worker, None) {
+        eprintln!("warning: failed to schedule update-helper cleanup: {err}");
+    }
 
     if !output.status.success() {
-        restore_windows_executable(&worker, &exe).with_context(|| {
-            format!(
-                "Windows update helper exited with status {}; failed to restore the original executable from {}",
-                output.status,
-                worker.display()
-            )
-        })?;
-        schedule_windows_worker_cleanup_with_warning(&worker);
-        return Err(anyhow::Error::new(UpdateWorkerError {
-            message: windows_worker_error_message(&output.stdout, &output.status),
-            exit_code: output.status.code(),
-        }));
+        fs::copy(&worker, &exe).context("failed to restore bt after update failure")?;
+        let message = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| {
+                format!("Windows update helper exited with status {}", output.status)
+            });
+        return Err(anyhow::Error::new(UpdateWorkerError(
+            message,
+            output.status.code(),
+        )));
     }
-
     if !exe.exists() {
-        restore_windows_executable(&worker, &exe).with_context(|| {
-            format!(
-                "Windows update did not install an executable; failed to restore the original executable from {}",
-                worker.display()
-            )
-        })?;
-        schedule_windows_worker_cleanup_with_warning(&worker);
-        anyhow::bail!(
-            "Windows update did not install an executable; restored the original executable"
-        );
+        fs::copy(&worker, &exe).context("update installed no executable; failed to restore bt")?;
+        anyhow::bail!("update installed no executable; restored the original bt");
     }
-
-    // A successful reinstall can produce byte-for-byte identical output, so
-    // installer success plus a readable executable is the reliable postcondition.
-    if let Err(err) = fs::File::open(&exe)
-        .with_context(|| format!("failed to verify updated executable {}", exe.display()))
-    {
-        schedule_windows_worker_cleanup_with_warning(&worker);
-        return Err(err);
-    }
-
-    schedule_windows_worker_cleanup_with_warning(&worker);
     Ok(())
-}
-
-#[cfg(windows)]
-fn windows_worker_error_message(stdout: &[u8], status: &ExitStatus) -> String {
-    serde_json::from_slice::<serde_json::Value>(stdout)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .and_then(|message| message.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| format!("Windows update helper exited with status {status}"))
-}
-
-#[cfg(windows)]
-const STALE_WINDOWS_UPDATE_WORKER_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-
-#[cfg(windows)]
-fn cleanup_stale_windows_update_workers(parent: &Path, active_worker: &Path) {
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(err) => {
-            eprintln!(
-                "warning: failed to scan for stale Windows update helpers in {}: {err}",
-                parent.display()
-            );
-            return;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(pid) = windows_update_worker_pid(&path) else {
-            continue;
-        };
-        if path == active_worker
-            || !windows_update_worker_is_old_enough(&path)
-            || windows_process_is_running(pid)
-        {
-            continue;
-        }
-        if let Err(err) = fs::remove_file(&path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "warning: failed to remove stale Windows update helper {}: {err}",
-                    path.display()
-                );
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn windows_update_worker_pid(path: &Path) -> Option<u32> {
-    let name = path.file_name()?.to_str()?;
-    name.strip_prefix("bt-update-")?
-        .strip_suffix(".exe")?
-        .parse()
-        .ok()
-}
-
-#[cfg(windows)]
-fn windows_update_worker_is_old_enough(path: &Path) -> bool {
-    path.metadata()
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age >= STALE_WINDOWS_UPDATE_WORKER_AGE)
-}
-
-#[cfg(windows)]
-fn windows_process_is_running(pid: u32) -> bool {
-    // Treat access-denied and query failures as "running" so cleanup is always
-    // conservative. ERROR_INVALID_PARAMETER means the PID no longer exists.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
-    }
-
-    let mut exit_code = 0_u32;
-    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
-    unsafe {
-        CloseHandle(handle);
-    }
-    !queried || exit_code == STILL_ACTIVE as u32
-}
-
-#[cfg(windows)]
-fn restore_windows_executable(worker: &Path, exe: &Path) -> Result<()> {
-    fs::copy(worker, exe).with_context(|| {
-        format!(
-            "failed to copy the original executable to {}",
-            exe.display()
-        )
-    })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn schedule_windows_worker_cleanup_with_warning(worker: &Path) {
-    if let Err(err) = schedule_windows_worker_cleanup(worker) {
-        eprintln!(
-            "warning: failed to schedule cleanup of Windows update helper {}: {err}",
-            worker.display()
-        );
-    }
 }
 
 #[cfg(windows)]
@@ -545,16 +353,22 @@ async fn run_windows_update_worker(
         anyhow::bail!("refusing to run the Windows update worker from an unexpected path");
     }
 
+    if let Err(err) = schedule_windows_worker_cleanup(&worker, Some(parent_pid)) {
+        eprintln!("warning: failed to schedule update-helper cleanup: {err}");
+    }
     run_installer(base, channel).await
 }
 
 #[cfg(windows)]
-fn schedule_windows_worker_cleanup(worker: &Path) -> Result<()> {
+fn schedule_windows_worker_cleanup(worker: &Path, parent_pid: Option<u32>) -> Result<()> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let worker_pid = std::process::id();
+    let pids = parent_pid.map_or_else(
+        || std::process::id().to_string(),
+        |pid| format!("{},{}", std::process::id(), pid),
+    );
     let escaped_path = worker.to_string_lossy().replace('\'', "''");
     let cleanup_script = format!(
-        "Wait-Process -Id {worker_pid} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '{escaped_path}' -Force -ErrorAction SilentlyContinue"
+        "Wait-Process -Id {pids} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '{escaped_path}' -Force -ErrorAction SilentlyContinue"
     );
     Command::new("powershell")
         .args([
@@ -570,23 +384,6 @@ fn schedule_windows_worker_cleanup(worker: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallerStdout {
-    Inherit,
-    Stderr,
-    Suppress,
-}
-
-fn installer_stdout(base: &BaseArgs) -> InstallerStdout {
-    if base.quiet {
-        InstallerStdout::Suppress
-    } else if base.json {
-        InstallerStdout::Stderr
-    } else {
-        InstallerStdout::Inherit
-    }
-}
-
 async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     #[cfg(not(windows))]
     {
@@ -594,14 +391,13 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
-        let status = run_installer_command(command, installer_stdout(base))
+        let status = run_installer_command(command, base.json, base.quiet)
             .await
             .context("failed to execute installer")?;
 
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
         }
-
         Ok(())
     }
 
@@ -615,7 +411,6 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
                 "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1"
             }
         };
-
         // Avoid the `irm ... | iex` pattern flagged by Windows security tools.
         let client = crate::http::build_http_client_from_builder(
             Client::builder().timeout(DEFAULT_HTTP_TIMEOUT),
@@ -639,38 +434,42 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         let mut command = Command::new("powershell");
         command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
         command.arg(&script_path);
-        let status = run_installer_command(command, installer_stdout(base))
+        let status = run_installer_command(command, base.json, base.quiet)
             .await
             .context("failed to execute PowerShell installer")?;
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
         }
-
         Ok(())
     }
 }
 
 async fn run_installer_command(
     mut command: Command,
-    stdout: InstallerStdout,
+    redirect: bool,
+    quiet: bool,
 ) -> Result<ExitStatus> {
-    tokio::task::spawn_blocking(move || match stdout {
-        InstallerStdout::Inherit => command.status().context("failed to start installer"),
-        InstallerStdout::Suppress => command
-            .stdout(Stdio::null())
-            .status()
-            .context("failed to start installer"),
-        InstallerStdout::Stderr => {
-            command.stdout(Stdio::piped());
-            let mut child = command.spawn().context("failed to start installer")?;
-            let mut stdout = child
+    tokio::task::spawn_blocking(move || {
+        if quiet {
+            return command
+                .stdout(Stdio::null())
+                .status()
+                .context("failed to start installer");
+        }
+        if !redirect {
+            return command.status().context("failed to start installer");
+        }
+        command.stdout(Stdio::piped());
+        let mut child = command.spawn().context("failed to start installer")?;
+        io::copy(
+            &mut child
                 .stdout
                 .take()
-                .context("failed to capture installer stdout")?;
-            let mut stderr = io::stderr().lock();
-            io::copy(&mut stdout, &mut stderr).context("failed to relay installer output")?;
-            child.wait().context("failed to wait for installer")
-        }
+                .context("failed to capture installer stdout")?,
+            &mut io::stderr().lock(),
+        )
+        .context("failed to relay installer output")?;
+        child.wait().context("failed to wait for installer")
     })
     .await
     .context("installer task failed")?
@@ -948,17 +747,5 @@ mod tests {
             inferred_update_channel(Some("canary")),
             UpdateChannel::Canary
         );
-    }
-
-    #[test]
-    fn installer_stdout_respects_json_and_quiet() {
-        let mut base = BaseArgs::default();
-        assert_eq!(installer_stdout(&base), InstallerStdout::Inherit);
-
-        base.json = true;
-        assert_eq!(installer_stdout(&base), InstallerStdout::Stderr);
-
-        base.quiet = true;
-        assert_eq!(installer_stdout(&base), InstallerStdout::Suppress);
     }
 }
