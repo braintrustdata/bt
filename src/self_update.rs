@@ -322,7 +322,21 @@ fn run_windows_update_worker(
         anyhow::bail!("refusing to run the Windows update worker from an unexpected path");
     }
 
-    let wait_script = format!("Wait-Process -Id {parent_pid} -ErrorAction SilentlyContinue");
+    // Schedule this before any fallible work so failed workers do not leave
+    // stale helper executables behind.
+    if let Err(err) = schedule_windows_worker_cleanup(&worker) {
+        eprintln!(
+            "warning: failed to schedule cleanup of Windows update helper {}: {err}",
+            worker.display()
+        );
+    }
+
+    // The parent can exit before PowerShell starts. Windows PowerShell reports
+    // that normal race as exit code 1 even with SilentlyContinue, so explicitly
+    // succeed after waiting (or discovering that the process is already gone).
+    let wait_script = format!(
+        "$parent = Get-Process -Id {parent_pid} -ErrorAction SilentlyContinue; if ($null -ne $parent) {{ $parent.WaitForExit() }}; exit 0"
+    );
     let wait_status = Command::new("powershell")
         .args([
             "-NoProfile",
@@ -337,15 +351,7 @@ fn run_windows_update_worker(
         anyhow::bail!("failed waiting for the original bt process: {wait_status}");
     }
 
-    let update_result =
-        run_installer(base, channel).and_then(|()| print_update_completed(base, channel));
-    if let Err(err) = schedule_windows_worker_cleanup(&worker) {
-        eprintln!(
-            "warning: failed to schedule cleanup of Windows update helper {}: {err}",
-            worker.display()
-        );
-    }
-    update_result
+    run_installer(base, channel).and_then(|()| print_update_completed(base, channel))
 }
 
 #[cfg(windows)]
