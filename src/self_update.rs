@@ -44,8 +44,6 @@ pub struct UpdateArgs {
     #[arg(long, value_enum)]
     pub channel: Option<UpdateChannel>,
 
-    // Process-internal plumbing: on Windows a running executable cannot be
-    // replaced, so bt moves itself aside and a helper installs its replacement.
     #[cfg(windows)]
     #[arg(long, hide = true, requires = "windows_update_parent_pid")]
     pub windows_update_worker: bool,
@@ -272,18 +270,14 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
             )
         })?;
     }
-    // Windows permits renaming a running executable even though it cannot be
-    // overwritten. Moving this process to the helper path frees the install
-    // path while keeping the original process alive, so the invoking shell can
-    // wait for the update and does not redraw its prompt before output finishes.
+    // Renaming frees the install path while this process waits for the helper.
     fs::rename(&exe, &worker).with_context(|| {
         format!(
             "failed to move bt to Windows update helper {}",
             worker.display()
         )
     })?;
-    // Keep an unlocked fallback at the install path. The installer can replace
-    // this copy, while an interrupted update still leaves a usable bt.exe.
+    // Preserve a usable bt.exe if the update is interrupted.
     if let Err(copy_err) = fs::copy(&worker, &exe) {
         if let Err(restore_err) = fs::rename(&worker, &exe) {
             anyhow::bail!(
@@ -372,8 +366,6 @@ async fn run_windows_update_worker(
 
 #[cfg(windows)]
 fn schedule_windows_worker_cleanup(worker: &Path) -> Result<()> {
-    // A Windows process cannot delete its own executable. Use the signed system
-    // PowerShell after this worker exits; this is process plumbing, not config.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let worker_pid = std::process::id();
     let escaped_path = worker.to_string_lossy().replace('\'', "''");
@@ -433,9 +425,7 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
         };
         status_line(&format!("updating bt from {} channel...", channel.name()));
 
-        // Download in-process instead of using `irm ... | iex`. Besides being
-        // easier to audit, this avoids a command pattern commonly blocked by
-        // Windows security products.
+        // Avoid the `irm ... | iex` pattern flagged by Windows security tools.
         let client = crate::http::build_http_client_from_builder(
             Client::builder().timeout(DEFAULT_HTTP_TIMEOUT),
         )
@@ -469,9 +459,6 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     }
 }
 
-/// Run the installer while keeping stdout reserved for the command's JSON payload.
-/// PowerShell 5.1 cannot parse the POSIX-style `1>&2`, so JSON mode relays the
-/// child's stdout to our stderr at the process level instead.
 fn run_installer_command(command: &mut Command, redirect_stdout: bool) -> Result<ExitStatus> {
     if !redirect_stdout {
         return command.status().context("failed to start installer");
