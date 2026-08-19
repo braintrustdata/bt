@@ -2,11 +2,11 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(windows)]
+use std::time::{Duration, SystemTime};
 
 #[cfg(windows)]
 use std::fs;
-#[cfg(windows)]
-use std::io::Read as _;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -15,10 +15,14 @@ use clap::{Args, Subcommand, ValueEnum};
 use reqwest::Client;
 use serde::Deserialize;
 #[cfg(windows)]
-use sha2::{Digest, Sha256};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE},
+    System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+};
 
 use crate::args::BaseArgs;
 use crate::http::DEFAULT_HTTP_TIMEOUT;
+use crate::ui::{print_command_status, CommandStatus};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -189,6 +193,11 @@ fn print_update_completed(base: &BaseArgs, channel: UpdateChannel) -> Result<()>
             "status": "completed",
         });
         println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        print_command_status(
+            CommandStatus::Success,
+            &format!("Updated bt from the {} channel", channel.name()),
+        );
     }
     Ok(())
 }
@@ -284,8 +293,6 @@ async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHu
 #[cfg(windows)]
 fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
-    let original_digest = file_sha256(&exe)
-        .with_context(|| format!("failed to hash current executable {}", exe.display()))?;
     let parent = exe
         .parent()
         .context("current executable has no parent directory")?;
@@ -331,7 +338,7 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
         "--windows-update-parent-pid",
         &parent_pid_arg,
     ]);
-    // Always capture the worker's JSON response so only this parent process
+    // Capture the worker's JSON error response so only this parent process
     // renders the final success or error to the user's stdout.
     command.arg("--json");
     if base.quiet {
@@ -385,21 +392,13 @@ fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Resu
         );
     }
 
-    let installed_digest = match file_sha256(&exe)
+    // A successful reinstall can produce byte-for-byte identical output, so
+    // installer success plus a readable executable is the reliable postcondition.
+    if let Err(err) = fs::File::open(&exe)
         .with_context(|| format!("failed to verify updated executable {}", exe.display()))
     {
-        Ok(digest) => digest,
-        Err(err) => {
-            schedule_windows_worker_cleanup_with_warning(&worker);
-            return Err(err);
-        }
-    };
-    if installed_digest == original_digest {
         schedule_windows_worker_cleanup_with_warning(&worker);
-        anyhow::bail!(
-            "Windows installer completed without replacing {}; the original executable remains installed",
-            exe.display()
-        );
+        return Err(err);
     }
 
     schedule_windows_worker_cleanup_with_warning(&worker);
@@ -420,19 +419,7 @@ fn windows_worker_error_message(stdout: &[u8], status: &ExitStatus) -> String {
 }
 
 #[cfg(windows)]
-fn file_sha256(path: &Path) -> Result<[u8; 32]> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().into())
-}
+const STALE_WINDOWS_UPDATE_WORKER_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[cfg(windows)]
 fn cleanup_stale_windows_update_workers(parent: &Path, active_worker: &Path) {
@@ -449,7 +436,13 @@ fn cleanup_stale_windows_update_workers(parent: &Path, active_worker: &Path) {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == active_worker || !is_windows_update_worker_path(&path) {
+        let Some(pid) = windows_update_worker_pid(&path) else {
+            continue;
+        };
+        if path == active_worker
+            || !windows_update_worker_is_old_enough(&path)
+            || windows_process_is_running(pid)
+        {
             continue;
         }
         if let Err(err) = fs::remove_file(&path) {
@@ -464,17 +457,38 @@ fn cleanup_stale_windows_update_workers(parent: &Path, active_worker: &Path) {
 }
 
 #[cfg(windows)]
-fn is_windows_update_worker_path(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let Some(pid) = name
-        .strip_prefix("bt-update-")
-        .and_then(|name| name.strip_suffix(".exe"))
-    else {
-        return false;
-    };
-    !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+fn windows_update_worker_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("bt-update-")?
+        .strip_suffix(".exe")?
+        .parse()
+        .ok()
+}
+
+#[cfg(windows)]
+fn windows_update_worker_is_old_enough(path: &Path) -> bool {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= STALE_WINDOWS_UPDATE_WORKER_AGE)
+}
+
+#[cfg(windows)]
+fn windows_process_is_running(pid: u32) -> bool {
+    // Treat access-denied and query failures as "running" so cleanup is always
+    // conservative. ERROR_INVALID_PARAMETER means the PID no longer exists.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+    }
+
+    let mut exit_code = 0_u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    unsafe {
+        CloseHandle(handle);
+    }
+    !queried || exit_code == STILL_ACTIVE as u32
 }
 
 #[cfg(windows)]
@@ -514,8 +528,7 @@ async fn run_windows_update_worker(
         anyhow::bail!("refusing to run the Windows update worker from an unexpected path");
     }
 
-    run_installer(base, channel).await?;
-    print_update_completed(base, channel)
+    run_installer(base, channel).await
 }
 
 #[cfg(windows)]
@@ -558,16 +571,9 @@ fn installer_stdout(base: &BaseArgs) -> InstallerStdout {
 }
 
 async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
-    let status_line = |msg: &str| {
-        if !base.quiet {
-            eprintln!("{msg}");
-        }
-    };
-
     #[cfg(not(windows))]
     {
         let installer_url = channel.installer_url();
-        status_line(&format!("updating bt from {} channel...", channel.name()));
         let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
@@ -578,7 +584,6 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
             anyhow::bail!("installer exited with status {status}");
         }
 
-        status_line("update completed");
         Ok(())
     }
 
@@ -592,7 +597,6 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
                 "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1"
             }
         };
-        status_line(&format!("updating bt from {} channel...", channel.name()));
 
         // Avoid the `irm ... | iex` pattern flagged by Windows security tools.
         let client = crate::http::build_http_client_from_builder(
@@ -623,7 +627,6 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
             anyhow::bail!("installer exited with status {status}");
         }
 
-        status_line("update completed");
         Ok(())
     }
 }
