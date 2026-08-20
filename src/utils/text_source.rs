@@ -20,15 +20,18 @@ fn read_text_source_with_stdin_guard(
     stdin_reader: &Mutex<Option<String>>,
 ) -> Result<String> {
     if value == "-" {
-        ensure_stdin_is_piped(label, std::io::stdin().is_terminal())?;
-
-        // The second reader would otherwise see "" and call it malformed input.
+        // Check this first so a duplicate source reports the actual conflict,
+        // even when the process's stdin is an interactive terminal.
         let mut reader = stdin_reader
             .lock()
             .map_err(|_| anyhow::anyhow!("stdin guard poisoned"))?;
         if let Some(previous) = reader.as_deref() {
             bail!("stdin was already read for {previous}; only one source can be '-'");
         }
+
+        ensure_stdin_is_piped(label, std::io::stdin().is_terminal())?;
+
+        // The second reader would otherwise see "" and call it malformed input.
         *reader = Some(label.to_string());
         drop(reader);
 
