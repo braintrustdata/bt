@@ -151,7 +151,7 @@ struct ConfigEnableArgs {
     #[command(flatten)]
     fields: TopicsConfigFieldsArgs,
 
-    /// Facet labels to enable. Reuse the built-in defaults by omitting this flag.
+    /// Facet label to enable. Repeat for multiple; omit to select interactively (defaults to Task).
     #[arg(long = "facet")]
     facets: Vec<String>,
 

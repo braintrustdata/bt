@@ -11,7 +11,7 @@ use crate::{http::ApiClient, project_context::ProjectContext, utils::app_project
 const DEFAULT_TOPIC_AUTOMATION_NAME: &str = "Topics";
 const DEFAULT_TOPIC_AUTOMATION_DESCRIPTION: &str =
     "Automatically extract facets and classify logs using topic maps";
-const DEFAULT_TOPIC_FACET_NAMES: &[&str] = &["Task", "Sentiment", "Issues"];
+const DEFAULT_TOPIC_FACET_NAMES: &[&str] = &["Task"];
 const DEFAULT_TOPIC_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const DEFAULT_TOPIC_RERUN_SECONDS: i64 = 24 * 60 * 60;
 const DEFAULT_TOPIC_RELABEL_OVERLAP_SECONDS: i64 = 60 * 60;
@@ -2515,13 +2515,10 @@ mod tests {
 
     #[test]
     fn normalize_facet_names_uses_defaults_when_empty() {
-        assert_eq!(
-            normalize_facet_names(&[]),
-            vec!["Task", "Sentiment", "Issues"]
-        );
+        assert_eq!(normalize_facet_names(&[]), vec!["Task"]);
         assert_eq!(
             normalize_facet_names(&["  ".to_string(), "".to_string()]),
-            vec!["Task", "Sentiment", "Issues"]
+            vec!["Task"]
         );
     }
 

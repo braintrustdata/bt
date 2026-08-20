@@ -1,8 +1,9 @@
 use anyhow::{bail, Result};
-use dialoguer::Confirm;
+use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 
 use crate::ui::{
-    is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
+    is_interactive, print_command_status, print_with_pager, prompt_term, with_spinner,
+    CommandStatus,
 };
 
 use super::{
@@ -14,6 +15,12 @@ use super::{
     formatting::{format_duration_compact, format_project_header},
     ConfigEnableArgs, ConfigSetArgs, ResolvedContext, TopicMapSetArgs, TopicsConfigFieldsArgs,
 };
+
+const BUILTIN_TOPIC_FACETS: [(&str, &str); 3] = [
+    ("Task", "User intent or goal"),
+    ("Sentiment", "User sentiment toward the interaction"),
+    ("Issues", "Problems with agent behavior or responses"),
+];
 
 pub async fn run_view(
     ctx: &ResolvedContext,
@@ -107,7 +114,10 @@ pub async fn run_set(ctx: &ResolvedContext, args: &ConfigSetArgs, json: bool) ->
 }
 
 pub async fn run_enable(ctx: &ResolvedContext, args: &ConfigEnableArgs, json: bool) -> Result<()> {
-    let create = args.to_create()?;
+    let mut create = args.to_create()?;
+    if create.facets.is_empty() {
+        create.facets = select_enable_facets(!json && is_interactive())?;
+    }
     let created =
         with_spinner("Enabling Topics...", api::enable_topics_config(ctx, create)).await?;
 
@@ -122,6 +132,34 @@ pub async fn run_enable(ctx: &ResolvedContext, args: &ConfigEnableArgs, json: bo
         &created,
     ))?;
     Ok(())
+}
+
+fn select_enable_facets(interactive: bool) -> Result<Vec<String>> {
+    if !interactive {
+        return Ok(vec!["Task".to_string()]);
+    }
+
+    let labels = BUILTIN_TOPIC_FACETS
+        .iter()
+        .map(|(name, description)| format!("{name} — {description}"))
+        .collect::<Vec<_>>();
+    let defaults = [true, false, false];
+    let term = prompt_term().ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?;
+    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select active facets (Space to toggle, Enter to continue)")
+        .items(&labels)
+        .defaults(&defaults)
+        .interact_on_opt(&term)?
+        .ok_or_else(|| anyhow::anyhow!("facet selection cancelled by user"))?;
+
+    if selected.is_empty() {
+        bail!("select at least one facet to enable Topics; for example, `bt topics config enable --facet Task`");
+    }
+
+    Ok(selected
+        .into_iter()
+        .map(|index| BUILTIN_TOPIC_FACETS[index].0.to_string())
+        .collect())
 }
 
 pub async fn run_delete(
@@ -1157,6 +1195,11 @@ mod tests {
         assert_eq!(create.btql_filter, None);
         assert_eq!(create.facets, vec!["Task", "Issues"]);
         assert_eq!(create.embedding_model.as_deref(), Some("brain-embedding-1"));
+    }
+
+    #[test]
+    fn config_enable_defaults_to_task_without_interactive_selection() {
+        assert_eq!(select_enable_facets(false).expect("facets"), vec!["Task"]);
     }
 
     #[test]
