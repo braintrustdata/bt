@@ -170,7 +170,7 @@ pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: b
     Ok(())
 }
 
-pub(super) fn report_validation_issues(report: &api::FunctionValidationReport) -> Result<()> {
+fn report_validation_issues(report: &api::FunctionValidationReport) -> Result<()> {
     let mut blocking = Vec::new();
     for result in &report.results {
         for issue in &result.issues {

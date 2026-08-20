@@ -1,22 +1,19 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::BoolishValueParser, Args};
 use dialoguer::Confirm;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::{
-    error::user_error,
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
     utils::{merge_json_objects, read_text_source},
 };
 
 use super::{
-    api, create::report_validation_issues, label, label_plural, select_function_interactive,
-};
-use super::{
+    api, label, label_plural,
     prompt_config::PromptConfigArgs,
     prompt_patch::materialize_prompt_data_patch,
     scorer_config::{build_scorer_config, ScorerConfig},
-    FunctionTypeFilter, ResolvedContext,
+    select_function_interactive, FunctionTypeFilter, ResolvedContext,
 };
 
 /// Update a function's prompt configuration or metadata in place.
@@ -57,12 +54,13 @@ pub struct UpdateArgs {
     #[command(flatten)]
     prompt_config: PromptConfigArgs,
 
-    /// Replace choice-to-score mappings for score output. Accepts inline JSON,
-    /// @PATH to read from a file, or - for stdin.
+    /// Replace choice-to-score mappings for an existing score-output scorer.
+    /// Accepts inline JSON, @PATH to read from a file, or - for stdin.
     #[arg(long, value_name = "SOURCE", conflicts_with = "classifications")]
     choice_scores: Option<String>,
 
-    /// Replace labels for classification output. Accepts an inline JSON array,
+    /// Replace labels for an existing classifier. This cannot change a
+    /// score-output scorer into a classifier. Accepts an inline JSON array,
     /// @PATH to read from a file, or - for stdin.
     #[arg(long, value_name = "SOURCE", conflicts_with = "choice_scores")]
     classifications: Option<String>,
@@ -85,7 +83,8 @@ pub struct UpdateArgs {
     )]
     allow_no_match: Option<bool>,
 
-    /// Update the score threshold for passing, between 0 and 1.
+    /// Update the score threshold for an existing score-output scorer, between
+    /// 0 and 1.
     #[arg(long, value_name = "NUMBER", conflicts_with = "classifications")]
     pass_threshold: Option<f64>,
 
@@ -156,46 +155,6 @@ enum UpdateSelector<'a> {
     Slug(Option<&'a str>),
 }
 
-fn validation_candidate(function: &api::Function, patch: &Value) -> Value {
-    let mut candidate = json!({
-        "project_id": function.project_id,
-        "name": function.name,
-        "slug": function.slug,
-    });
-    let object = candidate
-        .as_object_mut()
-        .expect("validation candidate is an object");
-
-    for (key, value) in [
-        (
-            "description",
-            function.description.as_ref().map(|v| json!(v)),
-        ),
-        (
-            "function_type",
-            function.function_type.as_ref().map(|v| json!(v)),
-        ),
-        ("prompt_data", function.prompt_data.clone()),
-        ("function_data", function.function_data.clone()),
-        ("tags", function.tags.as_ref().map(|v| json!(v))),
-        ("metadata", function.metadata.clone()),
-    ] {
-        if let Some(value) = value {
-            object.insert(key.to_string(), value);
-        }
-    }
-
-    // PATCH replaces each top-level value. `prompt_data` has already been
-    // materialized into a complete value before this helper is called.
-    for (key, value) in patch
-        .as_object()
-        .expect("function update patch is an object")
-    {
-        object.insert(key.clone(), value.clone());
-    }
-    candidate
-}
-
 pub async fn run(
     ctx: &ResolvedContext,
     args: &UpdateArgs,
@@ -205,66 +164,50 @@ pub async fn run(
     let mut body = build_patch_body(args)?;
 
     let function = resolve_target_function(ctx, args, ft).await?;
+    if !function_matches_filter(&function, ft) {
+        bail!("'{}' is not a {}", function.name, label(ft));
+    }
 
-    // LLM scorer/classifier output flags only apply to prompt-based scorers and
-    // classifiers. Reject them on other function kinds (for example tools) so an
-    // unrelated function is not silently patched with a parser it cannot use.
-    let is_scorer_like = matches!(
-        function.function_type.as_deref(),
-        Some("scorer") | Some("classifier")
-    );
-    let scorer_flags = args.scorer_output_flags();
-    if !scorer_flags.is_empty() && !is_scorer_like {
+    let implementation = function
+        .function_data
+        .as_ref()
+        .and_then(|data| data.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("prompt");
+    if body.get("prompt_data").is_some() && implementation != "prompt" {
         bail!(
-            "{} apply to LLM scorers and classifiers, not {} '{}'. \
-             Run `bt scorers update` on a scorer instead.",
-            scorer_flags.join(", "),
-            label(ft),
-            function.name,
+            "prompt configuration cannot update {}-backed function '{}'",
+            implementation,
+            function.name
         );
     }
 
-    // Mirrors `create`, where --allow-no-match requires --classifications: a
-    // score parser would never consult it.
-    let produces_classifications =
-        args.classifications.is_some() || function.function_type.as_deref() == Some("classifier");
-    if args.allow_no_match.is_some() && !produces_classifications {
+    let function_type = function.function_type.as_deref();
+    let scorer_flags = args.scorer_output_flags();
+    if !scorer_flags.is_empty() && !matches!(function_type, Some("scorer") | Some("classifier")) {
         bail!(
-            "--allow-no-match applies to classification output, but '{}' produces scores. \
-             Pass --classifications to switch it to labels.",
-            function.name,
+            "{} apply only to scorers and classifiers",
+            scorer_flags.join(", ")
         );
+    }
+    if matches!(
+        (
+            function_type,
+            args.choice_scores.is_some(),
+            args.classifications.is_some()
+        ),
+        (Some("classifier"), true, _) | (Some("scorer"), _, true)
+    ) {
+        bail!("PATCH cannot change between score and classification output");
+    }
+    if args.allow_no_match.is_some() && function_type != Some("classifier") {
+        bail!("--allow-no-match applies only to classification output");
+    }
+    if args.pass_threshold.is_some() && function_type == Some("classifier") {
+        bail!("--pass-threshold applies only to score output");
     }
 
     materialize_prompt_data_patch(&mut body, function.prompt_data.as_ref());
-
-    // Last of the up-front checks because it hits the network. Validate the
-    // complete candidate rather than the partial PATCH body so the backend can
-    // apply the same model-parameter checks as it does for scorer creation.
-    let candidate = validation_candidate(&function, &body);
-    let validation = with_spinner(
-        "Validating function...",
-        api::validate_functions(&ctx.client, std::slice::from_ref(&candidate)),
-    )
-    .await?;
-    report_validation_issues(&validation).map_err(user_error)?;
-
-    // Switching output mode updates function_type, but materialization merges
-    // the parser and does not drop the previous mode's keys. Warn so the
-    // user can review or recreate for a clean switch.
-    if !crate::ui::is_quiet() {
-        match function.function_type.as_deref() {
-            Some("classifier") if args.choice_scores.is_some() => print_command_status(
-                CommandStatus::Warning,
-                "Switching to score output; previous classification labels may remain in the definition. Review with `bt scorers view`.",
-            ),
-            Some("scorer") if args.classifications.is_some() => print_command_status(
-                CommandStatus::Warning,
-                "Switching to classification output; previous choice scores may remain in the definition. Review with `bt scorers view`.",
-            ),
-            _ => {}
-        }
-    }
 
     if !args.yes && is_interactive() {
         let confirm = Confirm::new()
@@ -316,6 +259,24 @@ pub async fn run(
     Ok(())
 }
 
+fn function_matches_filter(function: &api::Function, ft: Option<FunctionTypeFilter>) -> bool {
+    match ft {
+        None => true,
+        Some(FunctionTypeFilter::Scorer) => {
+            function.function_type.as_deref() == Some("scorer")
+                || function.function_type.as_deref() == Some("classifier")
+                    && function.prompt_data.is_some()
+                    && function
+                        .function_data
+                        .as_ref()
+                        .and_then(|data| data.get("type"))
+                        .and_then(Value::as_str)
+                        != Some("topic_map")
+        }
+        Some(expected) => function.function_type.as_deref() == Some(expected.as_str()),
+    }
+}
+
 async fn resolve_target_function(
     ctx: &ResolvedContext,
     args: &UpdateArgs,
@@ -360,6 +321,9 @@ fn build_patch_body(args: &UpdateArgs) -> Result<Value> {
         },
         false,
     )?;
+    // PATCH /v1/function does not support changing function_type. Output-mode
+    // changes are rejected after resolving the current function.
+    patch.remove("function_type");
 
     if let Some(description) = args.description.as_deref() {
         patch.insert(
@@ -398,6 +362,7 @@ fn parse_patch_object(raw: &str) -> Result<Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use serde_json::json;
 
     use super::*;
 
@@ -427,36 +392,6 @@ mod tests {
             patch: None,
             yes: true,
         }
-    }
-
-    #[test]
-    fn validation_candidate_applies_top_level_patch_to_existing_function() {
-        let function = api::Function {
-            id: "fn_test_update".to_string(),
-            name: "Test scorer".to_string(),
-            slug: "test-scorer".to_string(),
-            project_id: "test-project".to_string(),
-            description: Some("Old description".to_string()),
-            function_type: Some("scorer".to_string()),
-            prompt_data: Some(json!({"options": {"model": "test-model"}})),
-            function_data: Some(json!({"type": "prompt"})),
-            tags: Some(vec!["test-tag".to_string()]),
-            metadata: Some(json!({"owner": "test-user"})),
-            created: None,
-            _xact_id: None,
-        };
-        let patch = json!({
-            "description": "New description",
-            "prompt_data": {"options": {"model": "test-model-2"}}
-        });
-
-        let candidate = validation_candidate(&function, &patch);
-
-        assert_eq!(candidate["project_id"], "test-project");
-        assert_eq!(candidate["description"], "New description");
-        assert_eq!(candidate["prompt_data"], patch["prompt_data"]);
-        assert_eq!(candidate["function_data"], function.function_data.unwrap());
-        assert!(candidate.get("id").is_none());
     }
 
     #[test]
@@ -580,7 +515,7 @@ mod tests {
         args.metadata = Some("owner: test-team".to_string());
 
         let body = build_patch_body(&args).expect("patch body");
-        assert_eq!(body["function_type"], "classifier");
+        assert!(body.get("function_type").is_none());
         assert_eq!(
             body["prompt_data"]["parser"]["choice"],
             json!(["safe", "unsafe"])
@@ -596,7 +531,7 @@ mod tests {
         args.pass_threshold = Some(0.8);
 
         let body = build_patch_body(&args).expect("patch body");
-        assert_eq!(body["function_type"], "scorer");
+        assert!(body.get("function_type").is_none());
         assert_eq!(
             body["prompt_data"]["parser"]["choice_scores"],
             json!({"pass": 1, "fail": 0})
