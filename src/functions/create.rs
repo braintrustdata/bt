@@ -121,12 +121,6 @@ pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: b
     let slug = resolve_slug(args, &name).map_err(user_error)?;
     let definition =
         build_scorer_definition(args, &ctx.project.id, &name, &slug).map_err(user_error)?;
-    let validation = with_spinner(
-        "Validating scorer...",
-        api::validate_functions(&ctx.client, std::slice::from_ref(&definition)),
-    )
-    .await?;
-    report_validation_issues(&validation).map_err(user_error)?;
 
     let result = match with_spinner(
         "Creating scorer...",
@@ -136,6 +130,9 @@ pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: b
     {
         Ok(result) => result,
         Err(error) => {
+            if let Some(validation_error) = error.downcast_ref::<api::FunctionValidationError>() {
+                return report_validation_issues(&validation_error.report).map_err(user_error);
+            }
             print_command_status(CommandStatus::Error, &format!("Failed to create '{name}'"));
             return Err(error);
         }
