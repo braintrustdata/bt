@@ -97,6 +97,19 @@ pub struct FunctionValidationReport {
     pub results: Vec<FunctionValidationResult>,
 }
 
+#[derive(Debug)]
+pub struct FunctionValidationError {
+    pub report: FunctionValidationReport,
+}
+
+impl std::fmt::Display for FunctionValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the backend rejected the function definition")
+    }
+}
+
+impl std::error::Error for FunctionValidationError {}
+
 #[derive(Debug, Clone)]
 pub struct InsertFunctionsResult {
     pub ignored_entries: Option<usize>,
@@ -343,35 +356,25 @@ pub async fn upload_bundle(
         .context("failed to upload code bundle to signed URL")
 }
 
-pub async fn validate_functions(
-    client: &ApiClient,
-    functions: &[Value],
-) -> Result<FunctionValidationReport> {
-    let body = insert_functions_body(functions);
-    match client.post("/validate-functions", &body).await {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            let Some(http_error) = error.downcast_ref::<HttpError>() else {
-                return Err(error).context("failed to validate functions");
-            };
-            if http_error.status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-                return Err(error).context("failed to validate functions");
-            }
-            serde_json::from_str(&http_error.body)
-                .context("unexpected validate-functions error response shape")
-        }
-    }
-}
-
 pub async fn insert_functions(
     client: &ApiClient,
     functions: &[Value],
 ) -> Result<InsertFunctionsResult> {
     let body = insert_functions_body(functions);
-    let raw: Value = client
-        .post("/insert-functions", &body)
-        .await
-        .context("failed to insert functions")?;
+    let raw: Value = match client.post("/insert-functions", &body).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            let Some(http_error) = error.downcast_ref::<HttpError>() else {
+                return Err(error).context("failed to insert functions");
+            };
+            if http_error.status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                return Err(error).context("failed to insert functions");
+            }
+            let report = serde_json::from_str(&http_error.body)
+                .context("unexpected insert-functions validation error response shape")?;
+            return Err(FunctionValidationError { report }.into());
+        }
+    };
 
     let response: InsertFunctionsResponse = serde_json::from_value(raw.clone())
         .context("unexpected insert-functions response shape")?;
