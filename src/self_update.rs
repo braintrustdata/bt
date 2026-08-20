@@ -302,32 +302,26 @@ async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -
     if base.quiet {
         command.arg("--quiet");
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
-    let output = tokio::task::spawn_blocking(move || command.output()).await;
-    if !matches!(output, Ok(Ok(_))) {
+    command.stdout(Stdio::null()).stderr(Stdio::inherit());
+    let status = tokio::task::spawn_blocking(move || command.status()).await;
+    if !matches!(status, Ok(Ok(_))) {
         schedule_windows_worker_cleanup(&worker, None)?;
     }
-    let output = output
+    let status = status
         .context("Windows update helper task failed")?
         .context("failed to launch Windows update helper")?;
     if let Err(err) = schedule_windows_worker_cleanup(&worker, None) {
         eprintln!("warning: failed to schedule update-helper cleanup: {err}");
     }
 
-    if !output.status.success() {
+    if !status.success() {
         prepare_windows_executable(&worker)?
             .persist(&exe)
             .map_err(|err| err.error)
             .context("failed to restore bt after update failure")?;
-        let message = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .and_then(|v| v.pointer("/error/message")?.as_str().map(str::to_owned))
-            .unwrap_or_else(|| {
-                format!("Windows update helper exited with status {}", output.status)
-            });
         return Err(anyhow::Error::new(UpdateWorkerError(
-            message,
-            output.status.code(),
+            format!("Windows update helper exited with status {status}"),
+            status.code(),
         )));
     }
     if !exe.exists() {
@@ -397,6 +391,9 @@ fn schedule_windows_worker_cleanup(worker: &Path, parent_pid: Option<u32>) -> Re
             "-Command",
             &cleanup_script,
         ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .context("failed to launch Windows update-helper cleanup")?;
