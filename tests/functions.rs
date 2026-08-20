@@ -130,15 +130,7 @@ fn find_tsc() -> Option<PathBuf> {
     } else {
         repo_root().join("node_modules").join(".bin").join("tsc")
     };
-    if local.is_file() {
-        return Some(local);
-    }
-
-    if command_exists("tsc") {
-        return Some(PathBuf::from("tsc"));
-    }
-
-    None
+    local.is_file().then_some(local)
 }
 
 fn compile_functions_runner(tsc: &Path, root: &Path, runner_dir: &Path) {
@@ -763,12 +755,22 @@ fn root_login_refresh_uses_selected_profile() {
         .env("APPDATA", config_dir.path())
         .env("BRAINTRUST_NO_COLOR", "1")
         .env_remove("BRAINTRUST_API_KEY")
+        .env_remove("BRAINTRUST_API_URL")
+        .env_remove("BRAINTRUST_APP_URL")
         .env_remove("BRAINTRUST_ORG_NAME");
 
     let output = cmd.output().expect("run bt login --refresh");
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("`bt login --refresh` only applies to oauth profiles"));
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .expect("JSON failures should emit a machine-readable payload on stdout");
+    assert!(payload["error"]["message"].as_str().is_some_and(
+        |message| message.contains("`bt login --refresh` only applies to oauth profiles")
+    ));
+    assert!(
+        output.stderr.is_empty(),
+        "JSON failure should not be emitted on stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

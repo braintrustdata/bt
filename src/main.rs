@@ -599,7 +599,7 @@ fn json_error_message(details: &serde_json::Value) -> Option<String> {
 
 fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool, json_output: bool) {
     if json_output {
-        eprintln!("{}", json_error_payload(err));
+        println!("{}", json_error_payload(err));
         return;
     }
 
