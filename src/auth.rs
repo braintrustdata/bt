@@ -6,6 +6,7 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -35,6 +36,7 @@ use crate::{
     ui,
 };
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
@@ -3372,7 +3374,7 @@ fn auth_store_path() -> Result<PathBuf> {
     {
         let app_data =
             std::env::var_os("APPDATA").ok_or_else(|| anyhow::anyhow!("APPDATA is not set"))?;
-        return Ok(PathBuf::from(app_data).join("bt").join("auth.json"));
+        Ok(PathBuf::from(app_data).join("bt").join("auth.json"))
     }
 
     #[cfg(not(windows))]
