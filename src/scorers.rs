@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::args::BaseArgs;
-use crate::functions::{self, FunctionCommands, FunctionTypeFilter};
+use crate::functions::{self, ScorerFunctionCommands};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -30,16 +30,16 @@ enum ScorersCommands {
     /// Create an LLM scorer or classifier
     Create(Box<functions::create::CreateArgs>),
     #[command(flatten)]
-    Function(FunctionCommands),
+    Function(ScorerFunctionCommands),
 }
 
 pub async fn run(base: BaseArgs, args: ScorersArgs) -> Result<()> {
     match args.command {
         Some(ScorersCommands::Create(create)) => functions::run_scorer_create(base, *create).await,
         Some(ScorersCommands::Function(command)) => {
-            functions::run_typed_command(base, Some(command), FunctionTypeFilter::Scorer).await
+            functions::run_scorer_command(base, Some(command)).await
         }
-        None => functions::run_typed_command(base, None, FunctionTypeFilter::Scorer).await,
+        None => functions::run_scorer_command(base, None).await,
     }
 }
 
@@ -115,7 +115,7 @@ mod tests {
 
         assert!(matches!(
             parsed.args.command,
-            Some(ScorersCommands::Function(FunctionCommands::Update(_)))
+            Some(ScorersCommands::Function(ScorerFunctionCommands::Update(_)))
         ));
     }
 }

@@ -176,7 +176,7 @@ Examples:
   bt tools view my-tool
   bt tools view fn_123
   bt tools view --id fn_123
-  bt tools update my-tool --patch @tool-patch.json
+  bt tools update my-tool --name \"Lookup order\" --new-slug lookup-order
 ")]
 pub struct FunctionArgs {
     #[command(subcommand)]
@@ -193,8 +193,22 @@ pub(crate) enum FunctionCommands {
     Delete(DeleteArgs),
     /// Invoke by slug
     Invoke(invoke::InvokeArgs),
-    /// Update a function in place (prompt configuration, metadata, or arbitrary patch)
-    Update(Box<update::UpdateArgs>),
+    /// Update tool fields or prompt content
+    Update(Box<update::ToolUpdateArgs>),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum ScorerFunctionCommands {
+    /// List all in the current project
+    List,
+    /// View details
+    View(ViewArgs),
+    /// Delete by slug
+    Delete(DeleteArgs),
+    /// Invoke by slug
+    Invoke(invoke::InvokeArgs),
+    /// Update scorer configuration
+    Update(Box<update::ScorerUpdateArgs>),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -227,7 +241,7 @@ enum FunctionsCommands {
     Delete(FunctionsDeleteArgs),
     /// Invoke a function
     Invoke(FunctionsInvokeArgs),
-    /// Update a function in place (prompt configuration, metadata, or arbitrary patch)
+    /// Update common function fields or apply an arbitrary patch
     Update(Box<FunctionsUpdateArgs>),
     /// Push local function definitions
     Push(PushArgs),
@@ -281,7 +295,7 @@ struct FunctionsInvokeArgs {
 #[derive(Debug, Clone, Args)]
 struct FunctionsUpdateArgs {
     #[command(flatten)]
-    inner: update::UpdateArgs,
+    inner: update::GenericUpdateArgs,
     /// Filter by function type (for interactive selection)
     #[arg(long = "type", short = 't', value_enum)]
     function_type: Option<FunctionTypeFilter>,
@@ -672,7 +686,7 @@ pub(crate) async fn run_typed_command(
                 None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
                 Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
                 Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
-                Some(FunctionCommands::Update(u)) => update::run(&ctx, &u, base.json, ft).await,
+                Some(FunctionCommands::Update(u)) => update::run_tool(&ctx, &u, base.json).await,
                 Some(FunctionCommands::View(_)) => {
                     unreachable!("handled before context resolution")
                 }
@@ -685,6 +699,59 @@ pub(crate) async fn run_scorer_create(base: BaseArgs, args: create::CreateArgs) 
     let json_output = base.json;
     let ctx = resolve_context(&base).await?;
     create::run(&ctx, &args, json_output).await
+}
+
+pub(crate) async fn run_scorer_command(
+    base: BaseArgs,
+    command: Option<ScorerFunctionCommands>,
+) -> Result<()> {
+    let ft = Some(FunctionTypeFilter::Scorer);
+    match command {
+        Some(ScorerFunctionCommands::View(v)) => match v.selector()? {
+            ViewSelector::Id(id) => {
+                let auth_ctx = resolve_auth_context(&base).await?;
+                view::run_by_id(
+                    &auth_ctx,
+                    id,
+                    v.version.as_deref(),
+                    base.json,
+                    v.web,
+                    base.verbose,
+                    ft,
+                )
+                .await
+            }
+            ViewSelector::Slug(slug) => {
+                let ctx = resolve_context(&base).await?;
+                view::run(
+                    &ctx,
+                    slug,
+                    v.version.as_deref(),
+                    base.json,
+                    v.web,
+                    base.verbose,
+                    ft,
+                )
+                .await
+            }
+        },
+        command => {
+            let ctx = resolve_context(&base).await?;
+            match command {
+                None | Some(ScorerFunctionCommands::List) => list::run(&ctx, base.json, ft).await,
+                Some(ScorerFunctionCommands::Delete(d)) => {
+                    delete::run(&ctx, d.slug(), d.force, ft).await
+                }
+                Some(ScorerFunctionCommands::Invoke(i)) => {
+                    invoke::run(&ctx, &i, base.json, ft).await
+                }
+                Some(ScorerFunctionCommands::Update(u)) => {
+                    update::run_scorer(&ctx, &u, base.json).await
+                }
+                Some(ScorerFunctionCommands::View(_)) => unreachable!("handled above"),
+            }
+        }
+    }
 }
 
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
@@ -737,7 +804,13 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
                     invoke::run(&ctx, &i.inner, base.json, i.function_type.or(function_type)).await
                 }
                 Some(FunctionsCommands::Update(u)) => {
-                    update::run(&ctx, &u.inner, base.json, u.function_type.or(function_type)).await
+                    update::run_generic(
+                        &ctx,
+                        &u.inner,
+                        base.json,
+                        u.function_type.or(function_type),
+                    )
+                    .await
                 }
                 Some(FunctionsCommands::Push(_))
                 | Some(FunctionsCommands::Pull(_))

@@ -181,9 +181,9 @@ Update only the fields you specify, or use `--patch` for fields without dedicate
 
 ```bash
 bt scorers update helpfulness --messages @messages.json
-bt scorers update helpfulness --model gpt-5.4-nano
-bt functions update my-function --description "Updated"
-bt tools update my-tool --patch @tool-patch.json
+bt scorers update helpfulness --new-slug answer-helpfulness
+bt functions update my-function --name "Updated function" --description "Updated"
+bt tools update my-tool --prompt @prompt.txt --new-slug lookup-order
 ```
 
 The API replaces `prompt_data` rather than merging it, so `bt` reads the current definition and sends a materialized replacement with your changes. A concurrent edit can therefore be overwritten.
