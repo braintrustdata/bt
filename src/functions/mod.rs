@@ -117,7 +117,6 @@ pub enum PushLanguage {
 fn build_web_path(function: &Function) -> String {
     let id = &function.id;
     match function.function_type.as_deref() {
-        Some("tool") => format!("tools?pr={}", urlencoding::encode(id)),
         Some("scorer") => format!("scorers/{}", urlencoding::encode(id)),
         Some("classifier") if function.prompt_data.is_some() => {
             format!("scorers/{}", urlencoding::encode(id))
@@ -131,7 +130,8 @@ fn build_web_path(function: &Function) -> String {
             )
         }
         Some("parameters") => format!("parameters/{}", urlencoding::encode(id)),
-        _ => format!("functions/{}", urlencoding::encode(id)),
+        Some("llm") => format!("prompts/{}", urlencoding::encode(id)),
+        _ => format!("tools?pr={}", urlencoding::encode(id)),
     }
 }
 
