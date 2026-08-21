@@ -16,7 +16,7 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Resu
     }
 
     let prompt = match slug {
-        Some(s) => api::get_prompt_by_slug(&ctx.client, project_name, s)
+        Some(s) => api::get_prompt_by_slug(&ctx.client, project_name, s, None, None)
             .await?
             .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
         None => {

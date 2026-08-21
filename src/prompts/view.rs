@@ -13,6 +13,8 @@ use super::{api, ResolvedContext};
 pub async fn run(
     ctx: &ResolvedContext,
     slug: Option<&str>,
+    version: Option<&str>,
+    environment: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
@@ -21,7 +23,7 @@ pub async fn run(
     let prompt = match slug {
         Some(s) => with_spinner(
             "Loading prompt...",
-            api::get_prompt_by_slug(&ctx.client, project_name, s),
+            api::get_prompt_by_slug(&ctx.client, project_name, s, version, environment),
         )
         .await?
         .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
@@ -53,6 +55,17 @@ pub async fn run(
     let mut output = String::new();
 
     writeln!(output, "Viewing {}", console::style(&prompt.name).bold())?;
+    if let Some(environment) = environment {
+        writeln!(
+            output,
+            "{} {}",
+            console::style("Environment:").dim(),
+            environment
+        )?;
+    }
+    if let Some(version) = prompt._xact_id.as_deref().or(version) {
+        writeln!(output, "{} {}", console::style("Version:").dim(), version)?;
+    }
 
     let options = prompt.prompt_data.as_ref().and_then(|pd| pd.get("options"));
 

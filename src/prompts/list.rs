@@ -10,12 +10,16 @@ use crate::{
 
 use super::{api, ResolvedContext};
 
-pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
+pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -> Result<()> {
     let project_name = &ctx.project.name;
-    let prompts = with_spinner(
-        "Loading prompts...",
-        api::list_prompts(&ctx.client, project_name),
-    )
+    let prompts = with_spinner("Loading prompts...", async {
+        match environment {
+            Some(environment) => {
+                api::list_prompts_by_environment(&ctx.client, project_name, environment).await
+            }
+            None => api::list_prompts(&ctx.client, project_name).await,
+        }
+    })
     .await?;
 
     if json {
@@ -32,11 +36,14 @@ pub async fn run(ctx: &ResolvedContext, json: bool) -> Result<()> {
     );
     writeln!(
         output,
-        "{} found in {} {} {}\n",
+        "{} found in {} {} {}{}\n",
         console::style(count),
         console::style(ctx.client.org_name()).bold(),
         console::style("/").dim().bold(),
-        console::style(project_name).bold()
+        console::style(project_name).bold(),
+        environment
+            .map(|environment| format!(" for environment {}", console::style(environment).bold()))
+            .unwrap_or_default()
     )?;
 
     let mut table = styled_table();
