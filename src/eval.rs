@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use actix_web::dev::Service;
 use actix_web::http::header::{
@@ -13,7 +13,7 @@ use actix_web::http::header::{
     ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS,
     ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ORIGIN, VARY,
 };
-use actix_web::{guard, web, App, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{guard, web, App, HttpMessage, HttpRequest, HttpResponse, HttpServer};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use crossterm::style::Stylize;
@@ -26,7 +26,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::args::BaseArgs;
-use crate::auth::resolved_runner_env;
+use crate::auth::{resolve_auth, resolved_runner_env};
 use crate::js_runner;
 use crate::python_runner;
 use crate::runner_sse;
@@ -43,7 +43,7 @@ const BRAINTRUSTDATA_ORIGIN: &str = "https://www.braintrustdata.com";
 const CORS_METHODS: &str = "GET, PATCH, POST, PUT, DELETE, OPTIONS";
 const CORS_ALLOWED_HEADERS: &str = "Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token, x-bt-auth-token, x-bt-parent, x-bt-org-name, x-bt-project-id, x-bt-stream-fmt, x-bt-use-cache, x-bt-use-gateway, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch";
 const CORS_EXPOSED_HEADERS: &str =
-    "x-bt-cursor, x-bt-found-existing-experiment, x-bt-span-id, x-bt-span-export";
+    "x-bt-cursor, x-bt-found-existing-experiment, x-bt-span-id, x-bt-span-export, x-bt-request-id";
 const HEADER_BT_AUTH_TOKEN: &str = "x-bt-auth-token";
 const HEADER_BT_ORG_NAME: &str = "x-bt-org-name";
 const HEADER_CORS_REQ_PRIVATE_NETWORK: &str = "access-control-request-private-network";
@@ -62,6 +62,8 @@ const EVAL_TOTAL_SMOOTH_INTERVAL: Duration = Duration::from_millis(100);
 const EVAL_TOTAL_SMOOTH_DELTA_DIVISOR: u64 = 50;
 const EVAL_TOTAL_SMOOTH_MIN_STEP: u64 = 2;
 const EVAL_MIN_DETERMINATE_TOTAL: u64 = 2;
+const DEV_RUNNER_STDERR_EXCERPT_MAX_BYTES: usize = 8 * 1024;
+const HEADER_BT_REQUEST_ID: &str = "x-bt-request-id";
 
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
@@ -194,6 +196,12 @@ struct DevAuthContext {
     org_name: String,
     api_url: Option<String>,
 }
+
+#[derive(Clone)]
+struct DevRequestId(String);
+
+#[derive(Clone)]
+struct DevEvalName(String);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RunnerFilter {
@@ -511,7 +519,11 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
 
     if args.dev {
         let language = detect_eval_language(&files, args.language)?;
-        let app_url = resolve_app_url(&base);
+        let app_url = resolve_auth(&base)
+            .await
+            .context("failed to resolve eval dev server authentication")?
+            .app_url
+            .unwrap_or_else(|| "https://www.braintrust.dev".to_string());
         let state = DevServerState {
             base: base.clone(),
             language_override: Some(language),
@@ -1022,11 +1034,15 @@ where
             }
             EvalEvent::Console { stream, message } => {
                 if stream == "stderr"
-                    && !message.starts_with("Warning:")
-                    && matches!(console_policy, ConsolePolicy::BufferStderr)
+                    && (!message.starts_with("Warning:")
+                        || matches!(console_policy, ConsolePolicy::Forward))
                 {
-                    stderr_lines.push(message);
-                } else {
+                    stderr_lines.push(message.clone());
+                }
+                if stream != "stderr"
+                    || message.starts_with("Warning:")
+                    || matches!(console_policy, ConsolePolicy::Forward)
+                {
                     on_event(EvalEvent::Console { stream, message });
                 }
             }
@@ -1117,13 +1133,6 @@ fn is_esm_interop_error(message: &str) -> bool {
     ];
 
     PATTERNS.iter().any(|pattern| message.contains(pattern))
-}
-
-fn resolve_app_url(base: &BaseArgs) -> String {
-    if let Some(app_url) = base.app_url.as_ref() {
-        return app_url.clone();
-    }
-    "https://www.braintrust.dev".to_string()
 }
 
 fn app_origin_from_url(url: &str) -> Option<String> {
@@ -1243,6 +1252,9 @@ async fn authenticate_dev_request(
         .http_client
         .post(login_url)
         .bearer_auth(&token)
+        // The Next.js login endpoint only falls back to the Authorization
+        // header when the request body was parsed as an object.
+        .header("Content-Type", "application/json")
         .send()
         .await
         .map_err(|_| {
@@ -1413,6 +1425,70 @@ fn serialize_sse_event(event: &str, data: &str) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
+fn dev_request_id(req: &HttpRequest) -> String {
+    req.extensions()
+        .get::<DevRequestId>()
+        .map(|value| value.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn log_dev_runner_console(request_id: &str, stream: &str, message: &str) {
+    for line in message.lines() {
+        eprintln!("[remote-eval request_id={request_id} runner_{stream}] {line}");
+    }
+}
+
+fn log_dev_runner_error(request_id: &str, message: &str, stack: Option<&str>) {
+    eprintln!("[remote-eval request_id={request_id} runner_error] {message}");
+    if let Some(stack) = stack {
+        for line in stack.lines() {
+            eprintln!("[remote-eval request_id={request_id} runner_error] {line}");
+        }
+    }
+}
+
+fn bounded_stderr_excerpt(lines: &[String]) -> Option<String> {
+    let stderr = lines.join("\n");
+    if stderr.is_empty() {
+        return None;
+    }
+    if stderr.len() <= DEV_RUNNER_STDERR_EXCERPT_MAX_BYTES {
+        return Some(stderr);
+    }
+
+    let mut start = stderr.len() - DEV_RUNNER_STDERR_EXCERPT_MAX_BYTES;
+    while !stderr.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("…[stderr truncated]\n{}", &stderr[start..]))
+}
+
+fn unstructured_runner_error(status: ExitStatus, stderr_lines: &[String]) -> String {
+    let mut message = format!("Eval runner exited with {status}.");
+    if let Some(stderr) = bounded_stderr_excerpt(stderr_lines) {
+        message.push_str("\nRunner stderr:\n");
+        message.push_str(&stderr);
+    }
+    message
+}
+
+enum DevListManifestOutput {
+    Line { index: usize, manifest: Value },
+    Joined(Value),
+}
+
+fn parse_dev_list_manifest(stdout_lines: &[String]) -> Option<DevListManifestOutput> {
+    for (index, line) in stdout_lines.iter().enumerate().rev() {
+        if let Ok(manifest) = serde_json::from_str::<Value>(line) {
+            return Some(DevListManifestOutput::Line { index, manifest });
+        }
+    }
+
+    serde_json::from_str::<Value>(&stdout_lines.join("\n"))
+        .ok()
+        .map(DevListManifestOutput::Joined)
+}
+
 fn is_eval_progress_payload(progress: &SseProgressEventData) -> bool {
     serde_json::from_str::<EvalProgressData>(&progress.data)
         .map(|payload| payload.kind_type == "eval_progress")
@@ -1517,6 +1593,7 @@ fn apply_cors_headers(
 }
 
 async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> HttpResponse {
+    let request_id = dev_request_id(&req);
     let auth = match authenticate_dev_request(&req, &state).await {
         Ok(auth) => auth,
         Err(response) => return response,
@@ -1568,14 +1645,24 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
             spawned.process,
             ConsolePolicy::Forward,
             |event| match event {
-                EvalEvent::Console { stream, message } if stream == "stdout" => {
-                    stdout_lines.push(message);
+                EvalEvent::Console { stream, message } => {
+                    if stream == "stdout" {
+                        // Defer stdout logging until the evaluator manifest has
+                        // been identified. The manifest can contain parameter
+                        // defaults and is protocol output, not a user log.
+                        stdout_lines.push(message);
+                    } else {
+                        log_dev_runner_console(&request_id, &stream, &message);
+                    }
                 }
                 EvalEvent::Error {
                     message,
-                    stack: _,
+                    stack,
                     status,
-                } => errors.push((message, status)),
+                } => {
+                    log_dev_runner_error(&request_id, &message, stack.as_deref());
+                    errors.push((message, status));
+                }
                 _ => {}
             },
         )
@@ -1590,6 +1677,24 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
             }
         };
 
+    let parsed_manifest = if output.status.success() && errors.is_empty() {
+        parse_dev_list_manifest(&stdout_lines)
+    } else {
+        None
+    };
+    for (index, line) in stdout_lines.iter().enumerate() {
+        let is_manifest = matches!(
+            &parsed_manifest,
+            Some(DevListManifestOutput::Line {
+                index: manifest_index,
+                ..
+            }) if index == *manifest_index
+        ) || matches!(&parsed_manifest, Some(DevListManifestOutput::Joined(_)));
+        if !is_manifest {
+            log_dev_runner_console(&request_id, "stdout", line);
+        }
+    }
+
     if let Some((message, status)) = errors.first() {
         let status = status
             .and_then(|status| actix_web::http::StatusCode::from_u16(status).ok())
@@ -1599,26 +1704,15 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
     if !output.status.success() {
         return json_error_response(
             actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Eval runner exited with an error.",
+            &unstructured_runner_error(output.status, &output.stderr_lines),
         );
     }
 
-    let mut parsed_manifest: Option<Value> = None;
-    for line in stdout_lines.iter().rev() {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            parsed_manifest = Some(value);
-            break;
-        }
-    }
-    if parsed_manifest.is_none() {
-        let joined = stdout_lines.join("\n");
-        if let Ok(value) = serde_json::from_str::<Value>(&joined) {
-            parsed_manifest = Some(value);
-        }
-    }
-
     match parsed_manifest {
-        Some(manifest) => HttpResponse::Ok().json(manifest),
+        Some(DevListManifestOutput::Line { manifest, .. })
+        | Some(DevListManifestOutput::Joined(manifest)) => HttpResponse::Ok()
+            .append_header((CACHE_CONTROL, "no-store"))
+            .json(manifest),
         None => json_error_response(
             actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to parse evaluator manifest from runner output.",
@@ -1631,6 +1725,7 @@ async fn dev_server_eval(
     req: HttpRequest,
     body: web::Bytes,
 ) -> HttpResponse {
+    let request_id = dev_request_id(&req);
     let auth = match authenticate_dev_request(&req, &state).await {
         Ok(auth) => auth,
         Err(response) => return response,
@@ -1642,6 +1737,8 @@ async fn dev_server_eval(
             return json_error_response(actix_web::http::StatusCode::BAD_REQUEST, &err.to_string());
         }
     };
+    req.extensions_mut()
+        .insert(DevEvalName(eval_request.name.clone()));
     if let Err(response) =
         resolve_dataset_ref_for_eval_request(&state, &auth, &mut eval_request).await
     {
@@ -1694,8 +1791,14 @@ async fn dev_server_eval(
             let mut saw_error = false;
             let mut stderr_lines: Vec<String> = Vec::new();
             let output = drive_eval_runner(spawned.process, ConsolePolicy::Forward, |event| {
-                if matches!(event, EvalEvent::Error { .. }) {
+                if let EvalEvent::Error {
+                    ref message,
+                    ref stack,
+                    ..
+                } = event
+                {
                     saw_error = true;
+                    log_dev_runner_error(&request_id, message, stack.as_deref());
                 }
                 if matches!(event, EvalEvent::Done) {
                     return;
@@ -1705,6 +1808,7 @@ async fn dev_server_eval(
                     ref message,
                 } = event
                 {
+                    log_dev_runner_console(&request_id, stream, message);
                     for line in message.lines() {
                         let _ = tx.send(format!(": [{stream}] {line}\n"));
                     }
@@ -1722,11 +1826,7 @@ async fn dev_server_eval(
             match output {
                 Ok(output) => {
                     if !output.status.success() && !saw_error {
-                        let mut detail = format!("Eval runner exited with {}.", output.status);
-                        for line in stderr_lines.iter() {
-                            detail.push('\n');
-                            detail.push_str(line);
-                        }
+                        let detail = unstructured_runner_error(output.status, &stderr_lines);
                         let error =
                             serialize_sse_event("error", &json!({ "message": detail }).to_string());
                         let _ = tx.send(error);
@@ -1764,11 +1864,17 @@ async fn dev_server_eval(
             ConsolePolicy::Forward,
             |event| match event {
                 EvalEvent::Summary(current) => summary = Some(current),
+                EvalEvent::Console { stream, message } => {
+                    log_dev_runner_console(&request_id, &stream, &message);
+                }
                 EvalEvent::Error {
                     message,
-                    stack: _,
+                    stack,
                     status,
-                } => errors.push((message, status)),
+                } => {
+                    log_dev_runner_error(&request_id, &message, stack.as_deref());
+                    errors.push((message, status));
+                }
                 _ => {}
             },
         )
@@ -1795,7 +1901,7 @@ async fn dev_server_eval(
     if !output.status.success() {
         return json_error_response(
             actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Eval runner exited with an error.",
+            &unstructured_runner_error(output.status, &output.stderr_lines),
         );
     }
     json_error_response(
@@ -1806,8 +1912,8 @@ async fn dev_server_eval(
 
 async fn run_dev_server(state: DevServerState) -> Result<()> {
     println!(
-        "Starting eval dev server on http://{}:{}",
-        state.host, state.port
+        "Starting eval dev server on http://{}:{} (app URL: {})",
+        state.host, state.port, state.app_url
     );
     let host = state.host.clone();
     let port = state.port;
@@ -1818,6 +1924,20 @@ async fn run_dev_server(state: DevServerState) -> Result<()> {
                 let allowed_origins = allowed_origins.clone();
                 move |req, srv| {
                     let allowed_origins = allowed_origins.clone();
+                    let started = Instant::now();
+                    let method = req.method().clone();
+                    let route = req.path().to_string();
+                    let should_log = matches!(
+                        (method.as_str(), route.as_str()),
+                        ("GET", "/list") | ("POST", "/eval")
+                    );
+                    let request_id = uuid::Uuid::new_v4().to_string();
+                    req.extensions_mut().insert(DevRequestId(request_id.clone()));
+                    let org_name = req
+                        .headers()
+                        .get(HEADER_BT_ORG_NAME)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
                     let request_origin = req
                         .headers()
                         .get(ORIGIN)
@@ -1834,6 +1954,24 @@ async fn run_dev_server(state: DevServerState) -> Result<()> {
                             allow_private_network,
                             &allowed_origins,
                         );
+                        if let Ok(value) = HeaderValue::from_str(&request_id) {
+                            res.headers_mut()
+                                .insert(HeaderName::from_static(HEADER_BT_REQUEST_ID), value);
+                        }
+                        if should_log {
+                            let eval_name = res
+                                .request()
+                                .extensions()
+                                .get::<DevEvalName>()
+                                .map(|value| value.0.clone());
+                            eprintln!(
+                                "[remote-eval request_id={request_id}] method={method} route={route} status={} duration_ms={} org={:?} eval={:?}",
+                                res.status().as_u16(),
+                                started.elapsed().as_millis(),
+                                org_name,
+                                eval_name,
+                            );
+                        }
                         Ok::<_, actix_web::Error>(res)
                     }
                 }
@@ -3492,6 +3630,47 @@ mod tests {
 
     fn success_status() -> ExitStatus {
         exit_status(0)
+    }
+
+    #[test]
+    fn dev_runner_error_includes_stderr() {
+        let error = unstructured_runner_error(
+            exit_status(1),
+            &["import failed".to_string(), "traceback line".to_string()],
+        );
+        assert!(error.contains("Eval runner exited with"));
+        assert!(error.contains("Runner stderr:\nimport failed\ntraceback line"));
+    }
+
+    #[test]
+    fn dev_runner_stderr_excerpt_is_bounded_and_utf8_safe() {
+        let stderr = format!(
+            "old details{}final traceback",
+            "é".repeat(DEV_RUNNER_STDERR_EXCERPT_MAX_BYTES)
+        );
+        let excerpt = bounded_stderr_excerpt(&[stderr]).expect("stderr excerpt");
+        assert!(excerpt.starts_with("…[stderr truncated]"));
+        assert!(excerpt.ends_with("final traceback"));
+        assert!(excerpt.len() <= DEV_RUNNER_STDERR_EXCERPT_MAX_BYTES + 32);
+    }
+
+    #[test]
+    fn dev_list_manifest_is_identified_separately_from_user_stdout() {
+        let stdout = vec![
+            "user diagnostic".to_string(),
+            r#"{"test-eval":{"parameters":{"default":"private-value"}}}"#.to_string(),
+        ];
+        let parsed = parse_dev_list_manifest(&stdout).expect("manifest");
+        match parsed {
+            DevListManifestOutput::Line { index, manifest } => {
+                assert_eq!(index, 1);
+                assert_eq!(
+                    manifest["test-eval"]["parameters"]["default"],
+                    "private-value"
+                );
+            }
+            DevListManifestOutput::Joined(_) => panic!("expected a single-line manifest"),
+        }
     }
 
     fn get_command_env(command: &Command, key: &str) -> Option<String> {
