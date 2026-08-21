@@ -4,6 +4,7 @@ use dialoguer::Confirm;
 use serde_json::{Map, Value};
 
 use crate::{
+    error::user_error,
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
     utils::{merge_json_objects, read_text_source},
 };
@@ -128,11 +129,21 @@ pub(crate) struct ToolUpdateArgs {
     common: CommonUpdateArgs,
 
     /// Replace a completion prompt from inline text, @PATH, or stdin (-).
-    #[arg(long, value_name = "SOURCE", conflicts_with = "messages")]
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        conflicts_with = "messages",
+        allow_hyphen_values = true
+    )]
     prompt: Option<String>,
 
     /// Replace chat messages from inline JSON/YAML, @PATH, or stdin (-).
-    #[arg(long, value_name = "SOURCE", conflicts_with = "prompt")]
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        conflicts_with = "prompt",
+        allow_hyphen_values = true
+    )]
     messages: Option<String>,
 }
 
@@ -179,7 +190,7 @@ pub(crate) async fn run_scorer(
     args: &ScorerUpdateArgs,
     json_output: bool,
 ) -> Result<()> {
-    let body = build_scorer_patch_body(args)?;
+    let body = build_scorer_patch_body(args).map_err(user_error)?;
     run_update(
         ctx,
         &args.common,
@@ -196,7 +207,7 @@ pub(crate) async fn run_tool(
     args: &ToolUpdateArgs,
     json_output: bool,
 ) -> Result<()> {
-    let body = build_tool_patch_body(args)?;
+    let body = build_tool_patch_body(args).map_err(user_error)?;
     run_update(
         ctx,
         &args.common,
@@ -214,7 +225,7 @@ pub(crate) async fn run_generic(
     json_output: bool,
     ft: Option<FunctionTypeFilter>,
 ) -> Result<()> {
-    let body = build_common_patch_body(&args.common)?;
+    let body = build_common_patch_body(&args.common).map_err(user_error)?;
     run_update(ctx, &args.common, body, json_output, ft, None).await
 }
 
@@ -228,7 +239,27 @@ async fn run_update(
 ) -> Result<()> {
     let function = resolve_target_function(ctx, common, ft).await?;
     if !function_matches_filter(&function, ft) {
-        bail!("'{}' is not a {}", function.name, label(ft));
+        return Err(user_error(anyhow!(
+            "'{}' is not a {}",
+            function.name,
+            label(ft)
+        )));
+    }
+
+    if let Some(new_slug) = common.new_slug.as_deref() {
+        if new_slug != function.slug {
+            if let Some(conflict) =
+                api::get_function_by_slug(&ctx.client, &ctx.project.id, new_slug, None).await?
+            {
+                if conflict.id != function.id {
+                    return Err(user_error(anyhow!(
+                        "--new-slug '{new_slug}' is already used by {} '{}'",
+                        conflict.function_type.as_deref().unwrap_or("function"),
+                        conflict.name
+                    )));
+                }
+            }
+        }
     }
 
     let implementation = function
@@ -238,11 +269,12 @@ async fn run_update(
         .and_then(Value::as_str)
         .unwrap_or("prompt");
     if body.get("prompt_data").is_some() && implementation != "prompt" {
-        bail!(
-            "prompt configuration cannot update {}-backed function '{}'",
+        return Err(user_error(anyhow!(
+            "prompt configuration cannot update {}-backed {} '{}'. Edit its source and run: bt functions push <path> --if-exists replace",
             implementation,
+            label(ft),
             function.name
-        );
+        )));
     }
 
     if let Some(args) = scorer_args {
@@ -255,17 +287,24 @@ async fn run_update(
             ),
             (Some("classifier"), true, _) | (Some("scorer"), _, true)
         ) {
-            bail!("PATCH cannot change between score and classification output");
+            return Err(user_error(anyhow!(
+                "cannot change between score and classification output"
+            )));
         }
         if args.allow_no_match.is_some() && function_type != Some("classifier") {
-            bail!("--allow-no-match applies only to classification output");
+            return Err(user_error(anyhow!(
+                "--allow-no-match applies only to classification output"
+            )));
         }
         if args.pass_threshold.is_some() && function_type == Some("classifier") {
-            bail!("--pass-threshold applies only to score output");
+            return Err(user_error(anyhow!(
+                "--pass-threshold applies only to score output"
+            )));
         }
     }
 
     materialize_prompt_data_patch(&mut body, function.prompt_data.as_ref());
+    materialize_metadata_patch(&mut body, function.metadata.as_ref());
 
     if !common.yes && is_interactive() {
         let confirm = Confirm::new()
@@ -423,14 +462,14 @@ fn merge_common_fields(
     args: &CommonUpdateArgs,
     include_metadata: bool,
 ) -> Result<()> {
-    for (key, value) in [
-        ("name", args.name.as_deref()),
-        ("slug", args.new_slug.as_deref()),
-        ("description", args.description.as_deref()),
+    for (key, flag, value) in [
+        ("name", "--name", args.name.as_deref()),
+        ("slug", "--new-slug", args.new_slug.as_deref()),
+        ("description", "--description", args.description.as_deref()),
     ] {
         if let Some(value) = value {
             if value.trim().is_empty() && key != "description" {
-                bail!("--{} cannot be empty", key.replace('_', "-"));
+                bail!("{flag} cannot be empty");
             }
             patch.insert(key.to_string(), Value::String(value.to_string()));
         }
@@ -447,6 +486,19 @@ fn merge_common_fields(
         merge_json_objects(patch, &extra_obj);
     }
     Ok(())
+}
+
+fn materialize_metadata_patch(patch: &mut Value, existing_metadata: Option<&Value>) {
+    let Some(patch_metadata) = patch.get("metadata").and_then(Value::as_object).cloned() else {
+        return;
+    };
+
+    let mut metadata = existing_metadata
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    merge_json_objects(&mut metadata, &patch_metadata);
+    patch["metadata"] = Value::Object(metadata);
 }
 
 fn finish_patch(patch: Map<String, Value>, help_command: &str) -> Result<Value> {
@@ -483,6 +535,12 @@ mod tests {
     struct ScorerUpdateArgsHarness {
         #[command(flatten)]
         args: ScorerUpdateArgs,
+    }
+
+    #[derive(Debug, Parser)]
+    struct ToolUpdateArgsHarness {
+        #[command(flatten)]
+        args: ToolUpdateArgs,
     }
 
     fn args(model: Option<&str>, description: Option<&str>) -> ScorerUpdateArgs {
@@ -669,15 +727,33 @@ mod tests {
     }
 
     #[test]
-    fn tool_messages_accept_yaml() {
-        let scorer = args(None, None);
-        let args = ToolUpdateArgs {
-            common: scorer.common,
-            prompt: None,
-            messages: Some("- role: user\n  content: Look up {{order_id}}\n".to_string()),
-        };
+    fn tool_prompt_accepts_text_beginning_with_a_dash() {
+        let parsed = ToolUpdateArgsHarness::try_parse_from([
+            "test",
+            "test-tool",
+            "--prompt",
+            "- instruction {{value}}",
+        ])
+        .expect("parse prompt beginning with a dash");
 
-        let body = build_tool_patch_body(&args).expect("patch body");
+        let body = build_tool_patch_body(&parsed.args).expect("patch body");
+        assert_eq!(
+            body["prompt_data"]["prompt"]["content"],
+            "- instruction {{value}}"
+        );
+    }
+
+    #[test]
+    fn tool_messages_accept_yaml() {
+        let parsed = ToolUpdateArgsHarness::try_parse_from([
+            "test",
+            "test-tool",
+            "--messages",
+            "- role: user\n  content: Look up {{order_id}}\n",
+        ])
+        .expect("parse inline YAML beginning with a dash");
+
+        let body = build_tool_patch_body(&parsed.args).expect("patch body");
         assert_eq!(body["prompt_data"]["prompt"]["type"], "chat");
         assert_eq!(body["prompt_data"]["prompt"]["messages"][0]["role"], "user");
     }
@@ -761,5 +837,31 @@ mod tests {
             target["prompt_data"]["options"]["temperature"],
             serde_json::json!(0)
         );
+    }
+
+    #[test]
+    fn metadata_patch_preserves_existing_fields() {
+        let mut patch = json!({"metadata": {"owner": "test-team"}});
+        let existing = json!({"__pass_threshold": 0.6, "phase": "test"});
+
+        materialize_metadata_patch(&mut patch, Some(&existing));
+
+        assert_eq!(
+            patch["metadata"],
+            json!({
+                "__pass_threshold": 0.6,
+                "phase": "test",
+                "owner": "test-team"
+            })
+        );
+    }
+
+    #[test]
+    fn empty_new_slug_names_the_correct_flag() {
+        let mut args = args(None, None);
+        args.common.new_slug = Some(String::new());
+
+        let error = build_scorer_patch_body(&args).expect_err("empty slug should fail");
+        assert_eq!(error.to_string(), "--new-slug cannot be empty");
     }
 }
