@@ -48,6 +48,10 @@ pub async fn get_prompt_by_slug(
     Ok(list.objects.into_iter().next())
 }
 
+pub async fn create_prompt(client: &ApiClient, body: &serde_json::Value) -> Result<Prompt> {
+    client.post("/v1/prompt", body).await
+}
+
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
     client.delete(&path).await

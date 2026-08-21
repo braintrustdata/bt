@@ -1228,6 +1228,17 @@ fn scorers_create_help_includes_llm_judge_configuration() {
 }
 
 #[test]
+fn prompt_create_help_includes_prompt_configuration() {
+    bt_command()
+        .args(["prompts", "create", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--messages <SOURCE>"))
+        .stdout(predicate::str::contains("--model <MODEL>"))
+        .stdout(predicate::str::contains("--temperature <NUMBER>"));
+}
+
+#[test]
 fn scorer_update_help_is_conflict_free() {
     bt_command()
         .args(["scorers", "update", "--help"])

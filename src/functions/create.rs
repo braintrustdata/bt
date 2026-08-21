@@ -247,7 +247,7 @@ fn resolve_slug(args: &CreateArgs, name: &str) -> Result<String> {
     Ok(slug)
 }
 
-fn slugify(value: &str) -> String {
+pub(crate) fn slugify(value: &str) -> String {
     let mut slug = String::new();
     let mut pending_separator = false;
 

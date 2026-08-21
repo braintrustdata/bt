@@ -149,7 +149,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt view`      | View logs, traces, and spans                                       |
 | `bt projects`  | Manage projects (list, create, view, delete)                       |
 | `bt datasets`  | Manage remote datasets (list, create, update, view, delete)        |
-| `bt prompts`   | Manage prompts (list, view, update, delete)                        |
+| `bt prompts`   | Manage prompts (list, create, view, update, delete)                |
 | `bt functions` | Manage functions (list, view, invoke, update, push, pull, delete)  |
 | `bt tools`     | Manage tools (list, view, invoke, update, delete)                  |
 | `bt scorers`   | Manage scorers (list, create, view, invoke, update, delete)        |
