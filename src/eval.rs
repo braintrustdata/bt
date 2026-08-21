@@ -1398,6 +1398,44 @@ async fn resolve_dataset_ref_for_eval_request(
     Ok(())
 }
 
+fn select_effective_dev_api_url<'a>(
+    configured: Option<&'a str>,
+    authenticated_org: Option<&'a str>,
+) -> Option<(&'a str, &'static str)> {
+    configured
+        .map(|url| (url, "--api-url/BRAINTRUST_API_URL"))
+        .or_else(|| authenticated_org.map(|url| (url, "authenticated org")))
+}
+
+fn effective_dev_api_url<'a>(
+    state: &'a DevServerState,
+    auth: &'a DevAuthContext,
+) -> Option<(&'a str, &'static str)> {
+    select_effective_dev_api_url(state.base.api_url.as_deref(), auth.api_url.as_deref())
+}
+
+fn api_url_for_log(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            let origin = parsed.origin();
+            origin.is_tuple().then(|| origin.ascii_serialization())
+        })
+        .unwrap_or_else(|| "<invalid URL>".to_string())
+}
+
+fn log_dev_api_url(request_id: &str, state: &DevServerState, auth: &DevAuthContext) {
+    match effective_dev_api_url(state, auth) {
+        Some((api_url, source)) => eprintln!(
+            "[remote-eval request_id={request_id} config] api_url={} source={source:?}",
+            api_url_for_log(api_url)
+        ),
+        None => eprintln!(
+            "[remote-eval request_id={request_id} config] api_url=<SDK discovery/default> source=\"SDK\""
+        ),
+    }
+}
+
 fn make_dev_mode_env(
     auth: &DevAuthContext,
     state: &DevServerState,
@@ -1410,8 +1448,8 @@ fn make_dev_mode_env(
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
-    if let Some(api_url) = auth.api_url.as_ref() {
-        env.push(("BRAINTRUST_API_URL".to_string(), api_url.clone()));
+    if let Some((api_url, _source)) = effective_dev_api_url(state, auth) {
+        env.push(("BRAINTRUST_API_URL".to_string(), api_url.to_string()));
     }
     if let Some(request) = request {
         let serialized =
@@ -1435,6 +1473,11 @@ fn dev_request_id(req: &HttpRequest) -> String {
 fn log_dev_runner_console(request_id: &str, stream: &str, message: &str) {
     for line in message.lines() {
         eprintln!("[remote-eval request_id={request_id} runner_{stream}] {line}");
+    }
+    if stream == "stderr" && message.contains("Warning: no data rows found for evaluator") {
+        eprintln!(
+            "[remote-eval request_id={request_id} hint] Braintrust datasets are fetched by the remote eval runner. Verify that --api-url / BRAINTRUST_API_URL points to your data-plane API (see the request's config log above)."
+        );
     }
 }
 
@@ -1598,6 +1641,7 @@ async fn dev_server_list(state: web::Data<DevServerState>, req: HttpRequest) -> 
         Ok(auth) => auth,
         Err(response) => return response,
     };
+    log_dev_api_url(&request_id, &state, &auth);
     let extra_env = match make_dev_mode_env(&auth, &state, None, "list") {
         Ok(extra_env) => extra_env,
         Err(err) => {
@@ -1731,6 +1775,7 @@ async fn dev_server_eval(
         Err(response) => return response,
     };
 
+    log_dev_api_url(&request_id, &state, &auth);
     let mut eval_request: EvalRequest = match serde_json::from_slice(&body) {
         Ok(eval_request) => eval_request,
         Err(err) => {
@@ -1915,6 +1960,14 @@ async fn run_dev_server(state: DevServerState) -> Result<()> {
         "Starting eval dev server on http://{}:{} (app URL: {})",
         state.host, state.port, state.app_url
     );
+    if let Some(api_url) = state.base.api_url.as_deref() {
+        println!(
+            "Remote eval API URL: {} (source: --api-url/BRAINTRUST_API_URL)",
+            api_url_for_log(api_url)
+        );
+    } else {
+        println!("Remote eval API URL: discovered per request from the authenticated org");
+    }
     let host = state.host.clone();
     let port = state.port;
     HttpServer::new(move || {
@@ -3652,6 +3705,33 @@ mod tests {
         assert!(excerpt.starts_with("…[stderr truncated]"));
         assert!(excerpt.ends_with("final traceback"));
         assert!(excerpt.len() <= DEV_RUNNER_STDERR_EXCERPT_MAX_BYTES + 32);
+    }
+
+    #[test]
+    fn dev_api_url_logging_strips_paths_queries_and_credentials() {
+        assert_eq!(
+            api_url_for_log("https://user:secret@api.example.test:8443/private?token=secret"),
+            "https://api.example.test:8443"
+        );
+        assert_eq!(api_url_for_log("not a URL"), "<invalid URL>");
+    }
+
+    #[test]
+    fn configured_dev_api_url_takes_precedence_over_org_discovery() {
+        assert_eq!(
+            select_effective_dev_api_url(
+                Some("http://internal-api.example.test"),
+                Some("https://public-api.example.test"),
+            ),
+            Some((
+                "http://internal-api.example.test",
+                "--api-url/BRAINTRUST_API_URL"
+            ))
+        );
+        assert_eq!(
+            select_effective_dev_api_url(None, Some("https://public-api.example.test")),
+            Some(("https://public-api.example.test", "authenticated org"))
+        );
     }
 
     #[test]
