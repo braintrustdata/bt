@@ -4102,12 +4102,9 @@ mod tests {
         fs::write(dir.join("a.eval.ts"), "").unwrap();
         fs::write(nm.join("b.eval.ts"), "").unwrap();
 
-        let orig = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let mut result =
-            expand_eval_file_globs(&[".".to_string()]).expect("defaults should expand");
+        let mut result = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
+            .expect("defaults should expand");
         result.retain(|p| !is_excluded_by_default(p));
-        std::env::set_current_dir(orig).unwrap();
 
         assert_eq!(
             result.len(),
