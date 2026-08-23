@@ -1331,7 +1331,7 @@ function isNodeErrorCode(err: unknown, code: string): boolean {
 
 function formatError(err: unknown): string {
   if (err instanceof Error) {
-    return err.message;
+    return err.stack ?? err.message;
   }
   return String(err);
 }
@@ -2264,7 +2264,10 @@ function mergeProgress(
   };
 }
 
-async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
+async function createEvalRunner(
+  config: RunnerConfig,
+  sse: SseWriter | null,
+): Promise<EvalRunner> {
   const braintrust = await loadBraintrust();
   const Eval = braintrust.Eval;
   if (typeof Eval !== "function") {
@@ -2274,7 +2277,6 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   const initDataset = braintrust.initDataset;
   const invoke = braintrust.invoke;
 
-  const sse = createSseWriter();
   const noSendLogs = shouldDisableSendLogs();
   const parseParent = loadBraintrustUtilParseParent();
   const getState = extractGlobalStateGetter(braintrust);
@@ -2439,7 +2441,7 @@ async function createEvalRunner(config: RunnerConfig): Promise<EvalRunner> {
   };
 }
 
-export async function main() {
+async function runMain(sse: SseWriter | null) {
   const config = readRunnerConfig();
   const files = process.argv.slice(2);
   if (files.length === 0) {
@@ -2473,7 +2475,7 @@ export async function main() {
   const modules = await loadFiles(normalized);
   const btEvalMains = collectBtEvalMains(modules);
 
-  const runner = await createEvalRunner(config);
+  const runner = await createEvalRunner(config, sse);
   if (!runner.noSendLogs && typeof runner.login === "function") {
     try {
       await runner.login({});
@@ -2611,5 +2613,24 @@ export async function main() {
     collectRequireCacheDependencies();
     await collectDenoInfoDependencies(normalized);
     runner.finish(ok);
+  }
+}
+
+export async function main() {
+  let sse: SseWriter | null = null;
+  try {
+    sse = createSseWriter();
+    await runMain(sse);
+  } catch (err) {
+    const serialized = serializeError(err);
+    // The structured event preserves the stack in dev-server logs. Only print
+    // it directly without a parent connection to avoid duplicate tracebacks.
+    if (sse) {
+      sse.send("error", { ...serialized, status: 500 });
+      sse.close();
+    } else {
+      console.error(serialized.stack ?? serialized.message);
+    }
+    process.exitCode = 1;
   }
 }

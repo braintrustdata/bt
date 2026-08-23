@@ -1,6 +1,12 @@
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+
+#[cfg(windows)]
+use std::fs;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -9,6 +15,7 @@ use serde::Deserialize;
 
 use crate::args::BaseArgs;
 use crate::http::DEFAULT_HTTP_TIMEOUT;
+use crate::ui::{print_command_status, with_spinner, CommandStatus};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -37,6 +44,14 @@ pub struct UpdateArgs {
     /// Update channel (defaults to the build channel)
     #[arg(long, value_enum)]
     pub channel: Option<UpdateChannel>,
+
+    #[cfg(windows)]
+    #[arg(long, hide = true, requires = "windows_update_parent_pid")]
+    pub windows_update_worker: bool,
+
+    #[cfg(windows)]
+    #[arg(long, hide = true, requires = "windows_update_worker")]
+    pub windows_update_parent_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -46,6 +61,7 @@ pub enum UpdateChannel {
 }
 
 impl UpdateChannel {
+    #[cfg(not(windows))]
     fn installer_url(self) -> &'static str {
         match self {
             UpdateChannel::Stable => {
@@ -85,6 +101,18 @@ struct GitHubRelease {
     target_commitish: Option<String>,
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct UpdateWorkerError(String, pub(crate) Option<i32>);
+#[cfg(windows)]
+impl std::fmt::Display for UpdateWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[cfg(windows)]
+impl std::error::Error for UpdateWorkerError {}
+
 pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
     match args.command {
         SelfSubcommand::Update(args) => run_update(&base, args).await,
@@ -92,10 +120,19 @@ pub async fn run(base: BaseArgs, args: SelfArgs) -> Result<()> {
 }
 
 async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
-    ensure_installer_managed_install()?;
     let channel = args
         .channel
         .unwrap_or_else(|| inferred_update_channel(BUILD_UPDATE_CHANNEL));
+
+    #[cfg(windows)]
+    if args.windows_update_worker {
+        let parent_pid = args
+            .windows_update_parent_pid
+            .context("Windows update worker is missing its parent process ID")?;
+        return run_windows_update_worker(base, channel, parent_pid).await;
+    }
+
+    ensure_installer_managed_install()?;
 
     if args.check {
         check_for_update(base, channel).await?;
@@ -103,38 +140,57 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
     }
 
     if channel == UpdateChannel::Stable {
-        match fetch_release(base, channel).await {
-            Ok(release) => {
-                if stable_is_up_to_date(env!("CARGO_PKG_VERSION"), &release.tag_name) {
-                    print_check(base, channel, &release)?;
-                    return Ok(());
-                }
+        match with_spinner("Checking for updates...", fetch_release(base, channel)).await {
+            Ok(release) if stable_is_up_to_date(env!("CARGO_PKG_VERSION"), &release.tag_name) => {
+                print_check(base, channel, &release)?;
+                return Ok(());
             }
-            Err(err) => {
-                eprintln!(
-                    "warning: failed to pre-check stable version ({err}); continuing with update"
-                );
-            }
+            Err(err) => eprintln!(
+                "warning: failed to pre-check stable version ({err}); continuing with update"
+            ),
+            _ => {}
         }
     }
 
-    run_installer(base, channel)?;
+    #[cfg(windows)]
+    let result = launch_windows_update_worker(base, channel).await;
+    #[cfg(not(windows))]
+    let result = with_spinner("Updating bt...", run_installer(base, channel)).await;
+    if let Err(err) = result {
+        print_command_status(
+            CommandStatus::Error,
+            &format!("Failed to update bt from the {} channel", channel.name()),
+        );
+        return Err(err);
+    }
+    print_update_completed(base, channel)
+}
+
+fn print_update_completed(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     if base.json {
         let payload = serde_json::json!({
             "channel": channel.name(),
             "status": "completed",
         });
         println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        print_command_status(
+            CommandStatus::Success,
+            &format!("Updated bt from the {} channel", channel.name()),
+        );
     }
     Ok(())
 }
 
 fn ensure_installer_managed_install() -> Result<()> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
+    ensure_installer_managed_executable(&exe)
+}
 
+fn ensure_installer_managed_executable(exe: &Path) -> Result<()> {
     let receipt_exists = receipt_path().as_ref().is_some_and(|path| path.exists());
     let installer_bin_paths = installer_bin_paths();
-    if is_installer_managed_install(&exe, receipt_exists, &installer_bin_paths) {
+    if is_installer_managed_install(exe, receipt_exists, &installer_bin_paths) {
         return Ok(());
     }
 
@@ -145,7 +201,7 @@ fn ensure_installer_managed_install() -> Result<()> {
 }
 
 async fn check_for_update(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
-    let release = fetch_release(base, channel).await?;
+    let release = with_spinner("Checking for updates...", fetch_release(base, channel)).await?;
     print_check(base, channel, &release)
 }
 
@@ -217,30 +273,147 @@ async fn fetch_release(_base: &BaseArgs, channel: UpdateChannel) -> Result<GitHu
         .context("failed to parse GitHub release response")
 }
 
-fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
-    let status_line = |msg: &str| {
-        if base.json {
-            eprintln!("{msg}");
-        } else {
-            println!("{msg}");
-        }
-    };
-    let redirect_stdout = if base.json { " 1>&2" } else { "" };
+#[cfg(windows)]
+async fn launch_windows_update_worker(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
+    let exe = env::current_exe().context("failed to resolve current executable path")?;
+    let parent_pid = std::process::id();
+    let worker = exe.with_file_name(format!("bt-update-{parent_pid}.exe"));
+    if worker.exists() {
+        fs::remove_file(&worker)?;
+    }
+    let fallback = prepare_windows_executable(&exe)?;
+    fs::rename(&exe, &worker).context("failed to create Windows update helper")?;
+    if let Err(err) = fallback.persist(&exe) {
+        fs::rename(&worker, &exe)
+            .context("failed to restore bt after creating the update helper")?;
+        return Err(err.error).context("failed to create update fallback");
+    }
 
+    let mut command = Command::new(&worker);
+    command.args([
+        "update",
+        "--channel",
+        channel.name(),
+        "--windows-update-worker",
+        "--windows-update-parent-pid",
+        &parent_pid.to_string(),
+        "--json",
+    ]);
+    if base.quiet {
+        command.arg("--quiet");
+    }
+    command.stdout(Stdio::null()).stderr(Stdio::inherit());
+    let status = tokio::task::spawn_blocking(move || command.status()).await;
+    if !matches!(status, Ok(Ok(_))) {
+        schedule_windows_worker_cleanup(&worker, None)?;
+    }
+    let status = status
+        .context("Windows update helper task failed")?
+        .context("failed to launch Windows update helper")?;
+    if let Err(err) = schedule_windows_worker_cleanup(&worker, None) {
+        eprintln!("warning: failed to schedule update-helper cleanup: {err}");
+    }
+
+    if !status.success() {
+        prepare_windows_executable(&worker)?
+            .persist(&exe)
+            .map_err(|err| err.error)
+            .context("failed to restore bt after update failure")?;
+        return Err(anyhow::Error::new(UpdateWorkerError(
+            format!("Windows update helper exited with status {status}"),
+            status.code(),
+        )));
+    }
+    if !exe.exists() {
+        prepare_windows_executable(&worker)?
+            .persist(&exe)
+            .map_err(|err| err.error)
+            .context("update installed no executable; failed to restore bt")?;
+        anyhow::bail!("update installed no executable; restored the original bt");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_windows_executable(source: &Path) -> Result<tempfile::NamedTempFile> {
+    let parent = source
+        .parent()
+        .context("Windows executable path has no parent directory")?;
+    let temp = tempfile::NamedTempFile::new_in(parent)
+        .context("failed to create temporary update fallback")?;
+    fs::copy(source, temp.path()).context("failed to copy update fallback")?;
+    temp.as_file()
+        .sync_all()
+        .context("failed to flush update fallback")?;
+    Ok(temp)
+}
+
+#[cfg(windows)]
+async fn run_windows_update_worker(
+    base: &BaseArgs,
+    channel: UpdateChannel,
+    parent_pid: u32,
+) -> Result<()> {
+    let worker = env::current_exe().context("failed to resolve Windows update helper path")?;
+    let expected_name = format!("bt-update-{parent_pid}.exe");
+    let is_update_helper = worker
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(&expected_name));
+    if !is_update_helper {
+        anyhow::bail!("refusing to run the Windows update worker from an unexpected path");
+    }
+    let installed_exe = worker.with_file_name(binary_name());
+    ensure_installer_managed_executable(&installed_exe)?;
+
+    if let Err(err) = schedule_windows_worker_cleanup(&worker, Some(parent_pid)) {
+        eprintln!("warning: failed to schedule update-helper cleanup: {err}");
+    }
+    run_installer(base, channel).await
+}
+
+#[cfg(windows)]
+fn schedule_windows_worker_cleanup(worker: &Path, parent_pid: Option<u32>) -> Result<()> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let pids = parent_pid.map_or_else(
+        || std::process::id().to_string(),
+        |pid| format!("{},{}", std::process::id(), pid),
+    );
+    let escaped_path = worker.to_string_lossy().replace('\'', "''");
+    let cleanup_script = format!(
+        "Wait-Process -Id {pids} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath '{escaped_path}' -Force -ErrorAction SilentlyContinue"
+    );
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &cleanup_script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .context("failed to launch Windows update-helper cleanup")?;
+    Ok(())
+}
+
+async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
     #[cfg(not(windows))]
     {
         let installer_url = channel.installer_url();
-        status_line(&format!("updating bt from {} channel...", channel.name()));
-        let cmd = format!("curl -fsSL '{installer_url}' | sh{redirect_stdout}");
+        let cmd = format!("curl -fsSL '{installer_url}' | sh");
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
-        let status = command.status().context("failed to execute installer")?;
+        let status = run_installer_command(command, base.json, base.quiet)
+            .await
+            .context("failed to execute installer")?;
 
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
         }
-
-        status_line("update completed");
         Ok(())
     }
 
@@ -254,25 +427,70 @@ fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
                 "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1"
             }
         };
-        status_line(&format!("updating bt from {} channel...", channel.name()));
-        let script = format!("irm {installer_url} | iex{redirect_stdout}");
-        let status = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &script,
-            ])
-            .status()
+        // Avoid the `irm ... | iex` pattern flagged by Windows security tools.
+        let script = with_spinner("Downloading installer...", async {
+            let client = crate::http::build_http_client_from_builder(
+                Client::builder().timeout(DEFAULT_HTTP_TIMEOUT),
+            )
+            .context("failed to initialize installer HTTP client")?;
+            client
+                .get(installer_url)
+                .send()
+                .await
+                .context("failed to download PowerShell installer")?
+                .error_for_status()
+                .context("failed to download PowerShell installer")?
+                .bytes()
+                .await
+                .context("failed to read PowerShell installer")
+        })
+        .await?;
+        let temp_dir = tempfile::tempdir().context("failed to create installer directory")?;
+        let script_path = temp_dir.path().join("bt-installer.ps1");
+        fs::write(&script_path, script).context("failed to save PowerShell installer")?;
+
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+        command.arg(&script_path);
+        let status = run_installer_command(command, base.json, base.quiet)
+            .await
             .context("failed to execute PowerShell installer")?;
         if !status.success() {
             anyhow::bail!("installer exited with status {status}");
         }
-
-        status_line("update completed");
-        return Ok(());
+        Ok(())
     }
+}
+
+async fn run_installer_command(
+    mut command: Command,
+    redirect: bool,
+    quiet: bool,
+) -> Result<ExitStatus> {
+    tokio::task::spawn_blocking(move || {
+        if quiet {
+            return command
+                .stdout(Stdio::null())
+                .status()
+                .context("failed to start installer");
+        }
+        if !redirect {
+            return command.status().context("failed to start installer");
+        }
+        command.stdout(Stdio::piped());
+        let mut child = command.spawn().context("failed to start installer")?;
+        io::copy(
+            &mut child
+                .stdout
+                .take()
+                .context("failed to capture installer stdout")?,
+            &mut io::stderr().lock(),
+        )
+        .context("failed to relay installer output")?;
+        child.wait().context("failed to wait for installer")
+    })
+    .await
+    .context("installer task failed")?
 }
 
 fn receipt_path() -> Option<PathBuf> {
@@ -410,14 +628,17 @@ mod tests {
 
     #[test]
     fn channel_urls_are_expected() {
-        assert_eq!(
-            UpdateChannel::Stable.installer_url(),
-            "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh"
-        );
-        assert_eq!(
-            UpdateChannel::Canary.installer_url(),
-            "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh"
-        );
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                UpdateChannel::Stable.installer_url(),
+                "https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.sh"
+            );
+            assert_eq!(
+                UpdateChannel::Canary.installer_url(),
+                "https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.sh"
+            );
+        }
         assert_eq!(
             UpdateChannel::Stable.github_release_api_url(),
             "https://api.github.com/repos/braintrustdata/bt/releases/latest"

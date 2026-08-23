@@ -1436,13 +1436,23 @@ def main(argv: list[str] | None = None) -> int:
     if config.num_workers is not None:
         set_thread_pool_max_workers(config.num_workers)
 
-    if not local:
-        login(api_key=args.api_key, org_name=args.org_name, app_url=args.app_url)
-
     sse = create_sse_writer()
     cwd = os.path.abspath(os.getcwd())
+    success = False
     try:
-        success = asyncio.run(run_once(files, local, sse, config))
+        try:
+            if not local:
+                login(api_key=args.api_key, org_name=args.org_name, app_url=args.app_url)
+            success = asyncio.run(run_once(files, local, sse, config))
+        except Exception as exc:
+            stack = traceback.format_exc()
+            # The structured event preserves the traceback in dev-server logs.
+            # Only print it directly when no parent SSE connection is present,
+            # otherwise every traceback would be logged twice.
+            if sse:
+                send_eval_error(sse, str(exc), stack, 500)
+            else:
+                eprint(stack.rstrip())
 
         if not local:
             try:

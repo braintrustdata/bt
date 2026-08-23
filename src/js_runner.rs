@@ -200,11 +200,13 @@ pub fn find_binary_in_path(candidates: &[&str]) -> Option<PathBuf> {
     None
 }
 
+#[cfg(unix)]
 pub fn runner_bin_name(runner_command: &Path) -> Option<String> {
     let name = runner_command.file_name()?.to_str()?.to_ascii_lowercase();
     Some(name.strip_suffix(".cmd").unwrap_or(&name).to_string())
 }
 
+#[cfg(unix)]
 pub fn is_ts_node_runner_path(runner_command: &Path) -> bool {
     runner_bin_name(runner_command).is_some_and(|name| name == "ts-node" || name == "ts-node-esm")
 }

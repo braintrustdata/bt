@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+#[cfg(unix)]
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -139,6 +141,46 @@ fn find_tsc() -> Option<PathBuf> {
     None
 }
 
+fn compile_functions_runner(tsc: &Path, root: &Path, runner_dir: &Path) {
+    let mut command = Command::new(tsc);
+    command.current_dir(root).args([
+        "scripts/functions-runner.ts",
+        "scripts/runner-common.ts",
+        "--module",
+        "esnext",
+        "--target",
+        "es2020",
+        "--moduleResolution",
+        "bundler",
+        "--outDir",
+    ]);
+    command.arg(runner_dir);
+
+    let version = Command::new(tsc)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| {
+            output
+                .split_whitespace()
+                .find_map(|part| part.split('.').next()?.parse::<u32>().ok())
+        });
+    if version.is_some_and(|major| major >= 6) {
+        // TypeScript 6+ rejects explicit input files when a tsconfig is nearby.
+        // These are runtime tests, so compile independently and skip type checking.
+        command.args(["--ignoreConfig", "--noCheck"]);
+    }
+
+    let output = command.output().expect("compile functions runner");
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+}
+
+#[cfg(unix)]
 fn decode_uploaded_bundle(bundle: &[u8]) -> String {
     if bundle.starts_with(&[0x1f, 0x8b]) {
         let mut decoder = GzDecoder::new(bundle);
@@ -884,27 +926,7 @@ globalThis._evals.functions.push({
     .expect("write sample.js");
 
     let runner_dir = tmp.path().join("runner");
-    let compile_output = Command::new(&tsc)
-        .current_dir(&root)
-        .args([
-            "scripts/functions-runner.ts",
-            "scripts/runner-common.ts",
-            "--module",
-            "esnext",
-            "--target",
-            "es2020",
-            "--moduleResolution",
-            "bundler",
-            "--outDir",
-        ])
-        .arg(&runner_dir)
-        .output()
-        .expect("compile functions runner");
-    if !compile_output.status.success() {
-        let stdout = String::from_utf8_lossy(&compile_output.stdout);
-        let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    }
+    compile_functions_runner(&tsc, &root, &runner_dir);
 
     let runner_js = runner_dir.join("functions-runner.js");
     let runner_common_js = runner_dir.join("runner-common.js");
@@ -1073,27 +1095,7 @@ globalThis._evals.functions.push({{
     .expect("write sample.cjs");
 
     let runner_dir = tmp.path().join("runner");
-    let compile_output = Command::new(&tsc)
-        .current_dir(&root)
-        .args([
-            "scripts/functions-runner.ts",
-            "scripts/runner-common.ts",
-            "--module",
-            "esnext",
-            "--target",
-            "es2020",
-            "--moduleResolution",
-            "bundler",
-            "--outDir",
-        ])
-        .arg(&runner_dir)
-        .output()
-        .expect("compile functions runner");
-    if !compile_output.status.success() {
-        let stdout = String::from_utf8_lossy(&compile_output.stdout);
-        let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    }
+    compile_functions_runner(&tsc, &root, &runner_dir);
 
     let runner_js = runner_dir.join("functions-runner.js");
     let runner_common_js = runner_dir.join("runner-common.js");
@@ -1246,27 +1248,7 @@ globalThis._evals.functions.push({
     .expect("write sample-a.mjs");
 
     let runner_dir = tmp.path().join("runner");
-    let compile_output = Command::new(&tsc)
-        .current_dir(&root)
-        .args([
-            "scripts/functions-runner.ts",
-            "scripts/runner-common.ts",
-            "--module",
-            "esnext",
-            "--target",
-            "es2020",
-            "--moduleResolution",
-            "bundler",
-            "--outDir",
-        ])
-        .arg(&runner_dir)
-        .output()
-        .expect("compile functions runner");
-    if !compile_output.status.success() {
-        let stdout = String::from_utf8_lossy(&compile_output.stdout);
-        let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    }
+    compile_functions_runner(&tsc, &root, &runner_dir);
 
     let runner_js = runner_dir.join("functions-runner.js");
     let runner_common_js = runner_dir.join("runner-common.js");

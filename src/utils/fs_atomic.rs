@@ -55,14 +55,18 @@ fn write_atomic(path: &Path, contents: &[u8], visibility: Visibility) -> Result<
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
 
-    let mut builder = Builder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::PermissionsExt;
+        let mut builder = Builder::new();
         builder.permissions(std::fs::Permissions::from_mode(visibility.mode()));
-    }
+        builder
+    };
     #[cfg(not(unix))]
-    let _ = visibility;
+    let builder = {
+        let _ = visibility;
+        Builder::new()
+    };
 
     let mut file = builder
         .tempfile_in(parent)

@@ -126,7 +126,7 @@
         "baseline"
       ],
       "expect_success": false,
-      "stderr_contains": [
+      "stdout_contains": [
         "snapshot delete requires --force in non-interactive mode"
       ]
     },
@@ -169,7 +169,7 @@
         "snapshot-source"
       ],
       "expect_success": false,
-      "stderr_contains": [
+      "stdout_contains": [
         "dataset delete requires --force in non-interactive mode"
       ]
     },

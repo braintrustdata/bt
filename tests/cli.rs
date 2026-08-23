@@ -97,6 +97,7 @@ fn write_auth_store(config_home: &Path, profiles: &[(&str, &str)]) {
 }
 
 /// Record a default org the way `bt init` and `bt switch` do.
+#[cfg(unix)]
 fn write_config_org(config_home: &Path, org: &str) {
     let config_dir = config_home.join("bt");
     fs::create_dir_all(&config_dir).expect("create config dir");
@@ -868,9 +869,11 @@ fn trace_stop_gracefully_stops_an_isolated_daemon() {
 
 #[test]
 fn trace_status_and_stop_honor_global_json_when_daemon_is_absent() {
-    let state = tempfile::tempdir().expect("state tempdir");
     #[cfg(unix)]
-    let socket = state.path().join("missing.sock");
+    let socket = {
+        let state = tempfile::tempdir().expect("state tempdir");
+        state.path().join("missing.sock")
+    };
     #[cfg(windows)]
     let socket = std::path::PathBuf::from(format!(
         r"\\.\pipe\missing-bt-trace-{}",
