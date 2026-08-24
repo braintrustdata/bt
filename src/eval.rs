@@ -318,7 +318,8 @@ pub struct EvalArgs {
         visible_alias = "maxConcurrency",
         env = "BT_EVAL_MAX_CONCURRENCY",
         value_name = "COUNT",
-        value_parser = parse_positive_usize
+        value_parser = parse_positive_usize,
+        conflicts_with = "dev"
     )]
     pub max_concurrency: Option<usize>,
 
@@ -5134,6 +5135,25 @@ mod tests {
             EvalArgsHarness::try_parse_from(["bt", "--max-concurrency", "0", "sample.eval.ts"])
                 .expect_err("zero max concurrency should fail");
         assert!(err.to_string().contains("greater than 0"));
+
+        let err = EvalArgsHarness::try_parse_from([
+            "bt",
+            "--dev",
+            "--max-concurrency",
+            "2",
+            "sample.eval.ts",
+        ])
+        .expect_err("max concurrency with dev mode should fail");
+        let message = err.to_string();
+        assert!(message.contains("--max-concurrency"));
+        assert!(message.contains("--dev"));
+
+        set_env_var("BT_EVAL_MAX_CONCURRENCY", "2");
+        let err = EvalArgsHarness::try_parse_from(["bt", "--dev", "sample.eval.ts"])
+            .expect_err("max concurrency env var with dev mode should fail");
+        let message = err.to_string();
+        assert!(message.contains("--max-concurrency"));
+        assert!(message.contains("--dev"));
 
         restore_env_var("BT_EVAL_MAX_CONCURRENCY", previous);
     }

@@ -2285,7 +2285,7 @@ async function createEvalRunner(
 
   let availableEvalSlots = config.maxConcurrency ?? 0;
   const evalSlotWaiters: Array<() => void> = [];
-  const Eval: EvalFunction = async (...args) => {
+  const withEvalSlot = async <T>(run: () => Promise<T>): Promise<T> => {
     if (config.maxConcurrency !== null) {
       if (availableEvalSlots > 0) {
         availableEvalSlots -= 1;
@@ -2295,7 +2295,7 @@ async function createEvalRunner(
     }
 
     try {
-      return await sdkEval(...args);
+      return await run();
     } finally {
       if (config.maxConcurrency !== null) {
         const next = evalSlotWaiters.shift();
@@ -2307,6 +2307,7 @@ async function createEvalRunner(
       }
     }
   };
+  const Eval: EvalFunction = (...args) => withEvalSlot(() => sdkEval(...args));
 
   const makeEvalOptions = (
     evaluatorName: string,
@@ -2340,7 +2341,7 @@ async function createEvalRunner(
     return mergeEvalOptions(base, overrides);
   };
 
-  const runEval = async (
+  const runEvalUnbounded = async (
     projectName: string,
     evaluator: Record<string, unknown>,
     options?: EvalOptions,
@@ -2371,7 +2372,7 @@ async function createEvalRunner(
       ...evaluator,
       data: sampledData,
     });
-    const result = await Eval(projectName, wrappedEvaluator, opts);
+    const result = await sdkEval(projectName, wrappedEvaluator, opts);
     const summary = attachSamplingSummary(result.summary, config);
     const failingResults = result.results.filter(
       (r: { error?: unknown }) => r.error !== undefined,
@@ -2389,6 +2390,8 @@ async function createEvalRunner(
     }
     return result;
   };
+  const runEval: EvalRunner["runEval"] = (...args) =>
+    withEvalSlot(() => runEvalUnbounded(...args));
 
   const runRegisteredEvals = async (evaluators: EvaluatorEntry[]) => {
     if (sse) {
