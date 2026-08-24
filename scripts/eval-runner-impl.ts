@@ -121,6 +121,7 @@ type RunnerConfig = {
   jsonl: boolean;
   list: boolean;
   terminateOnFailure: boolean;
+  maxConcurrency: number | null;
   autoInstrumentation: boolean;
   filters: EvalFilter[];
   first: number | null;
@@ -421,6 +422,7 @@ function readRunnerConfig(): RunnerConfig {
     jsonl: envFlag("BT_EVAL_JSONL"),
     list: envFlag("BT_EVAL_LIST"),
     terminateOnFailure: envFlag("BT_EVAL_TERMINATE_ON_FAILURE"),
+    maxConcurrency: parsePositiveIntegerEnv("BT_EVAL_MAX_CONCURRENCY"),
     autoInstrumentation: !envFlag("BT_EVAL_NO_AUTO_INSTRUMENTATION"),
     filters: parseSerializedFilters(process.env.BT_EVAL_FILTER_PARSED),
     first: parsePositiveIntegerEnv("BT_EVAL_FIRST"),
@@ -2269,8 +2271,8 @@ async function createEvalRunner(
   sse: SseWriter | null,
 ): Promise<EvalRunner> {
   const braintrust = await loadBraintrust();
-  const Eval = braintrust.Eval;
-  if (typeof Eval !== "function") {
+  const sdkEval = braintrust.Eval;
+  if (typeof sdkEval !== "function") {
     throw new Error("Unable to load Eval() from braintrust package.");
   }
   const login = braintrust.login;
@@ -2280,6 +2282,31 @@ async function createEvalRunner(
   const noSendLogs = shouldDisableSendLogs();
   const parseParent = loadBraintrustUtilParseParent();
   const getState = extractGlobalStateGetter(braintrust);
+
+  let availableEvalSlots = config.maxConcurrency ?? 0;
+  const evalSlotWaiters: Array<() => void> = [];
+  const Eval: EvalFunction = async (...args) => {
+    if (config.maxConcurrency !== null) {
+      if (availableEvalSlots > 0) {
+        availableEvalSlots -= 1;
+      } else {
+        await new Promise<void>((resolve) => evalSlotWaiters.push(resolve));
+      }
+    }
+
+    try {
+      return await sdkEval(...args);
+    } finally {
+      if (config.maxConcurrency !== null) {
+        const next = evalSlotWaiters.shift();
+        if (next) {
+          next();
+        } else {
+          availableEvalSlots += 1;
+        }
+      }
+    }
+  };
 
   const makeEvalOptions = (
     evaluatorName: string,
