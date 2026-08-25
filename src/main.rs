@@ -68,7 +68,6 @@ Core
 Projects & resources
   projects     Manage projects
   topics       Inspect and control Topics automation
-  datasets     Manage datasets
   prompts      Manage prompts
   functions    Manage functions (tools, scorers, and more)
   tools        Manage tools
