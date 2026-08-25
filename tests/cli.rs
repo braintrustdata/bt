@@ -343,6 +343,74 @@ fn profiles_delete_removes_metadata_and_credentials() {
 
 #[cfg(unix)]
 #[test]
+fn logout_all_removes_every_saved_login_without_revoking_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(
+        config_home.path(),
+        &[
+            ("first-profile", "first-org"),
+            ("second-profile", "second-org"),
+        ],
+    );
+    write_profile_secrets(config_home.path(), &["first-profile", "second-profile"]);
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    let output = cmd
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["logout", "--all", "--force", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value =
+        serde_json::from_slice(&output).expect("parse logout JSON output");
+    assert_eq!(result["status"], "deleted");
+    assert_eq!(result["results"].as_array().unwrap().len(), 2);
+    assert!(result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["revoked"] == false));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].as_object().unwrap().is_empty());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert!(secrets["secrets"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn logout_all_requires_force_without_a_terminal() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["logout", "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "rerun with --force in non-interactive mode",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
 fn profiles_rename_moves_credentials_and_updates_config() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");

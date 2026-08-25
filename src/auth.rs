@@ -444,6 +444,10 @@ pub struct LoginArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct LogoutArgs {
+    /// Remove every saved login from this machine
+    #[arg(long)]
+    all: bool,
+
     /// Skip confirmation prompt
     #[arg(long, short = 'f')]
     force: bool,
@@ -1915,9 +1919,27 @@ pub(crate) fn delete_profile(profile_name: &str, force: bool, base_json: bool) -
         }
     }
 
+    remove_profile_from_store(&mut store, profile_name)?;
+
+    emit_result(
+        base_json,
+        serde_json::json!({ "name": profile_name, "status": "deleted" }),
+        || {
+            ui::print_command_status(
+                ui::CommandStatus::Success,
+                &format!(
+                    "Removed saved login '{profile_name}' from this machine; the credential was not revoked"
+                ),
+            )
+        },
+    )?;
+    Ok(true)
+}
+
+fn remove_profile_from_store(store: &mut AuthStore, profile_name: &str) -> Result<()> {
     store.profiles.remove(profile_name);
     store.profile_ids.remove(profile_name);
-    save_auth_store(&store)?;
+    save_auth_store(store)?;
     if let Err(err) = delete_profile_secret(profile_name) {
         eprintln!("warning: failed to delete keychain credential for '{profile_name}': {err}");
     }
@@ -1927,18 +1949,7 @@ pub(crate) fn delete_profile(profile_name: &str, force: bool, base_json: bool) -
     if let Err(err) = delete_profile_oauth_access_token(profile_name) {
         eprintln!("warning: failed to delete oauth access token for '{profile_name}': {err}");
     }
-
-    emit_result(
-        base_json,
-        serde_json::json!({ "name": profile_name, "status": "deleted" }),
-        || {
-            ui::print_command_status(
-                ui::CommandStatus::Success,
-                &format!("Deleted profile '{profile_name}'"),
-            )
-        },
-    )?;
-    Ok(true)
+    Ok(())
 }
 
 pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) -> Result<()> {
@@ -2028,11 +2039,60 @@ pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) ->
 
 fn run_login_logout(base: BaseArgs, args: LogoutArgs) -> Result<()> {
     let base_json = base.json;
-    let store = load_auth_store()?;
+    let mut store = load_auth_store()?;
     if store.profiles.is_empty() {
         return emit_result(base_json, serde_json::json!({ "status": "empty" }), || {
             println!("No saved profiles.")
         });
+    }
+
+    if args.all {
+        if base.login.profile.is_some() {
+            bail!("--all cannot be combined with --profile");
+        }
+        if !args.force {
+            let Some(term) = ui::prompt_term() else {
+                bail!("removing all saved logins requires confirmation; rerun with --force in non-interactive mode");
+            };
+            let confirmed = Confirm::new()
+                .with_prompt(format!(
+                    "Remove all {} saved logins from this machine? Credentials will not be revoked.",
+                    store.profiles.len()
+                ))
+                .default(false)
+                .interact_on(&term)?;
+            if !confirmed {
+                return emit_result(
+                    base_json,
+                    serde_json::json!({ "status": "cancelled", "results": [] }),
+                    || eprintln!("Cancelled"),
+                );
+            }
+        }
+
+        let profile_names: Vec<String> = store.profiles.keys().cloned().collect();
+        let mut results = Vec::with_capacity(profile_names.len());
+        for profile_name in &profile_names {
+            remove_profile_from_store(&mut store, profile_name)?;
+            results.push(serde_json::json!({
+                "name": profile_name,
+                "status": "deleted",
+                "revoked": false,
+            }));
+        }
+        return emit_result(
+            base_json,
+            serde_json::json!({ "status": "deleted", "results": results }),
+            || {
+                ui::print_command_status(
+                    ui::CommandStatus::Success,
+                    &format!(
+                        "Removed {} saved logins from this machine; credentials were not revoked",
+                        profile_names.len()
+                    ),
+                )
+            },
+        );
     }
 
     let profile_name = if let Some(p) = base.login.profile {
