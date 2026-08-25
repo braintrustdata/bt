@@ -6,9 +6,9 @@ use crate::{args::BaseArgs, project_context::resolve_project_command_context_wit
 pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 
 mod api;
+mod assign;
 mod delete;
 mod list;
-mod promote;
 mod view;
 
 #[derive(Debug, Clone, Args)]
@@ -17,7 +17,7 @@ Examples:
   bt prompts list
   bt prompts list --environment production
   bt prompts view my-prompt --environment production
-  bt prompts promote my-prompt --environment production --version 1234
+  bt prompts assign my-prompt --environment production --version 1234
   bt prompts delete my-prompt
 ")]
 pub struct PromptsArgs {
@@ -31,8 +31,8 @@ enum PromptsCommands {
     List(ListArgs),
     /// View a prompt's content
     View(ViewArgs),
-    /// Promote a prompt version to an environment
-    Promote(PromoteArgs),
+    /// Assign a prompt version to an environment
+    Assign(AssignArgs),
     /// Delete a prompt
     Delete(DeleteArgs),
 }
@@ -103,7 +103,7 @@ impl ViewArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct PromoteArgs {
+pub struct AssignArgs {
     /// Prompt slug (positional)
     #[arg(value_name = "SLUG")]
     slug_positional: Option<String>,
@@ -116,7 +116,7 @@ pub struct PromoteArgs {
     selector: PromptSelectorArgs,
 }
 
-impl PromoteArgs {
+impl AssignArgs {
     fn slug(&self) -> Option<&str> {
         self.slug_positional
             .as_deref()
@@ -171,9 +171,9 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
             )
             .await
         }
-        Some(PromptsCommands::Promote(args)) => {
+        Some(PromptsCommands::Assign(args)) => {
             let hint =
-                "Use: bt prompts promote <slug> --environment <environment> --version <version>";
+                "Use: bt prompts assign <slug> --environment <environment> --version <version>";
             let version = args
                 .selector
                 .version()
@@ -182,7 +182,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
                 .selector
                 .environment()
                 .ok_or_else(|| anyhow!("--environment is required. {hint}"))?;
-            promote::run(&ctx, args.slug(), environment, version, base.json).await
+            assign::run(&ctx, args.slug(), environment, version, base.json).await
         }
         Some(PromptsCommands::Delete(args)) => delete::run(&ctx, args.slug(), args.force).await,
     }
@@ -234,21 +234,21 @@ mod tests {
             .to_string()
             .contains("unexpected argument '--version'"));
 
-        let promote = CliHarness::try_parse_from([
+        let assign = CliHarness::try_parse_from([
             "bt-prompts",
-            "promote",
+            "assign",
             "test-prompt",
             "--environment",
             "production",
             "--version",
             "1234",
         ])
-        .expect("parse promote");
-        let Some(PromptsCommands::Promote(promote)) = promote.prompts.command else {
-            panic!("expected promote command");
+        .expect("parse assign");
+        let Some(PromptsCommands::Assign(assign)) = assign.prompts.command else {
+            panic!("expected assign command");
         };
-        assert_eq!(promote.selector.version(), Some("1234"));
-        assert_eq!(promote.selector.environment(), Some("production"));
+        assert_eq!(assign.selector.version(), Some("1234"));
+        assert_eq!(assign.selector.environment(), Some("production"));
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn prompts_routes_mutations_to_validated_auth() {
         assert!(!prompts_command_is_read_only(Some(
-            &PromptsCommands::Promote(PromoteArgs {
+            &PromptsCommands::Assign(AssignArgs {
                 slug_positional: Some("test-prompt".to_string()),
                 slug_flag: None,
                 selector: selectors(Some("1234"), Some("production")),

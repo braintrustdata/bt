@@ -12,7 +12,7 @@ pub async fn run(
     json: bool,
 ) -> Result<()> {
     let Some(slug) = slug else {
-        bail!("prompt slug required. Use: bt prompts promote <slug> --environment <environment> --version <version>");
+        bail!("prompt slug required. Use: bt prompts assign <slug> --environment <environment> --version <version>");
     };
 
     let prompt = with_spinner(
@@ -23,12 +23,12 @@ pub async fn run(
     .ok_or_else(|| anyhow!("prompt with slug '{slug}' not found at version {version}"))?;
 
     let object_version = prompt._xact_id.as_deref().ok_or_else(|| {
-        anyhow!("prompt version response did not include a transaction version; cannot promote")
+        anyhow!("prompt version response did not include a transaction version; cannot assign")
     })?;
 
     let association = with_spinner(
-        "Promoting prompt...",
-        api::promote_prompt(&ctx.client, &prompt.id, environment, object_version),
+        "Assigning prompt...",
+        api::assign_prompt(&ctx.client, &prompt.id, environment, object_version),
     )
     .await?;
 
@@ -37,7 +37,7 @@ pub async fn run(
     } else {
         print_command_status(
             CommandStatus::Success,
-            &format!("Promoted prompt '{slug}' version {version} to environment '{environment}'"),
+            &format!("Assigned prompt '{slug}' version {version} to environment '{environment}'"),
         );
     }
 

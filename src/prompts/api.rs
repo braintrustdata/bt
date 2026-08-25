@@ -91,7 +91,7 @@ pub async fn get_prompt_by_slug(
     Ok(list.objects.into_iter().next())
 }
 
-pub async fn promote_prompt(
+pub async fn assign_prompt(
     client: &ApiClient,
     prompt_id: &str,
     environment: &str,
