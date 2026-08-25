@@ -47,7 +47,16 @@ pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -
     )?;
 
     let mut table = styled_table();
-    table.set_header(vec![header("Name"), header("Description"), header("Slug")]);
+    if environment.is_some() {
+        table.set_header(vec![
+            header("Name"),
+            header("Description"),
+            header("Slug"),
+            header("Version"),
+        ]);
+    } else {
+        table.set_header(vec![header("Name"), header("Description"), header("Slug")]);
+    }
     apply_column_padding(&mut table, (0, 6));
 
     for prompt in &prompts {
@@ -57,7 +66,20 @@ pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -
             .filter(|s| !s.is_empty())
             .map(|s| truncate(s, 60))
             .unwrap_or_else(|| "-".to_string());
-        table.add_row(vec![&prompt.name, &desc, &prompt.slug]);
+        if environment.is_some() {
+            table.add_row(vec![
+                prompt.name.as_str(),
+                desc.as_str(),
+                prompt.slug.as_str(),
+                prompt._xact_id.as_deref().unwrap_or("-"),
+            ]);
+        } else {
+            table.add_row(vec![
+                prompt.name.as_str(),
+                desc.as_str(),
+                prompt.slug.as_str(),
+            ]);
+        }
     }
 
     write!(output, "{table}")?;
