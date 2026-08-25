@@ -23,11 +23,14 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
 /// Setup, managed run, and import resolve a Braintrust credential and org
 /// before writing a route, so those tests supply a synthetic one rather than
 /// depending on whatever auth the ambient environment happens to carry.
-fn bt_trace_command() -> Command {
+fn bt_trace_command(config_home: &Path, profile: &str, org: &str) -> Command {
+    write_auth_store(config_home, &[(profile, org)]);
+    write_profile_secrets(config_home, &[profile]);
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
-    cmd.env("BRAINTRUST_API_KEY", "test-api-key")
-        .env("BRAINTRUST_ORG_NAME", "test-org");
+    cmd.env("XDG_CONFIG_HOME", config_home)
+        .env("BRAINTRUST_PROFILE", profile)
+        .env("BRAINTRUST_ORG_NAME", org);
     cmd
 }
 
@@ -550,6 +553,7 @@ fn trace_help_exposes_user_commands_and_hides_internal_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\n  enable"))
+        .stdout(predicate::str::contains("\n  doctor"))
         .stdout(predicate::str::contains("\n  import"))
         .stdout(predicate::str::contains("\n  run"))
         .stdout(predicate::str::contains("\n  daemon").not())
@@ -710,13 +714,15 @@ fn trace_setup_adopts_the_configured_org_without_prompting() {
         r#"{"installed":[]}"#,
     );
     write_config_org(config_home.path(), "test-org");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["test-profile"]);
 
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
     cmd.env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("BRAINTRUST_PROFILE", "test-profile")
         .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
         .env("BT_DAEMON_CONFIG", &config)
         .args([
@@ -739,6 +745,7 @@ fn trace_setup_adopts_the_configured_org_without_prompting() {
 #[test]
 fn trace_run_uses_the_invocation_project_without_changing_setup() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let run_log = state_dir.path().join("run.log");
@@ -746,7 +753,7 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
     let setup_settings = state_dir.path().join("setup-settings.json");
     write_run_agent(&bin_dir.path().join("codex"));
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_RUN_LOG", &run_log)
@@ -783,6 +790,7 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
 #[test]
 fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let run_log = state_dir.path().join("run.log");
@@ -794,7 +802,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("opencode"));
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("OPENCODE_BIN", bin_dir.path().join("opencode"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -836,6 +844,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
 #[test]
 fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let run_log = state_dir.path().join("run.log");
@@ -846,7 +855,7 @@ fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("pi"));
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("PI_BIN", bin_dir.path().join("pi"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -1020,7 +1029,7 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
     )
     .expect("seed config");
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -1068,13 +1077,14 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
 #[test]
 fn trace_setup_claude_installs_plugin_and_writes_selected_project() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let log = state_dir.path().join("claude.log");
     let config = state_dir.path().join("config.json");
     write_agent_cli(&bin_dir.path().join("claude"), "[]", "[]");
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -1113,7 +1123,7 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
     write_auth_store(config_home.path(), &[("work", "acme")]);
     write_profile_secrets(config_home.path(), &["work"]);
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "work", "acme")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -1158,7 +1168,7 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
 fn trace_setup_honors_global_json() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
-    let stdout = bt_trace_command()
+    let stdout = bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -1192,14 +1202,58 @@ fn trace_setup_honors_global_json() {
 
 #[cfg(unix)]
 #[test]
+fn trace_doctor_reports_saved_profile_provenance_without_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let log = tempfile::NamedTempFile::new().expect("setup log");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", log.path())
+        .args(["trace", "enable", "codex", "--project", "agent-traces"])
+        .assert()
+        .success();
+
+    let output = bt_trace_command(config_home.path(), "test-profile", "test-org")
+        .env("HOME", home.path())
+        .args(["trace", "doctor", "codex", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&output).expect("trace doctor emits JSON");
+    assert_eq!(doctor["command"], "doctor");
+    assert_eq!(doctor["source"], "codex");
+    assert_eq!(doctor["enabled"], true);
+    assert_eq!(doctor["auth"]["status"], "ready");
+    assert_eq!(doctor["auth"]["source"], "saved_profile");
+    assert_eq!(doctor["auth"]["kind"], "api_key");
+    assert_eq!(doctor["auth"]["profile"], "test-profile");
+    assert!(!String::from_utf8(output)
+        .expect("UTF-8 doctor output")
+        .contains("test-api-key"));
+}
+
+#[cfg(unix)]
+#[test]
 fn trace_setup_pi_installs_the_npm_extension_and_selected_route() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let log = state_dir.path().join("pi.log");
     write_agent_cli(&bin_dir.path().join("pi"), "{}", "{}");
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -1236,7 +1290,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         r#"{"installed":[]}"#,
     );
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -1244,7 +1298,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         .args(["trace", "setup", "codex", "--project", "codex-project"])
         .assert()
         .success();
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([

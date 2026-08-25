@@ -2150,6 +2150,33 @@ fn load_credential_for_profile(name: &str, profile: &AuthProfile) -> CredentialL
     }
 }
 
+pub(crate) fn diagnose_stored_profile(name: &str) -> Result<ProfileVerification> {
+    let store = load_auth_store()?;
+    let profile = store
+        .profiles
+        .get(name)
+        .ok_or_else(|| profile_not_found_err(name, &store))?;
+    let verification = match load_credential_for_profile(name, profile) {
+        CredentialLoad::Found(credential) => {
+            let (identity, hint) = match profile.auth_kind {
+                AuthKind::Oauth => (Some(decode_jwt_identity(&credential)), None),
+                AuthKind::ApiKey => (None, profile.api_key_hint.clone()),
+            };
+            build_verification(name, profile, identity, hint, ProfileStatus::Ok)
+        }
+        CredentialLoad::Missing => {
+            build_verification(name, profile, None, None, ProfileStatus::Missing)
+        }
+        CredentialLoad::Expired => {
+            build_verification(name, profile, None, None, ProfileStatus::Expired)
+        }
+        CredentialLoad::Error(error) => {
+            build_verification(name, profile, None, None, ProfileStatus::Error(error))
+        }
+    };
+    Ok(verification)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileVerification {
     pub name: String,

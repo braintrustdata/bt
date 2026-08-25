@@ -12,11 +12,11 @@ use bt_daemon::wire::{
     AuthSelection, AuthSource, BackendAuth, FlushMode, SessionRoute, TraceDestination,
 };
 use bt_daemon::{
-    AuthLease, AuthResolveReason, OutputFormat, RouteRequirements, RunHookCommand,
+    AuthDiagnostic, AuthLease, AuthResolveReason, OutputFormat, RouteRequirements, RunHookCommand,
     TraceHostContext, TraceHostServices,
 };
 
-use crate::args::BaseArgs;
+use crate::args::{ArgValueSource, BaseArgs};
 
 #[derive(Clone)]
 struct BtTraceHost {
@@ -53,6 +53,68 @@ fn require_saved_trace_profile(profile: Option<String>) -> anyhow::Result<String
             "coding-agent tracing requires a saved Braintrust profile; run `bt login --profile <NAME>`, then rerun this command with `--profile <NAME>`"
         )
     })
+}
+
+fn profile_auth_diagnostic(
+    verification: crate::auth::ProfileVerification,
+    source: &str,
+    selected_org: Option<String>,
+) -> AuthDiagnostic {
+    let expires_at_ms = verification
+        .expires_at
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .and_then(|seconds| seconds.checked_mul(1000));
+    let (status, error) = match verification.status.as_str() {
+        "ok" => ("ready", None),
+        "expired" => (
+            "expired",
+            Some(format!(
+                "OAuth access token is expired; run `bt login --refresh --profile {}`",
+                verification.name
+            )),
+        ),
+        "missing" => (
+            "error",
+            Some(format!(
+                "saved profile credential is missing; rerun `bt login --profile {}`",
+                verification.name
+            )),
+        ),
+        _ => (
+            "error",
+            Some(
+                verification
+                    .error
+                    .unwrap_or_else(|| "saved profile is unusable".into()),
+            ),
+        ),
+    };
+    AuthDiagnostic {
+        status: status.into(),
+        source: source.into(),
+        kind: Some(verification.auth),
+        profile: Some(verification.name),
+        org_name: selected_org.or(verification.org),
+        expires_at_ms,
+        error,
+    }
+}
+
+fn unresolved_auth_diagnostic(
+    source: &str,
+    profile: Option<String>,
+    org_name: Option<String>,
+    error: impl Into<String>,
+) -> AuthDiagnostic {
+    AuthDiagnostic {
+        status: "error".into(),
+        source: source.into(),
+        kind: None,
+        profile,
+        org_name,
+        expires_at_ms: None,
+        error: Some(error.into()),
+    }
 }
 
 /// Ensure the route carries an organization, the way `resolve_trace_project`
@@ -231,6 +293,87 @@ impl TraceHostServices for BtTraceHost {
             expires_at_ms,
         })
     }
+
+    async fn diagnose_auth(&self, selection: &AuthSelection) -> AuthDiagnostic {
+        let selected_profile = selection
+            .profile
+            .clone()
+            .or_else(|| self.base.profile.clone());
+        if let Some(profile) = selected_profile {
+            if profile == "environment" {
+                return unresolved_auth_diagnostic(
+                    "legacy_environment_route",
+                    Some(profile),
+                    selection.org_name.clone(),
+                    "profile `environment` is not a saved login; rerun setup with --profile <NAME>",
+                );
+            }
+            return match crate::auth::diagnose_stored_profile(&profile) {
+                Ok(verification) => profile_auth_diagnostic(
+                    verification,
+                    "saved_profile",
+                    selection.org_name.clone(),
+                ),
+                Err(error) => unresolved_auth_diagnostic(
+                    "saved_profile",
+                    Some(profile),
+                    selection.org_name.clone(),
+                    error.to_string(),
+                ),
+            };
+        }
+
+        if self.base.api_key.is_some() {
+            let source = match self.base.api_key_source {
+                Some(ArgValueSource::CommandLine) => "command_line_api_key",
+                Some(ArgValueSource::EnvVariable) => "environment_api_key",
+                None => "api_key_override",
+            };
+            return unresolved_auth_diagnostic(
+                source,
+                None,
+                selection.org_name.clone(),
+                "coding-agent tracing requires a saved Braintrust profile; run `bt login --profile <NAME>`",
+            );
+        }
+
+        match crate::auth::list_profiles() {
+            Ok(profiles) if profiles.len() == 1 => {
+                let profile = &profiles[0].name;
+                match crate::auth::diagnose_stored_profile(profile) {
+                    Ok(verification) => profile_auth_diagnostic(
+                        verification,
+                        "automatic_saved_profile",
+                        selection.org_name.clone(),
+                    ),
+                    Err(error) => unresolved_auth_diagnostic(
+                        "automatic_saved_profile",
+                        Some(profile.clone()),
+                        selection.org_name.clone(),
+                        error.to_string(),
+                    ),
+                }
+            }
+            Ok(profiles) if profiles.is_empty() => unresolved_auth_diagnostic(
+                "unresolved",
+                None,
+                selection.org_name.clone(),
+                "no saved Braintrust profile; run `bt login --profile <NAME>`",
+            ),
+            Ok(_) => unresolved_auth_diagnostic(
+                "unresolved",
+                None,
+                selection.org_name.clone(),
+                "multiple saved profiles exist; pass --profile <NAME>",
+            ),
+            Err(error) => unresolved_auth_diagnostic(
+                "saved_profile_store",
+                None,
+                selection.org_name.clone(),
+                error.to_string(),
+            ),
+        }
+    }
 }
 
 pub fn context(base: BaseArgs) -> TraceHostContext {
@@ -270,5 +413,34 @@ mod tests {
             require_saved_trace_profile(Some("test-profile".into())).unwrap(),
             "test-profile"
         );
+    }
+
+    #[test]
+    fn profile_diagnostic_reports_expiry_without_credentials() {
+        let diagnostic = profile_auth_diagnostic(
+            crate::auth::ProfileVerification {
+                name: "work".into(),
+                auth: "oauth".into(),
+                app_url: "https://www.braintrust.dev".into(),
+                api_url: None,
+                org: Some("acme".into()),
+                user_name: None,
+                user_email: None,
+                api_key_hint: None,
+                expires_at: Some(1_700_000_000),
+                status: "expired".into(),
+                error: None,
+            },
+            "saved_profile",
+            None,
+        );
+        assert_eq!(diagnostic.status, "expired");
+        assert_eq!(diagnostic.kind.as_deref(), Some("oauth"));
+        assert_eq!(diagnostic.expires_at_ms, Some(1_700_000_000_000));
+        assert!(diagnostic
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("bt login --refresh --profile work"));
     }
 }
