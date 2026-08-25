@@ -109,6 +109,20 @@ pub async fn assign_prompt(
     client.put(&path, &body).await
 }
 
+pub async fn unassign_prompt(
+    client: &ApiClient,
+    prompt_id: &str,
+    environment: &str,
+) -> Result<EnvironmentObject> {
+    let path = format!(
+        "/environment-object/prompt/{}/{}?org_name={}",
+        encode(prompt_id),
+        encode(environment),
+        encode(client.org_name())
+    );
+    client.delete_with_response(&path).await
+}
+
 pub async fn delete_prompt(client: &ApiClient, prompt_id: &str) -> Result<()> {
     let path = format!("/v1/prompt/{}", encode(prompt_id));
     client.delete(&path).await

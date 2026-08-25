@@ -18,6 +18,7 @@ Examples:
   bt prompts list --environment production
   bt prompts view my-prompt --environment production
   bt prompts assign my-prompt --environment production --version 1234
+  bt prompts unassign my-prompt --environment production
   bt prompts delete my-prompt
 ")]
 pub struct PromptsArgs {
@@ -33,6 +34,8 @@ enum PromptsCommands {
     View(ViewArgs),
     /// Assign a prompt version to an environment
     Assign(AssignArgs),
+    /// Unassign a prompt from an environment
+    Unassign(UnassignArgs),
     /// Delete a prompt
     Delete(DeleteArgs),
 }
@@ -40,14 +43,14 @@ enum PromptsCommands {
 #[derive(Debug, Clone, Args)]
 struct PromptEnvironmentArgs {
     /// Environment slug (for example, production)
-    #[arg(long, env = "BT_PROMPTS_ENVIRONMENT")]
+    #[arg(long)]
     environment: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
 struct PromptVersionArgs {
     /// Prompt version identifier (for example, a transaction ID)
-    #[arg(long, env = "BT_PROMPTS_VERSION")]
+    #[arg(long)]
     version: Option<String>,
 }
 
@@ -125,6 +128,28 @@ impl AssignArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct UnassignArgs {
+    /// Prompt slug (positional)
+    #[arg(value_name = "SLUG")]
+    slug_positional: Option<String>,
+
+    /// Prompt slug (flag)
+    #[arg(long = "slug", short = 's')]
+    slug_flag: Option<String>,
+
+    #[command(flatten)]
+    environment: PromptEnvironmentArgs,
+}
+
+impl UnassignArgs {
+    fn slug(&self) -> Option<&str> {
+        self.slug_positional
+            .as_deref()
+            .or(self.slug_flag.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct DeleteArgs {
     /// Prompt slug (positional) of the prompt to delete
     #[arg(value_name = "SLUG")]
@@ -182,7 +207,30 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
                 .selector
                 .environment()
                 .ok_or_else(|| anyhow!("--environment is required. {hint}"))?;
-            assign::run(&ctx, args.slug(), environment, version, base.json).await
+            assign::run(
+                &ctx,
+                args.slug(),
+                environment,
+                assign::Action::Assign { version },
+                base.json,
+            )
+            .await
+        }
+        Some(PromptsCommands::Unassign(args)) => {
+            let hint = "Use: bt prompts unassign <slug> --environment <environment>";
+            let environment = args
+                .environment
+                .environment
+                .as_deref()
+                .ok_or_else(|| anyhow!("--environment is required. {hint}"))?;
+            assign::run(
+                &ctx,
+                args.slug(),
+                environment,
+                assign::Action::Unassign,
+                base.json,
+            )
+            .await
         }
         Some(PromptsCommands::Delete(args)) => delete::run(&ctx, args.slug(), args.force).await,
     }
