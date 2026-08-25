@@ -47,6 +47,14 @@ fn session_route(base: &BaseArgs) -> SessionRoute {
     }
 }
 
+fn require_saved_trace_profile(profile: Option<String>) -> anyhow::Result<String> {
+    profile.ok_or_else(|| {
+        anyhow::anyhow!(
+            "coding-agent tracing requires a saved Braintrust profile; run `bt login --profile <NAME>`, then rerun this command with `--profile <NAME>`"
+        )
+    })
+}
+
 /// Ensure the route carries an organization, the way `resolve_trace_project`
 /// ensures it carries a project. Tracing has no later opportunity to ask: the
 /// org is baked into the route before the daemon sees a single event, so a
@@ -196,10 +204,7 @@ impl TraceHostServices for BtTraceHost {
         let token = resolved
             .api_key
             .ok_or_else(|| anyhow::anyhow!("selected Braintrust profile has no credential"))?;
-        let profile = resolved
-            .profile
-            .or_else(|| selection.profile.clone())
-            .unwrap_or_else(|| "environment".into());
+        let profile = require_saved_trace_profile(resolved.profile)?;
         let expires_at_ms = resolved.is_oauth.then(|| {
             chrono::Utc::now()
                 .timestamp_millis()
@@ -243,5 +248,27 @@ pub fn context(base: BaseArgs) -> TraceHostContext {
             args: vec![OsString::from("trace")],
         },
         services: Arc::new(BtTraceHost { base }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracing_rejects_environment_only_auth() {
+        let error = require_saved_trace_profile(None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a saved Braintrust profile"));
+        assert!(error.to_string().contains("bt login --profile <NAME>"));
+    }
+
+    #[test]
+    fn tracing_keeps_the_resolved_saved_profile() {
+        assert_eq!(
+            require_saved_trace_profile(Some("test-profile".into())).unwrap(),
+            "test-profile"
+        );
     }
 }
