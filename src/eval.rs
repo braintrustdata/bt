@@ -315,7 +315,6 @@ pub struct EvalArgs {
     /// Maximum number of evaluators to run concurrently.
     #[arg(
         long,
-        visible_alias = "maxConcurrency",
         env = "BT_EVAL_MAX_CONCURRENCY",
         value_name = "COUNT",
         value_parser = parse_positive_usize,
@@ -5115,7 +5114,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_args_parse_max_concurrency_flag_and_alias() {
+    fn eval_args_parse_max_concurrency_flag() {
         let _guard = env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5126,10 +5125,9 @@ mod tests {
                 .expect("max-concurrency flag should parse");
         assert_eq!(parsed.eval.max_concurrency, Some(2));
 
-        let parsed =
-            EvalArgsHarness::try_parse_from(["bt", "--maxConcurrency=3", "sample.eval.ts"])
-                .expect("maxConcurrency alias should parse");
-        assert_eq!(parsed.eval.max_concurrency, Some(3));
+        let err = EvalArgsHarness::try_parse_from(["bt", "--maxConcurrency=3", "sample.eval.ts"])
+            .expect_err("camelCase maxConcurrency flag should not parse");
+        assert!(err.to_string().contains("unexpected argument"));
 
         let err =
             EvalArgsHarness::try_parse_from(["bt", "--max-concurrency", "0", "sample.eval.ts"])
