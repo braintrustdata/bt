@@ -436,6 +436,10 @@ pub struct LoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
+
+    /// Persist BRAINTRUST_API_KEY as a saved profile without prompting
+    #[arg(long, conflicts_with_all = ["oauth", "refresh"])]
+    save_env_api_key: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1276,6 +1280,8 @@ async fn run_login_set(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         }
     }
 
+    confirm_environment_api_key_persistence(base, args.save_env_api_key)?;
+
     let interactive = ui::can_prompt();
 
     let api_key = match base.api_key.clone() {
@@ -1334,6 +1340,33 @@ async fn run_login_set(base: &BaseArgs, args: LoginArgs) -> Result<()> {
             ui::print_command_status(ui::CommandStatus::Success, &human);
         },
     )
+}
+
+fn confirm_environment_api_key_persistence(base: &BaseArgs, explicitly_allowed: bool) -> Result<()> {
+    if !environment_api_key_needs_confirmation(base, explicitly_allowed) {
+        return Ok(());
+    }
+
+    let Some(term) = ui::prompt_term() else {
+        bail!(
+            "`bt login` would persist BRAINTRUST_API_KEY as a saved profile; pass --save-env-api-key to confirm, or unset BRAINTRUST_API_KEY to choose another login method"
+        );
+    };
+    let confirmed = Confirm::new()
+        .with_prompt("Save BRAINTRUST_API_KEY as a login on this machine?")
+        .default(false)
+        .interact_on(&term)?;
+    if !confirmed {
+        bail!("login cancelled; BRAINTRUST_API_KEY was not saved");
+    }
+    Ok(())
+}
+
+fn environment_api_key_needs_confirmation(base: &BaseArgs, explicitly_allowed: bool) -> bool {
+    matches!(
+        base.api_key_source,
+        Some(crate::args::ArgValueSource::EnvVariable)
+    ) && !explicitly_allowed
 }
 
 async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
@@ -3510,6 +3543,17 @@ mod tests {
 
     fn make_base() -> BaseArgs {
         BaseArgs::default()
+    }
+
+    #[test]
+    fn environment_api_keys_require_explicit_persistence_consent() {
+        let mut base = make_base();
+        base.api_key_source = Some(crate::args::ArgValueSource::EnvVariable);
+        assert!(environment_api_key_needs_confirmation(&base, false));
+        assert!(!environment_api_key_needs_confirmation(&base, true));
+
+        base.api_key_source = Some(crate::args::ArgValueSource::CommandLine);
+        assert!(!environment_api_key_needs_confirmation(&base, false));
     }
 
     fn auth_config(profile: Option<&str>, org: Option<&str>) -> crate::config::Config {
