@@ -8,6 +8,7 @@ mod auth;
 mod config;
 mod datasets;
 mod env;
+mod environments;
 #[cfg(unix)]
 mod eval;
 mod experiments;
@@ -74,6 +75,7 @@ Projects & resources
   tools        Manage tools
   scorers      Manage scorers
   experiments  Manage experiments
+  environments Manage deployment environments
 
 Data & evaluation
   datasets     Manage datasets
@@ -151,6 +153,8 @@ enum Commands {
     Topics(CLIArgs<topics::TopicsArgs>),
     /// Manage datasets
     Datasets(CLIArgs<datasets::DatasetsArgs>),
+    /// Manage deployment environments
+    Environments(CLIArgs<environments::EnvironmentsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
     /// Update bt in-place
@@ -196,6 +200,7 @@ impl Commands {
             Commands::Projects(cmd) => &cmd.base,
             Commands::Topics(cmd) => &cmd.base,
             Commands::Datasets(cmd) => &cmd.base,
+            Commands::Environments(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
             Commands::Update(cmd) => &cmd.base,
             Commands::SelfCommand(cmd) => &cmd.base,
@@ -225,6 +230,7 @@ impl Commands {
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
             Commands::Datasets(cmd) => &mut cmd.base,
+            Commands::Environments(cmd) => &mut cmd.base,
             Commands::Topics(cmd) => &mut cmd.base,
             Commands::Prompts(cmd) => &mut cmd.base,
             Commands::Update(cmd) => &mut cmd.base,
@@ -358,6 +364,7 @@ fn try_main() -> Result<()> {
             Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
             Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
             Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
+            Commands::Environments(cmd) => environments::run(cmd.base, cmd.args).await?,
             Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
             Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
             Commands::Update(cmd) => {

@@ -135,24 +135,25 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Commands
 
-| Command       | Description                                                        |
-| ------------- | ------------------------------------------------------------------ |
-| `bt init`     | Initialize `.bt/` config directory and link to a project           |
-| `bt login`    | Log in to Braintrust or refresh an OAuth login                     |
-| `bt logout`   | Remove a saved Braintrust login                                    |
-| `bt profiles` | List, delete, and rename saved login profiles                      |
-| `bt switch`   | Switch org and project context                                     |
-| `bt status`   | Show current org and project context                               |
-| `bt datasets` | Manage datasets and dataset pipelines                              |
-| `bt eval`     | Run eval files (Unix only)                                         |
-| `bt sql`      | Run SQL queries against Braintrust                                 |
-| `bt view`     | View logs, traces, and spans                                       |
-| `bt projects` | Manage projects (list, create, view, delete)                       |
-| `bt datasets` | Manage remote datasets (list, create, update, view, delete)        |
-| `bt prompts`  | Manage prompts (list, view, delete)                                |
-| `bt scorers`  | Manage scorers (list, create, view, invoke, delete)                |
-| `bt sync`     | Synchronize project logs between Braintrust and local NDJSON files |
-| `bt update`   | Update bt in-place                                                 |
+| Command           | Description                                                         |
+| ----------------- | ------------------------------------------------------------------- |
+| `bt init`         | Initialize `.bt/` config directory and link to a project            |
+| `bt login`        | Log in to Braintrust or refresh an OAuth login                      |
+| `bt logout`       | Remove a saved Braintrust login                                     |
+| `bt profiles`     | List, delete, and rename saved login profiles                       |
+| `bt switch`       | Switch org and project context                                      |
+| `bt status`       | Show current org and project context                                |
+| `bt datasets`     | Manage datasets and dataset pipelines                               |
+| `bt eval`         | Run eval files (Unix only)                                          |
+| `bt sql`          | Run SQL queries against Braintrust                                  |
+| `bt view`         | View logs, traces, and spans                                        |
+| `bt projects`     | Manage projects (list, create, view, delete)                        |
+| `bt datasets`     | Manage remote datasets (list, create, update, view, delete)         |
+| `bt prompts`      | Manage prompts (list, view, delete)                                 |
+| `bt scorers`      | Manage scorers (list, create, view, invoke, delete)                 |
+| `bt environments` | Manage deployment environments (list, view, create, update, delete) |
+| `bt sync`         | Synchronize project logs between Braintrust and local NDJSON files  |
+| `bt update`       | Update bt in-place                                                  |
 
 ## `bt scorers`
 
