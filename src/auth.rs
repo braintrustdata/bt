@@ -1342,7 +1342,10 @@ async fn run_login_set(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     )
 }
 
-fn confirm_environment_api_key_persistence(base: &BaseArgs, explicitly_allowed: bool) -> Result<()> {
+fn confirm_environment_api_key_persistence(
+    base: &BaseArgs,
+    explicitly_allowed: bool,
+) -> Result<()> {
     if !environment_api_key_needs_confirmation(base, explicitly_allowed) {
         return Ok(());
     }
@@ -2102,6 +2105,8 @@ pub struct ProfileVerification {
     pub user_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -2138,6 +2143,9 @@ fn build_verification(
         user_name: jwt_id.as_ref().and_then(|j| j.name.clone()),
         user_email: jwt_id.as_ref().and_then(|j| j.email.clone()),
         api_key_hint,
+        expires_at: (profile.auth_kind == AuthKind::Oauth)
+            .then_some(profile.oauth_access_expires_at)
+            .flatten(),
         status: status_str.to_string(),
         error,
     }
@@ -2215,38 +2223,96 @@ pub(crate) async fn profile_verifications() -> Result<Vec<ProfileVerification>> 
     Ok(verify_all_profiles_from_store(&store).await)
 }
 
-pub(crate) fn credentials_path() -> Result<PathBuf> {
+pub(crate) fn profile_metadata_path() -> Result<PathBuf> {
     auth_store_path()
 }
 
-pub(crate) fn format_verification_line(v: &ProfileVerification) -> String {
-    let mut parts = vec![v.name.clone(), v.app_url.clone(), v.auth.clone()];
-    if let Some(ref api_url) = v.api_url {
-        parts.push(format!("api: {api_url}"));
-    }
-    if let Some(ref org) = v.org {
-        parts.push(format!("org: {org}"));
-    }
-    match v.status.as_str() {
-        "ok" => {
-            let id = match (&v.user_name, &v.user_email) {
-                (Some(name), Some(email)) => Some(format!("{name} ({email})")),
-                (None, Some(email)) => Some(email.clone()),
-                _ => v.api_key_hint.clone(),
-            };
-            if let Some(id) = id {
-                parts.push(id);
+pub(crate) fn secret_storage_description() -> Result<String> {
+    let fallback = secret_store_path()?;
+    #[cfg(target_os = "macos")]
+    return Ok(format!(
+        "macOS Keychain (plaintext fallback: {})",
+        fallback.display()
+    ));
+    #[cfg(target_os = "linux")]
+    return Ok(format!(
+        "Secret Service (plaintext fallback: {})",
+        fallback.display()
+    ));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Ok(format!("plaintext file: {}", fallback.display()));
+}
+
+pub(crate) fn credential_precedence(base: &BaseArgs) -> String {
+    if resolve_api_key_override(base).is_some() {
+        return match base.api_key_source {
+            Some(crate::args::ArgValueSource::CommandLine) => {
+                "explicit --api-key overrides saved profiles".into()
             }
-        }
-        "expired" => parts.push("token expired".into()),
-        "missing" => parts.push("credential missing".into()),
-        _ => {
-            if let Some(ref e) = v.error {
-                parts.push(e.clone());
+            Some(crate::args::ArgValueSource::EnvVariable) => {
+                "BRAINTRUST_API_KEY overrides saved profiles".into()
             }
-        }
+            None => "API key override is active".into(),
+        };
     }
-    parts.join(" — ")
+    if let Some(profile) = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+    {
+        return format!("saved profile `{profile}` is selected");
+    }
+    "saved profile selection is automatic".into()
+}
+
+pub(crate) fn format_verification_block(v: &ProfileVerification, selected: bool) -> String {
+    let identity = match (&v.user_name, &v.user_email, &v.api_key_hint) {
+        (Some(name), Some(email), _) => Some(format!("{name} <{email}>")),
+        (None, Some(email), _) => Some(email.clone()),
+        (_, _, Some(hint)) => Some(hint.clone()),
+        _ => None,
+    };
+    let status = match v.status.as_str() {
+        "ok" => "Ready".to_string(),
+        "expired" => "Needs refresh".to_string(),
+        "missing" => "Credential missing".to_string(),
+        _ => v.error.clone().unwrap_or_else(|| "Error".into()),
+    };
+    let mut lines = vec![format!(
+        "{}{}",
+        v.name,
+        if selected { " (selected)" } else { "" }
+    )];
+    lines.push(format!(
+        "  Auth:       {}{}",
+        v.auth,
+        identity
+            .as_deref()
+            .map(|identity| format!(", {identity}"))
+            .unwrap_or_default()
+    ));
+    if let Some(org) = &v.org {
+        lines.push(format!("  Org:        {org}"));
+    }
+    lines.push(format!("  App URL:    {}", v.app_url));
+    if let Some(api_url) = &v.api_url {
+        lines.push(format!("  API URL:    {api_url}"));
+    }
+    if let Some(expires_at) = v.expires_at {
+        let timestamp = chrono::DateTime::<Utc>::from_timestamp(expires_at as i64, 0)
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| expires_at.to_string());
+        lines.push(format!("  Expires:    {timestamp}"));
+    }
+    lines.push(format!("  Status:     {status}"));
+    if v.status == "expired" {
+        lines.push(format!(
+            "  Fix:        bt login --refresh --profile {}",
+            shell_quote_arg(&v.name)
+        ));
+    }
+    lines.join("\n")
 }
 
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
@@ -5000,7 +5066,7 @@ mod tests {
     }
 
     #[test]
-    fn format_verification_line_ok_with_identity() {
+    fn format_verification_block_ok_with_identity() {
         let v = ProfileVerification {
             name: "work".into(),
             auth: "oauth".into(),
@@ -5010,17 +5076,20 @@ mod tests {
             user_name: Some("Alice".into()),
             user_email: Some("alice@example.com".into()),
             api_key_hint: None,
+            expires_at: Some(1_800_000_000),
             status: "ok".into(),
             error: None,
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "work — https://app.test.example — oauth — api: https://api.test.example — org: acme — Alice (alice@example.com)"
-        );
+        let block = format_verification_block(&v, true);
+        assert!(block.contains("work (selected)"));
+        assert!(block.contains("Auth:       oauth, Alice <alice@example.com>"));
+        assert!(block.contains("Org:        acme"));
+        assert!(block.contains("API URL:    https://api.test.example"));
+        assert!(block.contains("Status:     Ready"));
     }
 
     #[test]
-    fn format_verification_line_ok_with_api_key_hint() {
+    fn format_verification_block_ok_with_api_key_hint() {
         let v = ProfileVerification {
             name: "work".into(),
             auth: "api_key".into(),
@@ -5030,17 +5099,18 @@ mod tests {
             user_name: None,
             user_email: None,
             api_key_hint: Some("sk-****zhJwO".into()),
+            expires_at: None,
             status: "ok".into(),
             error: None,
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "work — https://app.test.example — api_key — org: acme — sk-****zhJwO"
-        );
+        let block = format_verification_block(&v, false);
+        assert!(block.contains("Auth:       api_key, sk-****zhJwO"));
+        assert!(block.contains("Org:        acme"));
+        assert!(block.contains("Status:     Ready"));
     }
 
     #[test]
-    fn format_verification_line_expired() {
+    fn format_verification_block_expired() {
         let v = ProfileVerification {
             name: "old".into(),
             auth: "oauth".into(),
@@ -5050,17 +5120,20 @@ mod tests {
             user_name: None,
             user_email: None,
             api_key_hint: None,
+            expires_at: Some(1_700_000_000),
             status: "expired".into(),
             error: None,
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "old — https://app.test.example — oauth — token expired"
-        );
+        let block = format_verification_block(&v, true);
+        assert!(block.contains("old (selected)"));
+        assert!(block.contains("Auth:       oauth"));
+        assert!(block.contains("Expires:    2023-11-14T22:13:20+00:00"));
+        assert!(block.contains("Status:     Needs refresh"));
+        assert!(block.contains("bt login --refresh --profile old"));
     }
 
     #[test]
-    fn format_verification_line_error() {
+    fn format_verification_block_error() {
         let v = ProfileVerification {
             name: "bad".into(),
             auth: "api_key".into(),
@@ -5070,13 +5143,13 @@ mod tests {
             user_name: None,
             user_email: None,
             api_key_hint: None,
+            expires_at: None,
             status: "error".into(),
             error: Some("invalid API key".into()),
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "bad — https://app.test.example — api_key — org: corp — invalid API key"
-        );
+        let block = format_verification_block(&v, false);
+        assert!(block.contains("Org:        corp"));
+        assert!(block.contains("Status:     invalid API key"));
     }
 
     #[tokio::test]
