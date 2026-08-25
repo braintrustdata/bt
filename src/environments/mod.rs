@@ -63,15 +63,26 @@ impl Selector {
 
 #[derive(Debug, Clone, Args)]
 struct CreateArgs {
-    /// Display name for the environment
+    /// Display name for the environment (positional)
     #[arg(value_name = "NAME")]
-    name: Option<String>,
+    name_positional: Option<String>,
+    /// Display name for the environment (flag)
+    #[arg(long = "name")]
+    name_flag: Option<String>,
     /// URL-friendly slug, unique within the organization
     #[arg(long)]
     slug: Option<String>,
     /// Environment description
     #[arg(long)]
     description: Option<String>,
+}
+
+impl CreateArgs {
+    fn name(&self) -> Option<&str> {
+        self.name_positional
+            .as_deref()
+            .or(self.name_flag.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -177,9 +188,9 @@ async fn view(client: &ApiClient, slug: Option<&str>, json: bool) -> Result<()> 
 
 async fn create(client: &ApiClient, args: CreateArgs, json: bool) -> Result<()> {
     let name = required(
-        args.name.as_deref(),
+        args.name(),
         "Environment name",
-        "environment name required",
+        "environment name required. Use: bt environments create --name <name> --slug <slug>",
     )?;
     let slug = required(
         args.slug.as_deref(),
