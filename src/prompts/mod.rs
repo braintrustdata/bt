@@ -9,6 +9,7 @@ mod api;
 mod assign;
 mod delete;
 mod list;
+mod versions;
 mod view;
 
 #[derive(Debug, Clone, Args)]
@@ -16,6 +17,7 @@ mod view;
 Examples:
   bt prompts list
   bt prompts list --environment production
+  bt prompts versions my-prompt
   bt prompts view my-prompt --environment production
   bt prompts assign my-prompt --environment production --version 1234
   bt prompts unassign my-prompt --environment production
@@ -32,6 +34,8 @@ enum PromptsCommands {
     List(ListArgs),
     /// View a prompt's content
     View(ViewArgs),
+    /// List all versions of a prompt
+    Versions(PromptSlugArgs),
     /// Assign a prompt version to an environment
     Assign(AssignArgs),
     /// Unassign a prompt from an environment
@@ -80,7 +84,7 @@ pub struct ListArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct ViewArgs {
+struct PromptSlugArgs {
     /// Prompt slug (positional)
     #[arg(value_name = "SLUG")]
     slug_positional: Option<String>,
@@ -88,6 +92,20 @@ pub struct ViewArgs {
     /// Prompt slug (flag)
     #[arg(long = "slug", short = 's')]
     slug_flag: Option<String>,
+}
+
+impl PromptSlugArgs {
+    fn slug(&self) -> Option<&str> {
+        self.slug_positional
+            .as_deref()
+            .or(self.slug_flag.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ViewArgs {
+    #[command(flatten)]
+    slug: PromptSlugArgs,
 
     #[command(flatten)]
     selector: PromptSelectorArgs,
@@ -97,79 +115,32 @@ pub struct ViewArgs {
     web: bool,
 }
 
-impl ViewArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug_positional
-            .as_deref()
-            .or(self.slug_flag.as_deref())
-    }
-}
-
 #[derive(Debug, Clone, Args)]
 pub struct AssignArgs {
-    /// Prompt slug (positional)
-    #[arg(value_name = "SLUG")]
-    slug_positional: Option<String>,
-
-    /// Prompt slug (flag)
-    #[arg(long = "slug", short = 's')]
-    slug_flag: Option<String>,
+    #[command(flatten)]
+    slug: PromptSlugArgs,
 
     #[command(flatten)]
     selector: PromptSelectorArgs,
 }
 
-impl AssignArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug_positional
-            .as_deref()
-            .or(self.slug_flag.as_deref())
-    }
-}
-
 #[derive(Debug, Clone, Args)]
 pub struct UnassignArgs {
-    /// Prompt slug (positional)
-    #[arg(value_name = "SLUG")]
-    slug_positional: Option<String>,
-
-    /// Prompt slug (flag)
-    #[arg(long = "slug", short = 's')]
-    slug_flag: Option<String>,
+    #[command(flatten)]
+    slug: PromptSlugArgs,
 
     #[command(flatten)]
     environment: PromptEnvironmentArgs,
 }
 
-impl UnassignArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug_positional
-            .as_deref()
-            .or(self.slug_flag.as_deref())
-    }
-}
-
 #[derive(Debug, Clone, Args)]
 pub struct DeleteArgs {
-    /// Prompt slug (positional) of the prompt to delete
-    #[arg(value_name = "SLUG")]
-    slug_positional: Option<String>,
-
-    /// Prompt slug (flag) of the prompt to delete
-    #[arg(long = "slug", short = 's')]
-    slug_flag: Option<String>,
+    #[command(flatten)]
+    slug: PromptSlugArgs,
 
     /// Skip confirmation prompt (requires slug)
     #[arg(long, short = 'f')]
     force: bool,
-}
-
-impl DeleteArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug_positional
-            .as_deref()
-            .or(self.slug_flag.as_deref())
-    }
 }
 
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
@@ -181,13 +152,14 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         Some(PromptsCommands::List(args)) => {
             list::run(&ctx, args.environment.environment.as_deref(), base.json).await
         }
+        Some(PromptsCommands::Versions(args)) => versions::run(&ctx, args.slug(), base.json).await,
         Some(PromptsCommands::View(args)) => {
             if args.selector.version().is_some() && args.selector.environment().is_some() {
                 bail!("--version and --environment cannot be used together");
             }
             view::run(
                 &ctx,
-                args.slug(),
+                args.slug.slug(),
                 args.selector.version(),
                 args.selector.environment(),
                 base.json,
@@ -209,7 +181,7 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
                 .ok_or_else(|| anyhow!("--environment is required. {hint}"))?;
             assign::run(
                 &ctx,
-                args.slug(),
+                args.slug.slug(),
                 environment,
                 assign::Action::Assign { version },
                 base.json,
@@ -225,21 +197,25 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
                 .ok_or_else(|| anyhow!("--environment is required. {hint}"))?;
             assign::run(
                 &ctx,
-                args.slug(),
+                args.slug.slug(),
                 environment,
                 assign::Action::Unassign,
                 base.json,
             )
             .await
         }
-        Some(PromptsCommands::Delete(args)) => delete::run(&ctx, args.slug(), args.force).await,
+        Some(PromptsCommands::Delete(args)) => {
+            delete::run(&ctx, args.slug.slug(), args.force).await
+        }
     }
 }
 
 fn prompts_command_is_read_only(command: Option<&PromptsCommands>) -> bool {
     matches!(
         command,
-        None | Some(PromptsCommands::List(_)) | Some(PromptsCommands::View(_))
+        None | Some(PromptsCommands::List(_))
+            | Some(PromptsCommands::View(_))
+            | Some(PromptsCommands::Versions(_))
     )
 }
 
@@ -266,6 +242,13 @@ mod tests {
         }
     }
 
+    fn slug(slug: &str) -> PromptSlugArgs {
+        PromptSlugArgs {
+            slug_positional: Some(slug.to_string()),
+            slug_flag: None,
+        }
+    }
+
     #[test]
     fn subcommands_only_expose_supported_selectors() {
         let list =
@@ -281,6 +264,13 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unexpected argument '--version'"));
+
+        let versions = CliHarness::try_parse_from(["bt-prompts", "versions", "test-prompt"])
+            .expect("parse versions");
+        let Some(PromptsCommands::Versions(versions)) = versions.prompts.command else {
+            panic!("expected versions command");
+        };
+        assert_eq!(versions.slug(), Some("test-prompt"));
 
         let assign = CliHarness::try_parse_from([
             "bt-prompts",
@@ -309,27 +299,27 @@ mod tests {
         ))));
         assert!(prompts_command_is_read_only(Some(&PromptsCommands::View(
             ViewArgs {
-                slug_positional: Some("test-prompt".to_string()),
-                slug_flag: None,
+                slug: slug("test-prompt"),
                 selector: selectors(None, None),
                 web: false,
             }
         ))));
+        assert!(prompts_command_is_read_only(Some(
+            &PromptsCommands::Versions(slug("test-prompt"))
+        )));
     }
 
     #[test]
     fn prompts_routes_mutations_to_validated_auth() {
         assert!(!prompts_command_is_read_only(Some(
             &PromptsCommands::Assign(AssignArgs {
-                slug_positional: Some("test-prompt".to_string()),
-                slug_flag: None,
+                slug: slug("test-prompt"),
                 selector: selectors(Some("1234"), Some("production")),
             })
         )));
         assert!(!prompts_command_is_read_only(Some(
             &PromptsCommands::Delete(DeleteArgs {
-                slug_positional: Some("test-prompt".to_string()),
-                slug_flag: None,
+                slug: slug("test-prompt"),
                 force: true,
             })
         )));

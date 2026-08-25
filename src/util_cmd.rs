@@ -388,7 +388,7 @@ fn modular_multiply(value: u64, prime: u64) -> u64 {
     ((value as u128 * prime as u128) % MODULUS) as u64
 }
 
-fn prettify_xact(value: u64) -> String {
+pub(crate) fn prettify_xact(value: u64) -> String {
     let encoded = modular_multiply(value, COPRIME);
     format!("{encoded:016x}")
 }

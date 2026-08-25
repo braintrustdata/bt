@@ -149,7 +149,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt view`         | View logs, traces, and spans                                        |
 | `bt projects`     | Manage projects (list, create, view, delete)                        |
 | `bt datasets`     | Manage remote datasets (list, create, update, view, delete)         |
-| `bt prompts`      | Manage prompts (list, view, delete)                                 |
+| `bt prompts`      | Manage prompts (list, view, versions, assign, delete)               |
 | `bt scorers`      | Manage scorers (list, create, view, invoke, delete)                 |
 | `bt environments` | Manage deployment environments (list, view, create, update, delete) |
 | `bt sync`         | Synchronize project logs between Braintrust and local NDJSON files  |
