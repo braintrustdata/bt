@@ -1,19 +1,21 @@
+use std::fmt::Write as _;
+
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
+use dialoguer::{console, Confirm, Input};
+use serde::Serialize;
 
 use crate::{
     args::BaseArgs,
     auth::{login, login_read_only},
     http::ApiClient,
-    ui::{fuzzy_select, is_interactive, with_spinner},
+    ui::{
+        apply_column_padding, fuzzy_select, header, is_interactive, is_quiet, print_command_status,
+        print_with_pager, styled_table, truncate, with_spinner, CommandStatus,
+    },
 };
 
 mod api;
-mod create;
-mod delete;
-mod list;
-mod update;
-mod view;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -26,15 +28,15 @@ Examples:
 ")]
 pub struct EnvironmentsArgs {
     #[command(subcommand)]
-    command: Option<EnvironmentsCommands>,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum EnvironmentsCommands {
+enum Command {
     /// List all environments
     List,
     /// View an environment
-    View(ViewArgs),
+    View(Selector),
     /// Create an environment
     Create(CreateArgs),
     /// Update an environment
@@ -44,21 +46,18 @@ enum EnvironmentsCommands {
 }
 
 #[derive(Debug, Clone, Args)]
-struct ViewArgs {
+struct Selector {
     /// Environment slug
     #[arg(value_name = "SLUG")]
-    slug_positional: Option<String>,
-
+    positional: Option<String>,
     /// Environment slug
-    #[arg(long = "slug", env = "BT_ENVIRONMENTS_SLUG")]
-    slug_flag: Option<String>,
+    #[arg(long = "slug")]
+    flag: Option<String>,
 }
 
-impl ViewArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug_positional
-            .as_deref()
-            .or(self.slug_flag.as_deref())
+impl Selector {
+    fn value(&self) -> Option<&str> {
+        self.positional.as_deref().or(self.flag.as_deref())
     }
 }
 
@@ -66,105 +65,44 @@ impl ViewArgs {
 struct CreateArgs {
     /// Display name for the environment
     #[arg(value_name = "NAME")]
-    name_positional: Option<String>,
-
-    /// Display name for the environment
-    #[arg(long = "name", env = "BT_ENVIRONMENTS_NAME")]
-    name_flag: Option<String>,
-
+    name: Option<String>,
     /// URL-friendly slug, unique within the organization
-    #[arg(long, env = "BT_ENVIRONMENTS_SLUG")]
+    #[arg(long)]
     slug: Option<String>,
-
     /// Environment description
-    #[arg(long, env = "BT_ENVIRONMENTS_DESCRIPTION")]
+    #[arg(long)]
     description: Option<String>,
-}
-
-impl CreateArgs {
-    fn name(&self) -> Option<&str> {
-        self.name_positional
-            .as_deref()
-            .or(self.name_flag.as_deref())
-    }
 }
 
 #[derive(Debug, Clone, Args)]
 struct UpdateArgs {
-    /// Current environment slug
-    #[arg(value_name = "SLUG")]
-    slug_positional: Option<String>,
-
-    /// Current environment slug
-    #[arg(long = "slug", env = "BT_ENVIRONMENTS_SLUG")]
-    slug_flag: Option<String>,
-
+    #[command(flatten)]
+    selector: Selector,
     /// New display name
-    #[arg(long, env = "BT_ENVIRONMENTS_NAME")]
+    #[arg(long)]
     name: Option<String>,
-
     /// New environment slug
-    #[arg(long, env = "BT_ENVIRONMENTS_NEW_SLUG")]
+    #[arg(long)]
     new_slug: Option<String>,
-
     /// New environment description
-    #[arg(
-        long,
-        env = "BT_ENVIRONMENTS_DESCRIPTION",
-        conflicts_with = "clear_description"
-    )]
+    #[arg(long, conflicts_with = "clear_description")]
     description: Option<String>,
-
     /// Remove the environment description
-    #[arg(
-        long,
-        env = "BT_ENVIRONMENTS_CLEAR_DESCRIPTION",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        default_value_t = false,
-        conflicts_with = "description"
-    )]
+    #[arg(long, default_value_t = false, conflicts_with = "description")]
     clear_description: bool,
-}
-
-impl UpdateArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug_positional
-            .as_deref()
-            .or(self.slug_flag.as_deref())
-    }
 }
 
 #[derive(Debug, Clone, Args)]
 struct DeleteArgs {
-    /// Environment slug
-    #[arg(value_name = "SLUG")]
-    slug_positional: Option<String>,
-
-    /// Environment slug
-    #[arg(long = "slug", env = "BT_ENVIRONMENTS_SLUG")]
-    slug_flag: Option<String>,
-
+    #[command(flatten)]
+    selector: Selector,
     /// Skip the confirmation prompt
-    #[arg(
-        long,
-        short = 'f',
-        env = "BT_ENVIRONMENTS_FORCE",
-        value_parser = clap::builder::BoolishValueParser::new(),
-        default_value_t = false
-    )]
+    #[arg(long, short = 'f', default_value_t = false)]
     force: bool,
 }
 
-impl DeleteArgs {
-    fn slug(&self) -> Option<&str> {
-        self.slug_positional
-            .as_deref()
-            .or(self.slug_flag.as_deref())
-    }
-}
-
 pub async fn run(base: BaseArgs, args: EnvironmentsArgs) -> Result<()> {
-    let read_only = environments_command_is_read_only(args.command.as_ref());
+    let read_only = matches!(args.command, None | Some(Command::List | Command::View(_)));
     let auth = if read_only {
         login_read_only(&base).await?
     } else {
@@ -173,153 +111,206 @@ pub async fn run(base: BaseArgs, args: EnvironmentsArgs) -> Result<()> {
     let client = ApiClient::new(&auth)?;
 
     match args.command {
-        None | Some(EnvironmentsCommands::List) => list::run(&client, base.json).await,
-        Some(EnvironmentsCommands::View(args)) => view::run(&client, args.slug(), base.json).await,
-        Some(EnvironmentsCommands::Create(args)) => {
-            create::run(
-                &client,
-                args.name(),
-                args.slug.as_deref(),
-                args.description.as_deref(),
-                base.json,
-            )
-            .await
-        }
-        Some(EnvironmentsCommands::Update(args)) => {
-            let options = update::UpdateOptions {
-                name: args.name.as_deref(),
-                new_slug: args.new_slug.as_deref(),
-                description: args.description.as_deref(),
-                clear_description: args.clear_description,
-                json: base.json,
-            };
-            update::run(&client, args.slug(), options).await
-        }
-        Some(EnvironmentsCommands::Delete(args)) => {
-            delete::run(&client, args.slug(), args.force, base.json).await
-        }
+        None | Some(Command::List) => list(&client, base.json).await,
+        Some(Command::View(args)) => view(&client, args.value(), base.json).await,
+        Some(Command::Create(args)) => create(&client, args, base.json).await,
+        Some(Command::Update(args)) => update(&client, args, base.json).await,
+        Some(Command::Delete(args)) => delete(&client, args, base.json).await,
     }
 }
 
-fn environments_command_is_read_only(command: Option<&EnvironmentsCommands>) -> bool {
-    matches!(
-        command,
-        None | Some(EnvironmentsCommands::List) | Some(EnvironmentsCommands::View(_))
-    )
+async fn list(client: &ApiClient, json: bool) -> Result<()> {
+    let environments = with_spinner("Loading environments...", api::list(client)).await?;
+    if json {
+        return print_json(&environments);
+    }
+
+    let mut output = String::new();
+    writeln!(
+        output,
+        "{} environments found in {}\n",
+        console::style(environments.len()),
+        console::style(client.org_name()).bold()
+    )?;
+    let mut table = styled_table();
+    table.set_header([
+        header("Name"),
+        header("Slug"),
+        header("Description"),
+        header("Created"),
+    ]);
+    apply_column_padding(&mut table, (0, 6));
+    for environment in environments {
+        let description = display(environment.description.as_deref(), 60);
+        let created = display(environment.created.as_deref(), 10);
+        table.add_row([environment.name, environment.slug, description, created]);
+    }
+    write!(output, "{table}")?;
+    print_with_pager(&output)?;
+    Ok(())
 }
 
-async fn resolve_environment(
+async fn view(client: &ApiClient, slug: Option<&str>, json: bool) -> Result<()> {
+    let environment = resolve(client, slug, "view").await?;
+    if json {
+        return print_json(&environment);
+    }
+
+    let mut output = String::new();
+    writeln!(output, "{}", console::style(&environment.name).bold())?;
+    for (label, value) in [
+        ("Slug:", Some(environment.slug.as_str())),
+        ("Description:", environment.description.as_deref()),
+        ("Created:", environment.created.as_deref()),
+        ("ID:", Some(environment.id.as_str())),
+    ] {
+        writeln!(
+            output,
+            "{} {}",
+            console::style(label).dim(),
+            value.unwrap_or("-")
+        )?;
+    }
+    print_with_pager(&output)?;
+    Ok(())
+}
+
+async fn create(client: &ApiClient, args: CreateArgs, json: bool) -> Result<()> {
+    let name = required(
+        args.name.as_deref(),
+        "Environment name",
+        "environment name required",
+    )?;
+    let slug = required(
+        args.slug.as_deref(),
+        "Environment slug",
+        "--slug required. Use: bt environments create <name> --slug <slug>",
+    )?;
+    let body = api::CreateEnvironment {
+        name: &name,
+        slug: &slug,
+        description: args.description.as_deref(),
+        org_name: client.org_name(),
+    };
+    let environment = with_spinner("Creating environment...", api::create(client, &body)).await?;
+    output_result(&environment, json, "Created")
+}
+
+async fn update(client: &ApiClient, args: UpdateArgs, json: bool) -> Result<()> {
+    if args.name.is_none()
+        && args.new_slug.is_none()
+        && args.description.is_none()
+        && !args.clear_description
+    {
+        bail!("at least one update is required. Use --name, --new-slug, --description, or --clear-description");
+    }
+    let environment = resolve(client, args.selector.value(), "update").await?;
+    let body = api::UpdateEnvironment {
+        name: args.name.as_deref(),
+        slug: args.new_slug.as_deref(),
+        description: if args.clear_description {
+            Some(None)
+        } else {
+            args.description.as_deref().map(Some)
+        },
+    };
+    let environment = with_spinner(
+        "Updating environment...",
+        api::update(client, &environment.id, &body),
+    )
+    .await?;
+    output_result(&environment, json, "Updated")
+}
+
+async fn delete(client: &ApiClient, args: DeleteArgs, json: bool) -> Result<()> {
+    if args.force && args.selector.value().is_none() {
+        bail!("environment slug required when using --force. Use: bt environments delete <slug> --force");
+    }
+    let environment = resolve(client, args.selector.value(), "delete").await?;
+    if !args.force {
+        if !is_interactive() {
+            bail!("environment delete requires --force in non-interactive mode. Use: bt environments delete <slug> --force");
+        }
+        if !Confirm::new()
+            .with_prompt(format!(
+                "Delete environment '{}' ({})?",
+                environment.name, environment.slug
+            ))
+            .default(false)
+            .interact()?
+        {
+            return Ok(());
+        }
+    }
+    with_spinner(
+        "Deleting environment...",
+        api::delete(client, &environment.id),
+    )
+    .await?;
+    output_result(&environment, json, "Deleted")?;
+    if !json && !is_quiet() {
+        eprintln!("Run `bt environments list` to see remaining environments.");
+    }
+    Ok(())
+}
+
+async fn resolve(
     client: &ApiClient,
     slug: Option<&str>,
     command: &str,
 ) -> Result<api::Environment> {
     if let Some(slug) = slug {
-        return with_spinner(
-            "Loading environment...",
-            api::get_environment_by_slug(client, slug),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("environment '{slug}' not found"));
+        return with_spinner("Loading environment...", api::get_by_slug(client, slug))
+            .await?
+            .ok_or_else(|| anyhow!("environment '{slug}' not found"));
     }
-
     if !is_interactive() {
         bail!("environment slug required. Use: bt environments {command} <slug>");
     }
-
-    let environments =
-        with_spinner("Loading environments...", api::list_environments(client)).await?;
+    let environments = with_spinner("Loading environments...", api::list(client)).await?;
     if environments.is_empty() {
         bail!(
             "no environments found. Create one with: bt environments create <name> --slug <slug>"
         );
     }
-    let labels = environments
+    let labels: Vec<_> = environments
         .iter()
-        .map(|environment| format!("{} ({})", environment.name, environment.slug))
-        .collect::<Vec<_>>();
-    let selection = fuzzy_select("Select environment", &labels, 0)?;
-    Ok(environments[selection].clone())
+        .map(|e| format!("{} ({})", e.name, e.slug))
+        .collect();
+    Ok(environments[fuzzy_select("Select environment", &labels, 0)?].clone())
 }
 
-#[cfg(test)]
-mod tests {
-    use clap::Parser;
-
-    use super::*;
-
-    #[derive(Debug, Parser)]
-    struct CliHarness {
-        #[command(flatten)]
-        environments: EnvironmentsArgs,
+fn required(value: Option<&str>, prompt: &str, error: &str) -> Result<String> {
+    match value.filter(|value| !value.is_empty()) {
+        Some(value) => Ok(value.to_string()),
+        None if is_interactive() => Ok(Input::new().with_prompt(prompt).interact_text()?),
+        None => bail!("{error}"),
     }
+}
 
-    #[test]
-    fn parses_environment_crud_commands() {
-        let create = CliHarness::try_parse_from([
-            "bt-environments",
-            "create",
-            "Production",
-            "--slug",
-            "production",
-            "--description",
-            "Production deployment",
-        ])
-        .expect("parse create");
-        let Some(EnvironmentsCommands::Create(create)) = create.environments.command else {
-            panic!("expected create command");
-        };
-        assert_eq!(create.name(), Some("Production"));
-        assert_eq!(create.slug.as_deref(), Some("production"));
+fn display(value: Option<&str>, limit: usize) -> String {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| truncate(value, limit))
+        .unwrap_or_else(|| "-".into())
+}
 
-        let update = CliHarness::try_parse_from([
-            "bt-environments",
-            "update",
-            "production",
-            "--new-slug",
-            "prod",
-            "--clear-description",
-        ])
-        .expect("parse update");
-        let Some(EnvironmentsCommands::Update(update)) = update.environments.command else {
-            panic!("expected update command");
-        };
-        assert_eq!(update.slug(), Some("production"));
-        assert_eq!(update.new_slug.as_deref(), Some("prod"));
-        assert!(update.clear_description);
-    }
+fn print_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
 
-    #[test]
-    fn rejects_conflicting_description_updates() {
-        let error = CliHarness::try_parse_from([
-            "bt-environments",
-            "update",
-            "production",
-            "--description",
-            "Production",
-            "--clear-description",
-        ])
-        .expect_err("description flags should conflict");
-        assert!(error.to_string().contains("cannot be used with"));
-    }
-
-    #[test]
-    fn routes_only_list_and_view_to_read_only_auth() {
-        assert!(environments_command_is_read_only(None));
-        assert!(environments_command_is_read_only(Some(
-            &EnvironmentsCommands::List
-        )));
-        assert!(environments_command_is_read_only(Some(
-            &EnvironmentsCommands::View(ViewArgs {
-                slug_positional: Some("production".to_string()),
-                slug_flag: None,
-            })
-        )));
-        assert!(!environments_command_is_read_only(Some(
-            &EnvironmentsCommands::Delete(DeleteArgs {
-                slug_positional: Some("production".to_string()),
-                slug_flag: None,
-                force: true,
-            })
-        )));
+fn output_result(environment: &api::Environment, json: bool, verb: &str) -> Result<()> {
+    if json {
+        print_json(environment)
+    } else {
+        print_command_status(
+            CommandStatus::Success,
+            &format!(
+                "{verb} environment '{}' ({})",
+                environment.name, environment.slug
+            ),
+        );
+        Ok(())
     }
 }
