@@ -22,7 +22,7 @@ mod api;
 Examples:
   bt environments list
   bt environments view production
-  bt environments create Production --slug production
+  bt environments create Production
   bt environments update production --description \"Production deployment\"
   bt environments delete production --force
 ")]
@@ -69,7 +69,7 @@ struct CreateArgs {
     /// Display name for the environment (flag)
     #[arg(long = "name")]
     name_flag: Option<String>,
-    /// URL-friendly slug, unique within the organization
+    /// Unique slug within the organization (defaults to a slug generated from the name)
     #[arg(long)]
     slug: Option<String>,
     /// Environment description
@@ -190,13 +190,9 @@ async fn create(client: &ApiClient, args: CreateArgs, json: bool) -> Result<()> 
     let name = required(
         args.name(),
         "Environment name",
-        "environment name required. Use: bt environments create --name <name> --slug <slug>",
+        "environment name required. Use: bt environments create --name <name>",
     )?;
-    let slug = required(
-        args.slug.as_deref(),
-        "Environment slug",
-        "--slug required. Use: bt environments create <name> --slug <slug>",
-    )?;
+    let slug = create_slug(args.slug.as_deref(), &name)?;
     let body = api::CreateEnvironment {
         name: &name,
         slug: &slug,
@@ -253,7 +249,7 @@ async fn delete(client: &ApiClient, args: DeleteArgs, json: bool) -> Result<()> 
             return Ok(());
         }
     }
-    with_spinner(
+    let environment = with_spinner(
         "Deleting environment...",
         api::delete(client, &environment.id),
     )
@@ -291,6 +287,39 @@ async fn resolve(
     Ok(environments[fuzzy_select("Select environment", &labels, 0)?].clone())
 }
 
+fn create_slug(slug: Option<&str>, name: &str) -> Result<String> {
+    let slug = match slug {
+        Some("") => {
+            bail!("--slug cannot be empty. Omit --slug to generate one from the environment name.")
+        }
+        Some(slug) => slug.to_string(),
+        None => slugify_environment_name(name),
+    };
+    if slug.is_empty() {
+        bail!("could not generate a slug from the environment name; pass --slug explicitly");
+    }
+    Ok(slug)
+}
+
+fn slugify_environment_name(value: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+
+    for character in value.trim().chars() {
+        if character.is_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.extend(character.to_lowercase());
+            pending_separator = false;
+        } else if !slug.is_empty() {
+            pending_separator = true;
+        }
+    }
+
+    slug
+}
+
 fn required(value: Option<&str>, prompt: &str, error: &str) -> Result<String> {
     match value.filter(|value| !value.is_empty()) {
         Some(value) => Ok(value.to_string()),
@@ -323,5 +352,29 @@ fn output_result(environment: &api::Environment, json: bool, verb: &str) -> Resu
             ),
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_slug;
+
+    #[test]
+    fn create_slug_normalizes_default_from_name() {
+        assert_eq!(
+            create_slug(None, "  Test   Environment  ").unwrap(),
+            "test-environment"
+        );
+    }
+
+    #[test]
+    fn create_slug_collapses_non_alphanumeric_characters() {
+        assert_eq!(create_slug(None, "Test / Preview").unwrap(), "test-preview");
+    }
+
+    #[test]
+    fn create_slug_preserves_explicit_slug() {
+        let slug = "custom-slug";
+        assert_eq!(create_slug(Some(slug), "Environment").unwrap(), slug);
     }
 }
