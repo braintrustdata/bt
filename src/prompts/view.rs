@@ -31,7 +31,34 @@ pub async fn run(
             if !crate::ui::is_interactive() {
                 bail!("prompt slug required. Use: bt prompts view <slug>");
             }
-            select_prompt_interactive(&ctx.client, project_name).await?
+            let selected = select_prompt_interactive(&ctx.client, project_name).await?;
+            if version.is_some() || environment.is_some() {
+                with_spinner(
+                    "Loading prompt...",
+                    api::get_prompt_by_slug(
+                        &ctx.client,
+                        project_name,
+                        &selected.slug,
+                        version,
+                        environment,
+                    ),
+                )
+                .await?
+                .ok_or_else(|| {
+                    let selector = version
+                        .map(|version| format!("version {version}"))
+                        .or_else(|| {
+                            environment.map(|environment| format!("environment {environment}"))
+                        })
+                        .unwrap_or_default();
+                    anyhow!(
+                        "prompt with slug '{}' not found at {selector}",
+                        selected.slug
+                    )
+                })?
+            } else {
+                selected
+            }
         }
     };
 
@@ -64,7 +91,12 @@ pub async fn run(
         )?;
     }
     if let Some(version) = prompt._xact_id.as_deref().or(version) {
-        writeln!(output, "{} {}", console::style("Version:").dim(), version)?;
+        writeln!(
+            output,
+            "{} {}",
+            console::style("Version:").dim(),
+            display_version(version)
+        )?;
     }
 
     let options = prompt.prompt_data.as_ref().and_then(|pd| pd.get("options"));
@@ -90,4 +122,27 @@ pub async fn run(
 
     print_with_pager(&output)?;
     Ok(())
+}
+
+fn display_version(version: &str) -> String {
+    if version.len() == 16 && version.chars().all(|c| c.is_ascii_hexdigit()) {
+        return version.to_string();
+    }
+
+    version
+        .parse::<u64>()
+        .map(crate::util_cmd::prettify_xact)
+        .unwrap_or_else(|_| version.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_version;
+
+    #[test]
+    fn display_version_uses_pretty_encoding_for_xact_ids() {
+        assert_eq!(display_version("1000192656880881099"), "81cd05ee665fdfb3");
+        assert_eq!(display_version("81cd05ee665fdfb3"), "81cd05ee665fdfb3");
+        assert_eq!(display_version("1234567890123456"), "1234567890123456");
+    }
 }
