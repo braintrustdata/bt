@@ -398,6 +398,11 @@ fn apply_base_arg_sources(matches: &ArgMatches, base: &mut LoginBaseArgs) {
     base.verbose_source = find_value_source(matches, "verbose").and_then(map_value_source);
     base.quiet_source = find_value_source(matches, "quiet").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
+
+    if !matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) {
+        base.api_key = None;
+        base.api_key_source = None;
+    }
 }
 
 fn apply_base_output_defaults(command: &mut Commands) {
@@ -609,27 +614,6 @@ mod tests {
             Some(value) => env::set_var(key, value),
             None => env::remove_var(key),
         }
-    }
-
-    #[test]
-    fn apply_base_arg_sources_tracks_cli_api_key() {
-        let _guard = env_test_lock().lock().expect("env test lock");
-        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
-        env::remove_var("BRAINTRUST_API_KEY");
-
-        let matches = Cli::command()
-            .try_get_matches_from(["bt", "status", "--api-key", "secret"])
-            .expect("matches");
-        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
-
-        apply_base_arg_sources(&matches, cli.command.base_mut());
-
-        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
-
-        assert_eq!(
-            cli.command.base().api_key_source,
-            Some(ArgValueSource::CommandLine)
-        );
     }
 
     #[test]

@@ -2200,12 +2200,7 @@ async fn build_setup_auth_context(
 }
 
 fn should_create_api_key_for_setup(is_oauth: bool, base: &BaseArgs, needs_api_key: bool) -> bool {
-    needs_api_key
-        && is_oauth
-        && !matches!(
-            base.api_key_source,
-            Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
-        )
+    needs_api_key && is_oauth && !matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
 }
 
 async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> Result<String> {

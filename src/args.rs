@@ -46,14 +46,18 @@ pub struct LoginBaseArgs {
     #[arg(skip = false)]
     pub profile_explicit: bool,
 
-    /// Override stored API key (or via BRAINTRUST_API_KEY)
-    #[arg(long, env = "BRAINTRUST_API_KEY", global = true, hide = true)]
+    #[arg(
+        long = "braintrust-internal-api-key-environment-binding-do-not-use",
+        env = "BRAINTRUST_API_KEY",
+        global = true,
+        hide = true
+    )]
     pub api_key: Option<String>,
 
     #[arg(skip)]
     pub api_key_source: Option<ArgValueSource>,
 
-    /// Prefer profile credentials even if BRAINTRUST_API_KEY/--api-key is set.
+    /// Prefer profile credentials even if BRAINTRUST_API_KEY is set.
     #[arg(long, global = true)]
     pub prefer_profile: bool,
 

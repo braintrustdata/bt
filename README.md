@@ -361,7 +361,7 @@ Local version and pagination-key conversion helpers:
 Auth resolution order for commands is:
 
 1. Explicit `--profile`
-2. `--api-key` or `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
+2. `BRAINTRUST_API_KEY` (unless `--prefer-profile` is set)
 3. `BRAINTRUST_PROFILE`
 4. Compatible profile for the selected app URL and organization
 5. Single-profile auto-select (if only one compatible profile exists)
