@@ -34,6 +34,15 @@ fn bt_trace_command(config_home: &Path, profile: &str, org: &str) -> Command {
     cmd
 }
 
+fn bt_trace_environment_command(config_home: &Path) -> Command {
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("XDG_CONFIG_HOME", config_home)
+        .env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org");
+    cmd
+}
+
 fn write_executable(path: &Path) {
     fs::write(path, "#!/bin/sh\nexit 0\n").expect("write executable");
     #[cfg(unix)]
@@ -71,7 +80,7 @@ esac
 fn write_run_agent(path: &Path) {
     fs::write(
         path,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_DAEMON_ENV\" ]; then printf '%s\\n%s\\n' \"$BT_DAEMON_SOCKET\" \"$BT_DAEMON_DATA_DIR\" > \"$AGENT_RUN_DAEMON_ENV\"; fi\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n",
     )
     .expect("write fake run agent");
     use std::os::unix::fs::PermissionsExt;
@@ -291,6 +300,54 @@ fn status_verbose_explicitly_shows_unset_profile() {
         .assert()
         .success()
         .stdout(predicate::str::contains("profile: (unset)"));
+}
+
+#[test]
+fn bare_status_does_not_render_the_all_profiles_report() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Saved login profiles").not())
+        .stdout(predicate::str::contains("Credential precedence").not())
+        .stdout(predicate::str::contains("Profile metadata").not())
+        .stdout(predicate::str::contains("Secret storage").not());
+}
+
+#[test]
+fn status_all_only_shows_precedence_for_an_active_override() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+
+    let mut without_override = bt_command();
+    clear_braintrust_auth_env(&mut without_override);
+    without_override
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Saved login profiles"))
+        .stdout(predicate::str::contains("Credential precedence").not());
+
+    let mut with_override = bt_command();
+    clear_braintrust_auth_env(&mut with_override);
+    with_override
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_API_KEY", "synthetic-api-key")
+        .args(["status", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Credential precedence"))
+        .stdout(predicate::str::contains(
+            "BRAINTRUST_API_KEY overrides saved profiles",
+        ));
 }
 
 #[cfg(unix)]
@@ -642,10 +699,14 @@ fn trace_commands_require_a_project_non_interactively() {
     ] {
         let home = tempfile::tempdir().expect("home tempdir");
         let config_home = tempfile::tempdir().expect("config tempdir");
+        write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+        write_profile_secrets(config_home.path(), &["test-profile"]);
         let mut cmd = bt_command();
         clear_braintrust_auth_env(&mut cmd);
         cmd.env("HOME", home.path())
             .env("XDG_CONFIG_HOME", config_home.path())
+            .env("BRAINTRUST_PROFILE", "test-profile")
+            .env("BRAINTRUST_ORG_NAME", "test-org")
             .args(args)
             .assert()
             .failure()
@@ -684,9 +745,21 @@ fn trace_commands_require_an_org_when_the_credential_resolves_none() {
         let config_home = tempfile::tempdir().expect("config tempdir");
         let mut cmd = bt_command();
         clear_braintrust_auth_env(&mut cmd);
+        if args[1] == "setup" {
+            let auth_dir = config_home.path().join("bt");
+            fs::create_dir_all(&auth_dir).expect("create auth dir");
+            fs::write(
+                auth_dir.join("auth.json"),
+                r#"{"profiles":{"test-profile":{"auth_kind":"api_key"}}}"#,
+            )
+            .expect("write unbound profile");
+            write_profile_secrets(config_home.path(), &["test-profile"]);
+            cmd.env("BRAINTRUST_PROFILE", "test-profile");
+        } else {
+            cmd.env("BRAINTRUST_API_KEY", "test-api-key");
+        }
         cmd.env("HOME", home.path())
             .env("XDG_CONFIG_HOME", config_home.path())
-            .env("BRAINTRUST_API_KEY", "test-api-key")
             .args(args)
             .assert()
             .failure()
@@ -750,14 +823,16 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let run_log = state_dir.path().join("run.log");
     let run_settings = state_dir.path().join("run-settings.json");
+    let run_daemon_env = state_dir.path().join("run-daemon-env.txt");
     let setup_settings = state_dir.path().join("setup-settings.json");
     write_run_agent(&bin_dir.path().join("codex"));
 
-    bt_trace_command(config_home.path(), "test-profile", "test-org")
+    bt_trace_environment_command(config_home.path())
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_RUN_LOG", &run_log)
         .env("AGENT_RUN_SETTINGS", &run_settings)
+        .env("AGENT_RUN_DAEMON_ENV", &run_daemon_env)
         .env("BT_DAEMON_CONFIG", &setup_settings)
         .args([
             "trace",
@@ -780,10 +855,46 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
         settings["route"]["destination"]["project_name"],
         "invocation-project"
     );
+    assert_eq!(settings["route"]["auth"]["source"], "environment");
+    assert!(settings["route"]["auth"].get("profile").is_none());
+    let daemon_env = fs::read_to_string(run_daemon_env).expect("read managed daemon environment");
+    let mut daemon_env = daemon_env.lines();
+    let socket = daemon_env.next().expect("managed daemon socket");
+    let data_dir = daemon_env.next().expect("managed daemon data directory");
+    assert!(socket.contains("bt-trace-run-"));
+    assert!(data_dir.contains("bt-trace-run-"));
     assert!(
         !setup_settings.exists(),
         "managed run must not change persistent setup settings"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_enable_requires_durable_saved_profile_auth() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+
+    bt_trace_environment_command(config_home.path())
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
+        .args(["trace", "enable", "codex", "--project", "agent-traces"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "persistent coding-agent tracing requires a saved Braintrust profile",
+        ))
+        .stderr(predicate::str::contains(
+            "bt login --profile <NAME> --save-env-api-key",
+        ));
 }
 
 #[cfg(unix)]

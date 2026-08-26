@@ -24,13 +24,21 @@ struct BtTraceHost {
 }
 
 fn session_route(base: &BaseArgs) -> SessionRoute {
+    let source = if base.profile.is_some() {
+        AuthSource::SavedProfile
+    } else if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
+        && base
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+    {
+        AuthSource::Environment
+    } else {
+        AuthSource::Auto
+    };
     SessionRoute {
         auth: AuthSelection {
-            source: if base.profile.is_some() {
-                AuthSource::SavedProfile
-            } else {
-                AuthSource::Environment
-            },
+            source,
             profile_id: None,
             profile: base.profile.clone(),
             org_name: base.org_name.clone(),
@@ -53,6 +61,25 @@ fn require_saved_trace_profile(profile: Option<String>) -> anyhow::Result<String
             "coding-agent tracing requires a saved Braintrust profile; run `bt login --profile <NAME>`, then rerun this command with `--profile <NAME>`"
         )
     })
+}
+
+async fn resolve_persistent_trace_auth(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
+    base.prefer_profile = true;
+    let resolved = crate::auth::resolve_auth(&base)
+        .await
+        .map_err(|error| anyhow::anyhow!("resolve saved auth: {error}"))?;
+    let profile = require_saved_trace_profile(resolved.profile).map_err(|_| {
+        anyhow::anyhow!(
+            "persistent coding-agent tracing requires a saved Braintrust profile because hooks run in future processes; run `bt login --profile <NAME> --save-env-api-key`, then rerun with `--profile <NAME>`"
+        )
+    })?;
+    base.profile = Some(profile);
+    base.profile_explicit = true;
+    base.prefer_profile = true;
+    if base.org_name.is_none() {
+        base.org_name = resolved.org_name;
+    }
+    Ok(base)
 }
 
 fn profile_auth_diagnostic(
@@ -223,10 +250,15 @@ impl TraceHostServices for BtTraceHost {
         if !requirements.interactive_auth {
             crate::ui::set_no_input(true);
         }
-        let mut base = if requirements.destination_required {
-            resolve_trace_project(self.base.clone()).await?
+        let base = if requirements.persistent_auth {
+            resolve_persistent_trace_auth(self.base.clone()).await?
         } else {
             self.base.clone()
+        };
+        let mut base = if requirements.destination_required {
+            resolve_trace_project(base).await?
+        } else {
+            base
         };
         // Hooks tolerate an unresolved org — the daemon accepts their events
         // without one — but setup, managed run, and import bake the org into a
@@ -244,18 +276,40 @@ impl TraceHostServices for BtTraceHost {
     ) -> anyhow::Result<AuthLease> {
         let mut base = self.base.clone();
         base.no_input = true;
-        if let Some(profile_id) = &selection.profile_id {
-            let profile = crate::auth::profile_name_for_id(profile_id)?
-                .ok_or_else(|| anyhow::anyhow!(
-                    "saved profile ID '{profile_id}' no longer exists; run `bt trace enable` to select a profile"
-                ))?;
-            base.profile = Some(profile);
-            base.profile_explicit = true;
-            base.prefer_profile = true;
-        } else if let Some(profile) = &selection.profile {
-            base.profile = Some(profile.clone());
-            base.profile_explicit = true;
-            base.prefer_profile = true;
+        let selection = selection.clone().canonicalized()?;
+        match selection.source {
+            AuthSource::SavedProfile => {
+                let profile = if let Some(profile_id) = &selection.profile_id {
+                    crate::auth::profile_name_for_id(profile_id)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "saved profile ID '{profile_id}' no longer exists; run `bt trace enable` to select a profile"
+                        )
+                    })?
+                } else {
+                    selection.profile.clone().ok_or_else(|| {
+                        anyhow::anyhow!("saved-profile auth requires a profile ID or name")
+                    })?
+                };
+                base.profile = Some(profile);
+                base.profile_explicit = true;
+                base.prefer_profile = true;
+            }
+            AuthSource::Environment => {
+                if !matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
+                    || base
+                        .api_key
+                        .as_deref()
+                        .is_none_or(|key| key.trim().is_empty())
+                {
+                    anyhow::bail!(
+                        "this trace route uses environment auth, but BRAINTRUST_API_KEY is not set"
+                    );
+                }
+                base.profile = None;
+                base.profile_explicit = false;
+                base.prefer_profile = false;
+            }
+            AuthSource::Auto => {}
         }
         if let Some(org_name) = &selection.org_name {
             base.org_name = Some(org_name.clone());
@@ -266,23 +320,34 @@ impl TraceHostServices for BtTraceHost {
         let token = resolved
             .api_key
             .ok_or_else(|| anyhow::anyhow!("selected Braintrust profile has no credential"))?;
-        let profile = require_saved_trace_profile(resolved.profile)?;
+        let canonical_selection = if let Some(profile) = resolved.profile {
+            AuthSelection {
+                source: AuthSource::SavedProfile,
+                profile_id: resolved
+                    .profile_id
+                    .or_else(|| selection.profile_id.clone()),
+                profile: Some(profile),
+                org_name: resolved.org_name.clone(),
+            }
+        } else if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) {
+            AuthSelection {
+                source: AuthSource::Environment,
+                profile_id: None,
+                profile: None,
+                org_name: resolved.org_name.clone(),
+            }
+        } else {
+            anyhow::bail!(
+                "invocation-local tracing with an API key requires BRAINTRUST_API_KEY; `--api-key` cannot be forwarded safely to the tracing daemon"
+            );
+        };
         let expires_at_ms = resolved.is_oauth.then(|| {
             chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_add(5 * 60 * 1000)
         });
         Ok(AuthLease {
-            selection: AuthSelection {
-                source: if profile == "environment" {
-                    AuthSource::Environment
-                } else {
-                    AuthSource::SavedProfile
-                },
-                profile_id: resolved.profile_id.or_else(|| selection.profile_id.clone()),
-                profile: (profile != "environment").then_some(profile),
-                org_name: resolved.org_name.clone(),
-            },
+            selection: canonical_selection,
             auth: BackendAuth {
                 token,
                 api_url: resolved.api_url,
@@ -295,19 +360,39 @@ impl TraceHostServices for BtTraceHost {
     }
 
     async fn diagnose_auth(&self, selection: &AuthSelection) -> AuthDiagnostic {
-        let selected_profile = selection
-            .profile
-            .clone()
-            .or_else(|| self.base.profile.clone());
-        if let Some(profile) = selected_profile {
-            if profile == "environment" {
-                return unresolved_auth_diagnostic(
-                    "legacy_environment_route",
-                    Some(profile),
+        if selection.effective_source() == AuthSource::Environment {
+            return if matches!(self.base.api_key_source, Some(ArgValueSource::EnvVariable))
+                && self
+                    .base
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty())
+            {
+                AuthDiagnostic {
+                    status: "ready".into(),
+                    source: "environment".into(),
+                    kind: Some("api_key".into()),
+                    profile: None,
+                    org_name: selection.org_name.clone(),
+                    expires_at_ms: None,
+                    error: None,
+                }
+            } else {
+                unresolved_auth_diagnostic(
+                    "environment",
+                    None,
                     selection.org_name.clone(),
-                    "profile `environment` is not a saved login; rerun setup with --profile <NAME>",
-                );
-            }
+                    "BRAINTRUST_API_KEY is not set in the current process",
+                )
+            };
+        }
+
+        let selected_profile = selection.profile.clone().or_else(|| {
+            (selection.effective_source() == AuthSource::Auto)
+                .then(|| self.base.profile.clone())
+                .flatten()
+        });
+        if let Some(profile) = selected_profile {
             return match crate::auth::diagnose_stored_profile(&profile) {
                 Ok(verification) => profile_auth_diagnostic(
                     verification,
@@ -329,12 +414,15 @@ impl TraceHostServices for BtTraceHost {
                 Some(ArgValueSource::EnvVariable) => "environment_api_key",
                 None => "api_key_override",
             };
-            return unresolved_auth_diagnostic(
-                source,
-                None,
-                selection.org_name.clone(),
-                "coding-agent tracing requires a saved Braintrust profile; run `bt login --profile <NAME>`",
-            );
+            return AuthDiagnostic {
+                status: "ready".into(),
+                source: source.into(),
+                kind: Some("api_key".into()),
+                profile: None,
+                org_name: selection.org_name.clone(),
+                expires_at_ms: None,
+                error: None,
+            };
         }
 
         match crate::auth::list_profiles() {
@@ -397,9 +485,10 @@ pub fn context(base: BaseArgs) -> TraceHostContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::LoginBaseArgs;
 
     #[test]
-    fn tracing_rejects_environment_only_auth() {
+    fn persistent_tracing_rejects_auth_without_a_saved_profile() {
         let error = require_saved_trace_profile(None).unwrap_err();
         assert!(error
             .to_string()
@@ -442,5 +531,34 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("bt login --refresh --profile work"));
+    }
+
+    #[tokio::test]
+    async fn invocation_environment_auth_returns_an_environment_lease() {
+        let base = BaseArgs {
+            login: LoginBaseArgs {
+                api_key: Some("synthetic-api-key".into()),
+                api_key_source: Some(ArgValueSource::EnvVariable),
+                ..LoginBaseArgs::default()
+            },
+            org_name: Some("test-org".into()),
+            ..BaseArgs::default()
+        };
+        let host = BtTraceHost { base };
+        let lease = host
+            .resolve_auth(
+                &AuthSelection {
+                    source: AuthSource::Environment,
+                    profile: None,
+                    org_name: Some("test-org".into()),
+                },
+                AuthResolveReason::Initial,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lease.selection.source, AuthSource::Environment);
+        assert_eq!(lease.selection.profile, None);
+        assert_eq!(lease.auth.token, "synthetic-api-key");
+        assert_eq!(lease.auth.org_name.as_deref(), Some("test-org"));
     }
 }
