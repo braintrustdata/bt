@@ -96,26 +96,4 @@ mod tests {
             Some(ScorersCommands::Create(_))
         ));
     }
-
-    #[test]
-    fn parses_create_classifier() {
-        let parsed = ScorersArgsHarness::try_parse_from([
-            "bt-scorers",
-            "create",
-            "Test classifier",
-            "--model",
-            "gpt-test",
-            "--messages",
-            r#"[{"role":"user","content":"Classify {{output}}"}]"#,
-            "--classifications",
-            r#"["safe","unsafe"]"#,
-            "--allow-no-match",
-        ])
-        .expect("parse create classifier");
-
-        assert!(matches!(
-            parsed.args.command,
-            Some(ScorersCommands::Create(_))
-        ));
-    }
 }

@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::{
+    error::user_error,
+    http::{ApiClient, HttpError},
+};
 
 fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
@@ -65,6 +68,47 @@ pub struct InsertedFunctionResult {
     pub slug: String,
     pub found_existing: bool,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationSuggestion {
+    pub action: String,
+    #[serde(default)]
+    pub value: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationIssue {
+    pub code: String,
+    pub path: Vec<Value>,
+    pub message: String,
+    pub blocking: bool,
+    #[serde(default)]
+    pub suggestion: Option<FunctionValidationSuggestion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationResult {
+    pub issues: Vec<FunctionValidationIssue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationReport {
+    pub valid: bool,
+    pub results: Vec<FunctionValidationResult>,
+}
+
+#[derive(Debug)]
+pub struct FunctionValidationError {
+    pub report: FunctionValidationReport,
+}
+
+impl std::fmt::Display for FunctionValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the backend rejected the function definition")
+    }
+}
+
+impl std::error::Error for FunctionValidationError {}
 
 #[derive(Debug, Clone)]
 pub struct InsertFunctionsResult {
@@ -164,9 +208,43 @@ pub async fn invoke_function(
         Vec::new()
     };
     let timeout = std::time::Duration::from_secs(300);
-    client
+    let result = client
         .post_with_headers_timeout("/function/invoke", body, &headers, Some(timeout))
-        .await
+        .await;
+
+    match result {
+        Ok(value) => Ok(value),
+        Err(error)
+            if error
+                .downcast_ref::<HttpError>()
+                .is_some_and(is_provider_auth_response) =>
+        {
+            Err(user_error(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_provider_auth_response(error: &HttpError) -> bool {
+    if error.status != reqwest::StatusCode::UNAUTHORIZED
+        && error.status != reqwest::StatusCode::FORBIDDEN
+    {
+        return false;
+    }
+
+    let Ok(body) = serde_json::from_str::<Value>(&error.body) else {
+        return false;
+    };
+    let provider_error = body.get("error").unwrap_or(&body);
+    provider_error.get("code").and_then(Value::as_str) == Some("invalid_api_key")
+        || provider_error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                let message = message.to_ascii_lowercase();
+                message.contains("incorrect api key provided")
+                    || message.contains("llm provider") && message.contains("credential")
+            })
 }
 
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
@@ -283,10 +361,20 @@ pub async fn insert_functions(
     functions: &[Value],
 ) -> Result<InsertFunctionsResult> {
     let body = insert_functions_body(functions);
-    let raw: Value = client
-        .post("/insert-functions", &body)
-        .await
-        .context("failed to insert functions")?;
+    let raw: Value = match client.post("/insert-functions", &body).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            let Some(http_error) = error.downcast_ref::<HttpError>() else {
+                return Err(error).context("failed to insert functions");
+            };
+            if http_error.status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                return Err(error).context("failed to insert functions");
+            }
+            let report = serde_json::from_str(&http_error.body)
+                .context("unexpected insert-functions validation error response shape")?;
+            return Err(FunctionValidationError { report }.into());
+        }
+    };
 
     let response: InsertFunctionsResponse = serde_json::from_value(raw.clone())
         .context("unexpected insert-functions response shape")?;
@@ -332,6 +420,27 @@ fn ignored_count_from_function_results(raw: &Value, requests: &[Value]) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_auth_detection_requires_an_auth_status_and_provider_shape() {
+        let provider_error = HttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: serde_json::json!({
+                "error": {
+                    "message": "Incorrect API key provided: synthetic-key",
+                    "code": "invalid_api_key"
+                }
+            })
+            .to_string(),
+        };
+        assert!(is_provider_auth_response(&provider_error));
+
+        let bad_request = HttpError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: provider_error.body,
+        };
+        assert!(!is_provider_auth_response(&bad_request));
+    }
 
     #[test]
     fn scorer_list_query_matches_web_ui_filter() {

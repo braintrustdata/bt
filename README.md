@@ -174,6 +174,8 @@ bt scorers create "Safety label" \
 
 Use `--if-exists error|ignore|replace` to control slug conflicts. Text and structured input flags accept an inline value, `@PATH`, or `-` for stdin; only one flag per command may read stdin. Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja. Model options include `--use-cache[=true|false]` and `--response-format text|json-object|<SOURCE>`; structured output accepts a full `response_format` JSON object inline or from `@PATH`.
 
+Before writing a scorer, `bt` sends the complete candidate definition to Braintrust for validation. The backend applies the same model-parameter and replacement checks as the write and returns structured issues with normalization suggestions when available.
+
 For TypeScript and Python code scorers, use the Braintrust SDK and `bt functions push`.
 
 ## `bt eval`

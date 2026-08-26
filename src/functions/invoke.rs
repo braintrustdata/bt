@@ -128,17 +128,9 @@ mod tests {
     use super::resolve_mode;
 
     #[test]
-    fn json_output_requests_json_invoke_mode() {
+    fn resolves_invoke_mode() {
         assert_eq!(resolve_mode(None, true), Some("json"));
-    }
-
-    #[test]
-    fn explicit_invoke_mode_takes_precedence_over_json_output() {
         assert_eq!(resolve_mode(Some("text"), true), Some("text"));
-    }
-
-    #[test]
-    fn default_output_does_not_set_invoke_mode() {
         assert_eq!(resolve_mode(None, false), None);
     }
 }
