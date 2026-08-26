@@ -188,7 +188,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::active_observability_template::template::{KIND, SCHEMA_VERSION};
+    use crate::observability::template::{KIND, SCHEMA_VERSION};
 
     fn template() -> ActiveObservabilityTemplate {
         serde_json::from_value(json!({

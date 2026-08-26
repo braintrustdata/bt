@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
-mod active_observability_template;
 mod args;
 mod auth;
 #[allow(dead_code)]
@@ -18,6 +17,7 @@ mod functions;
 mod http;
 mod init;
 mod js_runner;
+mod observability;
 mod profiles;
 mod project_context;
 mod projects;
@@ -61,36 +61,36 @@ const HELP_TEMPLATE: &str = "\
 {before-help}{about} - {usage}
 
 Core
-  init         Initialize .bt config directory and files
-  login        Log in to Braintrust
-  logout       Remove a saved Braintrust login
-  profiles     Manage saved Braintrust login profiles
-  switch       Switch org and project context
-  view         View logs, traces, and spans
+  init          Initialize .bt config directory and files
+  login         Log in to Braintrust
+  logout        Remove a saved Braintrust login
+  profiles      Manage saved Braintrust login profiles
+  switch        Switch org and project context
+  view          View logs, traces, and spans
 
 Projects & resources
-  projects     Manage projects
-  active-observability-template  Pull and push portable active observability templates
-  topics       Inspect and control Topics automation
-  prompts      Manage prompts
-  functions    Manage functions (tools, scorers, and more)
-  tools        Manage tools
-  scorers      Manage scorers
-  experiments  Manage experiments
-  environments Manage deployment environments
+  projects      Manage projects
+  observability Manage active observability tools
+  topics        Inspect and control Topics automation
+  prompts       Manage prompts
+  functions     Manage functions (tools, scorers, and more)
+  tools         Manage tools
+  scorers       Manage scorers
+  experiments   Manage experiments
+  environments  Manage deployment environments
 
 Data & evaluation
-  datasets     Manage datasets
-  eval         Run eval files
-  sql          Run SQL queries against Braintrust
-  sync         Synchronize project logs between Braintrust and local NDJSON files
+  datasets      Manage datasets
+  eval          Run eval files
+  sql           Run SQL queries against Braintrust
+  sync          Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
-  docs         Manage workflow docs for coding agents
-  trace        Manage coding-agent tracing
-  setup        Configure Braintrust setup flows (deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh)
-  status       Show current identity, org, and project context
-  update       Update bt in-place
+  docs          Manage workflow docs for coding agents
+  trace         Manage coding-agent tracing
+  setup         Configure Braintrust setup flows (deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh)
+  status        Show current identity, org, and project context
+  update        Update bt in-place
 
 Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
@@ -151,10 +151,8 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
-    /// Pull and push facets and Loop automations as a portable template
-    ActiveObservabilityTemplate(
-        CLIArgs<active_observability_template::ActiveObservabilityTemplateArgs>,
-    ),
+    /// Manage active observability tools
+    Observability(CLIArgs<observability::ObservabilityArgs>),
     /// Inspect and control Topics automation
     Topics(CLIArgs<topics::TopicsArgs>),
     /// Manage datasets
@@ -204,7 +202,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
-            Commands::ActiveObservabilityTemplate(cmd) => &cmd.base,
+            Commands::Observability(cmd) => &cmd.base,
             Commands::Topics(cmd) => &cmd.base,
             Commands::Datasets(cmd) => &cmd.base,
             Commands::Environments(cmd) => &cmd.base,
@@ -236,7 +234,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
-            Commands::ActiveObservabilityTemplate(cmd) => &mut cmd.base,
+            Commands::Observability(cmd) => &mut cmd.base,
             Commands::Datasets(cmd) => &mut cmd.base,
             Commands::Environments(cmd) => &mut cmd.base,
             Commands::Topics(cmd) => &mut cmd.base,
@@ -371,9 +369,7 @@ fn try_main() -> Result<()> {
             #[cfg(unix)]
             Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
             Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
-            Commands::ActiveObservabilityTemplate(cmd) => {
-                active_observability_template::run(cmd.base, cmd.args).await?
-            }
+            Commands::Observability(cmd) => observability::run(cmd.base, cmd.args).await?,
             Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
             Commands::Environments(cmd) => environments::run(cmd.base, cmd.args).await?,
             Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,

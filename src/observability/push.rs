@@ -585,7 +585,7 @@ async fn upsert_function(client: &ApiClient, request: &Value, replace: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::active_observability_template::template::{validate, KIND, SCHEMA_VERSION};
+    use crate::observability::template::{validate, KIND, SCHEMA_VERSION};
 
     fn facet(topics: Option<&str>) -> FacetTemplate {
         FacetTemplate {

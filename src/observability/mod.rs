@@ -21,20 +21,32 @@ use crate::{
 use self::{push::Snapshot, template::ActiveObservabilityTemplate};
 
 #[derive(Debug, Clone, Args)]
-#[command(after_help = "\
-Examples:
-  bt active-observability-template pull --output active-observability-template.json
-  bt active-observability-template push active-observability-template.json --project test-project
-  bt active-observability-template push https://example.com/active-observability-template.json
-  bt active-observability-template pull | bt active-observability-template push - --project test-project
-")]
-pub(crate) struct ActiveObservabilityTemplateArgs {
+pub(crate) struct ObservabilityArgs {
     #[command(subcommand)]
-    command: ActiveObservabilityTemplateCommand,
+    command: ObservabilityCommand,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum ActiveObservabilityTemplateCommand {
+enum ObservabilityCommand {
+    /// Pull and push facets and Loop automations as a portable template
+    Template(TemplateArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt observability template pull --output active-observability-template.json
+  bt observability template push active-observability-template.json --project test-project
+  bt observability template push https://example.com/active-observability-template.json
+  bt observability template pull | bt observability template push - --project test-project
+")]
+struct TemplateArgs {
+    #[command(subcommand)]
+    command: TemplateCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TemplateCommand {
     /// Pull facets and Loop automations into a portable template
     Pull(PullArgs),
     /// Push facets and Loop automations from a portable template
@@ -47,7 +59,7 @@ pub(super) struct PullArgs {
     #[arg(
         long,
         short = 'O',
-        env = "BT_ACTIVE_OBSERVABILITY_TEMPLATE_PULL_OUTPUT",
+        env = "BT_OBSERVABILITY_TEMPLATE_PULL_OUTPUT",
         value_name = "PATH"
     )]
     output: Option<PathBuf>,
@@ -55,7 +67,7 @@ pub(super) struct PullArgs {
     /// Overwrite an existing output file
     #[arg(
         long,
-        env = "BT_ACTIVE_OBSERVABILITY_TEMPLATE_PULL_FORCE",
+        env = "BT_OBSERVABILITY_TEMPLATE_PULL_FORCE",
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
@@ -72,7 +84,7 @@ struct PushArgs {
     #[arg(
         long = "file",
         short = 'f',
-        env = "BT_ACTIVE_OBSERVABILITY_TEMPLATE_PUSH_FILE",
+        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_FILE",
         value_name = "SOURCE"
     )]
     source_flag: Option<String>,
@@ -80,7 +92,7 @@ struct PushArgs {
     /// Use this existing Topics automation for every facet
     #[arg(
         long,
-        env = "BT_ACTIVE_OBSERVABILITY_TEMPLATE_PUSH_TOPICS_AUTOMATION",
+        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_TOPICS_AUTOMATION",
         value_name = "NAME_OR_ID"
     )]
     topics_automation: Option<String>,
@@ -88,7 +100,7 @@ struct PushArgs {
     /// Replace existing matching resources
     #[arg(
         long,
-        env = "BT_ACTIVE_OBSERVABILITY_TEMPLATE_PUSH_FORCE",
+        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_FORCE",
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
@@ -98,7 +110,7 @@ struct PushArgs {
     #[arg(
         long,
         short = 'y',
-        env = "BT_ACTIVE_OBSERVABILITY_TEMPLATE_PUSH_YES",
+        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_YES",
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
@@ -111,16 +123,22 @@ impl PushArgs {
             (Some(_), Some(_)) => bail!("use either a template source or --file, not both"),
             (Some(source), None) | (None, Some(source)) => Ok(source),
             (None, None) => bail!(
-                "active observability template source required. Use: bt active-observability-template push <source>"
+                "active observability template source required. Use: bt observability template push <source>"
             ),
         }
     }
 }
 
-pub(crate) async fn run(base: BaseArgs, args: ActiveObservabilityTemplateArgs) -> Result<()> {
+pub(crate) async fn run(base: BaseArgs, args: ObservabilityArgs) -> Result<()> {
     match args.command {
-        ActiveObservabilityTemplateCommand::Pull(args) => pull::run(base, args).await,
-        ActiveObservabilityTemplateCommand::Push(args) => run_push(base, args).await,
+        ObservabilityCommand::Template(args) => run_template(base, args).await,
+    }
+}
+
+async fn run_template(base: BaseArgs, args: TemplateArgs) -> Result<()> {
+    match args.command {
+        TemplateCommand::Pull(args) => pull::run(base, args).await,
+        TemplateCommand::Push(args) => run_push(base, args).await,
     }
 }
 
@@ -254,17 +272,19 @@ mod tests {
     #[test]
     fn active_observability_commands_parse_from_the_root_cli() {
         for args in [
-            vec!["bt", "active-observability-template", "pull"],
+            vec!["bt", "observability", "template", "pull"],
             vec![
                 "bt",
-                "active-observability-template",
+                "observability",
+                "template",
                 "pull",
                 "--output",
                 "template.json",
             ],
             vec![
                 "bt",
-                "active-observability-template",
+                "observability",
+                "template",
                 "push",
                 "template.json",
                 "--topics-automation",
@@ -274,13 +294,15 @@ mod tests {
             ],
             vec![
                 "bt",
-                "active-observability-template",
+                "observability",
+                "template",
                 "push",
                 "https://example.com/template.json",
             ],
             vec![
                 "bt",
-                "active-observability-template",
+                "observability",
+                "template",
                 "push",
                 "--file",
                 "template.json",
