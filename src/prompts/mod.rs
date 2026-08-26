@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 
+use crate::ui::{is_interactive, with_spinner};
 use crate::{args::BaseArgs, project_context::resolve_project_command_context_with_auth_mode};
 
 pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
@@ -45,42 +46,21 @@ enum PromptsCommands {
 }
 
 #[derive(Debug, Clone, Args)]
-struct PromptEnvironmentArgs {
+struct PromptSelectorArgs {
+    /// Prompt version identifier (for example, a transaction ID)
+    #[arg(long)]
+    version: Option<String>,
+
     /// Environment slug (for example, production)
     #[arg(long)]
     environment: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
-struct PromptVersionArgs {
-    /// Prompt version identifier (for example, a transaction ID)
-    #[arg(long)]
-    version: Option<String>,
-}
-
-#[derive(Debug, Clone, Args)]
-struct PromptSelectorArgs {
-    #[command(flatten)]
-    version: PromptVersionArgs,
-
-    #[command(flatten)]
-    environment: PromptEnvironmentArgs,
-}
-
-impl PromptSelectorArgs {
-    fn version(&self) -> Option<&str> {
-        self.version.version.as_deref()
-    }
-
-    fn environment(&self) -> Option<&str> {
-        self.environment.environment.as_deref()
-    }
-}
-
-#[derive(Debug, Clone, Args)]
 pub struct ListArgs {
-    #[command(flatten)]
-    environment: PromptEnvironmentArgs,
+    /// Environment slug (for example, production)
+    #[arg(long)]
+    environment: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -129,8 +109,9 @@ pub struct UnassignArgs {
     #[command(flatten)]
     slug: PromptSlugArgs,
 
-    #[command(flatten)]
-    environment: PromptEnvironmentArgs,
+    /// Environment slug (for example, production)
+    #[arg(long)]
+    environment: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -143,6 +124,47 @@ pub struct DeleteArgs {
     force: bool,
 }
 
+async fn resolve_prompt(
+    ctx: &ResolvedContext,
+    slug: Option<&str>,
+    version: Option<&str>,
+    environment: Option<&str>,
+    usage: &str,
+) -> Result<api::Prompt> {
+    let interactive_selection = slug.is_none();
+    let selected = if interactive_selection {
+        if !is_interactive() {
+            bail!("prompt slug required. Use: {usage}");
+        }
+        Some(delete::select_prompt_interactive(&ctx.client, &ctx.project.name).await?)
+    } else {
+        None
+    };
+    if version.is_none() && environment.is_none() {
+        if let Some(prompt) = selected {
+            return Ok(prompt);
+        }
+    }
+
+    let slug = slug.unwrap_or_else(|| &selected.as_ref().unwrap().slug);
+    with_spinner(
+        "Loading prompt...",
+        api::get_prompt_by_slug(&ctx.client, &ctx.project.name, slug, version, environment),
+    )
+    .await?
+    .ok_or_else(|| {
+        if interactive_selection {
+            let selector = version
+                .map(|value| format!("version {value}"))
+                .or_else(|| environment.map(|value| format!("environment {value}")))
+                .unwrap_or_default();
+            anyhow!("prompt with slug '{slug}' not found at {selector}")
+        } else {
+            anyhow!("prompt with slug '{slug}' not found")
+        }
+    })
+}
+
 pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     let read_only = prompts_command_is_read_only(args.command.as_ref());
     let ctx = resolve_project_command_context_with_auth_mode(&base, read_only).await?;
@@ -150,18 +172,18 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
     match args.command {
         None => list::run(&ctx, None, base.json).await,
         Some(PromptsCommands::List(args)) => {
-            list::run(&ctx, args.environment.environment.as_deref(), base.json).await
+            list::run(&ctx, args.environment.as_deref(), base.json).await
         }
         Some(PromptsCommands::Versions(args)) => versions::run(&ctx, args.slug(), base.json).await,
         Some(PromptsCommands::View(args)) => {
-            if args.selector.version().is_some() && args.selector.environment().is_some() {
+            if args.selector.version.is_some() && args.selector.environment.is_some() {
                 bail!("--version and --environment cannot be used together");
             }
             view::run(
                 &ctx,
                 args.slug.slug(),
-                args.selector.version(),
-                args.selector.environment(),
+                args.selector.version.as_deref(),
+                args.selector.environment.as_deref(),
                 base.json,
                 args.web,
                 base.verbose,
@@ -173,11 +195,13 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
                 "Use: bt prompts assign <slug> --environment <environment> --version <version>";
             let version = args
                 .selector
-                .version()
+                .version
+                .as_deref()
                 .ok_or_else(|| anyhow!("--version is required. {hint}"))?;
             let environment = args
                 .selector
-                .environment()
+                .environment
+                .as_deref()
                 .ok_or_else(|| anyhow!("--environment is required. {hint}"))?;
             assign::run(
                 &ctx,
@@ -191,7 +215,6 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
         Some(PromptsCommands::Unassign(args)) => {
             let hint = "Use: bt prompts unassign <slug> --environment <environment>";
             let environment = args
-                .environment
                 .environment
                 .as_deref()
                 .ok_or_else(|| anyhow!("--environment is required. {hint}"))?;
@@ -233,12 +256,8 @@ mod tests {
 
     fn selectors(version: Option<&str>, environment: Option<&str>) -> PromptSelectorArgs {
         PromptSelectorArgs {
-            version: PromptVersionArgs {
-                version: version.map(ToOwned::to_owned),
-            },
-            environment: PromptEnvironmentArgs {
-                environment: environment.map(ToOwned::to_owned),
-            },
+            version: version.map(ToOwned::to_owned),
+            environment: environment.map(ToOwned::to_owned),
         }
     }
 
@@ -257,7 +276,7 @@ mod tests {
         let Some(PromptsCommands::List(list)) = list.prompts.command else {
             panic!("expected list command");
         };
-        assert_eq!(list.environment.environment.as_deref(), Some("production"));
+        assert_eq!(list.environment.as_deref(), Some("production"));
 
         let error = CliHarness::try_parse_from(["bt-prompts", "list", "--version", "1234"])
             .expect_err("list should reject version");
@@ -285,17 +304,15 @@ mod tests {
         let Some(PromptsCommands::Assign(assign)) = assign.prompts.command else {
             panic!("expected assign command");
         };
-        assert_eq!(assign.selector.version(), Some("1234"));
-        assert_eq!(assign.selector.environment(), Some("production"));
+        assert_eq!(assign.selector.version.as_deref(), Some("1234"));
+        assert_eq!(assign.selector.environment.as_deref(), Some("production"));
     }
 
     #[test]
     fn prompts_routes_list_and_view_to_read_only_auth() {
         assert!(prompts_command_is_read_only(None));
         assert!(prompts_command_is_read_only(Some(&PromptsCommands::List(
-            ListArgs {
-                environment: PromptEnvironmentArgs { environment: None },
-            }
+            ListArgs { environment: None }
         ))));
         assert!(prompts_command_is_read_only(Some(&PromptsCommands::View(
             ViewArgs {

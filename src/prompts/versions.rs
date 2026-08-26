@@ -1,30 +1,15 @@
 use std::fmt::Write as _;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use dialoguer::console;
 
-use crate::prompts::delete::select_prompt_interactive;
 use crate::ui::{header, print_with_pager, styled_table, with_spinner};
 use crate::utils::pluralize;
 
-use super::{api, ResolvedContext};
+use super::{api, resolve_prompt, ResolvedContext};
 
 pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, json: bool) -> Result<()> {
-    let project_name = &ctx.project.name;
-    let prompt = match slug {
-        Some(slug) => with_spinner(
-            "Loading prompt...",
-            api::get_prompt_by_slug(&ctx.client, project_name, slug, None, None),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("prompt with slug '{slug}' not found"))?,
-        None => {
-            if !crate::ui::is_interactive() {
-                bail!("prompt slug required. Use: bt prompts versions <slug>");
-            }
-            select_prompt_interactive(&ctx.client, project_name).await?
-        }
-    };
+    let prompt = resolve_prompt(ctx, slug, None, None, "bt prompts versions <slug>").await?;
 
     let versions = with_spinner(
         "Loading prompt versions...",

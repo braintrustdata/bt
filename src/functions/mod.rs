@@ -454,6 +454,16 @@ pub struct ViewArgs {
 }
 
 impl ViewArgs {
+    fn options(&self, base: &BaseArgs) -> view::ViewOptions<'_> {
+        view::ViewOptions {
+            version: self.version.as_deref(),
+            environment: self.environment.as_deref(),
+            json: base.json,
+            web: self.web,
+            verbose: base.verbose,
+        }
+    }
+
     fn selector(&self) -> Result<ViewSelector<'_>> {
         match (
             self.id.as_deref(),
@@ -633,35 +643,11 @@ pub(crate) async fn run_typed_command(
         Some(FunctionCommands::View(v)) => match v.selector()? {
             ViewSelector::Id(id) => {
                 let auth_ctx = resolve_auth_context(&base).await?;
-                view::run_by_id(
-                    &auth_ctx,
-                    id,
-                    view::ViewOptions {
-                        version: v.version.as_deref(),
-                        environment: v.environment.as_deref(),
-                        json: base.json,
-                        web: v.web,
-                        verbose: base.verbose,
-                    },
-                    ft,
-                )
-                .await
+                view::run_by_id(&auth_ctx, id, v.options(&base), ft).await
             }
             ViewSelector::Slug(slug) => {
                 let ctx = resolve_context(&base).await?;
-                view::run(
-                    &ctx,
-                    slug,
-                    view::ViewOptions {
-                        version: v.version.as_deref(),
-                        environment: v.environment.as_deref(),
-                        json: base.json,
-                        web: v.web,
-                        verbose: base.verbose,
-                    },
-                    ft,
-                )
-                .await
+                view::run(&ctx, slug, v.options(&base), ft).await
             }
         },
         command => {
@@ -694,35 +680,11 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
             match v.inner.selector()? {
                 ViewSelector::Id(id) => {
                     let auth_ctx = resolve_auth_context(&base).await?;
-                    view::run_by_id(
-                        &auth_ctx,
-                        id,
-                        view::ViewOptions {
-                            version: v.inner.version.as_deref(),
-                            environment: v.inner.environment.as_deref(),
-                            json: base.json,
-                            web: v.inner.web,
-                            verbose: base.verbose,
-                        },
-                        ft,
-                    )
-                    .await
+                    view::run_by_id(&auth_ctx, id, v.inner.options(&base), ft).await
                 }
                 ViewSelector::Slug(slug) => {
                     let ctx = resolve_context(&base).await?;
-                    view::run(
-                        &ctx,
-                        slug,
-                        view::ViewOptions {
-                            version: v.inner.version.as_deref(),
-                            environment: v.inner.environment.as_deref(),
-                            json: base.json,
-                            web: v.inner.web,
-                            verbose: base.verbose,
-                        },
-                        ft,
-                    )
-                    .await
+                    view::run(&ctx, slug, v.inner.options(&base), ft).await
                 }
             }
         }

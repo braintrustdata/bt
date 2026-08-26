@@ -12,14 +12,10 @@ use super::{api, ResolvedContext};
 
 pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -> Result<()> {
     let project_name = &ctx.project.name;
-    let prompts = with_spinner("Loading prompts...", async {
-        match environment {
-            Some(environment) => {
-                api::list_prompts_by_environment(&ctx.client, project_name, environment).await
-            }
-            None => api::list_prompts(&ctx.client, project_name).await,
-        }
-    })
+    let prompts = with_spinner(
+        "Loading prompts...",
+        api::list_prompts(&ctx.client, project_name, environment),
+    )
     .await?;
 
     if json {
@@ -47,16 +43,11 @@ pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -
     )?;
 
     let mut table = styled_table();
+    let mut headers = vec![header("Name"), header("Description"), header("Slug")];
     if environment.is_some() {
-        table.set_header(vec![
-            header("Name"),
-            header("Description"),
-            header("Slug"),
-            header("Version"),
-        ]);
-    } else {
-        table.set_header(vec![header("Name"), header("Description"), header("Slug")]);
+        headers.push(header("Version"));
     }
+    table.set_header(headers);
     apply_column_padding(&mut table, (0, 6));
 
     for prompt in &prompts {
@@ -66,20 +57,11 @@ pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -
             .filter(|s| !s.is_empty())
             .map(|s| truncate(s, 60))
             .unwrap_or_else(|| "-".to_string());
+        let mut row = vec![prompt.name.as_str(), desc.as_str(), prompt.slug.as_str()];
         if environment.is_some() {
-            table.add_row(vec![
-                prompt.name.as_str(),
-                desc.as_str(),
-                prompt.slug.as_str(),
-                prompt._xact_id.as_deref().unwrap_or("-"),
-            ]);
-        } else {
-            table.add_row(vec![
-                prompt.name.as_str(),
-                desc.as_str(),
-                prompt.slug.as_str(),
-            ]);
+            row.push(prompt._xact_id.as_deref().unwrap_or("-"));
         }
+        table.add_row(row);
     }
 
     write!(output, "{table}")?;

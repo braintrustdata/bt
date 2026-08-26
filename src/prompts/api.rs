@@ -45,28 +45,19 @@ struct PromptVersionsResponse {
     data: Vec<Value>,
 }
 
-pub async fn list_prompts(client: &ApiClient, project: &str) -> Result<Vec<Prompt>> {
-    let path = format!(
+pub async fn list_prompts(
+    client: &ApiClient,
+    project: &str,
+    environment: Option<&str>,
+) -> Result<Vec<Prompt>> {
+    let mut path = format!(
         "/v1/prompt?org_name={}&project_name={}",
         encode(client.org_name()),
         encode(project)
     );
-    let list: ListResponse<Prompt> = client.get(&path).await?;
-
-    Ok(list.objects)
-}
-
-pub async fn list_prompts_by_environment(
-    client: &ApiClient,
-    project: &str,
-    environment: &str,
-) -> Result<Vec<Prompt>> {
-    let path = format!(
-        "/v1/prompt?org_name={}&project_name={}&environment={}",
-        encode(client.org_name()),
-        encode(project),
-        encode(environment)
-    );
+    if let Some(environment) = environment {
+        path.push_str(&format!("&environment={}", encode(environment)));
+    }
     let list: ListResponse<Prompt> = client.get(&path).await?;
     Ok(list.objects)
 }

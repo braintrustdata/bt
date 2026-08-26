@@ -1,14 +1,13 @@
 use std::fmt::Write as _;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use dialoguer::console;
 
-use crate::prompts::delete::select_prompt_interactive;
 use crate::ui::prompt_render::{render_options, render_prompt_block};
-use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
+use crate::ui::{print_command_status, print_with_pager, CommandStatus};
 use crate::utils::app_project_url;
 
-use super::{api, ResolvedContext};
+use super::{resolve_prompt, ResolvedContext};
 
 pub async fn run(
     ctx: &ResolvedContext,
@@ -20,47 +19,7 @@ pub async fn run(
     verbose: bool,
 ) -> Result<()> {
     let project_name = &ctx.project.name;
-    let prompt = match slug {
-        Some(s) => with_spinner(
-            "Loading prompt...",
-            api::get_prompt_by_slug(&ctx.client, project_name, s, version, environment),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
-        None => {
-            if !crate::ui::is_interactive() {
-                bail!("prompt slug required. Use: bt prompts view <slug>");
-            }
-            let selected = select_prompt_interactive(&ctx.client, project_name).await?;
-            if version.is_some() || environment.is_some() {
-                with_spinner(
-                    "Loading prompt...",
-                    api::get_prompt_by_slug(
-                        &ctx.client,
-                        project_name,
-                        &selected.slug,
-                        version,
-                        environment,
-                    ),
-                )
-                .await?
-                .ok_or_else(|| {
-                    let selector = version
-                        .map(|version| format!("version {version}"))
-                        .or_else(|| {
-                            environment.map(|environment| format!("environment {environment}"))
-                        })
-                        .unwrap_or_default();
-                    anyhow!(
-                        "prompt with slug '{}' not found at {selector}",
-                        selected.slug
-                    )
-                })?
-            } else {
-                selected
-            }
-        }
-    };
+    let prompt = resolve_prompt(ctx, slug, version, environment, "bt prompts view <slug>").await?;
 
     if web {
         let url = app_project_url(
