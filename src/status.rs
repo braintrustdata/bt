@@ -163,8 +163,10 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
             source.as_deref().unwrap_or("automatic")
         );
 
-        println!("\nCredential precedence");
-        println!("  {}", auth::credential_precedence(&base));
+        if let Some(precedence) = auth::credential_precedence(&base) {
+            println!("\nCredential precedence");
+            println!("  {precedence}");
+        }
 
         println!("\nSaved login profiles");
         if profiles.is_empty() {

@@ -2330,9 +2330,9 @@ pub(crate) fn secret_storage_description() -> Result<String> {
     return Ok(format!("plaintext file: {}", fallback.display()));
 }
 
-pub(crate) fn credential_precedence(base: &BaseArgs) -> String {
+pub(crate) fn credential_precedence(base: &BaseArgs) -> Option<String> {
     if resolve_api_key_override(base).is_some() {
-        return match base.api_key_source {
+        return Some(match base.api_key_source {
             Some(crate::args::ArgValueSource::CommandLine) => {
                 "explicit --api-key overrides saved profiles".into()
             }
@@ -2340,17 +2340,9 @@ pub(crate) fn credential_precedence(base: &BaseArgs) -> String {
                 "BRAINTRUST_API_KEY overrides saved profiles".into()
             }
             None => "API key override is active".into(),
-        };
+        });
     }
-    if let Some(profile) = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|profile| !profile.is_empty())
-    {
-        return format!("saved profile `{profile}` is selected");
-    }
-    "saved profile selection is automatic".into()
+    None
 }
 
 pub(crate) fn format_verification_block(v: &ProfileVerification, selected: bool) -> String {
