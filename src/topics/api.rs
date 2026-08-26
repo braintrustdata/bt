@@ -8,6 +8,53 @@ use urlencoding::encode;
 
 use crate::{http::ApiClient, project_context::ProjectContext, utils::app_project_url};
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub(crate) struct ProjectAutomation {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub config: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListResponse<T> {
+    objects: Vec<T>,
+}
+
+pub(crate) async fn list_project_automations(
+    client: &ApiClient,
+    project_id: &str,
+) -> Result<Vec<ProjectAutomation>> {
+    let path = format!("/v1/project_automation?project_id={}", encode(project_id));
+    let response: ListResponse<ProjectAutomation> = client.get(&path).await?;
+    Ok(response.objects)
+}
+
+pub(crate) async fn create_project_automation(
+    client: &ApiClient,
+    body: &Value,
+) -> Result<ProjectAutomation> {
+    client.post("/v1/project_automation", body).await
+}
+
+pub(crate) async fn replace_project_automation(
+    client: &ApiClient,
+    body: &Value,
+) -> Result<ProjectAutomation> {
+    client.put("/v1/project_automation", body).await
+}
+
+pub(crate) async fn patch_project_automation(
+    client: &ApiClient,
+    automation_id: &str,
+    body: &Value,
+) -> Result<ProjectAutomation> {
+    let path = format!("/v1/project_automation/{}", encode(automation_id));
+    client.patch(&path, body).await
+}
+
 const DEFAULT_TOPIC_AUTOMATION_NAME: &str = "Topics";
 const DEFAULT_TOPIC_AUTOMATION_DESCRIPTION: &str =
     "Automatically extract facets and classify logs using topic maps";
@@ -955,6 +1002,16 @@ async fn seed_topic_automation_cursors(
         start_xact_id,
         window_seconds,
     })
+}
+
+pub(crate) async fn seed_new_topic_automation_cursors(
+    client: &ApiClient,
+    project_id: &str,
+    automation: &ProjectAutomation,
+) -> Result<()> {
+    seed_topic_automation_cursors(client, project_id, &serde_json::to_value(automation)?, None)
+        .await?;
+    Ok(())
 }
 
 fn filter_or_resolve_topic_automation_rows(

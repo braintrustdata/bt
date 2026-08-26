@@ -233,6 +233,26 @@ impl ApiClient {
         parse_json_response(response, "POST", path).await
     }
 
+    pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
+        let url = self.url(path);
+        let response = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.api_key)
+            .json(body)
+            .send()
+            .await
+            .context("request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(HttpError { status, body }.into());
+        }
+
+        parse_json_response(response, "PUT", path).await
+    }
+
     pub async fn patch<T: DeserializeOwned, B: Serialize>(
         &self,
         path: &str,

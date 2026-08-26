@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
+mod active_observability_template;
 mod args;
 mod auth;
 #[allow(dead_code)]
@@ -69,6 +70,7 @@ Core
 
 Projects & resources
   projects     Manage projects
+  active-observability-template  Pull and push portable active observability templates
   topics       Inspect and control Topics automation
   prompts      Manage prompts
   functions    Manage functions (tools, scorers, and more)
@@ -149,6 +151,10 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Pull and push facets and Loop automations as a portable template
+    ActiveObservabilityTemplate(
+        CLIArgs<active_observability_template::ActiveObservabilityTemplateArgs>,
+    ),
     /// Inspect and control Topics automation
     Topics(CLIArgs<topics::TopicsArgs>),
     /// Manage datasets
@@ -198,6 +204,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
+            Commands::ActiveObservabilityTemplate(cmd) => &cmd.base,
             Commands::Topics(cmd) => &cmd.base,
             Commands::Datasets(cmd) => &cmd.base,
             Commands::Environments(cmd) => &cmd.base,
@@ -229,6 +236,7 @@ impl Commands {
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
+            Commands::ActiveObservabilityTemplate(cmd) => &mut cmd.base,
             Commands::Datasets(cmd) => &mut cmd.base,
             Commands::Environments(cmd) => &mut cmd.base,
             Commands::Topics(cmd) => &mut cmd.base,
@@ -363,6 +371,9 @@ fn try_main() -> Result<()> {
             #[cfg(unix)]
             Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
             Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+            Commands::ActiveObservabilityTemplate(cmd) => {
+                active_observability_template::run(cmd.base, cmd.args).await?
+            }
             Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
             Commands::Environments(cmd) => environments::run(cmd.base, cmd.args).await?,
             Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
