@@ -1,0 +1,867 @@
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{builder::BoolishValueParser, Args};
+use dialoguer::Confirm;
+use serde_json::{Map, Value};
+
+use crate::{
+    error::user_error,
+    ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
+    utils::{merge_json_objects, read_text_source},
+};
+
+use super::{
+    api, label, label_plural,
+    prompt_config::PromptConfigArgs,
+    prompt_patch::materialize_prompt_data_patch,
+    scorer_config::{build_scorer_config, ScorerConfig},
+    select_function_interactive, FunctionTypeFilter, ResolvedContext,
+};
+
+/// Fields shared by every function kind.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CommonUpdateArgs {
+    #[command(flatten)]
+    slug: super::SlugArgs,
+
+    /// Function id (alternative to slug). Auto-detected for `fn_`/`func_` prefixes.
+    #[arg(long = "id")]
+    id: Option<String>,
+
+    /// Update the display name.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
+    /// Update the slug. `--slug` identifies the current function.
+    #[arg(long, value_name = "SLUG")]
+    new_slug: Option<String>,
+
+    /// Deep-merge metadata from inline YAML, @PATH, or stdin (-).
+    #[arg(long, value_name = "SOURCE")]
+    metadata: Option<String>,
+
+    /// Update the function description.
+    #[arg(long, short = 'd', value_name = "TEXT")]
+    description: Option<String>,
+
+    /// Arbitrary JSON object deep-merged into the function. Accepts inline
+    /// JSON, @PATH to read JSON from a file, or - for stdin.
+    #[arg(long, value_name = "SOURCE")]
+    patch: Option<String>,
+
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+/// Update scorer prompt configuration and output behavior.
+#[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt scorers update my-scorer --name \"Helpfulness\" --new-slug helpfulness
+  bt scorers update my-scorer --messages @messages.json
+  bt scorers update my-scorer --model gpt-5.4-nano --reasoning-effort none --temperature 0.1
+  bt scorers update my-scorer --template-format jinja --pass-threshold 0.7
+  bt scorers update my-scorer --classifications '[\"safe\",\"unsafe\"]'
+  bt scorers update my-scorer --metadata @metadata.yaml
+  bt scorers update --id fn_123 --patch @scorer-patch.json
+")]
+pub(crate) struct ScorerUpdateArgs {
+    #[command(flatten)]
+    common: CommonUpdateArgs,
+
+    /// Replacement chat messages source: inline JSON, @PATH to read from a
+    /// file, or - for stdin.
+    #[arg(long, value_name = "SOURCE")]
+    messages: Option<String>,
+
+    /// Update the model used by an LLM scorer/prompt.
+    #[arg(long, short = 'm', value_name = "MODEL")]
+    model: Option<String>,
+
+    #[command(flatten)]
+    prompt_config: PromptConfigArgs,
+
+    /// Replace choice-to-score mappings for an existing score-output scorer.
+    /// Accepts inline JSON, @PATH to read from a file, or - for stdin.
+    #[arg(long, value_name = "SOURCE", conflicts_with = "classifications")]
+    choice_scores: Option<String>,
+
+    /// Replace labels for an existing classifier. This cannot change a
+    /// score-output scorer into a classifier. Accepts an inline JSON array,
+    /// @PATH to read from a file, or - for stdin.
+    #[arg(long, value_name = "SOURCE", conflicts_with = "choice_scores")]
+    classifications: Option<String>,
+
+    /// Update chain-of-thought reasoning. Pass --use-cot=false to disable it.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = BoolishValueParser::new()
+    )]
+    use_cot: Option<bool>,
+
+    /// Update whether a classifier may return no matching classification.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = BoolishValueParser::new()
+    )]
+    allow_no_match: Option<bool>,
+
+    /// Update the score threshold for an existing score-output scorer, between
+    /// 0 and 1.
+    #[arg(long, value_name = "NUMBER", conflicts_with = "classifications")]
+    pass_threshold: Option<f64>,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt tools update my-tool --name \"Lookup order\" --new-slug lookup-order
+  bt tools update my-tool --description \"Look up an order by id\"
+  bt tools update my-tool --prompt @prompt.txt
+  bt tools update --id fn_123 --patch @tool-patch.json
+")]
+pub(crate) struct ToolUpdateArgs {
+    #[command(flatten)]
+    common: CommonUpdateArgs,
+
+    /// Replace a completion prompt from inline text, @PATH, or stdin (-).
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        conflicts_with = "messages",
+        allow_hyphen_values = true
+    )]
+    prompt: Option<String>,
+
+    /// Replace chat messages from inline JSON/YAML, @PATH, or stdin (-).
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        conflicts_with = "prompt",
+        allow_hyphen_values = true
+    )]
+    messages: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(after_help = "\
+Examples:
+  bt functions update my-function --name \"New name\"
+  bt functions update my-function --new-slug new-slug
+  bt functions update my-function --description \"Updated description\"
+  bt functions update --id fn_123 --patch @function-patch.json
+")]
+pub(crate) struct GenericUpdateArgs {
+    #[command(flatten)]
+    common: CommonUpdateArgs,
+}
+
+impl CommonUpdateArgs {
+    fn selector(&self) -> Result<UpdateSelector<'_>> {
+        match (
+            self.id.as_deref(),
+            self.slug.slug_positional(),
+            self.slug.slug_flag(),
+        ) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                bail!("use either --id or a slug, not both")
+            }
+            (Some(id), None, None) => Ok(UpdateSelector::Id(id)),
+            (None, Some(positional), None) if super::is_likely_function_id(positional) => {
+                Ok(UpdateSelector::Id(positional))
+            }
+            (None, positional, flag) => Ok(UpdateSelector::Slug(positional.or(flag))),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum UpdateSelector<'a> {
+    Id(&'a str),
+    Slug(Option<&'a str>),
+}
+
+pub(crate) async fn run_scorer(
+    ctx: &ResolvedContext,
+    args: &ScorerUpdateArgs,
+    json_output: bool,
+) -> Result<()> {
+    let body = build_scorer_patch_body(args).map_err(user_error)?;
+    run_update(
+        ctx,
+        &args.common,
+        body,
+        json_output,
+        Some(FunctionTypeFilter::Scorer),
+        Some(args),
+    )
+    .await
+}
+
+pub(crate) async fn run_tool(
+    ctx: &ResolvedContext,
+    args: &ToolUpdateArgs,
+    json_output: bool,
+) -> Result<()> {
+    let body = build_tool_patch_body(args).map_err(user_error)?;
+    run_update(
+        ctx,
+        &args.common,
+        body,
+        json_output,
+        Some(FunctionTypeFilter::Tool),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_generic(
+    ctx: &ResolvedContext,
+    args: &GenericUpdateArgs,
+    json_output: bool,
+    ft: Option<FunctionTypeFilter>,
+) -> Result<()> {
+    let body = build_common_patch_body(&args.common).map_err(user_error)?;
+    run_update(ctx, &args.common, body, json_output, ft, None).await
+}
+
+async fn run_update(
+    ctx: &ResolvedContext,
+    common: &CommonUpdateArgs,
+    mut body: Value,
+    json_output: bool,
+    ft: Option<FunctionTypeFilter>,
+    scorer_args: Option<&ScorerUpdateArgs>,
+) -> Result<()> {
+    let function = resolve_target_function(ctx, common, ft).await?;
+    if !function_matches_filter(&function, ft) {
+        return Err(user_error(anyhow!(
+            "'{}' is not a {}",
+            function.name,
+            label(ft)
+        )));
+    }
+
+    if let Some(new_slug) = common.new_slug.as_deref() {
+        if new_slug != function.slug {
+            if let Some(conflict) =
+                api::get_function_by_slug(&ctx.client, &ctx.project.id, new_slug, None).await?
+            {
+                if conflict.id != function.id {
+                    return Err(user_error(anyhow!(
+                        "--new-slug '{new_slug}' is already used by {} '{}'",
+                        conflict.function_type.as_deref().unwrap_or("function"),
+                        conflict.name
+                    )));
+                }
+            }
+        }
+    }
+
+    let implementation = function
+        .function_data
+        .as_ref()
+        .and_then(|data| data.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("prompt");
+    if body.get("prompt_data").is_some() && implementation != "prompt" {
+        return Err(user_error(anyhow!(
+            "prompt configuration cannot update {}-backed {} '{}'. Edit its source and run: bt functions push <path> --if-exists replace",
+            implementation,
+            label(ft),
+            function.name
+        )));
+    }
+
+    if let Some(args) = scorer_args {
+        let function_type = function.function_type.as_deref();
+        if matches!(
+            (
+                function_type,
+                args.choice_scores.is_some(),
+                args.classifications.is_some()
+            ),
+            (Some("classifier"), true, _) | (Some("scorer"), _, true)
+        ) {
+            return Err(user_error(anyhow!(
+                "cannot change between score and classification output"
+            )));
+        }
+        if args.allow_no_match.is_some() && function_type != Some("classifier") {
+            return Err(user_error(anyhow!(
+                "--allow-no-match applies only to classification output"
+            )));
+        }
+        if args.pass_threshold.is_some() && function_type == Some("classifier") {
+            return Err(user_error(anyhow!(
+                "--pass-threshold applies only to score output"
+            )));
+        }
+    }
+
+    materialize_prompt_data_patch(&mut body, function.prompt_data.as_ref());
+    materialize_metadata_patch(&mut body, function.metadata.as_ref());
+
+    if !common.yes && is_interactive() {
+        let confirm = Confirm::new()
+            .with_prompt(format!(
+                "Update {} '{}' in {}?",
+                label(ft),
+                function.name,
+                ctx.project.name
+            ))
+            .default(false)
+            .interact()?;
+        if !confirm {
+            return Ok(());
+        }
+    }
+
+    let updated = match with_spinner(
+        &format!("Updating {}...", label(ft)),
+        api::patch_function(&ctx.client, &function.id, &body),
+    )
+    .await
+    {
+        Ok(value) => {
+            print_command_status(
+                CommandStatus::Success,
+                &format!("Updated '{}'", function.name),
+            );
+            value
+        }
+        Err(error) => {
+            print_command_status(
+                CommandStatus::Error,
+                &format!("Failed to update '{}'", function.name),
+            );
+            return Err(error);
+        }
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string(&updated)?);
+    } else if !crate::ui::is_quiet() {
+        eprintln!(
+            "Run `bt {} view {}` to inspect the updated definition.",
+            label_plural(ft),
+            common.new_slug.as_deref().unwrap_or(&function.slug)
+        );
+    }
+
+    Ok(())
+}
+
+fn function_matches_filter(function: &api::Function, ft: Option<FunctionTypeFilter>) -> bool {
+    match ft {
+        None => true,
+        Some(FunctionTypeFilter::Scorer) => {
+            function.function_type.as_deref() == Some("scorer")
+                || function.function_type.as_deref() == Some("classifier")
+                    && function.prompt_data.is_some()
+                    && function
+                        .function_data
+                        .as_ref()
+                        .and_then(|data| data.get("type"))
+                        .and_then(Value::as_str)
+                        != Some("topic_map")
+        }
+        Some(expected) => function.function_type.as_deref() == Some(expected.as_str()),
+    }
+}
+
+async fn resolve_target_function(
+    ctx: &ResolvedContext,
+    args: &CommonUpdateArgs,
+    ft: Option<FunctionTypeFilter>,
+) -> Result<api::Function> {
+    let project_id = &ctx.project.id;
+    match args.selector()? {
+        UpdateSelector::Id(id) => api::get_function_by_id(&ctx.client, id, None)
+            .await?
+            .ok_or_else(|| anyhow!("{} with id '{id}' not found", label(ft))),
+        UpdateSelector::Slug(Some(slug)) => {
+            api::get_function_by_slug(&ctx.client, project_id, slug, None)
+                .await?
+                .ok_or_else(|| anyhow!("{} with slug '{slug}' not found", label(ft)))
+        }
+        UpdateSelector::Slug(None) => {
+            if !is_interactive() {
+                bail!(
+                    "{} slug or --id required. Use: bt {} update <slug> [--patch ...]",
+                    label(ft),
+                    label_plural(ft),
+                );
+            }
+            Ok(select_function_interactive(&ctx.client, project_id, ft).await?)
+        }
+    }
+}
+
+fn build_scorer_patch_body(args: &ScorerUpdateArgs) -> Result<Value> {
+    let mut patch = build_scorer_config(
+        &ScorerConfig {
+            messages: args.messages.as_deref(),
+            model: args.model.as_deref(),
+            prompt_config: &args.prompt_config,
+            choice_scores: args.choice_scores.as_deref(),
+            classifications: args.classifications.as_deref(),
+            use_cot: args.use_cot,
+            allow_no_match: args.allow_no_match,
+            pass_threshold: args.pass_threshold,
+            metadata: args.common.metadata.as_deref(),
+            metadata_label: "scorer metadata",
+        },
+        false,
+    )?;
+    // PATCH /v1/function does not support changing function_type. Output-mode
+    // changes are rejected after resolving the current scorer.
+    patch.remove("function_type");
+    merge_common_fields(&mut patch, &args.common, false)?;
+    finish_patch(patch, "bt scorers update --help")
+}
+
+fn build_tool_patch_body(args: &ToolUpdateArgs) -> Result<Value> {
+    let mut patch = Map::new();
+
+    if let Some(source) = args.prompt.as_deref() {
+        let content = read_text_source(source, "prompt")?;
+        patch.insert(
+            "prompt_data".to_string(),
+            serde_json::json!({"prompt": {"type": "completion", "content": content}}),
+        );
+    } else if let Some(source) = args.messages.as_deref() {
+        let raw = read_text_source(source, "messages")?;
+        let messages: Value =
+            yaml_serde::from_str(&raw).context("invalid JSON or YAML in --messages")?;
+        if !messages.is_array() {
+            bail!("--messages must contain an array");
+        }
+        patch.insert(
+            "prompt_data".to_string(),
+            serde_json::json!({"prompt": {"type": "chat", "messages": messages}}),
+        );
+    }
+
+    merge_common_fields(&mut patch, &args.common, true)?;
+    finish_patch(patch, "bt tools update --help")
+}
+
+fn build_common_patch_body(args: &CommonUpdateArgs) -> Result<Value> {
+    let mut patch = Map::new();
+    merge_common_fields(&mut patch, args, true)?;
+    finish_patch(patch, "bt functions update --help")
+}
+
+fn merge_common_fields(
+    patch: &mut Map<String, Value>,
+    args: &CommonUpdateArgs,
+    include_metadata: bool,
+) -> Result<()> {
+    for (key, flag, value) in [
+        ("name", "--name", args.name.as_deref()),
+        ("slug", "--new-slug", args.new_slug.as_deref()),
+        ("description", "--description", args.description.as_deref()),
+    ] {
+        if let Some(value) = value {
+            if value.trim().is_empty() && key != "description" {
+                bail!("{flag} cannot be empty");
+            }
+            patch.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+
+    if include_metadata {
+        if let Some(source) = args.metadata.as_deref() {
+            let metadata = crate::utils::read_yaml_object_source(source, "function metadata")?;
+            patch.insert("metadata".to_string(), Value::Object(metadata));
+        }
+    }
+
+    if let Some(extra_obj) = resolve_extra_patch(args.patch.as_deref())? {
+        merge_json_objects(patch, &extra_obj);
+    }
+    Ok(())
+}
+
+fn materialize_metadata_patch(patch: &mut Value, existing_metadata: Option<&Value>) {
+    let Some(patch_metadata) = patch.get("metadata").and_then(Value::as_object).cloned() else {
+        return;
+    };
+
+    let mut metadata = existing_metadata
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    merge_json_objects(&mut metadata, &patch_metadata);
+    patch["metadata"] = Value::Object(metadata);
+}
+
+fn finish_patch(patch: Map<String, Value>, help_command: &str) -> Result<Value> {
+    if patch.is_empty() {
+        bail!("no updates requested. Pass an update flag; see `{help_command}`");
+    }
+    Ok(Value::Object(patch))
+}
+
+fn resolve_extra_patch(source: Option<&str>) -> Result<Option<Map<String, Value>>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let raw = read_text_source(source, "patch")?;
+    parse_patch_object(&raw).map(Some)
+}
+
+fn parse_patch_object(raw: &str) -> Result<Map<String, Value>> {
+    let value: Value = serde_json::from_str(raw).context("invalid JSON in --patch")?;
+    match value {
+        Value::Object(map) => Ok(map),
+        _ => bail!("--patch must be a JSON object"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Debug, Parser)]
+    struct ScorerUpdateArgsHarness {
+        #[command(flatten)]
+        args: ScorerUpdateArgs,
+    }
+
+    #[derive(Debug, Parser)]
+    struct ToolUpdateArgsHarness {
+        #[command(flatten)]
+        args: ToolUpdateArgs,
+    }
+
+    fn args(model: Option<&str>, description: Option<&str>) -> ScorerUpdateArgs {
+        ScorerUpdateArgs {
+            common: CommonUpdateArgs {
+                slug: super::super::SlugArgs {
+                    slug_positional: Some("test-slug".to_string()),
+                    slug_flag: None,
+                },
+                id: None,
+                name: None,
+                new_slug: None,
+                metadata: None,
+                description: description.map(ToOwned::to_owned),
+                patch: None,
+                yes: true,
+            },
+            messages: None,
+            model: model.map(ToOwned::to_owned),
+            prompt_config: PromptConfigArgs::default(),
+            choice_scores: None,
+            classifications: None,
+            use_cot: None,
+            allow_no_match: None,
+            pass_threshold: None,
+        }
+    }
+
+    #[test]
+    fn build_patch_body_messages_writes_chat_block() {
+        let mut args = args(None, None);
+        args.messages = Some(r#"[{"role":"user","content":"hi"}]"#.to_string());
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(
+            body["prompt_data"]["prompt"]["type"],
+            serde_json::json!("chat")
+        );
+        assert_eq!(
+            body["prompt_data"]["prompt"]["messages"],
+            serde_json::json!([{"role":"user","content":"hi"}])
+        );
+    }
+
+    #[test]
+    fn build_patch_body_model_merges_into_prompt_data() {
+        let args = args(Some("gpt-4o-mini"), None);
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(
+            body["prompt_data"]["options"]["model"],
+            serde_json::json!("gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn build_patch_body_messages_and_model_combine() {
+        let mut args = args(Some("gpt-4o-mini"), None);
+        args.messages = Some(r#"[{"role":"user","content":"Grade it."}]"#.to_string());
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(
+            body["prompt_data"]["prompt"]["messages"],
+            json!([{"role": "user", "content": "Grade it."}])
+        );
+        assert_eq!(
+            body["prompt_data"]["options"]["model"],
+            serde_json::json!("gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn build_patch_body_updates_all_llm_configuration() {
+        let parsed = ScorerUpdateArgsHarness::try_parse_from([
+            "test",
+            "test-scorer",
+            "--model",
+            "gpt-test",
+            "--temperature",
+            "0.2",
+            "--max-tokens",
+            "128",
+            "--top-p",
+            "0.9",
+            "--frequency-penalty",
+            "0.5",
+            "--presence-penalty",
+            "0.25",
+            "--stop-sequence",
+            "END",
+            "--tool-choice",
+            "test_tool",
+            "--reasoning-effort",
+            "low",
+            "--verbosity",
+            "high",
+            "--template-format",
+            "none",
+            "--use-cot=false",
+        ])
+        .expect("parse update");
+
+        let body = build_scorer_patch_body(&parsed.args).expect("patch body");
+        let params = &body["prompt_data"]["options"]["params"];
+        assert_eq!(body["prompt_data"]["options"]["model"], "gpt-test");
+        assert_eq!(params["temperature"], 0.2);
+        assert_eq!(params["max_tokens"], 128);
+        assert_eq!(params["top_p"], 0.9);
+        assert_eq!(params["frequency_penalty"], 0.5);
+        assert_eq!(params["presence_penalty"], 0.25);
+        assert_eq!(params["stop"], json!(["END"]));
+        assert_eq!(
+            params["tool_choice"],
+            json!({"type": "function", "function": {"name": "test_tool"}})
+        );
+        assert_eq!(params["reasoning_effort"], "low");
+        assert_eq!(params["verbosity"], "high");
+        assert_eq!(body["prompt_data"]["template_format"], "none");
+        assert_eq!(body["prompt_data"]["parser"]["use_cot"], false);
+    }
+
+    #[test]
+    fn build_patch_body_switches_to_classification_output() {
+        let mut args = args(None, None);
+        args.classifications = Some(r#"["safe","unsafe"]"#.to_string());
+        args.allow_no_match = Some(true);
+        args.common.metadata = Some("owner: test-team".to_string());
+
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert!(body.get("function_type").is_none());
+        assert_eq!(
+            body["prompt_data"]["parser"]["choice"],
+            json!(["safe", "unsafe"])
+        );
+        assert_eq!(body["prompt_data"]["parser"]["allow_no_match"], true);
+        assert_eq!(body["metadata"]["owner"], "test-team");
+    }
+
+    #[test]
+    fn build_patch_body_updates_scores_and_pass_threshold() {
+        let mut args = args(None, None);
+        args.choice_scores = Some(r#"{"pass":1,"fail":0}"#.to_string());
+        args.pass_threshold = Some(0.8);
+
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert!(body.get("function_type").is_none());
+        assert_eq!(
+            body["prompt_data"]["parser"]["choice_scores"],
+            json!({"pass": 1, "fail": 0})
+        );
+        assert_eq!(body["metadata"]["__pass_threshold"], 0.8);
+    }
+
+    #[test]
+    fn build_patch_body_description_is_top_level() {
+        let args = args(None, Some("Helpfulness judge"));
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(body["description"], serde_json::json!("Helpfulness judge"));
+    }
+
+    #[test]
+    fn common_fields_update_name_and_slug() {
+        let mut args = args(None, None);
+        args.common.name = Some("Updated scorer".to_string());
+        args.common.new_slug = Some("updated-scorer".to_string());
+
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(body["name"], "Updated scorer");
+        assert_eq!(body["slug"], "updated-scorer");
+    }
+
+    #[test]
+    fn tool_prompt_builds_completion_prompt_patch() {
+        let scorer = args(None, None);
+        let args = ToolUpdateArgs {
+            common: scorer.common,
+            prompt: Some("Look up {{order_id}}".to_string()),
+            messages: None,
+        };
+
+        let body = build_tool_patch_body(&args).expect("patch body");
+        assert_eq!(body["prompt_data"]["prompt"]["type"], "completion");
+        assert_eq!(
+            body["prompt_data"]["prompt"]["content"],
+            "Look up {{order_id}}"
+        );
+    }
+
+    #[test]
+    fn tool_prompt_accepts_text_beginning_with_a_dash() {
+        let parsed = ToolUpdateArgsHarness::try_parse_from([
+            "test",
+            "test-tool",
+            "--prompt",
+            "- instruction {{value}}",
+        ])
+        .expect("parse prompt beginning with a dash");
+
+        let body = build_tool_patch_body(&parsed.args).expect("patch body");
+        assert_eq!(
+            body["prompt_data"]["prompt"]["content"],
+            "- instruction {{value}}"
+        );
+    }
+
+    #[test]
+    fn tool_messages_accept_yaml() {
+        let parsed = ToolUpdateArgsHarness::try_parse_from([
+            "test",
+            "test-tool",
+            "--messages",
+            "- role: user\n  content: Look up {{order_id}}\n",
+        ])
+        .expect("parse inline YAML beginning with a dash");
+
+        let body = build_tool_patch_body(&parsed.args).expect("patch body");
+        assert_eq!(body["prompt_data"]["prompt"]["type"], "chat");
+        assert_eq!(body["prompt_data"]["prompt"]["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn build_patch_body_reads_at_prefixed_messages_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("messages.json");
+        std::fs::write(&path, r#"[{"role":"user","content":"Grade from a file."}]"#)
+            .expect("write messages");
+        let source = format!("@{}", path.display());
+
+        let mut args = args(None, None);
+        args.messages = Some(source);
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(
+            body["prompt_data"]["prompt"]["messages"],
+            json!([{"role": "user", "content": "Grade from a file."}])
+        );
+    }
+
+    #[test]
+    fn build_patch_body_reads_at_prefixed_patch_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("patch.json");
+        std::fs::write(&path, r#"{"description":"From a file"}"#).expect("write patch");
+        let source = format!("@{}", path.display());
+
+        let mut args = args(None, None);
+        args.common.patch = Some(source);
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(body["description"], "From a file");
+    }
+
+    #[test]
+    fn build_patch_body_rejects_empty_update() {
+        let args = args(None, None);
+        let err = build_scorer_patch_body(&args).expect_err("should reject empty");
+        assert!(err.to_string().contains("no updates requested"));
+    }
+
+    #[test]
+    fn build_patch_body_extra_patch_merges_into_prompt_data() {
+        let mut args = args(None, None);
+        args.common.patch = Some(r#"{"prompt_data":{"parser":{"type":"llm_classifier","use_cot":true,"choice_scores":{"A":1.0,"B":0.0}}}}"#.to_string());
+        let body = build_scorer_patch_body(&args).expect("patch body");
+        assert_eq!(
+            body["prompt_data"]["parser"]["choice_scores"],
+            serde_json::json!({"A": 1.0, "B": 0.0})
+        );
+    }
+
+    #[test]
+    fn parse_patch_object_rejects_non_object() {
+        let err = parse_patch_object("[1,2,3]").expect_err("should reject");
+        assert!(err.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn merge_objects_deep_merges_nested_maps() {
+        let mut target = serde_json::json!({
+            "prompt_data": { "options": { "model": "gpt-4o" } }
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+        let source = serde_json::json!({
+            "prompt_data": { "options": { "temperature": 0 } }
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+
+        merge_json_objects(&mut target, &source);
+
+        assert_eq!(
+            target["prompt_data"]["options"]["model"],
+            serde_json::json!("gpt-4o")
+        );
+        assert_eq!(
+            target["prompt_data"]["options"]["temperature"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[test]
+    fn metadata_patch_preserves_existing_fields() {
+        let mut patch = json!({"metadata": {"owner": "test-team"}});
+        let existing = json!({"__pass_threshold": 0.6, "phase": "test"});
+
+        materialize_metadata_patch(&mut patch, Some(&existing));
+
+        assert_eq!(
+            patch["metadata"],
+            json!({
+                "__pass_threshold": 0.6,
+                "phase": "test",
+                "owner": "test-team"
+            })
+        );
+    }
+
+    #[test]
+    fn empty_new_slug_names_the_correct_flag() {
+        let mut args = args(None, None);
+        args.common.new_slug = Some(String::new());
+
+        let error = build_scorer_patch_body(&args).expect_err("empty slug should fail");
+        assert_eq!(error.to_string(), "--new-slug cannot be empty");
+    }
+}

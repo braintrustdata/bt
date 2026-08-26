@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::args::BaseArgs;
-use crate::functions::{self, FunctionCommands, FunctionTypeFilter};
+use crate::functions::{self, ScorerFunctionCommands};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -11,6 +11,7 @@ Examples:
   bt scorers view my-scorer
   bt scorers create \"Helpfulness\" --model gpt-5.4-nano --messages @messages.json \\
     --choice-scores '{\"A\":1,\"B\":0}'
+  bt scorers update my-scorer --messages @messages.json
   bt scorers delete my-scorer
 
 TypeScript and Python code scorers:
@@ -29,16 +30,16 @@ enum ScorersCommands {
     /// Create an LLM scorer or classifier
     Create(Box<functions::create::CreateArgs>),
     #[command(flatten)]
-    Function(FunctionCommands),
+    Function(ScorerFunctionCommands),
 }
 
 pub async fn run(base: BaseArgs, args: ScorersArgs) -> Result<()> {
     match args.command {
         Some(ScorersCommands::Create(create)) => functions::run_scorer_create(base, *create).await,
         Some(ScorersCommands::Function(command)) => {
-            functions::run_typed_command(base, Some(command), FunctionTypeFilter::Scorer).await
+            functions::run_scorer_command(base, Some(command)).await
         }
-        None => functions::run_typed_command(base, None, FunctionTypeFilter::Scorer).await,
+        None => functions::run_scorer_command(base, None).await,
     }
 }
 
@@ -47,30 +48,11 @@ mod tests {
     use clap::Parser;
 
     use super::*;
-    use crate::args::CLIArgs;
 
     #[derive(Debug, Parser)]
     struct ScorersArgsHarness {
         #[command(flatten)]
         args: ScorersArgs,
-    }
-
-    #[test]
-    fn invoke_accepts_global_json_flag() {
-        #[derive(Debug, Parser)]
-        struct Harness {
-            #[command(flatten)]
-            command: CLIArgs<ScorersArgs>,
-        }
-
-        let parsed = Harness::try_parse_from(["bt-scorers", "invoke", "test-scorer", "--json"])
-            .expect("parse scorer invoke with global JSON output");
-
-        assert!(parsed.command.base.json);
-        assert!(matches!(
-            parsed.command.args.command,
-            Some(ScorersCommands::Function(FunctionCommands::Invoke(_)))
-        ));
     }
 
     #[test]
@@ -94,6 +76,46 @@ mod tests {
         assert!(matches!(
             parsed.args.command,
             Some(ScorersCommands::Create(_))
+        ));
+    }
+
+    #[test]
+    fn parses_create_classifier() {
+        let parsed = ScorersArgsHarness::try_parse_from([
+            "bt-scorers",
+            "create",
+            "Test classifier",
+            "--model",
+            "gpt-test",
+            "--messages",
+            r#"[{"role":"user","content":"Classify {{output}}"}]"#,
+            "--classifications",
+            r#"["safe","unsafe"]"#,
+            "--allow-no-match",
+        ])
+        .expect("parse create classifier");
+
+        assert!(matches!(
+            parsed.args.command,
+            Some(ScorersCommands::Create(_))
+        ));
+    }
+
+    #[test]
+    fn still_parses_shared_scorer_commands() {
+        let parsed = ScorersArgsHarness::try_parse_from([
+            "bt-scorers",
+            "update",
+            "test-scorer",
+            "--model",
+            "gpt-test",
+            "--yes",
+        ])
+        .expect("parse update");
+
+        assert!(matches!(
+            parsed.args.command,
+            Some(ScorersCommands::Function(ScorerFunctionCommands::Update(_)))
         ));
     }
 }
