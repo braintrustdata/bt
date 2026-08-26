@@ -66,7 +66,7 @@ pub struct ListArgs {
 #[derive(Debug, Clone, Args)]
 struct PromptSlugArgs {
     /// Prompt slug (positional)
-    #[arg(value_name = "SLUG")]
+    #[arg(value_name = "SLUG", conflicts_with = "slug_flag")]
     slug_positional: Option<String>,
 
     /// Prompt slug (flag)
