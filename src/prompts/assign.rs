@@ -39,7 +39,10 @@ pub async fn run(
     )
     .await?
     .ok_or_else(|| match version {
-        Some(version) => anyhow!("prompt with slug '{slug}' not found at version {version}"),
+        Some(version) => anyhow!(
+            "prompt with slug '{slug}' not found at version {}",
+            crate::util_cmd::display_xact_id(version)
+        ),
         None => anyhow!("prompt with slug '{slug}' not found"),
     })?;
 
@@ -70,7 +73,10 @@ pub async fn run(
     } else {
         let message = match action {
             Action::Assign { version } => {
-                format!("Assigned prompt '{slug}' version {version} to environment '{environment}'")
+                format!(
+                    "Assigned prompt '{slug}' version {} to environment '{environment}'",
+                    crate::util_cmd::display_xact_id(version)
+                )
             }
             Action::Unassign => {
                 format!("Unassigned prompt '{slug}' from environment '{environment}'")

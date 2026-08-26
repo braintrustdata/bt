@@ -57,9 +57,14 @@ pub async fn run(ctx: &ResolvedContext, environment: Option<&str>, json: bool) -
             .filter(|s| !s.is_empty())
             .map(|s| truncate(s, 60))
             .unwrap_or_else(|| "-".to_string());
+        let version = prompt
+            ._xact_id
+            .as_deref()
+            .map(crate::util_cmd::display_xact_id)
+            .unwrap_or_else(|| "-".to_string());
         let mut row = vec![prompt.name.as_str(), desc.as_str(), prompt.slug.as_str()];
         if environment.is_some() {
-            row.push(prompt._xact_id.as_deref().unwrap_or("-"));
+            row.push(version.as_str());
         }
         table.add_row(row);
     }

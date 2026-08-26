@@ -69,12 +69,15 @@ pub async fn get_prompt_by_slug(
     version: Option<&str>,
     environment: Option<&str>,
 ) -> Result<Option<Prompt>> {
+    let normalized_version = version
+        .map(crate::util_cmd::normalize_xact_id)
+        .transpose()?;
     let mut params = vec![
         ("org_name", client.org_name()),
         ("project_name", project),
         ("slug", slug),
     ];
-    if let Some(version) = version {
+    if let Some(version) = normalized_version.as_deref() {
         params.push(("version", version));
     }
     if let Some(environment) = environment {

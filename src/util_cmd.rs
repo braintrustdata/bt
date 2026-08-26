@@ -393,6 +393,27 @@ pub(crate) fn prettify_xact(value: u64) -> String {
     format!("{encoded:016x}")
 }
 
+/// Format a transaction ID as the canonical short version ID.
+///
+/// Values that are already short version IDs, or are not valid decimal
+/// transaction IDs, are returned unchanged.
+pub(crate) fn display_xact_id(value: &str) -> String {
+    if is_pretty_version(value) {
+        return value.to_string();
+    }
+
+    value
+        .parse::<u64>()
+        .map(prettify_xact)
+        .unwrap_or_else(|_| value.to_string())
+}
+
+/// Convert a short version ID to the decimal transaction ID expected by APIs.
+/// Decimal transaction IDs are returned unchanged.
+pub(crate) fn normalize_xact_id(value: &str) -> Result<String> {
+    load_pretty_xact(value)
+}
+
 fn load_pretty_xact(encoded_hex: &str) -> Result<String> {
     if encoded_hex.len() != 16 {
         return Ok(encoded_hex.to_string());
@@ -516,6 +537,18 @@ mod tests {
             assert_eq!(prettify_xact(original_u64), pretty);
             assert_eq!(load_pretty_xact(pretty).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn display_and_normalize_xact_ids_accept_both_forms() {
+        let long = "1000192656880881099";
+        let short = "81cd05ee665fdfb3";
+
+        assert_eq!(display_xact_id(long), short);
+        assert_eq!(display_xact_id(short), short);
+        assert_eq!(display_xact_id("1234567890123456"), "1234567890123456");
+        assert_eq!(normalize_xact_id(long).unwrap(), long);
+        assert_eq!(normalize_xact_id(short).unwrap(), long);
     }
 
     #[test]

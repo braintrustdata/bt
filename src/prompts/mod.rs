@@ -47,7 +47,7 @@ enum PromptsCommands {
 
 #[derive(Debug, Clone, Args)]
 struct PromptSelectorArgs {
-    /// Prompt version identifier (for example, a transaction ID)
+    /// Prompt version ID (short or decimal transaction ID)
     #[arg(long)]
     version: Option<String>,
 
@@ -155,7 +155,7 @@ async fn resolve_prompt(
     .ok_or_else(|| {
         if interactive_selection {
             let selector = version
-                .map(|value| format!("version {value}"))
+                .map(|value| format!("version {}", crate::util_cmd::display_xact_id(value)))
                 .or_else(|| environment.map(|value| format!("environment {value}")))
                 .unwrap_or_default();
             anyhow!("prompt with slug '{slug}' not found at {selector}")

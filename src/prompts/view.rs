@@ -54,7 +54,7 @@ pub async fn run(
             output,
             "{} {}",
             console::style("Version:").dim(),
-            display_version(version)
+            crate::util_cmd::display_xact_id(version)
         )?;
     }
 
@@ -81,27 +81,4 @@ pub async fn run(
 
     print_with_pager(&output)?;
     Ok(())
-}
-
-fn display_version(version: &str) -> String {
-    if version.len() == 16 && version.chars().all(|c| c.is_ascii_hexdigit()) {
-        return version.to_string();
-    }
-
-    version
-        .parse::<u64>()
-        .map(crate::util_cmd::prettify_xact)
-        .unwrap_or_else(|_| version.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::display_version;
-
-    #[test]
-    fn display_version_uses_pretty_encoding_for_xact_ids() {
-        assert_eq!(display_version("1000192656880881099"), "81cd05ee665fdfb3");
-        assert_eq!(display_version("81cd05ee665fdfb3"), "81cd05ee665fdfb3");
-        assert_eq!(display_version("1234567890123456"), "1234567890123456");
-    }
 }
