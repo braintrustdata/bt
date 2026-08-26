@@ -125,6 +125,10 @@ fn prompt_versions_request(project_id: &str, prompt_id: &str) -> Value {
                 "args": [{ "op": "literal", "value": project_id }]
             },
             "select": [{ "op": "star" }],
+            "sort": [{
+                "expr": { "op": "ident", "name": ["_xact_id"] },
+                "dir": "desc"
+            }],
             "filter": {
                 "op": "eq",
                 "left": { "op": "ident", "name": ["id"] },
