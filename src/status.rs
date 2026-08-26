@@ -42,6 +42,8 @@ struct StatusOutput {
     source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profiles: Option<Vec<auth::ProfileVerification>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_storage: Option<auth::SecretStorageInfo>,
 }
 
 fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
@@ -120,6 +122,7 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
     } else {
         None
     };
+    let secret_storage = args.all.then(auth::secret_storage_info);
 
     if base.json {
         let output = StatusOutput {
@@ -135,6 +138,7 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
             api_key_hint: profile_info.as_ref().and_then(|p| p.api_key_hint.clone()),
             source,
             profiles,
+            secret_storage,
         };
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
@@ -152,9 +156,17 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
                 };
                 crate::ui::print_command_status(status, &auth::format_verification_line(profile));
             }
-            if let Ok(path) = auth::credentials_path() {
-                eprintln!("\nCredentials: {}\n", path.display());
+        }
+        if let Some(storage) = secret_storage.as_ref() {
+            match &storage.path {
+                Some(path) => {
+                    eprintln!("\nSecret storage: {} ({})", storage.backend, path.display())
+                }
+                None => eprintln!("\nSecret storage: {}", storage.backend),
             }
+        }
+        if let Ok(path) = auth::credentials_path() {
+            eprintln!("Profile metadata: {}\n", path.display());
         }
     }
 

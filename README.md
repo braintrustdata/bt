@@ -352,7 +352,7 @@ Local version and pagination-key conversion helpers:
   - `bt profiles` or `bt profiles list`
   - `bt profiles delete work`
   - `bt profiles rename work renamed-work`
-- Check every profile's connection status and the current context:
+- Check every profile's connection status, the current context, and the secret-storage backend:
   - `bt status --all`
 - Log out (remove a saved profile):
   - `bt logout`
@@ -369,7 +369,7 @@ Auth resolution order for commands is:
 5. Single-profile auto-select (if only one compatible profile exists)
 6. Interactive profile picker (if multiple compatible profiles exist and a TTY is available)
 
-On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
+On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, secure storage uses the `security` keychain utility. Windows Credential Manager integration is not currently implemented. If a secure store is unavailable or unsupported, `bt` falls back to a plaintext `secrets.json` file with `0600` permissions where supported. `bt status --all` reports the backend in use (and the path when plaintext storage is in use).
 
 ## `bt switch`
 

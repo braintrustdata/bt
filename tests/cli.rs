@@ -434,16 +434,17 @@ fn profiles_rename_moves_oauth_credentials() {
 }
 
 #[test]
-fn status_all_json_includes_profile_urls() {
+fn status_all_includes_profile_urls_and_secret_storage() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
     let auth_dir = config_home.path().join("bt");
     fs::create_dir_all(&auth_dir).expect("create auth dir");
     fs::write(
         auth_dir.join("auth.json"),
-        r#"{"profiles":{"test-profile":{"auth_kind":"oauth","api_url":"https://oauth-api.test.example","app_url":"https://app.test.example","oauth_client_id":"bt_cli_test"}}}"#,
+        r#"{"profiles":{"test-profile":{"auth_kind":"oauth","api_url":"https://oauth-api.test.example","app_url":"https://app.test.example","oauth_client_id":"bt_cli_test","oauth_access_expires_at":1}}}"#,
     )
     .expect("write auth store");
+    write_profile_secrets(config_home.path(), &["oauth_access::test-profile"]);
 
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
@@ -457,6 +458,21 @@ fn status_all_json_includes_profile_urls() {
         ))
         .stdout(predicate::str::contains(
             "\"api_url\":\"https://oauth-api.test.example\"",
+        ))
+        .stdout(predicate::str::contains(
+            r#""secret_storage":{"backend":"plaintext secrets.json","path":"#,
+        ));
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status", "--all"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Secret storage:").count(1))
+        .stderr(predicate::str::contains(
+            "Secret storage: plaintext secrets.json (",
         ));
 }
 

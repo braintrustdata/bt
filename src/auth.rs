@@ -38,6 +38,12 @@ use crate::{
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
+#[cfg(target_os = "macos")]
+const SECURE_STORAGE_BACKEND: Option<&str> = Some("macOS Keychain");
+#[cfg(target_os = "linux")]
+const SECURE_STORAGE_BACKEND: Option<&str> = Some("Linux Secret Service (via secret-tool)");
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const SECURE_STORAGE_BACKEND: Option<&str> = None;
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
@@ -2154,6 +2160,32 @@ pub(crate) async fn profile_verifications() -> Result<Vec<ProfileVerification>> 
 
 pub(crate) fn credentials_path() -> Result<PathBuf> {
     auth_store_path()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SecretStorageInfo {
+    pub backend: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+}
+
+pub(crate) fn secret_storage_info() -> SecretStorageInfo {
+    let path = secret_store_path().ok();
+    let plaintext = path.as_ref().is_some_and(|path| {
+        load_secret_store()
+            .map(|store| !store.secrets.is_empty())
+            .unwrap_or_else(|_| path.exists())
+    });
+    if plaintext || SECURE_STORAGE_BACKEND.is_none() {
+        return SecretStorageInfo {
+            backend: "plaintext secrets.json",
+            path,
+        };
+    }
+    SecretStorageInfo {
+        backend: SECURE_STORAGE_BACKEND.expect("secure storage backend checked above"),
+        path: None,
+    }
 }
 
 pub(crate) fn format_verification_line(v: &ProfileVerification) -> String {
