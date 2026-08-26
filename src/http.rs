@@ -323,14 +323,7 @@ impl ApiClient {
     }
 
     pub async fn delete(&self, path: &str) -> Result<()> {
-        let url = self.url(path);
-        let response = self
-            .http
-            .delete(&url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .context("request failed")?;
+        let response = self.send_delete(path).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -339,6 +332,27 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    pub async fn delete_with_response<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let response = self.send_delete(path).await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(HttpError { status, body }.into());
+        }
+
+        parse_json_response(response, "DELETE", path).await
+    }
+
+    async fn send_delete(&self, path: &str) -> Result<reqwest::Response> {
+        self.http
+            .delete(self.url(path))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("request failed")
     }
 
     pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
