@@ -185,11 +185,11 @@ pub struct FunctionArgs {
 pub(crate) enum FunctionCommands {
     /// List all in the current project
     List,
-    /// View a function's details
+    /// View details
     View(ViewArgs),
-    /// Delete a function
+    /// Delete by slug
     Delete(DeleteArgs),
-    /// Invoke a function
+    /// Invoke by slug
     Invoke(invoke::InvokeArgs),
 }
 

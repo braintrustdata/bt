@@ -10,6 +10,8 @@ fn bt_command() -> Command {
 fn clear_braintrust_auth_env(cmd: &mut Command) {
     for key in [
         "BRAINTRUST_API_KEY",
+        "BRAINTRUST_API_URL",
+        "BRAINTRUST_APP_URL",
         "BRAINTRUST_PROFILE",
         "BRAINTRUST_ORG_NAME",
         "BRAINTRUST_DEFAULT_PROJECT",
