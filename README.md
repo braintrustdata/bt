@@ -48,7 +48,7 @@ To use the latest stable version:
 
 ```toml
 [tools."github:braintrustdata/bt"]
-version = "stable"
+version = "latest"
 ```
 
 To pin a specific version with sha256 hash:
@@ -65,8 +65,8 @@ linux-x64.checksum = "sha256:the sha256 for linux-x64"
 
 The supported architectures are macos-arm64, macos-x64, linux-arm64, linux-x64, linux-x64-musl, windows-arm64 and windows-x64.
 
-The version can be `"stable"` for the latest stable version, `"major.minor.patch"` for a specific version, `"canary"` to get the latest canary version, or `"canary-7129692509ab"` (12 character short SHA1) to get a specific canary version.
-Don't choose `"stable"` or `"canary"` while pinning SHA256 since they change every release.
+The version can be `"latest"` for the latest stable version, `"major.minor.patch"` for a specific version, `"canary"` to get the latest canary version, or `"canary-7129692509ab"` (12 character short SHA1) to get a specific canary version.
+Don't choose `"latest"` or `"canary"` while pinning SHA256 since they change every release.
 The SHA1 is the commit hash while the (optional) SHA256 of `mise.toml` are hashed from the archive with the binaries.
 
 ### PR/branch builds (no release)
