@@ -6,16 +6,20 @@ use crate::{args::BaseArgs, project_context::resolve_project_command_context_wit
 pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 
 mod api;
+mod create;
 mod delete;
 mod list;
+mod update;
 mod view;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
   bt prompts list
+  bt prompts create \"Support reply\" --model gpt-5.4-nano --messages @messages.json
   bt prompts view my-prompt
   bt prompts delete my-prompt
+  bt prompts update my-prompt --messages @messages.json
 ")]
 pub struct PromptsArgs {
     #[command(subcommand)]
@@ -26,8 +30,12 @@ pub struct PromptsArgs {
 enum PromptsCommands {
     /// List all prompts
     List,
+    /// Create a prompt
+    Create(Box<create::CreateArgs>),
     /// View a prompt's content
     View(ViewArgs),
+    /// Update a prompt in place (prompt configuration, metadata, or arbitrary patch)
+    Update(Box<update::UpdateArgs>),
     /// Delete a prompt
     Delete(DeleteArgs),
 }
@@ -84,9 +92,11 @@ pub async fn run(base: BaseArgs, args: PromptsArgs) -> Result<()> {
 
     match args.command {
         None | Some(PromptsCommands::List) => list::run(&ctx, base.json).await,
+        Some(PromptsCommands::Create(p)) => create::run(&ctx, &p, base.json).await,
         Some(PromptsCommands::View(p)) => {
             view::run(&ctx, p.slug(), base.json, p.web, base.verbose).await
         }
+        Some(PromptsCommands::Update(p)) => update::run(&ctx, &p, base.json).await,
         Some(PromptsCommands::Delete(p)) => delete::run(&ctx, p.slug(), p.force).await,
     }
 }
@@ -100,7 +110,15 @@ fn prompts_command_is_read_only(command: Option<&PromptsCommands>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
+
+    #[derive(Debug, Parser)]
+    struct PromptsArgsHarness {
+        #[command(flatten)]
+        args: PromptsArgs,
+    }
 
     #[test]
     fn prompts_routes_list_and_view_to_read_only_auth() {
@@ -116,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn prompts_routes_delete_to_validated_auth() {
+    fn prompts_routes_mutations_to_validated_auth() {
         assert!(!prompts_command_is_read_only(Some(
             &PromptsCommands::Delete(DeleteArgs {
                 slug_positional: Some("my-prompt".to_string()),
@@ -124,5 +142,20 @@ mod tests {
                 force: true,
             })
         )));
+    }
+
+    #[test]
+    fn prompts_routes_update_to_validated_auth() {
+        let parsed = PromptsArgsHarness::try_parse_from([
+            "bt-prompts",
+            "update",
+            "my-prompt",
+            "--description",
+            "updated",
+            "--yes",
+        ])
+        .expect("parse update");
+
+        assert!(!prompts_command_is_read_only(parsed.args.command.as_ref()));
     }
 }
