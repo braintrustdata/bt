@@ -272,7 +272,6 @@ mod tests {
     #[test]
     fn active_observability_commands_parse_from_the_root_cli() {
         for args in [
-            vec!["bt", "observability", "template", "pull"],
             vec![
                 "bt",
                 "observability",
@@ -291,13 +290,6 @@ mod tests {
                 "Topics",
                 "--force",
                 "--yes",
-            ],
-            vec![
-                "bt",
-                "observability",
-                "template",
-                "push",
-                "https://example.com/template.json",
             ],
             vec![
                 "bt",

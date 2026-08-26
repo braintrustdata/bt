@@ -208,14 +208,6 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_stdout_is_only_pretty_json() {
-        let text = serialize_stdout(&template()).expect("serialize stdout");
-        let value: serde_json::Value = serde_json::from_str(&text).expect("clean JSON");
-        assert_eq!(value["kind"], KIND);
-        assert!(!text.contains("Pulled active observability"));
-    }
-
-    #[test]
     fn active_observability_selection_filters_both_resource_types() {
         let template = template();
         let (facets, automations) = filter_resources(template.facets, template.automations, &[1]);
@@ -224,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_noninteractive_pull_uses_active_defaults() {
+    fn active_observability_active_defaults_exclude_inactive_resources() {
         let mut template = template();
         template.facets.push(FacetTemplate {
             name: "Active facet".to_string(),

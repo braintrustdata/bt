@@ -759,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_preflight_rejects_type_and_no_force_conflicts() {
+    fn active_observability_preflight_rejects_a_function_type_collision() {
         let wrong = plan(
             &template(facet(Some("Topics"))),
             Snapshot {
@@ -771,7 +771,10 @@ mod tests {
         )
         .expect_err("wrong type");
         assert!(wrong.to_string().contains("not a facet"));
+    }
 
+    #[test]
+    fn active_observability_preflight_requires_force_for_an_existing_facet() {
         let no_force = plan(
             &template(facet(Some("Topics"))),
             Snapshot {
@@ -783,7 +786,10 @@ mod tests {
         )
         .expect_err("no force conflict");
         assert!(no_force.to_string().contains("--force"));
+    }
 
+    #[test]
+    fn active_observability_preflight_rejects_an_automation_type_collision() {
         let wrong_loop = plan(
             &ActiveObservabilityTemplate {
                 kind: KIND.to_string(),

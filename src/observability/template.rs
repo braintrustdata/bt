@@ -814,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_force_conversions_preserve_customization_and_actions() {
+    fn active_observability_topic_map_reconciliation_preserves_customization() {
         let topic_map = function(
             "fn-test-topic-map",
             "test-facet-topic-map",
@@ -842,7 +842,10 @@ mod tests {
             request["function_data"]["source_facet_function"],
             json!({"type": "function", "id": "fn-test-facet"})
         );
+    }
 
+    #[test]
+    fn active_observability_loop_replacement_preserves_target_actions() {
         let config = loop_config_for_target(
             &json!({"event_type": "windowed", "window": {}, "loop": {}, "actions": ["source"]}),
             Some(&json!({"event_type": "windowed", "loop": {}, "actions": ["target"]})),
