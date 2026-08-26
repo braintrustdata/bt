@@ -35,6 +35,9 @@ pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     if !base.json && !base.no_input && ui::is_interactive() {
         (template.facets, template.automations) =
             select_resources(template.facets, template.automations)?;
+    } else {
+        (template.facets, template.automations) =
+            filter_active_resources(template.facets, template.automations);
     }
     // Selection happens first so a selected facet never loses its required definition.
     deduplicate_preprocessors(&mut template.facets);
@@ -167,6 +170,19 @@ fn filter_resources(
     (facets, automations)
 }
 
+fn filter_active_resources(
+    facets: Vec<FacetTemplate>,
+    automations: Vec<AutomationTemplate>,
+) -> (Vec<FacetTemplate>, Vec<AutomationTemplate>) {
+    (
+        facets.into_iter().filter(FacetTemplate::active).collect(),
+        automations
+            .into_iter()
+            .filter(AutomationTemplate::active)
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -205,5 +221,43 @@ mod tests {
         let (facets, automations) = filter_resources(template.facets, template.automations, &[1]);
         assert!(facets.is_empty());
         assert_eq!(automations.len(), 1);
+    }
+
+    #[test]
+    fn active_observability_noninteractive_pull_uses_active_defaults() {
+        let mut template = template();
+        template.facets.push(FacetTemplate {
+            name: "Active facet".to_string(),
+            slug: "active-facet".to_string(),
+            topics_automation: Some("Synthetic Topics".to_string()),
+            ..template.facets[0].clone()
+        });
+        template.automations.push(AutomationTemplate {
+            name: "Paused Loop".to_string(),
+            description: None,
+            config: json!({
+                "event_type": "windowed",
+                "status": "paused",
+                "window": {},
+                "loop": {}
+            }),
+        });
+
+        let (facets, automations) = filter_active_resources(template.facets, template.automations);
+
+        assert_eq!(
+            facets
+                .iter()
+                .map(|facet| facet.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Active facet"]
+        );
+        assert_eq!(
+            automations
+                .iter()
+                .map(|automation| automation.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Test Loop"]
+        );
     }
 }

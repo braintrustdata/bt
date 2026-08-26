@@ -16,8 +16,9 @@ use crate::{
 use super::template::{
     add_topics_functions, default_topics_config, embedding_model, is_loop_config, is_topics,
     loop_config_for_target, new_topic_map_request, reconciled_topic_map_request,
-    saved_preprocessor_slug, topic_map_slug, with_preprocessor_id, ActiveObservabilityTemplate,
-    AutomationTemplate, FacetTemplate, PortableFunction, DEFAULT_TOPICS_DESCRIPTION,
+    remove_topics_functions, saved_preprocessor_slug, topic_map_slug, with_preprocessor_id,
+    ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate, PortableFunction,
+    DEFAULT_TOPICS_DESCRIPTION,
 };
 
 #[derive(Debug)]
@@ -195,6 +196,14 @@ pub(crate) fn plan(
             embedding_model: model,
             config,
         });
+        plan_topics_removals(
+            &mut topics,
+            &topics_automations,
+            &key,
+            existing,
+            topic_map,
+            &functions_by_id,
+        )?;
         facets.push(FacetMutation {
             template: facet.clone(),
             existing: existing.cloned(),
@@ -248,6 +257,53 @@ pub(crate) fn plan(
             .map(|function| (function.slug, function.id))
             .collect(),
     })
+}
+
+fn plan_topics_removals(
+    topics: &mut BTreeMap<String, TopicsMutation>,
+    automations: &[&ProjectAutomation],
+    selected_key: &str,
+    facet: Option<&Function>,
+    topic_map: Option<&Function>,
+    functions_by_id: &HashMap<&str, &Function>,
+) -> Result<()> {
+    if facet.is_none() && topic_map.is_none() {
+        return Ok(());
+    }
+
+    for &automation in automations {
+        let key = TopicsTarget::Existing(automation.clone()).key();
+        if key == selected_key {
+            continue;
+        }
+        let current_config = topics
+            .get(&key)
+            .map(|mutation| &mutation.config)
+            .unwrap_or(&automation.config);
+        let Some(config) = remove_topics_functions(
+            current_config,
+            facet.map(|facet| facet.id.as_str()),
+            topic_map.map(|topic_map| topic_map.id.as_str()),
+        )?
+        else {
+            continue;
+        };
+
+        match topics.get_mut(&key) {
+            Some(mutation) => mutation.config = config,
+            None => {
+                topics.insert(
+                    key,
+                    TopicsMutation {
+                        target: TopicsTarget::Existing(automation.clone()),
+                        embedding_model: embedding_model(automation, functions_by_id),
+                        config,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn unique_functions_by_slug(functions: &[Function]) -> Result<HashMap<&str, &Function>> {
@@ -659,6 +715,47 @@ mod tests {
         .expect("one new destination");
         assert_eq!(plan.topics.len(), 1);
         assert_eq!(plan.facets.len(), 2);
+    }
+
+    #[test]
+    fn active_observability_remap_removes_the_previous_topics_wiring() {
+        let mut previous = automation("auto-previous", "Previous Topics", "topic");
+        previous.config["facet_functions"] = json!([
+            {"type": "function", "id": "fn-test-facet"},
+            {"type": "function", "id": "fn-unrelated-facet"}
+        ]);
+        previous.config["topic_map_functions"] = json!([
+            {"function": {"type": "function", "id": "fn-test-facet-topic-map"}},
+            {"function": {"type": "function", "id": "fn-unrelated-topic-map"}}
+        ]);
+
+        let planned = plan(
+            &template(facet(Some("Destination Topics"))),
+            Snapshot {
+                functions: vec![
+                    existing_function("test-facet", "facet", "facet"),
+                    existing_function("test-facet-topic-map", "classifier", "topic_map"),
+                ],
+                automations: vec![
+                    previous,
+                    automation("auto-destination", "Destination Topics", "topic"),
+                ],
+            },
+            None,
+            true,
+        )
+        .expect("facet remap");
+
+        let previous = &planned.topics["id:auto-previous"].config;
+        assert_eq!(
+            previous["facet_functions"],
+            json!([{"type": "function", "id": "fn-unrelated-facet"}])
+        );
+        assert_eq!(
+            previous["topic_map_functions"],
+            json!([{"function": {"type": "function", "id": "fn-unrelated-topic-map"}}])
+        );
+        assert!(planned.topics.contains_key("id:auto-destination"));
     }
 
     #[test]

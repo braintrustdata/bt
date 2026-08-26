@@ -585,6 +585,44 @@ pub(crate) fn add_topics_functions(
     Ok(Value::Object(config))
 }
 
+pub(crate) fn remove_topics_functions(
+    config: &Value,
+    facet_id: Option<&str>,
+    topic_map_id: Option<&str>,
+) -> Result<Option<Value>> {
+    let contains_facet = facet_id.is_some_and(|id| {
+        config
+            .get("facet_functions")
+            .and_then(Value::as_array)
+            .is_some_and(|facets| {
+                facets
+                    .iter()
+                    .any(|entry| function_ref_id(entry) == Some(id))
+            })
+    });
+    let contains_topic_map = topic_map_id.is_some_and(|id| {
+        config
+            .get("topic_map_functions")
+            .and_then(Value::as_array)
+            .is_some_and(|topic_maps| {
+                topic_maps
+                    .iter()
+                    .any(|entry| entry.get("function").and_then(function_ref_id) == Some(id))
+            })
+    });
+    if !contains_facet && !contains_topic_map {
+        return Ok(None);
+    }
+
+    let mut config = object(config, "Topics automation config")?.clone();
+    array_entry(&mut config, "facet_functions")?
+        .retain(|entry| facet_id.is_none_or(|id| function_ref_id(entry) != Some(id)));
+    array_entry(&mut config, "topic_map_functions")?.retain(|entry| {
+        topic_map_id.is_none_or(|id| entry.get("function").and_then(function_ref_id) != Some(id))
+    });
+    Ok(Some(Value::Object(config)))
+}
+
 pub(crate) fn embedding_model(
     automation: &ProjectAutomation,
     functions_by_id: &HashMap<&str, &Function>,
