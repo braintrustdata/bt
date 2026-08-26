@@ -9,7 +9,7 @@ use crate::ui::prompt_render::{
 use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
 };
-use crate::utils::app_project_url_with_encoded_path;
+use crate::utils::{app_project_url_with_encoded_path, app_url_with_selected_version};
 use crate::{http::ApiClient, projects::api as projects_api};
 
 use super::{api, build_web_path, label, label_plural, select_function_interactive};
@@ -123,8 +123,14 @@ async fn render_function(
             Some(project_name) => project_name.to_string(),
             None => resolve_project_name(client, &function.project_id).await?,
         };
-        let url =
+        let mut url =
             app_project_url_with_encoded_path(app_url, client.org_name(), &project_name, &path);
+        url = app_url_with_selected_version(
+            url,
+            requested_version,
+            environment,
+            function._xact_id.as_deref(),
+        );
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());

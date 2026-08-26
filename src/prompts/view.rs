@@ -5,7 +5,7 @@ use dialoguer::console;
 
 use crate::ui::prompt_render::{render_options, render_prompt_block};
 use crate::ui::{print_command_status, print_with_pager, CommandStatus};
-use crate::utils::app_project_url;
+use crate::utils::{app_project_url, app_url_with_selected_version};
 
 use super::{resolve_prompt, ResolvedContext};
 
@@ -22,12 +22,13 @@ pub async fn run(
     let prompt = resolve_prompt(ctx, slug, version, environment, "bt prompts view <slug>").await?;
 
     if web {
-        let url = app_project_url(
+        let mut url = app_project_url(
             &ctx.app_url,
             ctx.client.org_name(),
             project_name,
             &["prompts", &prompt.id],
         );
+        url = app_url_with_selected_version(url, version, environment, prompt._xact_id.as_deref());
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());
