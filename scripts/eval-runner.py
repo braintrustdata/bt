@@ -82,6 +82,7 @@ class RunnerConfig:
     jsonl: bool
     list_only: bool
     terminate_on_failure: bool
+    max_concurrency: int | None
     num_workers: int | None
     filters: list[EvalFilter]
     first: int | None
@@ -270,6 +271,7 @@ def read_runner_config() -> RunnerConfig:
         jsonl=env_flag("BT_EVAL_JSONL"),
         list_only=env_flag("BT_EVAL_LIST"),
         terminate_on_failure=env_flag("BT_EVAL_TERMINATE_ON_FAILURE"),
+        max_concurrency=parse_positive_int_env("BT_EVAL_MAX_CONCURRENCY"),
         num_workers=num_workers,
         filters=parse_serialized_filters(os.getenv("BT_EVAL_FILTER_PARSED")),
         first=parse_positive_int_env("BT_EVAL_FIRST"),
@@ -1324,6 +1326,11 @@ async def run_once(
         sse.send("processing", {"evaluators": len(evaluators)})
 
     progress_mode = run_evaluator_progress_mode()
+    eval_semaphore = (
+        asyncio.Semaphore(config.max_concurrency)
+        if config.max_concurrency is not None
+        else None
+    )
 
     async def run_single_evaluator(
         idx: int, evaluator_instance: EvaluatorInstance
@@ -1350,7 +1357,11 @@ async def run_once(
             # command running multiple evaluators doesn't fail on unrelated params.
             filtered_params = filter_params_for_evaluator(effective_params, evaluator.parameters)
             evaluator.parameters = validate_parameters(filtered_params, evaluator.parameters)
+        acquired_eval_slot = False
         try:
+            if eval_semaphore is not None:
+                await eval_semaphore.acquire()
+                acquired_eval_slot = True
             result = await run_evaluator_task(
                 evaluator_instance.evaluator,
                 idx,
@@ -1363,6 +1374,9 @@ async def run_once(
         except Exception as exc:
             err = serialize_error(str(exc), traceback.format_exc())
             return evaluator_instance, resolved_reporter, None, err
+        finally:
+            if acquired_eval_slot and eval_semaphore is not None:
+                eval_semaphore.release()
 
         return evaluator_instance, resolved_reporter, result, None
 

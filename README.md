@@ -213,6 +213,8 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
 - If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
 
+Use `--max-concurrency <n>` to limit how many evaluators run at once. This does not change the concurrency configured inside an individual evaluator.
+
 ## `bt datasets`
 
 - `bt datasets` works directly against remote Braintrust datasets — no local `bt sync` artifact flow is required.

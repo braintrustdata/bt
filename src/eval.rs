@@ -312,6 +312,16 @@ pub struct EvalArgs {
     )]
     pub terminate_on_failure: bool,
 
+    /// Maximum number of evaluators to run concurrently.
+    #[arg(
+        long,
+        env = "BT_EVAL_MAX_CONCURRENCY",
+        value_name = "COUNT",
+        value_parser = parse_positive_usize,
+        conflicts_with = "dev"
+    )]
+    pub max_concurrency: Option<usize>,
+
     /// Number of worker threads for Python eval execution.
     #[arg(long, env = "BT_EVAL_NUM_WORKERS", value_name = "COUNT")]
     pub num_workers: Option<usize>,
@@ -454,6 +464,7 @@ enum EvalSamplingMode {
 struct EvalRunOptions {
     jsonl: bool,
     terminate_on_failure: bool,
+    max_concurrency: Option<usize>,
     num_workers: Option<usize>,
     list: bool,
     filter: Vec<String>,
@@ -506,6 +517,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     let options = EvalRunOptions {
         jsonl: args.jsonl,
         terminate_on_failure: args.terminate_on_failure,
+        max_concurrency: args.max_concurrency,
         num_workers: args.num_workers,
         list: args.list,
         filter: args.filter,
@@ -866,6 +878,9 @@ async fn spawn_eval_runner(
     }
     if options.terminate_on_failure {
         cmd.env("BT_EVAL_TERMINATE_ON_FAILURE", "1");
+    }
+    if let Some(max_concurrency) = options.max_concurrency {
+        cmd.env("BT_EVAL_MAX_CONCURRENCY", max_concurrency.to_string());
     }
     if options.list {
         cmd.env("BT_EVAL_LIST", "1");
@@ -5099,6 +5114,49 @@ mod tests {
     }
 
     #[test]
+    fn eval_args_parse_max_concurrency_flag() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = clear_env_var("BT_EVAL_MAX_CONCURRENCY");
+
+        let parsed =
+            EvalArgsHarness::try_parse_from(["bt", "--max-concurrency", "2", "sample.eval.ts"])
+                .expect("max-concurrency flag should parse");
+        assert_eq!(parsed.eval.max_concurrency, Some(2));
+
+        let err = EvalArgsHarness::try_parse_from(["bt", "--maxConcurrency=3", "sample.eval.ts"])
+            .expect_err("camelCase maxConcurrency flag should not parse");
+        assert!(err.to_string().contains("unexpected argument"));
+
+        let err =
+            EvalArgsHarness::try_parse_from(["bt", "--max-concurrency", "0", "sample.eval.ts"])
+                .expect_err("zero max concurrency should fail");
+        assert!(err.to_string().contains("greater than 0"));
+
+        let err = EvalArgsHarness::try_parse_from([
+            "bt",
+            "--dev",
+            "--max-concurrency",
+            "2",
+            "sample.eval.ts",
+        ])
+        .expect_err("max concurrency with dev mode should fail");
+        let message = err.to_string();
+        assert!(message.contains("--max-concurrency"));
+        assert!(message.contains("--dev"));
+
+        set_env_var("BT_EVAL_MAX_CONCURRENCY", "2");
+        let err = EvalArgsHarness::try_parse_from(["bt", "--dev", "sample.eval.ts"])
+            .expect_err("max concurrency env var with dev mode should fail");
+        let message = err.to_string();
+        assert!(message.contains("--max-concurrency"));
+        assert!(message.contains("--dev"));
+
+        restore_env_var("BT_EVAL_MAX_CONCURRENCY", previous);
+    }
+
+    #[test]
     fn eval_args_from_env_populates_supported_fields() {
         let _guard = env_test_lock()
             .lock()
@@ -5106,6 +5164,7 @@ mod tests {
         let keys = [
             "BT_EVAL_JSONL",
             "BT_EVAL_TERMINATE_ON_FAILURE",
+            "BT_EVAL_MAX_CONCURRENCY",
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
@@ -5123,6 +5182,7 @@ mod tests {
             keys.iter().map(|key| (*key, clear_env_var(key))).collect();
         set_env_var("BT_EVAL_JSONL", "true");
         set_env_var("BT_EVAL_TERMINATE_ON_FAILURE", "1");
+        set_env_var("BT_EVAL_MAX_CONCURRENCY", "3");
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
@@ -5137,6 +5197,7 @@ mod tests {
             .expect("env vars should parse into eval args");
         assert!(parsed.eval.jsonl);
         assert!(parsed.eval.terminate_on_failure);
+        assert_eq!(parsed.eval.max_concurrency, Some(3));
         assert_eq!(parsed.eval.num_workers, Some(4));
         assert!(parsed.eval.list);
         assert_eq!(
