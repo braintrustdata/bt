@@ -137,7 +137,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 | Command           | Description                                                         |
 | ----------------- | ------------------------------------------------------------------- |
-| `bt init`         | Initialize `.bt/` config directory and link to a project            |
+| `bt init`         | Initialize `.bt/` config and link to profile & org & project        |
 | `bt login`        | Log in to Braintrust or refresh an OAuth login                      |
 | `bt logout`       | Remove a saved Braintrust login                                     |
 | `bt profiles`     | List, delete, and rename saved login profiles                       |
@@ -170,6 +170,19 @@ bt scorers create "Safety label" \
   --messages @messages.json \
   --classifications '["safe","unsafe"]' \
   --allow-no-match
+```
+`message.json`:
+```
+[
+  {
+    "role": "system",
+    "content": "You are a strict evaluator. Compare the candidate answer with the expected answer. Return exactly PASS or FAIL."
+  },
+  {
+    "role": "user",
+    "content": "Question: {{input.question}}\nExpected answer: {{expected}}\nCandidate answer: {{output}}"
+  }
+]
 ```
 
 Use `--if-exists error|ignore|replace` to control slug conflicts. Text and structured input flags accept an inline value, `@PATH`, or `-` for stdin; only one flag per command may read stdin. Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja. Model options include `--use-cache[=true|false]` and `--response-format text|json-object|<SOURCE>`; structured output accepts a full `response_format` JSON object inline or from `@PATH`.
@@ -344,7 +357,7 @@ Local version and pagination-key conversion helpers:
 - Authenticate interactively:
   - `bt login`
   - First prompt chooses: `OAuth (browser)` (default) or `API key`.
-  - Login stores an identity and its app URL. OAuth login does not select an organization unless `--org` is passed explicitly.
+  - Login stores an identity and its app URL.
   - Use `bt switch` to select the active profile, organization, and project context.
 - Login with OAuth (browser-based, stores refresh token in secure credential store):
   - `bt login --oauth --profile work`
@@ -393,6 +406,7 @@ Show current org and project context:
 
 ## `bt setup` and `bt docs`
 
+`bt setup` is deprecated, use `use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh` instead.
 Use setup/docs commands to configure coding-agent skills and workflow docs for Braintrust.
 
 - Configure skills with default setup flow:
