@@ -36,7 +36,7 @@ use crate::{
     ui,
 };
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
@@ -2989,6 +2989,26 @@ fn secret_store_path() -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(target_os = "windows")]
+fn windows_credential_target(profile_name: &str) -> Result<Vec<u16>> {
+    if profile_name.contains('\0') {
+        bail!("credential profile name contains a null character");
+    }
+
+    Ok(format!("{KEYCHAIN_SERVICE}/{profile_name}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_credential_error(operation: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "failed to {operation} credential in Windows Credential Manager: {}",
+        std::io::Error::last_os_error()
+    )
+}
+
 fn save_profile_secret_keychain(profile_name: &str, api_key: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -3059,7 +3079,46 @@ fn save_profile_secret_keychain(profile_name: &str, api_key: &str) -> Result<()>
         );
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Security::Credentials::{
+            CredWriteW, CREDENTIALW, CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PERSIST_LOCAL_MACHINE,
+            CRED_TYPE_GENERIC,
+        };
+
+        let mut target = windows_credential_target(profile_name)?;
+        let mut username: Vec<u16> = profile_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut secret = api_key.as_bytes().to_vec();
+        let secret_len = u32::try_from(secret.len()).context("credential is too large")?;
+        if secret_len > CRED_MAX_CREDENTIAL_BLOB_SIZE {
+            bail!(
+                "credential is too large for Windows Credential Manager ({} bytes; maximum is {CRED_MAX_CREDENTIAL_BLOB_SIZE})",
+                secret.len()
+            );
+        }
+
+        let credential = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target.as_mut_ptr(),
+            CredentialBlobSize: secret_len,
+            CredentialBlob: secret.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            UserName: username.as_mut_ptr(),
+            ..Default::default()
+        };
+
+        // SAFETY: all pointers reference live buffers for the duration of the
+        // call, and their lengths are represented by the CREDENTIALW fields.
+        if unsafe { CredWriteW(&credential, 0) } != 0 {
+            return Ok(());
+        }
+        Err(windows_credential_error("store"))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = profile_name;
         let _ = api_key;
@@ -3138,7 +3197,61 @@ fn load_profile_secret_keychain(profile_name: &str) -> Result<Option<String>> {
         );
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::{
+            Foundation::ERROR_NOT_FOUND,
+            Security::Credentials::{CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC},
+        };
+
+        let target = windows_credential_target(profile_name)?;
+        let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: target is null-terminated and credential points to writable
+        // storage for the API-owned result pointer.
+        if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+                return Ok(None);
+            }
+            return Err(anyhow::anyhow!(
+                "failed to load credential from Windows Credential Manager: {err}"
+            ));
+        }
+        if credential.is_null() {
+            bail!("Windows Credential Manager returned an empty credential pointer");
+        }
+
+        // Copy the blob before releasing the API-owned CREDENTIALW allocation.
+        // SAFETY: a successful CredReadW returns a valid CREDENTIALW and blob
+        // of CredentialBlobSize bytes; CredFree is required exactly once.
+        let blob = unsafe {
+            let credential_ref = &*credential;
+            let blob = if credential_ref.CredentialBlobSize == 0 {
+                Vec::new()
+            } else {
+                if credential_ref.CredentialBlob.is_null() {
+                    CredFree(credential.cast());
+                    bail!("Windows Credential Manager returned an invalid credential blob");
+                }
+                std::slice::from_raw_parts(
+                    credential_ref.CredentialBlob,
+                    credential_ref.CredentialBlobSize as usize,
+                )
+                .to_vec()
+            };
+            CredFree(credential.cast());
+            blob
+        };
+
+        if blob.is_empty() {
+            return Ok(None);
+        }
+        String::from_utf8(blob)
+            .map(Some)
+            .context("credential in Windows Credential Manager is not valid UTF-8")
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = profile_name;
         bail!("OS keychain credential retrieval is not implemented on this platform");
@@ -3203,7 +3316,26 @@ fn delete_profile_secret_keychain(profile_name: &str) -> Result<()> {
         );
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::{
+            Foundation::ERROR_NOT_FOUND,
+            Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC},
+        };
+
+        let target = windows_credential_target(profile_name)?;
+        // SAFETY: target is a valid null-terminated UTF-16 string.
+        if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+            return Ok(());
+        }
+        bail!("failed to delete credential from Windows Credential Manager: {err}");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = profile_name;
         bail!("OS keychain credential deletion is not implemented on this platform");
@@ -3400,6 +3532,32 @@ mod tests {
 
     fn make_base() -> BaseArgs {
         BaseArgs::default()
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_credential_manager_round_trip() {
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = delete_profile_secret_keychain(&self.0);
+            }
+        }
+
+        let profile_name = format!("bt-test-profile-{}", uuid::Uuid::new_v4());
+        let _cleanup = Cleanup(profile_name.clone());
+        let secret = "synthetic-test-secret-ü";
+
+        save_profile_secret_keychain(&profile_name, secret).expect("store Windows credential");
+        assert_eq!(
+            load_profile_secret_keychain(&profile_name).expect("load Windows credential"),
+            Some(secret.to_string())
+        );
+        delete_profile_secret_keychain(&profile_name).expect("delete Windows credential");
+        assert_eq!(
+            load_profile_secret_keychain(&profile_name).expect("check deleted Windows credential"),
+            None
+        );
     }
 
     fn auth_config(profile: Option<&str>, org: Option<&str>) -> crate::config::Config {
