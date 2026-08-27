@@ -55,24 +55,29 @@ fn session_route(base: &BaseArgs) -> SessionRoute {
     }
 }
 
-fn require_saved_trace_profile(profile: Option<String>) -> anyhow::Result<String> {
-    profile.ok_or_else(|| {
-        anyhow::anyhow!(
-            "coding-agent tracing requires a saved Braintrust profile; run `bt login --profile <NAME>`, then rerun this command with `--profile <NAME>`"
-        )
-    })
-}
-
 async fn resolve_persistent_trace_auth(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
     base.prefer_profile = true;
-    let resolved = crate::auth::resolve_auth(&base)
-        .await
-        .map_err(|error| anyhow::anyhow!("resolve saved auth: {error}"))?;
-    let profile = require_saved_trace_profile(resolved.profile).map_err(|_| {
-        anyhow::anyhow!(
-            "persistent coding-agent tracing requires a saved Braintrust profile because hooks run in future processes; run `bt login --profile <NAME> --save-env-api-key`, then rerun with `--profile <NAME>`"
-        )
-    })?;
+    let resolved = match crate::auth::resolve_auth(&base).await {
+        Ok(resolved) if resolved.profile.is_some() => resolved,
+        Ok(_) => crate::auth::ensure_saved_trace_profile(&base)
+            .await
+            .map_err(|error| anyhow::anyhow!("save tracing login: {error}"))?,
+        Err(_)
+            if crate::ui::can_prompt()
+                || base
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty()) =>
+        {
+            crate::auth::ensure_saved_trace_profile(&base)
+                .await
+                .map_err(|error| anyhow::anyhow!("save tracing login: {error}"))?
+        }
+        Err(error) => return Err(anyhow::anyhow!("resolve saved auth: {error}")),
+    };
+    let profile = resolved
+        .profile
+        .expect("saved trace profile resolver always returns a profile");
     base.profile = Some(profile);
     base.profile_explicit = true;
     base.prefer_profile = true;
@@ -80,6 +85,36 @@ async fn resolve_persistent_trace_auth(mut base: BaseArgs) -> anyhow::Result<Bas
         base.org_name = resolved.org_name;
     }
     Ok(base)
+}
+
+async fn resolve_invocation_trace_auth(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
+    match crate::auth::resolve_auth(&base).await {
+        Ok(resolved) if resolved.api_key.is_some() => {
+            if let Some(profile) = resolved.profile {
+                base.profile = Some(profile);
+                base.profile_explicit = true;
+                base.prefer_profile = true;
+            }
+            if base.org_name.is_none() {
+                base.org_name = resolved.org_name;
+            }
+            Ok(base)
+        }
+        Ok(_) | Err(_) if crate::ui::can_prompt() => {
+            let resolved = crate::auth::ensure_saved_trace_profile(&base)
+                .await
+                .map_err(|error| anyhow::anyhow!("create tracing login: {error}"))?;
+            base.profile = resolved.profile;
+            base.profile_explicit = true;
+            base.prefer_profile = true;
+            if base.org_name.is_none() {
+                base.org_name = resolved.org_name;
+            }
+            Ok(base)
+        }
+        Ok(_) => Ok(base),
+        Err(error) => Err(anyhow::anyhow!("resolve auth: {error}")),
+    }
 }
 
 fn profile_auth_diagnostic(
@@ -252,6 +287,8 @@ impl TraceHostServices for BtTraceHost {
         }
         let base = if requirements.persistent_auth {
             resolve_persistent_trace_auth(self.base.clone()).await?
+        } else if requirements.interactive_auth {
+            resolve_invocation_trace_auth(self.base.clone()).await?
         } else {
             self.base.clone()
         };
@@ -293,6 +330,10 @@ impl TraceHostServices for BtTraceHost {
                 base.profile = Some(profile);
                 base.profile_explicit = true;
                 base.prefer_profile = true;
+                // The route explicitly selects this durable credential. Do
+                // not let any transient override displace it on lease renewal.
+                base.api_key = None;
+                base.api_key_source = None;
             }
             AuthSource::Environment => {
                 if !matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
@@ -338,7 +379,7 @@ impl TraceHostServices for BtTraceHost {
             }
         } else {
             anyhow::bail!(
-                "invocation-local tracing with an API key requires BRAINTRUST_API_KEY; `--api-key` cannot be forwarded safely to the tracing daemon"
+                "trace route resolved an unsupported transient credential; use BRAINTRUST_API_KEY or a saved profile"
             );
         };
         let expires_at_ms = resolved.is_oauth.then(|| {
@@ -410,9 +451,8 @@ impl TraceHostServices for BtTraceHost {
 
         if self.base.api_key.is_some() {
             let source = match self.base.api_key_source {
-                Some(ArgValueSource::CommandLine) => "command_line_api_key",
                 Some(ArgValueSource::EnvVariable) => "environment_api_key",
-                None => "api_key_override",
+                _ => "api_key_override",
             };
             return AuthDiagnostic {
                 status: "ready".into(),
@@ -486,23 +526,6 @@ pub fn context(base: BaseArgs) -> TraceHostContext {
 mod tests {
     use super::*;
     use crate::args::LoginBaseArgs;
-
-    #[test]
-    fn persistent_tracing_rejects_auth_without_a_saved_profile() {
-        let error = require_saved_trace_profile(None).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("requires a saved Braintrust profile"));
-        assert!(error.to_string().contains("bt login --profile <NAME>"));
-    }
-
-    #[test]
-    fn tracing_keeps_the_resolved_saved_profile() {
-        assert_eq!(
-            require_saved_trace_profile(Some("test-profile".into())).unwrap(),
-            "test-profile"
-        );
-    }
 
     #[test]
     fn profile_diagnostic_reports_expiry_without_credentials() {

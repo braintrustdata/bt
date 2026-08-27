@@ -1376,6 +1376,70 @@ fn environment_api_key_needs_confirmation(base: &BaseArgs, explicitly_allowed: b
     ) && !explicitly_allowed
 }
 
+/// Ensure persistent coding-agent tracing has a credential it can resolve in
+/// future processes. Unlike ordinary login, `trace enable` is itself an
+/// explicit request to persist the credential needed by the installed hooks,
+/// so an environment API key does not require a second confirmation flag.
+pub(crate) async fn ensure_saved_trace_profile(base: &BaseArgs) -> Result<ResolvedAuth> {
+    let api_key = match base.api_key.clone() {
+        Some(value) if !value.trim().is_empty() => value,
+        Some(_) => bail!("api key cannot be empty"),
+        None if ui::can_prompt() => prompt_api_key()?,
+        None => bail!(
+            "coding-agent tracing needs a Braintrust credential; set BRAINTRUST_API_KEY or run without --no-input to enter one"
+        ),
+    };
+
+    let app_url = base
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let login_orgs = fetch_login_orgs(&api_key, &app_url).await?;
+    let org_constraint = single_org_api_key_constraint(&api_key, &login_orgs);
+    let store = load_auth_store()?;
+    let explicit_profile = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let (mut profile_name, should_confirm_overwrite) = resolve_api_key_login_profile_name(
+        explicit_profile,
+        org_constraint.map(|org| org.name.as_str()),
+        &app_url,
+        &store,
+    )?;
+
+    if should_confirm_overwrite {
+        if ui::can_prompt() {
+            confirm_profile_overwrite(&profile_name)?;
+        } else {
+            // Never overwrite an unrelated profile just to make setup
+            // non-interactive. Pick an unused deterministic name and return
+            // it to the route resolver instead.
+            profile_name = next_available_profile_name(&profile_name, &store);
+        }
+    }
+
+    commit_api_key_profile(
+        &profile_name,
+        &api_key,
+        Some(app_url.clone()),
+        org_constraint.map(|org| org.name.clone()),
+    )?;
+
+    Ok(ResolvedAuth {
+        api_key: Some(api_key),
+        api_url: base.api_url.clone(),
+        app_url: Some(app_url),
+        org_name: base
+            .org_name
+            .clone()
+            .or_else(|| org_constraint.map(|org| org.name.clone())),
+        is_oauth: false,
+        profile: Some(profile_name),
+    })
+}
+
 async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     let api_url = base
         .api_url
@@ -2333,13 +2397,10 @@ pub(crate) fn secret_storage_description() -> Result<String> {
 pub(crate) fn credential_precedence(base: &BaseArgs) -> Option<String> {
     if resolve_api_key_override(base).is_some() {
         return Some(match base.api_key_source {
-            Some(crate::args::ArgValueSource::CommandLine) => {
-                "explicit --api-key overrides saved profiles".into()
-            }
             Some(crate::args::ArgValueSource::EnvVariable) => {
                 "BRAINTRUST_API_KEY overrides saved profiles".into()
             }
-            None => "API key override is active".into(),
+            _ => "API key override is active".into(),
         });
     }
     None
@@ -3696,9 +3757,6 @@ mod tests {
         base.api_key_source = Some(crate::args::ArgValueSource::EnvVariable);
         assert!(environment_api_key_needs_confirmation(&base, false));
         assert!(!environment_api_key_needs_confirmation(&base, true));
-
-        base.api_key_source = Some(crate::args::ArgValueSource::CommandLine);
-        assert!(!environment_api_key_needs_confirmation(&base, false));
     }
 
     fn auth_config(profile: Option<&str>, org: Option<&str>) -> crate::config::Config {

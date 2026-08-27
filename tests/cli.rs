@@ -1,6 +1,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::TcpListener;
 use std::path::Path;
 
 fn bt_command() -> Command {
@@ -87,6 +91,29 @@ fn write_run_agent(path: &Path) {
     let mut perms = fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).expect("chmod");
+}
+
+#[cfg(unix)]
+fn serve_login_once() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind login server");
+    let address = listener.local_addr().expect("login server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept login request");
+        let mut request = [0_u8; 4096];
+        let size = stream.read(&mut request).expect("read login request");
+        let request = String::from_utf8_lossy(&request[..size]);
+        assert!(request.starts_with("POST /api/apikey/login "));
+
+        let body = r#"{"org_info":[{"id":"org-1","name":"test-org","api_url":"https://api.braintrust.dev"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write login response");
+    });
+    (format!("http://{address}"), handle)
 }
 
 fn make_git_repo() -> tempfile::TempDir {
@@ -871,11 +898,13 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
 
 #[cfg(unix)]
 #[test]
-fn trace_enable_requires_durable_saved_profile_auth() {
+fn trace_enable_persists_environment_auth_and_completes_setup() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
+    let daemon_config = state_dir.path().join("daemon.json");
+    let (app_url, login_server) = serve_login_once();
     write_agent_cli(
         &bin_dir.path().join("codex"),
         r#"{"marketplaces":[]}"#,
@@ -886,15 +915,31 @@ fn trace_enable_requires_durable_saved_profile_auth() {
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
-        .args(["trace", "enable", "codex", "--project", "agent-traces"])
+        .env("BT_DAEMON_CONFIG", &daemon_config)
+        .args([
+            "trace",
+            "--app-url",
+            &app_url,
+            "enable",
+            "codex",
+            "--project",
+            "agent-traces",
+        ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "persistent coding-agent tracing requires a saved Braintrust profile",
-        ))
-        .stderr(predicate::str::contains(
-            "bt login --profile <NAME> --save-env-api-key",
-        ));
+        .success();
+    login_server.join().expect("login server thread");
+
+    let auth_store =
+        fs::read_to_string(config_home.path().join("bt/auth.json")).expect("saved auth profile");
+    assert!(auth_store.contains(r#""profile""#));
+    let secrets = fs::read_to_string(config_home.path().join("bt/secrets.json"))
+        .expect("saved profile credential");
+    assert!(secrets.contains("test-api-key"));
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(daemon_config).expect("persistent tracing configuration"))
+            .expect("parse tracing configuration");
+    assert_eq!(settings["route"]["auth"]["source"], "saved_profile");
+    assert_eq!(settings["route"]["auth"]["profile"], "profile");
 }
 
 #[cfg(unix)]
