@@ -438,15 +438,32 @@ pub struct ViewArgs {
     /// Function id
     #[arg(long = "id", env = "BT_FUNCTIONS_VIEW_ID")]
     id: Option<String>,
-    /// Version selector.
-    #[arg(long, env = "BT_FUNCTIONS_VIEW_VERSION")]
+    /// Function version identifier (for example, a transaction ID)
+    #[arg(
+        long,
+        env = "BT_FUNCTIONS_VIEW_VERSION",
+        conflicts_with = "environment"
+    )]
     version: Option<String>,
+    /// Environment slug whose assigned function version should be shown
+    #[arg(long, env = "BT_FUNCTIONS_VIEW_ENVIRONMENT")]
+    environment: Option<String>,
     /// Open in browser
     #[arg(long)]
     web: bool,
 }
 
 impl ViewArgs {
+    fn options(&self, base: &BaseArgs) -> view::ViewOptions<'_> {
+        view::ViewOptions {
+            version: self.version.as_deref(),
+            environment: self.environment.as_deref(),
+            json: base.json,
+            web: self.web,
+            verbose: base.verbose,
+        }
+    }
+
     fn selector(&self) -> Result<ViewSelector<'_>> {
         match (
             self.id.as_deref(),
@@ -626,29 +643,11 @@ pub(crate) async fn run_typed_command(
         Some(FunctionCommands::View(v)) => match v.selector()? {
             ViewSelector::Id(id) => {
                 let auth_ctx = resolve_auth_context(&base).await?;
-                view::run_by_id(
-                    &auth_ctx,
-                    id,
-                    v.version.as_deref(),
-                    base.json,
-                    v.web,
-                    base.verbose,
-                    ft,
-                )
-                .await
+                view::run_by_id(&auth_ctx, id, v.options(&base), ft).await
             }
             ViewSelector::Slug(slug) => {
                 let ctx = resolve_context(&base).await?;
-                view::run(
-                    &ctx,
-                    slug,
-                    v.version.as_deref(),
-                    base.json,
-                    v.web,
-                    base.verbose,
-                    ft,
-                )
-                .await
+                view::run(&ctx, slug, v.options(&base), ft).await
             }
         },
         command => {
@@ -681,29 +680,11 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
             match v.inner.selector()? {
                 ViewSelector::Id(id) => {
                     let auth_ctx = resolve_auth_context(&base).await?;
-                    view::run_by_id(
-                        &auth_ctx,
-                        id,
-                        v.inner.version.as_deref(),
-                        base.json,
-                        v.inner.web,
-                        base.verbose,
-                        ft,
-                    )
-                    .await
+                    view::run_by_id(&auth_ctx, id, v.inner.options(&base), ft).await
                 }
                 ViewSelector::Slug(slug) => {
                     let ctx = resolve_context(&base).await?;
-                    view::run(
-                        &ctx,
-                        slug,
-                        v.inner.version.as_deref(),
-                        base.json,
-                        v.inner.web,
-                        base.verbose,
-                        ft,
-                    )
-                    .await
+                    view::run(&ctx, slug, v.inner.options(&base), ft).await
                 }
             }
         }
@@ -1050,6 +1031,39 @@ mod tests {
             panic!("expected pull command");
         };
         assert_eq!(pull.slug_flag, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn view_accepts_environment_selector() {
+        let _guard = test_lock();
+        let parsed = parse(&[
+            "functions",
+            "view",
+            "test-function",
+            "--environment",
+            "production",
+        ])
+        .expect("parse view");
+        let FunctionsCommands::View(view) = parsed.command.expect("subcommand") else {
+            panic!("expected view command");
+        };
+        assert_eq!(view.inner.environment.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn view_rejects_version_with_environment() {
+        let _guard = test_lock();
+        let err = parse(&[
+            "functions",
+            "view",
+            "test-function",
+            "--version",
+            "1234",
+            "--environment",
+            "production",
+        ])
+        .expect_err("selectors should conflict");
+        assert!(err.to_string().contains("cannot be used with"));
     }
 
     #[test]

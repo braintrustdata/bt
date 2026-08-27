@@ -43,6 +43,7 @@ pub struct FunctionListQuery {
     pub slug: Option<String>,
     pub id: Option<String>,
     pub version: Option<String>,
+    pub environment: Option<String>,
     pub cursor: Option<String>,
     pub snapshot: Option<String>,
 }
@@ -160,11 +161,13 @@ pub async fn get_function_by_slug(
     project_id: &str,
     slug: &str,
     version: Option<&str>,
+    environment: Option<&str>,
 ) -> Result<Option<Function>> {
     let query = FunctionListQuery {
         project_id: Some(project_id.to_string()),
         slug: Some(slug.to_string()),
         version: version.map(ToOwned::to_owned),
+        environment: environment.map(ToOwned::to_owned),
         ..Default::default()
     };
     let page = list_functions_page(client, &query).await?;
@@ -181,10 +184,12 @@ pub async fn get_function_by_id(
     client: &ApiClient,
     id: &str,
     version: Option<&str>,
+    environment: Option<&str>,
 ) -> Result<Option<Function>> {
     let query = FunctionListQuery {
         id: Some(id.to_string()),
         version: version.map(ToOwned::to_owned),
+        environment: environment.map(ToOwned::to_owned),
         ..Default::default()
     };
     let page = list_functions_page(client, &query).await?;
@@ -271,6 +276,9 @@ pub async fn list_functions_page(
     }
     if let Some(version) = &query.version {
         params.push(("version", version.clone()));
+    }
+    if let Some(environment) = &query.environment {
+        params.push(("environment", environment.clone()));
     }
     if let Some(cursor) = &query.cursor {
         params.push(("cursor", cursor.clone()));

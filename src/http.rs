@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
-use reqwest::{Client, ClientBuilder, StatusCode};
+use reqwest::{Client, ClientBuilder, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -213,24 +213,34 @@ impl ApiClient {
         parse_json_response(response, "GET", path).await
     }
 
-    pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
-        let url = self.url(path);
+    async fn send_json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
         let response = self
             .http
-            .post(&url)
+            .request(method.clone(), self.url(path))
             .bearer_auth(&self.api_key)
             .json(body)
             .send()
             .await
             .context("request failed")?;
-
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(HttpError { status, body }.into());
         }
+        parse_json_response(response, method.as_str(), path).await
+    }
 
-        parse_json_response(response, "POST", path).await
+    pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
+        self.send_json(Method::POST, path, body).await
+    }
+
+    pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
+        self.send_json(Method::PUT, path, body).await
     }
 
     pub async fn patch<T: DeserializeOwned, B: Serialize>(
@@ -238,23 +248,7 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let url = self.url(path);
-        let response = self
-            .http
-            .patch(&url)
-            .bearer_auth(&self.api_key)
-            .json(body)
-            .send()
-            .await
-            .context("request failed")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(HttpError { status, body }.into());
-        }
-
-        parse_json_response(response, "PATCH", path).await
+        self.send_json(Method::PATCH, path, body).await
     }
 
     pub async fn post_with_headers<T, B>(
@@ -322,37 +316,28 @@ impl ApiClient {
         request.send().await.context("request failed")
     }
 
-    pub async fn delete(&self, path: &str) -> Result<()> {
-        let response = self.send_delete(path).await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(HttpError { status, body }.into());
-        }
-
-        Ok(())
-    }
-
-    pub async fn delete_with_response<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let response = self.send_delete(path).await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(HttpError { status, body }.into());
-        }
-
-        parse_json_response(response, "DELETE", path).await
-    }
-
     async fn send_delete(&self, path: &str) -> Result<reqwest::Response> {
-        self.http
+        let response = self
+            .http
             .delete(self.url(path))
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .context("request failed")
+            .context("request failed")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(HttpError { status, body }.into());
+        }
+        Ok(response)
+    }
+
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        self.send_delete(path).await.map(|_| ())
+    }
+
+    pub async fn delete_with_response<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        parse_json_response(self.send_delete(path).await?, "DELETE", path).await
     }
 
     pub async fn btql<T: DeserializeOwned>(&self, query: &str) -> Result<BtqlResponse<T>> {
