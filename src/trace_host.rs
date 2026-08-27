@@ -21,6 +21,20 @@ struct BtTraceHost {
     base: BaseArgs,
 }
 
+// AuthLease currently requires a canonical string even when the credential is
+// supplied directly by BRAINTRUST_API_KEY rather than a saved profile. Keep a
+// distinct sentinel for that auth source, and accept the old value so routes
+// written by earlier bt versions continue to work.
+const ENVIRONMENT_API_KEY_AUTH: &str = "environment:BRAINTRUST_API_KEY";
+const LEGACY_ENVIRONMENT_API_KEY_AUTH: &str = "environment";
+
+fn is_environment_api_key_auth(profile: &str) -> bool {
+    matches!(
+        profile,
+        ENVIRONMENT_API_KEY_AUTH | LEGACY_ENVIRONMENT_API_KEY_AUTH
+    )
+}
+
 fn session_route(base: &BaseArgs) -> SessionRoute {
     SessionRoute {
         auth: AuthSelection {
@@ -166,7 +180,27 @@ impl TraceHostServices for BtTraceHost {
     ) -> anyhow::Result<AuthLease> {
         let mut base = self.base.clone();
         base.no_input = true;
-        if let Some(profile) = &selection.profile {
+        let uses_environment_api_key = selection
+            .profile
+            .as_deref()
+            .is_some_and(is_environment_api_key_auth);
+        if uses_environment_api_key {
+            if base
+                .api_key
+                .as_deref()
+                .is_none_or(|api_key| api_key.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "route uses BRAINTRUST_API_KEY authentication, but BRAINTRUST_API_KEY is not available"
+                );
+            }
+            // The sentinel identifies an auth source, not a saved profile.
+            // Leaving profile selection unset allows resolve_auth to use the
+            // API key already parsed by clap into BaseArgs.
+            base.profile = None;
+            base.profile_explicit = false;
+            base.prefer_profile = false;
+        } else if let Some(profile) = &selection.profile {
             base.profile = Some(profile.clone());
             base.profile_explicit = true;
             base.prefer_profile = true;
@@ -182,8 +216,13 @@ impl TraceHostServices for BtTraceHost {
             .ok_or_else(|| anyhow::anyhow!("selected Braintrust profile has no credential"))?;
         let profile = resolved
             .profile
-            .or_else(|| selection.profile.clone())
-            .unwrap_or_else(|| "environment".into());
+            .or_else(|| {
+                selection
+                    .profile
+                    .clone()
+                    .filter(|_| !uses_environment_api_key)
+            })
+            .unwrap_or_else(|| ENVIRONMENT_API_KEY_AUTH.into());
         let expires_at_ms = resolved.is_oauth.then(|| {
             chrono::Utc::now()
                 .timestamp_millis()
@@ -218,5 +257,65 @@ pub fn context(base: BaseArgs) -> TraceHostContext {
             args: vec![OsString::from("trace")],
         },
         services: Arc::new(BtTraceHost { base }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn environment_auth_route_reuses_the_cli_api_key() {
+        for sentinel in [ENVIRONMENT_API_KEY_AUTH, LEGACY_ENVIRONMENT_API_KEY_AUTH] {
+            // A configured profile must not override the route's explicit
+            // environment-key auth source.
+            let base = BaseArgs {
+                login: crate::args::LoginBaseArgs {
+                    api_key: Some("sk-test-fake".into()),
+                    profile: Some("test-profile".into()),
+                    profile_explicit: true,
+                    prefer_profile: true,
+                    ..crate::args::LoginBaseArgs::default()
+                },
+                ..BaseArgs::default()
+            };
+            let host = BtTraceHost { base };
+
+            let lease = host
+                .resolve_auth(
+                    &AuthSelection {
+                        profile: Some(sentinel.into()),
+                        org_name: Some("test-org".into()),
+                    },
+                    AuthResolveReason::Initial,
+                )
+                .await
+                .expect("resolve environment auth");
+
+            assert_eq!(lease.profile, ENVIRONMENT_API_KEY_AUTH);
+            assert_eq!(lease.auth.token, "sk-test-fake");
+            assert_eq!(lease.auth.org_name.as_deref(), Some("test-org"));
+        }
+    }
+
+    #[tokio::test]
+    async fn environment_auth_route_requires_the_cli_api_key() {
+        let host = BtTraceHost {
+            base: BaseArgs::default(),
+        };
+        let error = host
+            .resolve_auth(
+                &AuthSelection {
+                    profile: Some(ENVIRONMENT_API_KEY_AUTH.into()),
+                    org_name: None,
+                },
+                AuthResolveReason::Initial,
+            )
+            .await
+            .expect_err("missing environment key should fail");
+
+        assert!(error
+            .to_string()
+            .contains("BRAINTRUST_API_KEY is not available"));
     }
 }
