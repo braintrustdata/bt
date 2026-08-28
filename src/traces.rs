@@ -5716,32 +5716,7 @@ fn parse_startup_trace_url_from_view_args(args: &ViewArgs) -> Result<Option<Pars
 }
 
 fn apply_url_hints_to_base(mut base: BaseArgs, parsed_url: Option<&ParsedTraceUrl>) -> BaseArgs {
-    let Some(parsed) = parsed_url else {
-        return base;
-    };
-    let Some(url_org) = parsed
-        .org
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    else {
-        return base;
-    };
-
-    let has_profile_override = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
-    let has_org_override = base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
-
-    if !has_org_override && !has_profile_override {
-        base.org_name = Some(url_org.to_string());
-    }
+    base.apply_url_org_hint(parsed_url.and_then(|parsed| parsed.org.as_deref()));
     base
 }
 
@@ -6925,7 +6900,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_url_hints_keeps_profile_independent_from_url_org() {
+    fn apply_url_hints_uses_url_org() {
         let base = base_args();
         let parsed = parsed_url_with_org("Lovable");
 
@@ -6936,7 +6911,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_url_hints_preserves_explicit_profile() {
+    fn apply_url_hints_uses_url_org_with_explicit_profile() {
         let mut base = base_args();
         base.profile = Some("explicit-profile".to_string());
         let parsed = parsed_url_with_org("Lovable");
@@ -6944,7 +6919,20 @@ mod tests {
         let updated = apply_url_hints_to_base(base, Some(&parsed));
 
         assert_eq!(updated.profile.as_deref(), Some("explicit-profile"));
-        assert!(updated.org_name.is_none());
+        assert_eq!(updated.org_name.as_deref(), Some("Lovable"));
+    }
+
+    #[test]
+    fn apply_url_hints_preserves_explicit_org() {
+        let mut base = base_args();
+        base.profile = Some("explicit-profile".to_string());
+        base.org_name = Some("explicit-org".to_string());
+        let parsed = parsed_url_with_org("url-org");
+
+        let updated = apply_url_hints_to_base(base, Some(&parsed));
+
+        assert_eq!(updated.profile.as_deref(), Some("explicit-profile"));
+        assert_eq!(updated.org_name.as_deref(), Some("explicit-org"));
     }
 
     #[test]

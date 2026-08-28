@@ -151,6 +151,23 @@ impl std::ops::DerefMut for BaseArgs {
     }
 }
 
+impl BaseArgs {
+    pub(crate) fn apply_url_org_hint(&mut self, url_org: Option<&str>) {
+        if self
+            .org_name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|org| !org.is_empty())
+        {
+            return;
+        }
+
+        if let Some(url_org) = url_org.map(str::trim).filter(|org| !org.is_empty()) {
+            self.org_name = Some(url_org.to_string());
+        }
+    }
+}
+
 impl From<LoginBaseArgs> for BaseArgs {
     fn from(login: LoginBaseArgs) -> Self {
         Self {

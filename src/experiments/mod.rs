@@ -219,26 +219,7 @@ fn apply_experiment_url_hints_to_base(
         }
     }
 
-    let has_profile_override = base
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
-    let has_org_override = base
-        .org_name
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|v| !v.is_empty());
-    if !has_profile_override && !has_org_override {
-        if let Some(org) = parsed_url
-            .org
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            base.org_name = Some(org.to_string());
-        }
-    }
+    base.apply_url_org_hint(parsed_url.org.as_deref());
 
     base
 }
@@ -403,5 +384,48 @@ mod tests {
 
         assert_eq!(parsed.base_experiment.as_deref(), Some("baseline"));
         assert_eq!(parsed.comparison_experiment.as_deref(), Some("challenger"));
+    }
+
+    #[test]
+    fn experiment_url_hints_use_url_org_with_explicit_profile() {
+        let base = BaseArgs {
+            login: crate::args::LoginBaseArgs {
+                profile: Some("test-profile".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let parsed = parse_experiment_compare_url(
+            "https://www.example.test/app/url-org/p/url-project/experiments/baseline?c=challenger",
+        )
+        .expect("parse url");
+
+        let updated = apply_experiment_url_hints_to_base(base, Some(&parsed));
+
+        assert_eq!(updated.profile.as_deref(), Some("test-profile"));
+        assert_eq!(updated.org_name.as_deref(), Some("url-org"));
+        assert_eq!(updated.project.as_deref(), Some("url-project"));
+    }
+
+    #[test]
+    fn experiment_url_hints_preserve_explicit_org_and_project() {
+        let base = BaseArgs {
+            login: crate::args::LoginBaseArgs {
+                profile: Some("test-profile".to_string()),
+                ..Default::default()
+            },
+            org_name: Some("explicit-org".to_string()),
+            project: Some("explicit-project".to_string()),
+        };
+        let parsed = parse_experiment_compare_url(
+            "https://www.example.test/app/url-org/p/url-project/experiments/baseline?c=challenger",
+        )
+        .expect("parse url");
+
+        let updated = apply_experiment_url_hints_to_base(base, Some(&parsed));
+
+        assert_eq!(updated.profile.as_deref(), Some("test-profile"));
+        assert_eq!(updated.org_name.as_deref(), Some("explicit-org"));
+        assert_eq!(updated.project.as_deref(), Some("explicit-project"));
     }
 }
