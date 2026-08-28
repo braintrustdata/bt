@@ -64,6 +64,19 @@ pub(crate) struct AutomationTemplate {
     pub config: Value,
 }
 
+#[derive(Serialize)]
+struct PortableFunctionRequest<'a> {
+    project_id: &'a str,
+    name: &'a str,
+    slug: &'a str,
+    description: Option<&'a str>,
+    function_type: &'a str,
+    function_data: &'a Value,
+    prompt_data: Option<&'a Value>,
+    tags: Option<&'a [String]>,
+    function_schema: Option<&'a Value>,
+}
+
 pub(crate) fn from_remote(
     functions: &[Function],
     automations: &[ProjectAutomation],
@@ -367,62 +380,38 @@ impl PortableFunction {
     }
 
     pub(crate) fn request(&self, project_id: &str, function_type: &str) -> Value {
-        portable_function_request(
+        json!(PortableFunctionRequest {
             project_id,
-            &self.name,
-            &self.slug,
-            self.description.as_ref(),
+            name: &self.name,
+            slug: &self.slug,
+            description: self.description.as_deref(),
             function_type,
-            &self.function_data,
-            self.prompt_data.as_ref(),
-            self.tags.as_ref(),
-            self.function_schema.as_ref(),
-        )
+            function_data: &self.function_data,
+            prompt_data: self.prompt_data.as_ref(),
+            tags: self.tags.as_deref(),
+            function_schema: self.function_schema.as_ref(),
+        })
     }
 }
 
 impl FacetTemplate {
     pub(crate) fn request(&self, project_id: &str, function_data: &Value) -> Value {
-        portable_function_request(
+        json!(PortableFunctionRequest {
             project_id,
-            &self.name,
-            &self.slug,
-            self.description.as_ref(),
-            "facet",
+            name: &self.name,
+            slug: &self.slug,
+            description: self.description.as_deref(),
+            function_type: "facet",
             function_data,
-            self.prompt_data.as_ref(),
-            self.tags.as_ref(),
-            self.function_schema.as_ref(),
-        )
+            prompt_data: self.prompt_data.as_ref(),
+            tags: self.tags.as_deref(),
+            function_schema: self.function_schema.as_ref(),
+        })
     }
 
     pub(crate) fn active(&self) -> bool {
         self.topics_automation.is_some()
     }
-}
-
-fn portable_function_request(
-    project_id: &str,
-    name: &str,
-    slug: &str,
-    description: Option<&String>,
-    function_type: &str,
-    function_data: &Value,
-    prompt_data: Option<&Value>,
-    tags: Option<&Vec<String>>,
-    function_schema: Option<&Value>,
-) -> Value {
-    json!({
-        "project_id": project_id,
-        "name": name,
-        "slug": slug,
-        "description": description,
-        "function_type": function_type,
-        "function_data": function_data,
-        "prompt_data": prompt_data,
-        "tags": tags,
-        "function_schema": function_schema,
-    })
 }
 
 pub(crate) fn saved_preprocessor_slug(function_data: &Value) -> Result<Option<&str>> {
@@ -501,17 +490,17 @@ pub(crate) fn reconciled_topic_map_request(
         "source_facet_function".to_string(),
         json!({"type": "function", "id": facet_id}),
     );
-    Ok(portable_function_request(
-        &existing.project_id,
-        &facet.name,
-        &existing.slug,
-        existing.description.as_ref(),
-        "classifier",
-        &Value::Object(data),
-        existing.prompt_data.as_ref(),
-        existing.tags.as_ref(),
-        existing.function_schema.as_ref(),
-    ))
+    Ok(json!(PortableFunctionRequest {
+        project_id: &existing.project_id,
+        name: &facet.name,
+        slug: &existing.slug,
+        description: existing.description.as_deref(),
+        function_type: "classifier",
+        function_data: &Value::Object(data),
+        prompt_data: existing.prompt_data.as_ref(),
+        tags: existing.tags.as_deref(),
+        function_schema: existing.function_schema.as_ref(),
+    }))
 }
 
 pub(crate) fn deduplicate_preprocessors(facets: &mut [FacetTemplate]) {

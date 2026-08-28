@@ -1,45 +1,34 @@
 use std::fmt::Write as _;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use dialoguer::console;
 
-use crate::prompts::delete::select_prompt_interactive;
 use crate::ui::prompt_render::{render_options, render_prompt_block};
-use crate::ui::{print_command_status, print_with_pager, with_spinner, CommandStatus};
-use crate::utils::app_project_url;
+use crate::ui::{print_command_status, print_with_pager, CommandStatus};
+use crate::utils::{app_project_url, app_url_with_selected_version};
 
-use super::{api, ResolvedContext};
+use super::{resolve_prompt, ResolvedContext};
 
 pub async fn run(
     ctx: &ResolvedContext,
     slug: Option<&str>,
+    version: Option<&str>,
+    environment: Option<&str>,
     json: bool,
     web: bool,
     verbose: bool,
 ) -> Result<()> {
     let project_name = &ctx.project.name;
-    let prompt = match slug {
-        Some(s) => with_spinner(
-            "Loading prompt...",
-            api::get_prompt_by_slug(&ctx.client, project_name, s),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
-        None => {
-            if !crate::ui::is_interactive() {
-                bail!("prompt slug required. Use: bt prompts view <slug>");
-            }
-            select_prompt_interactive(&ctx.client, project_name).await?
-        }
-    };
+    let prompt = resolve_prompt(ctx, slug, version, environment, "bt prompts view <slug>").await?;
 
     if web {
-        let url = app_project_url(
+        let mut url = app_project_url(
             &ctx.app_url,
             ctx.client.org_name(),
             project_name,
             &["prompts", &prompt.id],
         );
+        url = app_url_with_selected_version(url, version, environment, prompt._xact_id.as_deref());
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());
@@ -53,6 +42,22 @@ pub async fn run(
     let mut output = String::new();
 
     writeln!(output, "Viewing {}", console::style(&prompt.name).bold())?;
+    if let Some(environment) = environment {
+        writeln!(
+            output,
+            "{} {}",
+            console::style("Environment:").dim(),
+            environment
+        )?;
+    }
+    if let Some(version) = prompt._xact_id.as_deref().or(version) {
+        writeln!(
+            output,
+            "{} {}",
+            console::style("Version:").dim(),
+            crate::util_cmd::display_xact_id(version)
+        )?;
+    }
 
     let options = prompt.prompt_data.as_ref().and_then(|pd| pd.get("options"));
 

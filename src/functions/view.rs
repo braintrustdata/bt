@@ -9,26 +9,34 @@ use crate::ui::prompt_render::{
 use crate::ui::{
     is_interactive, print_command_status, print_with_pager, with_spinner, CommandStatus,
 };
-use crate::utils::app_project_url_with_encoded_path;
+use crate::utils::{app_project_url_with_encoded_path, app_url_with_selected_version};
 use crate::{http::ApiClient, projects::api as projects_api};
 
 use super::{api, build_web_path, label, label_plural, select_function_interactive};
 use super::{AuthContext, FunctionTypeFilter, ResolvedContext};
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ViewOptions<'a> {
+    pub version: Option<&'a str>,
+    pub environment: Option<&'a str>,
+    pub json: bool,
+    pub web: bool,
+    pub verbose: bool,
+}
+
 pub async fn run(
     ctx: &ResolvedContext,
     slug: Option<&str>,
-    version: Option<&str>,
-    json: bool,
-    web: bool,
-    verbose: bool,
+    options: ViewOptions<'_>,
     ft: Option<FunctionTypeFilter>,
 ) -> Result<()> {
+    let version = options.version;
+    let environment = options.environment;
     let project_id = &ctx.project.id;
     let function = match slug {
         Some(s) => with_spinner(
             &format!("Loading {}...", label(ft)),
-            api::get_function_by_slug(&ctx.client, project_id, s, version),
+            api::get_function_by_slug(&ctx.client, project_id, s, version, environment),
         )
         .await?
         .ok_or_else(|| anyhow!("{} with slug '{s}' not found", label(ft)))?,
@@ -41,20 +49,27 @@ pub async fn run(
                 );
             }
             let selected = select_function_interactive(&ctx.client, project_id, ft).await?;
-            if let Some(version) = version {
+            if version.is_some() || environment.is_some() {
                 with_spinner(
                     &format!("Loading {}...", label(ft)),
                     api::get_function_by_slug(
                         &ctx.client,
                         project_id,
                         &selected.slug,
-                        Some(version),
+                        version,
+                        environment,
                     ),
                 )
                 .await?
                 .ok_or_else(|| {
+                    let selector = version
+                        .map(|version| format!("version {version}"))
+                        .or_else(|| {
+                            environment.map(|environment| format!("environment {environment}"))
+                        })
+                        .unwrap_or_default();
                     anyhow!(
-                        "{} with slug '{}' not found at version {version}",
+                        "{} with slug '{}' not found at {selector}",
                         label(ft),
                         selected.slug
                     )
@@ -70,9 +85,7 @@ pub async fn run(
         &ctx.app_url,
         Some(&ctx.project.name),
         &function,
-        json,
-        web,
-        verbose,
+        options,
     )
     .await
 }
@@ -80,29 +93,19 @@ pub async fn run(
 pub async fn run_by_id(
     ctx: &AuthContext,
     id: &str,
-    version: Option<&str>,
-    json: bool,
-    web: bool,
-    verbose: bool,
+    options: ViewOptions<'_>,
     ft: Option<FunctionTypeFilter>,
 ) -> Result<()> {
+    let version = options.version;
+    let environment = options.environment;
     let function = with_spinner(
         &format!("Loading {}...", label(ft)),
-        api::get_function_by_id(&ctx.client, id, version),
+        api::get_function_by_id(&ctx.client, id, version, environment),
     )
     .await?
     .ok_or_else(|| anyhow!("{} with id '{id}' not found", label(ft)))?;
 
-    render_function(
-        &ctx.client,
-        &ctx.app_url,
-        None,
-        &function,
-        json,
-        web,
-        verbose,
-    )
-    .await
+    render_function(&ctx.client, &ctx.app_url, None, &function, options).await
 }
 
 async fn render_function(
@@ -110,24 +113,30 @@ async fn render_function(
     app_url: &str,
     project_name: Option<&str>,
     function: &api::Function,
-    json: bool,
-    web: bool,
-    verbose: bool,
+    options: ViewOptions<'_>,
 ) -> Result<()> {
-    if web {
+    let requested_version = options.version;
+    let environment = options.environment;
+    if options.web {
         let path = build_web_path(function);
         let project_name = match project_name {
             Some(project_name) => project_name.to_string(),
             None => resolve_project_name(client, &function.project_id).await?,
         };
-        let url =
+        let mut url =
             app_project_url_with_encoded_path(app_url, client.org_name(), &project_name, &path);
+        url = app_url_with_selected_version(
+            url,
+            requested_version,
+            environment,
+            function._xact_id.as_deref(),
+        );
         open::that(&url)?;
         print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));
         return Ok(());
     }
 
-    if json {
+    if options.json {
         println!("{}", serde_json::to_string(&function)?);
         return Ok(());
     }
@@ -140,6 +149,19 @@ async fn render_function(
         console::style("Slug:").dim(),
         function.slug
     )?;
+    if let Some(environment) = environment {
+        writeln!(
+            output,
+            "{} {}",
+            console::style("Environment:").dim(),
+            environment
+        )?;
+    }
+    if requested_version.is_some() || environment.is_some() {
+        if let Some(version) = function._xact_id.as_deref().or(requested_version) {
+            writeln!(output, "{} {}", console::style("Version:").dim(), version)?;
+        }
+    }
 
     if let Some(ft) = &function.function_type {
         writeln!(output, "{} {}", console::style("Type:").dim(), ft)?;
@@ -151,15 +173,15 @@ async fn render_function(
     }
 
     if let Some(pd) = &function.prompt_data {
-        let options = pd.get("options");
-        if let Some(model) = options
+        let prompt_options = pd.get("options");
+        if let Some(model) = prompt_options
             .and_then(|o| o.get("model"))
             .and_then(|m| m.as_str())
         {
             writeln!(output, "{} {}", console::style("Model:").dim(), model)?;
         }
-        if verbose {
-            if let Some(opts) = options {
+        if options.verbose {
+            if let Some(opts) = prompt_options {
                 render_options(&mut output, opts)?;
             }
         }
@@ -220,7 +242,7 @@ async fn render_function(
                                     }
                                 }
 
-                                if verbose {
+                                if options.verbose {
                                     if let Some(bid) =
                                         data.get("bundle_id").and_then(|b| b.as_str())
                                     {
@@ -366,7 +388,7 @@ async fn render_function(
         }
     }
 
-    if verbose {
+    if options.verbose {
         if let Some(tags) = &function.tags {
             if !tags.is_empty() {
                 writeln!(

@@ -149,7 +149,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt view`         | View logs, traces, and spans                                        |
 | `bt projects`     | Manage projects (list, create, view, delete)                        |
 | `bt datasets`     | Manage remote datasets (list, create, update, view, delete)         |
-| `bt prompts`      | Manage prompts (list, view, delete)                                 |
+| `bt prompts`      | Manage prompts (list, view, versions, assign, delete)               |
 | `bt scorers`      | Manage scorers (list, create, view, invoke, delete)                 |
 | `bt environments` | Manage deployment environments (list, view, create, update, delete) |
 | `bt sync`         | Synchronize project logs between Braintrust and local NDJSON files  |
@@ -212,6 +212,8 @@ bt eval foo.eval.ts -- --description "Prod" --shard=1/4
 - `bt eval --first 20 qa.eval.ts` — run the first 20 examples and clearly label the summary as a non-final smoke run.
 - `bt eval --sample 20 --sample-seed 7 qa.eval.ts` — run a deterministic random sample and clearly label the summary as a non-final smoke run.
 - If you do not pass a sampling flag, `bt eval` runs the full dataset and marks the summary as final.
+
+Use `--max-concurrency <n>` to limit how many evaluators run at once. This does not change the concurrency configured inside an individual evaluator.
 
 ## `bt datasets`
 
