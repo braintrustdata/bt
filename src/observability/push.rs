@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -16,9 +16,9 @@ use crate::{
 use super::template::{
     add_topics_functions, default_topics_config, embedding_model, is_loop_config, is_topics,
     loop_config_for_target, new_topic_map_request, reconciled_topic_map_request,
-    remove_topics_functions, saved_preprocessor_slug, topic_map_slug, with_preprocessor_id,
-    ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate, PortableFunction,
-    DEFAULT_TOPICS_DESCRIPTION,
+    remove_topics_functions, saved_preprocessor_slug, topic_map_ids, topic_map_matches,
+    topic_map_slug, with_preprocessor_id, ActiveObservabilityTemplate, AutomationTemplate,
+    FacetTemplate, PortableFunction, DEFAULT_TOPICS_DESCRIPTION,
 };
 
 #[derive(Debug)]
@@ -89,7 +89,7 @@ pub(crate) fn plan(
     topics_override: Option<&str>,
     force: bool,
 ) -> Result<MutationPlan> {
-    let functions_by_slug = unique_functions_by_slug(&snapshot.functions)?;
+    let functions_by_slug = functions_by_slug(&snapshot.functions);
     let functions_by_id = snapshot
         .functions
         .iter()
@@ -105,11 +105,15 @@ pub(crate) fn plan(
                 .or_insert_with(|| preprocessor.clone());
         }
     }
+    let bundled_preprocessor_slugs = preprocessor_templates
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     let preprocessors = preprocessor_templates
         .into_values()
         .map(|template| {
-            let existing = checked_function(
-                functions_by_slug.get(template.slug.as_str()).copied(),
+            let existing = checked_function_by_slug(
+                &functions_by_slug,
                 &template.slug,
                 "preprocessor",
                 "preprocessor",
@@ -131,33 +135,27 @@ pub(crate) fn plan(
     let mut facets = Vec::with_capacity(template.facets.len());
 
     for facet in &template.facets {
-        let existing = checked_function(
-            functions_by_slug.get(facet.slug.as_str()).copied(),
-            &facet.slug,
-            "facet",
-            "facet",
-        )?;
+        let existing = checked_function_by_slug(&functions_by_slug, &facet.slug, "facet", "facet")?;
         conflict(existing, "facet", &facet.slug, force)?;
 
         if let Some(slug) = saved_preprocessor_slug(&facet.function_data)? {
-            let target = functions_by_slug.get(slug).copied();
-            if facet.preprocessor.is_none() && target.is_none() {
+            let target =
+                checked_function_by_slug(&functions_by_slug, slug, "preprocessor", "preprocessor")?;
+            if !bundled_preprocessor_slugs.contains(slug) && target.is_none() {
                 bail!(
                     "facet '{}' references preprocessor '{slug}', but it is not bundled or present in the target project",
                     facet.name
                 );
             }
-            if let Some(target) = target {
-                checked_function(Some(target), slug, "preprocessor", "preprocessor")?;
-            }
         }
 
         let map_slug = topic_map_slug(&facet.slug);
-        let topic_map = checked_function(
-            functions_by_slug.get(map_slug.as_str()).copied(),
+        let topic_map = existing_topic_map(
+            existing,
+            &topics_automations,
+            &functions_by_id,
+            &functions_by_slug,
             &map_slug,
-            "classifier topic map",
-            "classifier",
         )?;
         if let Some(topic_map) = topic_map {
             if topic_map
@@ -172,7 +170,12 @@ pub(crate) fn plan(
                 );
             }
         }
-        conflict(topic_map, "topic map", &map_slug, force)?;
+        conflict(
+            topic_map,
+            "topic map",
+            topic_map.map_or(map_slug.as_str(), |function| function.slug.as_str()),
+            force,
+        )?;
 
         let target = resolve_topics_target(
             facet,
@@ -254,6 +257,7 @@ pub(crate) fn plan(
         function_ids: snapshot
             .functions
             .into_iter()
+            .filter(|function| function.function_type.as_deref() == Some("preprocessor"))
             .map(|function| (function.slug, function.id))
             .collect(),
     })
@@ -306,14 +310,15 @@ fn plan_topics_removals(
     Ok(())
 }
 
-fn unique_functions_by_slug(functions: &[Function]) -> Result<HashMap<&str, &Function>> {
+fn functions_by_slug(functions: &[Function]) -> HashMap<&str, Vec<&Function>> {
     let mut by_slug = HashMap::new();
     for function in functions {
-        if by_slug.insert(function.slug.as_str(), function).is_some() {
-            bail!("multiple target functions have slug '{}'", function.slug);
-        }
+        by_slug
+            .entry(function.slug.as_str())
+            .or_insert_with(Vec::new)
+            .push(function);
     }
-    Ok(by_slug)
+    by_slug
 }
 
 fn unique_automations_by_name(
@@ -334,21 +339,75 @@ fn unique_automations_by_name(
     Ok(by_name)
 }
 
-fn checked_function<'a>(
-    function: Option<&'a Function>,
+fn checked_function_by_slug<'a>(
+    functions_by_slug: &HashMap<&str, Vec<&'a Function>>,
     slug: &str,
     label: &str,
     expected_type: &str,
 ) -> Result<Option<&'a Function>> {
-    if let Some(function) = function {
-        if function.function_type.as_deref() != Some(expected_type) {
-            bail!(
-                "function slug '{slug}' is occupied by a '{}' function, not a {label}",
-                function.function_type.as_deref().unwrap_or("unknown")
-            );
+    let Some(functions) = functions_by_slug.get(slug) else {
+        return Ok(None);
+    };
+    let mut matching = functions
+        .iter()
+        .copied()
+        .filter(|function| function.function_type.as_deref() == Some(expected_type));
+    let Some(function) = matching.next() else {
+        let actual_type = functions
+            .first()
+            .and_then(|function| function.function_type.as_deref())
+            .unwrap_or("unknown");
+        bail!("function slug '{slug}' is occupied by a '{actual_type}' function, not a {label}");
+    };
+    if matching.next().is_some() {
+        bail!("multiple target {label} functions have slug '{slug}'");
+    }
+    Ok(Some(function))
+}
+
+fn existing_topic_map<'a>(
+    facet: Option<&Function>,
+    topics_automations: &[&ProjectAutomation],
+    functions_by_id: &HashMap<&str, &'a Function>,
+    functions_by_slug: &HashMap<&str, Vec<&'a Function>>,
+    fallback_slug: &str,
+) -> Result<Option<&'a Function>> {
+    if let Some(facet) = facet {
+        let mut matches = BTreeMap::new();
+        for automation in topics_automations {
+            for id in topic_map_ids(&automation.config) {
+                let Some(topic_map) = functions_by_id.get(id).copied() else {
+                    continue;
+                };
+                if topic_map.function_type.as_deref() == Some("classifier")
+                    && topic_map
+                        .function_data
+                        .as_ref()
+                        .and_then(|data| data.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("topic_map")
+                    && topic_map_matches(topic_map, facet)
+                {
+                    matches.insert(topic_map.id.as_str(), topic_map);
+                }
+            }
+        }
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches.into_values().next()),
+            _ => bail!(
+                "facet '{}' is wired to multiple topic maps in the target project",
+                facet.slug
+            ),
         }
     }
-    Ok(function)
+
+    checked_function_by_slug(
+        functions_by_slug,
+        fallback_slug,
+        "classifier topic map",
+        "classifier",
+    )
 }
 
 fn conflict(existing: Option<&Function>, label: &str, slug: &str, force: bool) -> Result<()> {
@@ -642,6 +701,21 @@ mod tests {
         }
     }
 
+    fn portable_preprocessor(slug: &str) -> PortableFunction {
+        PortableFunction {
+            name: "Shared preprocessor".to_string(),
+            slug: slug.to_string(),
+            description: None,
+            function_data: json!({
+                "type": "code",
+                "data": {"type": "inline", "code": "return input"}
+            }),
+            prompt_data: None,
+            tags: None,
+            function_schema: None,
+        }
+    }
+
     #[test]
     fn active_observability_plans_topics_selection_rules() {
         let only = automation("auto-topics", "Topics", "topic");
@@ -715,6 +789,82 @@ mod tests {
         .expect("one new destination");
         assert_eq!(plan.topics.len(), 1);
         assert_eq!(plan.facets.len(), 2);
+    }
+
+    #[test]
+    fn active_observability_preflight_accepts_a_sibling_bundled_preprocessor() {
+        let preprocessor_slug = "shared-preprocessor";
+        let mut first = facet(Some("Topics"));
+        first.function_data["preprocessor"] =
+            json!({"type": "function", "slug": preprocessor_slug});
+        first.preprocessor = Some(portable_preprocessor(preprocessor_slug));
+        let mut second = FacetTemplate {
+            slug: "second-facet".to_string(),
+            name: "Second facet".to_string(),
+            ..facet(Some("Topics"))
+        };
+        second.function_data["preprocessor"] =
+            json!({"type": "function", "slug": preprocessor_slug});
+        let source = ActiveObservabilityTemplate {
+            kind: KIND.to_string(),
+            schema_version: SCHEMA_VERSION,
+            facets: vec![first, second],
+            automations: Vec::new(),
+        };
+        validate(&source).expect("valid shared preprocessor template");
+
+        let planned = plan(
+            &source,
+            Snapshot {
+                functions: Vec::new(),
+                automations: vec![automation("auto-topics", "Topics", "topic")],
+            },
+            None,
+            false,
+        )
+        .expect("sibling bundle satisfies dependency");
+
+        assert_eq!(planned.preprocessors.len(), 1);
+        assert_eq!(planned.facets.len(), 2);
+    }
+
+    #[test]
+    fn active_observability_finds_existing_topic_map_from_topics_wiring() {
+        let mut existing_facet = existing_function("test-facet", "facet", "facet");
+        existing_facet.id = "fn-existing-facet".to_string();
+        let mut existing_topic_map = existing_function("test-facet", "classifier", "topic_map");
+        existing_topic_map.id = "fn-existing-topic-map".to_string();
+        existing_topic_map.function_data = Some(json!({
+            "type": "topic_map",
+            "source_facet": "Test facet",
+            "source_facet_function": {
+                "type": "function",
+                "id": "fn-existing-facet"
+            }
+        }));
+        let mut topics = automation("auto-topics", "Topics", "topic");
+        topics.config["facet_functions"] = json!([{"type": "function", "id": "fn-existing-facet"}]);
+        topics.config["topic_map_functions"] = json!([{
+            "function": {"type": "function", "id": "fn-existing-topic-map"}
+        }]);
+
+        let planned = plan(
+            &template(facet(Some("Topics"))),
+            Snapshot {
+                functions: vec![existing_facet, existing_topic_map],
+                automations: vec![topics],
+            },
+            None,
+            true,
+        )
+        .expect("existing topic map is found through Topics wiring");
+
+        let topic_map = planned.facets[0]
+            .topic_map
+            .as_ref()
+            .expect("existing topic map");
+        assert_eq!(topic_map.id, "fn-existing-topic-map");
+        assert_eq!(topic_map.slug, "test-facet");
     }
 
     #[test]

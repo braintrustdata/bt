@@ -169,7 +169,9 @@ async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
         args.force,
     )?;
 
-    if !args.yes && ui::is_interactive() && !confirm_push(&ctx, &template, args.force)? {
+    if should_confirm_push(base.json, args.yes, ui::is_interactive())
+        && !confirm_push(&ctx, &template, args.force)?
+    {
         return Ok(());
     }
 
@@ -202,6 +204,10 @@ async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn should_confirm_push(json: bool, yes: bool, interactive: bool) -> bool {
+    !json && !yes && interactive
 }
 
 fn confirm_push(
@@ -327,6 +333,14 @@ mod tests {
             yes: false,
         };
         assert!(both.source().unwrap_err().to_string().contains("either"));
+    }
+
+    #[test]
+    fn active_observability_push_never_prompts_for_json_output() {
+        assert!(!should_confirm_push(true, false, true));
+        assert!(should_confirm_push(false, false, true));
+        assert!(!should_confirm_push(false, true, true));
+        assert!(!should_confirm_push(false, false, false));
     }
 
     #[tokio::test]

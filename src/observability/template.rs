@@ -219,7 +219,7 @@ fn topics_by_facet(
         .collect()
 }
 
-fn topic_map_matches(topic_map: &Function, facet: &Function) -> bool {
+pub(crate) fn topic_map_matches(topic_map: &Function, facet: &Function) -> bool {
     let Some(data) = topic_map.function_data.as_ref() else {
         return false;
     };
@@ -636,7 +636,7 @@ pub(crate) fn embedding_model(
         .to_string()
 }
 
-fn topic_map_ids(config: &Value) -> impl Iterator<Item = &str> {
+pub(crate) fn topic_map_ids(config: &Value) -> impl Iterator<Item = &str> {
     config
         .get("topic_map_functions")
         .and_then(Value::as_array)
