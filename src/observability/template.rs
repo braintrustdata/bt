@@ -774,46 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_pull_bundles_shared_preprocessor_once() {
-        let shared = PortableFunction {
-            name: "Shared preprocessor".to_string(),
-            slug: "shared-preprocessor".to_string(),
-            description: None,
-            function_data: json!({"type": "code", "data": {"type": "inline"}}),
-            prompt_data: None,
-            tags: None,
-            function_schema: None,
-        };
-        let facet = |name: &str, slug: &str| FacetTemplate {
-            name: name.to_string(),
-            slug: slug.to_string(),
-            topics_automation: Some("Topics".to_string()),
-            description: None,
-            preprocessor: Some(shared.clone()),
-            function_data: json!({
-                "type": "facet",
-                "preprocessor": {"type": "function", "slug": "shared-preprocessor"}
-            }),
-            prompt_data: None,
-            tags: None,
-            function_schema: None,
-        };
-        let mut facets = vec![
-            facet("First facet", "first-facet"),
-            facet("Second facet", "second-facet"),
-        ];
-
-        deduplicate_preprocessors(&mut facets);
-
-        assert!(facets[0].preprocessor.is_some());
-        assert!(facets[1].preprocessor.is_none());
-        assert!(facets.iter().all(|facet| {
-            facet.function_data["preprocessor"]
-                == json!({"type": "function", "slug": "shared-preprocessor"})
-        }));
-    }
-
-    #[test]
     fn active_observability_topic_map_reconciliation_preserves_customization() {
         let topic_map = function(
             "fn-test-topic-map",

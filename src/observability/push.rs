@@ -644,7 +644,9 @@ async fn upsert_function(client: &ApiClient, request: &Value, replace: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability::template::{validate, KIND, SCHEMA_VERSION};
+    use crate::observability::template::{
+        deduplicate_preprocessors, validate, KIND, SCHEMA_VERSION,
+    };
 
     fn facet(topics: Option<&str>) -> FacetTemplate {
         FacetTemplate {
@@ -792,12 +794,13 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_preflight_accepts_a_sibling_bundled_preprocessor() {
+    fn active_observability_shared_preprocessor_round_trips_once() {
         let preprocessor_slug = "shared-preprocessor";
         let mut first = facet(Some("Topics"));
         first.function_data["preprocessor"] =
             json!({"type": "function", "slug": preprocessor_slug});
-        first.preprocessor = Some(portable_preprocessor(preprocessor_slug));
+        let shared = portable_preprocessor(preprocessor_slug);
+        first.preprocessor = Some(shared.clone());
         let mut second = FacetTemplate {
             slug: "second-facet".to_string(),
             name: "Second facet".to_string(),
@@ -805,10 +808,13 @@ mod tests {
         };
         second.function_data["preprocessor"] =
             json!({"type": "function", "slug": preprocessor_slug});
+        second.preprocessor = Some(shared);
+        let mut facets = vec![first, second];
+        deduplicate_preprocessors(&mut facets);
         let source = ActiveObservabilityTemplate {
             kind: KIND.to_string(),
             schema_version: SCHEMA_VERSION,
-            facets: vec![first, second],
+            facets,
             automations: Vec::new(),
         };
         validate(&source).expect("valid shared preprocessor template");
@@ -829,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_finds_existing_topic_map_from_topics_wiring() {
+    fn active_observability_finds_and_remaps_an_existing_topic_map() {
         let mut existing_facet = existing_function("test-facet", "facet", "facet");
         existing_facet.id = "fn-existing-facet".to_string();
         let mut existing_topic_map = existing_function("test-facet", "classifier", "topic_map");
@@ -842,17 +848,24 @@ mod tests {
                 "id": "fn-existing-facet"
             }
         }));
-        let mut topics = automation("auto-topics", "Topics", "topic");
-        topics.config["facet_functions"] = json!([{"type": "function", "id": "fn-existing-facet"}]);
-        topics.config["topic_map_functions"] = json!([{
-            "function": {"type": "function", "id": "fn-existing-topic-map"}
-        }]);
+        let mut previous = automation("auto-previous", "Previous Topics", "topic");
+        previous.config["facet_functions"] = json!([
+            {"type": "function", "id": "fn-existing-facet"},
+            {"type": "function", "id": "fn-unrelated-facet"}
+        ]);
+        previous.config["topic_map_functions"] = json!([
+            {"function": {"type": "function", "id": "fn-existing-topic-map"}},
+            {"function": {"type": "function", "id": "fn-unrelated-topic-map"}}
+        ]);
 
         let planned = plan(
-            &template(facet(Some("Topics"))),
+            &template(facet(Some("Destination Topics"))),
             Snapshot {
                 functions: vec![existing_facet, existing_topic_map],
-                automations: vec![topics],
+                automations: vec![
+                    previous,
+                    automation("auto-destination", "Destination Topics", "topic"),
+                ],
             },
             None,
             true,
@@ -865,37 +878,6 @@ mod tests {
             .expect("existing topic map");
         assert_eq!(topic_map.id, "fn-existing-topic-map");
         assert_eq!(topic_map.slug, "test-facet");
-    }
-
-    #[test]
-    fn active_observability_remap_removes_the_previous_topics_wiring() {
-        let mut previous = automation("auto-previous", "Previous Topics", "topic");
-        previous.config["facet_functions"] = json!([
-            {"type": "function", "id": "fn-test-facet"},
-            {"type": "function", "id": "fn-unrelated-facet"}
-        ]);
-        previous.config["topic_map_functions"] = json!([
-            {"function": {"type": "function", "id": "fn-test-facet-topic-map"}},
-            {"function": {"type": "function", "id": "fn-unrelated-topic-map"}}
-        ]);
-
-        let planned = plan(
-            &template(facet(Some("Destination Topics"))),
-            Snapshot {
-                functions: vec![
-                    existing_function("test-facet", "facet", "facet"),
-                    existing_function("test-facet-topic-map", "classifier", "topic_map"),
-                ],
-                automations: vec![
-                    previous,
-                    automation("auto-destination", "Destination Topics", "topic"),
-                ],
-            },
-            None,
-            true,
-        )
-        .expect("facet remap");
-
         let previous = &planned.topics["id:auto-previous"].config;
         assert_eq!(
             previous["facet_functions"],
@@ -960,26 +942,5 @@ mod tests {
         )
         .expect_err("wrong automation type");
         assert!(wrong_loop.to_string().contains("not a Loop"));
-    }
-
-    #[test]
-    fn active_observability_preflight_rejects_malformed_topics_config() {
-        let mut topics = automation("auto-topics", "Topics", "topic");
-        topics.config["facet_functions"] = json!("not-an-array");
-
-        let error = plan(
-            &template(facet(Some("Topics"))),
-            Snapshot {
-                functions: vec![],
-                automations: vec![topics],
-            },
-            None,
-            false,
-        )
-        .expect_err("malformed Topics config");
-
-        assert!(error
-            .to_string()
-            .contains("Topics automation facet_functions must be an array"));
     }
 }

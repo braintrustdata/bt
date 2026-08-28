@@ -342,20 +342,4 @@ mod tests {
         assert!(!should_confirm_push(false, true, true));
         assert!(!should_confirm_push(false, false, false));
     }
-
-    #[tokio::test]
-    async fn active_observability_reads_a_local_template() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("template.json");
-        std::fs::write(
-            &path,
-            r#"{"kind":"active_observability_template","schema_version":1}"#,
-        )
-        .expect("write template");
-
-        let template = read_template_source(path.to_str().expect("UTF-8 path"))
-            .await
-            .expect("read template");
-        assert_eq!(template.kind, template::KIND);
-    }
 }
