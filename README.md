@@ -27,19 +27,19 @@ curl -fsSL https://bt.dev/cli/install.sh | bash -s -- --canary
 ### Windows (PowerShell)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1 | iex"
 ```
 
 Install a specific version:
 
 ```powershell
-$env:BT_VERSION='0.1.2'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/v0.18.0/bt-installer.ps1 | iex"
 ```
 
 Canary:
 
 ```powershell
-$env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1 | iex"
 ```
 
 ### [mise](https://mise.jdx.dev)
@@ -107,8 +107,6 @@ bt update --check
 bt update --channel canary
 ```
 
-If `bt` was installed via npm, use that to update instead.
-
 ## Uninstall
 
 Unix-like systems:
@@ -143,7 +141,6 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt profiles`     | List, delete, and rename saved login profiles                       |
 | `bt switch`       | Switch org and project context                                      |
 | `bt status`       | Show current org and project context                                |
-| `bt datasets`     | Manage datasets and dataset pipelines                               |
 | `bt eval`         | Run eval files (Unix only)                                          |
 | `bt sql`          | Run SQL queries against Braintrust                                  |
 | `bt view`         | View logs, traces, and spans                                        |
@@ -392,6 +389,12 @@ Show current org and project context:
 - `bt status -j` — JSON output
 
 ## `bt setup` and `bt docs`
+
+`bt setup` is deprecated. For new coding-agent integrations, use:
+
+```bash
+curl -fsSL https://braintrust.dev/wizard/setup.sh | sh
+```
 
 Use setup/docs commands to configure coding-agent skills and workflow docs for Braintrust.
 
