@@ -21,6 +21,8 @@ use super::{
     PullArgs,
 };
 
+const PUBLIC_PREVIEW_NOTICE: &str = "Observability templates are in public preview and subject to change. Learn more: https://www.braintrust.dev/docs/feature-lifecycle#public-preview";
+
 pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     let ctx = resolve_project_command_context_with_auth_mode(&base, true).await?;
     let (functions, automations) =
@@ -73,6 +75,7 @@ pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             );
         }
     }
+    print_command_status(CommandStatus::Warning, PUBLIC_PREVIEW_NOTICE);
     Ok(())
 }
 
