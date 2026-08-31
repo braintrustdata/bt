@@ -142,6 +142,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt switch`       | Switch org and project context                                      |
 | `bt status`       | Show current org and project context                                |
 | `bt eval`         | Run eval files (Unix only)                                          |
+| `bt trace`        | Trace coding-agent sessions                                         |
 | `bt sql`          | Run SQL queries against Braintrust                                  |
 | `bt view`         | View logs, traces, and spans                                        |
 | `bt projects`     | Manage projects (list, create, view, delete)                        |
@@ -388,15 +389,27 @@ Show current org and project context:
 - `bt status --verbose` — show detailed config resolution
 - `bt status -j` — JSON output
 
-## `bt setup` and `bt docs`
+## Project SDK setup and coding-agent tracing
 
-`bt setup` is deprecated. For new coding-agent integrations, use:
+To add the Braintrust SDK to an application, run the project setup wizard from
+the application's repository:
 
 ```bash
 curl -fsSL https://braintrust.dev/wizard/setup.sh | sh
 ```
 
-Use setup/docs commands to configure coding-agent skills and workflow docs for Braintrust.
+The wizard detects the project language, installs the appropriate Braintrust
+SDK, instruments the application, and verifies that the application emits a
+trace. It does not enable tracing of the coding agent itself.
+
+Coding-agent session tracing is managed separately with `bt trace`:
+
+- `bt trace setup <agent>` installs or configures a persistent tracing integration; supported agents are Codex, Claude Code, OpenCode, and Pi.
+- `bt trace run <agent> [arguments...]` launches one supported agent invocation with tracing enabled.
+- `bt trace import <agent> <session-id>` imports an existing Codex or Claude Code session.
+
+The older `bt setup` and `bt docs` commands are deprecated. Their compatibility
+behavior is documented below.
 
 - Configure skills with default setup flow:
   - `bt setup --local`
