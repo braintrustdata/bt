@@ -389,7 +389,7 @@ Show current org and project context:
 - `bt status --verbose` — show detailed config resolution
 - `bt status -j` — JSON output
 
-## Project SDK setup and coding-agent tracing
+## Application SDK setup
 
 To add the Braintrust SDK to an application, run the project setup wizard from
 the application's repository:
@@ -402,11 +402,15 @@ The wizard detects the project language, installs the appropriate Braintrust
 SDK, instruments the application, and verifies that the application emits a
 trace. It does not enable tracing of the coding agent itself.
 
-Coding-agent session tracing is managed separately with `bt trace`:
+## Coding-agent tracing
+
+Coding-agent session tracing is managed with `bt trace`:
 
 - `bt trace setup <agent>` installs or configures a persistent tracing integration; supported agents are Codex, Claude Code, OpenCode, and Pi.
 - `bt trace run <agent> [arguments...]` launches one supported agent invocation with tracing enabled.
 - `bt trace import <agent> <session-id>` imports an existing Codex or Claude Code session.
+
+## Legacy `bt setup` and `bt docs`
 
 The older `bt setup` and `bt docs` commands are deprecated. Their compatibility
 behavior is documented below.
