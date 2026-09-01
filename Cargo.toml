@@ -57,6 +57,9 @@ flate2 = "1.1.2"
 tempfile = "3"
 uuid = { version = "1.21.0", features = ["v4"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
 [profile.dist]
 inherits = "release"
 lto = "thin"

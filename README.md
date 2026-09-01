@@ -369,7 +369,7 @@ Auth resolution order for commands is:
 5. Single-profile auto-select (if only one compatible profile exists)
 6. Interactive profile picker (if multiple compatible profiles exist and a TTY is available)
 
-On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
+Secure credentials are stored in Windows Credential Manager on Windows, with `secret-tool` (libsecret) on Linux, and with the `security` keychain utility on macOS. On Linux, a running Secret Service daemon is required. If a secure store is unavailable, `bt` falls back to a private plaintext secrets file.
 
 ## `bt switch`
 
