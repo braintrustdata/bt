@@ -8,7 +8,9 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bt_daemon::wire::{AuthSelection, BackendAuth, FlushMode, SessionRoute, TraceDestination};
+use bt_daemon::wire::{
+    AuthSelection, AuthSource, BackendAuth, FlushMode, SessionRoute, TraceDestination,
+};
 use bt_daemon::{
     AuthLease, AuthResolveReason, OutputFormat, RouteRequirements, RunHookCommand,
     TraceHostContext, TraceHostServices,
@@ -24,6 +26,12 @@ struct BtTraceHost {
 fn session_route(base: &BaseArgs) -> SessionRoute {
     SessionRoute {
         auth: AuthSelection {
+            source: if base.profile.is_some() {
+                AuthSource::SavedProfile
+            } else {
+                AuthSource::Environment
+            },
+            profile_id: None,
             profile: base.profile.clone(),
             org_name: base.org_name.clone(),
         },
@@ -190,7 +198,16 @@ impl TraceHostServices for BtTraceHost {
                 .saturating_add(5 * 60 * 1000)
         });
         Ok(AuthLease {
-            profile,
+            selection: AuthSelection {
+                source: if profile == "environment" {
+                    AuthSource::Environment
+                } else {
+                    AuthSource::SavedProfile
+                },
+                profile_id: resolved.profile_id.or_else(|| selection.profile_id.clone()),
+                profile: (profile != "environment").then_some(profile),
+                org_name: resolved.org_name.clone(),
+            },
             auth: BackendAuth {
                 token,
                 api_url: resolved.api_url,

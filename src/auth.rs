@@ -61,6 +61,7 @@ pub struct ResolvedAuth {
     pub org_name: Option<String>,
     pub is_oauth: bool,
     pub profile: Option<String>,
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +317,10 @@ pub(crate) async fn list_available_orgs_for_api_key(
 struct AuthStore {
     #[serde(default)]
     profiles: BTreeMap<String, AuthProfile>,
+    /// Stable local identities for saved profiles. Kept separately from
+    /// credentials so a rename changes only the lookup name, never the ID.
+    #[serde(default)]
+    profile_ids: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1164,6 +1169,7 @@ where
             org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
             is_oauth: false,
             profile: None,
+            profile_id: None,
         });
     }
 
@@ -1229,6 +1235,7 @@ where
             org_name,
             is_oauth,
             profile: Some(profile_name.to_string()),
+            profile_id: store.profile_ids.get(profile_name).cloned(),
         });
     }
 
@@ -1239,6 +1246,7 @@ where
         org_name: base.org_name.clone().or_else(|| cfg_org.clone()),
         is_oauth: false,
         profile: None,
+        profile_id: None,
     })
 }
 
@@ -1448,6 +1456,10 @@ pub(crate) fn commit_api_key_profile(
             api_key_hint: Some(obscure_api_key(api_key)),
         },
     );
+    store
+        .profile_ids
+        .entry(profile_name.to_string())
+        .or_insert_with(crate::utils::new_uuid_id);
     save_auth_store(&store)
 }
 
@@ -1487,6 +1499,10 @@ fn commit_oauth_profile(
             api_key_hint: None,
         },
     );
+    store
+        .profile_ids
+        .entry(profile_name.to_string())
+        .or_insert_with(crate::utils::new_uuid_id);
     save_auth_store(&store)
 }
 
@@ -1852,6 +1868,7 @@ pub(crate) fn delete_profile(profile_name: &str, force: bool, base_json: bool) -
     }
 
     store.profiles.remove(profile_name);
+    store.profile_ids.remove(profile_name);
     save_auth_store(&store)?;
     if let Err(err) = delete_profile_secret(profile_name) {
         eprintln!("warning: failed to delete keychain credential for '{profile_name}': {err}");
@@ -1927,6 +1944,7 @@ pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) ->
 
     store.profiles.remove(old_name);
     store.profiles.insert(new_name.to_string(), profile);
+    move_profile_id(&mut store, old_name, new_name);
     if let Err(err) = save_auth_store(&store) {
         for saved_key in &saved_credentials {
             let _ = delete_profile_secret(saved_key);
@@ -3336,7 +3354,35 @@ fn current_unix_timestamp() -> u64 {
 
 fn load_auth_store() -> Result<AuthStore> {
     let path = auth_store_path()?;
-    load_auth_store_from_path(&path)
+    let mut store = load_auth_store_from_path(&path)?;
+    if ensure_profile_ids(&mut store) {
+        save_auth_store_to_path(&path, &store)?;
+    }
+    Ok(store)
+}
+
+/// Give profiles created by older versions an ID the first time their store is
+/// read. UUIDs are local identifiers: they never leave the credential store
+/// except as non-secret routing metadata for coding-agent trace settings.
+fn ensure_profile_ids(store: &mut AuthStore) -> bool {
+    let mut changed = false;
+    for name in store.profiles.keys() {
+        if !store.profile_ids.contains_key(name) {
+            store
+                .profile_ids
+                .insert(name.clone(), crate::utils::new_uuid_id());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn move_profile_id(store: &mut AuthStore, old_name: &str, new_name: &str) {
+    let profile_id = store
+        .profile_ids
+        .remove(old_name)
+        .unwrap_or_else(crate::utils::new_uuid_id);
+    store.profile_ids.insert(new_name.to_string(), profile_id);
 }
 
 fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
@@ -3870,13 +3916,75 @@ mod tests {
                 ..Default::default()
             },
         );
+        store.profile_ids.insert(
+            "work".to_string(),
+            "00000000-0000-4000-8000-000000000001".to_string(),
+        );
 
         save_auth_store_to_path(&path, &store).expect("save");
         let loaded = load_auth_store_from_path(&path).expect("load");
 
         assert!(loaded.profiles.contains_key("work"));
+        assert_eq!(
+            loaded.profile_ids["work"],
+            "00000000-0000-4000-8000-000000000001"
+        );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_profiles_receive_persistable_stable_ids() {
+        let mut store = AuthStore::default();
+        store
+            .profiles
+            .insert("test-profile".to_string(), AuthProfile::default());
+
+        assert!(ensure_profile_ids(&mut store));
+        let id = store.profile_ids["test-profile"].clone();
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert!(!ensure_profile_ids(&mut store));
+        assert_eq!(store.profile_ids["test-profile"], id);
+    }
+
+    #[tokio::test]
+    async fn loading_a_legacy_store_backfills_profile_ids_on_disk() {
+        let _env = TestEnv::new(None, None).await;
+        let path = auth_store_path().expect("auth store path");
+        fs::create_dir_all(path.parent().expect("auth store parent")).expect("create parent");
+        fs::write(
+            &path,
+            r#"{"profiles":{"test-profile":{"auth_kind":"api_key"}}}"#,
+        )
+        .expect("write legacy store");
+
+        let store = load_auth_store().expect("load and migrate store");
+        let id = &store.profile_ids["test-profile"];
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read migrated store"))
+                .expect("parse migrated store");
+        assert_eq!(persisted["profile_ids"]["test-profile"], *id);
+    }
+
+    #[test]
+    fn renaming_a_profile_preserves_its_stable_id() {
+        let mut store = AuthStore {
+            profiles: BTreeMap::new(),
+            profile_ids: BTreeMap::from([(
+                "old-profile".to_string(),
+                "00000000-0000-4000-8000-000000000001".to_string(),
+            )]),
+        };
+
+        move_profile_id(&mut store, "old-profile", "new-profile");
+
+        assert!(!store.profile_ids.contains_key("old-profile"));
+        assert_eq!(
+            store.profile_ids["new-profile"],
+            "00000000-0000-4000-8000-000000000001"
+        );
     }
 
     #[test]
@@ -3898,6 +4006,10 @@ mod tests {
                 ..Default::default()
             },
         );
+        store.profile_ids.insert(
+            "work".to_string(),
+            "00000000-0000-4000-8000-000000000001".to_string(),
+        );
 
         let resolved = resolve_auth_from_store_with_secret_lookup(
             &base,
@@ -3910,6 +4022,10 @@ mod tests {
         assert_eq!(resolved.api_url, None);
         assert_eq!(resolved.org_name.as_deref(), Some("Example Org"));
         assert!(!resolved.is_oauth);
+        assert_eq!(
+            resolved.profile_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
     }
 
     #[test]
@@ -4961,6 +5077,7 @@ mod tests {
                 org_name: None,
                 is_oauth: false,
                 profile: Some("test-profile".to_string()),
+                profile_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             },
             api_key: "sk-test".to_string(),
             orgs: Vec::new(),

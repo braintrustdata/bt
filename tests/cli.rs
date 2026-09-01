@@ -205,7 +205,8 @@ fn top_level_help_shows_update_not_self() {
         .args(["--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("update       Update bt in-place"))
+        .stdout(predicate::str::contains("update"))
+        .stdout(predicate::str::contains("Update bt in-place"))
         .stdout(predicate::str::contains("self         Self-management commands").not());
 }
 
@@ -215,8 +216,13 @@ fn top_level_help_shows_profiles() {
         .args(["--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("profiles"));
+    bt_command()
+        .args(["--help"])
+        .assert()
+        .success()
         .stdout(predicate::str::contains(
-            "profiles     Manage saved Braintrust login profiles",
+            "Manage saved Braintrust login profiles",
         ));
 }
 
@@ -373,6 +379,13 @@ fn profiles_rename_moves_credentials_and_updates_config() {
     .expect("parse auth store");
     assert!(auth["profiles"].get("old-profile").is_none());
     assert!(auth["profiles"].get("renamed-profile").is_some());
+    assert!(auth["profile_ids"].get("old-profile").is_none());
+    assert!(uuid::Uuid::parse_str(
+        auth["profile_ids"]["renamed-profile"]
+            .as_str()
+            .expect("stable profile ID"),
+    )
+    .is_ok());
 
     let secrets: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secret store"),
@@ -468,7 +481,7 @@ fn trace_help_exposes_user_commands_and_hides_internal_commands() {
         .args(["trace", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("setup"))
+        .stdout(predicate::str::contains("\n  enable"))
         .stdout(predicate::str::contains("\n  import"))
         .stdout(predicate::str::contains("\n  run"))
         .stdout(predicate::str::contains("\n  daemon").not())
@@ -736,7 +749,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
             .expect("parse OpenCode inline config");
     assert_eq!(
         inline["plugin"],
-        serde_json::json!(["@braintrust/trace-opencode@^1"])
+        serde_json::json!(["@braintrust/trace-opencode/tracing"])
     );
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(run_settings).expect("read invocation settings"))
@@ -1095,7 +1108,7 @@ fn trace_setup_honors_global_json() {
         .clone();
     let output: serde_json::Value =
         serde_json::from_slice(&stdout).expect("trace setup emits JSON");
-    assert_eq!(output["command"], "setup");
+    assert_eq!(output["command"], "enable");
     assert_eq!(output["source"], "opencode");
     assert_eq!(output["display_name"], "OpenCode");
     assert_eq!(output["restart_required"], true);
