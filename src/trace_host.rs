@@ -23,14 +23,17 @@ struct BtTraceHost {
     base: BaseArgs,
 }
 
+fn has_usable_api_key(base: &BaseArgs) -> bool {
+    base.api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+}
+
 fn session_route(base: &BaseArgs) -> SessionRoute {
     let source = if base.profile.is_some() {
         AuthSource::SavedProfile
     } else if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
-        && base
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty())
+        && has_usable_api_key(base)
     {
         AuthSource::Environment
     } else {
@@ -449,7 +452,7 @@ impl TraceHostServices for BtTraceHost {
             };
         }
 
-        if self.base.api_key.is_some() {
+        if has_usable_api_key(&self.base) {
             let source = match self.base.api_key_source {
                 Some(ArgValueSource::EnvVariable) => "environment_api_key",
                 _ => "api_key_override",
@@ -554,6 +557,21 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("bt login --refresh --profile work"));
+    }
+
+    #[test]
+    fn automatic_route_ignores_an_empty_environment_api_key() {
+        let base = BaseArgs {
+            login: LoginBaseArgs {
+                api_key: Some("  ".into()),
+                api_key_source: Some(ArgValueSource::EnvVariable),
+                ..LoginBaseArgs::default()
+            },
+            ..BaseArgs::default()
+        };
+
+        assert!(!has_usable_api_key(&base));
+        assert_eq!(session_route(&base).auth.source, AuthSource::Auto);
     }
 
     #[tokio::test]

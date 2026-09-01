@@ -431,6 +431,13 @@ fn profiles_delete_removes_metadata_and_credentials() {
 #[cfg(unix)]
 #[test]
 fn logout_all_removes_every_saved_login_without_revoking_credentials() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(
+        repo.path().join(".bt/config.json"),
+        r#"{"profile":"second-profile","org":"second-org"}"#,
+    )
+    .expect("write local config");
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
     let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
@@ -442,13 +449,20 @@ fn logout_all_removes_every_saved_login_without_revoking_credentials() {
         ],
     );
     write_profile_secrets(config_home.path(), &["first-profile", "second-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"first-profile","org":"first-org"}"#,
+    )
+    .expect("write global config");
 
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
     use_fake_credential_store(&mut cmd, fake_bin.path());
     let output = cmd
+        .current_dir(repo.path())
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_PROFILE", "first-profile")
         .args(["logout", "--all", "--force", "--json"])
         .assert()
         .success()
@@ -476,6 +490,38 @@ fn logout_all_removes_every_saved_login_without_revoking_credentials() {
     )
     .expect("parse secret store");
     assert!(secrets["secrets"].as_object().unwrap().is_empty());
+
+    let global_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read global config"),
+    )
+    .expect("parse global config");
+    assert!(global_config["profile"].is_null());
+    assert_eq!(global_config["org"], "first-org");
+
+    let local_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo.path().join(".bt/config.json")).expect("read local config"),
+    )
+    .expect("parse local config");
+    assert!(local_config["profile"].is_null());
+    assert_eq!(local_config["org"], "second-org");
+}
+
+#[test]
+fn logout_all_rejects_an_explicit_profile() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["logout", "--all", "--force", "--profile", "test-profile"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--all cannot be combined with --profile",
+        ));
 }
 
 #[test]

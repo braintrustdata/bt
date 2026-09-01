@@ -2111,7 +2111,7 @@ fn run_login_logout(base: BaseArgs, args: LogoutArgs) -> Result<()> {
     }
 
     if args.all {
-        if base.login.profile.is_some() {
+        if base.profile_explicit {
             bail!("--all cannot be combined with --profile");
         }
         if !args.force {
@@ -2138,6 +2138,11 @@ fn run_login_logout(base: BaseArgs, args: LogoutArgs) -> Result<()> {
         let mut results = Vec::with_capacity(profile_names.len());
         for profile_name in &profile_names {
             remove_profile_from_store(&mut store, profile_name)?;
+            if let Err(err) = crate::config::replace_profile_references(profile_name, None) {
+                eprintln!(
+                    "warning: saved login '{profile_name}' was removed, but its config reference was not: {err}"
+                );
+            }
             results.push(serde_json::json!({
                 "name": profile_name,
                 "status": "deleted",
