@@ -1983,6 +1983,9 @@ pub(crate) fn delete_profile(profile_name: &str, force: bool, base_json: bool) -
         }
     }
 
+    crate::config::replace_profile_references(profile_name, None).with_context(|| {
+        format!("failed to clear config references for profile '{profile_name}'")
+    })?;
     remove_profile_from_store(&mut store, profile_name)?;
 
     emit_result(
@@ -2065,15 +2068,30 @@ pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) ->
         saved_credentials.push(key.clone());
     }
 
-    store.profiles.remove(old_name);
+    // Stage both names before updating config. That keeps every old or new
+    // reference resolvable even if a config write fails or the process exits
+    // between the independently atomic file updates.
     store.profiles.insert(new_name.to_string(), profile);
     move_profile_id(&mut store, old_name, new_name);
     if let Err(err) = save_auth_store(&store) {
         for saved_key in &saved_credentials {
             let _ = delete_profile_secret(saved_key);
         }
-        return Err(err).context("failed to save renamed profile");
+        return Err(err).context("failed to stage renamed profile");
     }
+
+    crate::config::replace_profile_references(old_name, Some(new_name)).with_context(|| {
+        format!(
+            "failed to update config references while renaming '{old_name}' to '{new_name}'; both profiles remain available"
+        )
+    })?;
+
+    store.profiles.remove(old_name);
+    save_auth_store(&store).with_context(|| {
+        format!(
+            "failed to finish renaming '{old_name}' to '{new_name}'; both profiles remain available"
+        )
+    })?;
 
     for old_key in [
         old_name.to_string(),
@@ -2135,14 +2153,18 @@ fn run_login_logout(base: BaseArgs, args: LogoutArgs) -> Result<()> {
         }
 
         let profile_names: Vec<String> = store.profiles.keys().cloned().collect();
+        // Clear every selected reference before deleting any profile. A
+        // partial config failure can then only leave an existing profile
+        // unselected; it can never leave config pointing at a deleted one.
+        for profile_name in &profile_names {
+            crate::config::replace_profile_references(profile_name, None).with_context(|| {
+                format!("failed to clear config references for profile '{profile_name}'")
+            })?;
+        }
+
         let mut results = Vec::with_capacity(profile_names.len());
         for profile_name in &profile_names {
             remove_profile_from_store(&mut store, profile_name)?;
-            if let Err(err) = crate::config::replace_profile_references(profile_name, None) {
-                eprintln!(
-                    "warning: saved login '{profile_name}' was removed, but its config reference was not: {err}"
-                );
-            }
             results.push(serde_json::json!({
                 "name": profile_name,
                 "status": "deleted",

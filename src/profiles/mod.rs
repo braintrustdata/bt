@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::args::LoginBaseArgs;
-use crate::{auth, config, ui};
+use crate::{auth, ui};
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
@@ -144,22 +144,12 @@ fn delete(base: &LoginBaseArgs, args: DeleteArgs) -> Result<()> {
         bail!("profile name required. Use: bt profiles delete <name>");
     };
 
-    if auth::delete_profile(&name, args.force, base.json)? {
-        update_config_references(&name, None);
-    }
+    auth::delete_profile(&name, args.force, base.json)?;
     Ok(())
 }
 
 fn rename(json: bool, args: RenameArgs) -> Result<()> {
     let old_name = args.name.trim().to_string();
     let new_name = args.new_name.trim().to_string();
-    auth::rename_profile(&old_name, &new_name, json)?;
-    update_config_references(&old_name, Some(&new_name));
-    Ok(())
-}
-
-fn update_config_references(old_name: &str, new_name: Option<&str>) {
-    if let Err(err) = config::replace_profile_references(old_name, new_name) {
-        eprintln!("warning: profile was updated, but its config reference was not: {err}");
-    }
+    auth::rename_profile(&old_name, &new_name, json)
 }

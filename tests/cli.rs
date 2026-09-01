@@ -430,6 +430,56 @@ fn profiles_delete_removes_metadata_and_credentials() {
 
 #[cfg(unix)]
 #[test]
+fn profiles_delete_preserves_profile_when_a_config_update_fails() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(repo.path().join(".bt/config.json"), "not valid JSON")
+        .expect("write invalid local config");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["test-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"test-profile","org":"test-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "delete", "test-profile", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed to clear config references for profile 'test-profile'",
+        ));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].get("test-profile").is_some());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secrets"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"]["test-profile"], "test-api-key");
+
+    let global_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read config"),
+    )
+    .expect("parse global config");
+    assert!(global_config["profile"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
 fn logout_all_removes_every_saved_login_without_revoking_credentials() {
     let repo = make_git_repo();
     fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
@@ -504,6 +554,56 @@ fn logout_all_removes_every_saved_login_without_revoking_credentials() {
     .expect("parse local config");
     assert!(local_config["profile"].is_null());
     assert_eq!(local_config["org"], "second-org");
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_all_preserves_every_profile_when_a_config_update_fails() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(repo.path().join(".bt/config.json"), "not valid JSON")
+        .expect("write invalid local config");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(
+        config_home.path(),
+        &[
+            ("first-profile", "first-org"),
+            ("second-profile", "second-org"),
+        ],
+    );
+    write_profile_secrets(config_home.path(), &["first-profile", "second-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"first-profile","org":"first-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["logout", "--all", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed to clear config references for profile",
+        ));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert_eq!(auth["profiles"].as_object().unwrap().len(), 2);
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secrets"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"].as_object().unwrap().len(), 2);
 }
 
 #[test]
@@ -601,6 +701,56 @@ fn profiles_rename_moves_credentials_and_updates_config() {
     .expect("parse config");
     assert_eq!(config["profile"], "renamed-profile");
     assert_eq!(config["org"], "test-org");
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_rename_keeps_both_names_resolvable_when_a_config_update_fails() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(repo.path().join(".bt/config.json"), "not valid JSON")
+        .expect("write invalid local config");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(config_home.path(), &[("old-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["old-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"old-profile","org":"test-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "rename", "old-profile", "new-profile"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("both profiles remain available"));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].get("old-profile").is_some());
+    assert!(auth["profiles"].get("new-profile").is_some());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secrets"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"]["old-profile"], "test-api-key");
+    assert_eq!(secrets["secrets"]["new-profile"], "test-api-key");
+
+    let global_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read config"),
+    )
+    .expect("parse global config");
+    assert_eq!(global_config["profile"], "new-profile");
 }
 
 #[cfg(unix)]
