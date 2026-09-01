@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::Read;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -17,6 +18,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use unicode_width::UnicodeWidthStr;
@@ -25,20 +27,25 @@ use urlencoding::encode;
 use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::http::{ApiClient, HttpError};
+use crate::project_context::resolve_required_project;
 use crate::ui::with_spinner;
 use crate::utils::parse_duration_to_seconds;
 
 const QUERY_SOURCE: &str = "bt_sql_9f4b1e6d7c2a4a7b8d4f9a6c2b1e7f3d";
+static LOGS_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bfrom[ \t\r\n]+(?P<source>logs)\b").expect("valid logs source regex")
+});
 
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
-  bt sql \"SELECT * FROM project_logs('<PROJECT_ID>') LIMIT 5\"
+  bt sql \"SELECT * FROM project_logs('project-name') WHERE created > now() - interval 1 day LIMIT 5\"
+  bt sql -p project-name \"SELECT * FROM logs WHERE created > now() - interval 1 day LIMIT 5\"
   cat query.sql | bt sql
-  bt sql --non-interactive \"SELECT count(*) FROM project_logs('<PROJECT_ID>')\"
+  bt sql --non-interactive \"SELECT count(*) FROM project_logs('project-name') WHERE created > now() - interval 1 day\"
 ")]
 pub struct SqlArgs {
-    /// SQL query to execute
+    /// SQL query to execute. Use FROM logs with --project as shorthand for project_logs(...)
     pub query: Option<String>,
 
     /// Force non-interactive mode
@@ -228,6 +235,7 @@ pub async fn run(base: BaseArgs, args: SqlArgs) -> Result<()> {
     };
 
     if let Some(query) = query {
+        let query = prepare_query(&base, &client, &query).await?;
         if args.async_query {
             run_async_query(&client, &query, &args, base.json).await?;
             return Ok(());
@@ -281,9 +289,135 @@ fn read_non_interactive_query(
     Ok(Some(trimmed.to_string()))
 }
 
+async fn prepare_query(base: &BaseArgs, client: &ApiClient, query: &str) -> Result<String> {
+    if !has_logs_source(query) {
+        return Ok(query.to_string());
+    }
+
+    let project = resolve_required_project(base, client, false)
+        .await
+        .context("`FROM logs` requires a project; pass --project <name> or run `bt switch`")?;
+    Ok(rewrite_logs_sources(query, &project.id))
+}
+
+fn has_logs_source(query: &str) -> bool {
+    let masked = mask_sql_literals_and_comments(query);
+    LOGS_SOURCE_RE.is_match(&masked)
+}
+
+fn rewrite_logs_sources(query: &str, project_id: &str) -> String {
+    let masked = mask_sql_literals_and_comments(query);
+    let ranges = LOGS_SOURCE_RE
+        .captures_iter(&masked)
+        .filter_map(|captures| captures.name("source").map(|source| source.range()))
+        .collect::<Vec<_>>();
+
+    if ranges.is_empty() {
+        return query.to_string();
+    }
+
+    let replacement = format!("project_logs({})", sql_string_literal(project_id));
+    let mut rewritten = query.to_string();
+    for range in ranges.into_iter().rev() {
+        rewritten.replace_range(range, &replacement);
+    }
+    rewritten
+}
+
+fn mask_sql_literals_and_comments(query: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        SingleQuoted,
+        DoubleQuoted,
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = query.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut state = State::Code;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let current = bytes[index];
+        let next = bytes.get(index + 1).copied();
+
+        match state {
+            State::Code => match (current, next) {
+                (b'\'', _) => {
+                    masked[index] = b' ';
+                    state = State::SingleQuoted;
+                }
+                (b'"', _) => {
+                    masked[index] = b' ';
+                    state = State::DoubleQuoted;
+                }
+                (b'-', Some(b'-')) => {
+                    masked[index] = b' ';
+                    masked[index + 1] = b' ';
+                    index += 1;
+                    state = State::LineComment;
+                }
+                (b'/', Some(b'*')) => {
+                    masked[index] = b' ';
+                    masked[index + 1] = b' ';
+                    index += 1;
+                    state = State::BlockComment;
+                }
+                _ => {}
+            },
+            State::SingleQuoted => {
+                masked[index] = b' ';
+                if current == b'\'' {
+                    if next == Some(b'\'') {
+                        masked[index + 1] = b' ';
+                        index += 1;
+                    } else {
+                        state = State::Code;
+                    }
+                }
+            }
+            State::DoubleQuoted => {
+                masked[index] = b' ';
+                if current == b'"' {
+                    if next == Some(b'"') {
+                        masked[index + 1] = b' ';
+                        index += 1;
+                    } else {
+                        state = State::Code;
+                    }
+                }
+            }
+            State::LineComment => {
+                masked[index] = b' ';
+                if current == b'\n' {
+                    state = State::Code;
+                }
+            }
+            State::BlockComment => {
+                masked[index] = b' ';
+                if current == b'*' && next == Some(b'/') {
+                    masked[index + 1] = b' ';
+                    index += 1;
+                    state = State::Code;
+                }
+            }
+        }
+
+        index += 1;
+    }
+
+    String::from_utf8(masked).expect("masking preserves valid UTF-8")
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 async fn run_interactive(base: BaseArgs, client: ApiClient, lint_mode: String) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| run_interactive_blocking(base.json, client, handle, lint_mode))
+    tokio::task::block_in_place(|| run_interactive_blocking(base, client, handle, lint_mode))
 }
 
 struct TerminalGuard;
@@ -296,7 +430,7 @@ impl Drop for TerminalGuard {
 }
 
 fn run_interactive_blocking(
-    json_output: bool,
+    base: BaseArgs,
     client: ApiClient,
     handle: tokio::runtime::Handle,
     lint_mode: String,
@@ -308,19 +442,19 @@ fn run_interactive_blocking(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, json_output, client, handle, lint_mode);
+    let res = run_app(&mut terminal, base, client, handle, lint_mode);
     terminal.show_cursor().ok();
     res
 }
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    json_output: bool,
+    base: BaseArgs,
     client: ApiClient,
     handle: tokio::runtime::Handle,
     lint_mode: String,
 ) -> Result<()> {
-    let mut app = App::new(json_output, lint_mode);
+    let mut app = App::new(base.json, lint_mode);
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
@@ -328,7 +462,7 @@ fn run_app(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if handle_key_event(&mut app, key, &client, &handle)? {
+                    if handle_key_event(&mut app, key, &base, &client, &handle)? {
                         break;
                     }
                 }
@@ -344,6 +478,7 @@ fn run_app(
 fn handle_key_event(
     app: &mut App,
     key: KeyEvent,
+    base: &BaseArgs,
     client: &ApiClient,
     handle: &tokio::runtime::Handle,
 ) -> Result<bool> {
@@ -364,7 +499,10 @@ fn handle_key_event(
             }
 
             app.status = "Running query...".to_string();
-            let result = handle.block_on(execute_query(client, &query, app.lint_mode.as_str()));
+            let result = handle.block_on(async {
+                let query = prepare_query(base, client, &query).await?;
+                execute_query(client, &query, app.lint_mode.as_str()).await
+            });
             match result {
                 Ok(response) => {
                     app.output = format_response(&response, app.json_output)?;
@@ -996,6 +1134,52 @@ mod tests {
         assert_eq!(body["lint_mode"], "strict");
         assert_eq!(body["strict_lint_mode"], true);
         assert_eq!(body["query_source"], QUERY_SOURCE);
+    }
+
+    #[test]
+    fn rewrites_logs_source_to_selected_project_id() {
+        let query = "SELECT id FROM LoGs WHERE created > now() - interval 1 day";
+
+        assert_eq!(
+            rewrite_logs_sources(query, "project_test_id"),
+            "SELECT id FROM project_logs('project_test_id') WHERE created > now() - interval 1 day"
+        );
+    }
+
+    #[test]
+    fn rewrites_every_logs_source() {
+        let query = "SELECT * FROM logs WHERE id IN (SELECT id FROM logs)";
+
+        assert_eq!(
+            rewrite_logs_sources(query, "project_test_id"),
+            "SELECT * FROM project_logs('project_test_id') WHERE id IN (SELECT id FROM project_logs('project_test_id'))"
+        );
+    }
+
+    #[test]
+    fn ignores_logs_text_in_literals_identifiers_and_comments() {
+        let query = "SELECT 'from logs', \"from logs\" -- from logs\nFROM logs /* from logs */ WHERE created > now() - interval 1 day";
+
+        assert_eq!(
+            rewrite_logs_sources(query, "project_test_id"),
+            "SELECT 'from logs', \"from logs\" -- from logs\nFROM project_logs('project_test_id') /* from logs */ WHERE created > now() - interval 1 day"
+        );
+    }
+
+    #[test]
+    fn leaves_named_btql_sources_unchanged() {
+        for query in [
+            "SELECT * FROM project_logs('test-project') WHERE created > now() - interval 1 day",
+            "SELECT * FROM experiment(['test-project', 'test-experiment'])",
+        ] {
+            assert!(!has_logs_source(query));
+            assert_eq!(rewrite_logs_sources(query, "unused"), query);
+        }
+    }
+
+    #[test]
+    fn quotes_project_ids_for_sql() {
+        assert_eq!(sql_string_literal("project'id"), "'project''id'");
     }
 
     #[test]
