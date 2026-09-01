@@ -22,6 +22,7 @@ use chrono::{DateTime, Months, Utc};
 use clap::Args;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dialoguer::{Confirm, Input, Password};
+use fs2::FileExt;
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
@@ -181,6 +182,17 @@ pub(crate) fn list_stored_profiles() -> Result<Vec<StoredProfileInfo>> {
             org_name: profile.org_constraint().map(str::to_string),
         })
         .collect())
+}
+
+/// Resolve the current profile name for a stable local profile ID. IDs are
+/// authoritative for persisted coding-agent routes because users can rename
+/// profiles and later reuse their old names.
+pub(crate) fn profile_name_for_id(profile_id: &str) -> Result<Option<String>> {
+    let store = load_auth_store()?;
+    Ok(store
+        .profile_ids
+        .iter()
+        .find_map(|(name, id)| (id == profile_id).then(|| name.clone())))
 }
 
 pub fn select_profile_interactive(current: Option<&str>) -> Result<Option<String>> {
@@ -3356,7 +3368,7 @@ fn load_auth_store() -> Result<AuthStore> {
     let path = auth_store_path()?;
     let mut store = load_auth_store_from_path(&path)?;
     if ensure_profile_ids(&mut store) {
-        save_auth_store_to_path(&path, &store)?;
+        backfill_profile_ids(&path, &mut store)?;
     }
     Ok(store)
 }
@@ -3385,6 +3397,58 @@ fn move_profile_id(store: &mut AuthStore, old_name: &str, new_name: &str) {
     store.profile_ids.insert(new_name.to_string(), profile_id);
 }
 
+/// Persist generated IDs without writing the stale profile snapshot that
+/// observed a legacy store. All writers take the same lock, and this helper
+/// re-reads the store while holding it before adding only missing IDs.
+fn backfill_profile_ids(path: &Path, store: &mut AuthStore) -> Result<()> {
+    with_auth_store_lock(path, || {
+        let mut current = load_auth_store_from_path(path)?;
+        let mut changed = false;
+        for name in current.profiles.keys() {
+            let id = current
+                .profile_ids
+                .entry(name.clone())
+                .or_insert_with(|| {
+                    changed = true;
+                    store
+                        .profile_ids
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(crate::utils::new_uuid_id)
+                })
+                .clone();
+            store.profile_ids.insert(name.clone(), id);
+        }
+        if changed {
+            save_auth_store_to_path(path, &current)?;
+        }
+        Ok(())
+    })
+}
+
+fn with_auth_store_lock<T>(path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("auth config path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let lock_path = path.with_extension(format!(
+        "{}lock",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+    ));
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    let result = action();
+    FileExt::unlock(&lock)?;
+    result
+}
+
 fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
     if !path.exists() {
         return Ok(AuthStore::default());
@@ -3398,7 +3462,7 @@ fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
 
 fn save_auth_store(store: &AuthStore) -> Result<()> {
     let path = auth_store_path()?;
-    save_auth_store_to_path(&path, store)
+    with_auth_store_lock(&path, || save_auth_store_to_path(&path, store))
 }
 
 fn save_auth_store_to_path(path: &Path, store: &AuthStore) -> Result<()> {
@@ -3961,6 +4025,10 @@ mod tests {
         let store = load_auth_store().expect("load and migrate store");
         let id = &store.profile_ids["test-profile"];
         assert!(uuid::Uuid::parse_str(id).is_ok());
+        assert_eq!(
+            profile_name_for_id(id).expect("resolve profile ID"),
+            Some("test-profile".to_string())
+        );
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(path).expect("read migrated store"))

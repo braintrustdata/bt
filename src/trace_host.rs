@@ -174,7 +174,15 @@ impl TraceHostServices for BtTraceHost {
     ) -> anyhow::Result<AuthLease> {
         let mut base = self.base.clone();
         base.no_input = true;
-        if let Some(profile) = &selection.profile {
+        if let Some(profile_id) = &selection.profile_id {
+            let profile = crate::auth::profile_name_for_id(profile_id)?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "saved profile ID '{profile_id}' no longer exists; run `bt trace enable` to select a profile"
+                ))?;
+            base.profile = Some(profile);
+            base.profile_explicit = true;
+            base.prefer_profile = true;
+        } else if let Some(profile) = &selection.profile {
             base.profile = Some(profile.clone());
             base.profile_explicit = true;
             base.prefer_profile = true;
