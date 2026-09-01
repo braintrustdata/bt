@@ -1229,6 +1229,11 @@ fn trace_enable_persists_environment_auth_and_completes_setup() {
     let auth_store =
         fs::read_to_string(config_home.path().join("bt/auth.json")).expect("saved auth profile");
     assert!(auth_store.contains(r#""profile""#));
+    let auth_store: serde_json::Value =
+        serde_json::from_str(&auth_store).expect("parse saved auth profile");
+    let profile_id = auth_store["profile_ids"]["profile"]
+        .as_str()
+        .expect("saved profile ID");
     let secrets = fs::read_to_string(config_home.path().join("bt/secrets.json"))
         .expect("saved profile credential");
     assert!(secrets.contains("test-api-key"));
@@ -1236,6 +1241,7 @@ fn trace_enable_persists_environment_auth_and_completes_setup() {
         serde_json::from_slice(&fs::read(daemon_config).expect("persistent tracing configuration"))
             .expect("parse tracing configuration");
     assert_eq!(settings["route"]["auth"]["source"], "saved_profile");
+    assert_eq!(settings["route"]["auth"]["profile_id"], profile_id);
     assert_eq!(settings["route"]["auth"]["profile"], "profile");
 }
 

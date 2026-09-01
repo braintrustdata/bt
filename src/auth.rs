@@ -1495,6 +1495,7 @@ pub(crate) async fn ensure_saved_trace_profile(base: &BaseArgs) -> Result<Resolv
         Some(app_url.clone()),
         org_constraint.map(|org| org.name.clone()),
     )?;
+    let profile_id = load_auth_store()?.profile_ids.get(&profile_name).cloned();
 
     Ok(ResolvedAuth {
         api_key: Some(api_key),
@@ -1506,6 +1507,7 @@ pub(crate) async fn ensure_saved_trace_profile(base: &BaseArgs) -> Result<Resolv
             .or_else(|| org_constraint.map(|org| org.name.clone())),
         is_oauth: false,
         profile: Some(profile_name),
+        profile_id,
     })
 }
 

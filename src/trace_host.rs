@@ -367,9 +367,7 @@ impl TraceHostServices for BtTraceHost {
         let canonical_selection = if let Some(profile) = resolved.profile {
             AuthSelection {
                 source: AuthSource::SavedProfile,
-                profile_id: resolved
-                    .profile_id
-                    .or_else(|| selection.profile_id.clone()),
+                profile_id: resolved.profile_id.or_else(|| selection.profile_id.clone()),
                 profile: Some(profile),
                 org_name: resolved.org_name.clone(),
             }
@@ -590,6 +588,7 @@ mod tests {
             .resolve_auth(
                 &AuthSelection {
                     source: AuthSource::Environment,
+                    profile_id: None,
                     profile: None,
                     org_name: Some("test-org".into()),
                 },
