@@ -27,19 +27,19 @@ curl -fsSL https://bt.dev/cli/install.sh | bash -s -- --canary
 ### Windows (PowerShell)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/latest/download/bt-installer.ps1 | iex"
 ```
 
 Install a specific version:
 
 ```powershell
-$env:BT_VERSION='0.1.2'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/v0.18.0/bt-installer.ps1 | iex"
 ```
 
 Canary:
 
 ```powershell
-$env:BT_CHANNEL='canary'; powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/braintrustdata/bt/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/braintrustdata/bt/releases/download/canary/bt-installer.ps1 | iex"
 ```
 
 ### [mise](https://mise.jdx.dev)
@@ -107,8 +107,6 @@ bt update --check
 bt update --channel canary
 ```
 
-If `bt` was installed via npm, use that to update instead.
-
 ## Uninstall
 
 Unix-like systems:
@@ -143,8 +141,8 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt profiles`     | List, delete, and rename saved login profiles                       |
 | `bt switch`       | Switch org and project context                                      |
 | `bt status`       | Show current org and project context                                |
-| `bt datasets`     | Manage datasets and dataset pipelines                               |
 | `bt eval`         | Run eval files (Unix only)                                          |
+| `bt trace`        | Trace coding-agent sessions                                         |
 | `bt sql`          | Run SQL queries against Braintrust                                  |
 | `bt view`         | View logs, traces, and spans                                        |
 | `bt projects`     | Manage projects (list, create, view, delete)                        |
@@ -391,9 +389,31 @@ Show current org and project context:
 - `bt status --verbose` — show detailed config resolution
 - `bt status -j` — JSON output
 
-## `bt setup` and `bt docs`
+## Application SDK setup
 
-Use setup/docs commands to configure coding-agent skills and workflow docs for Braintrust.
+To add the Braintrust SDK to an application, run the project setup wizard from
+the application's repository:
+
+```bash
+curl -fsSL https://braintrust.dev/wizard/setup.sh | sh
+```
+
+The wizard detects the project language, installs the appropriate Braintrust
+SDK, instruments the application, and verifies that the application emits a
+trace. It does not enable tracing of the coding agent itself.
+
+## Coding-agent tracing
+
+Coding-agent session tracing is managed with `bt trace`:
+
+- `bt trace setup <agent>` installs or configures a persistent tracing integration; supported agents are Codex, Claude Code, OpenCode, and Pi.
+- `bt trace run <agent> [arguments...]` launches one supported agent invocation with tracing enabled.
+- `bt trace import <agent> <session-id>` imports an existing Codex or Claude Code session.
+
+## Legacy `bt setup` and `bt docs`
+
+The older `bt setup` and `bt docs` commands are deprecated. Their compatibility
+behavior is documented below.
 
 - Configure skills with default setup flow:
   - `bt setup --local`

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,6 +30,8 @@ pub struct Function {
     pub function_data: Option<serde_json::Value>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub function_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
@@ -304,6 +308,47 @@ pub async fn list_functions_page(
         .with_context(|| format!("failed to list functions via {path}"))?;
 
     parse_function_list_page(raw)
+}
+
+/// List a project's functions using the public API's cursor contract.
+pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<Vec<Function>> {
+    let mut query = FunctionListQuery {
+        project_id: Some(project_id.to_string()),
+        ..Default::default()
+    };
+    let mut functions = Vec::new();
+    let mut cursors = HashSet::new();
+
+    loop {
+        let page = list_functions_page(client, &query).await?;
+        if query.snapshot.is_none() {
+            query.snapshot = page.snapshot;
+        }
+        functions.extend(
+            page.objects
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("unexpected function response shape")?,
+        );
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        if !cursors.insert(cursor.clone()) {
+            anyhow::bail!("function pagination returned a repeated cursor");
+        }
+        query.cursor = Some(cursor);
+    }
+
+    Ok(functions)
+}
+
+pub async fn create_function(client: &ApiClient, body: &Value) -> Result<Function> {
+    client.post("/v1/function", body).await
+}
+
+pub async fn replace_function(client: &ApiClient, body: &Value) -> Result<Function> {
+    client.put("/v1/function", body).await
 }
 
 fn parse_function_list_page(raw: Value) -> Result<FunctionListPage> {
