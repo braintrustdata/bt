@@ -341,6 +341,75 @@ struct SecretStore {
     secrets: BTreeMap<String, String>,
 }
 
+fn secret_profile_name(key: &str) -> &str {
+    key.strip_prefix("oauth_refresh::")
+        .or_else(|| key.strip_prefix("oauth_access::"))
+        .unwrap_or(key)
+}
+
+pub(crate) fn orphaned_plaintext_secret_keys() -> Result<Vec<String>> {
+    let profiles = load_auth_store()?;
+    let secrets = load_secret_store()?;
+    Ok(secrets
+        .secrets
+        .keys()
+        .filter(|key| !profiles.profiles.contains_key(secret_profile_name(key)))
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn repair_orphaned_plaintext_secrets() -> Result<Vec<String>> {
+    let profiles = load_auth_store()?;
+    let path = secret_store_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut secrets = load_secret_store()?;
+    let orphaned = secrets
+        .secrets
+        .keys()
+        .filter(|key| !profiles.profiles.contains_key(secret_profile_name(key)))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in &orphaned {
+        secrets.secrets.remove(key);
+    }
+    if !orphaned.is_empty() {
+        save_secret_store(&secrets)?;
+    }
+    Ok(orphaned)
+}
+
+pub(crate) fn repair_named_orphaned_credentials(names: &[String]) -> Result<Vec<String>> {
+    let profiles = load_auth_store()?;
+    let mut repaired = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("orphaned profile name cannot be empty");
+        }
+        if profiles.profiles.contains_key(name) {
+            bail!(
+                "profile '{name}' still exists; use `bt profiles delete {}` instead",
+                shell_quote_arg(name)
+            );
+        }
+        for key in [
+            name.to_string(),
+            oauth_refresh_secret_key(name),
+            oauth_access_secret_key(name),
+        ] {
+            delete_profile_secret(&key).with_context(|| {
+                format!("failed to remove orphaned credential for profile '{name}'")
+            })?;
+        }
+        repaired.push(name.to_string());
+    }
+    repaired.sort();
+    repaired.dedup();
+    Ok(repaired)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthProfile {
     #[serde(default)]
@@ -1473,8 +1542,13 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         .url();
     let authorize_url = authorize_url.to_string();
 
-    eprintln!("Opening browser for OAuth authorization...");
-    eprintln!("If it does not open, visit:\n{authorize_url}");
+    let quiet_requested = explicitly_quiet(base) || base.json;
+    if !quiet_requested {
+        eprintln!(
+            "{}",
+            oauth_authorization_message(&authorize_url, args.no_browser || is_ssh_session())
+        );
+    }
     if !args.no_browser {
         if let Err(err) = open::that(&authorize_url) {
             eprintln!("warning: failed to open browser automatically: {err}");
@@ -1484,7 +1558,7 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     let callback = collect_oauth_callback(
         callback_server,
         args.no_browser || is_ssh_session(),
-        explicitly_quiet(base),
+        quiet_requested,
     )
     .await?;
     if let Some(error) = callback.error {
@@ -1528,6 +1602,11 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     )?;
 
     let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    let human = if args.no_browser || is_ssh_session() {
+        format!("Logged-in profile\n{human}")
+    } else {
+        human
+    };
     emit_result(
         base.json,
         serde_json::json!({
@@ -2700,6 +2779,16 @@ enum OAuthCallbackMode {
     PromptThenListener,
 }
 
+fn oauth_authorization_message(authorize_url: &str, manual: bool) -> String {
+    if manual {
+        format!("Authorization URL\n  {authorize_url}")
+    } else {
+        format!(
+            "Opening browser for OAuth authorization...\n\nAuthorization URL\n  {authorize_url}\n  Use this URL if the browser does not open."
+        )
+    }
+}
+
 fn oauth_callback_mode(prefer_manual: bool) -> OAuthCallbackMode {
     if prefer_manual {
         if ui::can_prompt() {
@@ -2815,13 +2904,12 @@ async fn collect_oauth_callback(
             let term = ui::prompt_term()
                 .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?;
             if !quiet_requested {
-                println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
+                println!("\nCallback instructions");
+                println!("  Open the authorization URL in a browser on your local machine.");
                 println!(
-                    "After approving access, your browser may show a localhost connection error on remote hosts."
+                    "  After approval, a localhost connection error on the remote host is expected."
                 );
-                println!(
-                    "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
-                );
+                println!("  Copy the full browser URL (or code=...&state=...) and paste it below.");
             }
             let pasted = Input::<String>::new()
                 .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
@@ -3228,11 +3316,11 @@ fn warn_secret_store_plaintext_fallback(err: &anyhow::Error) {
 
     match secret_store_path() {
         Ok(path) => eprintln!(
-            "warning: secure credential store unavailable ({err}); falling back to plaintext credential file at {} (permissions: 0600).",
+            "\nCredential storage warning\n  Secure credential store unavailable ({err}); falling back to plaintext credential file at {} (permissions: 0600).",
             path.display()
         ),
         Err(_) => eprintln!(
-            "warning: secure credential store unavailable ({err}); falling back to plaintext credential storage."
+            "\nCredential storage warning\n  Secure credential store unavailable ({err}); falling back to plaintext credential storage."
         ),
     }
 }
@@ -4546,6 +4634,23 @@ mod tests {
         assert_eq!(parsed.code.as_deref(), Some("abc123"));
         assert_eq!(parsed.state.as_deref(), Some("state123"));
         assert_eq!(parsed.error, None);
+    }
+
+    #[test]
+    fn manual_oauth_authorization_message_is_labeled_and_browser_neutral() {
+        let message = oauth_authorization_message("https://example.com/authorize", true);
+        assert_eq!(
+            message,
+            "Authorization URL\n  https://example.com/authorize"
+        );
+        assert!(!message.contains("Opening browser"));
+    }
+
+    #[test]
+    fn browser_oauth_authorization_message_keeps_fallback_url() {
+        let message = oauth_authorization_message("https://example.com/authorize", false);
+        assert!(message.contains("Opening browser"));
+        assert!(message.contains("Authorization URL\n  https://example.com/authorize"));
     }
 
     #[test]

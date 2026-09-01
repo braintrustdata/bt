@@ -798,6 +798,107 @@ fn profiles_rename_moves_oauth_credentials() {
 }
 
 #[test]
+fn profiles_doctor_reports_only_orphaned_plaintext_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"kept":{"auth_kind":"api_key"}}}"#,
+    )
+    .expect("write auth store");
+    fs::write(
+        auth_dir.join("secrets.json"),
+        r#"{"secrets":{"kept":"kept-secret","orphan":"orphan-secret","oauth_refresh::missing":"refresh-secret"}}"#,
+    )
+    .expect("write secret store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"status\":\"orphaned_credentials\"",
+        ))
+        .stdout(predicate::str::contains("\"orphan\""))
+        .stdout(predicate::str::contains("oauth_refresh::missing"))
+        .stdout(predicate::str::contains("kept-secret").not())
+        .stdout(predicate::str::contains("orphan-secret").not());
+}
+
+#[test]
+fn profiles_repair_removes_only_currently_orphaned_plaintext_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"kept":{"auth_kind":"api_key"}}}"#,
+    )
+    .expect("write auth store");
+    fs::write(
+        auth_dir.join("secrets.json"),
+        r#"{"secrets":{"kept":"kept-secret","orphan":"orphan-secret","oauth_access::missing":"access-secret"}}"#,
+    )
+    .expect("write secret store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "repair", "--force", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"repaired\""));
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(auth_dir.join("secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"]["kept"], "kept-secret");
+    assert!(secrets["secrets"].get("orphan").is_none());
+    assert!(secrets["secrets"].get("oauth_access::missing").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_repair_accepts_an_explicit_deleted_profile_for_keychain_cleanup() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(auth_dir.join("auth.json"), r#"{"profiles":{}}"#).expect("write auth store");
+    fs::write(
+        auth_dir.join("secrets.json"),
+        r#"{"secrets":{"deleted":"api-secret","oauth_refresh::deleted":"refresh-secret","oauth_access::deleted":"access-secret"}}"#,
+    )
+    .expect("write secret store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "repair", "deleted", "--force", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"scope\":\"named_credentials\""))
+        .stdout(predicate::str::contains("\"deleted\""));
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(auth_dir.join("secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"], serde_json::json!({}));
+}
+
+#[test]
 fn status_all_json_includes_profile_urls() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
