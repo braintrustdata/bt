@@ -141,21 +141,51 @@ pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
     }
 
     if let Some(profiles) = profiles.as_ref() {
+        println!("Braintrust CLI status");
+        println!("\nActive default context");
+        println!("  Organization: {}", org.as_deref().unwrap_or("(unset)"));
+        println!(
+            "  Project:      {}",
+            project.as_deref().unwrap_or("(unset)")
+        );
+        println!(
+            "  Profile:      {}",
+            profile_info
+                .as_ref()
+                .map(|profile| profile.name.as_str())
+                .unwrap_or("(none)")
+        );
+        if let Some(profile) = &profile_info {
+            println!("  Auth:         {}", format_auth(profile));
+        }
+        println!(
+            "  Source:       {}",
+            source.as_deref().unwrap_or("automatic")
+        );
+
+        if let Some(precedence) = auth::credential_precedence(&base) {
+            println!("\nCredential precedence");
+            println!("  {precedence}");
+        }
+
+        println!("\nSaved login profiles");
         if profiles.is_empty() {
-            eprintln!("No saved profiles. Run `bt login` to create one.");
+            println!("  No saved profiles. Run `bt login` to create one.");
         } else {
             for profile in profiles {
-                let status = match profile.status.as_str() {
-                    "ok" => crate::ui::CommandStatus::Success,
-                    "expired" => crate::ui::CommandStatus::Warning,
-                    _ => crate::ui::CommandStatus::Error,
-                };
-                crate::ui::print_command_status(status, &auth::format_verification_line(profile));
-            }
-            if let Ok(path) = auth::credentials_path() {
-                eprintln!("\nCredentials: {}\n", path.display());
+                let selected = profile_info
+                    .as_ref()
+                    .is_some_and(|selected| selected.name == profile.name);
+                println!("\n{}", auth::format_verification_block(profile, selected));
             }
         }
+        if let Ok(path) = auth::profile_metadata_path() {
+            println!("\nProfile metadata: {}", path.display());
+        }
+        if let Ok(storage) = auth::secret_storage_description() {
+            println!("Secret storage: {storage}");
+        }
+        return Ok(());
     }
 
     if base.verbose {

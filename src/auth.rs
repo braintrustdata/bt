@@ -341,6 +341,75 @@ struct SecretStore {
     secrets: BTreeMap<String, String>,
 }
 
+fn secret_profile_name(key: &str) -> &str {
+    key.strip_prefix("oauth_refresh::")
+        .or_else(|| key.strip_prefix("oauth_access::"))
+        .unwrap_or(key)
+}
+
+pub(crate) fn orphaned_plaintext_secret_keys() -> Result<Vec<String>> {
+    let profiles = load_auth_store()?;
+    let secrets = load_secret_store()?;
+    Ok(secrets
+        .secrets
+        .keys()
+        .filter(|key| !profiles.profiles.contains_key(secret_profile_name(key)))
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn repair_orphaned_plaintext_secrets() -> Result<Vec<String>> {
+    let profiles = load_auth_store()?;
+    let path = secret_store_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut secrets = load_secret_store()?;
+    let orphaned = secrets
+        .secrets
+        .keys()
+        .filter(|key| !profiles.profiles.contains_key(secret_profile_name(key)))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in &orphaned {
+        secrets.secrets.remove(key);
+    }
+    if !orphaned.is_empty() {
+        save_secret_store(&secrets)?;
+    }
+    Ok(orphaned)
+}
+
+pub(crate) fn repair_named_orphaned_credentials(names: &[String]) -> Result<Vec<String>> {
+    let profiles = load_auth_store()?;
+    let mut repaired = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("orphaned profile name cannot be empty");
+        }
+        if profiles.profiles.contains_key(name) {
+            bail!(
+                "profile '{name}' still exists; use `bt profiles delete {}` instead",
+                shell_quote_arg(name)
+            );
+        }
+        for key in [
+            name.to_string(),
+            oauth_refresh_secret_key(name),
+            oauth_access_secret_key(name),
+        ] {
+            delete_profile_secret(&key).with_context(|| {
+                format!("failed to remove orphaned credential for profile '{name}'")
+            })?;
+        }
+        repaired.push(name.to_string());
+    }
+    repaired.sort();
+    repaired.dedup();
+    Ok(repaired)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AuthProfile {
     #[serde(default)]
@@ -436,10 +505,18 @@ pub struct LoginArgs {
     /// Do not try to open a browser automatically
     #[arg(long)]
     no_browser: bool,
+
+    /// Persist BRAINTRUST_API_KEY as a saved profile without prompting
+    #[arg(long, conflicts_with_all = ["oauth", "refresh"])]
+    save_env_api_key: bool,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct LogoutArgs {
+    /// Remove every saved login from this machine
+    #[arg(long)]
+    all: bool,
+
     /// Skip confirmation prompt
     #[arg(long, short = 'f')]
     force: bool,
@@ -1276,6 +1353,8 @@ async fn run_login_set(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         }
     }
 
+    confirm_environment_api_key_persistence(base, args.save_env_api_key)?;
+
     let interactive = ui::can_prompt();
 
     let api_key = match base.api_key.clone() {
@@ -1336,6 +1415,102 @@ async fn run_login_set(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     )
 }
 
+fn confirm_environment_api_key_persistence(
+    base: &BaseArgs,
+    explicitly_allowed: bool,
+) -> Result<()> {
+    if !environment_api_key_needs_confirmation(base, explicitly_allowed) {
+        return Ok(());
+    }
+
+    let Some(term) = ui::prompt_term() else {
+        bail!(
+            "`bt login` would persist BRAINTRUST_API_KEY as a saved profile; pass --save-env-api-key to confirm, or unset BRAINTRUST_API_KEY to choose another login method"
+        );
+    };
+    let confirmed = Confirm::new()
+        .with_prompt("Save BRAINTRUST_API_KEY as a login on this machine?")
+        .default(false)
+        .interact_on(&term)?;
+    if !confirmed {
+        bail!("login cancelled; BRAINTRUST_API_KEY was not saved");
+    }
+    Ok(())
+}
+
+fn environment_api_key_needs_confirmation(base: &BaseArgs, explicitly_allowed: bool) -> bool {
+    matches!(
+        base.api_key_source,
+        Some(crate::args::ArgValueSource::EnvVariable)
+    ) && !explicitly_allowed
+}
+
+/// Ensure persistent coding-agent tracing has a credential it can resolve in
+/// future processes. Unlike ordinary login, `trace enable` is itself an
+/// explicit request to persist the credential needed by the installed hooks,
+/// so an environment API key does not require a second confirmation flag.
+pub(crate) async fn ensure_saved_trace_profile(base: &BaseArgs) -> Result<ResolvedAuth> {
+    let api_key = match base.api_key.clone() {
+        Some(value) if !value.trim().is_empty() => value,
+        Some(_) => bail!("api key cannot be empty"),
+        None if ui::can_prompt() => prompt_api_key()?,
+        None => bail!(
+            "coding-agent tracing needs a Braintrust credential; set BRAINTRUST_API_KEY or run without --no-input to enter one"
+        ),
+    };
+
+    let app_url = base
+        .app_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+    let login_orgs = fetch_login_orgs(&api_key, &app_url).await?;
+    let org_constraint = single_org_api_key_constraint(&api_key, &login_orgs);
+    let store = load_auth_store()?;
+    let explicit_profile = base
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let (mut profile_name, should_confirm_overwrite) = resolve_api_key_login_profile_name(
+        explicit_profile,
+        org_constraint.map(|org| org.name.as_str()),
+        &app_url,
+        &store,
+    )?;
+
+    if should_confirm_overwrite {
+        if ui::can_prompt() {
+            confirm_profile_overwrite(&profile_name)?;
+        } else {
+            // Never overwrite an unrelated profile just to make setup
+            // non-interactive. Pick an unused deterministic name and return
+            // it to the route resolver instead.
+            profile_name = next_available_profile_name(&profile_name, &store);
+        }
+    }
+
+    commit_api_key_profile(
+        &profile_name,
+        &api_key,
+        Some(app_url.clone()),
+        org_constraint.map(|org| org.name.clone()),
+    )?;
+    let profile_id = load_auth_store()?.profile_ids.get(&profile_name).cloned();
+
+    Ok(ResolvedAuth {
+        api_key: Some(api_key),
+        api_url: base.api_url.clone(),
+        app_url: Some(app_url),
+        org_name: base
+            .org_name
+            .clone()
+            .or_else(|| org_constraint.map(|org| org.name.clone())),
+        is_oauth: false,
+        profile: Some(profile_name),
+        profile_id,
+    })
+}
+
 async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     let api_url = base
         .api_url
@@ -1369,8 +1544,13 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
         .url();
     let authorize_url = authorize_url.to_string();
 
-    eprintln!("Opening browser for OAuth authorization...");
-    eprintln!("If it does not open, visit:\n{authorize_url}");
+    let quiet_requested = explicitly_quiet(base) || base.json;
+    if !quiet_requested {
+        eprintln!(
+            "{}",
+            oauth_authorization_message(&authorize_url, args.no_browser || is_ssh_session())
+        );
+    }
     if !args.no_browser {
         if let Err(err) = open::that(&authorize_url) {
             eprintln!("warning: failed to open browser automatically: {err}");
@@ -1380,7 +1560,7 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     let callback = collect_oauth_callback(
         callback_server,
         args.no_browser || is_ssh_session(),
-        explicitly_quiet(base),
+        quiet_requested,
     )
     .await?;
     if let Some(error) = callback.error {
@@ -1424,6 +1604,11 @@ async fn run_login_oauth(base: &BaseArgs, args: LoginArgs) -> Result<()> {
     )?;
 
     let human = format_login_success(&selected_org, &profile_name, &selected_api_url);
+    let human = if args.no_browser || is_ssh_session() {
+        format!("Logged-in profile\n{human}")
+    } else {
+        human
+    };
     emit_result(
         base.json,
         serde_json::json!({
@@ -1879,9 +2064,30 @@ pub(crate) fn delete_profile(profile_name: &str, force: bool, base_json: bool) -
         }
     }
 
+    crate::config::replace_profile_references(profile_name, None).with_context(|| {
+        format!("failed to clear config references for profile '{profile_name}'")
+    })?;
+    remove_profile_from_store(&mut store, profile_name)?;
+
+    emit_result(
+        base_json,
+        serde_json::json!({ "name": profile_name, "status": "deleted" }),
+        || {
+            ui::print_command_status(
+                ui::CommandStatus::Success,
+                &format!(
+                    "Removed saved login '{profile_name}' from this machine; the credential was not revoked"
+                ),
+            )
+        },
+    )?;
+    Ok(true)
+}
+
+fn remove_profile_from_store(store: &mut AuthStore, profile_name: &str) -> Result<()> {
     store.profiles.remove(profile_name);
     store.profile_ids.remove(profile_name);
-    save_auth_store(&store)?;
+    save_auth_store(store)?;
     if let Err(err) = delete_profile_secret(profile_name) {
         eprintln!("warning: failed to delete keychain credential for '{profile_name}': {err}");
     }
@@ -1891,18 +2097,7 @@ pub(crate) fn delete_profile(profile_name: &str, force: bool, base_json: bool) -
     if let Err(err) = delete_profile_oauth_access_token(profile_name) {
         eprintln!("warning: failed to delete oauth access token for '{profile_name}': {err}");
     }
-
-    emit_result(
-        base_json,
-        serde_json::json!({ "name": profile_name, "status": "deleted" }),
-        || {
-            ui::print_command_status(
-                ui::CommandStatus::Success,
-                &format!("Deleted profile '{profile_name}'"),
-            )
-        },
-    )?;
-    Ok(true)
+    Ok(())
 }
 
 pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) -> Result<()> {
@@ -1954,15 +2149,30 @@ pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) ->
         saved_credentials.push(key.clone());
     }
 
-    store.profiles.remove(old_name);
+    // Stage both names before updating config. That keeps every old or new
+    // reference resolvable even if a config write fails or the process exits
+    // between the independently atomic file updates.
     store.profiles.insert(new_name.to_string(), profile);
     move_profile_id(&mut store, old_name, new_name);
     if let Err(err) = save_auth_store(&store) {
         for saved_key in &saved_credentials {
             let _ = delete_profile_secret(saved_key);
         }
-        return Err(err).context("failed to save renamed profile");
+        return Err(err).context("failed to stage renamed profile");
     }
+
+    crate::config::replace_profile_references(old_name, Some(new_name)).with_context(|| {
+        format!(
+            "failed to update config references while renaming '{old_name}' to '{new_name}'; both profiles remain available"
+        )
+    })?;
+
+    store.profiles.remove(old_name);
+    save_auth_store(&store).with_context(|| {
+        format!(
+            "failed to finish renaming '{old_name}' to '{new_name}'; both profiles remain available"
+        )
+    })?;
 
     for old_key in [
         old_name.to_string(),
@@ -1992,11 +2202,69 @@ pub(crate) fn rename_profile(old_name: &str, new_name: &str, base_json: bool) ->
 
 fn run_login_logout(base: BaseArgs, args: LogoutArgs) -> Result<()> {
     let base_json = base.json;
-    let store = load_auth_store()?;
+    let mut store = load_auth_store()?;
     if store.profiles.is_empty() {
         return emit_result(base_json, serde_json::json!({ "status": "empty" }), || {
             println!("No saved profiles.")
         });
+    }
+
+    if args.all {
+        if base.profile_explicit {
+            bail!("--all cannot be combined with --profile");
+        }
+        if !args.force {
+            let Some(term) = ui::prompt_term() else {
+                bail!("removing all saved logins requires confirmation; rerun with --force in non-interactive mode");
+            };
+            let confirmed = Confirm::new()
+                .with_prompt(format!(
+                    "Remove all {} saved logins from this machine? Credentials will not be revoked.",
+                    store.profiles.len()
+                ))
+                .default(false)
+                .interact_on(&term)?;
+            if !confirmed {
+                return emit_result(
+                    base_json,
+                    serde_json::json!({ "status": "cancelled", "results": [] }),
+                    || eprintln!("Cancelled"),
+                );
+            }
+        }
+
+        let profile_names: Vec<String> = store.profiles.keys().cloned().collect();
+        // Clear every selected reference before deleting any profile. A
+        // partial config failure can then only leave an existing profile
+        // unselected; it can never leave config pointing at a deleted one.
+        for profile_name in &profile_names {
+            crate::config::replace_profile_references(profile_name, None).with_context(|| {
+                format!("failed to clear config references for profile '{profile_name}'")
+            })?;
+        }
+
+        let mut results = Vec::with_capacity(profile_names.len());
+        for profile_name in &profile_names {
+            remove_profile_from_store(&mut store, profile_name)?;
+            results.push(serde_json::json!({
+                "name": profile_name,
+                "status": "deleted",
+                "revoked": false,
+            }));
+        }
+        return emit_result(
+            base_json,
+            serde_json::json!({ "status": "deleted", "results": results }),
+            || {
+                ui::print_command_status(
+                    ui::CommandStatus::Success,
+                    &format!(
+                        "Removed {} saved logins from this machine; credentials were not revoked",
+                        profile_names.len()
+                    ),
+                )
+            },
+        );
     }
 
     let profile_name = if let Some(p) = base.login.profile {
@@ -2054,6 +2322,33 @@ fn load_credential_for_profile(name: &str, profile: &AuthProfile) -> CredentialL
     }
 }
 
+pub(crate) fn diagnose_stored_profile(name: &str) -> Result<ProfileVerification> {
+    let store = load_auth_store()?;
+    let profile = store
+        .profiles
+        .get(name)
+        .ok_or_else(|| profile_not_found_err(name, &store))?;
+    let verification = match load_credential_for_profile(name, profile) {
+        CredentialLoad::Found(credential) => {
+            let (identity, hint) = match profile.auth_kind {
+                AuthKind::Oauth => (Some(decode_jwt_identity(&credential)), None),
+                AuthKind::ApiKey => (None, profile.api_key_hint.clone()),
+            };
+            build_verification(name, profile, identity, hint, ProfileStatus::Ok)
+        }
+        CredentialLoad::Missing => {
+            build_verification(name, profile, None, None, ProfileStatus::Missing)
+        }
+        CredentialLoad::Expired => {
+            build_verification(name, profile, None, None, ProfileStatus::Expired)
+        }
+        CredentialLoad::Error(error) => {
+            build_verification(name, profile, None, None, ProfileStatus::Error(error))
+        }
+    };
+    Ok(verification)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileVerification {
     pub name: String,
@@ -2069,6 +2364,8 @@ pub struct ProfileVerification {
     pub user_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -2105,6 +2402,9 @@ fn build_verification(
         user_name: jwt_id.as_ref().and_then(|j| j.name.clone()),
         user_email: jwt_id.as_ref().and_then(|j| j.email.clone()),
         api_key_hint,
+        expires_at: (profile.auth_kind == AuthKind::Oauth)
+            .then_some(profile.oauth_access_expires_at)
+            .flatten(),
         status: status_str.to_string(),
         error,
     }
@@ -2182,38 +2482,85 @@ pub(crate) async fn profile_verifications() -> Result<Vec<ProfileVerification>> 
     Ok(verify_all_profiles_from_store(&store).await)
 }
 
-pub(crate) fn credentials_path() -> Result<PathBuf> {
+pub(crate) fn profile_metadata_path() -> Result<PathBuf> {
     auth_store_path()
 }
 
-pub(crate) fn format_verification_line(v: &ProfileVerification) -> String {
-    let mut parts = vec![v.name.clone(), v.app_url.clone(), v.auth.clone()];
-    if let Some(ref api_url) = v.api_url {
-        parts.push(format!("api: {api_url}"));
-    }
-    if let Some(ref org) = v.org {
-        parts.push(format!("org: {org}"));
-    }
-    match v.status.as_str() {
-        "ok" => {
-            let id = match (&v.user_name, &v.user_email) {
-                (Some(name), Some(email)) => Some(format!("{name} ({email})")),
-                (None, Some(email)) => Some(email.clone()),
-                _ => v.api_key_hint.clone(),
-            };
-            if let Some(id) = id {
-                parts.push(id);
+pub(crate) fn secret_storage_description() -> Result<String> {
+    let fallback = secret_store_path()?;
+    #[cfg(target_os = "macos")]
+    return Ok(format!(
+        "macOS Keychain (plaintext fallback: {})",
+        fallback.display()
+    ));
+    #[cfg(target_os = "linux")]
+    return Ok(format!(
+        "Secret Service (plaintext fallback: {})",
+        fallback.display()
+    ));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Ok(format!("plaintext file: {}", fallback.display()));
+}
+
+pub(crate) fn credential_precedence(base: &BaseArgs) -> Option<String> {
+    if resolve_api_key_override(base).is_some() {
+        return Some(match base.api_key_source {
+            Some(crate::args::ArgValueSource::EnvVariable) => {
+                "BRAINTRUST_API_KEY overrides saved profiles".into()
             }
-        }
-        "expired" => parts.push("token expired".into()),
-        "missing" => parts.push("credential missing".into()),
-        _ => {
-            if let Some(ref e) = v.error {
-                parts.push(e.clone());
-            }
-        }
+            _ => "API key override is active".into(),
+        });
     }
-    parts.join(" — ")
+    None
+}
+
+pub(crate) fn format_verification_block(v: &ProfileVerification, selected: bool) -> String {
+    let identity = match (&v.user_name, &v.user_email, &v.api_key_hint) {
+        (Some(name), Some(email), _) => Some(format!("{name} <{email}>")),
+        (None, Some(email), _) => Some(email.clone()),
+        (_, _, Some(hint)) => Some(hint.clone()),
+        _ => None,
+    };
+    let status = match v.status.as_str() {
+        "ok" => "Ready".to_string(),
+        "expired" => "Needs refresh".to_string(),
+        "missing" => "Credential missing".to_string(),
+        _ => v.error.clone().unwrap_or_else(|| "Error".into()),
+    };
+    let mut lines = vec![format!(
+        "{}{}",
+        v.name,
+        if selected { " (selected)" } else { "" }
+    )];
+    lines.push(format!(
+        "  Auth:       {}{}",
+        v.auth,
+        identity
+            .as_deref()
+            .map(|identity| format!(", {identity}"))
+            .unwrap_or_default()
+    ));
+    if let Some(org) = &v.org {
+        lines.push(format!("  Org:        {org}"));
+    }
+    lines.push(format!("  App URL:    {}", v.app_url));
+    if let Some(api_url) = &v.api_url {
+        lines.push(format!("  API URL:    {api_url}"));
+    }
+    if let Some(expires_at) = v.expires_at {
+        let timestamp = chrono::DateTime::<Utc>::from_timestamp(expires_at as i64, 0)
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| expires_at.to_string());
+        lines.push(format!("  Expires:    {timestamp}"));
+    }
+    lines.push(format!("  Status:     {status}"));
+    if v.status == "expired" {
+        lines.push(format!(
+            "  Fix:        bt login --refresh --profile {}",
+            shell_quote_arg(&v.name)
+        ));
+    }
+    lines.join("\n")
 }
 
 async fn fetch_login_orgs(api_key: &str, app_url: &str) -> Result<Vec<LoginOrgInfo>> {
@@ -2434,6 +2781,16 @@ enum OAuthCallbackMode {
     PromptThenListener,
 }
 
+fn oauth_authorization_message(authorize_url: &str, manual: bool) -> String {
+    if manual {
+        format!("Authorization URL\n  {authorize_url}")
+    } else {
+        format!(
+            "Opening browser for OAuth authorization...\n\nAuthorization URL\n  {authorize_url}\n  Use this URL if the browser does not open."
+        )
+    }
+}
+
 fn oauth_callback_mode(prefer_manual: bool) -> OAuthCallbackMode {
     if prefer_manual {
         if ui::can_prompt() {
@@ -2549,13 +2906,12 @@ async fn collect_oauth_callback(
             let term = ui::prompt_term()
                 .ok_or_else(|| anyhow::anyhow!("interactive mode requires TTY"))?;
             if !quiet_requested {
-                println!("Remote/SSH OAuth flow: open the URL in a browser on your local machine.");
+                println!("\nCallback instructions");
+                println!("  Open the authorization URL in a browser on your local machine.");
                 println!(
-                    "After approving access, your browser may show a localhost connection error on remote hosts."
+                    "  After approval, a localhost connection error on the remote host is expected."
                 );
-                println!(
-                    "Copy the full URL from the browser address bar (or just code=...&state=...) and paste it below."
-                );
+                println!("  Copy the full browser URL (or code=...&state=...) and paste it below.");
             }
             let pasted = Input::<String>::new()
                 .with_prompt("Callback URL/query/JSON (press Enter to wait for automatic callback)")
@@ -2962,11 +3318,11 @@ fn warn_secret_store_plaintext_fallback(err: &anyhow::Error) {
 
     match secret_store_path() {
         Ok(path) => eprintln!(
-            "warning: secure credential store unavailable ({err}); falling back to plaintext credential file at {} (permissions: 0600).",
+            "\nCredential storage warning\n  Secure credential store unavailable ({err}); falling back to plaintext credential file at {} (permissions: 0600).",
             path.display()
         ),
         Err(_) => eprintln!(
-            "warning: secure credential store unavailable ({err}); falling back to plaintext credential storage."
+            "\nCredential storage warning\n  Secure credential store unavailable ({err}); falling back to plaintext credential storage."
         ),
     }
 }
@@ -3510,6 +3866,14 @@ mod tests {
 
     fn make_base() -> BaseArgs {
         BaseArgs::default()
+    }
+
+    #[test]
+    fn environment_api_keys_require_explicit_persistence_consent() {
+        let mut base = make_base();
+        base.api_key_source = Some(crate::args::ArgValueSource::EnvVariable);
+        assert!(environment_api_key_needs_confirmation(&base, false));
+        assert!(!environment_api_key_needs_confirmation(&base, true));
     }
 
     fn auth_config(profile: Option<&str>, org: Option<&str>) -> crate::config::Config {
@@ -4275,6 +4639,23 @@ mod tests {
     }
 
     #[test]
+    fn manual_oauth_authorization_message_is_labeled_and_browser_neutral() {
+        let message = oauth_authorization_message("https://example.com/authorize", true);
+        assert_eq!(
+            message,
+            "Authorization URL\n  https://example.com/authorize"
+        );
+        assert!(!message.contains("Opening browser"));
+    }
+
+    #[test]
+    fn browser_oauth_authorization_message_keeps_fallback_url() {
+        let message = oauth_authorization_message("https://example.com/authorize", false);
+        assert!(message.contains("Opening browser"));
+        assert!(message.contains("Authorization URL\n  https://example.com/authorize"));
+    }
+
+    #[test]
     fn parse_oauth_callback_input_accepts_fragment_payload() {
         let parsed = parse_oauth_callback_input("#code=abc123&state=state123").expect("parse");
         assert_eq!(parsed.code.as_deref(), Some("abc123"));
@@ -4956,7 +5337,7 @@ mod tests {
     }
 
     #[test]
-    fn format_verification_line_ok_with_identity() {
+    fn format_verification_block_ok_with_identity() {
         let v = ProfileVerification {
             name: "work".into(),
             auth: "oauth".into(),
@@ -4966,17 +5347,20 @@ mod tests {
             user_name: Some("Alice".into()),
             user_email: Some("alice@example.com".into()),
             api_key_hint: None,
+            expires_at: Some(1_800_000_000),
             status: "ok".into(),
             error: None,
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "work — https://app.test.example — oauth — api: https://api.test.example — org: acme — Alice (alice@example.com)"
-        );
+        let block = format_verification_block(&v, true);
+        assert!(block.contains("work (selected)"));
+        assert!(block.contains("Auth:       oauth, Alice <alice@example.com>"));
+        assert!(block.contains("Org:        acme"));
+        assert!(block.contains("API URL:    https://api.test.example"));
+        assert!(block.contains("Status:     Ready"));
     }
 
     #[test]
-    fn format_verification_line_ok_with_api_key_hint() {
+    fn format_verification_block_ok_with_api_key_hint() {
         let v = ProfileVerification {
             name: "work".into(),
             auth: "api_key".into(),
@@ -4986,17 +5370,18 @@ mod tests {
             user_name: None,
             user_email: None,
             api_key_hint: Some("sk-****zhJwO".into()),
+            expires_at: None,
             status: "ok".into(),
             error: None,
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "work — https://app.test.example — api_key — org: acme — sk-****zhJwO"
-        );
+        let block = format_verification_block(&v, false);
+        assert!(block.contains("Auth:       api_key, sk-****zhJwO"));
+        assert!(block.contains("Org:        acme"));
+        assert!(block.contains("Status:     Ready"));
     }
 
     #[test]
-    fn format_verification_line_expired() {
+    fn format_verification_block_expired() {
         let v = ProfileVerification {
             name: "old".into(),
             auth: "oauth".into(),
@@ -5006,17 +5391,20 @@ mod tests {
             user_name: None,
             user_email: None,
             api_key_hint: None,
+            expires_at: Some(1_700_000_000),
             status: "expired".into(),
             error: None,
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "old — https://app.test.example — oauth — token expired"
-        );
+        let block = format_verification_block(&v, true);
+        assert!(block.contains("old (selected)"));
+        assert!(block.contains("Auth:       oauth"));
+        assert!(block.contains("Expires:    2023-11-14T22:13:20+00:00"));
+        assert!(block.contains("Status:     Needs refresh"));
+        assert!(block.contains("bt login --refresh --profile old"));
     }
 
     #[test]
-    fn format_verification_line_error() {
+    fn format_verification_block_error() {
         let v = ProfileVerification {
             name: "bad".into(),
             auth: "api_key".into(),
@@ -5026,13 +5414,13 @@ mod tests {
             user_name: None,
             user_email: None,
             api_key_hint: None,
+            expires_at: None,
             status: "error".into(),
             error: Some("invalid API key".into()),
         };
-        assert_eq!(
-            format_verification_line(&v),
-            "bad — https://app.test.example — api_key — org: corp — invalid API key"
-        );
+        let block = format_verification_block(&v, false);
+        assert!(block.contains("Org:        corp"));
+        assert!(block.contains("Status:     invalid API key"));
     }
 
     #[tokio::test]

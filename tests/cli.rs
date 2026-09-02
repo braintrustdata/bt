@@ -1,6 +1,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::TcpListener;
 use std::path::Path;
 
 fn bt_command() -> Command {
@@ -23,10 +27,22 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
 /// Setup, managed run, and import resolve a Braintrust credential and org
 /// before writing a route, so those tests supply a synthetic one rather than
 /// depending on whatever auth the ambient environment happens to carry.
-fn bt_trace_command() -> Command {
+fn bt_trace_command(config_home: &Path, profile: &str, org: &str) -> Command {
+    write_auth_store(config_home, &[(profile, org)]);
+    write_profile_secrets(config_home, &[profile]);
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
-    cmd.env("BRAINTRUST_API_KEY", "test-api-key")
+    cmd.env("XDG_CONFIG_HOME", config_home)
+        .env("BRAINTRUST_PROFILE", profile)
+        .env("BRAINTRUST_ORG_NAME", org);
+    cmd
+}
+
+fn bt_trace_environment_command(config_home: &Path) -> Command {
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("XDG_CONFIG_HOME", config_home)
+        .env("BRAINTRUST_API_KEY", "test-api-key")
         .env("BRAINTRUST_ORG_NAME", "test-org");
     cmd
 }
@@ -68,13 +84,36 @@ esac
 fn write_run_agent(path: &Path) {
     fs::write(
         path,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AGENT_RUN_LOG\"\nprintf '%s\\n' \"$BT_TRACE_INVOCATION_SETTINGS\" > \"$AGENT_RUN_SETTINGS\"\nif [ -n \"$AGENT_RUN_DAEMON_ENV\" ]; then printf '%s\\n%s\\n' \"$BT_DAEMON_SOCKET\" \"$BT_DAEMON_DATA_DIR\" > \"$AGENT_RUN_DAEMON_ENV\"; fi\nif [ -n \"$AGENT_RUN_CONFIG\" ]; then printf '%s\\n' \"$OPENCODE_CONFIG_CONTENT\" > \"$AGENT_RUN_CONFIG\"; fi\n",
     )
     .expect("write fake run agent");
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).expect("chmod");
+}
+
+#[cfg(unix)]
+fn serve_login_once() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind login server");
+    let address = listener.local_addr().expect("login server address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept login request");
+        let mut request = [0_u8; 4096];
+        let size = stream.read(&mut request).expect("read login request");
+        let request = String::from_utf8_lossy(&request[..size]);
+        assert!(request.starts_with("POST /api/apikey/login "));
+
+        let body = r#"{"org_info":[{"id":"org-1","name":"test-org","api_url":"https://api.braintrust.dev"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write login response");
+    });
+    (format!("http://{address}"), handle)
 }
 
 fn make_git_repo() -> tempfile::TempDir {
@@ -290,6 +329,54 @@ fn status_verbose_explicitly_shows_unset_profile() {
         .stdout(predicate::str::contains("profile: (unset)"));
 }
 
+#[test]
+fn bare_status_does_not_render_the_all_profiles_report() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Saved login profiles").not())
+        .stdout(predicate::str::contains("Credential precedence").not())
+        .stdout(predicate::str::contains("Profile metadata").not())
+        .stdout(predicate::str::contains("Secret storage").not());
+}
+
+#[test]
+fn status_all_only_shows_precedence_for_an_active_override() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+
+    let mut without_override = bt_command();
+    clear_braintrust_auth_env(&mut without_override);
+    without_override
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["status", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Saved login profiles"))
+        .stdout(predicate::str::contains("Credential precedence").not());
+
+    let mut with_override = bt_command();
+    clear_braintrust_auth_env(&mut with_override);
+    with_override
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_API_KEY", "synthetic-api-key")
+        .args(["status", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Credential precedence"))
+        .stdout(predicate::str::contains(
+            "BRAINTRUST_API_KEY overrides saved profiles",
+        ));
+}
+
 #[cfg(unix)]
 #[test]
 fn profiles_delete_removes_metadata_and_credentials() {
@@ -339,6 +426,220 @@ fn profiles_delete_removes_metadata_and_credentials() {
     .expect("parse config");
     assert!(config["profile"].is_null());
     assert_eq!(config["org"], "test-org");
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_delete_preserves_profile_when_a_config_update_fails() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(repo.path().join(".bt/config.json"), "not valid JSON")
+        .expect("write invalid local config");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["test-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"test-profile","org":"test-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "delete", "test-profile", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed to clear config references for profile 'test-profile'",
+        ));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].get("test-profile").is_some());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secrets"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"]["test-profile"], "test-api-key");
+
+    let global_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read config"),
+    )
+    .expect("parse global config");
+    assert!(global_config["profile"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_all_removes_every_saved_login_without_revoking_credentials() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(
+        repo.path().join(".bt/config.json"),
+        r#"{"profile":"second-profile","org":"second-org"}"#,
+    )
+    .expect("write local config");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(
+        config_home.path(),
+        &[
+            ("first-profile", "first-org"),
+            ("second-profile", "second-org"),
+        ],
+    );
+    write_profile_secrets(config_home.path(), &["first-profile", "second-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"first-profile","org":"first-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    let output = cmd
+        .current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_PROFILE", "first-profile")
+        .args(["logout", "--all", "--force", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let result: serde_json::Value =
+        serde_json::from_slice(&output).expect("parse logout JSON output");
+    assert_eq!(result["status"], "deleted");
+    assert_eq!(result["results"].as_array().unwrap().len(), 2);
+    assert!(result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["revoked"] == false));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].as_object().unwrap().is_empty());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert!(secrets["secrets"].as_object().unwrap().is_empty());
+
+    let global_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read global config"),
+    )
+    .expect("parse global config");
+    assert!(global_config["profile"].is_null());
+    assert_eq!(global_config["org"], "first-org");
+
+    let local_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo.path().join(".bt/config.json")).expect("read local config"),
+    )
+    .expect("parse local config");
+    assert!(local_config["profile"].is_null());
+    assert_eq!(local_config["org"], "second-org");
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_all_preserves_every_profile_when_a_config_update_fails() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(repo.path().join(".bt/config.json"), "not valid JSON")
+        .expect("write invalid local config");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(
+        config_home.path(),
+        &[
+            ("first-profile", "first-org"),
+            ("second-profile", "second-org"),
+        ],
+    );
+    write_profile_secrets(config_home.path(), &["first-profile", "second-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"first-profile","org":"first-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["logout", "--all", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed to clear config references for profile",
+        ));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert_eq!(auth["profiles"].as_object().unwrap().len(), 2);
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secrets"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"].as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn logout_all_rejects_an_explicit_profile() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["logout", "--all", "--force", "--profile", "test-profile"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--all cannot be combined with --profile",
+        ));
+}
+
+#[test]
+fn logout_all_requires_force_without_a_terminal() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["logout", "--all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "rerun with --force in non-interactive mode",
+        ));
 }
 
 #[cfg(unix)]
@@ -404,6 +705,56 @@ fn profiles_rename_moves_credentials_and_updates_config() {
 
 #[cfg(unix)]
 #[test]
+fn profiles_rename_keeps_both_names_resolvable_when_a_config_update_fails() {
+    let repo = make_git_repo();
+    fs::create_dir_all(repo.path().join(".bt")).expect("create local bt dir");
+    fs::write(repo.path().join(".bt/config.json"), "not valid JSON")
+        .expect("write invalid local config");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    write_auth_store(config_home.path(), &[("old-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["old-profile"]);
+    fs::write(
+        config_home.path().join("bt/config.json"),
+        r#"{"profile":"old-profile","org":"test-org"}"#,
+    )
+    .expect("write global config");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.current_dir(repo.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "rename", "old-profile", "new-profile"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("both profiles remain available"));
+
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/auth.json")).expect("read auth store"),
+    )
+    .expect("parse auth store");
+    assert!(auth["profiles"].get("old-profile").is_some());
+    assert!(auth["profiles"].get("new-profile").is_some());
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/secrets.json")).expect("read secrets"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"]["old-profile"], "test-api-key");
+    assert_eq!(secrets["secrets"]["new-profile"], "test-api-key");
+
+    let global_config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(config_home.path().join("bt/config.json")).expect("read config"),
+    )
+    .expect("parse global config");
+    assert_eq!(global_config["profile"], "new-profile");
+}
+
+#[cfg(unix)]
+#[test]
 fn profiles_rename_moves_oauth_credentials() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
@@ -447,6 +798,107 @@ fn profiles_rename_moves_oauth_credentials() {
 }
 
 #[test]
+fn profiles_doctor_reports_only_orphaned_plaintext_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"kept":{"auth_kind":"api_key"}}}"#,
+    )
+    .expect("write auth store");
+    fs::write(
+        auth_dir.join("secrets.json"),
+        r#"{"secrets":{"kept":"kept-secret","orphan":"orphan-secret","oauth_refresh::missing":"refresh-secret"}}"#,
+    )
+    .expect("write secret store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"status\":\"orphaned_credentials\"",
+        ))
+        .stdout(predicate::str::contains("\"orphan\""))
+        .stdout(predicate::str::contains("oauth_refresh::missing"))
+        .stdout(predicate::str::contains("kept-secret").not())
+        .stdout(predicate::str::contains("orphan-secret").not());
+}
+
+#[test]
+fn profiles_repair_removes_only_currently_orphaned_plaintext_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"profiles":{"kept":{"auth_kind":"api_key"}}}"#,
+    )
+    .expect("write auth store");
+    fs::write(
+        auth_dir.join("secrets.json"),
+        r#"{"secrets":{"kept":"kept-secret","orphan":"orphan-secret","oauth_access::missing":"access-secret"}}"#,
+    )
+    .expect("write secret store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "repair", "--force", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\":\"repaired\""));
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(auth_dir.join("secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"]["kept"], "kept-secret");
+    assert!(secrets["secrets"].get("orphan").is_none());
+    assert!(secrets["secrets"].get("oauth_access::missing").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn profiles_repair_accepts_an_explicit_deleted_profile_for_keychain_cleanup() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let fake_bin = tempfile::tempdir().expect("fake bin tempdir");
+    let auth_dir = config_home.path().join("bt");
+    fs::create_dir_all(&auth_dir).expect("create auth dir");
+    fs::write(auth_dir.join("auth.json"), r#"{"profiles":{}}"#).expect("write auth store");
+    fs::write(
+        auth_dir.join("secrets.json"),
+        r#"{"secrets":{"deleted":"api-secret","oauth_refresh::deleted":"refresh-secret","oauth_access::deleted":"access-secret"}}"#,
+    )
+    .expect("write secret store");
+
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    use_fake_credential_store(&mut cmd, fake_bin.path());
+    cmd.env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .args(["profiles", "repair", "deleted", "--force", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"scope\":\"named_credentials\""))
+        .stdout(predicate::str::contains("\"deleted\""));
+
+    let secrets: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(auth_dir.join("secrets.json")).expect("read secret store"),
+    )
+    .expect("parse secret store");
+    assert_eq!(secrets["secrets"], serde_json::json!({}));
+}
+
+#[test]
 fn status_all_json_includes_profile_urls() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
@@ -482,6 +934,7 @@ fn trace_help_exposes_user_commands_and_hides_internal_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\n  enable"))
+        .stdout(predicate::str::contains("\n  doctor"))
         .stdout(predicate::str::contains("\n  import"))
         .stdout(predicate::str::contains("\n  run"))
         .stdout(predicate::str::contains("\n  daemon").not())
@@ -570,10 +1023,14 @@ fn trace_commands_require_a_project_non_interactively() {
     ] {
         let home = tempfile::tempdir().expect("home tempdir");
         let config_home = tempfile::tempdir().expect("config tempdir");
+        write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+        write_profile_secrets(config_home.path(), &["test-profile"]);
         let mut cmd = bt_command();
         clear_braintrust_auth_env(&mut cmd);
         cmd.env("HOME", home.path())
             .env("XDG_CONFIG_HOME", config_home.path())
+            .env("BRAINTRUST_PROFILE", "test-profile")
+            .env("BRAINTRUST_ORG_NAME", "test-org")
             .args(args)
             .assert()
             .failure()
@@ -612,9 +1069,21 @@ fn trace_commands_require_an_org_when_the_credential_resolves_none() {
         let config_home = tempfile::tempdir().expect("config tempdir");
         let mut cmd = bt_command();
         clear_braintrust_auth_env(&mut cmd);
+        if args[1] == "setup" {
+            let auth_dir = config_home.path().join("bt");
+            fs::create_dir_all(&auth_dir).expect("create auth dir");
+            fs::write(
+                auth_dir.join("auth.json"),
+                r#"{"profiles":{"test-profile":{"auth_kind":"api_key"}}}"#,
+            )
+            .expect("write unbound profile");
+            write_profile_secrets(config_home.path(), &["test-profile"]);
+            cmd.env("BRAINTRUST_PROFILE", "test-profile");
+        } else {
+            cmd.env("BRAINTRUST_API_KEY", "test-api-key");
+        }
         cmd.env("HOME", home.path())
             .env("XDG_CONFIG_HOME", config_home.path())
-            .env("BRAINTRUST_API_KEY", "test-api-key")
             .args(args)
             .assert()
             .failure()
@@ -642,13 +1111,15 @@ fn trace_setup_adopts_the_configured_org_without_prompting() {
         r#"{"installed":[]}"#,
     );
     write_config_org(config_home.path(), "test-org");
+    write_auth_store(config_home.path(), &[("test-profile", "test-org")]);
+    write_profile_secrets(config_home.path(), &["test-profile"]);
 
     let mut cmd = bt_command();
     clear_braintrust_auth_env(&mut cmd);
     cmd.env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
-        .env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("BRAINTRUST_PROFILE", "test-profile")
         .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
         .env("BT_DAEMON_CONFIG", &config)
         .args([
@@ -671,18 +1142,21 @@ fn trace_setup_adopts_the_configured_org_without_prompting() {
 #[test]
 fn trace_run_uses_the_invocation_project_without_changing_setup() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let run_log = state_dir.path().join("run.log");
     let run_settings = state_dir.path().join("run-settings.json");
+    let run_daemon_env = state_dir.path().join("run-daemon-env.txt");
     let setup_settings = state_dir.path().join("setup-settings.json");
     write_run_agent(&bin_dir.path().join("codex"));
 
-    bt_trace_command()
+    bt_trace_environment_command(config_home.path())
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_RUN_LOG", &run_log)
         .env("AGENT_RUN_SETTINGS", &run_settings)
+        .env("AGENT_RUN_DAEMON_ENV", &run_daemon_env)
         .env("BT_DAEMON_CONFIG", &setup_settings)
         .args([
             "trace",
@@ -705,6 +1179,14 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
         settings["route"]["destination"]["project_name"],
         "invocation-project"
     );
+    assert_eq!(settings["route"]["auth"]["source"], "environment");
+    assert!(settings["route"]["auth"].get("profile").is_none());
+    let daemon_env = fs::read_to_string(run_daemon_env).expect("read managed daemon environment");
+    let mut daemon_env = daemon_env.lines();
+    let socket = daemon_env.next().expect("managed daemon socket");
+    let data_dir = daemon_env.next().expect("managed daemon data directory");
+    assert!(socket.contains("bt-trace-run-"));
+    assert!(data_dir.contains("bt-trace-run-"));
     assert!(
         !setup_settings.exists(),
         "managed run must not change persistent setup settings"
@@ -713,8 +1195,61 @@ fn trace_run_uses_the_invocation_project_without_changing_setup() {
 
 #[cfg(unix)]
 #[test]
+fn trace_enable_persists_environment_auth_and_completes_setup() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let daemon_config = state_dir.path().join("daemon.json");
+    let (app_url, login_server) = serve_login_once();
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+
+    bt_trace_environment_command(config_home.path())
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
+        .env("BT_DAEMON_CONFIG", &daemon_config)
+        .args([
+            "trace",
+            "--app-url",
+            &app_url,
+            "enable",
+            "codex",
+            "--project",
+            "agent-traces",
+        ])
+        .assert()
+        .success();
+    login_server.join().expect("login server thread");
+
+    let auth_store =
+        fs::read_to_string(config_home.path().join("bt/auth.json")).expect("saved auth profile");
+    assert!(auth_store.contains(r#""profile""#));
+    let auth_store: serde_json::Value =
+        serde_json::from_str(&auth_store).expect("parse saved auth profile");
+    let profile_id = auth_store["profile_ids"]["profile"]
+        .as_str()
+        .expect("saved profile ID");
+    let secrets = fs::read_to_string(config_home.path().join("bt/secrets.json"))
+        .expect("saved profile credential");
+    assert!(secrets.contains("test-api-key"));
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(daemon_config).expect("persistent tracing configuration"))
+            .expect("parse tracing configuration");
+    assert_eq!(settings["route"]["auth"]["source"], "saved_profile");
+    assert_eq!(settings["route"]["auth"]["profile_id"], profile_id);
+    assert_eq!(settings["route"]["auth"]["profile"], "profile");
+}
+
+#[cfg(unix)]
+#[test]
 fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let run_log = state_dir.path().join("run.log");
@@ -726,7 +1261,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("opencode"));
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("OPENCODE_BIN", bin_dir.path().join("opencode"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -768,6 +1303,7 @@ fn trace_run_opencode_injects_the_npm_plugin_without_changing_global_config() {
 #[test]
 fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let run_log = state_dir.path().join("run.log");
@@ -778,7 +1314,7 @@ fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
     fs::write(&global_config, r#"{"trace_to_braintrust":true}"#).expect("seed global config");
     write_run_agent(&bin_dir.path().join("pi"));
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("PI_BIN", bin_dir.path().join("pi"))
         .env("AGENT_RUN_LOG", &run_log)
@@ -952,7 +1488,7 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
     )
     .expect("seed config");
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -1000,13 +1536,14 @@ fn trace_setup_codex_installs_plugin_and_preserves_existing_settings() {
 #[test]
 fn trace_setup_claude_installs_plugin_and_writes_selected_project() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let log = state_dir.path().join("claude.log");
     let config = state_dir.path().join("config.json");
     write_agent_cli(&bin_dir.path().join("claude"), "[]", "[]");
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -1045,7 +1582,7 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
     write_auth_store(config_home.path(), &[("work", "acme")]);
     write_profile_secrets(config_home.path(), &["work"]);
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "work", "acme")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -1090,7 +1627,7 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
 fn trace_setup_honors_global_json() {
     let home = tempfile::tempdir().expect("home tempdir");
     let config_home = tempfile::tempdir().expect("config tempdir");
-    let stdout = bt_trace_command()
+    let stdout = bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
@@ -1124,14 +1661,58 @@ fn trace_setup_honors_global_json() {
 
 #[cfg(unix)]
 #[test]
+fn trace_doctor_reports_saved_profile_provenance_without_credentials() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let bin_dir = tempfile::tempdir().expect("bin tempdir");
+    let log = tempfile::NamedTempFile::new().expect("setup log");
+    write_agent_cli(
+        &bin_dir.path().join("codex"),
+        r#"{"marketplaces":[]}"#,
+        r#"{"installed":[]}"#,
+    );
+
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
+        .env("HOME", home.path())
+        .env("PATH", bin_dir.path())
+        .env("AGENT_SETUP_LOG", log.path())
+        .args(["trace", "enable", "codex", "--project", "agent-traces"])
+        .assert()
+        .success();
+
+    let output = bt_trace_command(config_home.path(), "test-profile", "test-org")
+        .env("HOME", home.path())
+        .args(["trace", "doctor", "codex", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&output).expect("trace doctor emits JSON");
+    assert_eq!(doctor["command"], "doctor");
+    assert_eq!(doctor["source"], "codex");
+    assert_eq!(doctor["enabled"], true);
+    assert_eq!(doctor["auth"]["status"], "ready");
+    assert_eq!(doctor["auth"]["source"], "saved_profile");
+    assert_eq!(doctor["auth"]["kind"], "api_key");
+    assert_eq!(doctor["auth"]["profile"], "test-profile");
+    assert!(!String::from_utf8(output)
+        .expect("UTF-8 doctor output")
+        .contains("test-api-key"));
+}
+
+#[cfg(unix)]
+#[test]
 fn trace_setup_pi_installs_the_npm_extension_and_selected_route() {
     let home = tempfile::tempdir().expect("home tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
     let bin_dir = tempfile::tempdir().expect("bin tempdir");
     let state_dir = tempfile::tempdir().expect("state tempdir");
     let log = state_dir.path().join("pi.log");
     write_agent_cli(&bin_dir.path().join("pi"), "{}", "{}");
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("PATH", bin_dir.path())
         .env("AGENT_SETUP_LOG", &log)
@@ -1168,7 +1749,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         r#"{"installed":[]}"#,
     );
 
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
@@ -1176,7 +1757,7 @@ fn trace_setup_keeps_each_agents_persistent_selection_independent() {
         .args(["trace", "setup", "codex", "--project", "codex-project"])
         .assert()
         .success();
-    bt_trace_command()
+    bt_trace_command(config_home.path(), "test-profile", "test-org")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
         .args([
