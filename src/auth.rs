@@ -46,6 +46,12 @@ const AI_PROVIDER_KEY_STALENESS_CHECK_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 static SECRET_STORE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static AI_PROVIDER_KEY_STALENESS_WARNED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> &'static futures_util::lock::Mutex<()> {
+    static LOCK: std::sync::OnceLock<futures_util::lock::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| futures_util::lock::Mutex::new(()))
+}
+
 #[derive(Clone)]
 pub struct LoginContext {
     pub login: LoginState,
@@ -303,6 +309,38 @@ impl OrgOptions {
     }
 }
 
+/// Data-plane coordinates of the selected organization as reported by the app
+/// URL's login endpoint.
+#[derive(Debug, Clone)]
+pub(crate) struct OrgDataPlane {
+    pub api_url: String,
+    pub org_id: Option<String>,
+}
+
+/// Non-interactive adapter over the resolution login flows use: ask the app
+/// URL which organizations the credential can access, select `org_name`, and
+/// let [`resolve_profile_api_url`] apply the same URL precedence login does.
+/// The per-organization URL is the only correct source for hybrid
+/// deployments, where the control plane and an organization's data plane are
+/// different instances.
+pub(crate) async fn resolve_org_data_plane(
+    credential: &str,
+    app_url: &str,
+    org_name: Option<&str>,
+) -> Result<OrgDataPlane> {
+    let orgs = fetch_login_orgs(credential, app_url).await?;
+    let selected = match org_name {
+        Some(name) => Some(orgs.iter().find(|org| org.name == name).ok_or_else(|| {
+            anyhow::anyhow!("credential cannot access organization '{name}' via {app_url}")
+        })?),
+        None => (orgs.len() == 1).then(|| &orgs[0]),
+    };
+    Ok(OrgDataPlane {
+        api_url: resolve_profile_api_url(None, selected, &orgs)?,
+        org_id: selected.map(|org| org.id.clone()),
+    })
+}
+
 pub(crate) async fn list_available_orgs_for_api_key(
     api_key: &str,
     app_url: &str,
@@ -416,7 +454,8 @@ struct AuthProfile {
     auth_kind: AuthKind,
     // OAuth API base used to refresh credentials. Keep the legacy serialized
     // key for compatibility with existing profiles. This must not be used as
-    // a command data-plane default or to infer an app URL.
+    // a command data-plane default or to infer an app URL; commands and trace
+    // routes resolve their data-plane URL per organization instead.
     #[serde(default, rename = "api_url")]
     oauth_api_url: Option<String>,
     #[serde(default)]
@@ -3851,7 +3890,6 @@ fn auth_store_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::lock::Mutex;
     use tempfile::TempDir;
 
     use super::*;
@@ -3860,7 +3898,6 @@ mod tests {
         ffi::OsString,
         fs,
         path::PathBuf,
-        sync::OnceLock,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -4125,11 +4162,6 @@ mod tests {
 
         assert_eq!(loaded.warned, state.warned);
         assert_eq!(loaded.last_checked_at, state.last_checked_at);
-    }
-
-    fn env_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn setup_global_config(project_id: Option<&str>, org: Option<&str>) {
@@ -5551,6 +5583,8 @@ mod tests {
     /// Must fill the same fields the SDK's `perform_login` does.
     #[tokio::test]
     async fn login_context_matches_a_real_login() {
+        // Given: a normal, non-tracing command has resolved a saved profile and
+        // the selected organization returned its own API URL during login.
         // `json` suppresses the interactive warnings the call would otherwise emit.
         let base: BaseArgs = crate::args::LoginBaseArgs {
             json: true,
@@ -5559,9 +5593,13 @@ mod tests {
         .into();
         let profile_url = Some("https://api.profile.example");
 
+        // When: the command builds its authenticated login context.
         let ctx = org_options(profile_url)
             .login_context(&base, &available_org(Some("https://api.org.example")))
             .await;
+
+        // Then: the organization URL takes precedence, and the remaining saved
+        // profile identity is preserved.
         assert_eq!(ctx.api_url, "https://api.org.example");
         assert_eq!(ctx.app_url, DEFAULT_APP_URL);
         assert_eq!(ctx.profile.as_deref(), Some("test-profile"));
@@ -5569,14 +5607,22 @@ mod tests {
         assert_eq!(ctx.login.org_id().as_deref(), Some("org_123"));
         assert_eq!(ctx.login.org_name().as_deref(), Some("test-org"));
 
+        // Given: the selected organization did not return its own API URL.
+        // When: the same normal command builds its login context.
         let from_profile = org_options(profile_url)
             .login_context(&base, &available_org(None))
             .await;
+
+        // Then: the command falls back to the saved profile's API URL.
         assert_eq!(from_profile.api_url, "https://api.profile.example");
 
+        // Given: neither the organization nor the profile provides an API URL.
+        // When: the normal command builds its login context.
         let from_default = org_options(None)
             .login_context(&base, &available_org(None))
             .await;
+
+        // Then: the command uses the hosted Braintrust API URL.
         assert_eq!(from_default.api_url, DEFAULT_API_URL);
     }
 
