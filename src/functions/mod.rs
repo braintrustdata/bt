@@ -18,9 +18,12 @@ mod delete;
 mod invoke;
 mod list;
 pub(crate) mod prompt_config;
+pub(crate) mod prompt_patch;
 mod pull;
 mod push;
 pub(crate) mod report;
+mod scorer_config;
+mod update;
 mod view;
 
 use api::Function;
@@ -114,7 +117,6 @@ pub enum PushLanguage {
 fn build_web_path(function: &Function) -> String {
     let id = &function.id;
     match function.function_type.as_deref() {
-        Some("tool") => format!("tools?pr={}", urlencoding::encode(id)),
         Some("scorer") => format!("scorers/{}", urlencoding::encode(id)),
         Some("classifier") if function.prompt_data.is_some() => {
             format!("scorers/{}", urlencoding::encode(id))
@@ -128,7 +130,8 @@ fn build_web_path(function: &Function) -> String {
             )
         }
         Some("parameters") => format!("parameters/{}", urlencoding::encode(id)),
-        _ => format!("functions/{}", urlencoding::encode(id)),
+        Some("llm") => format!("prompts/{}", urlencoding::encode(id)),
+        _ => format!("tools?pr={}", urlencoding::encode(id)),
     }
 }
 
@@ -173,8 +176,7 @@ Examples:
   bt tools view my-tool
   bt tools view fn_123
   bt tools view --id fn_123
-  bt scorers list
-  bt scorers delete my-scorer
+  bt tools update my-tool --name \"Lookup order\" --new-slug lookup-order
 ")]
 pub struct FunctionArgs {
     #[command(subcommand)]
@@ -191,6 +193,22 @@ pub(crate) enum FunctionCommands {
     Delete(DeleteArgs),
     /// Invoke by slug
     Invoke(invoke::InvokeArgs),
+    /// Update tool fields or prompt content
+    Update(Box<update::ToolUpdateArgs>),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum ScorerFunctionCommands {
+    /// List all in the current project
+    List,
+    /// View details
+    View(ViewArgs),
+    /// Delete by slug
+    Delete(DeleteArgs),
+    /// Invoke by slug
+    Invoke(invoke::InvokeArgs),
+    /// Update scorer configuration
+    Update(Box<update::ScorerUpdateArgs>),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -223,6 +241,8 @@ enum FunctionsCommands {
     Delete(FunctionsDeleteArgs),
     /// Invoke a function
     Invoke(FunctionsInvokeArgs),
+    /// Update common function fields or apply an arbitrary patch
+    Update(Box<FunctionsUpdateArgs>),
     /// Push local function definitions
     Push(PushArgs),
     /// Pull remote function definitions
@@ -267,6 +287,15 @@ impl FunctionsDeleteArgs {
 struct FunctionsInvokeArgs {
     #[command(flatten)]
     inner: invoke::InvokeArgs,
+    /// Filter by function type (for interactive selection)
+    #[arg(long = "type", short = 't', value_enum)]
+    function_type: Option<FunctionTypeFilter>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct FunctionsUpdateArgs {
+    #[command(flatten)]
+    inner: update::GenericUpdateArgs,
     /// Filter by function type (for interactive selection)
     #[arg(long = "type", short = 't', value_enum)]
     function_type: Option<FunctionTypeFilter>,
@@ -656,6 +685,7 @@ pub(crate) async fn run_typed_command(
                 None | Some(FunctionCommands::List) => list::run(&ctx, base.json, ft).await,
                 Some(FunctionCommands::Delete(d)) => delete::run(&ctx, d.slug(), d.force, ft).await,
                 Some(FunctionCommands::Invoke(i)) => invoke::run(&ctx, &i, base.json, ft).await,
+                Some(FunctionCommands::Update(u)) => update::run_tool(&ctx, &u, base.json).await,
                 Some(FunctionCommands::View(_)) => {
                     unreachable!("handled before context resolution")
                 }
@@ -668,6 +698,41 @@ pub(crate) async fn run_scorer_create(base: BaseArgs, args: create::CreateArgs) 
     let json_output = base.json;
     let ctx = resolve_context(&base).await?;
     create::run(&ctx, &args, json_output).await
+}
+
+pub(crate) async fn run_scorer_command(
+    base: BaseArgs,
+    command: Option<ScorerFunctionCommands>,
+) -> Result<()> {
+    let ft = Some(FunctionTypeFilter::Scorer);
+    match command {
+        Some(ScorerFunctionCommands::View(v)) => match v.selector()? {
+            ViewSelector::Id(id) => {
+                let auth_ctx = resolve_auth_context(&base).await?;
+                view::run_by_id(&auth_ctx, id, v.options(&base), ft).await
+            }
+            ViewSelector::Slug(slug) => {
+                let ctx = resolve_context(&base).await?;
+                view::run(&ctx, slug, v.options(&base), ft).await
+            }
+        },
+        command => {
+            let ctx = resolve_context(&base).await?;
+            match command {
+                None | Some(ScorerFunctionCommands::List) => list::run(&ctx, base.json, ft).await,
+                Some(ScorerFunctionCommands::Delete(d)) => {
+                    delete::run(&ctx, d.slug(), d.force, ft).await
+                }
+                Some(ScorerFunctionCommands::Invoke(i)) => {
+                    invoke::run(&ctx, &i, base.json, ft).await
+                }
+                Some(ScorerFunctionCommands::Update(u)) => {
+                    update::run_scorer(&ctx, &u, base.json).await
+                }
+                Some(ScorerFunctionCommands::View(_)) => unreachable!("handled above"),
+            }
+        }
+    }
 }
 
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
@@ -700,6 +765,15 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
                 }
                 Some(FunctionsCommands::Invoke(i)) => {
                     invoke::run(&ctx, &i.inner, base.json, i.function_type.or(function_type)).await
+                }
+                Some(FunctionsCommands::Update(u)) => {
+                    update::run_generic(
+                        &ctx,
+                        &u.inner,
+                        base.json,
+                        u.function_type.or(function_type),
+                    )
+                    .await
                 }
                 Some(FunctionsCommands::Push(_))
                 | Some(FunctionsCommands::Pull(_))
@@ -1216,6 +1290,31 @@ mod tests {
             command,
             None | Some(FunctionsCommands::List(_)) | Some(FunctionsCommands::View(_))
         )
+    }
+
+    #[test]
+    fn typed_function_update_command_is_not_read_only() {
+        let _guard = test_lock();
+        let parsed = FunctionArgsHarness::try_parse_from(["bt-tools", "update", "my-tool", "-y"])
+            .expect("parse");
+        assert!(!function_command_is_read_only(parsed.args.command.as_ref()));
+    }
+
+    #[test]
+    fn functions_update_command_is_not_read_only() {
+        let _guard = test_lock();
+        let parsed = FunctionsArgsHarness::try_parse_from([
+            "bt-functions",
+            "update",
+            "my-fn",
+            "--description",
+            "x",
+            "-y",
+        ])
+        .expect("parse");
+        assert!(!functions_command_is_read_only(
+            parsed.args.command.as_ref()
+        ));
     }
 
     #[test]

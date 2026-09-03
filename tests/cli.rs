@@ -1822,6 +1822,21 @@ fn scorers_create_help_includes_llm_judge_configuration() {
 }
 
 #[test]
+fn scorer_update_help_is_conflict_free() {
+    bt_command()
+        .args(["scorers", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--patch <SOURCE>"))
+        .stdout(predicate::str::contains("--patch-file").not())
+        .stdout(predicate::str::contains("--messages <SOURCE>"))
+        .stdout(predicate::str::contains("--temperature"))
+        .stdout(predicate::str::contains("--classifications"))
+        .stdout(predicate::str::contains("--pass-threshold"))
+        .stdout(predicate::str::contains("--metadata"));
+}
+
+#[test]
 fn topics_report_help_accepts_global_org_short_conflict_free() {
     bt_command()
         .args([
