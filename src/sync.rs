@@ -33,6 +33,7 @@ pub(crate) mod discovery;
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PULL_LIMIT: usize = 100;
 const DEFAULT_PAGE_SIZE: usize = 1000;
+const DEFAULT_PROJECT_LOGS_PULL_WINDOW: &str = "3d";
 const DEFAULT_WORKERS_FALLBACK: usize = 8;
 // BTQL currently enforces limit <= 1000.
 const ROOT_DISCOVERY_PAGE_SIZE: usize = 1000;
@@ -94,9 +95,9 @@ struct PullArgs {
     #[arg(long)]
     filter: Option<String>,
 
-    /// Relative time window (e.g. 1h, 30m, 3d).
-    #[arg(long, env = "BT_SYNC_WINDOW", default_value = "3d")]
-    window: String,
+    /// Relative time window (e.g. 1h, 30m, 3d). Defaults to 3d for project_logs; other object types are unbounded.
+    #[arg(long, env = "BT_SYNC_WINDOW")]
+    window: Option<String>,
 
     /// Number of traces to fetch (default when no limit flag is set).
     #[arg(long)]
@@ -647,8 +648,8 @@ async fn run_pull(
     let fresh = args.force || args.cursor.is_some();
 
     let user_filter = trim_optional(args.filter.clone());
-    let window = args.window.clone();
-    let discovery_filter = Some(build_time_filter_clause(&window, user_filter.as_deref())?);
+    let window = resolve_pull_window(object.object_type, args.window);
+    let discovery_filter = build_pull_filter_clause(window.as_deref(), user_filter.as_deref())?;
 
     let spec = SyncSpec {
         schema_version: STATE_SCHEMA_VERSION,
@@ -658,7 +659,7 @@ async fn run_pull(
         direction: DirectionArg::Pull.as_str().to_string(),
         scope: scope.as_str().to_string(),
         filter: user_filter.clone(),
-        window: Some(window),
+        window,
         limit: Some(limit),
         page_size: args.page_size,
         include_vectors: args.include_vectors,
@@ -2810,6 +2811,30 @@ fn build_root_spans_query(
         parts.push(format!("cursor: {}", btql_quote(c)));
     }
     parts.join(" | ")
+}
+
+fn resolve_pull_window(
+    object_type: ObjectType,
+    requested_window: Option<String>,
+) -> Option<String> {
+    trim_optional(requested_window).or_else(|| {
+        (object_type == ObjectType::ProjectLogs)
+            .then(|| DEFAULT_PROJECT_LOGS_PULL_WINDOW.to_string())
+    })
+}
+
+fn build_pull_filter_clause(
+    window: Option<&str>,
+    extra_filter: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(window) = window {
+        return build_time_filter_clause(window, extra_filter).map(Some);
+    }
+
+    Ok(extra_filter
+        .map(str::trim)
+        .filter(|filter| !filter.is_empty())
+        .map(ToOwned::to_owned))
 }
 
 fn build_time_filter_clause(window: &str, extra_filter: Option<&str>) -> Result<String> {
@@ -5119,6 +5144,40 @@ mod tests {
         assert!(query.contains("filter: root_span_id = 'root-1'"));
         assert!(!query.contains(" OR span_id "));
         assert!(!query.contains(" OR id "));
+    }
+
+    #[test]
+    fn pull_window_defaults_only_for_project_logs() {
+        assert_eq!(
+            resolve_pull_window(ObjectType::ProjectLogs, None).as_deref(),
+            Some(DEFAULT_PROJECT_LOGS_PULL_WINDOW)
+        );
+        assert_eq!(resolve_pull_window(ObjectType::Experiment, None), None);
+        assert_eq!(resolve_pull_window(ObjectType::Dataset, None), None);
+    }
+
+    #[test]
+    fn explicit_pull_window_applies_to_all_object_types() {
+        for object_type in [
+            ObjectType::ProjectLogs,
+            ObjectType::Experiment,
+            ObjectType::Dataset,
+        ] {
+            assert_eq!(
+                resolve_pull_window(object_type, Some("12h".to_string())).as_deref(),
+                Some("12h")
+            );
+        }
+    }
+
+    #[test]
+    fn unbounded_pull_filter_preserves_only_the_user_filter() -> Result<()> {
+        assert_eq!(build_pull_filter_clause(None, None)?, None);
+        assert_eq!(
+            build_pull_filter_clause(None, Some("span_attributes.purpose != 'scorer'"))?,
+            Some("span_attributes.purpose != 'scorer'".to_string())
+        );
+        Ok(())
     }
 
     #[test]
