@@ -16,11 +16,50 @@ use bt_daemon::{
     TraceHostContext, TraceHostServices,
 };
 
+use braintrust_sdk_rust::DEFAULT_APP_URL;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+
 use crate::args::{ArgValueSource, BaseArgs};
+use crate::auth::OrgDataPlane;
 
 #[derive(Clone)]
 struct BtTraceHost {
     base: BaseArgs,
+    /// An organization's data plane is stable per (app URL, org name); cache
+    /// lookups so lease renewals don't re-query the app URL every few minutes.
+    org_data_plane_cache: Arc<Mutex<HashMap<(String, String), OrgDataPlane>>>,
+}
+
+impl BtTraceHost {
+    fn new(base: BaseArgs) -> Self {
+        Self {
+            base,
+            org_data_plane_cache: Arc::default(),
+        }
+    }
+
+    async fn org_data_plane(
+        &self,
+        credential: &str,
+        app_url: &str,
+        org_name: Option<&str>,
+    ) -> anyhow::Result<OrgDataPlane> {
+        let key = (
+            app_url.to_string(),
+            org_name.unwrap_or_default().to_string(),
+        );
+        // Held across the fetch so concurrent leases on a new key resolve once.
+        let mut cache = self.org_data_plane_cache.lock().await;
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+        let data_plane = crate::auth::resolve_org_data_plane(credential, app_url, org_name)
+            .await
+            .map_err(|error| anyhow::anyhow!("resolve organization data plane: {error}"))?;
+        cache.insert(key, data_plane.clone());
+        Ok(data_plane)
+    }
 }
 
 fn has_usable_api_key(base: &BaseArgs) -> bool {
@@ -388,14 +427,32 @@ impl TraceHostServices for BtTraceHost {
                 .timestamp_millis()
                 .saturating_add(5 * 60 * 1000)
         });
+        // An invocation-level --api-url / BRAINTRUST_API_URL override wins.
+        // Otherwise resolve the selected organization's data-plane URL the way
+        // login flows do — on hybrid deployments only the organization knows
+        // it. Never guess: a failed lookup fails the lease and the daemon
+        // retries, rather than silently routing traces to the wrong instance.
+        let (api_url, org_id) = match resolved.api_url {
+            Some(explicit) => (Some(explicit), None),
+            None => {
+                let app_url = resolved
+                    .app_url
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_APP_URL.to_string());
+                let data_plane = self
+                    .org_data_plane(&token, &app_url, resolved.org_name.as_deref())
+                    .await?;
+                (Some(data_plane.api_url), data_plane.org_id)
+            }
+        };
         Ok(AuthLease {
             selection: canonical_selection,
             auth: BackendAuth {
+                api_url,
                 token,
-                api_url: resolved.api_url,
                 app_url: resolved.app_url,
                 org_name: resolved.org_name,
-                org_id: None,
+                org_id,
             },
             expires_at_ms,
         })
@@ -519,7 +576,7 @@ pub fn context(base: BaseArgs) -> TraceHostContext {
             program: executable,
             args: vec![OsString::from("trace")],
         },
-        services: Arc::new(BtTraceHost { base }),
+        services: Arc::new(BtTraceHost::new(base)),
     }
 }
 
@@ -527,6 +584,168 @@ pub fn context(base: BaseArgs) -> TraceHostContext {
 mod tests {
     use super::*;
     use crate::args::LoginBaseArgs;
+    use std::{env, ffi::OsString, fs};
+    use tempfile::TempDir;
+
+    struct TestOAuthProfile {
+        name: &'static str,
+        id: &'static str,
+        org_name: &'static str,
+        api_url: &'static str,
+        app_url: String,
+        access_token: &'static str,
+    }
+
+    impl TestOAuthProfile {
+        // Represents the profile created by `bt login --oauth` for a
+        // self-hosted Braintrust deployment whose control plane lives at
+        // `app_url`.
+        fn self_hosted(app_url: String) -> Self {
+            Self {
+                name: "bt-test-self-hosted-00000000-0000-4000-8000-000000000001",
+                id: "00000000-0000-4000-8000-000000000002",
+                org_name: "test-org",
+                api_url: "https://api.self-hosted.example",
+                app_url,
+                access_token: "synthetic-access-token",
+            }
+        }
+    }
+
+    /// Serves the app URL's `/api/apikey/login` shape from a local socket so
+    /// organization lookups stay off the network. Returns the app URL to use.
+    async fn spawn_login_orgs_server(org_info: serde_json::Value) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind login mock");
+        let app_url = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("mock addr").port()
+        );
+        let body = serde_json::json!({ "org_info": org_info }).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        app_url
+    }
+
+    // Installs a fake profile in an isolated bt config directory. The test
+    // never reads or changes the developer's real bt configuration.
+    struct InstalledAuthProfile {
+        _guard: futures_util::lock::MutexGuard<'static, ()>,
+        _config_dir: TempDir,
+        previous_xdg_config_home: Option<OsString>,
+        previous_appdata: Option<OsString>,
+    }
+
+    impl InstalledAuthProfile {
+        async fn install(profile: &TestOAuthProfile) -> Self {
+            let guard = crate::auth::env_test_lock().lock().await;
+            let previous_xdg_config_home = env::var_os("XDG_CONFIG_HOME");
+            let previous_appdata = env::var_os("APPDATA");
+            let config_dir = TempDir::new().expect("create temp config dir");
+            env::set_var("XDG_CONFIG_HOME", config_dir.path());
+            env::set_var("APPDATA", config_dir.path());
+
+            let auth_dir = config_dir.path().join("bt");
+            fs::create_dir_all(&auth_dir).expect("create auth dir");
+
+            // `bt login` saves profile metadata, including the deployment URLs,
+            // in auth.json. The coding agent stores only a reference to it.
+            fs::write(
+                auth_dir.join("auth.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "profiles": {
+                        (profile.name): {
+                            "auth_kind": "oauth",
+                            "api_url": profile.api_url,
+                            "app_url": profile.app_url,
+                            "org_name": profile.org_name,
+                            "oauth_client_id": "synthetic-client-id",
+                            "oauth_access_expires_at": 4_102_444_800_u64
+                        }
+                    },
+                    "profile_ids": {
+                        (profile.name): profile.id
+                    }
+                }))
+                .expect("serialize auth store"),
+            )
+            .expect("write auth store");
+
+            // Use a valid cached token so the test never contacts an OAuth
+            // endpoint. secrets.json is bt's fallback for the OS keychain.
+            let access_secret_key = format!("oauth_access::{}", profile.name);
+            fs::write(
+                auth_dir.join("secrets.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "secrets": {
+                        (access_secret_key): profile.access_token
+                    }
+                }))
+                .expect("serialize secret store"),
+            )
+            .expect("write secret store");
+
+            Self {
+                _guard: guard,
+                _config_dir: config_dir,
+                previous_xdg_config_home,
+                previous_appdata,
+            }
+        }
+    }
+
+    impl Drop for InstalledAuthProfile {
+        fn drop(&mut self) {
+            match &self.previous_xdg_config_home {
+                Some(value) => env::set_var("XDG_CONFIG_HOME", value),
+                None => env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.previous_appdata {
+                Some(value) => env::set_var("APPDATA", value),
+                None => env::remove_var("APPDATA"),
+            }
+        }
+    }
+
+    async fn resolve_trace_auth(
+        profile: &TestOAuthProfile,
+        api_url_override: Option<&str>,
+    ) -> AuthLease {
+        // This models the later `bt trace hook` process. Clap puts either an
+        // explicit `--api-url` or BRAINTRUST_API_URL into this same field.
+        let host = BtTraceHost::new(BaseArgs {
+            login: LoginBaseArgs {
+                api_url: api_url_override.map(str::to_string),
+                ..LoginBaseArgs::default()
+            },
+            ..BaseArgs::default()
+        });
+
+        // This models the route that `bt trace setup` writes to the coding
+        // agent's braintrust.json. It references the bt profile by name and ID.
+        let saved_route = AuthSelection {
+            source: AuthSource::SavedProfile,
+            profile_id: Some(profile.id.into()),
+            profile: Some(profile.name.into()),
+            org_name: Some(profile.org_name.into()),
+        };
+
+        // This is the production handoff from bt's profile store to the daemon.
+        host.resolve_auth(&saved_route, AuthResolveReason::Initial)
+            .await
+            .expect("resolve saved-profile auth")
+    }
 
     #[test]
     fn profile_diagnostic_reports_expiry_without_credentials() {
@@ -574,16 +793,22 @@ mod tests {
 
     #[tokio::test]
     async fn invocation_environment_auth_returns_an_environment_lease() {
+        // A SaaS-style organization that advertises no data-plane URL of its own.
+        let app_url = spawn_login_orgs_server(serde_json::json!([
+            { "id": "org_123", "name": "test-org" },
+        ]))
+        .await;
         let base = BaseArgs {
             login: LoginBaseArgs {
                 api_key: Some("synthetic-api-key".into()),
                 api_key_source: Some(ArgValueSource::EnvVariable),
+                app_url: Some(app_url),
                 ..LoginBaseArgs::default()
             },
             org_name: Some("test-org".into()),
             ..BaseArgs::default()
         };
-        let host = BtTraceHost { base };
+        let host = BtTraceHost::new(base);
         let lease = host
             .resolve_auth(
                 &AuthSelection {
@@ -600,5 +825,112 @@ mod tests {
         assert_eq!(lease.selection.profile, None);
         assert_eq!(lease.auth.token, "synthetic-api-key");
         assert_eq!(lease.auth.org_name.as_deref(), Some("test-org"));
+    }
+
+    #[tokio::test]
+    async fn saved_profile_auth_resolves_the_orgs_api_url() {
+        // Given: `bt login --oauth` saved a self-hosted profile, and the
+        // organization reports the deployment's API URL, as every command
+        // resolving a data plane relies on.
+        let app_url = spawn_login_orgs_server(serde_json::json!([
+            {
+                "id": "org_123",
+                "name": "test-org",
+                "api_url": "https://api.self-hosted.example",
+            },
+        ]))
+        .await;
+        let profile = TestOAuthProfile::self_hosted(app_url.clone());
+        let _installed_profile = InstalledAuthProfile::install(&profile).await;
+
+        // When: a coding-agent trace resolves that profile without repeating
+        // `--api-url` on the trace-hook invocation.
+        let lease = resolve_trace_auth(&profile, None).await;
+
+        // Then: the daemon receives the profile's credential and the
+        // organization's deployment URLs.
+        assert_eq!(lease.auth.token, profile.access_token);
+        assert_eq!(
+            lease.auth.api_url.as_deref(),
+            Some("https://api.self-hosted.example")
+        );
+        assert_eq!(lease.auth.app_url.as_deref(), Some(app_url.as_str()));
+        assert_eq!(lease.auth.org_id.as_deref(), Some("org_123"));
+    }
+
+    #[tokio::test]
+    async fn saved_profile_auth_without_an_org_api_url_uses_the_default() {
+        // Given: a hosted-style organization that reports no API URL of its own.
+        let app_url = spawn_login_orgs_server(serde_json::json!([
+            { "id": "org_123", "name": "test-org" },
+        ]))
+        .await;
+        let profile = TestOAuthProfile::self_hosted(app_url);
+        let _installed_profile = InstalledAuthProfile::install(&profile).await;
+
+        // When: a coding-agent trace resolves that profile.
+        let lease = resolve_trace_auth(&profile, None).await;
+
+        // Then: resolution lands on the hosted default, exactly as
+        // resolve_profile_api_url settles it for login, and the profile's
+        // OAuth-refresh URL is not treated as a data plane.
+        assert_eq!(lease.auth.token, profile.access_token);
+        assert_eq!(
+            lease.auth.api_url.as_deref(),
+            Some(braintrust_sdk_rust::DEFAULT_API_URL)
+        );
+        assert_eq!(lease.auth.org_id.as_deref(), Some("org_123"));
+    }
+
+    #[tokio::test]
+    async fn saved_profile_auth_prefers_the_selected_orgs_api_url() {
+        // Given: a hybrid deployment — the control plane hosts several
+        // organizations and the selected one runs its own data plane.
+        let app_url = spawn_login_orgs_server(serde_json::json!([
+            {
+                "id": "org_123",
+                "name": "test-org",
+                "api_url": "https://api.hybrid-data-plane.example",
+            },
+            { "id": "org_456", "name": "other-org" },
+        ]))
+        .await;
+        let profile = TestOAuthProfile::self_hosted(app_url);
+        let _installed_profile = InstalledAuthProfile::install(&profile).await;
+
+        // When: a coding-agent trace resolves that profile.
+        let lease = resolve_trace_auth(&profile, None).await;
+
+        // Then: the organization's data-plane URL wins over the profile's
+        // control-plane URL, exactly as login-based commands resolve it.
+        assert_eq!(lease.auth.token, profile.access_token);
+        assert_eq!(
+            lease.auth.api_url.as_deref(),
+            Some("https://api.hybrid-data-plane.example")
+        );
+        assert_eq!(lease.auth.org_id.as_deref(), Some("org_123"));
+    }
+
+    #[tokio::test]
+    async fn saved_profile_auth_uses_an_api_url_override() {
+        // Given: `bt login --oauth` saved the same self-hosted profile. The
+        // unreachable app URL proves an override skips the organization lookup.
+        let profile = TestOAuthProfile::self_hosted("https://app.self-hosted.example".into());
+        let _installed_profile = InstalledAuthProfile::install(&profile).await;
+
+        // When: BRAINTRUST_API_URL or `--api-url` supplies an API URL to the
+        // trace-hook invocation. Clap represents both inputs with the same value.
+        let lease = resolve_trace_auth(&profile, Some("https://api.override.example")).await;
+
+        // Then: the invocation-level override takes precedence over the profile URL.
+        assert_eq!(lease.auth.token, profile.access_token);
+        assert_eq!(
+            lease.auth.api_url.as_deref(),
+            Some("https://api.override.example")
+        );
+        assert_eq!(
+            lease.auth.app_url.as_deref(),
+            Some(profile.app_url.as_str())
+        );
     }
 }
