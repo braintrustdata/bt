@@ -43,7 +43,7 @@ bun add braintrust
 
 ## Instrument the application
 
-**You must read https://www.braintrust.dev/docs/instrument/trace-llm-calls before instrumenting anything.** That page is the source of truth and may have changed since this guide was written.
+**You must read https://www.braintrust.dev/docs/sdks/typescript/install-and-instrument before instrumenting anything.** That page is the source of truth and may have changed since this guide was written.
 
 ### Prefer automatic instrumentation
 
@@ -76,7 +76,7 @@ initLogger({
 
 `initLogger` is the main entry point for tracing. It reads `BRAINTRUST_API_KEY` from the environment automatically if `apiKey` is not provided. If `initLogger` is not called, instrumentation is a no-op.
 
-The exact contents of this file (which instrumentations to register, etc.) come from https://www.braintrust.dev/docs/instrument/trace-llm-calls -- follow it.
+The exact contents of this file (which instrumentations to register, etc.) come from https://www.braintrust.dev/docs/sdks/typescript/install-and-instrument -- follow it.
 
 ### Setting up automatic instrumentation (recommended)
 
@@ -95,11 +95,11 @@ npx tsx --import braintrust/hook.mjs ./src/index.ts
 
 **Any runtime with a bundler (Next.js, webpack, Vite, esbuild, etc.)**
 
-Use the appropriate Braintrust bundler plugin / framework integration -- see https://www.braintrust.dev/docs/instrument/trace-llm-calls for the supported plugins and framework setup (e.g. Next.js `instrumentation.ts`, webpack/Vite/esbuild plugins). This is the preferred option whenever a bundler is in play and works under Node, Bun, Deno, and Cloudflare Workers alike.
+Use the appropriate Braintrust bundler plugin / framework integration -- see https://www.braintrust.dev/docs/sdks/typescript/install-and-instrument for the supported plugins and framework setup (e.g. Next.js `instrumentation.ts`, webpack/Vite/esbuild plugins). This is the preferred option whenever a bundler is in play and works under Node, Bun, Deno, and Cloudflare Workers alike.
 
 **Bun / Deno / Cloudflare Workers without a bundler → use manual wrappers**
 
-There is no automatic instrumentation path for these runtimes without a bundler. Use manual wrappers (`wrapOpenAI`, `wrapAnthropic`, `wrapAISDK`, etc.) at call sites instead -- see https://www.braintrust.dev/docs/instrument/trace-llm-calls for the available wrappers and how to apply them.
+There is no automatic instrumentation path for these runtimes without a bundler. Use manual wrappers (`wrapOpenAI`, `wrapAnthropic`, `wrapAISDK`, etc.) at call sites instead -- see https://www.braintrust.dev/docs/sdks/typescript/install-and-instrument for the available wrappers and how to apply them.
 
 If none of the above is configured, automatic instrumentation will silently do nothing.
 

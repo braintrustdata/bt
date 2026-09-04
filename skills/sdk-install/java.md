@@ -72,6 +72,8 @@ if (apiKey != null && !apiKey.isEmpty()) {
 
 ## Install instrumentation
 
+**You must read https://www.braintrust.dev/docs/sdks/java/install-and-instrument before instrumenting anything.** That page is the source of truth for supported clients and setup, and may have changed since this guide was written.
+
 The Java SDK instruments existing LLM clients by wrapping them. Find which clients the project already uses and wrap them as shown below. Only instrument frameworks that are actually present in the project.
 
 ### OpenAI (`com.openai:openai-java`)

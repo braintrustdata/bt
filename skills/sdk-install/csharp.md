@@ -57,6 +57,8 @@ if (!string.IsNullOrEmpty(apiKey))
 
 ## Install instrumentation
 
+**You must read https://www.braintrust.dev/docs/sdks/csharp/install-and-instrument before instrumenting anything.** That page is the source of truth for supported clients and setup, and may have changed since this guide was written.
+
 The C# SDK instruments LLM clients by wrapping them. Only instrument clients that are actually present in the project.
 
 ### OpenAI (`OpenAI` NuGet package)

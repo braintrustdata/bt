@@ -24,7 +24,7 @@ go list -m -versions github.com/braintrustdata/braintrust-sdk-go
 
 ## Instrument the application
 
-**You must read https://www.braintrust.dev/docs/instrument/trace-llm-calls before instrumenting anything.** That page is the source of truth for supported providers and setup, and may have changed since this guide was written.
+**You must read https://www.braintrust.dev/docs/sdks/go/install-and-instrument before instrumenting anything.** That page is the source of truth for supported providers and setup, and may have changed since this guide was written.
 
 ### Prefer automatic instrumentation (Orchestrion)
 
@@ -132,7 +132,7 @@ After this, LLM client calls are automatically traced with no application wrappe
 
 ### Supported providers
 
-For the current list of supported providers and their `trace/contrib/` import paths, see https://www.braintrust.dev/docs/instrument/trace-llm-calls.
+For the current list of supported providers and their `trace/contrib/` import paths, see https://www.braintrust.dev/docs/sdks/go/install-and-instrument.
 
 ## Run the application
 
