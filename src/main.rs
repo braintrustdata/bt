@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 
+mod acp;
 mod args;
 mod auth;
 #[allow(dead_code)]
@@ -86,6 +87,7 @@ Data & evaluation
   sync          Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
+  acp           Serve local ACP agents to remote clients
   docs          Manage workflow docs for coding agents
   trace         Manage coding-agent tracing
   setup         Configure Braintrust setup flows (deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh)
@@ -130,6 +132,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Serve local ACP agents to remote clients
+    Acp(CLIArgs<acp::AcpArgs>),
     /// Initialize .bt config directory and files
     Init(CLIArgs<init::InitArgs>),
     /// Configure Braintrust setup flows
@@ -184,6 +188,9 @@ enum Commands {
     Status(CLIArgs<status::StatusArgs>),
     /// Manage coding-agent tracing
     Trace(CLIArgs<bt_daemon::TraceArgs>),
+    #[command(name = "app-server", hide = true)]
+    /// Internal Codex app-server entry point used by `bt acp codex --trace`.
+    AcpCodexAppServer(CLIArgs<acp::CodexAppServerArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
@@ -191,6 +198,7 @@ enum Commands {
 impl Commands {
     fn base(&self) -> &LoginBaseArgs {
         match self {
+            Commands::Acp(cmd) => &cmd.base,
             Commands::Init(cmd) => &cmd.base,
             Commands::Setup(cmd) => &cmd.base,
             Commands::Docs(cmd) => &cmd.base,
@@ -218,11 +226,13 @@ impl Commands {
             Commands::Switch(cmd) => &cmd.base,
             Commands::Status(cmd) => &cmd.base,
             Commands::Trace(cmd) => &cmd.base,
+            Commands::AcpCodexAppServer(cmd) => &cmd.base,
         }
     }
 
     fn base_mut(&mut self) -> &mut LoginBaseArgs {
         match self {
+            Commands::Acp(cmd) => &mut cmd.base,
             Commands::Init(cmd) => &mut cmd.base,
             Commands::Setup(cmd) => &mut cmd.base,
             Commands::Docs(cmd) => &mut cmd.base,
@@ -250,6 +260,7 @@ impl Commands {
             Commands::Switch(cmd) => &mut cmd.base,
             Commands::Status(cmd) => &mut cmd.base,
             Commands::Trace(cmd) => &mut cmd.base,
+            Commands::AcpCodexAppServer(cmd) => &mut cmd.base,
         }
     }
 
@@ -358,6 +369,7 @@ fn try_main() -> Result<()> {
 
     let command_result: Result<()> = runtime.block_on(async move {
         match cli.command {
+            Commands::Acp(cmd) => acp::run(cmd.base, cmd.args).await?,
             Commands::Login(cmd) => auth::run_login_command(cmd.base.into(), cmd.args).await?,
             Commands::Logout(cmd) => auth::run_logout_command(cmd.base, cmd.args)?,
             Commands::Profiles(cmd) => profiles::run(cmd.base, cmd.args)?,
@@ -394,6 +406,9 @@ fn try_main() -> Result<()> {
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
             Commands::Trace(cmd) => {
                 bt_daemon::run_trace(cmd.args, trace_host::context(cmd.base)).await?
+            }
+            Commands::AcpCodexAppServer(cmd) => {
+                acp::run_codex_app_server(cmd.base, cmd.args).await?
             }
         }
         Ok(())

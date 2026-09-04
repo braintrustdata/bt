@@ -195,6 +195,38 @@ fn global_quiet_flag_still_parses_for_other_commands() {
 }
 
 #[test]
+fn acp_codex_help_describes_transport_and_tracing_options() {
+    bt_command()
+        .args(["acp", "codex", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--listen"))
+        .stdout(predicate::str::contains("--adapter"))
+        .stdout(predicate::str::contains("--no-auth"))
+        .stdout(predicate::str::contains("--trace"));
+}
+
+#[test]
+fn acp_codex_requires_an_explicit_access_mode() {
+    bt_command()
+        .args(["acp", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("an ACP access mode is required"));
+}
+
+#[test]
+fn acp_codex_no_auth_rejects_non_loopback_listeners() {
+    bt_command()
+        .args(["acp", "codex", "--no-auth", "--listen", "0.0.0.0:5001"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--no-auth only permits a loopback listener",
+        ));
+}
+
+#[test]
 fn quiet_flag_still_parses_for_setup_subcommands() {
     bt_command()
         .args(["setup", "skills", "--quiet", "--help"])
