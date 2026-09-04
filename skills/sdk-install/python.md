@@ -30,7 +30,7 @@ uv add braintrust
 
 ## Instrument the application
 
-**You must read https://www.braintrust.dev/docs/instrument/trace-llm-calls before instrumenting anything.** That page is the source of truth for supported libraries, extras, and setup, and may have changed since this guide was written.
+**You must read https://www.braintrust.dev/docs/sdks/python/install-and-instrument before instrumenting anything.** That page is the source of truth for supported libraries, extras, and setup, and may have changed since this guide was written.
 
 ### Prefer automatic instrumentation
 

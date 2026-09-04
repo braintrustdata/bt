@@ -101,7 +101,7 @@ Options for `Braintrust.init`:
 
 ## Instrument the application
 
-**You must read https://www.braintrust.dev/docs/instrument/trace-llm-calls before instrumenting anything.** That page is the source of truth for supported providers and setup, and may have changed since this guide was written.
+**You must read https://www.braintrust.dev/docs/sdks/ruby/install-and-instrument before instrumenting anything.** That page is the source of truth for supported providers and setup, and may have changed since this guide was written.
 
 ### Prefer automatic instrumentation
 
@@ -111,7 +111,7 @@ Manual span / wrapper code should only be used as a **last resort**, e.g. for cu
 
 ### Supported providers (auto-instrumented)
 
-For the current list of auto-instrumented gems and their integration names, see https://www.braintrust.dev/docs/instrument/trace-llm-calls.
+For the current list of auto-instrumented gems and their integration names, see https://www.braintrust.dev/docs/sdks/ruby/install-and-instrument.
 
 ### Selectively enabling integrations
 
