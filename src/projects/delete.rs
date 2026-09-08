@@ -9,7 +9,7 @@ use crate::ui::{
 
 use super::api;
 
-pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<()> {
+pub async fn run(client: &ApiClient, name: Option<&str>, force: bool, json: bool) -> Result<()> {
     if force && name.is_none() {
         bail!("project name required when using --force. Use: bt projects delete <name> --force");
     }
@@ -33,6 +33,15 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<
             .interact()?;
 
         if !confirm {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "deleted": false,
+                        "project": project,
+                    }))?
+                );
+            }
             return Ok(());
         }
     }
@@ -44,6 +53,16 @@ pub async fn run(client: &ApiClient, name: Option<&str>, force: bool) -> Result<
     .await
     {
         Ok(_) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "deleted": true,
+                        "project": project,
+                    }))?
+                );
+                return Ok(());
+            }
             print_command_status(
                 CommandStatus::Success,
                 &format!("Deleted '{}'", project.name),

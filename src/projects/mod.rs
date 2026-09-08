@@ -77,10 +77,14 @@ pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
 
     match args.command {
         None | Some(ProjectsCommands::List) => list::run(&client, &org_name, base.json).await,
-        Some(ProjectsCommands::Create(a)) => create::run(&client, a.name.as_deref()).await,
-        Some(ProjectsCommands::View(a)) => {
-            view::run(&client, &ctx.app_url, &org_name, a.name()).await
+        Some(ProjectsCommands::Create(a)) => {
+            create::run(&client, a.name.as_deref(), base.json).await
         }
-        Some(ProjectsCommands::Delete(a)) => delete::run(&client, a.name.as_deref(), a.force).await,
+        Some(ProjectsCommands::View(a)) => {
+            view::run(&client, &ctx.app_url, &org_name, a.name(), base.json).await
+        }
+        Some(ProjectsCommands::Delete(a)) => {
+            delete::run(&client, a.name.as_deref(), a.force, base.json).await
+        }
     }
 }
