@@ -1077,6 +1077,12 @@ pub async fn resolved_auth_env(base: &BaseArgs) -> Result<Vec<(String, String)>>
     if let Some(app_url) = auth.app_url {
         envs.push(("BRAINTRUST_APP_URL".to_string(), app_url));
     }
+    if let Some(app_public_url) = &base.app_public_url {
+        envs.push((
+            "BRAINTRUST_APP_PUBLIC_URL".to_string(),
+            app_public_url.clone(),
+        ));
+    }
     if let Some(org_name) = auth.org_name {
         envs.push(("BRAINTRUST_ORG_NAME".to_string(), org_name));
     }

@@ -74,6 +74,7 @@ pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
     let ctx = login(&base).await?;
     let client = ApiClient::new(&ctx)?;
     let org_name = ctx.login.org_name().unwrap_or_default();
+    let app_public_url = base.resolved_app_public_url(&ctx.app_url);
 
     match args.command {
         None | Some(ProjectsCommands::List) => list::run(&client, &org_name, base.json).await,
@@ -81,7 +82,7 @@ pub async fn run(base: BaseArgs, args: ProjectsArgs) -> Result<()> {
             create::run(&client, a.name.as_deref(), base.json).await
         }
         Some(ProjectsCommands::View(a)) => {
-            view::run(&client, &ctx.app_url, &org_name, a.name(), base.json).await
+            view::run(&client, app_public_url, &org_name, a.name(), base.json).await
         }
         Some(ProjectsCommands::Delete(a)) => {
             delete::run(&client, a.name.as_deref(), a.force, base.json).await

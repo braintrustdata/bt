@@ -82,7 +82,7 @@ pub async fn run(
 
     render_function(
         &ctx.client,
-        &ctx.app_url,
+        &ctx.app_public_url,
         Some(&ctx.project.name),
         &function,
         options,
@@ -105,7 +105,7 @@ pub async fn run_by_id(
     .await?
     .ok_or_else(|| anyhow!("{} with id '{id}' not found", label(ft)))?;
 
-    render_function(&ctx.client, &ctx.app_url, None, &function, options).await
+    render_function(&ctx.client, &ctx.app_public_url, None, &function, options).await
 }
 
 async fn render_function(

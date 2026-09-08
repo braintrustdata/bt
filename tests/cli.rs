@@ -16,6 +16,7 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
         "BRAINTRUST_API_KEY",
         "BRAINTRUST_API_URL",
         "BRAINTRUST_APP_URL",
+        "BRAINTRUST_APP_PUBLIC_URL",
         "BRAINTRUST_PROFILE",
         "BRAINTRUST_ORG_NAME",
         "BRAINTRUST_DEFAULT_PROJECT",

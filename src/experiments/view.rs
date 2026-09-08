@@ -28,7 +28,7 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, json: bool, web: boo
     };
 
     let url = app_project_url(
-        &ctx.app_url,
+        &ctx.app_public_url,
         ctx.client.org_name(),
         project_name,
         &["experiments", &experiment.name],

@@ -79,6 +79,15 @@ pub struct LoginBaseArgs {
     )]
     pub app_url: Option<String>,
 
+    /// Override public app URL for generated links (or via BRAINTRUST_APP_PUBLIC_URL)
+    #[arg(
+        long,
+        env = "BRAINTRUST_APP_PUBLIC_URL",
+        hide_env_values = true,
+        global = true
+    )]
+    pub app_public_url: Option<String>,
+
     /// Path to a PEM-encoded CA bundle used for HTTPS requests.
     #[arg(
         long = "ca-cert",
@@ -134,6 +143,10 @@ impl LoginBaseArgs {
 
     pub fn verbose_explicit(&self) -> bool {
         self.verbose && self.verbose_source.is_some()
+    }
+
+    pub fn resolved_app_public_url<'a>(&'a self, app_url: &'a str) -> &'a str {
+        self.app_public_url.as_deref().unwrap_or(app_url)
     }
 }
 
@@ -202,7 +215,7 @@ pub fn has_explicit_profile_arg(args: &[OsString]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_explicit_profile_arg;
+    use super::{has_explicit_profile_arg, LoginBaseArgs};
     use std::ffi::OsString;
 
     #[test]
@@ -236,5 +249,28 @@ mod tests {
             OsString::from("work"),
         ];
         assert!(!has_explicit_profile_arg(&args));
+    }
+
+    #[test]
+    fn app_public_url_defaults_to_resolved_app_url() {
+        let base = LoginBaseArgs::default();
+
+        assert_eq!(
+            base.resolved_app_public_url("https://private.example.test"),
+            "https://private.example.test"
+        );
+    }
+
+    #[test]
+    fn app_public_url_overrides_resolved_app_url() {
+        let base = LoginBaseArgs {
+            app_public_url: Some("https://public.example.test".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            base.resolved_app_public_url("https://private.example.test"),
+            "https://public.example.test"
+        );
     }
 }

@@ -440,7 +440,11 @@ pub async fn fetch_topics_status(
             id: ctx.project.id.clone(),
             name: ctx.project.name.clone(),
             org_name: ctx.client.org_name().to_string(),
-            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+            topics_url: topics_url(
+                &ctx.app_public_url,
+                ctx.client.org_name(),
+                &ctx.project.name,
+            ),
         },
         automations,
     })
@@ -486,7 +490,11 @@ pub async fn poke_topic_automations(ctx: &ProjectContext) -> Result<TopicsPokeRe
             id: ctx.project.id.clone(),
             name: ctx.project.name.clone(),
             org_name: ctx.client.org_name().to_string(),
-            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+            topics_url: topics_url(
+                &ctx.app_public_url,
+                ctx.client.org_name(),
+                &ctx.project.name,
+            ),
         },
         queued,
     })
@@ -523,7 +531,11 @@ pub async fn rewind_topic_automations(
             id: ctx.project.id.clone(),
             name: ctx.project.name.clone(),
             org_name: ctx.client.org_name().to_string(),
-            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+            topics_url: topics_url(
+                &ctx.app_public_url,
+                ctx.client.org_name(),
+                &ctx.project.name,
+            ),
         },
         rewound,
     })
@@ -630,7 +642,11 @@ pub async fn delete_topics_config(
             id: ctx.project.id.clone(),
             name: ctx.project.name.clone(),
             org_name: ctx.client.org_name().to_string(),
-            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+            topics_url: topics_url(
+                &ctx.app_public_url,
+                ctx.client.org_name(),
+                &ctx.project.name,
+            ),
         },
         automation,
     })
@@ -657,7 +673,11 @@ pub async fn fetch_topics_config(
             id: ctx.project.id.clone(),
             name: ctx.project.name.clone(),
             org_name: ctx.client.org_name().to_string(),
-            topics_url: topics_url(&ctx.app_url, ctx.client.org_name(), &ctx.project.name),
+            topics_url: topics_url(
+                &ctx.app_public_url,
+                ctx.client.org_name(),
+                &ctx.project.name,
+            ),
         },
         automations,
     })
