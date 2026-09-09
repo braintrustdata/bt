@@ -1776,9 +1776,12 @@ async fn resolve_target_context(
     let ctx = login(&target_base).await?;
     let client = ApiClient::new(&ctx)?;
     let project = resolve_target_project(&client, target).await?;
+    let app_public_url = target_base
+        .resolved_app_public_url(&ctx.app_url)
+        .to_string();
     Ok(ResolvedContext {
         client,
-        app_url: ctx.app_url,
+        app_public_url,
         project,
     })
 }

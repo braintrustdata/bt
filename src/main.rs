@@ -103,6 +103,7 @@ Flags
       --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
+      --app-public-url <URL>  Override public app URL for generated links [env: BRAINTRUST_APP_PUBLIC_URL]
       --ca-cert <PATH>       Path to PEM CA bundle [env: BRAINTRUST_CA_CERT; overrides SSL_CERT_FILE]
       --env-file <PATH>      Path to a .env file to load
   -h, --help                 Print help
@@ -681,6 +682,24 @@ mod tests {
             let err = Cli::try_parse_from(args).expect_err("context flag should be rejected");
             assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
         }
+    }
+
+    #[test]
+    fn app_public_url_parses_as_global_flag() {
+        let cli = Cli::try_parse_from([
+            "bt",
+            "projects",
+            "view",
+            "test-project",
+            "--app-public-url",
+            "https://public.example.test",
+        ])
+        .expect("app public URL should parse");
+
+        assert_eq!(
+            cli.command.base().app_public_url.as_deref(),
+            Some("https://public.example.test")
+        );
     }
 
     #[test]

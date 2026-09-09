@@ -23,7 +23,7 @@ pub async fn run(
 
     if web {
         let mut url = app_project_url(
-            &ctx.app_url,
+            &ctx.app_public_url,
             ctx.client.org_name(),
             project_name,
             &["prompts", &prompt.id],

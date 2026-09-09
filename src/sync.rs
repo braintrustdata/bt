@@ -588,6 +588,7 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
         .project
         .clone()
         .or_else(|| crate::config::configured_project_for_context(ctx.login.org_name().as_deref()));
+    let app_public_url = base.resolved_app_public_url(&ctx.app_url).to_string();
 
     match command {
         SyncCommand::Pull(pull) => {
@@ -595,7 +596,15 @@ pub async fn run(base: BaseArgs, args: SyncArgs) -> Result<()> {
             run_pull(base.json, verbose, &ctx, &client, project.as_deref(), pull).await
         }
         SyncCommand::Push(push) => {
-            run_push(base.json, &ctx, &client, project.as_deref(), push).await
+            run_push(
+                base.json,
+                &ctx,
+                &client,
+                &app_public_url,
+                project.as_deref(),
+                push,
+            )
+            .await
         }
         SyncCommand::Status(_) => unreachable!(),
     }
@@ -609,11 +618,13 @@ pub(crate) async fn push_jsonl_file(base: BaseArgs, args: SyncPushFileArgs) -> R
         .project
         .clone()
         .or_else(|| crate::config::configured_project_for_context(ctx.login.org_name().as_deref()));
+    let app_public_url = base.resolved_app_public_url(&ctx.app_url).to_string();
 
     run_push(
         json_output,
         &ctx,
         &client,
+        &app_public_url,
         project.as_deref(),
         PushArgs {
             object_ref: args.object_ref,
@@ -1651,11 +1662,12 @@ async fn run_push(
     json_output: bool,
     ctx: &LoginContext,
     client: &ApiClient,
+    app_public_url: &str,
     project_selector: Option<&str>,
     args: PushArgs,
 ) -> Result<()> {
     let destination = resolve_push_destination(client, &args.object_ref, project_selector).await?;
-    let object_url = push_destination_url(&ctx.app_url, client.org_name(), &destination);
+    let object_url = push_destination_url(app_public_url, client.org_name(), &destination);
     let object = destination.object.clone();
     let (scope, limit) = resolve_push_scope_and_limit(args.traces, args.spans)?;
 

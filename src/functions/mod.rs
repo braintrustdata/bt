@@ -509,7 +509,7 @@ impl DeleteArgs {
 
 pub(crate) struct AuthContext {
     pub client: ApiClient,
-    pub app_url: String,
+    pub app_public_url: String,
     pub org_id: String,
 }
 
@@ -518,9 +518,10 @@ pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext> {
     let ctx = login(base).await?;
     let client = ApiClient::new(&ctx)?;
+    let app_public_url = base.resolved_app_public_url(&ctx.app_url).to_string();
     Ok(AuthContext {
         client,
-        app_url: ctx.app_url,
+        app_public_url,
         org_id: ctx.login.org_id().unwrap_or_default(),
     })
 }
@@ -581,7 +582,7 @@ async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
     let project = resolve_project_context(base, &auth_ctx).await?;
     Ok(ResolvedContext {
         client: auth_ctx.client,
-        app_url: auth_ctx.app_url,
+        app_public_url: auth_ctx.app_public_url,
         project,
     })
 }

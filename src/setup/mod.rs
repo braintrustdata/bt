@@ -2785,7 +2785,8 @@ fn print_post_agent_followups(base: &BaseArgs) {
 fn setup_project_logs_url(base: &BaseArgs) -> Option<String> {
     let (org, project) = setup_project_context(base)?;
     let app_url = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
-    Some(app_project_url(app_url, &org, &project, &["logs"]))
+    let app_public_url = base.resolved_app_public_url(app_url);
+    Some(app_project_url(app_public_url, &org, &project, &["logs"]))
 }
 
 fn setup_project_context(base: &BaseArgs) -> Option<(String, String)> {
@@ -5388,6 +5389,24 @@ mod tests {
 
     fn make_base_args() -> BaseArgs {
         BaseArgs::default()
+    }
+
+    #[test]
+    fn project_logs_link_uses_public_app_url() {
+        let base = BaseArgs {
+            login: crate::args::LoginBaseArgs {
+                app_url: Some("https://private.example.test".to_string()),
+                app_public_url: Some("https://public.example.test".to_string()),
+                ..Default::default()
+            },
+            org_name: Some("test org".to_string()),
+            project: Some("test project".to_string()),
+        };
+
+        assert_eq!(
+            setup_project_logs_url(&base).as_deref(),
+            Some("https://public.example.test/app/test%20org/p/test%20project/logs")
+        );
     }
 
     fn restore_env_var(key: &str, previous: Option<OsString>) {

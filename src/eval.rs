@@ -1463,6 +1463,12 @@ fn make_dev_mode_env(
         ("BRAINTRUST_APP_URL".to_string(), state.app_url.clone()),
         ("BT_EVAL_DEV_MODE".to_string(), dev_mode.to_string()),
     ];
+    if let Some(app_public_url) = &state.base.app_public_url {
+        env.push((
+            "BRAINTRUST_APP_PUBLIC_URL".to_string(),
+            app_public_url.clone(),
+        ));
+    }
     if let Some((api_url, _source)) = effective_dev_api_url(state, auth) {
         env.push(("BRAINTRUST_API_URL".to_string(), api_url.to_string()));
     }
