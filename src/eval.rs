@@ -4515,344 +4515,353 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn detect_eval_language_detects_go_extension() {
-        let files = vec!["evals/classifier_eval.go".to_string()];
-        assert_eq!(
-            detect_eval_language(&files, None).expect("go should be detected"),
-            EvalLanguage::Go
-        );
-    }
+    /// Tests for Go eval support.
+    ///
+    /// Grouped so CI can run them by module path; see the eval-tests-go job.
+    mod go {
+        use super::*;
 
-    #[test]
-    fn detect_eval_language_rejects_mixed_go_and_python() {
-        let files = vec!["a_eval.go".to_string(), "eval_b.py".to_string()];
-        let err = detect_eval_language(&files, None).expect_err("mixed languages should fail");
-        assert!(format!("{err:#}").contains("Mixed eval file types are not supported yet"));
-    }
+        #[test]
+        fn detect_eval_language_detects_go_extension() {
+            let files = vec!["evals/classifier_eval.go".to_string()];
+            assert_eq!(
+                detect_eval_language(&files, None).expect("go should be detected"),
+                EvalLanguage::Go
+            );
+        }
 
-    #[test]
-    fn detect_eval_language_override_wins_over_extension() {
-        let files = vec!["a.eval.ts".to_string()];
-        assert_eq!(
-            detect_eval_language(&files, Some(EvalLanguage::Go)).expect("override should win"),
-            EvalLanguage::Go
-        );
-    }
+        #[test]
+        fn detect_eval_language_rejects_mixed_go_and_python() {
+            let files = vec!["a_eval.go".to_string(), "eval_b.py".to_string()];
+            let err = detect_eval_language(&files, None).expect_err("mixed languages should fail");
+            assert!(format!("{err:#}").contains("Mixed eval file types are not supported yet"));
+        }
 
-    // A Go eval needs no marker filename: `go list` reports the build inputs,
-    // so bt takes whatever the package actually compiles.
-    #[cfg(unix)]
-    #[test]
-    fn expand_eval_file_globs_go_language_takes_the_packages_build_inputs() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-package");
-        let json = go_list_json(&dir, "main", &["main.go", "classifier.go"], &[]);
-        let fake_go = write_fake_go(&dir, &json);
-        let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+        #[test]
+        fn detect_eval_language_override_wins_over_extension() {
+            let files = vec!["a.eval.ts".to_string()];
+            assert_eq!(
+                detect_eval_language(&files, Some(EvalLanguage::Go)).expect("override should win"),
+                EvalLanguage::Go
+            );
+        }
 
-        let result = expand_eval_file_globs_for_language(
-            &[dir.to_string_lossy().into_owned()],
-            Some(EvalLanguage::Go),
-        )
-        .expect("package dir should expand");
+        // A Go eval needs no marker filename: `go list` reports the build inputs,
+        // so bt takes whatever the package actually compiles.
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_go_language_takes_the_packages_build_inputs() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-package");
+            let json = go_list_json(&dir, "main", &["main.go", "classifier.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
 
-        restore_env_var("BT_EVAL_GO_BIN", previous);
+            let result = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                Some(EvalLanguage::Go),
+            )
+            .expect("package dir should expand");
 
-        // Sorted, absolute, and exactly what `go list` reported -- note neither
-        // filename carries an `_eval.go` suffix.
-        assert_eq!(result.len(), 2, "unexpected matches: {result:?}");
-        assert!(result[0].ends_with("classifier.go"), "got {result:?}");
-        assert!(result[1].ends_with("main.go"), "got {result:?}");
+            restore_env_var("BT_EVAL_GO_BIN", previous);
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            // Sorted, absolute, and exactly what `go list` reported -- note neither
+            // filename carries an `_eval.go` suffix.
+            assert_eq!(result.len(), 2, "unexpected matches: {result:?}");
+            assert!(result[0].ends_with("classifier.go"), "got {result:?}");
+            assert!(result[1].ends_with("main.go"), "got {result:?}");
 
-    // Build constraints and `_test.go` exclusion are the toolchain's job now, so
-    // whatever `go list` leaves out of GoFiles never reaches bt.
-    #[cfg(unix)]
-    #[test]
-    fn expand_eval_file_globs_go_language_honours_the_toolchains_file_list() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-skips");
-        fs::write(dir.join("main_test.go"), "package main").expect("test written");
-        fs::write(dir.join("linux_only.go"), "package main").expect("constrained written");
-        let json = go_list_json(&dir, "main", &["main.go"], &[]);
-        let fake_go = write_fake_go(&dir, &json);
-        let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let result = expand_eval_file_globs_for_language(
-            &[dir.to_string_lossy().into_owned()],
-            Some(EvalLanguage::Go),
-        )
-        .expect("package dir should expand");
+        // Build constraints and `_test.go` exclusion are the toolchain's job now, so
+        // whatever `go list` leaves out of GoFiles never reaches bt.
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_go_language_honours_the_toolchains_file_list() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-skips");
+            fs::write(dir.join("main_test.go"), "package main").expect("test written");
+            fs::write(dir.join("linux_only.go"), "package main").expect("constrained written");
+            let json = go_list_json(&dir, "main", &["main.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
 
-        restore_env_var("BT_EVAL_GO_BIN", previous);
+            let result = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                Some(EvalLanguage::Go),
+            )
+            .expect("package dir should expand");
 
-        assert_eq!(result.len(), 1, "unexpected matches: {result:?}");
-        assert!(result[0].ends_with("main.go"));
+            restore_env_var("BT_EVAL_GO_BIN", previous);
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            assert_eq!(result.len(), 1, "unexpected matches: {result:?}");
+            assert!(result[0].ends_with("main.go"));
 
-    #[cfg(unix)]
-    #[test]
-    fn expand_eval_file_globs_go_language_errors_on_dir_without_go_files() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-empty");
-        let fake_go = write_fake_go(&dir, "");
-        let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let err = expand_eval_file_globs_for_language(
-            &[dir.to_string_lossy().into_owned()],
-            Some(EvalLanguage::Go),
-        )
-        .expect_err("an empty package should fail");
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_go_language_errors_on_dir_without_go_files() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-empty");
+            let fake_go = write_fake_go(&dir, "");
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
 
-        restore_env_var("BT_EVAL_GO_BIN", previous);
-        assert!(format!("{err:#}").contains("no Go files found in package directory"));
+            let err = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                Some(EvalLanguage::Go),
+            )
+            .expect_err("an empty package should fail");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+            assert!(format!("{err:#}").contains("no Go files found in package directory"));
 
-    // The point of asking `go list`: bt finds Go evals with no naming convention
-    // at all. An eval runner is a `package main` that imports the SDK runner, so
-    // arbitrary filenames work and unrelated main packages are left alone.
-    #[cfg(unix)]
-    #[test]
-    fn expand_eval_file_globs_discovers_go_evals_without_a_naming_convention() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-discover");
-        fs::write(dir.join("go.mod"), "module example.test\n").expect("go.mod written");
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let evals_dir = dir.join("evals");
-        let cli_dir = dir.join("cmd").join("cli");
-        fs::create_dir_all(&evals_dir).expect("evals dir");
-        fs::create_dir_all(&cli_dir).expect("cli dir");
+        // The point of asking `go list`: bt finds Go evals with no naming convention
+        // at all. An eval runner is a `package main` that imports the SDK runner, so
+        // arbitrary filenames work and unrelated main packages are left alone.
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_discovers_go_evals_without_a_naming_convention() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-discover");
+            fs::write(dir.join("go.mod"), "module example.test\n").expect("go.mod written");
 
-        // Neither eval file carries a marker suffix.
-        let json = format!(
-            r#"{{"Dir": "{evals}", "ImportPath": "example.test/evals", "Name": "main",
-                  "GoFiles": ["classifier.go", "main.go"], "Deps": ["fmt", "{runner}"],
-                  "Module": {{"Path": "example.test", "Dir": "{root}"}}}}
-               {{"Dir": "{cli}", "ImportPath": "example.test/cmd/cli", "Name": "main",
-                  "GoFiles": ["main.go"], "Deps": ["fmt"],
-                  "Module": {{"Path": "example.test", "Dir": "{root}"}}}}"#,
-            evals = evals_dir.display(),
-            cli = cli_dir.display(),
-            root = dir.display(),
-            runner = go_runner::EVAL_RUNNER_IMPORT
-        );
-        let fake_go = write_fake_go(&dir, &json);
-        let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let evals_dir = dir.join("evals");
+            let cli_dir = dir.join("cmd").join("cli");
+            fs::create_dir_all(&evals_dir).expect("evals dir");
+            fs::create_dir_all(&cli_dir).expect("cli dir");
 
-        let result = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
-            .expect("go evals should be discovered");
+            // Neither eval file carries a marker suffix.
+            let json = format!(
+                r#"{{"Dir": "{evals}", "ImportPath": "example.test/evals", "Name": "main",
+                      "GoFiles": ["classifier.go", "main.go"], "Deps": ["fmt", "{runner}"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}
+                   {{"Dir": "{cli}", "ImportPath": "example.test/cmd/cli", "Name": "main",
+                      "GoFiles": ["main.go"], "Deps": ["fmt"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}"#,
+                evals = evals_dir.display(),
+                cli = cli_dir.display(),
+                root = dir.display(),
+                runner = go_runner::EVAL_RUNNER_IMPORT
+            );
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
 
-        restore_env_var("BT_EVAL_GO_BIN", previous);
+            let result = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
+                .expect("go evals should be discovered");
 
-        assert_eq!(result.len(), 2, "unexpected matches: {result:?}");
-        assert!(result[0].ends_with("classifier.go"), "got {result:?}");
-        assert!(result[1].ends_with("main.go"), "got {result:?}");
-        assert!(
-            result.iter().all(|f| f.contains("evals")),
-            "the plain cli main package must not be treated as an eval: {result:?}"
-        );
+            restore_env_var("BT_EVAL_GO_BIN", previous);
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            assert_eq!(result.len(), 2, "unexpected matches: {result:?}");
+            assert!(result[0].ends_with("classifier.go"), "got {result:?}");
+            assert!(result[1].ends_with("main.go"), "got {result:?}");
+            assert!(
+                result.iter().all(|f| f.contains("evals")),
+                "the plain cli main package must not be treated as an eval: {result:?}"
+            );
 
-    // A directory with no Go module must not pay for a `go list` spawn, and must
-    // still report the ordinary discovery error.
-    #[test]
-    fn expand_eval_file_globs_directory_without_evals_still_errors() {
-        let dir = make_temp_dir("go-no-module");
-        fs::write(dir.join("notes.txt"), "not an eval").expect("file written");
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let err = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
-            .expect_err("a directory with no evals should fail");
-        assert!(format!("{err:#}").contains("no eval files found in directory"));
+        // A directory with no Go module must not pay for a `go list` spawn, and must
+        // still report the ordinary discovery error.
+        #[test]
+        fn expand_eval_file_globs_directory_without_evals_still_errors() {
+            let dir = make_temp_dir("go-no-module");
+            fs::write(dir.join("notes.txt"), "not an eval").expect("file written");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            let err = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
+                .expect_err("a directory with no evals should fail");
+            assert!(format!("{err:#}").contains("no eval files found in directory"));
 
-    #[test]
-    fn go_package_dir_collapses_files_in_one_directory() {
-        let dir = make_temp_dir("go-collapse");
-        let main = dir.join("main.go");
-        let helper = dir.join("helper.go");
-        fs::write(&main, "package main").expect("main written");
-        fs::write(&helper, "package main").expect("helper written");
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let resolved = go_package_dir(&[
-            main.to_string_lossy().into_owned(),
-            helper.to_string_lossy().into_owned(),
-        ])
-        .expect("files in one directory should collapse");
+        #[test]
+        fn go_package_dir_collapses_files_in_one_directory() {
+            let dir = make_temp_dir("go-collapse");
+            let main = dir.join("main.go");
+            let helper = dir.join("helper.go");
+            fs::write(&main, "package main").expect("main written");
+            fs::write(&helper, "package main").expect("helper written");
 
-        assert_eq!(
-            resolved,
-            fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
-        );
+            let resolved = go_package_dir(&[
+                main.to_string_lossy().into_owned(),
+                helper.to_string_lossy().into_owned(),
+            ])
+            .expect("files in one directory should collapse");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            assert_eq!(
+                resolved,
+                fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
+            );
 
-    #[test]
-    fn go_package_dir_rejects_inputs_spanning_directories() {
-        let dir = make_temp_dir("go-span");
-        let a = dir.join("a");
-        let b = dir.join("b");
-        fs::create_dir_all(&a).expect("a created");
-        fs::create_dir_all(&b).expect("b created");
-        fs::write(a.join("main.go"), "package main").expect("a main written");
-        fs::write(b.join("main.go"), "package main").expect("b main written");
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let err = go_package_dir(&[
-            a.join("main.go").to_string_lossy().into_owned(),
-            b.join("main.go").to_string_lossy().into_owned(),
-        ])
-        .expect_err("multiple package directories should fail");
-        assert!(format!("{err:#}").contains("span 2 directories"));
+        #[test]
+        fn go_package_dir_rejects_inputs_spanning_directories() {
+            let dir = make_temp_dir("go-span");
+            let a = dir.join("a");
+            let b = dir.join("b");
+            fs::create_dir_all(&a).expect("a created");
+            fs::create_dir_all(&b).expect("b created");
+            fs::write(a.join("main.go"), "package main").expect("a main written");
+            fs::write(b.join("main.go"), "package main").expect("b main written");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            let err = go_package_dir(&[
+                a.join("main.go").to_string_lossy().into_owned(),
+                b.join("main.go").to_string_lossy().into_owned(),
+            ])
+            .expect_err("multiple package directories should fail");
+            assert!(format!("{err:#}").contains("span 2 directories"));
 
-    // The Go runner takes everything from BT_EVAL_* and ignores argv, so a
-    // prebuilt binary must be spawned bare. Appending bt's file list would
-    // break any main that parses flags.
-    #[test]
-    fn build_go_command_with_runner_override_passes_no_args() {
-        let dir = make_temp_dir("go-prebuilt");
-        let binary = dir.join("evals");
-        fs::write(&binary, "#!/bin/sh\n").expect("binary written");
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let cmd = build_go_command(
-            Some(binary.to_str().expect("utf-8 path")),
-            &["./cmd/evals".to_string()],
-        )
-        .expect("prebuilt runner should resolve");
+        // The Go runner takes everything from BT_EVAL_* and ignores argv, so a
+        // prebuilt binary must be spawned bare. Appending bt's file list would
+        // break any main that parses flags.
+        #[test]
+        fn build_go_command_with_runner_override_passes_no_args() {
+            let dir = make_temp_dir("go-prebuilt");
+            let binary = dir.join("evals");
+            fs::write(&binary, "#!/bin/sh\n").expect("binary written");
 
-        let std_cmd = cmd.as_std();
-        assert_eq!(Path::new(std_cmd.get_program()), binary);
-        assert_eq!(std_cmd.get_args().count(), 0, "argv must stay empty");
+            let cmd = build_go_command(
+                Some(binary.to_str().expect("utf-8 path")),
+                &["./cmd/evals".to_string()],
+            )
+            .expect("prebuilt runner should resolve");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            let std_cmd = cmd.as_std();
+            assert_eq!(Path::new(std_cmd.get_program()), binary);
+            assert_eq!(std_cmd.get_args().count(), 0, "argv must stay empty");
 
-    #[test]
-    fn build_go_command_rejects_a_missing_runner_binary() {
-        let err = build_go_command(Some("./definitely/not/here"), &[])
-            .expect_err("a missing runner should fail");
-        assert!(format!("{err:#}").contains("--runner binary not found"));
-    }
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-    #[cfg(unix)]
-    #[test]
-    fn build_go_command_runs_the_package_directory() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-run");
-        fs::write(dir.join("main.go"), "package main").expect("main written");
-        let json = go_list_json(&dir, "main", &["main.go"], &[]);
-        let fake_go = write_fake_go(&dir, &json);
-        let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+        #[test]
+        fn build_go_command_rejects_a_missing_runner_binary() {
+            let err = build_go_command(Some("./definitely/not/here"), &[])
+                .expect_err("a missing runner should fail");
+            assert!(format!("{err:#}").contains("--runner binary not found"));
+        }
 
-        let cmd = build_go_command(None, &[dir.join("main.go").to_string_lossy().into_owned()])
-            .expect("go run command should build");
+        #[cfg(unix)]
+        #[test]
+        fn build_go_command_runs_the_package_directory() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-run");
+            fs::write(dir.join("main.go"), "package main").expect("main written");
+            let json = go_list_json(&dir, "main", &["main.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
 
-        restore_env_var("BT_EVAL_GO_BIN", previous);
+            let cmd = build_go_command(None, &[dir.join("main.go").to_string_lossy().into_owned()])
+                .expect("go run command should build");
 
-        let std_cmd = cmd.as_std();
-        assert_eq!(Path::new(std_cmd.get_program()), fake_go);
-        let args: Vec<String> = std_cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[0], "run");
-        // The directory `go list` reported, not one bt assembled from paths.
-        assert_eq!(Path::new(&args[1]), dir.as_path(), "got {args:?}");
+            restore_env_var("BT_EVAL_GO_BIN", previous);
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            let std_cmd = cmd.as_std();
+            assert_eq!(Path::new(std_cmd.get_program()), fake_go);
+            let args: Vec<String> = std_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0], "run");
+            // The directory `go list` reported, not one bt assembled from paths.
+            assert_eq!(Path::new(&args[1]), dir.as_path(), "got {args:?}");
 
-    // `go run` needs `package main`. Catching it here gives a pointed error
-    // instead of letting the toolchain complain about a missing entry point.
-    #[cfg(unix)]
-    #[test]
-    fn build_go_command_rejects_a_non_main_package() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-not-main");
-        fs::write(dir.join("lib.go"), "package lib").expect("lib written");
-        let json = go_list_json(&dir, "lib", &["lib.go"], &[]);
-        let fake_go = write_fake_go(&dir, &json);
-        let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let err = build_go_command(None, &[dir.join("lib.go").to_string_lossy().into_owned()])
-            .expect_err("a library package should fail");
+        // `go run` needs `package main`. Catching it here gives a pointed error
+        // instead of letting the toolchain complain about a missing entry point.
+        #[cfg(unix)]
+        #[test]
+        fn build_go_command_rejects_a_non_main_package() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-not-main");
+            fs::write(dir.join("lib.go"), "package lib").expect("lib written");
+            let json = go_list_json(&dir, "lib", &["lib.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
 
-        restore_env_var("BT_EVAL_GO_BIN", previous);
-        let message = format!("{err:#}");
-        assert!(message.contains("not `package main`"), "got {message}");
+            let err = build_go_command(None, &[dir.join("lib.go").to_string_lossy().into_owned()])
+                .expect_err("a library package should fail");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+            let message = format!("{err:#}");
+            assert!(message.contains("not `package main`"), "got {message}");
 
-    #[test]
-    fn build_go_command_errors_without_a_go_toolchain() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-missing-toolchain");
-        fs::write(dir.join("main.go"), "package main").expect("main written");
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let go_bin = clear_env_var("BT_EVAL_GO_BIN");
-        let go_alt = clear_env_var("BT_EVAL_GO");
-        let goroot = clear_env_var("GOROOT");
-        let path = clear_env_var("PATH");
+        #[test]
+        fn build_go_command_errors_without_a_go_toolchain() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-missing-toolchain");
+            fs::write(dir.join("main.go"), "package main").expect("main written");
 
-        let err = build_go_command(None, &[dir.join("main.go").to_string_lossy().into_owned()])
-            .expect_err("no toolchain should fail");
-        assert!(format!("{err:#}").contains("No Go toolchain found"));
+            let go_bin = clear_env_var("BT_EVAL_GO_BIN");
+            let go_alt = clear_env_var("BT_EVAL_GO");
+            let goroot = clear_env_var("GOROOT");
+            let path = clear_env_var("PATH");
 
-        restore_env_var("PATH", path);
-        restore_env_var("GOROOT", goroot);
-        restore_env_var("BT_EVAL_GO", go_alt);
-        restore_env_var("BT_EVAL_GO_BIN", go_bin);
-        let _ = fs::remove_dir_all(&dir);
-    }
+            let err = build_go_command(None, &[dir.join("main.go").to_string_lossy().into_owned()])
+                .expect_err("no toolchain should fail");
+            assert!(format!("{err:#}").contains("No Go toolchain found"));
 
-    // A Go binary cannot report its own sources, so bt watches the package
-    // directory (whose mtime changes when files come and go) plus the files
-    // `go list` says the build uses.
-    #[cfg(unix)]
-    #[test]
-    fn collect_go_static_dependencies_covers_the_package() {
-        let _guard = lock_env();
-        let dir = make_temp_dir("go-watch");
-        fs::write(dir.join("main.go"), "package main").expect("main written");
-        fs::write(dir.join("helper.go"), "package main").expect("helper written");
-        fs::write(dir.join("main_test.go"), "package main").expect("test written");
-        let json = go_list_json(&dir, "main", &["main.go", "helper.go"], &[]);
-        let fake_go = write_fake_go(&dir, &json);
-        let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            restore_env_var("PATH", path);
+            restore_env_var("GOROOT", goroot);
+            restore_env_var("BT_EVAL_GO", go_alt);
+            restore_env_var("BT_EVAL_GO_BIN", go_bin);
+            let _ = fs::remove_dir_all(&dir);
+        }
 
-        let deps =
-            collect_go_static_dependencies(&[dir.join("main.go").to_string_lossy().into_owned()])
-                .expect("dependencies should be collected");
+        // A Go binary cannot report its own sources, so bt watches the package
+        // directory (whose mtime changes when files come and go) plus the files
+        // `go list` says the build uses.
+        #[cfg(unix)]
+        #[test]
+        fn collect_go_static_dependencies_covers_the_package() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-watch");
+            fs::write(dir.join("main.go"), "package main").expect("main written");
+            fs::write(dir.join("helper.go"), "package main").expect("helper written");
+            fs::write(dir.join("main_test.go"), "package main").expect("test written");
+            let json = go_list_json(&dir, "main", &["main.go", "helper.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
 
-        restore_env_var("BT_EVAL_GO_BIN", previous);
+            let deps = collect_go_static_dependencies(&[dir
+                .join("main.go")
+                .to_string_lossy()
+                .into_owned()])
+            .expect("dependencies should be collected");
 
-        let names: Vec<String> = deps
-            .iter()
-            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .collect();
-        assert!(names.iter().any(|n| n == "main.go"), "got {names:?}");
-        assert!(names.iter().any(|n| n == "helper.go"), "got {names:?}");
-        assert!(
-            !names.iter().any(|n| n == "main_test.go"),
-            "test files are not part of the build: {names:?}"
-        );
+            restore_env_var("BT_EVAL_GO_BIN", previous);
 
-        let _ = fs::remove_dir_all(&dir);
+            let names: Vec<String> = deps
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            assert!(names.iter().any(|n| n == "main.go"), "got {names:?}");
+            assert!(names.iter().any(|n| n == "helper.go"), "got {names:?}");
+            assert!(
+                !names.iter().any(|n| n == "main_test.go"),
+                "test files are not part of the build: {names:?}"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

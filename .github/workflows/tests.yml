@@ -32,6 +32,32 @@ jobs:
       - name: Run auth unit tests
         run: cargo test auth::tests -- --nocapture
 
+  eval-tests-go:
+    name: eval-tests-go
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Configure git auth for private dependencies
+        run: |
+          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+        env:
+          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: 1.97.1
+      # No Go toolchain is installed on purpose: these tests stub `go` through
+      # BT_EVAL_GO_BIN, so they stay hermetic and fast. Exercising a real
+      # `go run` would need a fixture under tests/evals/go plus actions/setup-go.
+      - name: Run Go eval unit tests
+        run: "cargo test --bin bt -- eval::tests::go:: go_runner::tests::"
+
   eval-tests-node:
     name: eval-tests-node (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
