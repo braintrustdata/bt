@@ -3531,7 +3531,7 @@ fn render_instrument_task(
             list
         )
     };
-    let install_sdk_requirements = "- Install the latest Braintrust SDK via the language's package manager. Do not hard-pin the SDK version unless the user asks. Build-time dependencies called out by the language-specific resource (e.g. Orchestrion for Go) must still be pinned to an exact version.\n\
+    let install_sdk_requirements = "- Install the latest Braintrust SDK via the language's package manager. Do not hard-pin the SDK version unless the user asks. Build-time dependencies called out by the language's install docs (e.g. Orchestrion for Go) must still be pinned to an exact version.\n\
          - Modify only dependency files, a minimal application entry point (e.g., main/bootstrap), and any existing build/run scripts or checked-in env/config that must change to keep auto-instrumentation active in normal use. \
          Auto-instrument the app (except for Java and C# which don't support auto-instrumentation).\n\
          - Do not change unrelated code.";
