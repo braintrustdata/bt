@@ -5170,7 +5170,6 @@ mod tests {
         let keys = [
             "BT_EVAL_JSONL",
             "BT_EVAL_TERMINATE_ON_FAILURE",
-            "BT_EVAL_MAX_CONCURRENCY",
             "BT_EVAL_NUM_WORKERS",
             "BT_EVAL_LIST",
             "BT_EVAL_FILTER",
@@ -5188,7 +5187,6 @@ mod tests {
             keys.iter().map(|key| (*key, clear_env_var(key))).collect();
         set_env_var("BT_EVAL_JSONL", "true");
         set_env_var("BT_EVAL_TERMINATE_ON_FAILURE", "1");
-        set_env_var("BT_EVAL_MAX_CONCURRENCY", "3");
         set_env_var("BT_EVAL_NUM_WORKERS", "4");
         set_env_var("BT_EVAL_LIST", "yes");
         set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
@@ -5203,7 +5201,7 @@ mod tests {
             .expect("env vars should parse into eval args");
         assert!(parsed.eval.jsonl);
         assert!(parsed.eval.terminate_on_failure);
-        assert_eq!(parsed.eval.max_concurrency, Some(3));
+        assert_eq!(parsed.eval.max_concurrency, None);
         assert_eq!(parsed.eval.num_workers, Some(4));
         assert!(parsed.eval.list);
         assert_eq!(

@@ -3,10 +3,11 @@ name: tests
 on:
   pull_request:
   push:
+    branches: [main]
 
 jobs:
-  login-tests:
-    name: login-tests (${{ matrix.os }})
+  core-tests:
+    name: core-tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,8 +30,8 @@ jobs:
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: 1.97.1
-      - name: Run auth unit tests
-        run: cargo test auth::tests -- --nocapture
+      - name: Run all unit tests
+        run: cargo test --locked --bin bt
 
   eval-tests-node:
     name: eval-tests-node (node ${{ matrix.node-version }})
