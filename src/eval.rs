@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 
 use crate::args::BaseArgs;
 use crate::auth::{resolve_auth, resolved_runner_env};
+use crate::go_runner;
 use crate::js_runner;
 use crate::python_runner;
 use crate::runner_sse;
@@ -249,6 +250,7 @@ const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 const JS_RUNNER_FIRE_AND_FORGET_ENTRY: &str =
     "\nmain().catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n";
 const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
+const GO_TOOLCHAIN_ENV_OVERRIDES: &[&str] = &["BT_EVAL_GO_BIN", "BT_EVAL_GO"];
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 pub enum EvalLanguage {
@@ -256,6 +258,8 @@ pub enum EvalLanguage {
     JavaScript,
     #[value(alias = "py")]
     Python,
+    #[value(alias = "golang")]
+    Go,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -264,6 +268,8 @@ Examples:
   bt eval my.eval.ts
   bt eval --no-send-logs --runner tsx my.eval.ts
   bt eval --language python my_eval.py
+  bt eval ./cmd/evals
+  bt eval --runner ./bin/evals
 ")]
 pub struct EvalArgs {
     /// Eval files, directories, or glob patterns to execute (e.g. foo.eval.ts, tests/, "**/*.eval.ts").
@@ -271,7 +277,7 @@ pub struct EvalArgs {
     #[arg(value_name = "FILE")]
     pub files: Vec<String>,
 
-    /// Eval runner binary (e.g. tsx, bun, ts-node, deno, python). Defaults to tsx for JS files.
+    /// Eval runner binary (e.g. tsx, bun, ts-node, deno, python, or a prebuilt Go eval binary). Defaults to tsx for JS files.
     #[arg(long, short = 'r', env = "BT_EVAL_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,
 
@@ -485,7 +491,7 @@ pub async fn run(base: BaseArgs, args: EvalArgs) -> Result<()> {
     } else {
         args.files.clone()
     };
-    let mut files = expand_eval_file_globs(&inputs)?;
+    let mut files = expand_eval_file_globs_for_language(&inputs, args.language)?;
     if args.files.is_empty() {
         files.retain(|p| !is_excluded_by_default(p));
         if files.is_empty() {
@@ -742,9 +748,17 @@ async fn run_eval_files_once(
     let dependencies = if collect_dependencies {
         let mut dependencies =
             normalize_watch_paths(output.dependency_files.into_iter().map(PathBuf::from))?;
-        if plan.language == EvalLanguage::JavaScript {
-            let static_dependencies = collect_js_static_dependencies(files)?;
-            dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+        match plan.language {
+            EvalLanguage::JavaScript => {
+                let static_dependencies = collect_js_static_dependencies(files)?;
+                dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+            }
+            EvalLanguage::Go => {
+                let static_dependencies = collect_go_static_dependencies(files)?;
+                dependencies = merge_watch_paths(&dependencies, &static_dependencies);
+            }
+            // Python runners report their own dependencies over SSE.
+            EvalLanguage::Python => {}
         }
         dependencies
     } else {
@@ -815,7 +829,8 @@ async fn spawn_eval_runner(
     if language != EvalLanguage::Python && options.num_workers.is_some() {
         anyhow::bail!("--num-workers is only supported for Python evals.");
     }
-    let (js_runner, py_runner) = prepare_eval_runners()?;
+    // The JS/Python runner scripts are materialized lazily, inside the language
+    // arms below: Go needs neither, and --dev spawns per HTTP request.
     let force_esm = matches!(js_mode, JsMode::ForceEsm);
 
     let (listener, sse_guard) = runner_sse::bind_sse_listener("bt-eval")?;
@@ -845,11 +860,15 @@ async fn spawn_eval_runner(
     });
 
     let (mut cmd, runner_kind) = match language {
-        EvalLanguage::Python => (
-            build_python_command(runner_override, &py_runner, files)?,
-            RunnerKind::Other,
-        ),
+        EvalLanguage::Python => {
+            let (_, py_runner) = prepare_eval_runners()?;
+            (
+                build_python_command(runner_override, &py_runner, files)?,
+                RunnerKind::Other,
+            )
+        }
         EvalLanguage::JavaScript => {
+            let (js_runner, _) = prepare_eval_runners()?;
             if force_esm {
                 (
                     build_vite_node_fallback_command(&js_runner, files)?,
@@ -860,6 +879,9 @@ async fn spawn_eval_runner(
                 (plan.cmd, plan.kind)
             }
         }
+        // Go has no bt-supplied runner script: the user's package or prebuilt
+        // binary is the runner, so nothing is materialized to disk.
+        EvalLanguage::Go => (build_go_command(runner_override, files)?, RunnerKind::Other),
     };
     if language == EvalLanguage::JavaScript && should_set_node_heap_size(runner_kind) {
         set_node_heap_size_env(&mut cmd);
@@ -2396,6 +2418,7 @@ fn detect_eval_language(
         let current = match ext.as_str() {
             "py" => EvalLanguage::Python,
             "ts" | "tsx" | "js" | "mjs" | "cjs" => EvalLanguage::JavaScript,
+            "go" => EvalLanguage::Go,
             _ => {
                 anyhow::bail!("Unsupported eval file extension: {ext}");
             }
@@ -2432,6 +2455,8 @@ const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
     "__pycache__",
     ".venv",
     "venv",
+    // Vendored Go dependencies are never the user's own evals.
+    "vendor",
 ];
 
 fn is_excluded_by_default(path: &str) -> bool {
@@ -2444,7 +2469,23 @@ fn is_excluded_by_default(path: &str) -> bool {
     })
 }
 
+/// Expands the user's inputs without a language hint. Kept for tests and for
+/// callers that have no `--language` to pass.
+#[cfg(test)]
 fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
+    expand_eval_file_globs_for_language(inputs, None)
+}
+
+/// Expands eval inputs into a list of regular files.
+///
+/// The language override matters here because it arrives before
+/// `detect_eval_language` runs: Go's compilation unit is a package directory,
+/// so `--language go ./cmd/evals` must expand to that package's .go files
+/// rather than searching for conventionally-named eval files.
+fn expand_eval_file_globs_for_language(
+    inputs: &[String],
+    language_override: Option<EvalLanguage>,
+) -> Result<Vec<String>> {
     let mut expanded: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -2457,22 +2498,11 @@ fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
     for input in inputs {
         let path = Path::new(input);
         if path.is_dir() {
-            let mut dir_files: Vec<String> = Vec::new();
-            for glob_suffix in DEFAULT_EVAL_GLOBS {
-                let pattern = format!("{input}/{glob_suffix}");
-                let matches: Vec<PathBuf> = glob::glob(&pattern)
-                    .with_context(|| format!("invalid glob pattern: {pattern}"))?
-                    .collect::<Result<_, _>>()
-                    .with_context(|| format!("error expanding glob: {pattern}"))?;
-                dir_files.extend(
-                    matches
-                        .into_iter()
-                        .map(|p| p.to_string_lossy().into_owned()),
-                );
-            }
-            if dir_files.is_empty() {
-                anyhow::bail!("no eval files found in directory: {input}");
-            }
+            let dir_files = if language_override == Some(EvalLanguage::Go) {
+                expand_go_package_dir(input)?
+            } else {
+                expand_default_eval_globs_in_dir(input)?
+            };
             dir_files.into_iter().for_each(&mut push);
             continue;
         }
@@ -2499,6 +2529,86 @@ fn expand_eval_file_globs(inputs: &[String]) -> Result<Vec<String>> {
             .for_each(&mut push);
     }
     Ok(expanded)
+}
+
+/// Expands the default eval globs inside a directory input.
+fn expand_default_eval_globs_in_dir(input: &str) -> Result<Vec<String>> {
+    let mut dir_files: Vec<String> = Vec::new();
+    for glob_suffix in DEFAULT_EVAL_GLOBS {
+        let pattern = format!("{input}/{glob_suffix}");
+        let matches: Vec<PathBuf> = glob::glob(&pattern)
+            .with_context(|| format!("invalid glob pattern: {pattern}"))?
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("error expanding glob: {pattern}"))?;
+        dir_files.extend(
+            matches
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+    }
+    if dir_files.is_empty() {
+        // No JavaScript or Python evals here. Go has no marker filename, so ask
+        // the Go toolchain whether this tree holds eval runners instead.
+        if let Some(go_files) = discover_go_eval_packages(input) {
+            return Ok(go_files);
+        }
+        anyhow::bail!("no eval files found in directory: {input}");
+    }
+    Ok(dir_files)
+}
+
+/// Expands a Go package directory to the files that make up that package.
+///
+/// Non-recursive on purpose: a Go package is exactly one directory, and
+/// sub-directories are separate packages that `go run` cannot build together.
+/// Mirrors the go tool's own filtering, which skips `_`/`.`-prefixed files and
+/// leaves `_test.go` files out of a normal build.
+fn expand_go_package_dir(input: &str) -> Result<Vec<String>> {
+    let go = require_go_toolchain()?;
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let packages = go_runner::list_packages(&go, &[input.to_string()], &cwd)?;
+
+    let mut files: Vec<String> = packages
+        .iter()
+        .flat_map(go_runner::GoPackage::absolute_go_files)
+        .collect();
+    files.sort();
+
+    if files.is_empty() {
+        anyhow::bail!(
+            "no Go files found in package directory: {input}. Point bt at the directory containing your `package main` eval (e.g. `bt eval ./cmd/evals`), or pass a prebuilt binary with --runner."
+        );
+    }
+    Ok(files)
+}
+
+/// Finds the Go packages under `dir` that are eval runners.
+///
+/// Go needs no file-naming or directory-naming convention for this: an eval
+/// runner is a `package main` that imports the SDK's runner package, and
+/// `go list` can say which packages those are. Returns `None` when the answer
+/// is "not applicable" -- no module, no toolchain, or nothing that links the
+/// runner -- so the caller can fall back to its usual error.
+fn discover_go_eval_packages(dir: &str) -> Option<Vec<String>> {
+    let path = Path::new(dir);
+    if !go_runner::in_go_module(path) {
+        return None;
+    }
+    let go = go_runner::resolve_go_toolchain(GO_TOOLCHAIN_ENV_OVERRIDES)?;
+
+    let packages = go_runner::list_packages(&go, &["./...".to_string()], path).ok()?;
+    let mut files: Vec<String> = packages
+        .iter()
+        .filter(|pkg| pkg.is_eval_runner())
+        .flat_map(go_runner::GoPackage::absolute_go_files)
+        .collect();
+    files.sort();
+
+    if files.is_empty() {
+        None
+    } else {
+        Some(files)
+    }
 }
 
 fn validate_eval_input_files(files: &[String]) -> Result<()> {
@@ -2668,6 +2778,132 @@ fn build_python_command(
     let mut command = Command::new(python);
     command.arg(runner).args(files);
     Ok(command)
+}
+
+/// Builds the command for a Go eval.
+///
+/// Two shapes, unlike the other languages. With `--runner`, the user hands us a
+/// prebuilt eval binary that is already the complete program, so it is spawned
+/// with **no arguments** -- the Go runner reads everything from `BT_EVAL_*` and
+/// ignores argv, and appending our file list would break a `main` that parses
+/// flags. Without `--runner`, `go run` compiles and runs the package directory.
+fn build_go_command(runner_override: Option<&str>, files: &[String]) -> Result<Command> {
+    if let Some(explicit) = runner_override {
+        return Ok(Command::new(go_runner::resolve_prebuilt_runner(explicit)?));
+    }
+
+    let package_dir = go_package_dir(files)?;
+    let go = require_go_toolchain()?;
+    let package = resolve_go_package(&go, &package_dir)?;
+
+    // A package that is not `package main` cannot be run. Saying so here beats
+    // letting `go run` fail with output about a missing entry point.
+    if package.name != "main" {
+        anyhow::bail!(
+            "{} is `package {}`, not `package main`, so it cannot be run. Point bt at the directory holding your eval's `func main` (e.g. `bt eval ./cmd/evals`).",
+            package.import_path,
+            package.name
+        );
+    }
+
+    let mut command = Command::new(go);
+    command.arg("run").arg(&package.dir);
+
+    // `go run <pkg>` only works from inside the main module. Leave the working
+    // directory alone when we are already inside it, so the eval's own relative
+    // paths behave as the user expects. The module root comes from `go list`,
+    // which accounts for `go.work` overriding the nearest `go.mod`.
+    if let Some(module_root) = package.module.as_ref().and_then(|m| m.dir.as_ref()) {
+        let inside_module = std::env::current_dir()
+            .map(|cwd| cwd.starts_with(module_root))
+            .unwrap_or(false);
+        if !inside_module {
+            command.current_dir(module_root);
+        }
+    }
+
+    Ok(command)
+}
+
+/// Resolves the Go toolchain, or explains how to supply one.
+fn require_go_toolchain() -> Result<PathBuf> {
+    go_runner::resolve_go_toolchain(GO_TOOLCHAIN_ENV_OVERRIDES).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No Go toolchain found. Install Go (https://go.dev/dl/), set BT_EVAL_GO_BIN, or pass a prebuilt eval binary with --runner."
+        )
+    })
+}
+
+/// Resolves exactly one Go package, erroring when the pattern names none or many.
+fn resolve_go_package(go: &Path, package_dir: &Path) -> Result<go_runner::GoPackage> {
+    let patterns = [package_dir.to_string_lossy().into_owned()];
+    let pattern = &patterns[0];
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let mut packages = go_runner::list_packages(go, &patterns, &cwd)?;
+
+    match packages.len() {
+        0 => anyhow::bail!("`go list` reported no package at {pattern}."),
+        1 => Ok(packages.remove(0)),
+        n => anyhow::bail!("`go list` reported {n} packages at {pattern}; expected one."),
+    }
+}
+
+/// Collapses the expanded file list back to the single package directory that
+/// `go run` needs. Go compiles a directory, not a file list.
+fn go_package_dir(files: &[String]) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+
+    for file in files {
+        let path = Path::new(file);
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        let dir = if absolute.is_dir() {
+            absolute
+        } else {
+            absolute
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.clone())
+        };
+        // Canonicalize so the same directory reached by different paths counts
+        // once, and so the argument stays valid if we change the working dir.
+        dirs.insert(std::fs::canonicalize(&dir).unwrap_or(dir));
+    }
+
+    match dirs.len() {
+        0 => anyhow::bail!("No Go eval package provided."),
+        1 => Ok(dirs.into_iter().next().expect("exactly one entry")),
+        n => anyhow::bail!(
+            "Go evals must live in a single package directory, but the inputs span {n} directories: {}. Pass one package directory (e.g. `bt eval --language go ./cmd/evals`) or a prebuilt binary with --runner.",
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Derives the watch set for a Go eval.
+///
+/// A Go binary cannot report its own sources the way the JS and Python runners
+/// do, so bt works it out statically: every buildable file in the package, plus
+/// the directory itself, whose mtime changes when files are added or removed.
+/// Imported packages elsewhere in the module are not followed.
+fn collect_go_static_dependencies(files: &[String]) -> Result<Vec<PathBuf>> {
+    let package_dir = go_package_dir(files)?;
+    let go = require_go_toolchain()?;
+    let package = resolve_go_package(&go, &package_dir)?;
+
+    // Watch the directory itself as well as its files: its mtime changes when a
+    // file is added or removed, which the file list alone cannot notice.
+    let mut paths = vec![package.dir.clone()];
+    paths.extend(package.absolute_go_files().into_iter().map(PathBuf::from));
+
+    normalize_watch_paths(paths)
 }
 
 fn python_runner_search_roots(files: &[String]) -> Vec<PathBuf> {
@@ -3784,6 +4020,61 @@ mod tests {
         })
     }
 
+    /// Takes the environment lock, recovering from poisoning.
+    ///
+    /// The lock only serializes access to process environment variables, and
+    /// every test that takes it saves and restores what it touches. A panic
+    /// elsewhere therefore leaves nothing corrupt to guard, so recovering stops
+    /// one failing test from cascading into every other env-dependent test.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        env_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Writes an executable stub `go` that answers `list -json` with `json`.
+    ///
+    /// The Go path now delegates package layout to the toolchain, so exercising
+    /// it needs a `go` that replies rather than merely a path that exists.
+    #[cfg(unix)]
+    fn write_fake_go(dir: &Path, json: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_go = dir.join("go");
+        fs::write(
+            &fake_go,
+            format!("#!/bin/sh\ncat <<'BT_EOF'\n{json}\nBT_EOF\n"),
+        )
+        .expect("fake go written");
+        let mut perms = fs::metadata(&fake_go)
+            .expect("fake go metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_go, perms).expect("fake go made executable");
+        fake_go
+    }
+
+    /// A single `go list -json` document for `dir` holding `files`.
+    #[cfg(unix)]
+    fn go_list_json(dir: &Path, name: &str, files: &[&str], deps: &[&str]) -> String {
+        let quoted = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| format!("\"{item}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            r#"{{"Dir": "{dir}", "ImportPath": "example.test/evals", "Name": "{name}",
+                 "GoFiles": [{files}], "Deps": [{deps}],
+                 "Module": {{"Path": "example.test", "Dir": "{dir}"}}}}"#,
+            dir = dir.display(),
+            name = name,
+            files = quoted(files),
+            deps = quoted(deps)
+        )
+    }
+
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4222,6 +4513,355 @@ mod tests {
         assert!(message.contains("from input `evals`"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Tests for Go eval support.
+    ///
+    /// Grouped so CI can run them by module path; see the eval-tests-go job.
+    mod go {
+        use super::*;
+
+        #[test]
+        fn detect_eval_language_detects_go_extension() {
+            let files = vec!["evals/classifier_eval.go".to_string()];
+            assert_eq!(
+                detect_eval_language(&files, None).expect("go should be detected"),
+                EvalLanguage::Go
+            );
+        }
+
+        #[test]
+        fn detect_eval_language_rejects_mixed_go_and_python() {
+            let files = vec!["a_eval.go".to_string(), "eval_b.py".to_string()];
+            let err = detect_eval_language(&files, None).expect_err("mixed languages should fail");
+            assert!(format!("{err:#}").contains("Mixed eval file types are not supported yet"));
+        }
+
+        #[test]
+        fn detect_eval_language_override_wins_over_extension() {
+            let files = vec!["a.eval.ts".to_string()];
+            assert_eq!(
+                detect_eval_language(&files, Some(EvalLanguage::Go)).expect("override should win"),
+                EvalLanguage::Go
+            );
+        }
+
+        // A Go eval needs no marker filename: `go list` reports the build inputs,
+        // so bt takes whatever the package actually compiles.
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_go_language_takes_the_packages_build_inputs() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-package");
+            let json = go_list_json(&dir, "main", &["main.go", "classifier.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+
+            let result = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                Some(EvalLanguage::Go),
+            )
+            .expect("package dir should expand");
+
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+
+            // Sorted, absolute, and exactly what `go list` reported -- note neither
+            // filename carries an `_eval.go` suffix.
+            assert_eq!(result.len(), 2, "unexpected matches: {result:?}");
+            assert!(result[0].ends_with("classifier.go"), "got {result:?}");
+            assert!(result[1].ends_with("main.go"), "got {result:?}");
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // Build constraints and `_test.go` exclusion are the toolchain's job now, so
+        // whatever `go list` leaves out of GoFiles never reaches bt.
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_go_language_honours_the_toolchains_file_list() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-skips");
+            fs::write(dir.join("main_test.go"), "package main").expect("test written");
+            fs::write(dir.join("linux_only.go"), "package main").expect("constrained written");
+            let json = go_list_json(&dir, "main", &["main.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+
+            let result = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                Some(EvalLanguage::Go),
+            )
+            .expect("package dir should expand");
+
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+
+            assert_eq!(result.len(), 1, "unexpected matches: {result:?}");
+            assert!(result[0].ends_with("main.go"));
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_go_language_errors_on_dir_without_go_files() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-empty");
+            let fake_go = write_fake_go(&dir, "");
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+
+            let err = expand_eval_file_globs_for_language(
+                &[dir.to_string_lossy().into_owned()],
+                Some(EvalLanguage::Go),
+            )
+            .expect_err("an empty package should fail");
+
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+            assert!(format!("{err:#}").contains("no Go files found in package directory"));
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // The point of asking `go list`: bt finds Go evals with no naming convention
+        // at all. An eval runner is a `package main` that imports the SDK runner, so
+        // arbitrary filenames work and unrelated main packages are left alone.
+        #[cfg(unix)]
+        #[test]
+        fn expand_eval_file_globs_discovers_go_evals_without_a_naming_convention() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-discover");
+            fs::write(dir.join("go.mod"), "module example.test\n").expect("go.mod written");
+
+            let evals_dir = dir.join("evals");
+            let cli_dir = dir.join("cmd").join("cli");
+            fs::create_dir_all(&evals_dir).expect("evals dir");
+            fs::create_dir_all(&cli_dir).expect("cli dir");
+
+            // Neither eval file carries a marker suffix.
+            let json = format!(
+                r#"{{"Dir": "{evals}", "ImportPath": "example.test/evals", "Name": "main",
+                      "GoFiles": ["classifier.go", "main.go"], "Deps": ["fmt", "{runner}"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}
+                   {{"Dir": "{cli}", "ImportPath": "example.test/cmd/cli", "Name": "main",
+                      "GoFiles": ["main.go"], "Deps": ["fmt"],
+                      "Module": {{"Path": "example.test", "Dir": "{root}"}}}}"#,
+                evals = evals_dir.display(),
+                cli = cli_dir.display(),
+                root = dir.display(),
+                runner = go_runner::EVAL_RUNNER_IMPORT
+            );
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+
+            let result = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
+                .expect("go evals should be discovered");
+
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+
+            assert_eq!(result.len(), 2, "unexpected matches: {result:?}");
+            assert!(result[0].ends_with("classifier.go"), "got {result:?}");
+            assert!(result[1].ends_with("main.go"), "got {result:?}");
+            assert!(
+                result.iter().all(|f| f.contains("evals")),
+                "the plain cli main package must not be treated as an eval: {result:?}"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // A directory with no Go module must not pay for a `go list` spawn, and must
+        // still report the ordinary discovery error.
+        #[test]
+        fn expand_eval_file_globs_directory_without_evals_still_errors() {
+            let dir = make_temp_dir("go-no-module");
+            fs::write(dir.join("notes.txt"), "not an eval").expect("file written");
+
+            let err = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
+                .expect_err("a directory with no evals should fail");
+            assert!(format!("{err:#}").contains("no eval files found in directory"));
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn go_package_dir_collapses_files_in_one_directory() {
+            let dir = make_temp_dir("go-collapse");
+            let main = dir.join("main.go");
+            let helper = dir.join("helper.go");
+            fs::write(&main, "package main").expect("main written");
+            fs::write(&helper, "package main").expect("helper written");
+
+            let resolved = go_package_dir(&[
+                main.to_string_lossy().into_owned(),
+                helper.to_string_lossy().into_owned(),
+            ])
+            .expect("files in one directory should collapse");
+
+            assert_eq!(
+                resolved,
+                fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn go_package_dir_rejects_inputs_spanning_directories() {
+            let dir = make_temp_dir("go-span");
+            let a = dir.join("a");
+            let b = dir.join("b");
+            fs::create_dir_all(&a).expect("a created");
+            fs::create_dir_all(&b).expect("b created");
+            fs::write(a.join("main.go"), "package main").expect("a main written");
+            fs::write(b.join("main.go"), "package main").expect("b main written");
+
+            let err = go_package_dir(&[
+                a.join("main.go").to_string_lossy().into_owned(),
+                b.join("main.go").to_string_lossy().into_owned(),
+            ])
+            .expect_err("multiple package directories should fail");
+            assert!(format!("{err:#}").contains("span 2 directories"));
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // The Go runner takes everything from BT_EVAL_* and ignores argv, so a
+        // prebuilt binary must be spawned bare. Appending bt's file list would
+        // break any main that parses flags.
+        #[test]
+        fn build_go_command_with_runner_override_passes_no_args() {
+            let dir = make_temp_dir("go-prebuilt");
+            let binary = dir.join("evals");
+            fs::write(&binary, "#!/bin/sh\n").expect("binary written");
+
+            let cmd = build_go_command(
+                Some(binary.to_str().expect("utf-8 path")),
+                &["./cmd/evals".to_string()],
+            )
+            .expect("prebuilt runner should resolve");
+
+            let std_cmd = cmd.as_std();
+            assert_eq!(Path::new(std_cmd.get_program()), binary);
+            assert_eq!(std_cmd.get_args().count(), 0, "argv must stay empty");
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn build_go_command_rejects_a_missing_runner_binary() {
+            let err = build_go_command(Some("./definitely/not/here"), &[])
+                .expect_err("a missing runner should fail");
+            assert!(format!("{err:#}").contains("--runner binary not found"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn build_go_command_runs_the_package_directory() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-run");
+            fs::write(dir.join("main.go"), "package main").expect("main written");
+            let json = go_list_json(&dir, "main", &["main.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+
+            let cmd = build_go_command(None, &[dir.join("main.go").to_string_lossy().into_owned()])
+                .expect("go run command should build");
+
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+
+            let std_cmd = cmd.as_std();
+            assert_eq!(Path::new(std_cmd.get_program()), fake_go);
+            let args: Vec<String> = std_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0], "run");
+            // The directory `go list` reported, not one bt assembled from paths.
+            assert_eq!(Path::new(&args[1]), dir.as_path(), "got {args:?}");
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // `go run` needs `package main`. Catching it here gives a pointed error
+        // instead of letting the toolchain complain about a missing entry point.
+        #[cfg(unix)]
+        #[test]
+        fn build_go_command_rejects_a_non_main_package() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-not-main");
+            fs::write(dir.join("lib.go"), "package lib").expect("lib written");
+            let json = go_list_json(&dir, "lib", &["lib.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+
+            let err = build_go_command(None, &[dir.join("lib.go").to_string_lossy().into_owned()])
+                .expect_err("a library package should fail");
+
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+            let message = format!("{err:#}");
+            assert!(message.contains("not `package main`"), "got {message}");
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn build_go_command_errors_without_a_go_toolchain() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-missing-toolchain");
+            fs::write(dir.join("main.go"), "package main").expect("main written");
+
+            let go_bin = clear_env_var("BT_EVAL_GO_BIN");
+            let go_alt = clear_env_var("BT_EVAL_GO");
+            let goroot = clear_env_var("GOROOT");
+            let path = clear_env_var("PATH");
+
+            let err = build_go_command(None, &[dir.join("main.go").to_string_lossy().into_owned()])
+                .expect_err("no toolchain should fail");
+            assert!(format!("{err:#}").contains("No Go toolchain found"));
+
+            restore_env_var("PATH", path);
+            restore_env_var("GOROOT", goroot);
+            restore_env_var("BT_EVAL_GO", go_alt);
+            restore_env_var("BT_EVAL_GO_BIN", go_bin);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // A Go binary cannot report its own sources, so bt watches the package
+        // directory (whose mtime changes when files come and go) plus the files
+        // `go list` says the build uses.
+        #[cfg(unix)]
+        #[test]
+        fn collect_go_static_dependencies_covers_the_package() {
+            let _guard = lock_env();
+            let dir = make_temp_dir("go-watch");
+            fs::write(dir.join("main.go"), "package main").expect("main written");
+            fs::write(dir.join("helper.go"), "package main").expect("helper written");
+            fs::write(dir.join("main_test.go"), "package main").expect("test written");
+            let json = go_list_json(&dir, "main", &["main.go", "helper.go"], &[]);
+            let fake_go = write_fake_go(&dir, &json);
+            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+
+            let deps = collect_go_static_dependencies(&[dir
+                .join("main.go")
+                .to_string_lossy()
+                .into_owned()])
+            .expect("dependencies should be collected");
+
+            restore_env_var("BT_EVAL_GO_BIN", previous);
+
+            let names: Vec<String> = deps
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            assert!(names.iter().any(|n| n == "main.go"), "got {names:?}");
+            assert!(names.iter().any(|n| n == "helper.go"), "got {names:?}");
+            assert!(
+                !names.iter().any(|n| n == "main_test.go"),
+                "test files are not part of the build: {names:?}"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
