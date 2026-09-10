@@ -10,16 +10,29 @@ use crate::{config, utils::resolve_profile_info};
 #[command(after_help = "\
 Examples:
   bt status
+  bt status --all
   bt status --json
   bt status --verbose
 ")]
-pub struct StatusArgs {}
+pub struct StatusArgs {
+    /// Include all saved login profiles and their connection status
+    #[arg(long)]
+    all: bool,
+}
 
 #[derive(Serialize)]
 struct StatusOutput {
     org: Option<String>,
     project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
     profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,6 +40,8 @@ struct StatusOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_hint: Option<String>,
     source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profiles: Option<Vec<auth::ProfileVerification>>,
 }
 
 fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
@@ -40,7 +55,13 @@ fn format_identity(p: &auth::ProfileInfo) -> Option<String> {
     }
 }
 
-pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
+fn format_auth(p: &auth::ProfileInfo) -> String {
+    format_identity(p)
+        .map(|identity| format!("{} — {identity}", p.auth))
+        .unwrap_or_else(|| p.auth.clone())
+}
+
+pub async fn run(base: BaseArgs, args: StatusArgs) -> Result<()> {
     let global_path = config::global_path().ok();
     let global_cfg = config::load_global().unwrap_or_default();
     let local_path = config::local_path();
@@ -88,41 +109,100 @@ pub async fn run(base: BaseArgs, _args: StatusArgs) -> Result<()> {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        let mut project_base = base.clone();
-        if project_base
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            project_base.profile = selected_profile.clone();
-        }
-        project =
-            config::project_from_config_for_context(&project_base, &merged_cfg, org.as_deref());
+        project = config::project_from_config_for_context(&merged_cfg, org.as_deref());
     }
+
+    let project_id = (project.as_deref() == merged_cfg.project.as_deref())
+        .then(|| merged_cfg.project_id.clone())
+        .flatten();
+    let profiles = if args.all {
+        Some(auth::profile_verifications().await?)
+    } else {
+        None
+    };
 
     if base.json {
         let output = StatusOutput {
             org,
             project,
+            project_id,
             profile: profile_info.as_ref().map(|p| p.name.clone()),
+            auth: profile_info.as_ref().map(|p| p.auth.clone()),
+            app_url: profile_info.as_ref().map(|p| p.app_url.clone()),
+            api_url: profile_info.as_ref().and_then(|p| p.oauth_api_url.clone()),
             user_name: profile_info.as_ref().and_then(|p| p.user_name.clone()),
             user_email: profile_info.as_ref().and_then(|p| p.email.clone()),
             api_key_hint: profile_info.as_ref().and_then(|p| p.api_key_hint.clone()),
             source,
+            profiles,
         };
         println!("{}", serde_json::to_string(&output)?);
+        return Ok(());
+    }
+
+    if let Some(profiles) = profiles.as_ref() {
+        println!("Braintrust CLI status");
+        println!("\nActive default context");
+        println!("  Organization: {}", org.as_deref().unwrap_or("(unset)"));
+        println!(
+            "  Project:      {}",
+            project.as_deref().unwrap_or("(unset)")
+        );
+        println!(
+            "  Profile:      {}",
+            profile_info
+                .as_ref()
+                .map(|profile| profile.name.as_str())
+                .unwrap_or("(none)")
+        );
+        if let Some(profile) = &profile_info {
+            println!("  Auth:         {}", format_auth(profile));
+        }
+        println!(
+            "  Source:       {}",
+            source.as_deref().unwrap_or("automatic")
+        );
+
+        if let Some(precedence) = auth::credential_precedence(&base) {
+            println!("\nCredential precedence");
+            println!("  {precedence}");
+        }
+
+        println!("\nSaved login profiles");
+        if profiles.is_empty() {
+            println!("  No saved profiles. Run `bt login` to create one.");
+        } else {
+            for profile in profiles {
+                let selected = profile_info
+                    .as_ref()
+                    .is_some_and(|selected| selected.name == profile.name);
+                println!("\n{}", auth::format_verification_block(profile, selected));
+            }
+        }
+        if let Ok(path) = auth::profile_metadata_path() {
+            println!("\nProfile metadata: {}", path.display());
+        }
+        if let Ok(storage) = auth::secret_storage_description() {
+            println!("Secret storage: {storage}");
+        }
         return Ok(());
     }
 
     if base.verbose {
         println!("org: {}", org.as_deref().unwrap_or("(unset)"));
         println!("project: {}", project.as_deref().unwrap_or("(unset)"));
+        println!("project_id: {}", project_id.as_deref().unwrap_or("(unset)"));
+        println!(
+            "profile: {}",
+            selected_profile.as_deref().unwrap_or("(unset)")
+        );
         if let Some(ref p) = profile_info {
-            println!("profile: {}", p.name);
-            if let Some(id) = format_identity(p) {
-                println!("user: {id}");
-            }
+            println!("app_url: {}", p.app_url);
+            println!(
+                "api_url: {}",
+                p.oauth_api_url.as_deref().unwrap_or("(derived per org)")
+            );
+            println!("auth: {}", format_auth(p));
         }
         if let Some(src) = source {
             println!("source: {src}");
@@ -345,6 +425,13 @@ mod tests {
     ) -> auth::ProfileInfo {
         auth::ProfileInfo {
             name: name.into(),
+            auth: if api_key_hint.is_some() {
+                "api_key".into()
+            } else {
+                "oauth".into()
+            },
+            app_url: "https://app.test.example".into(),
+            oauth_api_url: None,
             org_name: None,
             user_name: user_name.map(Into::into),
             email: email.map(Into::into),

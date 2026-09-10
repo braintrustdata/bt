@@ -1,19 +1,12 @@
-use anyhow::{anyhow, bail, Result};
-use clap::{Args, Subcommand};
+use anyhow::{anyhow, bail, Context, Result};
 use std::{
-    env, fs,
-    io::{self, Write as _},
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::args::BaseArgs;
 use crate::ui::{print_command_status, CommandStatus};
-
-mod get;
-mod list;
-mod set;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -26,54 +19,7 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-pub const KNOWN_KEYS: &[&str] = &["profile", "org", "project", "project_id"];
-
 impl Config {
-    pub fn get_field(&self, key: &str) -> Option<&str> {
-        match key {
-            "profile" => self.profile.as_deref(),
-            "org" => self.org.as_deref(),
-            "project" => self.project.as_deref(),
-            "project_id" => self.project_id.as_deref(),
-            _ => None,
-        }
-    }
-
-    pub fn set_field(&mut self, key: &str, value: String) -> bool {
-        match key {
-            "profile" => self.profile = Some(value),
-            "org" => self.org = Some(value),
-            "project" => {
-                self.project = Some(value);
-                self.project_id = None;
-            }
-            "project_id" => self.project_id = Some(value),
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn unset_field(&mut self, key: &str) -> bool {
-        match key {
-            "profile" => self.profile = None,
-            "org" => self.org = None,
-            "project" => {
-                self.project = None;
-                self.project_id = None;
-            }
-            "project_id" => self.project_id = None,
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn non_empty_fields(&self) -> Vec<(&str, &str)> {
-        KNOWN_KEYS
-            .iter()
-            .filter_map(|&key| self.get_field(key).map(|v| (key, v)))
-            .collect()
-    }
-
     pub(crate) fn merge(&self, other: &Config) -> Config {
         let mut extra = self.extra.clone();
         extra.extend(other.extra.clone());
@@ -153,48 +99,34 @@ pub fn load() -> Result<Config> {
     Ok(global.merge(&local))
 }
 
-pub fn configured_project_for_context(
-    base: &BaseArgs,
-    resolved_org: Option<&str>,
-) -> Option<String> {
+pub fn configured_project_for_context(resolved_org: Option<&str>) -> Option<String> {
     load()
         .ok()
-        .and_then(|cfg| project_from_config_for_context(base, &cfg, resolved_org))
+        .and_then(|cfg| project_from_config_for_context(&cfg, resolved_org))
 }
 
-pub fn configured_project_id_for_base(base: &BaseArgs) -> Option<String> {
-    load().ok().and_then(|cfg| {
-        config_matches_context(base, &cfg, None)
-            .then(|| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
-            .flatten()
-    })
+pub fn configured_project_id() -> Option<String> {
+    load()
+        .ok()
+        .and_then(|cfg| trimmed_option(cfg.project_id.as_deref()).map(str::to_string))
 }
 
 pub(crate) fn project_from_config_for_context(
-    base: &BaseArgs,
     cfg: &Config,
     resolved_org: Option<&str>,
 ) -> Option<String> {
-    config_matches_context(base, cfg, resolved_org)
+    config_matches_context(cfg, resolved_org)
         .then(|| trimmed_option(cfg.project.as_deref()).map(str::to_string))
         .flatten()
 }
 
-fn config_matches_context(base: &BaseArgs, cfg: &Config, resolved_org: Option<&str>) -> bool {
-    let selected_profile = trimmed_option(base.profile.as_deref());
-    let cfg_profile = trimmed_option(cfg.profile.as_deref());
+fn config_matches_context(cfg: &Config, resolved_org: Option<&str>) -> bool {
     let cfg_org = trimmed_option(cfg.org.as_deref());
     let resolved_org = trimmed_option(resolved_org);
 
-    match selected_profile {
-        Some(profile) => {
-            cfg_profile == Some(profile)
-                || (cfg_profile.is_none() && cfg_org.is_some() && cfg_org == resolved_org)
-        }
-        None => cfg_org
-            .zip(resolved_org)
-            .is_none_or(|(cfg, resolved)| cfg == resolved),
-    }
+    cfg_org
+        .zip(resolved_org)
+        .is_none_or(|(cfg, resolved)| cfg == resolved)
 }
 
 pub(crate) fn trimmed_option(value: Option<&str>) -> Option<&str> {
@@ -202,21 +134,44 @@ pub(crate) fn trimmed_option(value: Option<&str>) -> Option<&str> {
 }
 
 pub fn save_file(path: &Path, config: &Config) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-
-    let json = serde_json::to_string_pretty(config)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(json.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.as_file().sync_all()?;
-    file.persist(path)?;
-
-    Ok(())
+    crate::utils::write_json_atomic(path, config)
 }
 
 pub fn save_global(config: &Config) -> Result<()> {
     save_file(&global_path()?, config)
+}
+
+/// Update the profile selected by the global config and the local config for
+/// the current working tree. Other working trees are intentionally untouched.
+pub(crate) fn replace_profile_references(
+    old_name: &str,
+    new_name: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = vec![global_path()?];
+    if let Some(local_path) = local_path() {
+        if !paths.contains(&local_path) {
+            paths.push(local_path);
+        }
+    }
+
+    let mut updated = Vec::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let data = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        let mut config: Config = serde_json::from_str(&data)
+            .with_context(|| format!("failed to parse config {}", path.display()))?;
+        if config.profile.as_deref() != Some(old_name) {
+            continue;
+        }
+        config.profile = new_name.map(str::to_string);
+        save_file(&path, &config)
+            .with_context(|| format!("failed to update config {}", path.display()))?;
+        updated.push(path);
+    }
+    Ok(updated)
 }
 
 pub fn find_local_config_dir() -> Option<PathBuf> {
@@ -243,38 +198,60 @@ pub fn local_path() -> Option<PathBuf> {
     find_local_config_dir().map(|dir| dir.join("config.json"))
 }
 
-pub enum WriteTarget {
-    Global(PathBuf),
-    Local(PathBuf),
-}
-
-pub fn write_target() -> Result<WriteTarget> {
-    match local_path() {
-        Some(p) => Ok(WriteTarget::Local(p)),
-        None => Ok(WriteTarget::Global(global_path()?)),
-    }
-}
-
-/// Resolve which config file to write based on --global/--local flags.
-pub fn resolve_write_path(global: bool, local: bool) -> Result<PathBuf> {
-    if global {
-        global_path()
-    } else if local {
-        match local_path() {
-            Some(p) => Ok(p),
-            None => {
-                bail!("No local .bt directory found. Use bt init to initialize this directory.")
-            }
-        }
-    } else {
-        match write_target()? {
-            WriteTarget::Local(p) | WriteTarget::Global(p) => Ok(p),
-        }
-    }
-}
-
 pub fn local_save_path() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(".bt").join("config.json"))
+}
+
+/// Creates nothing, so an aborted command leaves no config directory behind.
+pub fn preflight_config_write(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // `save_file` creates missing parents, so permissions hinge on this one.
+    let existing = nearest_existing_dir(parent);
+
+    if !existing.is_dir() {
+        bail!(
+            "Could not create config directory {}: {} is not a directory",
+            parent.display(),
+            existing.display()
+        );
+    }
+
+    let probe = tempfile::NamedTempFile::new_in(&existing)
+        .with_context(|| format!("Could not write to config directory {}", existing.display()))?;
+    probe
+        .close()
+        .with_context(|| format!("Could not clean up write test in {}", existing.display()))?;
+
+    // Unix renames over a read-only target fine; Windows does not.
+    #[cfg(windows)]
+    if path
+        .metadata()
+        .is_ok_and(|meta| meta.permissions().readonly())
+    {
+        bail!(
+            "Could not write config file {}: it is read-only",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn nearest_existing_dir(dir: &Path) -> PathBuf {
+    let mut current = if dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        dir.to_path_buf()
+    };
+    loop {
+        if current.exists() {
+            return current;
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent.to_path_buf(),
+            _ => return PathBuf::from("."),
+        }
+    }
 }
 
 pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
@@ -285,91 +262,6 @@ pub fn save_local(config: &Config, create_dir: bool) -> Result<PathBuf> {
     }
     save_file(&path, config)?;
     Ok(path)
-}
-
-// --- CLI commands ---
-
-#[derive(Debug, Clone, Args)]
-pub struct ScopeArgs {
-    /// Apply to global config (~/.config/bt/config.json)
-    #[arg(long, short = 'g', conflicts_with = "local")]
-    global: bool,
-
-    /// Apply to local config (.bt/config.json)
-    #[arg(long, short = 'l')]
-    local: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ConfigArgs {
-    #[command(subcommand)]
-    command: Option<ConfigCommands>,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-enum ConfigCommands {
-    /// List config values
-    List {
-        #[command(flatten)]
-        scope: ScopeArgs,
-        /// Show config values grouped by source
-        #[arg(long)]
-        verbose: bool,
-    },
-    /// Get a config value
-    Get {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-    /// Set a config value
-    Set {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        /// Value to set
-        value: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-    /// Remove a config value
-    Unset {
-        /// Config key (profile, org, project, project_id)
-        key: String,
-        #[command(flatten)]
-        scope: ScopeArgs,
-    },
-}
-
-fn validate_key(key: &str) -> Result<()> {
-    if !KNOWN_KEYS.contains(&key) {
-        bail!(
-            "Unknown config key: {key}\nValid keys: {}",
-            KNOWN_KEYS.join(", ")
-        );
-    }
-    Ok(())
-}
-
-pub fn run(base: BaseArgs, args: ConfigArgs) -> Result<()> {
-    match args.command {
-        None => list::run(base, false, false, false),
-        Some(ConfigCommands::List { scope, verbose }) => {
-            list::run(base, scope.global, scope.local, verbose)
-        }
-        Some(ConfigCommands::Get { key, scope }) => {
-            validate_key(&key)?;
-            get::run(base, &key, scope.global, scope.local)
-        }
-        Some(ConfigCommands::Set { key, value, scope }) => {
-            validate_key(&key)?;
-            set::run(&key, &value, scope.global, scope.local)
-        }
-        Some(ConfigCommands::Unset { key, scope }) => {
-            validate_key(&key)?;
-            set::unset(&key, scope.global, scope.local)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -433,29 +325,6 @@ mod tests {
         assert_eq!(merged.project, Some("other-proj".into()));
     }
 
-    fn base_with_profile(profile: Option<&str>) -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: profile.map(str::to_string),
-            profile_explicit: profile.is_some(),
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
-    }
-
     fn config(profile: Option<&str>, org: Option<&str>, project: Option<&str>) -> Config {
         Config {
             profile: profile.map(str::to_string),
@@ -466,13 +335,15 @@ mod tests {
     }
 
     #[test]
-    fn project_config_matches_explicit_profile_or_legacy_org() {
-        let base = base_with_profile(Some("work"));
+    fn project_config_matches_org_independently_of_profile() {
         let cases = [
             (config(None, Some("acme"), Some("demo")), Some("demo")),
             (config(None, Some("other"), Some("demo")), None),
-            (config(None, None, Some("demo")), None),
-            (config(Some("other"), Some("acme"), Some("demo")), None),
+            (config(None, None, Some("demo")), Some("demo")),
+            (
+                config(Some("other"), Some("acme"), Some("demo")),
+                Some("demo"),
+            ),
             (
                 config(Some("work"), Some("acme"), Some("demo")),
                 Some("demo"),
@@ -481,7 +352,7 @@ mod tests {
 
         for (cfg, expected) in cases {
             assert_eq!(
-                project_from_config_for_context(&base, &cfg, Some("acme")).as_deref(),
+                project_from_config_for_context(&cfg, Some("acme")).as_deref(),
                 expected
             );
         }
@@ -570,5 +441,49 @@ mod tests {
 
         save_file(&path, &config).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn preflight_config_write_checks_parent_without_creating_it() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join(".bt");
+        let existing = tmp.path().join("config.json");
+        save_file(&existing, &Config::default()).unwrap();
+
+        preflight_config_write(&missing.join("config.json")).unwrap();
+        preflight_config_write(&existing).unwrap();
+        assert!(!missing.exists());
+
+        let file_parent = tmp.path().join("not-a-dir");
+        fs::write(&file_parent, "").unwrap();
+        let error = preflight_config_write(&file_parent.join("config.json")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Could not create config directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_config_write_fails_when_parent_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("locked");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the mode bits, so the probe would succeed there.
+        let permissions_enforced = fs::write(parent.join("root-check"), "").is_err();
+
+        let result = preflight_config_write(&parent.join(".bt").join("config.json"));
+
+        // Restore write access so cleanup can remove the temp dir.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if permissions_enforced {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not write to config directory"));
+        }
     }
 }

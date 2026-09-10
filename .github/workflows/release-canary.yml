@@ -473,7 +473,7 @@ jobs:
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version | grep -i canary
-          bt self update --check
+          bt update --check
 
   smoke-install-macos:
     needs:
@@ -496,7 +496,7 @@ jobs:
         run: |
           export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
           bt --version | grep -i canary
-          bt self update --check
+          bt update --check
 
   smoke-install-windows:
     needs:
@@ -527,4 +527,4 @@ jobs:
             throw "expected canary version string, got: $version"
           }
           $env:PATH = "$binDir;$env:PATH"
-          & $btExe self update --check
+          & $btExe update --check

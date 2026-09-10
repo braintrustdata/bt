@@ -8,6 +8,8 @@ mod auth;
 mod config;
 mod datasets;
 mod env;
+mod environments;
+mod error;
 #[cfg(unix)]
 mod eval;
 mod experiments;
@@ -16,6 +18,8 @@ mod http;
 mod init;
 mod js_runner;
 mod loop_cmd;
+mod observability;
+mod profiles;
 mod project_context;
 mod projects;
 mod prompts;
@@ -31,12 +35,13 @@ mod switch;
 mod sync;
 mod tools;
 mod topics;
+mod trace_host;
 mod traces;
 mod ui;
 mod util_cmd;
 mod utils;
 
-use crate::args::{has_explicit_profile_arg, ArgValueSource, BaseArgs, CLIArgs};
+use crate::args::{has_explicit_profile_arg, ArgValueSource, CLIArgs, LoginBaseArgs};
 
 const DEFAULT_CANARY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-canary.dev");
 pub(crate) const CLI_VERSION: &str = match option_env!("BT_VERSION_STRING") {
@@ -57,33 +62,37 @@ const HELP_TEMPLATE: &str = "\
 {before-help}{about} - {usage}
 
 Core
-  init         Initialize .bt config directory and files
-  auth         Authenticate bt with Braintrust
-  switch       Switch org and project context
-  view         View logs, traces, and spans
+  init          Initialize .bt config directory and files
+  login         Log in to Braintrust
+  logout        Remove a saved Braintrust login
+  profiles      Manage saved Braintrust login profiles
+  switch        Switch org and project context
+  view          View logs, traces, and spans
 
 Projects & resources
-  projects     Manage projects
-  topics       Inspect and control Topics automation
-  datasets     Manage datasets
-  prompts      Manage prompts
-  functions    Manage functions (tools, scorers, and more)
-  tools        Manage tools
-  scorers      Manage scorers
-  experiments  Manage experiments
-  loop         Chat with Loop for the active project
+  projects      Manage projects
+  observability Manage active observability tools
+  topics        Inspect and control Topics automation
+  prompts       Manage prompts
+  functions     Manage functions (tools, scorers, and more)
+  tools         Manage tools
+  scorers       Manage scorers
+  experiments   Manage experiments
+  environments  Manage deployment environments
+  loop          Chat with Loop for the active project
 
 Data & evaluation
-  datasets     Manage datasets
-  eval         Run eval files
-  sql          Run SQL queries against Braintrust
-  sync         Synchronize project logs between Braintrust and local NDJSON files
+  datasets      Manage datasets
+  eval          Run eval files
+  sql           Run SQL queries against Braintrust
+  sync          Synchronize project logs between Braintrust and local NDJSON files
 
 Additional
-  docs         Manage workflow docs for coding agents
-  self         Self-management commands
-  setup        Configure Braintrust setup flows
-  status       Show current org and project context
+  docs          Manage workflow docs for coding agents
+  trace         Manage coding-agent tracing
+  setup         Configure Braintrust setup flows (deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh)
+  status        Show current identity, org, and project context
+  update        Update bt in-place
 
 Flags
       --profile <PROFILE>    Use a saved login profile [env: BRAINTRUST_PROFILE]
@@ -96,6 +105,7 @@ Flags
       --no-input             Disable all interactive prompts
       --api-url <URL>        Override API URL [env: BRAINTRUST_API_URL]
       --app-url <URL>        Override app URL [env: BRAINTRUST_APP_URL]
+      --app-public-url <URL>  Override public app URL for generated links [env: BRAINTRUST_APP_PUBLIC_URL]
       --ca-cert <PATH>       Path to PEM CA bundle [env: BRAINTRUST_CA_CERT; overrides SSL_CERT_FILE]
       --env-file <PATH>      Path to a .env file to load
   -h, --help                 Print help
@@ -131,8 +141,12 @@ enum Commands {
     Docs(CLIArgs<setup::DocsArgs>),
     /// Run SQL queries against Braintrust
     Sql(CLIArgs<sql::SqlArgs>),
-    /// Authenticate bt with Braintrust
-    Auth(CLIArgs<auth::AuthArgs>),
+    /// Log in to Braintrust
+    Login(CLIArgs<auth::LoginArgs, LoginBaseArgs>),
+    /// Remove a saved Braintrust login
+    Logout(CLIArgs<auth::LogoutArgs>),
+    /// Manage saved Braintrust login profiles
+    Profiles(CLIArgs<profiles::ProfilesArgs, LoginBaseArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
     #[cfg(unix)]
@@ -140,13 +154,19 @@ enum Commands {
     Eval(CLIArgs<eval::EvalArgs>),
     /// Manage projects
     Projects(CLIArgs<projects::ProjectsArgs>),
+    /// Manage active observability tools
+    Observability(CLIArgs<observability::ObservabilityArgs>),
     /// Inspect and control Topics automation
     Topics(CLIArgs<topics::TopicsArgs>),
     /// Manage datasets
     Datasets(CLIArgs<datasets::DatasetsArgs>),
+    /// Manage deployment environments
+    Environments(CLIArgs<environments::EnvironmentsArgs>),
     /// Manage prompts
     Prompts(CLIArgs<prompts::PromptsArgs>),
-    #[command(name = "self")]
+    /// Update bt in-place
+    Update(CLIArgs<self_update::UpdateArgs>),
+    #[command(name = "self", hide = true)]
     /// Self-management commands
     SelfCommand(CLIArgs<self_update::SelfArgs>),
     /// Manage tools
@@ -165,27 +185,34 @@ enum Commands {
     Util(CLIArgs<util_cmd::UtilArgs>),
     /// Switch org and project context
     Switch(CLIArgs<switch::SwitchArgs>),
-    /// Show current org and project context
+    /// Show current identity, org, and project context
     Status(CLIArgs<status::StatusArgs>),
+    /// Manage coding-agent tracing
+    Trace(CLIArgs<bt_daemon::TraceArgs>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
 
 impl Commands {
-    fn base(&self) -> &BaseArgs {
+    fn base(&self) -> &LoginBaseArgs {
         match self {
             Commands::Init(cmd) => &cmd.base,
             Commands::Setup(cmd) => &cmd.base,
             Commands::Docs(cmd) => &cmd.base,
             Commands::Sql(cmd) => &cmd.base,
-            Commands::Auth(cmd) => &cmd.base,
+            Commands::Login(cmd) => &cmd.base,
+            Commands::Logout(cmd) => &cmd.base,
+            Commands::Profiles(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
+            Commands::Observability(cmd) => &cmd.base,
             Commands::Topics(cmd) => &cmd.base,
             Commands::Datasets(cmd) => &cmd.base,
+            Commands::Environments(cmd) => &cmd.base,
             Commands::Prompts(cmd) => &cmd.base,
+            Commands::Update(cmd) => &cmd.base,
             Commands::SelfCommand(cmd) => &cmd.base,
             Commands::Tools(cmd) => &cmd.base,
             Commands::Scorers(cmd) => &cmd.base,
@@ -196,23 +223,29 @@ impl Commands {
             Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
             Commands::Status(cmd) => &cmd.base,
+            Commands::Trace(cmd) => &cmd.base,
         }
     }
 
-    fn base_mut(&mut self) -> &mut BaseArgs {
+    fn base_mut(&mut self) -> &mut LoginBaseArgs {
         match self {
             Commands::Init(cmd) => &mut cmd.base,
             Commands::Setup(cmd) => &mut cmd.base,
             Commands::Docs(cmd) => &mut cmd.base,
             Commands::Sql(cmd) => &mut cmd.base,
-            Commands::Auth(cmd) => &mut cmd.base,
+            Commands::Login(cmd) => &mut cmd.base,
+            Commands::Logout(cmd) => &mut cmd.base,
+            Commands::Profiles(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
+            Commands::Observability(cmd) => &mut cmd.base,
             Commands::Datasets(cmd) => &mut cmd.base,
+            Commands::Environments(cmd) => &mut cmd.base,
             Commands::Topics(cmd) => &mut cmd.base,
             Commands::Prompts(cmd) => &mut cmd.base,
+            Commands::Update(cmd) => &mut cmd.base,
             Commands::SelfCommand(cmd) => &mut cmd.base,
             Commands::Tools(cmd) => &mut cmd.base,
             Commands::Scorers(cmd) => &mut cmd.base,
@@ -223,6 +256,7 @@ impl Commands {
             Commands::Util(cmd) => &mut cmd.base,
             Commands::Switch(cmd) => &mut cmd.base,
             Commands::Status(cmd) => &mut cmd.base,
+            Commands::Trace(cmd) => &mut cmd.base,
         }
     }
 
@@ -241,13 +275,31 @@ enum ExitCode {
     User = 4,
 }
 
+impl ExitCode {
+    #[cfg(windows)]
+    fn from_process_code(code: Option<i32>) -> Self {
+        [Self::Error, Self::Auth, Self::Network, Self::User]
+            .into_iter()
+            .find(|value| Some(*value as i32) == code)
+            .unwrap_or(Self::Error)
+    }
+}
+
+static JSON_OUTPUT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn main() {
     let exit_code = match try_main() {
         Ok(()) => ExitCode::Success,
         Err(err) => {
             let missing_credential = crate::auth::is_missing_credential_error(&err);
             let code = classify_error(&err, missing_credential);
-            print_error(&err, code, missing_credential);
+            print_error(
+                &err,
+                code,
+                missing_credential,
+                JSON_OUTPUT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed),
+            );
             code
         }
     };
@@ -278,7 +330,7 @@ fn handle_version_json(argv: &[OsString]) -> Result<bool> {
     Ok(true)
 }
 
-fn apply_runtime_env_overrides(base: &BaseArgs) {
+fn apply_runtime_env_overrides(base: &LoginBaseArgs) {
     // Apply the CLI-owned override once so reqwest and inherited child
     // commands consistently observe BRAINTRUST_CA_CERT/--ca-cert precedence
     // over any ambient SSL_CERT_FILE.
@@ -300,6 +352,10 @@ fn try_main() -> Result<()> {
     apply_base_arg_sources(&matches, cli.command.base_mut());
     cli.command.base_mut().profile_explicit = has_explicit_profile_arg(&argv);
     apply_base_output_defaults(&mut cli.command);
+    JSON_OUTPUT_REQUESTED.store(
+        cli.command.base().json,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     configure_output(cli.command.base());
     apply_runtime_env_overrides(cli.command.base());
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -309,7 +365,9 @@ fn try_main() -> Result<()> {
 
     let command_result: Result<()> = runtime.block_on(async move {
         match cli.command {
-            Commands::Auth(cmd) => auth::run(cmd.base, cmd.args).await?,
+            Commands::Login(cmd) => auth::run_login_command(cmd.base.into(), cmd.args).await?,
+            Commands::Logout(cmd) => auth::run_logout_command(cmd.base, cmd.args)?,
+            Commands::Profiles(cmd) => profiles::run(cmd.base, cmd.args)?,
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
@@ -318,9 +376,20 @@ fn try_main() -> Result<()> {
             #[cfg(unix)]
             Commands::Eval(cmd) => eval::run(cmd.base, cmd.args).await?,
             Commands::Projects(cmd) => projects::run(cmd.base, cmd.args).await?,
+            Commands::Observability(cmd) => observability::run(cmd.base, cmd.args).await?,
             Commands::Datasets(cmd) => datasets::run(cmd.base, cmd.args).await?,
+            Commands::Environments(cmd) => environments::run(cmd.base, cmd.args).await?,
             Commands::Topics(cmd) => topics::run(cmd.base, cmd.args).await?,
             Commands::Prompts(cmd) => prompts::run(cmd.base, cmd.args).await?,
+            Commands::Update(cmd) => {
+                self_update::run(
+                    cmd.base,
+                    self_update::SelfArgs {
+                        command: self_update::SelfSubcommand::Update(cmd.args),
+                    },
+                )
+                .await?
+            }
             Commands::Tools(cmd) => tools::run(cmd.base, cmd.args).await?,
             Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
             Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
@@ -331,6 +400,9 @@ fn try_main() -> Result<()> {
             Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
             Commands::Switch(cmd) => switch::run(cmd.base, cmd.args).await?,
             Commands::Status(cmd) => status::run(cmd.base, cmd.args).await?,
+            Commands::Trace(cmd) => {
+                bt_daemon::run_trace(cmd.args, trace_host::context(cmd.base)).await?
+            }
         }
         Ok(())
     });
@@ -338,10 +410,15 @@ fn try_main() -> Result<()> {
     command_result
 }
 
-fn apply_base_arg_sources(matches: &ArgMatches, base: &mut BaseArgs) {
+fn apply_base_arg_sources(matches: &ArgMatches, base: &mut LoginBaseArgs) {
     base.verbose_source = find_value_source(matches, "verbose").and_then(map_value_source);
     base.quiet_source = find_value_source(matches, "quiet").and_then(map_value_source);
     base.api_key_source = find_value_source(matches, "api_key").and_then(map_value_source);
+
+    if !matches!(base.api_key_source, Some(ArgValueSource::EnvVariable)) {
+        base.api_key = None;
+        base.api_key_source = None;
+    }
 }
 
 fn apply_base_output_defaults(command: &mut Commands) {
@@ -374,7 +451,7 @@ fn map_value_source(source: ValueSource) -> Option<ArgValueSource> {
     }
 }
 
-fn configure_output(base: &BaseArgs) {
+fn configure_output(base: &LoginBaseArgs) {
     let mut disable_color = base.no_color || std::env::var_os("NO_COLOR").is_some();
 
     // TERM is a terminal capability signal; it isn't a user-facing config knob.
@@ -401,6 +478,18 @@ fn configure_output(base: &BaseArgs) {
 fn classify_error(err: &anyhow::Error, missing_credential: bool) -> ExitCode {
     if missing_credential {
         return ExitCode::Auth;
+    }
+
+    #[cfg(windows)]
+    if let Some(err) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<self_update::UpdateWorkerError>())
+    {
+        return ExitCode::from_process_code(err.1);
+    }
+
+    if has_user_error(err) {
+        return ExitCode::User;
     }
 
     if let Some(http_error) = find_http_error(err) {
@@ -483,6 +572,10 @@ fn has_io_error(err: &anyhow::Error) -> bool {
         .any(|source| source.downcast_ref::<std::io::Error>().is_some())
 }
 
+fn has_user_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::error::UserError>().is_some()
+}
+
 fn looks_like_user_error(err: &anyhow::Error) -> bool {
     let message = err.to_string().to_lowercase();
     message.contains("required")
@@ -491,10 +584,43 @@ fn looks_like_user_error(err: &anyhow::Error) -> bool {
         || message.contains("invalid")
 }
 
-fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool) {
+fn json_error_payload(err: &anyhow::Error) -> serde_json::Value {
+    let details = find_http_error(err)
+        .and_then(|error| serde_json::from_str::<serde_json::Value>(&error.body).ok());
+    let message = details
+        .as_ref()
+        .and_then(json_error_message)
+        .unwrap_or_else(|| err.to_string());
+
+    match details {
+        Some(details) => serde_json::json!({
+            "error": {
+                "message": message,
+                "details": details,
+            }
+        }),
+        None => serde_json::json!({ "error": { "message": message } }),
+    }
+}
+
+fn json_error_message(details: &serde_json::Value) -> Option<String> {
+    details
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| details.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| details.get("error").and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool, json_output: bool) {
+    if json_output {
+        println!("{}", json_error_payload(err));
+        return;
+    }
+
     eprintln!("error: {err}");
     if code == ExitCode::Auth && !missing_credential {
-        eprintln!("Your credentials may be expired or invalid. For OAuth profiles, try `bt auth refresh --profile <NAME>`; if refresh fails, re-run `bt auth login --oauth --profile <NAME>`. Run `bt auth profiles` and `bt status` to inspect profile status.");
+        eprintln!("Your credentials may be expired or invalid. For OAuth profiles, try `bt login --refresh --profile <NAME>`; if refresh fails, re-run `bt login --oauth --profile <NAME>`. Run `bt status --all` to inspect profile status.");
     }
     if code == ExitCode::Error {
         eprintln!("If this seems like a bug, file an issue at https://github.com/braintrustdata/bt/issues/new and include `bt --version`, `bt status --json`, and the command you ran.");
@@ -518,27 +644,6 @@ mod tests {
             Some(value) => env::set_var(key, value),
             None => env::remove_var(key),
         }
-    }
-
-    #[test]
-    fn apply_base_arg_sources_tracks_cli_api_key() {
-        let _guard = env_test_lock().lock().expect("env test lock");
-        let previous_api_key = env::var_os("BRAINTRUST_API_KEY");
-        env::remove_var("BRAINTRUST_API_KEY");
-
-        let matches = Cli::command()
-            .try_get_matches_from(["bt", "status", "--api-key", "secret"])
-            .expect("matches");
-        let mut cli = Cli::from_arg_matches(&matches).expect("cli");
-
-        apply_base_arg_sources(&matches, cli.command.base_mut());
-
-        restore_env_var("BRAINTRUST_API_KEY", previous_api_key);
-
-        assert_eq!(
-            cli.command.base().api_key_source,
-            Some(ArgValueSource::CommandLine)
-        );
     }
 
     #[test]
@@ -573,6 +678,35 @@ mod tests {
             Some(ArgValueSource::CommandLine)
         );
         assert!(cli.command.base().verbose_explicit());
+    }
+
+    #[test]
+    fn login_rejects_context_selection_flags() {
+        for args in [
+            ["bt", "login", "--org", "test-org"],
+            ["bt", "login", "--project", "test-project"],
+        ] {
+            let err = Cli::try_parse_from(args).expect_err("context flag should be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn app_public_url_parses_as_global_flag() {
+        let cli = Cli::try_parse_from([
+            "bt",
+            "projects",
+            "view",
+            "test-project",
+            "--app-public-url",
+            "https://public.example.test",
+        ])
+        .expect("app public URL should parse");
+
+        assert_eq!(
+            cli.command.base().app_public_url.as_deref(),
+            Some("https://public.example.test")
+        );
     }
 
     #[test]
@@ -646,6 +780,76 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn typed_user_errors_use_the_user_exit_code() {
+        let err =
+            crate::error::user_error(anyhow::anyhow!("--temperature must be between 0 and 2"));
+
+        assert_eq!(classify_error(&err, false), ExitCode::User);
+    }
+
+    #[test]
+    fn provider_credential_errors_are_not_classified_as_bt_auth_errors() {
+        let err = crate::error::user_error(anyhow::Error::new(crate::http::HttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: serde_json::json!({
+                "error": {
+                    "message": "Incorrect API key provided: synthetic-key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key"
+                },
+                "status": 401
+            })
+            .to_string(),
+        }));
+
+        assert_eq!(classify_error(&err, false), ExitCode::User);
+        let payload = json_error_payload(&err);
+        assert_eq!(
+            payload["error"]["message"],
+            "Incorrect API key provided: synthetic-key"
+        );
+        assert_eq!(
+            payload["error"]["details"]["error"]["code"],
+            "invalid_api_key"
+        );
+    }
+
+    #[test]
+    fn json_http_errors_use_a_stable_envelope() {
+        let err = anyhow::Error::new(crate::http::HttpError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: serde_json::json!(["synthetic", "details"]).to_string(),
+        });
+
+        let payload = json_error_payload(&err);
+        assert!(payload["error"]["message"].is_string());
+        assert_eq!(
+            payload["error"]["details"],
+            serde_json::json!(["synthetic", "details"])
+        );
+    }
+
+    #[test]
+    fn bt_unauthorized_errors_remain_auth_errors() {
+        for body in [
+            serde_json::json!({ "error": "Unauthorized" }),
+            serde_json::json!({
+                "error": {
+                    "message": "Invalid Braintrust API key",
+                    "code": "invalid_api_key"
+                }
+            }),
+        ] {
+            let err = anyhow::Error::new(crate::http::HttpError {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                body: body.to_string(),
+            });
+
+            assert_eq!(classify_error(&err, false), ExitCode::Auth);
+        }
     }
 
     #[test]

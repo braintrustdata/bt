@@ -41,7 +41,7 @@ pub async fn run(ctx: &ResolvedContext, name: Option<&str>, force: bool) -> Resu
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete dataset '{}' from {}?",
-                &dataset.name, &ctx.project.name
+                dataset.name, ctx.project.name
             ))
             .default(false)
             .interact()?;

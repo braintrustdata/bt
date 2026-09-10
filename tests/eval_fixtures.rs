@@ -205,6 +205,46 @@ fn eval_fixtures() {
 }
 
 #[test]
+fn eval_auto_instrumentation_failure_warns_and_continues() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but not installed");
+        }
+        eprintln!("Skipping auto-instrumentation failure test (node not installed).");
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-sample-init-dataset");
+    ensure_dependencies(&fixture_dir);
+
+    let output = Command::new(bt_binary_path(&root))
+        .args(["eval", "--sample", "5", "sample-init-dataset.eval.cjs"])
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_TEST_AUTO_INSTRUMENTATION_FAILURE", "1")
+        .output()
+        .expect("run eval with synthetic auto-instrumentation failure");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auto-instrumentation failure should not fail the eval\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Warning: Failed to apply Braintrust auto-instrumentation; continuing without it:"
+        ),
+        "auto-instrumentation failure should be logged\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn eval_watch_js_dependency_retriggers() {
     let _guard = test_lock();
     if !command_exists("node") {
@@ -419,6 +459,34 @@ fn eval_runner_list_mode_serializes_parameter_defaults() {
         .get("schema")
         .and_then(Value::as_object)
         .expect("parameters schema should be object");
+    let model = schema
+        .get("model")
+        .and_then(Value::as_object)
+        .expect("model parameter should exist");
+    assert_eq!(model.get("type").and_then(Value::as_str), Some("model"));
+    assert_eq!(
+        model.get("default").and_then(Value::as_str),
+        Some("test-model")
+    );
+    assert_eq!(
+        model.get("description").and_then(Value::as_str),
+        Some("Model used by the evaluator")
+    );
+
+    let prompt = schema
+        .get("prompt")
+        .and_then(Value::as_object)
+        .expect("prompt parameter should exist");
+    assert_eq!(prompt.get("type").and_then(Value::as_str), Some("prompt"));
+    assert_eq!(
+        prompt.get("description").and_then(Value::as_str),
+        Some("Prompt used by the evaluator")
+    );
+    assert!(
+        prompt.get("default").is_none(),
+        "prompt parameter should not gain a default"
+    );
+
     let optional = schema
         .get("optional_no_default")
         .and_then(Value::as_object)
@@ -855,6 +923,194 @@ fn eval_matrix_param_terminate_on_failure_stops_early() {
         lines,
         vec!["fail"],
         "with --terminate-on-failure, only the first (failing) combo should execute.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn evaluator_concurrency_stats(path: &Path) -> (usize, usize) {
+    let contents = fs::read_to_string(path).expect("read evaluator concurrency event log");
+    let mut active = BTreeSet::new();
+    let mut peak = 0;
+    let mut starts = 0;
+
+    for line in contents.lines() {
+        if let Some(name) = line.strip_prefix("start:") {
+            assert!(
+                active.insert(name.to_string()),
+                "evaluator {name} started more than once: {contents}"
+            );
+            starts += 1;
+            peak = peak.max(active.len());
+        } else if let Some(name) = line.strip_prefix("end:") {
+            assert!(
+                active.remove(name),
+                "evaluator {name} ended without being active: {contents}"
+            );
+        } else if !line.trim().is_empty() {
+            panic!("unexpected evaluator concurrency event {line:?}: {contents}");
+        }
+    }
+
+    assert!(
+        active.is_empty(),
+        "evaluators remained active at end of event log: {contents}"
+    );
+    (peak, starts)
+}
+
+#[test]
+fn eval_javascript_max_concurrency_limits_evaluators() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but unavailable for max-concurrency test");
+        }
+        eprintln!(
+            "Skipping eval_javascript_max_concurrency_limits_evaluators (node not installed)."
+        );
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-max-concurrency");
+    ensure_dependencies(&fixture_dir);
+
+    let out_file = fixture_dir.join(format!(
+        ".max-concurrency-out-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ));
+    let output = Command::new(bt_binary_path(&root))
+        .args(["eval", "--max-concurrency", "2", "max-concurrency.eval.mjs"])
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_MAX_CONCURRENCY_TEST_OUT", &out_file)
+        .output()
+        .expect("run JavaScript eval with max concurrency");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "JavaScript max-concurrency eval should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let stats = evaluator_concurrency_stats(&out_file);
+    let _ = fs::remove_file(&out_file);
+    assert_eq!(
+        stats,
+        (2, 3),
+        "expected three evaluators with peak concurrency two.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn eval_javascript_max_concurrency_limits_sampling() {
+    let _guard = test_lock();
+    if !command_exists("node") {
+        if required_runtimes().contains("node") {
+            panic!("node runtime is required but unavailable for max-concurrency sampling test");
+        }
+        eprintln!("Skipping eval_javascript_max_concurrency_limits_sampling (node not installed).");
+        return;
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = root
+        .join("tests")
+        .join("evals")
+        .join("js")
+        .join("eval-max-concurrency");
+    ensure_dependencies(&fixture_dir);
+
+    let out_file = fixture_dir.join(format!(
+        ".max-concurrency-sampling-out-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ));
+    let output = Command::new(bt_binary_path(&root))
+        .args([
+            "eval",
+            "--max-concurrency",
+            "2",
+            "--first",
+            "1",
+            "max-concurrency-sampling.eval.mjs",
+        ])
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_MAX_CONCURRENCY_TEST_OUT", &out_file)
+        .output()
+        .expect("run JavaScript sampled eval with max concurrency");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "JavaScript sampled max-concurrency eval should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let stats = evaluator_concurrency_stats(&out_file);
+    let _ = fs::remove_file(&out_file);
+    assert_eq!(
+        stats,
+        (2, 3),
+        "expected sampling for three evaluators with peak concurrency two.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn eval_python_max_concurrency_limits_evaluators() {
+    let _guard = test_lock();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixtures_root = root.join("tests").join("evals");
+    let fixture_dir = fixtures_root.join("py").join("max_concurrency");
+    let python = match ensure_python_env(&fixtures_root.join("py")) {
+        Some(python) => python,
+        None => {
+            if required_runtimes().contains("python") {
+                panic!("python runtime is required but unavailable for max-concurrency test");
+            }
+            eprintln!(
+                "Skipping eval_python_max_concurrency_limits_evaluators (python unavailable)."
+            );
+            return;
+        }
+    };
+
+    let out_file = fixture_dir.join(format!(
+        ".max-concurrency-out-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos()
+    ));
+    let output = Command::new(bt_binary_path(&root))
+        .args(["eval", "--max-concurrency", "2", "eval_max_concurrency.py"])
+        .current_dir(&fixture_dir)
+        .env("BT_EVAL_LOCAL", "1")
+        .env("BT_EVAL_PYTHON_RUNNER", &python)
+        .env("BT_MAX_CONCURRENCY_TEST_OUT", &out_file)
+        .output()
+        .expect("run Python eval with max concurrency");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Python max-concurrency eval should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let stats = evaluator_concurrency_stats(&out_file);
+    let _ = fs::remove_file(&out_file);
+    assert_eq!(
+        stats,
+        (2, 3),
+        "expected three evaluators with peak concurrency two.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 

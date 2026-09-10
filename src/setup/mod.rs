@@ -22,7 +22,23 @@ use crate::auth::LoginContext;
 use crate::config;
 use crate::http::ApiClient;
 use crate::ui::{self, with_spinner};
-use crate::utils::app_project_url;
+use crate::utils::{app_project_url, write_json_atomic, write_text_atomic};
+
+/// One-line deprecation notice shown in `bt setup` / `bt docs` help text.
+const SETUP_DEPRECATED_HELP: &str =
+    "Deprecated: use curl -fsSL https://braintrust.dev/wizard/setup.sh | sh";
+
+/// Multi-line deprecation warning printed to stderr when `bt setup` / `bt docs` run.
+const SETUP_DEPRECATED_WARNING: &str = "\
+bt setup has been deprecated, use the command below instead:\n\n    curl -fsSL https://braintrust.dev/wizard/setup.sh | sh";
+
+fn print_setup_deprecation_warning(base: &BaseArgs) {
+    if base.json {
+        return;
+    }
+    eprintln!("{}", SETUP_DEPRECATED_WARNING);
+    eprintln!();
+}
 
 mod agent_stream;
 mod docs;
@@ -41,7 +57,13 @@ const SETUP_WIZARD_POLL_PATH: &str = "/api/cli/wizard-session/poll";
 const SETUP_WIZARD_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const SETUP_WIZARD_MAX_CONSECUTIVE_POLL_FAILURES: usize = 30;
 const README_AGENT_SECTION_MARKERS: &[&str] = &[
-    "bt eval", "bt sql", "bt view", "bt auth", "bt setup", "bt docs",
+    "bt eval",
+    "bt sql",
+    "bt view",
+    "bt login",
+    "bt logout",
+    "bt setup",
+    "bt docs",
 ];
 const ALL_AGENTS: [Agent; 7] = [
     Agent::Claude,
@@ -61,12 +83,15 @@ const ALL_WORKFLOWS: [WorkflowArg; 5] = [
 ];
 
 #[derive(Debug, Clone, Args)]
-#[command(after_help = "\
+#[command(
+    before_help = SETUP_DEPRECATED_HELP,
+    after_help = "\
 Examples:
   bt setup --agent cursor --workflow observe
   bt setup skills --agent codex --global
   bt setup mcp --agent codex
-")]
+"
+)]
 pub struct SetupArgs {
     #[command(subcommand)]
     command: Option<SetupSubcommand>,
@@ -136,12 +161,16 @@ pub struct SetupArgs {
 #[derive(Debug, Clone, Subcommand)]
 enum SetupSubcommand {
     /// Configure coding-agent skills to use Braintrust
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Skills(AgentsSetupArgs),
     /// Download instrumentation docs and run a coding agent to instrument this repo
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Instrument(InstrumentSetupArgs),
     /// Configure MCP server settings for coding agents
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Mcp(AgentsMcpSetupArgs),
     /// Diagnose coding-agent setup for Braintrust
+    #[command(before_help = SETUP_DEPRECATED_HELP)]
     Doctor(AgentsDoctorArgs),
 }
 
@@ -566,6 +595,7 @@ struct SkillsAliasResult {
 }
 
 pub async fn run_setup_top(base: BaseArgs, mut args: SetupArgs) -> Result<()> {
+    print_setup_deprecation_warning(&base);
     // Deprecated flag: --no-mcp-skill is equivalent to --no-skills --no-mcp
     if args.no_mcp_skill {
         args.no_skills = true;
@@ -1199,8 +1229,7 @@ fn apply_setup_config_fallbacks(base: &mut BaseArgs) {
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        base.project =
-            config::project_from_config_for_context(base, &cfg, base.org_name.as_deref());
+        base.project = config::project_from_config_for_context(&cfg, base.org_name.as_deref());
     }
 }
 
@@ -1469,13 +1498,14 @@ async fn run_setup_browser_auth(
     };
     let stored_profiles = auth::list_profiles()?;
     let profile_name = setup_browser_profile_name(profile_name, &org.name, &stored_profiles);
+    let org_constraint = (completed.api_key.trim().starts_with("sk-") && available_orgs.len() == 1)
+        .then(|| org.name.clone());
 
     auth::commit_api_key_profile(
         &profile_name,
         &completed.api_key,
-        login.api_url.clone(),
         Some(login.app_url.clone()),
-        Some(org.name.clone()),
+        org_constraint,
     )
     .context("failed to save Braintrust auth profile after browser setup")?;
 
@@ -1522,7 +1552,7 @@ fn setup_browser_profile_name(
 fn resolve_profile_name_for_setup(
     base: &BaseArgs,
     profiles: &[auth::ProfileInfo],
-    prompt_for_choice: bool,
+    _prompt_for_choice: bool,
 ) -> Result<Option<String>> {
     if let Some(profile_name) = base
         .profile
@@ -1534,50 +1564,14 @@ fn resolve_profile_name_for_setup(
             return Ok(Some(profile_name.to_string()));
         }
         bail!(
-            "profile '{profile_name}' not found; run `bt auth profiles` to see available profiles"
+            "profile '{profile_name}' not found; run `bt status --all` to see available profiles"
         );
-    }
-
-    if let Some(org_name) = base.org_name.as_deref() {
-        if let Some(profile_name) = profiles
-            .iter()
-            .find(|profile| profile.name == org_name)
-            .map(|profile| profile.name.clone())
-        {
-            return Ok(Some(profile_name));
-        }
-
-        let mut matches = profiles
-            .iter()
-            .filter(|profile| profile.org_name.as_deref() == Some(org_name))
-            .map(|profile| profile.name.clone())
-            .collect::<Vec<_>>();
-        matches.sort();
-
-        return match matches.len() {
-            0 => Ok(None),
-            1 => Ok(Some(matches.remove(0))),
-            _ if prompt_for_choice => auth::select_profile_interactive(Some(org_name))?
-                .map(Some)
-                .ok_or_else(|| anyhow!("no profile selected")),
-            _ => bail!(
-                "multiple profiles for org '{org_name}': {}. Use --profile to disambiguate.",
-                matches.join(", ")
-            ),
-        };
     }
 
     if profiles.len() == 1 {
         return Ok(Some(profiles[0].name.clone()));
     }
-
-    if prompt_for_choice && !profiles.is_empty() {
-        auth::select_profile_interactive(None)?
-            .map(Some)
-            .ok_or_else(|| anyhow!("no profile selected"))
-    } else {
-        Ok(None)
-    }
+    Ok(None)
 }
 
 fn find_http_error(err: &anyhow::Error) -> Option<&crate::http::HttpError> {
@@ -1646,6 +1640,7 @@ fn build_api_key_login_context(
         login,
         api_url,
         app_url,
+        profile: None,
     }
 }
 
@@ -1758,13 +1753,17 @@ async fn ensure_profile_or_setup_browser_auth(
     auth_base.api_key = None;
     auth_base.api_key_source = None;
 
-    if let Some(profile_name) = selected_profile {
+    if let Some(profile_name) = selected_profile.as_ref() {
         auth_base.profile = Some(profile_name.clone());
+    }
 
+    if selected_profile.is_some() || !profiles.is_empty() {
         match auth::login(&auth_base).await {
             Ok(ctx) => {
-                base.profile = auth_base.profile.clone();
-                let is_oauth = auth::resolve_auth(&auth_base).await?.is_oauth;
+                base.profile = ctx.profile.clone();
+                let mut resolved_base = auth_base.clone();
+                resolved_base.profile = ctx.profile.clone();
+                let is_oauth = auth::resolve_auth(&resolved_base).await?.is_oauth;
                 return Ok(SetupAuthLogin {
                     login: ctx,
                     is_oauth,
@@ -1773,10 +1772,8 @@ async fn ensure_profile_or_setup_browser_auth(
             }
             Err(err) if auth::is_missing_credential_error(&err) => {
                 if base.verbose {
-                    eprintln!(
-                        "   Profile '{}' credentials inaccessible ({}). Re-authenticating in the browser...",
-                        profile_name, err
-                    );
+                    let profile = selected_profile.as_deref().unwrap_or("selected profile");
+                    eprintln!("   Profile '{profile}' credentials inaccessible ({err}). Re-authenticating in the browser...");
                 }
                 if !can_prompt {
                     bail!(
@@ -1785,7 +1782,7 @@ async fn ensure_profile_or_setup_browser_auth(
                 }
                 return run_setup_browser_auth(
                     base,
-                    Some(&profile_name),
+                    selected_profile.as_deref(),
                     project_name,
                     project_was_explicit,
                     requested_org,
@@ -2043,17 +2040,12 @@ async fn ensure_setup_auth(
                     &[],
                 )?;
                 let client = build_api_key_client(base, api_key, &org).await?;
-                let api_url = base
-                    .api_url
-                    .clone()
-                    .or_else(|| org.api_url.clone())
-                    .unwrap_or_else(|| DEFAULT_API_URL.to_string());
                 auth::commit_api_key_profile(
                     &org.name,
                     api_key,
-                    api_url,
                     base.app_url.clone(),
-                    Some(org.name.clone()),
+                    (api_key.trim().starts_with("sk-") && available_orgs.len() == 1)
+                        .then(|| org.name.clone()),
                 )?;
                 return build_setup_auth_context(base, client, false, needs_api_key, None).await;
             }
@@ -2208,12 +2200,7 @@ async fn build_setup_auth_context(
 }
 
 fn should_create_api_key_for_setup(is_oauth: bool, base: &BaseArgs, needs_api_key: bool) -> bool {
-    needs_api_key
-        && is_oauth
-        && !matches!(
-            base.api_key_source,
-            Some(ArgValueSource::CommandLine | ArgValueSource::EnvVariable)
-        )
+    needs_api_key && is_oauth && !matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
 }
 
 async fn maybe_create_api_key_for_oauth(base: &BaseArgs, client: &ApiClient) -> Result<String> {
@@ -2798,7 +2785,8 @@ fn print_post_agent_followups(base: &BaseArgs) {
 fn setup_project_logs_url(base: &BaseArgs) -> Option<String> {
     let (org, project) = setup_project_context(base)?;
     let app_url = base.app_url.as_deref().unwrap_or(DEFAULT_APP_URL);
-    Some(app_project_url(app_url, &org, &project, &["logs"]))
+    let app_public_url = base.resolved_app_public_url(app_url);
+    Some(app_project_url(app_public_url, &org, &project, &["logs"]))
 }
 
 fn setup_project_context(base: &BaseArgs) -> Option<(String, String)> {
@@ -5039,45 +5027,19 @@ fn load_toml_table_or_default(path: &Path) -> Result<toml::map::Map<String, Toml
 }
 
 fn write_json_object(path: &Path, object: &Map<String, Value>) -> Result<()> {
-    let data = serde_json::to_string_pretty(&Value::Object(object.clone()))
-        .with_context(|| format!("failed to serialize JSON for {}", path.display()))?;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, format!("{data}\n"))
-        .with_context(|| format!("failed to finalize temp JSON file {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
-
-    Ok(())
+    write_json_atomic(path, object)
 }
 
 fn write_toml_table(path: &Path, table: &toml::map::Map<String, TomlValue>) -> Result<()> {
     let data = toml::to_string_pretty(&TomlValue::Table(table.clone()))
         .with_context(|| format!("failed to serialize TOML for {}", path.display()))?;
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, format!("{data}\n"))
-        .with_context(|| format!("failed to finalize temp TOML file {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
-
-    Ok(())
+    write_text_atomic(path, &format!("{data}\n"))
 }
 
 pub(super) fn write_text_file(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-    fs::write(path, format!("{}\n", content.trim_end()))
+    let normalized = format!("{}\n", content.trim_end());
+    write_text_atomic(path, &normalized)
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
@@ -5426,26 +5388,25 @@ mod tests {
     }
 
     fn make_base_args() -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: None,
-            profile_explicit: false,
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
+        BaseArgs::default()
+    }
+
+    #[test]
+    fn project_logs_link_uses_public_app_url() {
+        let base = BaseArgs {
+            login: crate::args::LoginBaseArgs {
+                app_url: Some("https://private.example.test".to_string()),
+                app_public_url: Some("https://public.example.test".to_string()),
+                ..Default::default()
+            },
+            org_name: Some("test org".to_string()),
+            project: Some("test project".to_string()),
+        };
+
+        assert_eq!(
+            setup_project_logs_url(&base).as_deref(),
+            Some("https://public.example.test/app/test%20org/p/test%20project/logs")
+        );
     }
 
     fn restore_env_var(key: &str, previous: Option<OsString>) {
@@ -5474,6 +5435,7 @@ mod tests {
             login,
             api_url,
             app_url,
+            profile: None,
         }
     }
 
@@ -5778,6 +5740,9 @@ mod tests {
         let profiles = vec![
             auth::ProfileInfo {
                 name: "zeta".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Zeta Org".to_string()),
                 user_name: None,
                 email: None,
@@ -5785,6 +5750,9 @@ mod tests {
             },
             auth::ProfileInfo {
                 name: "alpha".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Alpha Org".to_string()),
                 user_name: None,
                 email: None,
@@ -5813,6 +5781,9 @@ mod tests {
         base.profile = Some("missing".to_string());
         let profiles = vec![auth::ProfileInfo {
             name: "work".to_string(),
+            auth: "api_key".to_string(),
+            app_url: "https://app.test.example".to_string(),
+            oauth_api_url: None,
             org_name: Some("Acme".to_string()),
             user_name: None,
             email: None,
@@ -5829,6 +5800,9 @@ mod tests {
         let profiles = vec![
             auth::ProfileInfo {
                 name: "Acme".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Acme".to_string()),
                 user_name: None,
                 email: None,
@@ -5836,6 +5810,9 @@ mod tests {
             },
             auth::ProfileInfo {
                 name: "Acme-2".to_string(),
+                auth: "api_key".to_string(),
+                app_url: "https://app.test.example".to_string(),
+                oauth_api_url: None,
                 org_name: Some("Acme".to_string()),
                 user_name: None,
                 email: None,
@@ -7375,6 +7352,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_gemini_project_scope_for_local() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7429,6 +7407,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_gemini_user_scope_for_global() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7475,6 +7454,7 @@ mod tests {
         assert!(log.contains(&home.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_qwen_project_scope_for_local() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7529,6 +7509,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_qwen_user_scope_for_global() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7575,6 +7556,7 @@ mod tests {
         assert!(log.contains(&home.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_copilot_with_config_dir_for_local() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");
@@ -7630,6 +7612,7 @@ mod tests {
         assert!(log.contains(&root.display().to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_mcp_for_agent_invokes_copilot_without_config_dir_for_global() {
         let _guard = cwd_test_lock().lock().expect("lock cwd test");

@@ -5,7 +5,7 @@
 - Do not introduce new ad-hoc configuration reads via `std::env::var(...)` / `process.env` / `os.getenv(...)` in command logic.
 - All user-facing/runtime configuration must be defined in `clap` arguments:
   - a CLI flag, and
-  - a corresponding environment variable (`#[arg(env = ...)]`).
+  - for persistent configuration, a corresponding environment variable (`#[arg(env = ...)]`).
 - Entry points/runners should receive configuration from the CLI layer (via args/env that the CLI owns), not from independent, undocumented env lookups.
 - Extreme edge-case exceptions are allowed only when a flag is not feasible (for example, process-internal plumbing), and must be:
   - documented inline with a short rationale, and
@@ -14,10 +14,10 @@
 
 ## BTQL Safety
 
-- Every BTQL query must include either:
-  - a timestamp filter (for example, `created >= NOW() - INTERVAL ...` or `created >= "<ts>"`), or
-  - a `root_span_id` filter.
-- Do not run BTQL queries that lack both constraints.
+- BTQL queries over `project_logs(...)` or the combined `project(...)` source must include a useful segment-elimination constraint:
+  - a selective range on `created`, `_xact_id`, or `_pagination_key`; or
+  - scoping to specific `root_span_id` or `id` values.
+- This requirement does not apply to other object sources such as `project_functions(...)`, `project_prompts(...)`, `dataset(...)`, or `experiment(...)`.
 
 ## Tooling
 

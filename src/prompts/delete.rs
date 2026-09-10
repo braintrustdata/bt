@@ -16,7 +16,7 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Resu
     }
 
     let prompt = match slug {
-        Some(s) => api::get_prompt_by_slug(&ctx.client, project_name, s)
+        Some(s) => api::get_prompt_by_slug(&ctx.client, project_name, s, None, None)
             .await?
             .ok_or_else(|| anyhow!("prompt with slug '{s}' not found"))?,
         None => {
@@ -31,7 +31,7 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Resu
         let confirm = Confirm::new()
             .with_prompt(format!(
                 "Delete prompt '{}' from {}?",
-                &prompt.name, project_name
+                prompt.name, project_name
             ))
             .default(false)
             .interact()?;
@@ -68,8 +68,11 @@ pub async fn run(ctx: &ResolvedContext, slug: Option<&str>, force: bool) -> Resu
 }
 
 pub async fn select_prompt_interactive(client: &ApiClient, project: &str) -> Result<Prompt> {
-    let mut prompts =
-        with_spinner("Loading prompts...", api::list_prompts(client, project)).await?;
+    let mut prompts = with_spinner(
+        "Loading prompts...",
+        api::list_prompts(client, project, None),
+    )
+    .await?;
     if prompts.is_empty() {
         bail!("no prompts found");
     }

@@ -82,6 +82,7 @@ class RunnerConfig:
     jsonl: bool
     list_only: bool
     terminate_on_failure: bool
+    max_concurrency: int | None
     num_workers: int | None
     filters: list[EvalFilter]
     first: int | None
@@ -270,6 +271,7 @@ def read_runner_config() -> RunnerConfig:
         jsonl=env_flag("BT_EVAL_JSONL"),
         list_only=env_flag("BT_EVAL_LIST"),
         terminate_on_failure=env_flag("BT_EVAL_TERMINATE_ON_FAILURE"),
+        max_concurrency=parse_positive_int_env("BT_EVAL_MAX_CONCURRENCY"),
         num_workers=num_workers,
         filters=parse_serialized_filters(os.getenv("BT_EVAL_FILTER_PARSED")),
         first=parse_positive_int_env("BT_EVAL_FIRST"),
@@ -1324,6 +1326,11 @@ async def run_once(
         sse.send("processing", {"evaluators": len(evaluators)})
 
     progress_mode = run_evaluator_progress_mode()
+    eval_semaphore = (
+        asyncio.Semaphore(config.max_concurrency)
+        if config.max_concurrency is not None
+        else None
+    )
 
     async def run_single_evaluator(
         idx: int, evaluator_instance: EvaluatorInstance
@@ -1350,7 +1357,11 @@ async def run_once(
             # command running multiple evaluators doesn't fail on unrelated params.
             filtered_params = filter_params_for_evaluator(effective_params, evaluator.parameters)
             evaluator.parameters = validate_parameters(filtered_params, evaluator.parameters)
+        acquired_eval_slot = False
         try:
+            if eval_semaphore is not None:
+                await eval_semaphore.acquire()
+                acquired_eval_slot = True
             result = await run_evaluator_task(
                 evaluator_instance.evaluator,
                 idx,
@@ -1363,6 +1374,9 @@ async def run_once(
         except Exception as exc:
             err = serialize_error(str(exc), traceback.format_exc())
             return evaluator_instance, resolved_reporter, None, err
+        finally:
+            if acquired_eval_slot and eval_semaphore is not None:
+                eval_semaphore.release()
 
         return evaluator_instance, resolved_reporter, result, None
 
@@ -1419,7 +1433,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run evals and emit SSE events for bt.")
     parser.add_argument("files", nargs="*", help="Eval files or directories to run.")
     parser.add_argument("--local", action="store_true", help="Do not send logs to Braintrust.")
-    parser.add_argument("--api-key", help="Specify a braintrust API key.")
     parser.add_argument("--org-name", help="Organization name.")
     parser.add_argument("--app-url", help="Braintrust app URL.")
     return parser
@@ -1436,13 +1449,23 @@ def main(argv: list[str] | None = None) -> int:
     if config.num_workers is not None:
         set_thread_pool_max_workers(config.num_workers)
 
-    if not local:
-        login(api_key=args.api_key, org_name=args.org_name, app_url=args.app_url)
-
     sse = create_sse_writer()
     cwd = os.path.abspath(os.getcwd())
+    success = False
     try:
-        success = asyncio.run(run_once(files, local, sse, config))
+        try:
+            if not local:
+                login(org_name=args.org_name, app_url=args.app_url)
+            success = asyncio.run(run_once(files, local, sse, config))
+        except Exception as exc:
+            stack = traceback.format_exc()
+            # The structured event preserves the traceback in dev-server logs.
+            # Only print it directly when no parent SSE connection is present,
+            # otherwise every traceback would be logged twice.
+            if sse:
+                send_eval_error(sse, str(exc), stack, 500)
+            else:
+                eprint(stack.rstrip())
 
         if not local:
             try:

@@ -194,6 +194,7 @@ where
     }
 }
 
+#[cfg(unix)]
 pub(crate) async fn forward_stream<T, F>(
     stream: T,
     name: &'static str,

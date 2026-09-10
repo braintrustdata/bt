@@ -14,25 +14,26 @@ pub async fn run(
     app_url: &str,
     org_name: &str,
     name: Option<&str>,
+    json: bool,
 ) -> Result<()> {
-    let project_name = match name {
-        Some(n) => {
-            with_spinner("Loading project...", api::get_project_by_name(client, n))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("project '{n}' not found"))?
-                .name
-        }
+    let project = match name {
+        Some(n) => with_spinner("Loading project...", api::get_project_by_name(client, n))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("project '{n}' not found"))?,
         None => {
             if !is_interactive() {
                 bail!("project name required. Use: bt projects view <name>")
             }
-            select_project(client, None, None, ProjectSelectMode::ExistingOnly)
-                .await?
-                .name
+            select_project(client, None, None, ProjectSelectMode::ExistingOnly).await?
         }
     };
 
-    let url = app_project_url(app_url, org_name, &project_name, &[]);
+    if json {
+        println!("{}", serde_json::to_string(&project)?);
+        return Ok(());
+    }
+
+    let url = app_project_url(app_url, org_name, &project.name, &[]);
 
     open::that(&url)?;
     print_command_status(CommandStatus::Success, &format!("Opened {url} in browser"));

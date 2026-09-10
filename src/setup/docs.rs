@@ -508,6 +508,7 @@ fn collect_docs_links(
         let Some(url) = absolutize_url(&raw_url, base_url) else {
             continue;
         };
+        let url = markdown_docs_url(&url);
         let Some(workflow) = workflow_from_url(&url) else {
             continue;
         };
@@ -535,6 +536,7 @@ fn collect_docs_links(
                     .to_string()
             })
             .unwrap_or_default();
+        let url = markdown_docs_url(&url);
         let Some(workflow) = workflow_from_url(&url) else {
             continue;
         };
@@ -614,6 +616,27 @@ fn docs_url_preference_score(url: &str) -> i32 {
 
 fn should_replace_docs_url(existing_url: &str, candidate_url: &str) -> bool {
     docs_url_preference_score(candidate_url) > docs_url_preference_score(existing_url)
+}
+
+fn markdown_docs_url(url: &str) -> String {
+    let (path, suffix) = match url.find(['?', '#']) {
+        Some(index) => url.split_at(index),
+        None => (url, ""),
+    };
+    if path.ends_with(".md") {
+        return url.to_string();
+    }
+    if let Some(path) = path.strip_suffix(".html") {
+        return format!("{path}.md{suffix}");
+    }
+    if path
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| segment.contains('.'))
+    {
+        return url.to_string();
+    }
+    format!("{}.md{suffix}", path.trim_end_matches('/'))
 }
 
 fn absolutize_url(raw: &str, base_url: &reqwest::Url) -> Option<String> {
@@ -859,6 +882,26 @@ mod tests {
         assert_eq!(
             canonical_docs_url("https://www.braintrust.dev/docs/deploy/ai-proxy"),
             "https://braintrust.dev/docs/deploy/ai-proxy"
+        );
+    }
+
+    #[test]
+    fn markdown_docs_url_prefers_markdown_for_extensionless_pages() {
+        assert_eq!(
+            markdown_docs_url("https://www.braintrust.dev/docs/observe"),
+            "https://www.braintrust.dev/docs/observe.md"
+        );
+        assert_eq!(
+            markdown_docs_url("https://www.braintrust.dev/docs/observe.html?tab=1"),
+            "https://www.braintrust.dev/docs/observe.md?tab=1"
+        );
+        assert_eq!(
+            markdown_docs_url("https://www.braintrust.dev/docs/observe.md#details"),
+            "https://www.braintrust.dev/docs/observe.md#details"
+        );
+        assert_eq!(
+            markdown_docs_url("https://www.braintrust.dev/docs/observe.mdx?tab=1"),
+            "https://www.braintrust.dev/docs/observe.mdx?tab=1"
         );
     }
 

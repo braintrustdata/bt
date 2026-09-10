@@ -469,7 +469,8 @@ pub async fn run(base: BaseArgs, args: TopicsArgs) -> Result<()> {
                             )
                             .await
                         }
-                        Some(TopicMapCommands::Set(mut set_args)) => {
+                        Some(TopicMapCommands::Set(set_args)) => {
+                            let mut set_args = *set_args;
                             set_args.automation_id =
                                 set_args.automation_id.or(topic_map_automation_id);
                             config::run_topic_map_set(&ctx, &set_args, base.json).await
@@ -811,6 +812,7 @@ mod tests {
         let Some(TopicMapCommands::Set(set_args)) = &topic_map_args.command else {
             panic!("expected topic-map set command");
         };
+        let set_args = set_args.as_ref();
 
         assert_eq!(set_args.topic_map, "Task");
         assert_eq!(

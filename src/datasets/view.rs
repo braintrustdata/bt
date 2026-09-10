@@ -45,7 +45,7 @@ pub async fn run(
     };
 
     let url = app_project_url(
-        &ctx.app_url,
+        &ctx.app_public_url,
         ctx.client.org_name(),
         &ctx.project.name,
         &["datasets", &dataset.name],

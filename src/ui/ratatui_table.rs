@@ -271,10 +271,7 @@ fn common_prefix_len(tokenized: &[Vec<String>]) -> usize {
         return 0;
     };
     let mut len = 0;
-    'outer: loop {
-        let Some(candidate) = first.get(len) else {
-            break;
-        };
+    'outer: while let Some(candidate) = first.get(len) {
         for tokens in tokenized.iter().skip(1) {
             if tokens.get(len) != Some(candidate) {
                 break 'outer;

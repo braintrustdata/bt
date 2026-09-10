@@ -13,9 +13,11 @@ use crate::{
 };
 
 pub(crate) mod api;
+pub(crate) mod create;
 mod delete;
 mod invoke;
 mod list;
+pub(crate) mod prompt_config;
 mod pull;
 mod push;
 pub(crate) mod report;
@@ -114,6 +116,9 @@ fn build_web_path(function: &Function) -> String {
     match function.function_type.as_deref() {
         Some("tool") => format!("tools?pr={}", urlencoding::encode(id)),
         Some("scorer") => format!("scorers/{}", urlencoding::encode(id)),
+        Some("classifier") if function.prompt_data.is_some() => {
+            format!("scorers/{}", urlencoding::encode(id))
+        }
         Some("classifier") => {
             let xact_id = function._xact_id.as_deref().unwrap_or("");
             format!(
@@ -177,14 +182,14 @@ pub struct FunctionArgs {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum FunctionCommands {
+pub(crate) enum FunctionCommands {
     /// List all in the current project
     List,
-    /// View a function's details
+    /// View details
     View(ViewArgs),
-    /// Delete a function
+    /// Delete by slug
     Delete(DeleteArgs),
-    /// Invoke a function
+    /// Invoke by slug
     Invoke(invoke::InvokeArgs),
 }
 
@@ -433,15 +438,32 @@ pub struct ViewArgs {
     /// Function id
     #[arg(long = "id", env = "BT_FUNCTIONS_VIEW_ID")]
     id: Option<String>,
-    /// Version selector.
-    #[arg(long, env = "BT_FUNCTIONS_VIEW_VERSION")]
+    /// Function version identifier (for example, a transaction ID)
+    #[arg(
+        long,
+        env = "BT_FUNCTIONS_VIEW_VERSION",
+        conflicts_with = "environment"
+    )]
     version: Option<String>,
+    /// Environment slug whose assigned function version should be shown
+    #[arg(long, env = "BT_FUNCTIONS_VIEW_ENVIRONMENT")]
+    environment: Option<String>,
     /// Open in browser
     #[arg(long)]
     web: bool,
 }
 
 impl ViewArgs {
+    fn options(&self, base: &BaseArgs) -> view::ViewOptions<'_> {
+        view::ViewOptions {
+            version: self.version.as_deref(),
+            environment: self.environment.as_deref(),
+            json: base.json,
+            web: self.web,
+            verbose: base.verbose,
+        }
+    }
+
     fn selector(&self) -> Result<ViewSelector<'_>> {
         match (
             self.id.as_deref(),
@@ -487,7 +509,7 @@ impl DeleteArgs {
 
 pub(crate) struct AuthContext {
     pub client: ApiClient,
-    pub app_url: String,
+    pub app_public_url: String,
     pub org_id: String,
 }
 
@@ -496,9 +518,10 @@ pub(crate) use crate::project_context::ProjectContext as ResolvedContext;
 pub(crate) async fn resolve_auth_context(base: &BaseArgs) -> Result<AuthContext> {
     let ctx = login(base).await?;
     let client = ApiClient::new(&ctx)?;
+    let app_public_url = base.resolved_app_public_url(&ctx.app_url).to_string();
     Ok(AuthContext {
         client,
-        app_url: ctx.app_url,
+        app_public_url,
         org_id: ctx.login.org_id().unwrap_or_default(),
     })
 }
@@ -559,7 +582,7 @@ async fn resolve_context(base: &BaseArgs) -> Result<ResolvedContext> {
     let project = resolve_project_context(base, &auth_ctx).await?;
     Ok(ResolvedContext {
         client: auth_ctx.client,
-        app_url: auth_ctx.app_url,
+        app_public_url: auth_ctx.app_public_url,
         project,
     })
 }
@@ -608,34 +631,24 @@ pub(crate) async fn select_function_interactive(
 }
 
 pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFilter) -> Result<()> {
+    run_typed_command(base, args.command, kind).await
+}
+
+pub(crate) async fn run_typed_command(
+    base: BaseArgs,
+    command: Option<FunctionCommands>,
+    kind: FunctionTypeFilter,
+) -> Result<()> {
     let ft = Some(kind);
-    match args.command {
+    match command {
         Some(FunctionCommands::View(v)) => match v.selector()? {
             ViewSelector::Id(id) => {
                 let auth_ctx = resolve_auth_context(&base).await?;
-                view::run_by_id(
-                    &auth_ctx,
-                    id,
-                    v.version.as_deref(),
-                    base.json,
-                    v.web,
-                    base.verbose,
-                    ft,
-                )
-                .await
+                view::run_by_id(&auth_ctx, id, v.options(&base), ft).await
             }
             ViewSelector::Slug(slug) => {
                 let ctx = resolve_context(&base).await?;
-                view::run(
-                    &ctx,
-                    slug,
-                    v.version.as_deref(),
-                    base.json,
-                    v.web,
-                    base.verbose,
-                    ft,
-                )
-                .await
+                view::run(&ctx, slug, v.options(&base), ft).await
             }
         },
         command => {
@@ -652,6 +665,12 @@ pub async fn run_typed(base: BaseArgs, args: FunctionArgs, kind: FunctionTypeFil
     }
 }
 
+pub(crate) async fn run_scorer_create(base: BaseArgs, args: create::CreateArgs) -> Result<()> {
+    let json_output = base.json;
+    let ctx = resolve_context(&base).await?;
+    create::run(&ctx, &args, json_output).await
+}
+
 pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
     let function_type = args.function_type;
     match args.command {
@@ -662,29 +681,11 @@ pub async fn run(base: BaseArgs, args: FunctionsArgs) -> Result<()> {
             match v.inner.selector()? {
                 ViewSelector::Id(id) => {
                     let auth_ctx = resolve_auth_context(&base).await?;
-                    view::run_by_id(
-                        &auth_ctx,
-                        id,
-                        v.inner.version.as_deref(),
-                        base.json,
-                        v.inner.web,
-                        base.verbose,
-                        ft,
-                    )
-                    .await
+                    view::run_by_id(&auth_ctx, id, v.inner.options(&base), ft).await
                 }
                 ViewSelector::Slug(slug) => {
                     let ctx = resolve_context(&base).await?;
-                    view::run(
-                        &ctx,
-                        slug,
-                        v.inner.version.as_deref(),
-                        base.json,
-                        v.inner.web,
-                        base.verbose,
-                        ft,
-                    )
-                    .await
+                    view::run(&ctx, slug, v.inner.options(&base), ft).await
                 }
             }
         }
@@ -1034,6 +1035,39 @@ mod tests {
     }
 
     #[test]
+    fn view_accepts_environment_selector() {
+        let _guard = test_lock();
+        let parsed = parse(&[
+            "functions",
+            "view",
+            "test-function",
+            "--environment",
+            "production",
+        ])
+        .expect("parse view");
+        let FunctionsCommands::View(view) = parsed.command.expect("subcommand") else {
+            panic!("expected view command");
+        };
+        assert_eq!(view.inner.environment.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn view_rejects_version_with_environment() {
+        let _guard = test_lock();
+        let err = parse(&[
+            "functions",
+            "view",
+            "test-function",
+            "--version",
+            "1234",
+            "--environment",
+            "production",
+        ])
+        .expect_err("selectors should conflict");
+        assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
     fn view_accepts_id_selector() {
         let _guard = test_lock();
         let parsed = parse(&["functions", "view", "--id", "f1"]).expect("parse view");
@@ -1086,6 +1120,27 @@ mod tests {
     }
 
     #[test]
+    fn prompt_classifier_web_path_uses_scorers_page() {
+        let function = Function {
+            id: "fn_test_classifier".to_string(),
+            name: "Test classifier".to_string(),
+            slug: "test-classifier".to_string(),
+            project_id: "test-project".to_string(),
+            description: None,
+            function_type: Some("classifier".to_string()),
+            prompt_data: Some(serde_json::json!({"parser": {"choice": ["a", "b"]}})),
+            function_data: Some(serde_json::json!({"type": "prompt"})),
+            tags: None,
+            function_schema: None,
+            metadata: None,
+            created: None,
+            _xact_id: None,
+        };
+
+        assert_eq!(build_web_path(&function), "scorers/fn_test_classifier");
+    }
+
+    #[test]
     fn function_selection_label_includes_slug_when_name_differs() {
         let function = Function {
             id: "id".to_string(),
@@ -1097,6 +1152,7 @@ mod tests {
             prompt_data: None,
             function_data: None,
             tags: None,
+            function_schema: None,
             metadata: None,
             created: None,
             _xact_id: None,
@@ -1124,6 +1180,7 @@ mod tests {
             prompt_data: None,
             function_data: None,
             tags: None,
+            function_schema: None,
             metadata: None,
             created: None,
             _xact_id: None,

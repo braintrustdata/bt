@@ -1,0 +1,11 @@
+{
+  "name": "bt-eval-max-concurrency",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "braintrust": "^3.25.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2"
+  }
+}

@@ -39,6 +39,26 @@ pub(crate) fn app_project_url_with_encoded_path(
     url
 }
 
+pub(crate) fn app_url_with_selected_version(
+    mut url: String,
+    requested_version: Option<&str>,
+    environment: Option<&str>,
+    resolved_version: Option<&str>,
+) -> String {
+    if requested_version.is_none() && environment.is_none() {
+        return url;
+    }
+    let Some(version) = resolved_version.or(requested_version) else {
+        return url;
+    };
+
+    let separator = if url.contains('?') { '&' } else { '?' };
+    url.push(separator);
+    url.push_str("pt=activity&vn=");
+    url.push_str(&encode(version));
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +83,33 @@ mod tests {
                     "tools?pr=function%2Fid",
                 ),
                 "https://www.example.test/app/test%20org/p/test%20project/tools?pr=function%2Fid",
+            ),
+            (
+                app_url_with_selected_version(
+                    "https://www.example.test/app/test/prompt".to_string(),
+                    Some("requested-version"),
+                    None,
+                    Some("resolved-version"),
+                ),
+                "https://www.example.test/app/test/prompt?pt=activity&vn=resolved-version",
+            ),
+            (
+                app_url_with_selected_version(
+                    "https://www.example.test/app/test/tools?pr=fn%2Ftest".to_string(),
+                    None,
+                    Some("production"),
+                    Some("version/test"),
+                ),
+                "https://www.example.test/app/test/tools?pr=fn%2Ftest&pt=activity&vn=version%2Ftest",
+            ),
+            (
+                app_url_with_selected_version(
+                    "https://www.example.test/app/test/prompt".to_string(),
+                    None,
+                    None,
+                    Some("resolved-version"),
+                ),
+                "https://www.example.test/app/test/prompt",
             ),
         ];
 

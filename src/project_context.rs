@@ -11,7 +11,7 @@ use crate::{
 
 pub(crate) struct ProjectContext {
     pub client: ApiClient,
-    pub app_url: String,
+    pub app_public_url: String,
     pub project: Project,
 }
 
@@ -20,7 +20,7 @@ pub(crate) async fn resolve_project_optional(
     client: &ApiClient,
     allow_interactive_selection: bool,
 ) -> Result<Option<Project>> {
-    let config_project = config::configured_project_for_context(base, Some(client.org_name()));
+    let config_project = config::configured_project_for_context(Some(client.org_name()));
     let project_name = match base.project.as_deref().or(config_project.as_deref()) {
         Some(project_name) => Some(project_name.to_string()),
         None if allow_interactive_selection && is_interactive() => Some(
@@ -61,9 +61,10 @@ pub(crate) async fn resolve_project_command_context_with_auth_mode(
     };
     let client = ApiClient::new(&auth)?;
     let project = resolve_required_project(base, &client, true).await?;
+    let app_public_url = base.resolved_app_public_url(&auth.app_url).to_string();
     Ok(ProjectContext {
         client,
-        app_url: auth.app_url,
+        app_public_url,
         project,
     })
 }

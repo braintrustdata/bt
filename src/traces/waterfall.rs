@@ -461,13 +461,7 @@ fn extract_ttft_seconds(metrics: &Map<String, Value>) -> Option<f64> {
         "first_token_latency",
     ];
     keys.iter().find_map(|key| {
-        parse_f64ish(metrics.get(*key)).and_then(|value| {
-            if value.is_finite() && value >= 0.0 {
-                Some(value)
-            } else {
-                None
-            }
-        })
+        parse_f64ish(metrics.get(*key)).filter(|&value| value.is_finite() && value >= 0.0)
     })
 }
 

@@ -65,7 +65,7 @@ fn is_conflict_error(err: &anyhow::Error) -> bool {
     })
 }
 
-pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
+pub async fn run(client: &ApiClient, name: Option<&str>, json: bool) -> Result<()> {
     let name = match name {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => {
@@ -77,7 +77,11 @@ pub async fn run(client: &ApiClient, name: Option<&str>) -> Result<()> {
     };
 
     match create_project_checked(client, &name).await {
-        Ok(CreateProjectOutcome::Created(_)) => {
+        Ok(CreateProjectOutcome::Created(project)) => {
+            if json {
+                println!("{}", serde_json::to_string(&project)?);
+                return Ok(());
+            }
             print_command_status(
                 CommandStatus::Success,
                 &format!("Successfully created '{name}'"),
@@ -189,6 +193,7 @@ mod tests {
             login,
             api_url: server.base_url.clone(),
             app_url: "https://app.example.com".to_string(),
+            profile: None,
         })
         .expect("build client");
         (server, client)

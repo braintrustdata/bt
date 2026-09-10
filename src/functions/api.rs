@@ -1,9 +1,14 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
 
-use crate::http::ApiClient;
+use crate::{
+    error::user_error,
+    http::{ApiClient, HttpError},
+};
 
 fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
@@ -26,6 +31,8 @@ pub struct Function {
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     #[serde(default)]
+    pub function_schema: Option<serde_json::Value>,
+    #[serde(default)]
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub created: Option<String>,
@@ -40,6 +47,7 @@ pub struct FunctionListQuery {
     pub slug: Option<String>,
     pub id: Option<String>,
     pub version: Option<String>,
+    pub environment: Option<String>,
     pub cursor: Option<String>,
     pub snapshot: Option<String>,
 }
@@ -58,9 +66,68 @@ pub struct CodeUploadSlot {
     pub bundle_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct InsertedFunctionResult {
+    pub id: String,
+    pub project_id: String,
+    pub slug: String,
+    pub found_existing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationSuggestion {
+    pub action: String,
+    #[serde(default)]
+    pub value: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationIssue {
+    pub code: String,
+    pub path: Vec<Value>,
+    pub message: String,
+    pub blocking: bool,
+    #[serde(default)]
+    pub suggestion: Option<FunctionValidationSuggestion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationResult {
+    pub issues: Vec<FunctionValidationIssue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionValidationReport {
+    pub valid: bool,
+    pub results: Vec<FunctionValidationResult>,
+}
+
+#[derive(Debug)]
+pub struct FunctionValidationError {
+    pub report: FunctionValidationReport,
+}
+
+impl std::fmt::Display for FunctionValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the backend rejected the function definition")
+    }
+}
+
+impl std::error::Error for FunctionValidationError {}
+
 #[derive(Debug, Clone)]
 pub struct InsertFunctionsResult {
     pub ignored_entries: Option<usize>,
+    pub xact_id: Option<String>,
+    pub functions: Vec<InsertedFunctionResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InsertFunctionsResponse {
+    #[serde(default)]
+    xact_id: Option<String>,
+    #[serde(default)]
+    functions: Vec<InsertedFunctionResult>,
 }
 
 pub async fn list_functions(
@@ -68,17 +135,29 @@ pub async fn list_functions(
     project_id: &str,
     function_type: Option<&str>,
 ) -> Result<Vec<Function>> {
-    let pid = escape_sql(project_id);
-    let query = match function_type {
-        Some(ft) => {
-            let ft = escape_sql(ft);
-            format!("SELECT * FROM project_functions('{pid}') WHERE function_type = '{ft}'")
-        }
-        None => format!("SELECT * FROM project_functions('{pid}')"),
-    };
+    let query = list_functions_query(project_id, function_type);
     let response = client.btql::<Function>(&query).await?;
 
     Ok(response.data)
+}
+
+fn list_functions_query(project_id: &str, function_type: Option<&str>) -> String {
+    let pid = escape_sql(project_id);
+    let type_filter = match function_type {
+        // Match the web UI's Scorers tab: label-producing classifiers appear
+        // alongside score-producing scorers, while topic maps do not.
+        Some("scorer") => "function_type IN ('scorer', 'classifier') \
+            AND COALESCE(function_data.type, '') != 'topic_map' \
+            AND (origin IS NULL OR NOT COALESCE(origin.internal, FALSE))"
+            .to_string(),
+        Some(ft) => {
+            let ft = escape_sql(ft);
+            format!("function_type = '{ft}'")
+        }
+        None => return format!("SELECT * FROM project_functions('{pid}')"),
+    };
+
+    format!("SELECT * FROM project_functions('{pid}') WHERE {type_filter}")
 }
 
 pub async fn get_function_by_slug(
@@ -86,11 +165,13 @@ pub async fn get_function_by_slug(
     project_id: &str,
     slug: &str,
     version: Option<&str>,
+    environment: Option<&str>,
 ) -> Result<Option<Function>> {
     let query = FunctionListQuery {
         project_id: Some(project_id.to_string()),
         slug: Some(slug.to_string()),
         version: version.map(ToOwned::to_owned),
+        environment: environment.map(ToOwned::to_owned),
         ..Default::default()
     };
     let page = list_functions_page(client, &query).await?;
@@ -107,10 +188,12 @@ pub async fn get_function_by_id(
     client: &ApiClient,
     id: &str,
     version: Option<&str>,
+    environment: Option<&str>,
 ) -> Result<Option<Function>> {
     let query = FunctionListQuery {
         id: Some(id.to_string()),
         version: version.map(ToOwned::to_owned),
+        environment: environment.map(ToOwned::to_owned),
         ..Default::default()
     };
     let page = list_functions_page(client, &query).await?;
@@ -134,9 +217,43 @@ pub async fn invoke_function(
         Vec::new()
     };
     let timeout = std::time::Duration::from_secs(300);
-    client
+    let result = client
         .post_with_headers_timeout("/function/invoke", body, &headers, Some(timeout))
-        .await
+        .await;
+
+    match result {
+        Ok(value) => Ok(value),
+        Err(error)
+            if error
+                .downcast_ref::<HttpError>()
+                .is_some_and(is_provider_auth_response) =>
+        {
+            Err(user_error(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_provider_auth_response(error: &HttpError) -> bool {
+    if error.status != reqwest::StatusCode::UNAUTHORIZED
+        && error.status != reqwest::StatusCode::FORBIDDEN
+    {
+        return false;
+    }
+
+    let Ok(body) = serde_json::from_str::<Value>(&error.body) else {
+        return false;
+    };
+    let provider_error = body.get("error").unwrap_or(&body);
+    provider_error.get("code").and_then(Value::as_str) == Some("invalid_api_key")
+        || provider_error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                let message = message.to_ascii_lowercase();
+                message.contains("incorrect api key provided")
+                    || message.contains("llm provider") && message.contains("credential")
+            })
 }
 
 pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()> {
@@ -164,6 +281,9 @@ pub async fn list_functions_page(
     if let Some(version) = &query.version {
         params.push(("version", version.clone()));
     }
+    if let Some(environment) = &query.environment {
+        params.push(("environment", environment.clone()));
+    }
     if let Some(cursor) = &query.cursor {
         params.push(("cursor", cursor.clone()));
     }
@@ -188,6 +308,47 @@ pub async fn list_functions_page(
         .with_context(|| format!("failed to list functions via {path}"))?;
 
     parse_function_list_page(raw)
+}
+
+/// List a project's functions using the public API's cursor contract.
+pub async fn list_all_functions(client: &ApiClient, project_id: &str) -> Result<Vec<Function>> {
+    let mut query = FunctionListQuery {
+        project_id: Some(project_id.to_string()),
+        ..Default::default()
+    };
+    let mut functions = Vec::new();
+    let mut cursors = HashSet::new();
+
+    loop {
+        let page = list_functions_page(client, &query).await?;
+        if query.snapshot.is_none() {
+            query.snapshot = page.snapshot;
+        }
+        functions.extend(
+            page.objects
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("unexpected function response shape")?,
+        );
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        if !cursors.insert(cursor.clone()) {
+            anyhow::bail!("function pagination returned a repeated cursor");
+        }
+        query.cursor = Some(cursor);
+    }
+
+    Ok(functions)
+}
+
+pub async fn create_function(client: &ApiClient, body: &Value) -> Result<Function> {
+    client.post("/v1/function", body).await
+}
+
+pub async fn replace_function(client: &ApiClient, body: &Value) -> Result<Function> {
+    client.put("/v1/function", body).await
 }
 
 fn parse_function_list_page(raw: Value) -> Result<FunctionListPage> {
@@ -252,15 +413,35 @@ pub async fn insert_functions(
     client: &ApiClient,
     functions: &[Value],
 ) -> Result<InsertFunctionsResult> {
-    let body = serde_json::json!({ "functions": functions });
-    let raw: Value = client
-        .post("/insert-functions", &body)
-        .await
-        .context("failed to insert functions")?;
+    let body = insert_functions_body(functions);
+    let raw: Value = match client.post("/insert-functions", &body).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            let Some(http_error) = error.downcast_ref::<HttpError>() else {
+                return Err(error).context("failed to insert functions");
+            };
+            if http_error.status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                return Err(error).context("failed to insert functions");
+            }
+            let report = serde_json::from_str(&http_error.body)
+                .context("unexpected insert-functions validation error response shape")?;
+            return Err(FunctionValidationError { report }.into());
+        }
+    };
+
+    let response: InsertFunctionsResponse = serde_json::from_value(raw.clone())
+        .context("unexpected insert-functions response shape")?;
 
     Ok(InsertFunctionsResult {
-        ignored_entries: ignored_count(&raw),
+        ignored_entries: ignored_count(&raw)
+            .or_else(|| ignored_count_from_function_results(&raw, functions)),
+        xact_id: response.xact_id,
+        functions: response.functions,
     })
+}
+
+pub(crate) fn insert_functions_body(functions: &[Value]) -> Value {
+    serde_json::json!({ "functions": functions })
 }
 
 fn ignored_count(raw: &Value) -> Option<usize> {
@@ -269,9 +450,68 @@ fn ignored_count(raw: &Value) -> Option<usize> {
         .and_then(|count| usize::try_from(count).ok())
 }
 
+fn ignored_count_from_function_results(raw: &Value, requests: &[Value]) -> Option<usize> {
+    let results = raw.get("functions")?.as_array()?;
+    if results.len() != requests.len() {
+        return None;
+    }
+
+    results
+        .iter()
+        .zip(requests)
+        .try_fold(0usize, |count, (result, request)| {
+            let should_ignore = request.get("if_exists").and_then(Value::as_str) == Some("ignore");
+            if !should_ignore {
+                return Some(count);
+            }
+
+            let found_existing = result.get("found_existing")?.as_bool()?;
+            Some(count + usize::from(found_existing))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_auth_detection_requires_an_auth_status_and_provider_shape() {
+        let provider_error = HttpError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            body: serde_json::json!({
+                "error": {
+                    "message": "Incorrect API key provided: synthetic-key",
+                    "code": "invalid_api_key"
+                }
+            })
+            .to_string(),
+        };
+        assert!(is_provider_auth_response(&provider_error));
+
+        let bad_request = HttpError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: provider_error.body,
+        };
+        assert!(!is_provider_auth_response(&bad_request));
+    }
+
+    #[test]
+    fn scorer_list_query_matches_web_ui_filter() {
+        let query = list_functions_query("test-project-id", Some("scorer"));
+
+        assert!(query.contains("function_type IN ('scorer', 'classifier')"));
+        assert!(query.contains("COALESCE(function_data.type, '') != 'topic_map'"));
+        assert!(query.contains("origin IS NULL"));
+        assert!(query.contains("origin.internal"));
+    }
+
+    #[test]
+    fn non_scorer_list_query_keeps_exact_type_filter() {
+        let query = list_functions_query("test-project-id", Some("tool"));
+
+        assert!(query.contains("function_type = 'tool'"));
+        assert!(!query.contains("classifier"));
+    }
 
     #[test]
     fn ignored_count_extracts_canonical_shape() {
@@ -285,6 +525,69 @@ mod tests {
         assert_eq!(ignored_count(&third), None);
 
         assert_eq!(ignored_count(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn derives_ignored_count_from_found_existing_results() {
+        let requests = vec![
+            serde_json::json!({ "slug": "first", "if_exists": "ignore" }),
+            serde_json::json!({ "slug": "second", "if_exists": "replace" }),
+            serde_json::json!({ "slug": "third", "if_exists": "ignore" }),
+        ];
+        let response = serde_json::json!({
+            "functions": [
+                { "slug": "first", "found_existing": true },
+                { "slug": "second", "found_existing": true },
+                { "slug": "third", "found_existing": false },
+            ]
+        });
+
+        assert_eq!(
+            ignored_count_from_function_results(&response, &requests),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ignored_count_fallback_rejects_mismatched_response_length() {
+        let requests = vec![serde_json::json!({
+            "slug": "first",
+            "if_exists": "ignore"
+        })];
+        let response = serde_json::json!({ "functions": [] });
+
+        assert_eq!(
+            ignored_count_from_function_results(&response, &requests),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_insert_function_operation_fields() {
+        let response: InsertFunctionsResponse = serde_json::from_value(serde_json::json!({
+            "xact_id": "1000000000000000001",
+            "functions": [{
+                "id": "fn_test_scorer",
+                "project_id": "test-project",
+                "slug": "test-scorer",
+                "found_existing": true
+            }]
+        }))
+        .expect("insert response");
+
+        assert_eq!(response.xact_id.as_deref(), Some("1000000000000000001"));
+        assert_eq!(response.functions[0].id, "fn_test_scorer");
+        assert_eq!(response.functions[0].project_id, "test-project");
+        assert_eq!(response.functions[0].slug, "test-scorer");
+        assert!(response.functions[0].found_existing);
+    }
+
+    #[test]
+    fn insert_functions_body_wraps_functions_array() {
+        let functions = vec![serde_json::json!({ "slug": "demo" })];
+        let body = insert_functions_body(&functions);
+
+        assert_eq!(body, serde_json::json!({ "functions": functions }));
     }
 
     #[test]

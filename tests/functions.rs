@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+#[cfg(unix)]
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -128,17 +130,49 @@ fn find_tsc() -> Option<PathBuf> {
     } else {
         repo_root().join("node_modules").join(".bin").join("tsc")
     };
-    if local.is_file() {
-        return Some(local);
-    }
-
-    if command_exists("tsc") {
-        return Some(PathBuf::from("tsc"));
-    }
-
-    None
+    local.is_file().then_some(local)
 }
 
+fn compile_functions_runner(tsc: &Path, root: &Path, runner_dir: &Path) {
+    let mut command = Command::new(tsc);
+    command.current_dir(root).args([
+        "scripts/functions-runner.ts",
+        "scripts/runner-common.ts",
+        "--module",
+        "esnext",
+        "--target",
+        "es2020",
+        "--moduleResolution",
+        "bundler",
+        "--outDir",
+    ]);
+    command.arg(runner_dir);
+
+    let version = Command::new(tsc)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| {
+            output
+                .split_whitespace()
+                .find_map(|part| part.split('.').next()?.parse::<u32>().ok())
+        });
+    if version.is_some_and(|major| major >= 6) {
+        // TypeScript 6+ rejects explicit input files when a tsconfig is nearby.
+        // These are runtime tests, so compile independently and skip type checking.
+        command.args(["--ignoreConfig", "--noCheck"]);
+    }
+
+    let output = command.output().expect("compile functions runner");
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+}
+
+#[cfg(unix)]
 fn decode_uploaded_bundle(bundle: &[u8]) -> String {
     if bundle.starts_with(&[0x1f, 0x8b]) {
         let mut decoder = GzDecoder::new(bundle);
@@ -188,22 +222,6 @@ fn sanitized_env_keys() -> &'static [&'static str] {
         "BT_FUNCTIONS_PULL_FORCE",
         "BT_FUNCTIONS_PULL_LANGUAGE",
     ]
-}
-
-fn auth_profiles_command(cwd: &Path, config_dir: &Path) -> Command {
-    let mut cmd = Command::new(bt_binary_path());
-    cmd.arg("auth")
-        .arg("profiles")
-        .current_dir(cwd)
-        .env("XDG_CONFIG_HOME", config_dir)
-        .env("APPDATA", config_dir)
-        .env("BRAINTRUST_NO_COLOR", "1")
-        .env_remove("BRAINTRUST_PROFILE")
-        .env_remove("BRAINTRUST_ORG_NAME")
-        .env_remove("BRAINTRUST_API_URL")
-        .env_remove("BRAINTRUST_APP_URL")
-        .env_remove("BRAINTRUST_ENV_FILE");
-    cmd
 }
 
 #[derive(Debug, Clone)]
@@ -694,9 +712,9 @@ fn functions_push_requires_app_url_with_custom_api_url() {
         .expect("run push with custom API URL and no app URL");
 
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--app-url or BRAINTRUST_APP_URL"));
-    assert!(!stderr.contains("https://www.braintrust.dev/api/apikey/login"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--app-url or BRAINTRUST_APP_URL"));
+    assert!(!stdout.contains("https://www.braintrust.dev/api/apikey/login"));
 }
 
 #[test]
@@ -713,41 +731,46 @@ fn functions_help_lists_push_and_pull() {
     assert!(stdout.contains("pull"));
 }
 
-#[test]
-fn auth_profiles_ignores_api_key_env_override() {
-    let cwd = tempdir().expect("create temp cwd");
-    let config_dir = tempdir().expect("create temp config dir");
-
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
-        .env("BRAINTRUST_API_KEY", "test-key")
-        .output()
-        .expect("run bt auth profiles with api key env");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
-    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
-    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
+/// Seed a synthetic api_key `test-profile` so verification reports "missing"
+/// without touching the network or keychain.
+fn seed_api_key_profile(config_dir: &Path) {
+    fs::create_dir_all(config_dir.join("bt")).expect("create bt config dir");
+    fs::write(
+        config_dir.join("bt").join("auth.json"),
+        r#"{"profiles":{"test-profile":{"auth_kind":"api_key","api_url":"https://api.braintrust.dev","app_url":"https://www.braintrust.dev","org_name":"test-org","user_name":null,"email":null,"api_key_hint":"sk-****test"}}}"#,
+    )
+    .expect("write auth.json");
 }
 
 #[test]
-fn auth_profiles_ignores_api_key_from_dotenv() {
+fn root_login_refresh_uses_selected_profile() {
     let cwd = tempdir().expect("create temp cwd");
     let config_dir = tempdir().expect("create temp config dir");
-    fs::write(cwd.path().join(".env"), "BRAINTRUST_API_KEY=test-key\n").expect("write .env");
+    seed_api_key_profile(config_dir.path());
 
-    let output = auth_profiles_command(cwd.path(), config_dir.path())
+    let mut cmd = Command::new(bt_binary_path());
+    cmd.args(["login", "--refresh", "--profile", "test-profile", "--json"])
+        .current_dir(cwd.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("APPDATA", config_dir.path())
+        .env("BRAINTRUST_NO_COLOR", "1")
         .env_remove("BRAINTRUST_API_KEY")
-        .output()
-        .expect("run bt auth profiles with dotenv api key");
+        .env_remove("BRAINTRUST_API_URL")
+        .env_remove("BRAINTRUST_APP_URL")
+        .env_remove("BRAINTRUST_ORG_NAME");
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("No saved profiles. Run `bt auth login` to create one."));
-    assert!(!stdout.contains("Auth source: --api-key/BRAINTRUST_API_KEY override"));
-    assert!(!stderr.contains("pass --prefer-profile or unset BRAINTRUST_API_KEY"));
+    let output = cmd.output().expect("run bt login --refresh");
+    assert!(!output.status.success());
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .expect("JSON failures should emit a machine-readable payload on stdout");
+    assert!(payload["error"]["message"].as_str().is_some_and(
+        |message| message.contains("`bt login --refresh` only applies to oauth profiles")
+    ));
+    assert!(
+        output.stderr.is_empty(),
+        "JSON failure should not be emitted on stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -905,27 +928,7 @@ globalThis._evals.functions.push({
     .expect("write sample.js");
 
     let runner_dir = tmp.path().join("runner");
-    let compile_output = Command::new(&tsc)
-        .current_dir(&root)
-        .args([
-            "scripts/functions-runner.ts",
-            "scripts/runner-common.ts",
-            "--module",
-            "esnext",
-            "--target",
-            "es2020",
-            "--moduleResolution",
-            "bundler",
-            "--outDir",
-        ])
-        .arg(&runner_dir)
-        .output()
-        .expect("compile functions runner");
-    if !compile_output.status.success() {
-        let stdout = String::from_utf8_lossy(&compile_output.stdout);
-        let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    }
+    compile_functions_runner(&tsc, &root, &runner_dir);
 
     let runner_js = runner_dir.join("functions-runner.js");
     let runner_common_js = runner_dir.join("runner-common.js");
@@ -1094,27 +1097,7 @@ globalThis._evals.functions.push({{
     .expect("write sample.cjs");
 
     let runner_dir = tmp.path().join("runner");
-    let compile_output = Command::new(&tsc)
-        .current_dir(&root)
-        .args([
-            "scripts/functions-runner.ts",
-            "scripts/runner-common.ts",
-            "--module",
-            "esnext",
-            "--target",
-            "es2020",
-            "--moduleResolution",
-            "bundler",
-            "--outDir",
-        ])
-        .arg(&runner_dir)
-        .output()
-        .expect("compile functions runner");
-    if !compile_output.status.success() {
-        let stdout = String::from_utf8_lossy(&compile_output.stdout);
-        let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    }
+    compile_functions_runner(&tsc, &root, &runner_dir);
 
     let runner_js = runner_dir.join("functions-runner.js");
     let runner_common_js = runner_dir.join("runner-common.js");
@@ -1267,27 +1250,7 @@ globalThis._evals.functions.push({
     .expect("write sample-a.mjs");
 
     let runner_dir = tmp.path().join("runner");
-    let compile_output = Command::new(&tsc)
-        .current_dir(&root)
-        .args([
-            "scripts/functions-runner.ts",
-            "scripts/runner-common.ts",
-            "--module",
-            "esnext",
-            "--target",
-            "es2020",
-            "--moduleResolution",
-            "bundler",
-            "--outDir",
-        ])
-        .arg(&runner_dir)
-        .output()
-        .expect("compile functions runner");
-    if !compile_output.status.success() {
-        let stdout = String::from_utf8_lossy(&compile_output.stdout);
-        let stderr = String::from_utf8_lossy(&compile_output.stderr);
-        panic!("tsc failed for functions runner:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    }
+    compile_functions_runner(&tsc, &root, &runner_dir);
 
     let runner_js = runner_dir.join("functions-runner.js");
     let runner_common_js = runner_dir.join("runner-common.js");
@@ -1765,6 +1728,7 @@ exit 24
         .args([
             "functions",
             "--json",
+            "--verbose",
             "push",
             "--file",
             source
@@ -1799,6 +1763,16 @@ exit 24
     assert_eq!(summary["status"].as_str(), Some("success"));
     assert_eq!(summary["uploaded_files"].as_u64(), Some(1));
     assert_eq!(summary["failed_files"].as_u64(), Some(0));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("building payload"),
+        "expected insert payload construction log, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("request body for POST /insert-functions"),
+        "expected final insert payload log, got:\n{stderr}"
+    );
 
     let inserted = state
         .inserted_functions

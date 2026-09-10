@@ -11,8 +11,8 @@ pub enum ArgValueSource {
     EnvVariable,
 }
 
-#[derive(Debug, Clone, Args)]
-pub struct BaseArgs {
+#[derive(Debug, Clone, Args, Default)]
+pub struct LoginBaseArgs {
     /// Output as JSON
     #[arg(long, global = true)]
     pub json: bool,
@@ -46,28 +46,18 @@ pub struct BaseArgs {
     #[arg(skip = false)]
     pub profile_explicit: bool,
 
-    /// Override active org (or via BRAINTRUST_ORG_NAME)
-    #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
-    pub org_name: Option<String>,
-
-    /// Override active project
     #[arg(
-        short = 'p',
-        long,
-        env = "BRAINTRUST_DEFAULT_PROJECT",
-        hide_env_values = true,
-        global = true
+        long = "braintrust-internal-api-key-environment-binding-do-not-use",
+        env = "BRAINTRUST_API_KEY",
+        global = true,
+        hide = true
     )]
-    pub project: Option<String>,
-
-    /// Override stored API key (or via BRAINTRUST_API_KEY)
-    #[arg(long, env = "BRAINTRUST_API_KEY", global = true, hide = true)]
     pub api_key: Option<String>,
 
     #[arg(skip)]
     pub api_key_source: Option<ArgValueSource>,
 
-    /// Prefer profile credentials even if BRAINTRUST_API_KEY/--api-key is set.
+    /// Prefer profile credentials even if BRAINTRUST_API_KEY is set.
     #[arg(long, global = true)]
     pub prefer_profile: bool,
 
@@ -89,6 +79,15 @@ pub struct BaseArgs {
     )]
     pub app_url: Option<String>,
 
+    /// Override public app URL for generated links (or via BRAINTRUST_APP_PUBLIC_URL)
+    #[arg(
+        long,
+        env = "BRAINTRUST_APP_PUBLIC_URL",
+        hide_env_values = true,
+        global = true
+    )]
+    pub app_public_url: Option<String>,
+
     /// Path to a PEM-encoded CA bundle used for HTTPS requests.
     #[arg(
         long = "ca-cert",
@@ -108,22 +107,87 @@ pub struct BaseArgs {
     pub env_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Args)]
-pub struct CLIArgs<T: Args> {
+#[derive(Debug, Clone, Args, Default)]
+pub struct BaseArgs {
     #[command(flatten)]
-    pub base: BaseArgs,
+    pub login: LoginBaseArgs,
 
-    #[command(flatten)]
-    pub args: T,
+    /// Override active org (or via BRAINTRUST_ORG_NAME)
+    #[arg(short = 'o', long = "org", env = "BRAINTRUST_ORG_NAME", global = true)]
+    pub org_name: Option<String>,
+
+    /// Override active project
+    #[arg(
+        short = 'p',
+        long,
+        env = "BRAINTRUST_DEFAULT_PROJECT",
+        hide_env_values = true,
+        global = true
+    )]
+    pub project: Option<String>,
 }
 
-impl BaseArgs {
+#[derive(Debug, Clone, Args)]
+pub struct CLIArgs<T: Args, B: Args = BaseArgs> {
+    #[command(flatten)]
+    pub args: T,
+
+    #[command(flatten, next_help_heading = "Global options")]
+    pub base: B,
+}
+
+impl LoginBaseArgs {
     pub fn ca_cert(&self) -> Option<&Path> {
         self.ca_cert.as_deref()
     }
 
     pub fn verbose_explicit(&self) -> bool {
         self.verbose && self.verbose_source.is_some()
+    }
+
+    pub fn resolved_app_public_url<'a>(&'a self, app_url: &'a str) -> &'a str {
+        self.app_public_url.as_deref().unwrap_or(app_url)
+    }
+}
+
+impl std::ops::Deref for BaseArgs {
+    type Target = LoginBaseArgs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.login
+    }
+}
+
+impl std::ops::DerefMut for BaseArgs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.login
+    }
+}
+
+impl BaseArgs {
+    pub(crate) fn apply_url_org_hint(&mut self, url_org: Option<&str>) {
+        if self
+            .org_name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|org| !org.is_empty())
+        {
+            return;
+        }
+
+        if let Some(url_org) = url_org.map(str::trim).filter(|org| !org.is_empty()) {
+            self.org_name = Some(url_org.to_string());
+        }
+    }
+}
+
+impl From<LoginBaseArgs> for BaseArgs {
+    fn from(login: LoginBaseArgs) -> Self {
+        Self {
+            login,
+            org_name: None,
+            project: None,
+        }
     }
 }
 
@@ -151,7 +215,7 @@ pub fn has_explicit_profile_arg(args: &[OsString]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_explicit_profile_arg;
+    use super::{has_explicit_profile_arg, LoginBaseArgs};
     use std::ffi::OsString;
 
     #[test]
@@ -185,5 +249,28 @@ mod tests {
             OsString::from("work"),
         ];
         assert!(!has_explicit_profile_arg(&args));
+    }
+
+    #[test]
+    fn app_public_url_defaults_to_resolved_app_url() {
+        let base = LoginBaseArgs::default();
+
+        assert_eq!(
+            base.resolved_app_public_url("https://private.example.test"),
+            "https://private.example.test"
+        );
+    }
+
+    #[test]
+    fn app_public_url_overrides_resolved_app_url() {
+        let base = LoginBaseArgs {
+            app_public_url: Some("https://public.example.test".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            base.resolved_app_public_url("https://private.example.test"),
+            "https://public.example.test"
+        );
     }
 }

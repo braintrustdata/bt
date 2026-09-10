@@ -28,9 +28,9 @@ use crate::sync::discovery::{
 };
 use crate::sync::{
     artifact_base_dir, artifact_spec_dir, create_jsonl_file_writer, epoch_seconds, read_json_file,
-    read_jsonl_values, stable_spec_hash, write_json_atomic, write_jsonl_value, SyncPushFileArgs,
+    read_jsonl_values, stable_spec_hash, write_jsonl_value, SyncPushFileArgs,
 };
-use crate::utils::parse_duration_to_seconds;
+use crate::utils::{parse_duration_to_seconds, write_json_atomic};
 use tokio::sync::mpsc;
 
 use super::{api as datasets_api, records, utils, ResolvedContext};
@@ -243,7 +243,7 @@ struct PipelinePushArgs {
 
     /// Ignore previous sync push state and upload from the beginning.
     #[arg(long)]
-    fresh: bool,
+    force: bool,
 }
 
 pub async fn run(base: BaseArgs, args: PipelineArgs) -> Result<()> {
@@ -1445,7 +1445,7 @@ async fn push_rows(base: &BaseArgs, args: PipelinePushArgs) -> Result<()> {
             object_ref: pipeline_target_dataset_ref(&target)?,
             input: input_path,
             root: args.artifacts.root,
-            fresh: args.fresh,
+            force: args.force,
         },
     )
     .await
@@ -1776,9 +1776,12 @@ async fn resolve_target_context(
     let ctx = login(&target_base).await?;
     let client = ApiClient::new(&ctx)?;
     let project = resolve_target_project(&client, target).await?;
+    let app_public_url = target_base
+        .resolved_app_public_url(&ctx.app_url)
+        .to_string();
     Ok(ResolvedContext {
         client,
-        app_url: ctx.app_url,
+        app_public_url,
         project,
     })
 }
@@ -1968,8 +1971,7 @@ async fn resolve_source_project(
             description: None,
         });
     }
-    let configured_project =
-        crate::config::configured_project_for_context(base, Some(client.org_name()));
+    let configured_project = crate::config::configured_project_for_context(Some(client.org_name()));
     let project_name = source
         .project_name
         .as_deref()
@@ -2065,26 +2067,7 @@ mod tests {
     }
 
     fn test_base_args() -> BaseArgs {
-        BaseArgs {
-            json: false,
-            verbose: false,
-            verbose_source: None,
-            quiet: false,
-            quiet_source: None,
-            no_color: false,
-            no_input: false,
-            profile: None,
-            profile_explicit: false,
-            org_name: None,
-            project: None,
-            api_key: None,
-            api_key_source: None,
-            prefer_profile: false,
-            api_url: None,
-            app_url: None,
-            ca_cert: None,
-            env_file: None,
-        }
+        BaseArgs::default()
     }
 
     fn test_source() -> PipelineSourceInspect {
