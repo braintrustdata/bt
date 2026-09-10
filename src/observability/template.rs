@@ -544,7 +544,6 @@ pub(crate) fn default_topics_config() -> Value {
         "topic_map_functions": [],
         "scope": {"type": "trace", "idle_seconds": 600},
         "rerun_seconds": 86400,
-        "relabel_overlap_seconds": 3600,
         "backfill_time_range": "86400s",
     })
 }

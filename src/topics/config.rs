@@ -319,13 +319,6 @@ fn render_config_block(automation: &TopicAutomationConfig) -> String {
                 hint: Some("how often Topics tries to generate fresh topic maps"),
             },
             ConfigField {
-                label: "relabel overlap",
-                value: format_duration_compact(automation.relabel_overlap_seconds),
-                hint: Some(
-                    "after recompute, this much recent history is relabeled with the new topics",
-                ),
-            },
-            ConfigField {
                 label: "idle time",
                 value: format_duration_compact(automation.idle_seconds),
                 hint: Some(
@@ -740,7 +733,6 @@ struct ResolvedTopicsConfigFields {
     sampling_rate: Option<f64>,
     window_seconds: Option<i64>,
     rerun_seconds: Option<i64>,
-    relabel_overlap_seconds: Option<i64>,
     idle_seconds: Option<i64>,
 }
 
@@ -754,7 +746,6 @@ impl TopicsConfigFieldsArgs {
             sampling_rate: parse_sampling_rate(self.sampling_rate.as_deref())?,
             window_seconds: parse_duration_to_seconds(self.window.as_deref())?,
             rerun_seconds: parse_duration_to_seconds(self.cadence.as_deref())?,
-            relabel_overlap_seconds: parse_duration_to_seconds(self.relabel_overlap.as_deref())?,
             idle_seconds: parse_duration_to_seconds(self.idle.as_deref())?,
         })
     }
@@ -775,7 +766,6 @@ impl ConfigSetArgs {
             sampling_rate: fields.sampling_rate,
             window_seconds: fields.window_seconds,
             rerun_seconds: fields.rerun_seconds,
-            relabel_overlap_seconds: fields.relabel_overlap_seconds,
             idle_seconds: fields.idle_seconds,
         };
 
@@ -785,7 +775,6 @@ impl ConfigSetArgs {
             && patch.sampling_rate.is_none()
             && patch.window_seconds.is_none()
             && patch.rerun_seconds.is_none()
-            && patch.relabel_overlap_seconds.is_none()
             && patch.idle_seconds.is_none()
         {
             bail!("no topic automation updates were requested");
@@ -805,7 +794,6 @@ impl ConfigEnableArgs {
             sampling_rate: fields.sampling_rate,
             window_seconds: fields.window_seconds,
             rerun_seconds: fields.rerun_seconds,
-            relabel_overlap_seconds: fields.relabel_overlap_seconds,
             idle_seconds: fields.idle_seconds,
             facets: self.facets.clone(),
             embedding_model: trim_to_option(self.embedding_model.as_deref()),
@@ -935,7 +923,6 @@ mod tests {
             sampling_rate: Some(1.0),
             window_seconds: Some(3600),
             rerun_seconds: Some(86400),
-            relabel_overlap_seconds: Some(3600),
             idle_seconds: Some(30),
             facet_functions: vec![api::FunctionSummary {
                 name: "Task".to_string(),
@@ -1068,7 +1055,6 @@ mod tests {
                 description: None,
                 window: Some("1h".to_string()),
                 cadence: Some("1d".to_string()),
-                relabel_overlap: None,
                 idle: Some("30s".to_string()),
                 sampling_rate: Some("50%".to_string()),
                 filter: Some("root_span_id = 'abc'".to_string()),
@@ -1096,7 +1082,6 @@ mod tests {
                 description: None,
                 window: None,
                 cadence: None,
-                relabel_overlap: None,
                 idle: None,
                 sampling_rate: Some("0.25".to_string()),
                 filter: None,
@@ -1117,7 +1102,6 @@ mod tests {
                 description: None,
                 window: None,
                 cadence: None,
-                relabel_overlap: None,
                 idle: None,
                 sampling_rate: Some("25".to_string()),
                 filter: None,
@@ -1137,7 +1121,6 @@ mod tests {
                 description: None,
                 window: Some("6h".to_string()),
                 cadence: Some("1d".to_string()),
-                relabel_overlap: Some("1h".to_string()),
                 idle: Some("10m".to_string()),
                 sampling_rate: Some("25%".to_string()),
                 filter: None,
@@ -1151,7 +1134,6 @@ mod tests {
         assert_eq!(create.name.as_deref(), Some("Topics"));
         assert_eq!(create.window_seconds, Some(6 * 60 * 60));
         assert_eq!(create.rerun_seconds, Some(24 * 60 * 60));
-        assert_eq!(create.relabel_overlap_seconds, Some(60 * 60));
         assert_eq!(create.idle_seconds, Some(10 * 60));
         assert_eq!(create.sampling_rate, Some(0.25));
         assert_eq!(create.btql_filter, None);
