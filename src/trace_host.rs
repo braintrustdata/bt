@@ -94,6 +94,7 @@ fn session_route(base: &BaseArgs) -> SessionRoute {
             }),
         flush_mode: FlushMode::FireAndForget,
         additional_metadata: None,
+        tags: Vec::new(),
     }
 }
 
@@ -788,7 +789,9 @@ mod tests {
         };
 
         assert!(!has_usable_api_key(&base));
-        assert_eq!(session_route(&base).auth.source, AuthSource::Auto);
+        let route = session_route(&base);
+        assert_eq!(route.auth.source, AuthSource::Auto);
+        assert!(route.tags.is_empty());
     }
 
     #[tokio::test]

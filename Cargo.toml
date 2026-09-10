@@ -18,8 +18,8 @@ eula = false
 actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
-braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "43ba73edbf5220b57090e049feb094b60a92fcd4" }
-bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "f2ce3b1b33aa317d48bf7f1f5d2bc06bac27999b" }
+braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "019e428ab80d0da4c00dab383d4b0d1fdf4486fd" }
+bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "c7e9984225b9726a179d51cb4c0d24cfec4617c9" }
 async-trait = "0.1"
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
