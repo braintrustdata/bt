@@ -7,7 +7,7 @@
 - **Only add Braintrust code.** Do not refactor or modify unrelated code.
 - **One language, one service per install run.** If the repo has more than one candidate, ask the user which one to instrument before starting. Do not instrument multiple languages or services in the same run.
 - **If the language is unclear, ask the user.** Do not guess. See Step 2.
-- **Install the latest Braintrust SDK.** Do not hard-pin the Braintrust SDK version unless the user asks for it -- use the package manager's normal install (which may produce an exact or a ranged version, whichever is idiomatic for that ecosystem). Build-time dependencies (e.g. Orchestrion for Go) must still be pinned to an exact version -- see the language-specific resource.
+- **Install the latest Braintrust SDK.** Do not hard-pin the Braintrust SDK version unless the user asks for it -- use the package manager's normal install (which may produce an exact or a ranged version, whichever is idiomatic for that ecosystem). Build-time dependencies (e.g. Orchestrion for Go) must still be pinned to an exact version -- see the language's install docs.
 - **Set the project name in code.** Do NOT configure project name via env vars.
 - **App must run without Braintrust.** If `BRAINTRUST_API_KEY` is missing at runtime, do not crash.
 - **Abort install if API key is not set.** (Do not modify runtime behavior.)
