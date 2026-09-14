@@ -61,7 +61,6 @@ const DEFAULT_TOPIC_AUTOMATION_DESCRIPTION: &str =
 const DEFAULT_TOPIC_FACET_NAMES: &[&str] = &["Task", "Sentiment", "Issues"];
 const DEFAULT_TOPIC_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const DEFAULT_TOPIC_RERUN_SECONDS: i64 = 24 * 60 * 60;
-const DEFAULT_TOPIC_RELABEL_OVERLAP_SECONDS: i64 = 60 * 60;
 const DEFAULT_TOPIC_IDLE_SECONDS: i64 = 10 * 60;
 const DEFAULT_TOPIC_SAMPLING_RATE: f64 = 1.0;
 const DEFAULT_TOPIC_EMBEDDING_MODEL: &str = "brain-embedding-1";
@@ -132,7 +131,6 @@ pub struct TopicAutomationStatus {
     pub btql_filter: Option<String>,
     pub window_seconds: Option<i64>,
     pub rerun_seconds: Option<i64>,
-    pub relabel_overlap_seconds: Option<i64>,
     pub idle_seconds: Option<i64>,
     pub configured_facets: usize,
     pub configured_topic_maps: usize,
@@ -178,7 +176,6 @@ pub struct TopicAutomationConfig {
     pub sampling_rate: Option<f64>,
     pub window_seconds: Option<i64>,
     pub rerun_seconds: Option<i64>,
-    pub relabel_overlap_seconds: Option<i64>,
     pub idle_seconds: Option<i64>,
     pub facet_functions: Vec<FunctionSummary>,
     pub topic_map_functions: Vec<FunctionSummary>,
@@ -193,7 +190,6 @@ pub struct TopicAutomationConfigPatch {
     pub sampling_rate: Option<f64>,
     pub window_seconds: Option<i64>,
     pub rerun_seconds: Option<i64>,
-    pub relabel_overlap_seconds: Option<i64>,
     pub idle_seconds: Option<i64>,
 }
 
@@ -205,7 +201,6 @@ pub struct TopicAutomationConfigCreate {
     pub sampling_rate: Option<f64>,
     pub window_seconds: Option<i64>,
     pub rerun_seconds: Option<i64>,
-    pub relabel_overlap_seconds: Option<i64>,
     pub idle_seconds: Option<i64>,
     pub facets: Vec<String>,
     pub embedding_model: Option<String>,
@@ -330,7 +325,6 @@ struct RegisterTopicAutomationConfig {
     topic_map_functions: Vec<TopicMapFunctionRef>,
     scope: TraceScopeConfig,
     rerun_seconds: i64,
-    relabel_overlap_seconds: i64,
     backfill_time_range: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     btql_filter: Option<String>,
@@ -561,9 +555,6 @@ pub async fn enable_topics_config(
         .window_seconds
         .unwrap_or(DEFAULT_TOPIC_WINDOW_SECONDS);
     let rerun_seconds = create.rerun_seconds.unwrap_or(DEFAULT_TOPIC_RERUN_SECONDS);
-    let relabel_overlap_seconds = create
-        .relabel_overlap_seconds
-        .unwrap_or(DEFAULT_TOPIC_RELABEL_OVERLAP_SECONDS);
     let idle_seconds = create.idle_seconds.unwrap_or(DEFAULT_TOPIC_IDLE_SECONDS);
     let sampling_rate = create.sampling_rate.unwrap_or(DEFAULT_TOPIC_SAMPLING_RATE);
     let embedding_model = create
@@ -602,7 +593,6 @@ pub async fn enable_topics_config(
                 idle_seconds,
             },
             rerun_seconds,
-            relabel_overlap_seconds,
             backfill_time_range: format_duration_seconds(window_seconds),
             btql_filter: create.btql_filter,
         },
@@ -710,13 +700,6 @@ pub async fn update_topics_config(
     }
     if let Some(rerun_seconds) = patch.rerun_seconds {
         next_config.insert("rerun_seconds".to_string(), Value::from(rerun_seconds));
-        has_config_changes = true;
-    }
-    if let Some(relabel_overlap_seconds) = patch.relabel_overlap_seconds {
-        next_config.insert(
-            "relabel_overlap_seconds".to_string(),
-            Value::from(relabel_overlap_seconds),
-        );
         has_config_changes = true;
     }
     if let Some(idle_seconds) = patch.idle_seconds {
@@ -1367,7 +1350,6 @@ async fn build_topic_automation_status(
         btql_filter: string_value(config.get("btql_filter")),
         window_seconds: backfill_time_range_to_window_seconds(config.get("backfill_time_range")),
         rerun_seconds: int_value(config.get("rerun_seconds")),
-        relabel_overlap_seconds: int_value(config.get("relabel_overlap_seconds")),
         idle_seconds: int_value(scope.get("idle_seconds")),
         configured_facets: config
             .get("facet_functions")
@@ -1423,7 +1405,6 @@ async fn build_topic_automation_config(
         sampling_rate: float_value(config.get("sampling_rate")),
         window_seconds: backfill_time_range_to_window_seconds(config.get("backfill_time_range")),
         rerun_seconds: int_value(config.get("rerun_seconds")),
-        relabel_overlap_seconds: int_value(config.get("relabel_overlap_seconds")),
         idle_seconds: int_value(scope.get("idle_seconds")),
         facet_functions: summarize_function_refs(
             client,

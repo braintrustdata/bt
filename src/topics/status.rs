@@ -239,10 +239,9 @@ fn write_automation_diagnostics(
     )?;
     writeln!(
         output,
-        "  schedule: window {} | cadence {} | overlap {} | idle {}",
+        "  schedule: window {} | cadence {} | idle {}",
         format_duration_compact(automation.window_seconds),
         format_duration_compact(automation.rerun_seconds),
-        format_duration_compact(automation.relabel_overlap_seconds),
         format_duration_compact(automation.idle_seconds)
     )?;
     writeln!(
@@ -830,7 +829,6 @@ mod tests {
                 btql_filter: None,
                 window_seconds: Some(86400),
                 rerun_seconds: Some(86400),
-                relabel_overlap_seconds: Some(3600),
                 idle_seconds: Some(600),
                 configured_facets: 3,
                 configured_topic_maps: 2,

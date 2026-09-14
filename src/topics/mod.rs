@@ -125,10 +125,6 @@ struct TopicsConfigFieldsArgs {
     #[arg(long = "generation-cadence", alias = "cadence")]
     cadence: Option<String>,
 
-    /// Relabel overlap duration, for example 1h
-    #[arg(long = "relabel-overlap")]
-    relabel_overlap: Option<String>,
-
     /// Trace idle wait duration, for example 30s
     #[arg(long = "idle-time", alias = "idle")]
     idle: Option<String>,
