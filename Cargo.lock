@@ -606,7 +606,7 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=c7e9984225b9726a179d51cb4c0d24cfec4617c9#c7e9984225b9726a179d51cb4c0d24cfec4617c9"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=ad6edb646c6678ceabb0c019853c77c12431324c#ad6edb646c6678ceabb0c019853c77c12431324c"
 dependencies = [
  "anyhow",
  "async-trait",
