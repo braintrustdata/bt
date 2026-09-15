@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "bt"
-version = "0.19.3"
+version = "0.20.0"
 dependencies = [
  "actix-web",
  "anyhow",
