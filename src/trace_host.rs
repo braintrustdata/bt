@@ -8,12 +8,10 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bt_daemon::wire::{
-    AuthSelection, AuthSource, BackendAuth, FlushMode, SessionRoute, TraceDestination,
-};
+use bt_daemon::wire::{AuthSelection, AuthSource, BackendAuth};
 use bt_daemon::{
-    AuthDiagnostic, AuthLease, AuthResolveReason, OutputFormat, RouteRequirements, RunHookCommand,
-    TraceHostContext, TraceHostServices,
+    AuthDiagnostic, AuthLease, AuthResolveReason, HostRouteSelection, OutputFormat,
+    RouteRequirements, RunHookCommand, TraceHostContext, TraceHostServices,
 };
 
 use braintrust_sdk_rust::DEFAULT_APP_URL;
@@ -68,7 +66,7 @@ fn has_usable_api_key(base: &BaseArgs) -> bool {
         .is_some_and(|key| !key.trim().is_empty())
 }
 
-fn session_route(base: &BaseArgs) -> SessionRoute {
+fn route_selection(base: &BaseArgs) -> HostRouteSelection {
     let source = if base.profile.is_some() {
         AuthSource::SavedProfile
     } else if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
@@ -78,24 +76,14 @@ fn session_route(base: &BaseArgs) -> SessionRoute {
     } else {
         AuthSource::Auto
     };
-    SessionRoute {
+    HostRouteSelection {
         auth: AuthSelection {
             source,
             profile_id: None,
             profile: base.profile.clone(),
             org_name: base.org_name.clone(),
         },
-        destination: base
-            .project
-            .clone()
-            .map(|project_name| TraceDestination::ProjectLogs {
-                project_id: None,
-                project_name: Some(project_name),
-            }),
-        flush_mode: FlushMode::FireAndForget,
-        additional_metadata: None,
-        tags: Vec::new(),
-        ..SessionRoute::default()
+        project_name: base.project.clone(),
     }
 }
 
@@ -321,7 +309,10 @@ async fn resolve_trace_project(mut base: BaseArgs) -> anyhow::Result<BaseArgs> {
 
 #[async_trait]
 impl TraceHostServices for BtTraceHost {
-    async fn resolve_route(&self, requirements: RouteRequirements) -> anyhow::Result<SessionRoute> {
+    async fn resolve_route(
+        &self,
+        requirements: RouteRequirements,
+    ) -> anyhow::Result<HostRouteSelection> {
         // Commands that run inside an agent's turn (hooks) leave this false so
         // no missing profile or org can block the turn on a prompt. bt gates
         // every prompt on this global, including the ones `resolve_auth`
@@ -347,7 +338,7 @@ impl TraceHostServices for BtTraceHost {
         if requirements.interactive_auth {
             base = resolve_trace_org(base).await?;
         }
-        Ok(session_route(&base))
+        Ok(route_selection(&base))
     }
 
     async fn resolve_auth(
@@ -786,13 +777,14 @@ mod tests {
                 api_key_source: Some(ArgValueSource::EnvVariable),
                 ..LoginBaseArgs::default()
             },
+            project: Some("test-project".into()),
             ..BaseArgs::default()
         };
 
         assert!(!has_usable_api_key(&base));
-        let route = session_route(&base);
+        let route = route_selection(&base);
         assert_eq!(route.auth.source, AuthSource::Auto);
-        assert!(route.tags.is_empty());
+        assert_eq!(route.project_name.as_deref(), Some("test-project"));
     }
 
     #[tokio::test]
