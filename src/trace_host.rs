@@ -66,7 +66,7 @@ fn has_usable_api_key(base: &BaseArgs) -> bool {
         .is_some_and(|key| !key.trim().is_empty())
 }
 
-fn route_selection(base: &BaseArgs) -> HostRouteSelection {
+fn session_route(base: &BaseArgs) -> HostRouteSelection {
     let source = if base.profile.is_some() {
         AuthSource::SavedProfile
     } else if matches!(base.api_key_source, Some(ArgValueSource::EnvVariable))
@@ -338,7 +338,7 @@ impl TraceHostServices for BtTraceHost {
         if requirements.interactive_auth {
             base = resolve_trace_org(base).await?;
         }
-        Ok(route_selection(&base))
+        Ok(session_route(&base))
     }
 
     async fn resolve_auth(
@@ -782,7 +782,7 @@ mod tests {
         };
 
         assert!(!has_usable_api_key(&base));
-        let route = route_selection(&base);
+        let route = session_route(&base);
         assert_eq!(route.auth.source, AuthSource::Auto);
         assert_eq!(route.project_name.as_deref(), Some("test-project"));
     }
