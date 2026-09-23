@@ -1,20 +1,17 @@
 use anyhow::{bail, Context, Result};
 use clap::{builder::BoolishValueParser, ArgGroup, Args};
 use dialoguer::Input;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use crate::{
     error::user_error,
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
-    utils::{merge_json_objects, read_text_source, read_yaml_object_source},
 };
 
 use super::{
     api,
-    prompt_config::{
-        parse_choice_scores_source, parse_classifications_source, validate_unit_interval,
-        PromptConfigArgs,
-    },
+    prompt_config::PromptConfigArgs,
+    scorer_config::{build_scorer_config, ScorerConfig},
     IfExistsMode, ResolvedContext,
 };
 
@@ -275,99 +272,39 @@ fn build_scorer_definition(
     name: &str,
     slug: &str,
 ) -> Result<Value> {
-    let prompt = resolve_prompt_block(args)?;
-    let (function_type, parser) = resolve_output_parser(args)?;
-
-    let mut prompt_data = json!({
-        "prompt": prompt,
-        "parser": parser,
-    })
-    .as_object()
-    .expect("prompt data is an object")
-    .clone();
-    let prompt_config = args
-        .prompt_config
-        .build_prompt_data_patch(Some(&args.model))?;
-    merge_json_objects(&mut prompt_data, &prompt_config);
+    let config = build_scorer_config(
+        &ScorerConfig {
+            messages: Some(&args.messages),
+            model: Some(&args.model),
+            prompt_config: &args.prompt_config,
+            choice_scores: args.choice_scores.as_deref(),
+            classifications: args.classifications.as_deref(),
+            use_cot: Some(args.use_cot),
+            allow_no_match: args.classifications.as_ref().map(|_| args.allow_no_match),
+            pass_threshold: args.pass_threshold,
+            metadata: args.metadata.as_deref(),
+            metadata_label: "scorer metadata",
+        },
+        true,
+    )?;
 
     let mut definition = json!({
         "project_id": project_id,
         "name": name,
         "slug": slug,
-        "function_data": {
-            "type": "prompt",
-        },
-        "prompt_data": prompt_data,
+        "function_data": { "type": "prompt" },
         "if_exists": args.if_exists.as_str(),
-        "function_type": function_type,
     });
+    definition
+        .as_object_mut()
+        .expect("scorer definition is an object")
+        .extend(config);
 
     if let Some(description) = args.description.as_deref() {
         definition["description"] = Value::String(description.to_string());
     }
 
-    let metadata = resolve_metadata(args)?;
-    if !metadata.is_empty() {
-        definition["metadata"] = Value::Object(metadata);
-    }
-
     Ok(definition)
-}
-
-fn resolve_output_parser(args: &CreateArgs) -> Result<(&'static str, Value)> {
-    match (
-        args.choice_scores.as_deref(),
-        args.classifications.as_deref(),
-    ) {
-        (Some(source), None) => Ok((
-            "scorer",
-            json!({
-                "type": "llm_classifier",
-                "use_cot": args.use_cot,
-                "choice_scores": parse_choice_scores_source(source)?,
-            }),
-        )),
-        (None, Some(source)) => Ok((
-            "classifier",
-            json!({
-                "type": "llm_classifier",
-                "use_cot": args.use_cot,
-                "choice": parse_classifications_source(source)?,
-                "allow_no_match": args.allow_no_match,
-            }),
-        )),
-        (Some(_), Some(_)) => bail!(
-            "use either --choice-scores for score output or --classifications for classification output, not both"
-        ),
-        (None, None) => bail!(
-            "output choices required. Pass --choice-scores <SOURCE> or --classifications <SOURCE>"
-        ),
-    }
-}
-
-fn resolve_metadata(args: &CreateArgs) -> Result<Map<String, Value>> {
-    let mut metadata = match args.metadata.as_deref() {
-        Some(source) => read_yaml_object_source(source, "scorer metadata")?,
-        None => Map::new(),
-    };
-    if let Some(pass_threshold) = args.pass_threshold {
-        validate_unit_interval(pass_threshold, "--pass-threshold")?;
-        metadata.insert("__pass_threshold".to_string(), json!(pass_threshold));
-    }
-    Ok(metadata)
-}
-
-fn resolve_prompt_block(args: &CreateArgs) -> Result<Value> {
-    let raw = read_text_source(&args.messages, "messages")?;
-    parse_messages(&raw)
-}
-
-fn parse_messages(raw: &str) -> Result<Value> {
-    let messages: Value = serde_json::from_str(raw).context("invalid JSON in scorer messages")?;
-    match messages {
-        Value::Array(_) => Ok(json!({ "type": "chat", "messages": messages })),
-        _ => bail!("scorer messages must be a JSON array"),
-    }
 }
 
 #[cfg(test)]

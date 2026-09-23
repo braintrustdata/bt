@@ -601,6 +601,39 @@ fn functions_push_help_includes_expected_flags() {
 }
 
 #[test]
+fn update_help_is_specific_to_each_function_kind() {
+    let help = |resource: &str| {
+        let output = Command::new(bt_binary_path())
+            .args([resource, "update", "--help"])
+            .output()
+            .unwrap_or_else(|error| panic!("run bt {resource} update --help: {error}"));
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).expect("UTF-8 help output")
+    };
+
+    let tools = help("tools");
+    assert!(tools.contains("--name"));
+    assert!(tools.contains("--new-slug"));
+    assert!(tools.contains("--prompt"));
+    assert!(tools.contains("--messages"));
+    assert!(!tools.contains("--choice-scores"));
+    assert!(!tools.contains("--pass-threshold"));
+
+    let functions = help("functions");
+    assert!(functions.contains("--name"));
+    assert!(functions.contains("--new-slug"));
+    assert!(functions.contains("--description"));
+    assert!(functions.contains("--patch"));
+    assert!(!functions.contains("--model"));
+    assert!(!functions.contains("--choice-scores"));
+
+    let scorers = help("scorers");
+    assert!(scorers.contains("--new-slug"));
+    assert!(scorers.contains("--model"));
+    assert!(scorers.contains("--choice-scores"));
+}
+
+#[test]
 fn functions_pull_help_includes_expected_flags() {
     let output = Command::new(bt_binary_path())
         .arg("functions")

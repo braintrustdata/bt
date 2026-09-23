@@ -148,7 +148,9 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt projects`     | Manage projects (list, create, view, delete)                        |
 | `bt datasets`     | Manage remote datasets (list, create, update, view, delete)         |
 | `bt prompts`      | Manage prompts (list, view, versions, assign, delete)               |
-| `bt scorers`      | Manage scorers (list, create, view, invoke, delete)                 |
+| `bt functions`    | Manage functions (list, view, invoke, update, push, pull, delete)  |
+| `bt tools`        | Manage tools (list, view, invoke, update, delete)                   |
+| `bt scorers`      | Manage scorers (list, create, view, invoke, update, delete)         |
 | `bt environments` | Manage deployment environments (list, view, create, update, delete) |
 | `bt sync`         | Synchronize project logs between Braintrust and local NDJSON files  |
 | `bt update`       | Update bt in-place                                                  |
@@ -173,6 +175,17 @@ bt scorers create "Safety label" \
 Use `--if-exists error|ignore|replace` to control slug conflicts. Text and structured input flags accept an inline value, `@PATH`, or `-` for stdin; only one flag per command may read stdin. Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja. Model options include `--use-cache[=true|false]` and `--response-format text|json-object|<SOURCE>`; structured output accepts a full `response_format` JSON object inline or from `@PATH`.
 
 Before writing a scorer, `bt` sends the complete candidate definition to Braintrust for validation. The backend applies the same model-parameter and replacement checks as the write and returns structured issues with normalization suggestions when available.
+
+Update only the fields you specify, or use `--patch` for fields without dedicated flags:
+
+```bash
+bt scorers update helpfulness --messages @messages.json
+bt scorers update helpfulness --new-slug answer-helpfulness
+bt functions update my-function --name "Updated function" --description "Updated"
+bt tools update my-tool --prompt @prompt.txt --new-slug lookup-order
+```
+
+The API replaces `prompt_data` rather than merging it, so `bt` reads the current definition and sends a materialized replacement with your changes. A concurrent edit can therefore be overwritten.
 
 For TypeScript and Python code scorers, use the Braintrust SDK and `bt functions push`.
 
