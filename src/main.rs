@@ -19,6 +19,7 @@ mod go_runner;
 mod http;
 mod init;
 mod js_runner;
+mod loop_cmd;
 mod observability;
 mod profiles;
 mod project_context;
@@ -80,6 +81,7 @@ Projects & resources
   scorers       Manage scorers
   experiments   Manage experiments
   environments  Manage deployment environments
+  loop          Chat with Loop for the active project
 
 Data & evaluation
   datasets      Manage datasets
@@ -177,6 +179,8 @@ enum Commands {
     Functions(CLIArgs<functions::FunctionsArgs>),
     /// Manage experiments
     Experiments(CLIArgs<experiments::ExperimentsArgs>),
+    /// Chat with Loop for the active project
+    Loop(CLIArgs<loop_cmd::LoopArgs>),
     /// Synchronize project logs between Braintrust and local NDJSON files
     Sync(CLIArgs<sync::SyncArgs>),
     /// Local utility commands
@@ -216,6 +220,7 @@ impl Commands {
             Commands::Scorers(cmd) => &cmd.base,
             Commands::Functions(cmd) => &cmd.base,
             Commands::Experiments(cmd) => &cmd.base,
+            Commands::Loop(cmd) => &cmd.base,
             Commands::Sync(cmd) => &cmd.base,
             Commands::Util(cmd) => &cmd.base,
             Commands::Switch(cmd) => &cmd.base,
@@ -248,6 +253,7 @@ impl Commands {
             Commands::Scorers(cmd) => &mut cmd.base,
             Commands::Functions(cmd) => &mut cmd.base,
             Commands::Experiments(cmd) => &mut cmd.base,
+            Commands::Loop(cmd) => &mut cmd.base,
             Commands::Sync(cmd) => &mut cmd.base,
             Commands::Util(cmd) => &mut cmd.base,
             Commands::Switch(cmd) => &mut cmd.base,
@@ -390,6 +396,7 @@ fn try_main() -> Result<()> {
             Commands::Scorers(cmd) => scorers::run(cmd.base, cmd.args).await?,
             Commands::Functions(cmd) => functions::run(cmd.base, cmd.args).await?,
             Commands::Experiments(cmd) => experiments::run(cmd.base, cmd.args).await?,
+            Commands::Loop(cmd) => loop_cmd::run(cmd.base, cmd.args).await?,
             Commands::Sync(cmd) => sync::run(cmd.base, cmd.args).await?,
             Commands::Util(cmd) => util_cmd::run(cmd.base, cmd.args).await?,
             Commands::SelfCommand(cmd) => self_update::run(cmd.base, cmd.args).await?,
