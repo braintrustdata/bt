@@ -174,8 +174,16 @@ enum DatasetViewsCommands {
 #[derive(Debug, Clone, Args)]
 struct BootstrapCommonArgs {
     /// Custom view name.
-    #[arg(value_name = "NAME")]
-    name: String,
+    #[arg(value_name = "NAME", required_unless_present = "name_flag")]
+    name: Option<String>,
+
+    /// Custom view name (positional NAME takes precedence).
+    #[arg(
+        long = "name",
+        env = "BT_CUSTOM_VIEWS_BOOTSTRAP_NAME",
+        value_name = "NAME"
+    )]
+    name_flag: Option<String>,
 
     /// Output file or directory path. Defaults to braintrust-custom-views/<name>.<type>-view.tsx.
     #[arg(
@@ -194,6 +202,15 @@ struct BootstrapCommonArgs {
         default_value_t = false
     )]
     force: bool,
+}
+
+impl BootstrapCommonArgs {
+    fn name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.name_flag.as_deref())
+            .expect("clap requires a positional name or --name")
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -237,8 +254,17 @@ struct BootstrapResult {
 #[derive(Debug, Clone, Args)]
 struct PreviewCommonArgs {
     /// Custom view file to preview.
-    #[arg(value_name = "PATH")]
-    path: PathBuf,
+    #[arg(value_name = "PATH", required_unless_present = "file_flag")]
+    path: Option<PathBuf>,
+
+    /// Custom view file to preview (positional PATH takes precedence).
+    #[arg(
+        long = "file",
+        alias = "path",
+        env = "BT_CUSTOM_VIEWS_PREVIEW_FILE",
+        value_name = "PATH"
+    )]
+    file_flag: Option<PathBuf>,
 
     /// View slug or name to preview.
     #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_VIEW")]
@@ -257,6 +283,15 @@ struct PreviewCommonArgs {
         default_value_t = false
     )]
     no_open: bool,
+}
+
+impl PreviewCommonArgs {
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .or(self.file_flag.as_deref())
+            .expect("clap requires a positional path or --file")
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -486,15 +521,15 @@ pub async fn run(base: BaseArgs, args: CustomViewsArgs) -> Result<()> {
 }
 
 fn bootstrap_trace(base: BaseArgs, args: TraceViewBootstrapArgs) -> Result<()> {
-    let slug = bootstrap_slug(&args.common.name)?;
+    let slug = bootstrap_slug(args.common.name())?;
     let default_file_name = format!("{slug}.trace-view.tsx");
-    let content = trace_view_bootstrap_template(&args.common.name, &slug);
+    let content = trace_view_bootstrap_template(args.common.name(), &slug);
     let result = write_bootstrap_scaffold(args.common, &default_file_name, &content)?;
     print_bootstrap_result(base.json, ViewType::Trace, &result)
 }
 
 fn bootstrap_dataset(base: BaseArgs, args: DatasetViewBootstrapArgs) -> Result<()> {
-    let slug = bootstrap_slug(&args.common.name)?;
+    let slug = bootstrap_slug(args.common.name())?;
     let dataset_ref = match (
         args.dataset_id.as_deref().map(str::trim),
         args.dataset.as_deref().map(str::trim),
@@ -506,7 +541,7 @@ fn bootstrap_dataset(base: BaseArgs, args: DatasetViewBootstrapArgs) -> Result<(
         _ => "{ name: \"test-dataset\" }".to_string(),
     };
     let default_file_name = format!("{slug}.dataset-view.tsx");
-    let content = dataset_view_bootstrap_template(&args.common.name, &slug, &dataset_ref);
+    let content = dataset_view_bootstrap_template(args.common.name(), &slug, &dataset_ref);
     let result = write_bootstrap_scaffold(args.common, &default_file_name, &content)?;
     print_bootstrap_result(base.json, ViewType::Dataset, &result)
 }
@@ -826,10 +861,10 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
         let prompt = format!("Push {} custom view(s)?", prepared.len());
         let confirmed = dialoguer::Confirm::new()
             .with_prompt(prompt)
-            .default(true)
+            .default(false)
             .interact()?;
         if !confirmed {
-            bail!("custom view push cancelled");
+            return Ok(());
         }
     }
 
@@ -888,13 +923,8 @@ async fn push(base: BaseArgs, args: ViewsPushArgs) -> Result<()> {
 }
 
 async fn preview_trace(base: BaseArgs, args: TraceViewPreviewArgs) -> Result<()> {
-    let context = resolve_preview_context(
-        &base,
-        &args.common,
-        ViewType::Trace,
-        args.target.url.as_deref(),
-    )
-    .await?;
+    let context =
+        resolve_preview_context(&base, &args.common, ViewType::Trace, Some(&args.target)).await?;
     serve_preview(
         base,
         &args.common,
@@ -923,16 +953,19 @@ async fn resolve_preview_context(
     base: &BaseArgs,
     args: &PreviewCommonArgs,
     view_type: ViewType,
-    trace_url: Option<&str>,
+    trace_target: Option<&TracePreviewTargetArgs>,
 ) -> Result<PreviewContext> {
-    let source = prepare_preview_source(&args.path, args.view.clone(), view_type)?;
+    let source = prepare_preview_source(args.path(), args.view.clone(), view_type)?;
 
+    let trace_url = trace_target.and_then(|target| target.url.as_deref());
     let parsed_url = trace_url.map(parse_trace_url).transpose()?;
     let mut base = base.clone();
     base.apply_url_org_hint(parsed_url.as_ref().and_then(|url| url.org.as_deref()));
     let auth_ctx = auth::login_read_only(&base).await?;
     let client = ApiClient::new(&auth_ctx)?;
-    let project = if trace_url_supplies_project(view_type, trace_url) {
+    let project = if trace_target.is_some_and(|target| target.project_id.is_some())
+        || trace_url_supplies_project(view_type, trace_url)
+    {
         None
     } else {
         resolve_project_optional(&base, &client, false).await?
@@ -1001,13 +1034,13 @@ async fn serve_preview(
             serde_json::to_string_pretty(&json!({
                 "url": url,
                 "view": {
-                    "path": args.path.display().to_string(),
+                    "path": args.path().display().to_string(),
                     "selector": args.view,
                 },
             }))?
         );
     } else {
-        println!("Previewing {} at {}", args.path.display(), url);
+        println!("Previewing {} at {}", args.path().display(), url);
     }
 
     if !args.no_open {

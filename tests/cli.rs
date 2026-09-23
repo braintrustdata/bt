@@ -1983,6 +1983,127 @@ fn custom_views_trace_bootstrap_creates_starter_file() {
 }
 
 #[test]
+fn custom_views_bootstrap_accepts_named_and_env_names_with_positional_precedence() {
+    for kind in ["trace", "dataset"] {
+        for (inputs, expected) in [
+            (vec!["--name", "Flag View"], "Flag View"),
+            (vec![], "Env View"),
+            (
+                vec!["Positional View", "--name", "Flag View"],
+                "Positional View",
+            ),
+            (vec!["Positional View"], "Positional View"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bt_command()
+                .current_dir(dir.path())
+                .env("BT_CUSTOM_VIEWS_BOOTSTRAP_NAME", "Env View")
+                .args(["custom-views", kind, "bootstrap"])
+                .args(inputs)
+                .args(["--file", "test.view.tsx"])
+                .assert()
+                .success();
+
+            let contents =
+                fs::read_to_string(dir.path().join("test.view.tsx")).expect("read starter view");
+            assert!(contents.contains(&format!("name: {expected:?}")));
+        }
+    }
+}
+
+#[test]
+fn custom_views_preview_accepts_named_and_env_paths_with_positional_precedence() {
+    for kind in ["trace", "dataset"] {
+        for (inputs, expected) in [
+            (vec!["--file", "flag.view.tsx"], "flag.view.tsx"),
+            (vec!["--path", "alias.view.tsx"], "alias.view.tsx"),
+            (vec![], "env.view.tsx"),
+            (
+                vec!["positional.view.tsx", "--file", "flag.view.tsx"],
+                "positional.view.tsx",
+            ),
+            (vec!["positional.view.tsx"], "positional.view.tsx"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            bt_command()
+                .current_dir(dir.path())
+                .env("BT_CUSTOM_VIEWS_PREVIEW_FILE", "env.view.tsx")
+                .args(["custom-views", kind, "preview"])
+                .args(inputs)
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(format!(
+                    "custom view file not found: {expected}"
+                )));
+        }
+    }
+}
+
+#[test]
+fn custom_views_bootstrap_and_preview_require_primary_inputs() {
+    for kind in ["trace", "dataset"] {
+        for command in ["bootstrap", "preview"] {
+            bt_command()
+                .env_remove("BT_CUSTOM_VIEWS_BOOTSTRAP_NAME")
+                .env_remove("BT_CUSTOM_VIEWS_PREVIEW_FILE")
+                .args(["custom-views", kind, command])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(
+                    "required arguments were not provided",
+                ));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn custom_views_trace_preview_explicit_project_id_skips_stale_default_project() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_home = tempfile::tempdir().expect("config tempdir");
+    let (app_url, login_server) = serve_login_once();
+    fs::write(
+        dir.path().join("test.view.tsx"),
+        "export default () => null;",
+    )
+    .expect("write view");
+    // An occupied port stops preview after context resolution without starting
+    // a long-running server. A stale-project lookup would fail before binding.
+    let occupied_port = TcpListener::bind("127.0.0.1:0").expect("bind occupied port");
+    let port = occupied_port.local_addr().unwrap().port().to_string();
+    let mut cmd = bt_command();
+    clear_braintrust_auth_env(&mut cmd);
+    cmd.current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("BRAINTRUST_ORG_NAME", "test-org")
+        .env("BRAINTRUST_DEFAULT_PROJECT", "stale-test-project")
+        .args([
+            "custom-views",
+            "trace",
+            "preview",
+            "--file",
+            "test.view.tsx",
+            "--app-url",
+            &app_url,
+            "--api-url",
+            &app_url,
+            "--project-id",
+            "proj_test",
+            "--trace-id",
+            "root-span",
+            "--port",
+            &port,
+            "--no-open",
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to bind preview server"));
+    login_server.join().expect("login server thread");
+}
+
+#[test]
 fn custom_views_dataset_bootstrap_creates_starter_file_with_dataset_name() {
     let dir = tempfile::tempdir().expect("tempdir");
 
