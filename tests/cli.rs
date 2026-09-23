@@ -1841,6 +1841,338 @@ fn topics_report_help_accepts_global_org_short_conflict_free() {
 }
 
 #[test]
+fn custom_views_help_accepts_push_trace_and_dataset_subcommands() {
+    bt_command()
+        .args(["custom-views", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("push"))
+        .stdout(predicate::str::contains("trace"))
+        .stdout(predicate::str::contains("dataset"));
+}
+
+#[test]
+fn custom_views_replaces_old_views_command() {
+    bt_command()
+        .args(["views", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+    bt_command()
+        .args(["custom-views", "push", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BT_CUSTOM_VIEWS_PUSH_FILES"));
+}
+
+#[test]
+fn custom_views_rejects_trace_and_dataset_aliases() {
+    for alias in ["traces", "datasets"] {
+        bt_command()
+            .args(["custom-views", alias, "--help"])
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
+fn custom_views_trace_help_lists_bootstrap_and_preview() {
+    bt_command()
+        .args(["custom-views", "trace", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bootstrap"))
+        .stdout(predicate::str::contains("preview"));
+}
+
+#[test]
+fn custom_views_dataset_help_lists_bootstrap_and_preview() {
+    bt_command()
+        .args(["custom-views", "dataset", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bootstrap"))
+        .stdout(predicate::str::contains("preview"));
+}
+
+#[test]
+fn custom_views_push_help_lists_custom_view_flags() {
+    bt_command()
+        .args(["custom-views", "push", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--if-exists"));
+}
+
+#[test]
+fn custom_views_trace_preview_help_lists_trace_selectors() {
+    bt_command()
+        .args(["custom-views", "trace", "preview", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--url"))
+        .stdout(predicate::str::contains("--dataset").not())
+        .stdout(predicate::str::contains("--row-index").not());
+}
+
+#[test]
+fn custom_views_dataset_preview_help_lists_dataset_selectors() {
+    bt_command()
+        .args(["custom-views", "dataset", "preview", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dataset"))
+        .stdout(predicate::str::contains("--trace-id").not())
+        .stdout(predicate::str::contains("--url").not())
+        .stdout(predicate::str::contains("--row-index"));
+}
+
+#[test]
+fn custom_views_preview_hidden_aggregate_command_is_removed() {
+    bt_command()
+        .args(["custom-views", "preview", "--help"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn custom_views_trace_bootstrap_creates_starter_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args(["custom-views", "trace", "bootstrap", "Trace Review"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "braintrust-custom-views/trace-review.trace-view.tsx",
+        ))
+        .stdout(predicate::str::contains(
+            "braintrust-custom-views/tsconfig.json",
+        ));
+
+    let contents = fs::read_to_string(
+        dir.path()
+            .join("braintrust-custom-views/trace-review.trace-view.tsx"),
+    )
+    .expect("read starter view");
+    assert!(contents.contains("export default customTraceView"));
+    assert!(contents.contains(r#"name: "Trace Review""#));
+    assert!(contents.contains(r#"slug: "trace-review""#));
+    assert!(contents.contains("({ trace, span, selectSpan }) => {"));
+    assert!(contents.contains("onChange={(event) => selectSpan?.(event.target.value)}"));
+    assert!(!contents.contains("function StarterTraceView"));
+    assert!(!contents.contains("StarterTraceView,"));
+    assert!(!contents.contains("trace: { spanOrder: string[] }"));
+    assert!(!contents.contains("event:"));
+    assert!(!contents.contains(r#"from "react""#));
+    assert!(!contents.contains("component: StarterTraceView"));
+
+    let tsconfig = fs::read_to_string(dir.path().join("braintrust-custom-views/tsconfig.json"))
+        .expect("read custom view tsconfig");
+    assert!(tsconfig.contains(r#""jsx": "react-jsx""#));
+    assert!(tsconfig.contains(r#""moduleResolution": "Bundler""#));
+    assert!(tsconfig.contains(r#""noEmit": true"#));
+    assert!(tsconfig.contains(r#""allowJs": true"#));
+    assert!(tsconfig.contains(r#""**/*.view.tsx""#));
+    assert!(tsconfig.contains(r#""**/*.view.jsx""#));
+    assert!(tsconfig.contains(r#""**/*-view.tsx""#));
+    assert!(tsconfig.contains(r#""**/*-view.jsx""#));
+    assert!(tsconfig.contains(r#""**/*.d.ts""#));
+}
+
+#[test]
+fn custom_views_dataset_bootstrap_creates_starter_file_with_dataset_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args([
+            "custom-views",
+            "dataset",
+            "bootstrap",
+            "Dataset Review",
+            "--dataset",
+            "test-dataset",
+            "--file",
+            "custom.dataset.view.tsx",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("custom.dataset.view.tsx"));
+
+    let contents =
+        fs::read_to_string(dir.path().join("custom.dataset.view.tsx")).expect("read starter view");
+    assert!(contents.contains("export default customDatasetView"));
+    assert!(contents.contains(r#"name: "Dataset Review""#));
+    assert!(contents.contains(r#"slug: "dataset-review""#));
+    assert!(contents.contains(r#"dataset: { name: "test-dataset" }"#));
+    assert!(contents.contains("({ id, input, expected, metadata, tags = [] }) => {"));
+    assert!(!contents.contains("function StarterDatasetView"));
+    assert!(!contents.contains("StarterDatasetView,"));
+    assert!(!contents.contains("id: string;"));
+    assert!(!contents.contains(r#"from "react""#));
+    assert!(!contents.contains("component: StarterDatasetView"));
+
+    let tsconfig =
+        fs::read_to_string(dir.path().join("tsconfig.json")).expect("read custom view tsconfig");
+    assert!(tsconfig.contains(r#""jsx": "react-jsx""#));
+}
+
+#[test]
+fn custom_views_bootstrap_json_reports_tsconfig() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let output = bt_command()
+        .current_dir(dir.path())
+        .args([
+            "custom-views",
+            "--json",
+            "trace",
+            "bootstrap",
+            "Trace Review",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output).expect("parse bootstrap json output");
+
+    assert_eq!(
+        payload["path"],
+        "braintrust-custom-views/trace-review.trace-view.tsx"
+    );
+    assert_eq!(
+        payload["tsconfig_path"],
+        "braintrust-custom-views/tsconfig.json"
+    );
+    assert_eq!(payload["tsconfig_created"], true);
+    assert_eq!(payload["view_type"], "trace");
+}
+
+#[test]
+fn custom_views_starters_typecheck_against_released_sdk() {
+    // Keep the scaffold below the repo so TypeScript resolves the installed SDK
+    // and React declarations exactly as it would in a user's project.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tempfile::tempdir_in(root).expect("tempdir");
+    for kind in ["trace", "dataset"] {
+        bt_command()
+            .current_dir(dir.path())
+            .args(["custom-views", kind, "bootstrap", "Test View"])
+            .assert()
+            .success();
+    }
+    let output = std::process::Command::new("node")
+        .arg(root.join("node_modules/typescript/bin/tsc"))
+        .arg("-p")
+        .arg(dir.path().join("braintrust-custom-views/tsconfig.json"))
+        .output()
+        .expect("typecheck starters");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn custom_views_bootstrap_preserves_existing_tsconfig_without_force() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("custom")).expect("create custom view dir");
+    fs::write(
+        dir.path().join("custom/tsconfig.json"),
+        "{ \"compilerOptions\": { \"jsx\": \"preserve\" } }\n",
+    )
+    .expect("write existing tsconfig");
+    fs::write(
+        dir.path().join("custom/custom-view-env.d.ts"),
+        "declare const preserved: true;\n",
+    )
+    .expect("write existing types");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args([
+            "custom-views",
+            "trace",
+            "bootstrap",
+            "Trace Review",
+            "--file",
+            "custom",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reused TypeScript config"));
+
+    let tsconfig =
+        fs::read_to_string(dir.path().join("custom/tsconfig.json")).expect("read tsconfig");
+    assert_eq!(
+        tsconfig,
+        "{ \"compilerOptions\": { \"jsx\": \"preserve\" } }\n"
+    );
+    assert!(dir
+        .path()
+        .join("custom/trace-review.trace-view.tsx")
+        .exists());
+    let types =
+        fs::read_to_string(dir.path().join("custom/custom-view-env.d.ts")).expect("read types");
+    assert_eq!(types, "declare const preserved: true;\n");
+}
+
+#[test]
+fn custom_views_bootstrap_force_overwrites_view_and_tsconfig() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("custom")).expect("create custom view dir");
+    fs::write(
+        dir.path().join("custom/trace-review.trace-view.tsx"),
+        "old view\n",
+    )
+    .expect("write view");
+    fs::write(
+        dir.path().join("custom/tsconfig.json"),
+        "{ \"compilerOptions\": { \"jsx\": \"preserve\" } }\n",
+    )
+    .expect("write existing tsconfig");
+    fs::write(
+        dir.path().join("custom/custom-view-env.d.ts"),
+        "declare const preserved: true;\n",
+    )
+    .expect("write existing types");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args([
+            "custom-views",
+            "trace",
+            "bootstrap",
+            "Trace Review",
+            "--file",
+            "custom",
+            "--force",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updated TypeScript config"));
+
+    let contents = fs::read_to_string(dir.path().join("custom/trace-review.trace-view.tsx"))
+        .expect("read starter view");
+    assert!(contents.contains("export default customTraceView"));
+
+    let tsconfig =
+        fs::read_to_string(dir.path().join("custom/tsconfig.json")).expect("read tsconfig");
+    assert!(tsconfig.contains(r#""jsx": "react-jsx""#));
+    assert!(!tsconfig.contains(r#""jsx": "preserve""#));
+    let types =
+        fs::read_to_string(dir.path().join("custom/custom-view-env.d.ts")).expect("read types");
+    assert_eq!(types, "declare const preserved: true;\n");
+}
+
+#[test]
 fn status_quiet_and_verbose_conflict() {
     bt_command()
         .args(["status", "--quiet", "--verbose"])
