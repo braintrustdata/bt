@@ -28,6 +28,8 @@ fn clear_braintrust_auth_env(cmd: &mut Command) {
 /// Setup, managed run, and import resolve a Braintrust credential and org
 /// before writing a route, so those tests supply a synthetic one rather than
 /// depending on whatever auth the ambient environment happens to carry.
+/// An explicit local API URL keeps auth leases from querying a live app for
+/// the organization's data-plane URL.
 fn bt_trace_command(config_home: &Path, profile: &str, org: &str) -> Command {
     write_auth_store(config_home, &[(profile, org)]);
     write_profile_secrets(config_home, &[profile]);
@@ -35,6 +37,7 @@ fn bt_trace_command(config_home: &Path, profile: &str, org: &str) -> Command {
     clear_braintrust_auth_env(&mut cmd);
     cmd.env("XDG_CONFIG_HOME", config_home)
         .env("BRAINTRUST_PROFILE", profile)
+        .env("BRAINTRUST_API_URL", "http://127.0.0.1:1")
         .env("BRAINTRUST_ORG_NAME", org);
     cmd
 }
@@ -44,6 +47,7 @@ fn bt_trace_environment_command(config_home: &Path) -> Command {
     clear_braintrust_auth_env(&mut cmd);
     cmd.env("XDG_CONFIG_HOME", config_home)
         .env("BRAINTRUST_API_KEY", "test-api-key")
+        .env("BRAINTRUST_API_URL", "http://127.0.0.1:1")
         .env("BRAINTRUST_ORG_NAME", "test-org");
     cmd
 }
@@ -1121,6 +1125,7 @@ fn trace_setup_adopts_the_configured_org_without_prompting() {
         .env("XDG_CONFIG_HOME", config_home.path())
         .env("PATH", bin_dir.path())
         .env("BRAINTRUST_PROFILE", "test-profile")
+        .env("BRAINTRUST_API_URL", "http://127.0.0.1:1")
         .env("AGENT_SETUP_LOG", state_dir.path().join("codex.log"))
         .env("BT_DAEMON_CONFIG", &config)
         .args([
@@ -1334,7 +1339,7 @@ fn trace_run_pi_injects_the_npm_extension_for_only_that_process() {
 
     assert!(fs::read_to_string(run_log)
         .expect("read Pi arguments")
-        .contains("-e npm:@braintrust/pi-extension@^1 --version"));
+        .contains("-e npm:@braintrust/pi-extension --version"));
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(run_settings).expect("read invocation settings"))
             .expect("parse invocation settings");
@@ -1608,7 +1613,7 @@ fn trace_setup_opencode_configures_the_npm_plugin_and_selected_route() {
     assert_eq!(opencode["model"], "test/model");
     assert_eq!(
         opencode["plugin"],
-        serde_json::json!(["other-plugin", "@braintrust/trace-opencode@^1"])
+        serde_json::json!(["other-plugin", "@braintrust/trace-opencode@^2"])
     );
 
     let settings: serde_json::Value = serde_json::from_slice(
@@ -1724,7 +1729,7 @@ fn trace_setup_pi_installs_the_npm_extension_and_selected_route() {
 
     assert_eq!(
         fs::read_to_string(log).expect("read Pi calls").trim(),
-        "install npm:@braintrust/pi-extension@^1"
+        "install npm:@braintrust/pi-extension"
     );
     let settings: serde_json::Value = serde_json::from_slice(
         &fs::read(home.path().join(".pi/agent/braintrust.json")).expect("read Pi settings"),
