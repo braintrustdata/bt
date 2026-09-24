@@ -140,6 +140,35 @@ Notes:
 - The workflow publishes an immutable tag: `canary-<branch-slug>-<short-sha>`.
 - It also updates a moving branch tag: `canary-<branch-slug>` when the run is for the latest commit on that branch.
 
+## npm Releases
+
+Stable releases publish seven platform binary packages, then the standalone `@braintrust/bt` package, from the `publish-npm` job in `release.yml`.
+The wrapper and its optional dependencies use the same exact CLI release version.
+Installation follows the [optional dependencies plus postinstall fallback pattern](https://blog.sentry.io/publishing-binaries-on-npm/).
+The builder also embeds SHA-256 checksums of the release binaries in the wrapper, following Sentry CLI's checksum approach; fallback downloads must match before they are installed.
+Existing published versions are skipped so a partially completed publishing job can be retried.
+Canary workflows do not publish npm packages.
+
+Package manifests are checked in under `npm/bt` and `npm/platforms`, including the wrapper's explicit optional dependencies and each platform's OS, CPU, and libc constraints.
+Their `0.0.0` versions are placeholders; the release script stamps the release version into all manifests and dependency pins, copies the binaries, and calculates checksums.
+`npm/targets.json` only maps Rust targets to platform package directories.
+Publish the prepared packages under `npm/dist`, not the source directories.
+To prepare packages from downloaded release archives:
+
+```bash
+node npm/scripts/build-platform-packages.mjs --version <version> --archives-dir <archives-dir>
+```
+
+Before the first standalone release, an npm organization maintainer must publish the generated `@braintrust/bt` package with their authenticated npm account after its matching platform packages are available.
+For this one-time local bootstrap, run `npm publish ./npm/dist/bt --access public --provenance=false`; subsequent CI publishes generate provenance through OIDC.
+Then configure its npm trusted publisher with organization `braintrustdata`, repository `bt`, workflow filename `release.yml`, and environment `npm-publish`, allowing direct publishing.
+Subsequent releases use the existing workflow's OIDC authentication without an npm publishing token.
+Make the standalone package available before releasing the SDK change that removes its bundled CLI.
+
+Run packaging tests with `node --test npm/tests/*.test.cjs npm/tests/*.test.mjs`.
+The archive builder tests require `tar`, `unzip`, and Python 3 and run on Linux in CI.
+Runtime tests also run on macOS and Windows.
+
 ## Windows Release Signing
 
 Release workflows Authenticode-sign Windows artifacts via [Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/) (the `sign-windows-artifacts` composite action). Signing runs when these GitHub Actions repository secrets are configured:

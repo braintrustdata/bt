@@ -6,6 +6,19 @@
 
 ## Install
 
+### npm
+
+```bash
+npm install -g @braintrust/bt
+bt --version
+```
+
+For a project-local installation, use `npm install --save-dev @braintrust/bt` and run `npx bt`.
+To run without adding a project dependency, use `npx @braintrust/bt --help`.
+Append `@<version>` to the package name to install a specific stable CLI release.
+The CLI is installed separately from the `braintrust` JavaScript SDK.
+See the [npm package README](npm/bt/README.md) for supported platforms and fallback download behavior.
+
 ### Unix (macOS / Linux)
 
 ```bash
@@ -94,6 +107,8 @@ shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 
 ## Update
 
+For npm installations, use `npm install -g @braintrust/bt@latest` globally or `npm install --save-dev @braintrust/bt@latest` in a project.
+
 `bt` can update itself when installed via the official installer.
 
 ```bash
@@ -108,6 +123,8 @@ bt update --channel canary
 ```
 
 ## Uninstall
+
+For npm installations, use `npm uninstall -g @braintrust/bt` globally or `npm uninstall @braintrust/bt` in a project.
 
 Unix-like systems:
 

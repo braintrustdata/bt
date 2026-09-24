@@ -1,17 +1,16 @@
 #!/usr/bin/env node
-// Builds the per-platform npm packages from cargo-dist release archives.
+// Prepares checked-in npm packages using cargo-dist release archives.
 //
 //   --version <semver>      version to stamp into every package.json (required)
 //   --archives-dir <path>   directory containing cargo-dist archives
 //                           (bt-<target>.tar.gz / bt-<target>.zip), required
 //   --out-dir <path>        directory to write packages into (default: npm/dist)
 //
-// Emits <out-dir>/bt-<pkg>/ (one per target), each ready to `npm publish`.
-// The `bt` command is exposed via the `braintrust` SDK, which lists these
-// packages as optionalDependencies and ships a launcher that resolves the
-// matching binary.
+// Emits <out-dir>/bt-<pkg>/ (one per target) and <out-dir>/bt/, each ready
+// to `npm publish`. The @braintrust/bt package exposes the `bt` command.
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -47,16 +46,23 @@ if (!existsSync(archivesDir))
   throw new Error(`archives-dir not found: ${archivesDir}`);
 
 const targets = JSON.parse(readFileSync(join(NPM_DIR, "targets.json"), "utf8"));
+const checksums = {};
 
 if (existsSync(outDir)) rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
 // --- Per-platform packages ---
-for (const [target, spec] of Object.entries(targets)) {
-  const archiveName = `bt-${target}.${spec.archiveExt}`;
+for (const [target, platform] of Object.entries(targets)) {
+  const packageDir = join(NPM_DIR, "platforms", `bt-${platform}`);
+  const platformPkg = JSON.parse(
+    readFileSync(join(packageDir, "package.json"), "utf8"),
+  );
+  const isWindows = platformPkg.os.includes("win32");
+  const binaryName = isWindows ? "bt.exe" : "bt";
+  const archiveName = `bt-${target}.${isWindows ? "zip" : "tar.gz"}`;
   const archive = join(archivesDir, archiveName);
   if (!existsSync(archive)) {
-    // Fail hard, don't skip: the SDK pins each package at an exact version, so a
+    // Fail hard, don't skip: the wrapper pins each package at an exact version, so a
     // missing platform would break installs for that platform at runtime.
     throw new Error(`Archive not found for ${target}: ${archive}`);
   }
@@ -82,49 +88,54 @@ for (const [target, spec] of Object.entries(targets)) {
     throw new Error(`Unsupported archive: ${archive}`);
   }
 
-  const binPath = join(stagingDir, spec.bin);
+  const binPath = join(stagingDir, binaryName);
   if (!existsSync(binPath)) {
-    throw new Error(`Binary ${spec.bin} not found at ${binPath}`);
+    throw new Error(`Binary ${binaryName} not found at ${binPath}`);
   }
 
-  const pkgName = `@braintrust/bt-${spec.pkg}`;
-  const pkgOut = join(outDir, `bt-${spec.pkg}`);
+  checksums[platformPkg.name] = createHash("sha256")
+    .update(readFileSync(binPath))
+    .digest("hex");
+  const pkgOut = join(outDir, `bt-${platform}`);
   const pkgBin = join(pkgOut, "bin");
   mkdirSync(pkgBin, { recursive: true });
-  cpSync(binPath, join(pkgBin, spec.bin));
-  if (spec.os !== "win32") chmodSync(join(pkgBin, spec.bin), 0o755);
+  cpSync(binPath, join(pkgBin, binaryName));
+  if (!isWindows) chmodSync(join(pkgBin, binaryName), 0o755);
 
-  const platformPkg = {
-    name: pkgName,
-    version,
-    description: `Prebuilt bt binary for ${spec.os}-${spec.cpu}${spec.libc ? `-${spec.libc}` : ""}`,
-    homepage: "https://github.com/braintrustdata/bt",
-    repository: {
-      type: "git",
-      url: "git+https://github.com/braintrustdata/bt.git",
-    },
-    license: "Apache-2.0",
-    author: "Braintrust engineering <eng@braintrust.dev>",
-    files: ["bin/"],
-    os: [spec.os],
-    cpu: [spec.cpu],
-    preferUnplugged: true,
-  };
-  if (spec.libc) platformPkg.libc = [spec.libc];
-
+  platformPkg.version = version;
   writeFileSync(
     join(pkgOut, "package.json"),
     JSON.stringify(platformPkg, null, 2) + "\n",
   );
-  writeFileSync(
-    join(pkgOut, "README.md"),
-    `# ${pkgName}\n\nPrebuilt \`bt\` binary for ${spec.os}-${spec.cpu}${spec.libc ? ` (${spec.libc})` : ""}.\n\nInstalled automatically as an optional dependency of [\`braintrust\`](https://www.npmjs.com/package/braintrust), which exposes the \`bt\` command. Install that package instead.\n`,
-  );
+  cpSync(join(NPM_DIR, "platforms", "README.md"), join(pkgOut, "README.md"));
 
-  console.log(`Built ${pkgName} -> ${pkgOut}`);
+  console.log(`Prepared ${platformPkg.name} -> ${pkgOut}`);
 }
 
 rmSync(join(outDir, ".staging"), { recursive: true, force: true });
 
-const expected = Object.keys(targets).length;
+// --- Standalone CLI package ---
+const wrapperOut = join(outDir, "bt");
+cpSync(join(NPM_DIR, "bt"), wrapperOut, { recursive: true });
+cpSync(join(NPM_DIR, "..", "LICENSE"), join(wrapperOut, "LICENSE"));
+writeFileSync(
+  join(wrapperOut, "checksums.json"),
+  JSON.stringify(checksums, null, 2) + "\n",
+);
+chmodSync(join(wrapperOut, "bin", "bt"), 0o755);
+const wrapperPkg = JSON.parse(
+  readFileSync(join(wrapperOut, "package.json"), "utf8"),
+);
+wrapperPkg.version = version;
+delete wrapperPkg.private;
+for (const dependency of Object.keys(wrapperPkg.optionalDependencies)) {
+  wrapperPkg.optionalDependencies[dependency] = version;
+}
+writeFileSync(
+  join(wrapperOut, "package.json"),
+  JSON.stringify(wrapperPkg, null, 2) + "\n",
+);
+console.log(`Built @braintrust/bt -> ${wrapperOut}`);
+
+const expected = Object.keys(targets).length + 1;
 console.log(`\nAll ${expected} packages written to ${outDir}`);

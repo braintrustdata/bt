@@ -576,7 +576,7 @@ jobs:
             --archives-dir archives \
             --out-dir npm/dist
 
-      - name: Publish platform packages
+      - name: Publish platform packages and standalone CLI
         shell: bash
         run: |
           set -euo pipefail
@@ -586,6 +586,8 @@ jobs:
             echo "No npm platform packages found in npm/dist" >&2
             exit 1
           fi
+          # Publish the wrapper last so every exact optional dependency exists.
+          package_dirs+=(npm/dist/bt)
           for dir in "${package_dirs[@]}"; do
             name="$(node -p "require('./$dir/package.json').name")"
             version="$(node -p "require('./$dir/package.json').version")"
@@ -597,5 +599,30 @@ jobs:
               continue
             fi
             echo "Publishing $name@$version"
-            (cd "$dir" && npm publish --access public)
+            (cd "$dir" && npm publish --access public --tag latest)
           done
+
+  smoke-npm:
+    needs:
+      - plan
+      - publish-npm
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: Install and run the published CLI
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.release-version }}
+        run: |
+          set -euo pipefail
+          npm install --global --ignore-scripts "@braintrust/bt@${RELEASE_VERSION}"
+          test "$(bt --version)" = "bt ${RELEASE_VERSION}"
+          test "$(npx --yes "@braintrust/bt@${RELEASE_VERSION}" --version)" = "bt ${RELEASE_VERSION}"
