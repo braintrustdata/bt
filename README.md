@@ -6,19 +6,6 @@
 
 ## Install
 
-### npm
-
-```bash
-npm install -g @braintrust/bt
-bt --version
-```
-
-For a project-local installation, use `npm install --save-dev @braintrust/bt` and run `npx bt`.
-To run without adding a project dependency, use `npx @braintrust/bt --help`.
-Append `@<version>` to the package name to install a specific stable CLI release.
-The CLI is installed separately from the `braintrust` JavaScript SDK.
-See the [npm package README](npm/bt/README.md) for supported platforms and fallback download behavior.
-
 ### Unix (macOS / Linux)
 
 ```bash
@@ -85,6 +72,43 @@ The SHA1 is the commit hash while the (optional) SHA256 of `mise.toml` are hashe
 ### PR/branch builds (no release)
 
 Non-`main` branch builds are available as GitHub Actions run artifacts (download from the workflow run page or with `gh run download`). They are not published as GitHub Releases.
+
+### npm, Yarn, and pnpm
+
+Install the CLI in your project using your package manager:
+
+```bash
+# npm
+npm install --save-dev @braintrust/bt
+
+# Yarn
+yarn add --dev @braintrust/bt
+
+# pnpm
+pnpm add --save-dev @braintrust/bt
+```
+
+Once installed, you can invoke `bt` directly from scripts in your `package.json`:
+
+```json
+{
+  "scripts": {
+    "bt": "bt"
+  }
+}
+```
+
+For example, run `npm run bt -- --help`, `yarn run bt --help`, or `pnpm run bt --help`.
+
+To install globally with npm:
+
+```bash
+npm install -g @braintrust/bt
+bt --version
+```
+
+To run without adding a project dependency, use `npx @braintrust/bt --help`.
+See the [npm package README](npm/bt/README.md) for supported platforms and fallback download behavior.
 
 ## Verify
 

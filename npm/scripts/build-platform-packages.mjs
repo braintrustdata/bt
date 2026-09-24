@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-// Prepares checked-in npm packages using cargo-dist release archives.
+// Prepares checked-in npm packages using cargo-dist release archives, then
+// packs tarballs and npm dependency SBOMs for sdk-actions to attest and publish.
 //
 //   --version <semver>      version to stamp into every package.json (required)
 //   --archives-dir <path>   directory containing cargo-dist archives
 //                           (bt-<target>.tar.gz / bt-<target>.zip), required
 //   --out-dir <path>        directory to write packages into (default: npm/dist)
 //
-// Emits <out-dir>/bt-<pkg>/ (one per target) and <out-dir>/bt/, each ready
-// to `npm publish`. The @braintrust/bt package exposes the `bt` command.
+// Emits <out-dir>/bt-<pkg>/ (one per target), <out-dir>/bt/, and
+// <out-dir>/artifacts/ containing the tarballs, SBOMs, and release manifest.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -18,6 +19,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -137,5 +139,62 @@ writeFileSync(
 );
 console.log(`Built @braintrust/bt -> ${wrapperOut}`);
 
+// Make every platform visible to npm sbom, including platforms other than the
+// build host. These exact dependencies aren't published yet, so use the local
+// packages without downloading dependencies or running installation scripts.
+const wrapperModules = join(wrapperOut, "node_modules");
+mkdirSync(join(wrapperModules, "@braintrust"), { recursive: true });
+const packageDirs = Object.values(targets).map((platform) => `bt-${platform}`);
+const artifactsDir = join(outDir, "artifacts");
+mkdirSync(artifactsDir);
+const packages = [];
+try {
+  for (const dir of packageDirs) {
+    symlinkSync(
+      join(outDir, dir),
+      join(wrapperModules, "@braintrust", dir),
+      "dir",
+    );
+  }
+
+  // The shared publisher consumes this order: dependencies before the wrapper.
+  for (const dir of [...packageDirs, "bt"]) {
+    const cwd = join(outDir, dir);
+    const [packed] = JSON.parse(
+      execFileSync(
+        "npm",
+        [
+          "pack",
+          "--json",
+          "--ignore-scripts",
+          "--pack-destination",
+          artifactsDir,
+        ],
+        { cwd, encoding: "utf8" },
+      ),
+    );
+    const sbomAsset = packed.filename.replace(/\.tgz$/, ".sbom.json");
+    const sbom = execFileSync(
+      "npm",
+      ["sbom", "--sbom-format=cyclonedx", "--omit=dev"],
+      { cwd, encoding: "utf8" },
+    );
+    writeFileSync(join(artifactsDir, sbomAsset), sbom);
+    packages.push({
+      name: packed.name,
+      version: packed.version,
+      tarball_asset: packed.filename,
+      sbom_asset: sbomAsset,
+    });
+  }
+} finally {
+  rmSync(wrapperModules, { recursive: true, force: true });
+}
+
+writeFileSync(
+  join(artifactsDir, "release-manifest.json"),
+  JSON.stringify({ packages }, null, 2) + "\n",
+);
+
 const expected = Object.keys(targets).length + 1;
-console.log(`\nAll ${expected} packages written to ${outDir}`);
+console.log(`\nAll ${expected} packages packed in ${artifactsDir}`);

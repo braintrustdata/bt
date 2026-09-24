@@ -79,9 +79,66 @@ test(
     const wrapper = JSON.parse(
       readFileSync(join(out, "bt/package.json"), "utf8"),
     );
+    const artifacts = join(out, "artifacts");
+    const manifest = JSON.parse(
+      readFileSync(join(artifacts, "release-manifest.json"), "utf8"),
+    );
     const env = { ...process.env, npm_config_cache: join(root, "cache") };
     delete env.BT_BINARY_PATH;
     delete env.BT_SKIP_DOWNLOAD;
+
+    await t.test(
+      "release manifest orders packed platforms before the wrapper with complete npm SBOMs",
+      () => {
+        const platformNames = Object.keys(wrapper.optionalDependencies);
+        assert.deepEqual(
+          manifest.packages.map((pkg) => pkg.name),
+          [...platformNames, wrapper.name],
+        );
+        for (const pkg of manifest.packages) {
+          assert.equal(pkg.version, version);
+          const tarball = join(artifacts, pkg.tarball_asset);
+          const packed = JSON.parse(
+            execFileSync("tar", ["-xOf", tarball, "package/package.json"], {
+              encoding: "utf8",
+            }),
+          );
+          assert.equal(packed.name, pkg.name);
+          assert.equal(packed.version, version);
+          const files = execFileSync("tar", ["-tf", tarball], {
+            encoding: "utf8",
+          });
+          assert.doesNotMatch(files, /node_modules/);
+          const sbom = JSON.parse(
+            readFileSync(join(artifacts, pkg.sbom_asset), "utf8"),
+          );
+          assert.equal(sbom.bomFormat, "CycloneDX");
+          assert.equal(
+            sbom.metadata.component["bom-ref"],
+            `${pkg.name}@${version}`,
+          );
+          assert.equal(sbom.metadata.component.version, version);
+          const expectedDeps = pkg.name === wrapper.name ? platformNames : [];
+          assert.deepEqual(
+            sbom.components.map((component) => component["bom-ref"]).sort(),
+            expectedDeps.map((name) => `${name}@${version}`).sort(),
+          );
+          for (const component of sbom.components) {
+            assert.equal(component.version, version);
+          }
+          assert.deepEqual(
+            sbom.dependencies
+              .find(
+                (dependency) =>
+                  dependency.ref === sbom.metadata.component["bom-ref"],
+              )
+              .dependsOn.sort(),
+            expectedDeps.map((name) => `${name}@${version}`).sort(),
+          );
+        }
+        assert.equal(existsSync(join(out, "bt/node_modules")), false);
+      },
+    );
 
     await t.test(
       "wrapper pins every platform and includes only the runtime files",
@@ -157,17 +214,12 @@ test(
     const hostName = helper
       .getDistributionForThisPlatform()
       .packageName.split("/")[1];
-    const tarballs = [];
-    for (const name of ["bt", hostName]) {
-      const [packed] = JSON.parse(
-        execFileSync(
-          "npm",
-          ["pack", "--json", "--ignore-scripts", "--pack-destination", root],
-          { cwd: join(out, name), env, encoding: "utf8" },
-        ),
-      );
-      tarballs.push(join(root, packed.filename));
-    }
+    const tarballs = ["@braintrust/bt", `@braintrust/${hostName}`].map((name) =>
+      join(
+        artifacts,
+        manifest.packages.find((pkg) => pkg.name === name).tarball_asset,
+      ),
+    );
 
     await t.test(
       "local and global packed installs work with lifecycle scripts disabled",
