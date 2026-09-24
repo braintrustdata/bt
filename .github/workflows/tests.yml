@@ -30,8 +30,21 @@ jobs:
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: 1.97.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.15.0"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Run all unit tests
         run: cargo test --locked --bin bt
+      - name: Test custom view CLI and preview callbacks
+        run: |
+          cargo test --locked --test cli custom_views
+          node --test scripts/custom-views-preview.test.mjs
 
   eval-tests-go:
     name: eval-tests-go
@@ -53,6 +66,15 @@ jobs:
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: 1.97.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.15.0"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
       # No Go toolchain is installed on purpose: these tests stub `go` through
       # BT_EVAL_GO_BIN, so they stay hermetic and fast. Exercising a real
       # `go run` would need a fixture under tests/evals/go plus actions/setup-go.
@@ -133,5 +155,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.15.0"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.28.2 --activate
+      - name: Install JS dependencies
+        run: pnpm install --ignore-scripts
       - name: Run eval fixtures
         run: cargo test --test eval_fixtures

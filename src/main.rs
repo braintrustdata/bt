@@ -6,6 +6,7 @@ mod args;
 mod auth;
 #[allow(dead_code)]
 mod config;
+mod custom_views;
 mod datasets;
 mod env;
 mod environments;
@@ -75,6 +76,7 @@ Projects & resources
   observability Manage active observability tools
   topics        Inspect and control Topics automation
   prompts       Manage prompts
+  custom-views  Push and preview custom views
   functions     Manage functions (tools, scorers, and more)
   tools         Manage tools
   scorers       Manage scorers
@@ -149,6 +151,8 @@ enum Commands {
     Profiles(CLIArgs<profiles::ProfilesArgs, LoginBaseArgs>),
     /// View logs, traces, and spans
     View(CLIArgs<traces::ViewArgs>),
+    /// Push and preview custom views
+    CustomViews(CLIArgs<custom_views::CustomViewsArgs>),
     #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
@@ -202,6 +206,7 @@ impl Commands {
             Commands::Logout(cmd) => &cmd.base,
             Commands::Profiles(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
+            Commands::CustomViews(cmd) => &cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
@@ -234,6 +239,7 @@ impl Commands {
             Commands::Logout(cmd) => &mut cmd.base,
             Commands::Profiles(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
+            Commands::CustomViews(cmd) => &mut cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
@@ -365,6 +371,7 @@ fn try_main() -> Result<()> {
             Commands::Logout(cmd) => auth::run_logout_command(cmd.base, cmd.args)?,
             Commands::Profiles(cmd) => profiles::run(cmd.base, cmd.args)?,
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
+            Commands::CustomViews(cmd) => custom_views::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
             Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,

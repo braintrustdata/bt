@@ -145,6 +145,7 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt trace`        | Trace coding-agent sessions                                         |
 | `bt sql`          | Run SQL queries against Braintrust                                  |
 | `bt view`         | View logs, traces, and spans                                        |
+| `bt custom-views` | Bootstrap, preview, and push trace and dataset custom views         |
 | `bt projects`     | Manage projects (list, create, view, delete)                        |
 | `bt datasets`     | Manage remote datasets (list, create, update, view, delete)         |
 | `bt prompts`      | Manage prompts (list, view, versions, assign, delete)               |
@@ -152,6 +153,30 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 | `bt environments` | Manage deployment environments (list, view, create, update, delete) |
 | `bt sync`         | Synchronize project logs between Braintrust and local NDJSON files  |
 | `bt update`       | Update bt in-place                                                  |
+
+## `bt custom-views`
+
+Define custom views with `customTraceView` or `customDatasetView` from `braintrust/custom-views` (SDK 3.33.0 or later).
+Each file default-exports one definition and React component.
+
+```bash
+npm install braintrust@^3.33.0 react@^18
+npm install -D @types/react@^18
+bt custom-views trace bootstrap 'Trace Review'
+bt custom-views dataset bootstrap 'Dataset Review' --dataset test-dataset
+bt custom-views trace preview ./braintrust-custom-views/trace-review.trace-view.tsx --project test-project --trace-id <ROOT_SPAN_ID>
+bt custom-views dataset preview ./braintrust-custom-views/dataset-review.dataset-view.tsx --project test-project --row-index 0
+bt custom-views push ./braintrust-custom-views --project test-project --if-exists replace
+```
+
+Preview supports local and installed-package imports, hot reload, `trace.fetchSpanFields`, `trace.update`, and dataset `update`.
+Trace URLs select their organization and experiment when present, unless the organization is explicitly overridden.
+Resolving a project-log trace URL by span ID searches the last 30 days by default; use `--lookup-window 90d` for older spans, or pass the root span ID with `--trace-id`.
+Edits affect only the local preview, return `{ transactionId: null }`, and are discarded on reload.
+Pushing publishes the component to Braintrust, where the application provides the editing callbacks.
+Set `project` in each definition or use `--project` / your configured project.
+Push requires Node.js; preview assets and the SDK helpers are embedded in the CLI.
+When building bt from source, run `pnpm install --frozen-lockfile --ignore-scripts` before Cargo to install the embedded assets and their build tools.
 
 ## `bt scorers`
 

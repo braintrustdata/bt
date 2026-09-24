@@ -296,20 +296,20 @@ struct BtqlResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ProjectSelection {
-    id: String,
-    name: Option<String>,
+pub(crate) struct ProjectSelection {
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct ParsedTraceUrl {
-    org: Option<String>,
-    project: Option<String>,
+pub(crate) struct ParsedTraceUrl {
+    pub(crate) org: Option<String>,
+    pub(crate) project: Option<String>,
     page: Option<String>,
     experiment: Option<String>,
     comparison_experiment: Option<String>,
-    row_ref: Option<String>,
-    span_id: Option<String>,
+    pub(crate) row_ref: Option<String>,
+    pub(crate) span_id: Option<String>,
     trace_view_type: Option<String>,
 }
 
@@ -1690,7 +1690,7 @@ async fn resolve_object_ref_for_view(
     ))
 }
 
-async fn resolve_first_experiment_for_trace_url(
+pub(crate) async fn resolve_first_experiment_for_trace_url(
     client: &ApiClient,
     project: &ProjectSelection,
     parsed_url: &ParsedTraceUrl,
@@ -1712,7 +1712,7 @@ async fn resolve_first_experiment_for_trace_url(
     Err(last_error.expect("at least one experiment selector should have been tried"))
 }
 
-fn trace_url_experiment_selectors(parsed_url: &ParsedTraceUrl) -> Vec<&str> {
+pub(crate) fn trace_url_experiment_selectors(parsed_url: &ParsedTraceUrl) -> Vec<&str> {
     let mut selectors = Vec::new();
     for selector in [
         parsed_url.experiment.as_deref(),
@@ -5734,7 +5734,7 @@ fn select_startup_url(
     }
 }
 
-fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
+pub(crate) fn parse_trace_url(input: &str) -> Result<ParsedTraceUrl> {
     let input = input.trim();
     if input.is_empty() {
         bail!("trace URL is empty");
@@ -5859,6 +5859,24 @@ async fn resolve_trace_target_for_url(
     let project =
         resolve_project_target_for_url(client, current_project, parsed.project.as_deref()).await?;
 
+    let root_span_id =
+        resolve_trace_root_span_id(client, source_expr, parsed, None, print_queries).await?;
+
+    Ok(ResolvedTraceTarget {
+        project,
+        root_span_id,
+        span_id: parsed.span_id.clone(),
+        detail_view: detail_view_from_tvt(parsed.trace_view_type.as_deref()),
+    })
+}
+
+pub(crate) async fn resolve_trace_root_span_id(
+    client: &ApiClient,
+    source_expr: &str,
+    parsed: &ParsedTraceUrl,
+    span_filter: Option<&str>,
+    print_queries: bool,
+) -> Result<String> {
     let mut root_span_id: Option<String> = None;
     if let Some(row_ref) = parsed.row_ref.as_deref() {
         root_span_id = lookup_root_span_id_for_query(
@@ -5884,7 +5902,7 @@ async fn resolve_trace_target_for_url(
         if let Some(span_id) = parsed.span_id.as_deref() {
             root_span_id = lookup_root_span_id_for_query(
                 client,
-                &build_url_lookup_by_span_id_query(source_expr, span_id),
+                &build_url_lookup_by_span_id_query(source_expr, span_id, span_filter),
                 "url-open-span-id",
                 print_queries,
             )
@@ -5892,7 +5910,7 @@ async fn resolve_trace_target_for_url(
         }
     }
 
-    let root_span_id = root_span_id.with_context(|| {
+    root_span_id.with_context(|| {
         if let Some(row_ref) = parsed.row_ref.as_deref() {
             format!(
                 "could not resolve trace from URL parameter r='{row_ref}' (tried root_span_id then row id lookup)"
@@ -5902,13 +5920,6 @@ async fn resolve_trace_target_for_url(
         } else {
             "trace URL must include query parameter `r` or `s`".to_string()
         }
-    })?;
-
-    Ok(ResolvedTraceTarget {
-        project,
-        root_span_id,
-        span_id: parsed.span_id.clone(),
-        detail_view: detail_view_from_tvt(parsed.trace_view_type.as_deref()),
     })
 }
 
@@ -5982,9 +5993,16 @@ fn build_url_lookup_by_row_id_query(source_expr: &str, row_id: &str) -> String {
     )
 }
 
-fn build_url_lookup_by_span_id_query(source_expr: &str, span_id: &str) -> String {
+fn build_url_lookup_by_span_id_query(
+    source_expr: &str,
+    span_id: &str,
+    span_filter: Option<&str>,
+) -> String {
+    let extra_filter = span_filter
+        .map(|filter| format!(" AND ({filter})"))
+        .unwrap_or_default();
     format!(
-        "select: root_span_id, span_id, id | from: {source_expr} spans | filter: span_id = {} | limit: 1",
+        "select: root_span_id, span_id, id | from: {source_expr} spans | filter: span_id = {}{extra_filter} | limit: 1",
         sql_quote(span_id),
     )
 }
@@ -6827,7 +6845,8 @@ mod tests {
         assert!(full_by_span_id.contains("preview_length: -1"));
         assert!(full_by_span_id.contains("filter: span_id = 'span-1'"));
 
-        let url_lookup = build_url_lookup_by_span_id_query("experiment('experiment-id')", "span-1");
+        let url_lookup =
+            build_url_lookup_by_span_id_query("experiment('experiment-id')", "span-1", None);
         assert!(url_lookup.contains("from: experiment('experiment-id') spans"));
         assert!(url_lookup.contains("filter: span_id = 'span-1'"));
     }

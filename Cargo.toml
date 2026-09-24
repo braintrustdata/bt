@@ -57,6 +57,15 @@ flate2 = "1.1.2"
 fs2 = "0.4"
 tempfile = "3"
 uuid = { version = "1.21.0", features = ["v4"] }
+swc_bundler = "49.0.0"
+swc_common = "21.0.2"
+swc_ecma_ast = "23.0.1"
+swc_ecma_codegen = "26.0.1"
+swc_ecma_loader = { version = "22.0.0", features = ["node"] }
+swc_ecma_parser = "39.1.0"
+swc_ecma_transforms_base = "42.0.1"
+swc_ecma_transforms_react = "47.0.0"
+swc_ecma_transforms_typescript = "47.0.0"
 
 [profile.dist]
 inherits = "release"
