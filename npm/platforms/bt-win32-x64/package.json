@@ -1,0 +1,22 @@
+{
+  "name": "@braintrust/bt-win32-x64",
+  "version": "0.0.0",
+  "description": "Prebuilt bt binary for win32-x64",
+  "homepage": "https://github.com/braintrustdata/bt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/braintrustdata/bt.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Braintrust engineering <eng@braintrust.dev>",
+  "files": [
+    "bin/"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "preferUnplugged": true
+}

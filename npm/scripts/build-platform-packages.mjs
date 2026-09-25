@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-// Builds the per-platform npm packages from cargo-dist release archives.
+// Prepares checked-in npm packages using cargo-dist release archives, then
+// packs tarballs and npm dependency SBOMs for sdk-actions to attest and publish.
 //
 //   --version <semver>      version to stamp into every package.json (required)
 //   --archives-dir <path>   directory containing cargo-dist archives
 //                           (bt-<target>.tar.gz / bt-<target>.zip), required
 //   --out-dir <path>        directory to write packages into (default: npm/dist)
 //
-// Emits <out-dir>/bt-<pkg>/ (one per target), each ready to `npm publish`.
-// The `bt` command is exposed via the `braintrust` SDK, which lists these
-// packages as optionalDependencies and ships a launcher that resolves the
-// matching binary.
+// Emits <out-dir>/bt-<pkg>/ (one per target), <out-dir>/bt/, and
+// <out-dir>/artifacts/ containing the tarballs, SBOMs, and release manifest.
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
@@ -19,6 +19,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -47,16 +48,23 @@ if (!existsSync(archivesDir))
   throw new Error(`archives-dir not found: ${archivesDir}`);
 
 const targets = JSON.parse(readFileSync(join(NPM_DIR, "targets.json"), "utf8"));
+const checksums = {};
 
 if (existsSync(outDir)) rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
 // --- Per-platform packages ---
-for (const [target, spec] of Object.entries(targets)) {
-  const archiveName = `bt-${target}.${spec.archiveExt}`;
+for (const [target, platform] of Object.entries(targets)) {
+  const packageDir = join(NPM_DIR, "platforms", `bt-${platform}`);
+  const platformPkg = JSON.parse(
+    readFileSync(join(packageDir, "package.json"), "utf8"),
+  );
+  const isWindows = platformPkg.os.includes("win32");
+  const binaryName = isWindows ? "bt.exe" : "bt";
+  const archiveName = `bt-${target}.${isWindows ? "zip" : "tar.gz"}`;
   const archive = join(archivesDir, archiveName);
   if (!existsSync(archive)) {
-    // Fail hard, don't skip: the SDK pins each package at an exact version, so a
+    // Fail hard, don't skip: the wrapper pins each package at an exact version, so a
     // missing platform would break installs for that platform at runtime.
     throw new Error(`Archive not found for ${target}: ${archive}`);
   }
@@ -82,49 +90,147 @@ for (const [target, spec] of Object.entries(targets)) {
     throw new Error(`Unsupported archive: ${archive}`);
   }
 
-  const binPath = join(stagingDir, spec.bin);
+  const binPath = join(stagingDir, binaryName);
   if (!existsSync(binPath)) {
-    throw new Error(`Binary ${spec.bin} not found at ${binPath}`);
+    throw new Error(`Binary ${binaryName} not found at ${binPath}`);
   }
 
-  const pkgName = `@braintrust/bt-${spec.pkg}`;
-  const pkgOut = join(outDir, `bt-${spec.pkg}`);
+  // Published versions are immutable and the publisher skips them on retries.
+  // Hash their original binary, not a rebuild (signing timestamps can differ).
+  const publishedUrl = `https://registry.npmjs.org/${platformPkg.name}/-/bt-${platform}-${version}.tgz`;
+  const published = await fetch(publishedUrl, {
+    signal: AbortSignal.timeout(10 * 60 * 1000),
+  });
+  let checksumBinaryPath = binPath;
+  if (published.status === 404) {
+    await published.body?.cancel();
+  } else {
+    if (!published.ok) {
+      throw new Error(
+        `Failed to check published package ${platformPkg.name}@${version}: HTTP ${published.status}`,
+      );
+    }
+    const publishedArchive = join(stagingDir, "published.tgz");
+    writeFileSync(publishedArchive, Buffer.from(await published.arrayBuffer()));
+    const publishedDir = join(stagingDir, "published");
+    mkdirSync(publishedDir);
+    execFileSync(
+      "tar",
+      [
+        "-xzf",
+        publishedArchive,
+        "-C",
+        publishedDir,
+        "--strip-components=1",
+        `package/bin/${binaryName}`,
+      ],
+      { stdio: "inherit" },
+    );
+    checksumBinaryPath = join(publishedDir, "bin", binaryName);
+    console.log(
+      `Using published binary checksum for ${platformPkg.name}@${version}`,
+    );
+  }
+  checksums[platformPkg.name] = createHash("sha256")
+    .update(readFileSync(checksumBinaryPath))
+    .digest("hex");
+  const pkgOut = join(outDir, `bt-${platform}`);
   const pkgBin = join(pkgOut, "bin");
   mkdirSync(pkgBin, { recursive: true });
-  cpSync(binPath, join(pkgBin, spec.bin));
-  if (spec.os !== "win32") chmodSync(join(pkgBin, spec.bin), 0o755);
+  cpSync(binPath, join(pkgBin, binaryName));
+  if (!isWindows) chmodSync(join(pkgBin, binaryName), 0o755);
 
-  const platformPkg = {
-    name: pkgName,
-    version,
-    description: `Prebuilt bt binary for ${spec.os}-${spec.cpu}${spec.libc ? `-${spec.libc}` : ""}`,
-    homepage: "https://github.com/braintrustdata/bt",
-    repository: {
-      type: "git",
-      url: "git+https://github.com/braintrustdata/bt.git",
-    },
-    license: "Apache-2.0",
-    author: "Braintrust engineering <eng@braintrust.dev>",
-    files: ["bin/"],
-    os: [spec.os],
-    cpu: [spec.cpu],
-    preferUnplugged: true,
-  };
-  if (spec.libc) platformPkg.libc = [spec.libc];
-
+  platformPkg.version = version;
   writeFileSync(
     join(pkgOut, "package.json"),
     JSON.stringify(platformPkg, null, 2) + "\n",
   );
-  writeFileSync(
-    join(pkgOut, "README.md"),
-    `# ${pkgName}\n\nPrebuilt \`bt\` binary for ${spec.os}-${spec.cpu}${spec.libc ? ` (${spec.libc})` : ""}.\n\nInstalled automatically as an optional dependency of [\`braintrust\`](https://www.npmjs.com/package/braintrust), which exposes the \`bt\` command. Install that package instead.\n`,
-  );
+  cpSync(join(NPM_DIR, "platforms", "README.md"), join(pkgOut, "README.md"));
 
-  console.log(`Built ${pkgName} -> ${pkgOut}`);
+  console.log(`Prepared ${platformPkg.name} -> ${pkgOut}`);
 }
 
 rmSync(join(outDir, ".staging"), { recursive: true, force: true });
 
-const expected = Object.keys(targets).length;
-console.log(`\nAll ${expected} packages written to ${outDir}`);
+// --- Standalone CLI package ---
+const wrapperOut = join(outDir, "bt");
+cpSync(join(NPM_DIR, "bt"), wrapperOut, { recursive: true });
+cpSync(join(NPM_DIR, "..", "LICENSE"), join(wrapperOut, "LICENSE"));
+writeFileSync(
+  join(wrapperOut, "checksums.json"),
+  JSON.stringify(checksums, null, 2) + "\n",
+);
+chmodSync(join(wrapperOut, "bin", "bt"), 0o755);
+const wrapperPkg = JSON.parse(
+  readFileSync(join(wrapperOut, "package.json"), "utf8"),
+);
+wrapperPkg.version = version;
+delete wrapperPkg.private;
+for (const dependency of Object.keys(wrapperPkg.optionalDependencies)) {
+  wrapperPkg.optionalDependencies[dependency] = version;
+}
+writeFileSync(
+  join(wrapperOut, "package.json"),
+  JSON.stringify(wrapperPkg, null, 2) + "\n",
+);
+console.log(`Built @braintrust/bt -> ${wrapperOut}`);
+
+// Make every platform visible to npm sbom, including platforms other than the
+// build host. These exact dependencies aren't published yet, so use the local
+// packages without downloading dependencies or running installation scripts.
+const wrapperModules = join(wrapperOut, "node_modules");
+mkdirSync(join(wrapperModules, "@braintrust"), { recursive: true });
+const packageDirs = Object.values(targets).map((platform) => `bt-${platform}`);
+const artifactsDir = join(outDir, "artifacts");
+mkdirSync(artifactsDir);
+const packages = [];
+try {
+  for (const dir of packageDirs) {
+    symlinkSync(
+      join(outDir, dir),
+      join(wrapperModules, "@braintrust", dir),
+      "dir",
+    );
+  }
+
+  // The shared publisher consumes this order: dependencies before the wrapper.
+  for (const dir of [...packageDirs, "bt"]) {
+    const cwd = join(outDir, dir);
+    const [packed] = JSON.parse(
+      execFileSync(
+        "npm",
+        [
+          "pack",
+          "--json",
+          "--ignore-scripts",
+          "--pack-destination",
+          artifactsDir,
+        ],
+        { cwd, encoding: "utf8" },
+      ),
+    );
+    const sbomAsset = packed.filename.replace(/\.tgz$/, ".sbom.json");
+    const sbom = execFileSync(
+      "npm",
+      ["sbom", "--sbom-format=cyclonedx", "--omit=dev"],
+      { cwd, encoding: "utf8" },
+    );
+    writeFileSync(join(artifactsDir, sbomAsset), sbom);
+    packages.push({
+      name: packed.name,
+      version: packed.version,
+      tarball_asset: packed.filename,
+      sbom_asset: sbomAsset,
+    });
+  }
+} finally {
+  rmSync(wrapperModules, { recursive: true, force: true });
+}
+
+writeFileSync(
+  join(artifactsDir, "release-manifest.json"),
+  JSON.stringify({ packages }, null, 2) + "\n",
+);
+
+const expected = Object.keys(targets).length + 1;
+console.log(`\nAll ${expected} packages packed in ${artifactsDir}`);
