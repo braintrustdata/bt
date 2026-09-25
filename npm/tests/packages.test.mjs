@@ -366,13 +366,7 @@ test(
         writeFileSync(join(staging, spec.bin), rebuilt);
         execFileSync(
           "python3",
-          [
-            "-m",
-            "zipfile",
-            "-c",
-            join(archives, `bt-${target}.zip`),
-            spec.bin,
-          ],
+          ["-m", "zipfile", "-c", join(archives, `bt-${target}.zip`), spec.bin],
           { cwd: staging },
         );
         writeFileSync(
