@@ -66,7 +66,14 @@ test(
         execFileSync("tar", ["-czf", archive, "-C", root, `bt-${target}`]);
       }
     }
+    const registry = join(root, "registry.mjs");
+    writeFileSync(
+      registry,
+      "globalThis.fetch = async () => new Response(null, { status: 404 });\n",
+    );
     const args = [
+      "--import",
+      registry,
       join(npmDir, "scripts/build-platform-packages.mjs"),
       "--version",
       version,
@@ -340,6 +347,105 @@ test(
           }).trim(),
           `bt ${version}`,
         );
+      },
+    );
+
+    await t.test(
+      "a partial release retry hashes the published Windows binary instead of its rebuild",
+      () => {
+        const [target, spec] = Object.entries(targets).find(
+          ([, spec]) => spec.pkg === "win32-x64",
+        );
+        const name = `@braintrust/bt-${spec.pkg}`;
+        const publishedTarball = join(
+          artifacts,
+          manifest.packages.find((pkg) => pkg.name === name).tarball_asset,
+        );
+        const rebuilt = `${stub}# changed signing timestamp\n`;
+        const staging = join(root, `bt-${target}`);
+        writeFileSync(join(staging, spec.bin), rebuilt);
+        execFileSync(
+          "python3",
+          [
+            "-m",
+            "zipfile",
+            "-c",
+            join(archives, `bt-${target}.zip`),
+            spec.bin,
+          ],
+          { cwd: staging },
+        );
+        writeFileSync(
+          registry,
+          `
+          import { readFileSync } from "node:fs";
+          globalThis.fetch = async (url) => {
+            if (url === ${JSON.stringify(`https://registry.npmjs.org/${name}/-/bt-${spec.pkg}-${version}.tgz`)}) {
+              return new Response(readFileSync(${JSON.stringify(publishedTarball)}));
+            }
+            return new Response(null, { status: 404 });
+          };
+        `,
+        );
+        const retryOut = join(root, "retry");
+        execFileSync(process.execPath, [...args, "--out-dir", retryOut]);
+        const checksums = JSON.parse(
+          readFileSync(join(retryOut, "bt/checksums.json"), "utf8"),
+        );
+        assert.equal(
+          readFileSync(join(retryOut, `bt-${spec.pkg}/bin/bt.exe`), "utf8"),
+          rebuilt,
+        );
+        assert.equal(
+          checksums[name],
+          createHash("sha256").update(stub).digest("hex"),
+        );
+        assert.notEqual(
+          checksums[name],
+          createHash("sha256").update(rebuilt).digest("hex"),
+        );
+        const wrapperTarball = manifest.packages.find(
+          (pkg) => pkg.name === "@braintrust/bt",
+        ).tarball_asset;
+        assert.deepEqual(
+          JSON.parse(
+            execFileSync(
+              "tar",
+              [
+                "-xOf",
+                join(retryOut, "artifacts", wrapperTarball),
+                "package/checksums.json",
+              ],
+              { encoding: "utf8" },
+            ),
+          ),
+          checksums,
+        );
+      },
+    );
+
+    await t.test(
+      "registry and published archive failures stop before packing the wrapper",
+      () => {
+        for (const [response, message] of [
+          ["new Response(null, { status: 503 })", /HTTP 503/],
+          ['Promise.reject(new Error("offline"))', /offline/],
+          ['new Response("invalid tarball")', /Command failed: tar/],
+        ]) {
+          writeFileSync(
+            registry,
+            `globalThis.fetch = async () => ${response};\n`,
+          );
+          const failedOut = join(root, "failed");
+          const result = spawnSync(
+            process.execPath,
+            [...args, "--out-dir", failedOut],
+            { encoding: "utf8" },
+          );
+          assert.notEqual(result.status, 0);
+          assert.match(result.stderr, message);
+          assert.equal(existsSync(join(failedOut, "bt/package.json")), false);
+        }
       },
     );
 

@@ -95,8 +95,44 @@ for (const [target, platform] of Object.entries(targets)) {
     throw new Error(`Binary ${binaryName} not found at ${binPath}`);
   }
 
+  // Published versions are immutable and the publisher skips them on retries.
+  // Hash their original binary, not a rebuild (signing timestamps can differ).
+  const publishedUrl = `https://registry.npmjs.org/${platformPkg.name}/-/bt-${platform}-${version}.tgz`;
+  const published = await fetch(publishedUrl, {
+    signal: AbortSignal.timeout(10 * 60 * 1000),
+  });
+  let checksumBinaryPath = binPath;
+  if (published.status === 404) {
+    await published.body?.cancel();
+  } else {
+    if (!published.ok) {
+      throw new Error(
+        `Failed to check published package ${platformPkg.name}@${version}: HTTP ${published.status}`,
+      );
+    }
+    const publishedArchive = join(stagingDir, "published.tgz");
+    writeFileSync(publishedArchive, Buffer.from(await published.arrayBuffer()));
+    const publishedDir = join(stagingDir, "published");
+    mkdirSync(publishedDir);
+    execFileSync(
+      "tar",
+      [
+        "-xzf",
+        publishedArchive,
+        "-C",
+        publishedDir,
+        "--strip-components=1",
+        `package/bin/${binaryName}`,
+      ],
+      { stdio: "inherit" },
+    );
+    checksumBinaryPath = join(publishedDir, "bin", binaryName);
+    console.log(
+      `Using published binary checksum for ${platformPkg.name}@${version}`,
+    );
+  }
   checksums[platformPkg.name] = createHash("sha256")
-    .update(readFileSync(binPath))
+    .update(readFileSync(checksumBinaryPath))
     .digest("hex");
   const pkgOut = join(outDir, `bt-${platform}`);
   const pkgBin = join(pkgOut, "bin");
