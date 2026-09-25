@@ -597,21 +597,29 @@ jobs:
           slack_token: ${{ secrets.SLACK_BOT_TOKEN }}
           slack_channel: C0ABHT0SWA2
 
-      - name: Create GitHub release
-        uses: braintrustdata/sdk-actions/actions/release/create-package-github-releases@337c5475631d724441403f5a4d8ad0b32ce12e29
-        with:
-          manifest: release-artifacts/release-manifest.json
-
-      - name: Attach native artifacts and all npm SBOMs
+      - name: Publish GitHub release with all assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          # The shared action skips existing releases, including packages sharing
-          # one tag. Upload every SBOM here so reruns complete partial releases.
+          set -euo pipefail
+          if ! is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"; then
+            title="$(jq -r '.packages[0].release_title' release-artifacts/release-manifest.json)"
+            jq -r '.packages[0].release_body' release-artifacts/release-manifest.json > "$RUNNER_TEMP/notes.txt"
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --title "$title" --notes-file "$RUNNER_TEMP/notes.txt"
+            is_draft=true
+          fi
+
+          # Reuse drafts on retries and repair assets on already-public releases.
           rm -f native-artifacts/*-dist-manifest.json
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             native-artifacts/* release-artifacts/*.sbom.json
+
+          # Installers and archives must be available before this becomes latest.
+          if [ "$is_draft" = true ]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi
 
   smoke-install-unix:
     needs:

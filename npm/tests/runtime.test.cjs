@@ -172,13 +172,21 @@ async function installerWorker({
   badChecksum = false,
   missingChecksum = false,
   writeError = false,
+  stall = null,
+  redirect = false,
+  redirectLocation = "https://registry.npmjs.org/test-redirect.tgz",
 } = {}) {
+  const { mock } = require("node:test");
+  mock.timers.enable({ apis: ["setTimeout"] });
   const writes = [];
   const messages = [];
   const exits = [];
   const requests = [];
   const renames = [];
   const removals = [];
+  const timeouts = [];
+  const destroyedRequests = [];
+  let clearedTimers = 0;
   const binary = Buffer.from("synthetic bt binary");
   const tar = Buffer.alloc(1536);
   tar.write("package/bin/bt");
@@ -195,6 +203,9 @@ async function installerWorker({
       renames,
       removals,
       binary,
+      timeouts,
+      destroyedRequests,
+      clearedTimers,
     });
   const fakeRequire = (name) => {
     if (name === "./bt-helper")
@@ -237,16 +248,27 @@ async function installerWorker({
     if (name === "node:https")
       return {
         get: (url, callback) => {
+          new URL(url);
           requests.push(url);
           const request = new EventEmitter();
+          request.destroy = (error) => {
+            destroyedRequests.push(url);
+            queueMicrotask(() => request.emit("error", error));
+          };
           queueMicrotask(() => {
             if (networkError)
               return request.emit("error", new Error("offline"));
+            const shouldRedirect = redirect && requests.length === 1;
+            if (!shouldRedirect && stall === "connection") return;
             const response = new EventEmitter();
-            response.statusCode = status;
-            response.headers = {};
+            response.statusCode = shouldRedirect ? 302 : status;
+            response.headers = shouldRedirect
+              ? { location: redirectLocation }
+              : {};
             response.resume = () => {};
+            if (shouldRedirect) mock.timers.tick(300000);
             callback(response);
+            if (shouldRedirect) return;
             response.emit(
               "data",
               gzipSync(
@@ -257,7 +279,7 @@ async function installerWorker({
                     : tar,
               ),
             );
-            response.emit("end");
+            if (stall !== "body") response.emit("end");
           });
           return request;
         },
@@ -267,6 +289,14 @@ async function installerWorker({
   vm.runInNewContext(workerData.source, {
     require: fakeRequire,
     Buffer,
+    setTimeout: (callback, delay) => {
+      timeouts.push(delay);
+      return setTimeout(callback, delay);
+    },
+    clearTimeout: (timer) => {
+      clearedTimers++;
+      clearTimeout(timer);
+    },
     console: {
       log: (message) => messages.push(message),
       error: (message) => messages.push(message),
@@ -283,6 +313,16 @@ async function installerWorker({
       },
     },
   });
+  await new Promise((resolve) => setImmediate(resolve));
+  if (stall) {
+    mock.timers.tick((redirect ? 300000 : 600000) - 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    require("node:assert/strict").equal(destroyedRequests.length, 0);
+    mock.timers.tick(1);
+  } else {
+    // Completed downloads must not leave a deadline that fires later.
+    mock.timers.tick(600000);
+  }
   await new Promise((resolve) => setImmediate(resolve));
   finish();
 }
@@ -346,6 +386,37 @@ test("postinstall downloads the exact pinned binary and makes it executable", as
     { from: "/fallback/bt.123.tmp", to: "/fallback/bt" },
   ]);
   assert.deepEqual(result.removals, ["/fallback/bt.123.tmp"]);
+  assert.deepEqual(result.timeouts, [600000]);
+  assert.equal(result.clearedTimers, 1);
+  assert.deepEqual(result.destroyedRequests, []);
+});
+
+test("postinstall enforces one ten-minute deadline across connections, bodies, and redirects", async () => {
+  for (const stall of ["connection", "body"]) {
+    for (const redirect of [false, true]) {
+      const result = await runInstaller({ stall, redirect });
+      assert.equal(result.exitCode, 1);
+      assert.deepEqual(result.timeouts, [600000]);
+      assert.equal(result.clearedTimers, 1);
+      assert.equal(result.requests.length, redirect ? 2 : 1);
+      assert.deepEqual(result.destroyedRequests, [result.requests.at(-1)]);
+      assert.deepEqual(result.writes, []);
+      assert.match(
+        result.messages,
+        /download timed out after 10 minutes; retry installation/,
+      );
+    }
+  }
+});
+
+test("postinstall clears the shared deadline after a successful redirect", async () => {
+  const result = await runInstaller({ redirect: true });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.requests.length, 2);
+  assert.deepEqual(result.timeouts, [600000]);
+  assert.equal(result.clearedTimers, 1);
+  assert.deepEqual(result.destroyedRequests, []);
+  assert.equal(result.writes.length, 1);
 });
 
 test("postinstall downloads the pinned version when an older hoisted binary exists", async () => {
@@ -377,6 +448,7 @@ test("postinstall fails for unsupported platforms and download failures", async 
     [{ missingVersion: true }, /cannot determine which version/],
     [{ status: 503 }, /status code 503/],
     [{ networkError: true }, /offline/],
+    [{ redirect: true, redirectLocation: "invalid" }, /Invalid URL/],
     [{ invalidTar: true }, /could not find/],
     [{ malformedTar: true }, /Invalid or truncated tar entry/],
     [{ truncatedTar: true }, /Invalid or truncated tar entry/],
@@ -389,6 +461,7 @@ test("postinstall fails for unsupported platforms and download failures", async 
     assert.equal(result.exitCode, 1);
     assert.equal(result.writes.length, 0);
     assert.equal(result.renames.length, 0);
+    assert.equal(result.clearedTimers, result.timeouts.length);
     if (options.writeError)
       assert.deepEqual(result.removals, ["/fallback/bt.123.tmp"]);
     assert.match(result.messages, message);

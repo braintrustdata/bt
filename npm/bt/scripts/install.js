@@ -64,40 +64,59 @@ if (!version) {
   process.exit(1);
 }
 
-function fetchBuffer(url, redirectsRemaining = 5) {
+function fetchBuffer(url) {
+  let request;
+  let timer;
   return new Promise((resolve, reject) => {
-    https
-      .get(url, (response) => {
-        const { statusCode = 0, headers } = response;
-        if (statusCode >= 200 && statusCode < 300) {
-          const chunks = [];
-          response.on("data", (chunk) => chunks.push(chunk));
-          response.on("end", () => resolve(Buffer.concat(chunks)));
-          response.on("error", reject);
-          return;
-        }
-        if (
-          statusCode >= 300 &&
-          statusCode < 400 &&
-          headers.location &&
-          redirectsRemaining > 0
-        ) {
-          response.resume();
-          fetchBuffer(headers.location, redirectsRemaining - 1).then(
-            resolve,
-            reject,
-          );
-          return;
-        }
-        response.resume();
-        reject(
-          new Error(
-            `npm registry responded with status code ${statusCode} when downloading ${url}`,
-          ),
+    // One deadline covers connecting, receiving the body, and all redirects.
+    timer = setTimeout(
+      () => {
+        const error = new Error(
+          "download timed out after 10 minutes; retry installation",
         );
-      })
-      .on("error", reject);
-  });
+        request.destroy(error);
+        reject(error);
+      },
+      10 * 60 * 1000,
+    );
+
+    function download(url, redirectsRemaining) {
+      request = https
+        .get(url, (response) => {
+          const { statusCode = 0, headers } = response;
+          if (statusCode >= 200 && statusCode < 300) {
+            const chunks = [];
+            response.on("data", (chunk) => chunks.push(chunk));
+            response.on("end", () => resolve(Buffer.concat(chunks)));
+            response.on("error", reject);
+            return;
+          }
+          if (
+            statusCode >= 300 &&
+            statusCode < 400 &&
+            headers.location &&
+            redirectsRemaining > 0
+          ) {
+            response.resume();
+            try {
+              download(headers.location, redirectsRemaining - 1);
+            } catch (error) {
+              reject(error);
+            }
+            return;
+          }
+          response.resume();
+          reject(
+            new Error(
+              `npm registry responded with status code ${statusCode} when downloading ${url}`,
+            ),
+          );
+        })
+        .on("error", reject);
+    }
+
+    download(url, 5);
+  }).finally(() => clearTimeout(timer));
 }
 
 // Extracts a single file from an uncompressed tar archive. Tar archives are
