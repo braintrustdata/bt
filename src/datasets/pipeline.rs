@@ -2525,32 +2525,15 @@ export default DatasetPipeline({
             "sourceProjectId": "source-project-id",
             "attachmentDir": attachment_dir,
         });
-        let mut child = Command::new("node")
+        let mut command = Command::new("node");
+        command
             .arg("--experimental-strip-types")
             .arg(&runner_path)
             .arg(&pipeline_path)
-            .current_dir(root.path())
-            .env("BT_DATASET_PIPELINE_STAGE", "transform")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn node runner");
-        child
-            .stdin
-            .as_mut()
-            .expect("runner stdin")
-            .write_all(request.to_string().as_bytes())
-            .expect("write runner request");
-        let output = child.wait_with_output().expect("runner output");
-        assert!(
-            output.status.success(),
-            "runner failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .current_dir(root.path());
+        let output = run_pipeline_transform(command, &request);
+        let response = pipeline_transform_response(&output);
 
-        let response: Value = serde_json::from_slice(&output.stdout).expect("runner JSON response");
         assert_eq!(response["rowCount"], json!(1));
         assert_eq!(response["rows"][0]["id"], json!("source-row"));
         assert_eq!(
@@ -2759,6 +2742,244 @@ export default DatasetPipeline({
         assert_eq!(
             transform_artifact.output_path,
             pull_artifact.spec_dir.join("transformed.jsonl")
+        );
+    }
+
+    fn write_fake_python_braintrust_package(root: &Path) -> PathBuf {
+        let package_root = root.join("fake_site_packages");
+        let package_dir = package_root.join("braintrust");
+        fs::create_dir_all(&package_dir).expect("create fake braintrust package");
+        fs::write(
+            package_dir.join("__init__.py"),
+            r#"
+from .dataset_pipeline import DatasetPipeline
+"#,
+        )
+        .expect("write fake braintrust __init__");
+        fs::write(
+            package_dir.join("dataset_pipeline.py"),
+            r#"
+_DATASET_PIPELINES = []
+
+
+def DatasetPipeline(name=None, source=None, target=None, transform=None):
+    pipeline = {
+        "name": name,
+        "source": dict(source or {}),
+        "target": dict(target or {}),
+        "transform": transform,
+    }
+    _DATASET_PIPELINES.append(pipeline)
+    return pipeline
+"#,
+        )
+        .expect("write fake dataset_pipeline module");
+        fs::write(
+            package_dir.join("framework.py"),
+            r#"
+import inspect
+
+
+# The real SDK dispatches by signature; the pipelines below take **kwargs, where
+# that dispatch is equivalent to forwarding every argument.
+async def call_user_fn(loop, fn, **kwargs):
+    result = fn(**kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+"#,
+        )
+        .expect("write fake framework module");
+        fs::write(
+            package_dir.join("logger.py"),
+            r#"
+class _FakeState:
+    def login(self, **kwargs):
+        return self
+
+
+_STATE = _FakeState()
+
+
+def _internal_get_global_state():
+    return _STATE
+
+
+# Imported by the runner at module load; only reached for a cross-org source.
+def login_to_state(org_name=None):
+    return _STATE
+"#,
+        )
+        .expect("write fake logger module");
+        fs::write(
+            package_dir.join("trace.py"),
+            r#"
+class LocalTrace:
+    def __init__(
+        self,
+        object_type=None,
+        object_id=None,
+        root_span_id=None,
+        ensure_spans_flushed=None,
+        state=None,
+    ):
+        self.root_span_id = root_span_id
+
+    def get_configuration(self):
+        return {"root_span_id": self.root_span_id}
+
+    async def get_spans(self, include_scorers=False):
+        return [
+            {
+                "id": "source-row",
+                "span_id": "source-span",
+                "input": {"prompt": "hello"},
+                "output": {"answer": "world"},
+                "expected": "ok",
+                "metadata": {"topic": "smoke"},
+            }
+        ]
+"#,
+        )
+        .expect("write fake trace module");
+        package_root
+    }
+
+    /// Runs an already-configured runner command through the transform stage.
+    fn run_pipeline_transform(mut command: Command, request: &Value) -> std::process::Output {
+        let mut child = command
+            .env("BT_DATASET_PIPELINE_STAGE", "transform")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pipeline runner");
+        child
+            .stdin
+            .as_mut()
+            .expect("runner stdin")
+            .write_all(request.to_string().as_bytes())
+            .expect("write runner request");
+        child.wait_with_output().expect("runner output")
+    }
+
+    fn pipeline_transform_response(output: &std::process::Output) -> Value {
+        assert!(
+            output.status.success(),
+            "runner failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("runner JSON response")
+    }
+
+    /// Writes the Python runner plus a stub `braintrust` package into `root` and
+    /// returns the command that runs `pipeline_source` against them.
+    fn python_pipeline_transform_command(root: &Path, pipeline_source: &str) -> Option<Command> {
+        let python = python_runner::resolve_python_interpreter(None, &[])?;
+        let package_root = write_fake_python_braintrust_package(root);
+        let runner_path = root.join(PY_RUNNER_FILE);
+        fs::write(&runner_path, PY_RUNNER_SOURCE).expect("write python runner source");
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(&pipeline_path, pipeline_source).expect("write pipeline");
+
+        let mut command = Command::new(python);
+        command
+            .arg(&runner_path)
+            .arg(&pipeline_path)
+            .current_dir(root)
+            .env("PYTHONPATH", &package_root);
+        Some(command)
+    }
+
+    /// One transform that reports the exact arg set it was handed, so both scopes
+    /// can assert the contract with the same pipeline.
+    const SCOPE_PROBE_PIPELINE: &str = r#"
+from braintrust import DatasetPipeline
+
+
+def transform(**kwargs):
+    return {
+        "input": {
+            "args": sorted(kwargs),
+            "span_input": kwargs.get("input"),
+            "root_span_id": kwargs["trace"].get_configuration()["root_span_id"],
+        }
+    }
+
+
+DatasetPipeline(
+    name="py-scope-smoke",
+    source={"project_name": "test-project", "scope": "__SCOPE__"},
+    target={"project_name": "test-target-project", "dataset_name": "test-dataset"},
+    transform=transform,
+)
+"#;
+
+    #[test]
+    fn python_runner_passes_scoped_transform_args() {
+        // Trace-scoped discovery emits refs without a span row id; span-scoped refs
+        // carry one. The span case also overrides the scope the pipeline declares.
+        let cases = [
+            (
+                "trace",
+                json!({
+                    "refs": [{ "root_span_id": "root-span" }],
+                    "sourceProjectId": "source-project-id",
+                }),
+                json!(["trace"]),
+                Value::Null,
+                json!("root-span"),
+            ),
+            (
+                "trace",
+                json!({
+                    "refs": [{ "root_span_id": "root-span", "id": "source-row" }],
+                    "sourceProjectId": "source-project-id",
+                    "source": { "projectName": "test-project", "scope": "span" },
+                }),
+                json!(["expected", "id", "input", "metadata", "output", "trace"]),
+                json!({ "prompt": "hello" }),
+                json!("source-row"),
+            ),
+        ];
+
+        for (declared_scope, request, expected_args, expected_span_input, expected_id) in cases {
+            let root = tempfile::tempdir().expect("tempdir");
+            let Some(command) = python_pipeline_transform_command(
+                root.path(),
+                &SCOPE_PROBE_PIPELINE.replace("__SCOPE__", declared_scope),
+            ) else {
+                eprintln!(
+                    "Skipping python_runner_passes_scoped_transform_args (python not installed)."
+                );
+                return;
+            };
+
+            let output = run_pipeline_transform(command, &request);
+            let response = pipeline_transform_response(&output);
+
+            assert_eq!(response["candidates"], json!(1));
+            assert_eq!(response["rowCount"], json!(1));
+            let row = &response["rows"][0];
+            assert_eq!(row["input"]["args"], expected_args);
+            assert_eq!(row["input"]["span_input"], expected_span_input);
+            assert_eq!(row["input"]["root_span_id"], json!("root-span"));
+            assert_eq!(row["id"], expected_id);
+        }
+    }
+
+    #[test]
+    fn pipeline_inspect_rejects_unknown_source_scope() {
+        let error = serde_json::from_value::<PipelineInspect>(json!({
+            "source": { "projectName": "test-project", "scope": "traces" },
+            "target": { "projectName": "test-target-project", "datasetName": "test-dataset" },
+        }))
+        .expect_err("unknown scope should not deserialize");
+
+        assert!(
+            error.to_string().contains("`span`") && error.to_string().contains("`trace`"),
+            "error should name the valid scopes: {error}"
         );
     }
 }
