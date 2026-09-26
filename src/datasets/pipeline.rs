@@ -2745,103 +2745,39 @@ export default DatasetPipeline({
         );
     }
 
+    /// Stub `braintrust` package the Python runner imports, in
+    /// `pipeline-test-fixtures/braintrust/`.
+    const STUB_BRAINTRUST_MODULES: [(&str, &str); 5] = [
+        (
+            "__init__.py",
+            include_str!("pipeline-test-fixtures/braintrust/__init__.py"),
+        ),
+        (
+            "dataset_pipeline.py",
+            include_str!("pipeline-test-fixtures/braintrust/dataset_pipeline.py"),
+        ),
+        (
+            "framework.py",
+            include_str!("pipeline-test-fixtures/braintrust/framework.py"),
+        ),
+        (
+            "logger.py",
+            include_str!("pipeline-test-fixtures/braintrust/logger.py"),
+        ),
+        (
+            "trace.py",
+            include_str!("pipeline-test-fixtures/braintrust/trace.py"),
+        ),
+    ];
+
     fn write_fake_python_braintrust_package(root: &Path) -> PathBuf {
         let package_root = root.join("fake_site_packages");
         let package_dir = package_root.join("braintrust");
         fs::create_dir_all(&package_dir).expect("create fake braintrust package");
-        fs::write(
-            package_dir.join("__init__.py"),
-            r#"
-from .dataset_pipeline import DatasetPipeline
-"#,
-        )
-        .expect("write fake braintrust __init__");
-        fs::write(
-            package_dir.join("dataset_pipeline.py"),
-            r#"
-_DATASET_PIPELINES = []
-
-
-def DatasetPipeline(name=None, source=None, target=None, transform=None):
-    pipeline = {
-        "name": name,
-        "source": dict(source or {}),
-        "target": dict(target or {}),
-        "transform": transform,
-    }
-    _DATASET_PIPELINES.append(pipeline)
-    return pipeline
-"#,
-        )
-        .expect("write fake dataset_pipeline module");
-        fs::write(
-            package_dir.join("framework.py"),
-            r#"
-import inspect
-
-
-# The real SDK dispatches by signature; the pipelines below take **kwargs, where
-# that dispatch is equivalent to forwarding every argument.
-async def call_user_fn(loop, fn, **kwargs):
-    result = fn(**kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
-"#,
-        )
-        .expect("write fake framework module");
-        fs::write(
-            package_dir.join("logger.py"),
-            r#"
-class _FakeState:
-    def login(self, **kwargs):
-        return self
-
-
-_STATE = _FakeState()
-
-
-def _internal_get_global_state():
-    return _STATE
-
-
-# Imported by the runner at module load; only reached for a cross-org source.
-def login_to_state(org_name=None):
-    return _STATE
-"#,
-        )
-        .expect("write fake logger module");
-        fs::write(
-            package_dir.join("trace.py"),
-            r#"
-class LocalTrace:
-    def __init__(
-        self,
-        object_type=None,
-        object_id=None,
-        root_span_id=None,
-        ensure_spans_flushed=None,
-        state=None,
-    ):
-        self.root_span_id = root_span_id
-
-    def get_configuration(self):
-        return {"root_span_id": self.root_span_id}
-
-    async def get_spans(self, include_scorers=False):
-        return [
-            {
-                "id": "source-row",
-                "span_id": "source-span",
-                "input": {"prompt": "hello"},
-                "output": {"answer": "world"},
-                "expected": "ok",
-                "metadata": {"topic": "smoke"},
-            }
-        ]
-"#,
-        )
-        .expect("write fake trace module");
+        for (name, source) in STUB_BRAINTRUST_MODULES {
+            fs::write(package_dir.join(name), source)
+                .unwrap_or_else(|err| panic!("write fake braintrust {name}: {err}"));
+        }
         package_root
     }
 
@@ -2892,29 +2828,8 @@ class LocalTrace:
         Some(command)
     }
 
-    /// One transform that reports the exact arg set it was handed, so both scopes
-    /// can assert the contract with the same pipeline.
-    const SCOPE_PROBE_PIPELINE: &str = r#"
-from braintrust import DatasetPipeline
-
-
-def transform(**kwargs):
-    return {
-        "input": {
-            "args": sorted(kwargs),
-            "span_input": kwargs.get("input"),
-            "root_span_id": kwargs["trace"].get_configuration()["root_span_id"],
-        }
-    }
-
-
-DatasetPipeline(
-    name="py-scope-smoke",
-    source={"project_name": "test-project", "scope": "__SCOPE__"},
-    target={"project_name": "test-target-project", "dataset_name": "test-dataset"},
-    transform=transform,
-)
-"#;
+    const SCOPE_PROBE_PIPELINE: &str =
+        include_str!("pipeline-test-fixtures/scope_probe_pipeline.py");
 
     #[test]
     fn python_runner_passes_scoped_transform_args() {
