@@ -300,6 +300,11 @@ bt datasets pipeline push ./pipeline.ts
 bt datasets pipeline run ./pipeline.py --project "<source project>" --limit 100
 ```
 
+The pipeline source `scope` selects what each transform call receives:
+
+- `"span"` (the default) discovers spans and passes `id`, `input`, `output`, `expected`, `metadata`, and `trace`.
+- `"trace"` discovers whole traces and passes only `trace`.
+
 Useful flags:
 
 - `--limit <n>` controls how many source refs to discover.

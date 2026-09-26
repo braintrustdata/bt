@@ -2380,134 +2380,11 @@ mod tests {
         }
 
         let root = tempfile::tempdir().expect("tempdir");
-        let node_modules = root.path().join("node_modules").join("braintrust");
-        fs::create_dir_all(&node_modules).expect("create fake braintrust package");
-        fs::write(
-            node_modules.join("package.json"),
-            r#"{"name":"braintrust","type":"module","exports":{".":{"import":"./index.mjs","require":"./index.cjs"}}}"#,
-        )
-        .expect("write fake package.json");
-        fs::write(
-            node_modules.join("index.cjs"),
-            r#"
-class OriginalJSONAttachment {
-  constructor() {
-    throw new Error("original JSONAttachment should be shimmed");
-  }
-}
-
-module.exports = {
-  DatasetPipeline(definition) {
-    globalThis.__braintrust_dataset_pipelines ??= [];
-    globalThis.__braintrust_dataset_pipelines.push({
-      ...definition,
-      source: {
-        ...definition.source,
-        scope: definition.source.scope ?? "span",
-      },
-    });
-  },
-  LocalTrace: class {
-    constructor(options) {
-      this.options = options;
-    }
-    getConfiguration() {
-      return { root_span_id: this.options.rootSpanId };
-    }
-    async getSpans() {
-      return [{
-        id: "source-row",
-        span_id: "source-span",
-        input: { prompt: "hello" },
-        output: { answer: "world" },
-        expected: "ok",
-        metadata: { topic: "smoke" },
-      }];
-    }
-  },
-  _internalGetGlobalState() {
-    return {
-      loggedIn: true,
-      orgName: "source-org",
-      login: async function () {
-        return this;
-      },
-    };
-  },
-  loginToState: async function ({ orgName }) {
-    return {
-      loggedIn: true,
-      orgName,
-      login: async function () {
-        return this;
-      },
-    };
-  },
-  JSONAttachment: OriginalJSONAttachment,
-};
-"#,
-        )
-        .expect("write fake braintrust cjs module");
-        fs::write(
-            node_modules.join("index.mjs"),
-            r#"
-export function DatasetPipeline(definition) {
-  globalThis.__braintrust_dataset_pipelines ??= [];
-  globalThis.__braintrust_dataset_pipelines.push({
-    ...definition,
-    source: {
-      ...definition.source,
-      scope: definition.source.scope ?? "span",
-    },
-  });
-}
-
-export class JSONAttachment {
-  constructor(data, options) {
-    const hook = globalThis.__BT_DATASET_PIPELINE_DEFER_JSON_ATTACHMENT__;
-    if (hook) {
-      return hook(data, options);
-    }
-    throw new Error("dataset pipeline deferred JSON hook was not installed");
-  }
-}
-"#,
-        )
-        .expect("write fake braintrust esm module");
-
-        let runner_path = root.path().join("dataset-pipeline-runner.ts");
+        write_fake_node_braintrust_package(root.path());
+        let runner_path = root.path().join(RUNNER_FILE);
         fs::write(&runner_path, RUNNER_SOURCE).expect("write runner source");
         let pipeline_path = root.path().join("pipeline.ts");
-        fs::write(
-            &pipeline_path,
-            r#"
-import { DatasetPipeline, JSONAttachment } from "braintrust";
-
-export default DatasetPipeline({
-  name: "ts-json-attachment-smoke",
-  source: { projectName: "source-project", scope: "span" },
-  target: { projectName: "target-project", datasetName: "traces" },
-  transform: (args) => {
-    if (args.id !== "source-row") {
-      throw new Error(`expected source row id, got ${args.id}`);
-    }
-    return {
-      id: undefined,
-      origin: { object_type: "dataset", object_id: "wrong", id: "wrong" },
-      input: {
-        source_id: args.id,
-        source_input: args.input,
-        full_trace: new JSONAttachment(
-          { ok: true, root: args.trace.getConfiguration().root_span_id },
-          { filename: "trace.json", pretty: true },
-        ),
-      },
-    };
-  },
-});
-"#,
-        )
-        .expect("write pipeline");
+        fs::write(&pipeline_path, JSON_ATTACHMENT_PIPELINE).expect("write pipeline");
 
         let attachment_dir = root.path().join("attachments");
         let request = json!({
@@ -2525,32 +2402,15 @@ export default DatasetPipeline({
             "sourceProjectId": "source-project-id",
             "attachmentDir": attachment_dir,
         });
-        let mut child = Command::new("node")
+        let mut command = Command::new("node");
+        command
             .arg("--experimental-strip-types")
             .arg(&runner_path)
             .arg(&pipeline_path)
-            .current_dir(root.path())
-            .env("BT_DATASET_PIPELINE_STAGE", "transform")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn node runner");
-        child
-            .stdin
-            .as_mut()
-            .expect("runner stdin")
-            .write_all(request.to_string().as_bytes())
-            .expect("write runner request");
-        let output = child.wait_with_output().expect("runner output");
-        assert!(
-            output.status.success(),
-            "runner failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .current_dir(root.path());
+        let output = run_pipeline_transform(command, &request);
+        let response = pipeline_transform_response(&output);
 
-        let response: Value = serde_json::from_slice(&output.stdout).expect("runner JSON response");
         assert_eq!(response["rowCount"], json!(1));
         assert_eq!(response["rows"][0]["id"], json!("source-row"));
         assert_eq!(
@@ -2759,6 +2619,188 @@ export default DatasetPipeline({
         assert_eq!(
             transform_artifact.output_path,
             pull_artifact.spec_dir.join("transformed.jsonl")
+        );
+    }
+
+    /// Stub `braintrust` package the Python runner imports, in
+    /// `pipeline-test-fixtures/python/braintrust/`.
+    const STUB_BRAINTRUST_MODULES: [(&str, &str); 5] = [
+        (
+            "__init__.py",
+            include_str!("pipeline-test-fixtures/python/braintrust/__init__.py"),
+        ),
+        (
+            "dataset_pipeline.py",
+            include_str!("pipeline-test-fixtures/python/braintrust/dataset_pipeline.py"),
+        ),
+        (
+            "framework.py",
+            include_str!("pipeline-test-fixtures/python/braintrust/framework.py"),
+        ),
+        (
+            "logger.py",
+            include_str!("pipeline-test-fixtures/python/braintrust/logger.py"),
+        ),
+        (
+            "trace.py",
+            include_str!("pipeline-test-fixtures/python/braintrust/trace.py"),
+        ),
+    ];
+
+    /// Stub `braintrust` package the TypeScript runner imports, in
+    /// `pipeline-test-fixtures/node/braintrust/`.
+    const STUB_NODE_BRAINTRUST_FILES: [(&str, &str); 3] = [
+        (
+            "package.json",
+            include_str!("pipeline-test-fixtures/node/braintrust/package.json"),
+        ),
+        (
+            "index.cjs",
+            include_str!("pipeline-test-fixtures/node/braintrust/index.cjs"),
+        ),
+        (
+            "index.mjs",
+            include_str!("pipeline-test-fixtures/node/braintrust/index.mjs"),
+        ),
+    ];
+
+    const JSON_ATTACHMENT_PIPELINE: &str =
+        include_str!("pipeline-test-fixtures/node/json_attachment_pipeline.ts");
+
+    fn write_fake_node_braintrust_package(root: &Path) {
+        let package_dir = root.join("node_modules").join("braintrust");
+        fs::create_dir_all(&package_dir).expect("create fake braintrust package");
+        for (name, source) in STUB_NODE_BRAINTRUST_FILES {
+            fs::write(package_dir.join(name), source)
+                .unwrap_or_else(|err| panic!("write fake braintrust {name}: {err}"));
+        }
+    }
+
+    fn write_fake_python_braintrust_package(root: &Path) -> PathBuf {
+        let package_root = root.join("fake_site_packages");
+        let package_dir = package_root.join("braintrust");
+        fs::create_dir_all(&package_dir).expect("create fake braintrust package");
+        for (name, source) in STUB_BRAINTRUST_MODULES {
+            fs::write(package_dir.join(name), source)
+                .unwrap_or_else(|err| panic!("write fake braintrust {name}: {err}"));
+        }
+        package_root
+    }
+
+    /// Runs an already-configured runner command through the transform stage.
+    fn run_pipeline_transform(mut command: Command, request: &Value) -> std::process::Output {
+        let mut child = command
+            .env("BT_DATASET_PIPELINE_STAGE", "transform")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pipeline runner");
+        child
+            .stdin
+            .as_mut()
+            .expect("runner stdin")
+            .write_all(request.to_string().as_bytes())
+            .expect("write runner request");
+        child.wait_with_output().expect("runner output")
+    }
+
+    fn pipeline_transform_response(output: &std::process::Output) -> Value {
+        assert!(
+            output.status.success(),
+            "runner failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("runner JSON response")
+    }
+
+    /// Writes the Python runner plus a stub `braintrust` package into `root` and
+    /// returns the command that runs `pipeline_source` against them.
+    fn python_pipeline_transform_command(root: &Path, pipeline_source: &str) -> Option<Command> {
+        let python = python_runner::resolve_python_interpreter(None, &[])?;
+        let package_root = write_fake_python_braintrust_package(root);
+        let runner_path = root.join(PY_RUNNER_FILE);
+        fs::write(&runner_path, PY_RUNNER_SOURCE).expect("write python runner source");
+        let pipeline_path = root.join("pipeline.py");
+        fs::write(&pipeline_path, pipeline_source).expect("write pipeline");
+
+        let mut command = Command::new(python);
+        command
+            .arg(&runner_path)
+            .arg(&pipeline_path)
+            .current_dir(root)
+            .env("PYTHONPATH", &package_root);
+        Some(command)
+    }
+
+    const SCOPE_PROBE_PIPELINE: &str =
+        include_str!("pipeline-test-fixtures/python/scope_probe_pipeline.py");
+
+    #[test]
+    fn python_runner_passes_scoped_transform_args() {
+        // Trace-scoped discovery emits refs without a span row id; span-scoped refs
+        // carry one. The span case also overrides the scope the pipeline declares.
+        let cases = [
+            (
+                "trace",
+                json!({
+                    "refs": [{ "root_span_id": "root-span" }],
+                    "sourceProjectId": "source-project-id",
+                }),
+                json!(["trace"]),
+                Value::Null,
+                json!("root-span"),
+            ),
+            (
+                "trace",
+                json!({
+                    "refs": [{ "root_span_id": "root-span", "id": "source-row" }],
+                    "sourceProjectId": "source-project-id",
+                    "source": { "projectName": "test-project", "scope": "span" },
+                }),
+                json!(["expected", "id", "input", "metadata", "output", "trace"]),
+                json!({ "prompt": "hello" }),
+                json!("source-row"),
+            ),
+        ];
+
+        for (declared_scope, request, expected_args, expected_span_input, expected_id) in cases {
+            let root = tempfile::tempdir().expect("tempdir");
+            let Some(command) = python_pipeline_transform_command(
+                root.path(),
+                &SCOPE_PROBE_PIPELINE.replace("__SCOPE__", declared_scope),
+            ) else {
+                eprintln!(
+                    "Skipping python_runner_passes_scoped_transform_args (python not installed)."
+                );
+                return;
+            };
+
+            let output = run_pipeline_transform(command, &request);
+            let response = pipeline_transform_response(&output);
+
+            assert_eq!(response["candidates"], json!(1));
+            assert_eq!(response["rowCount"], json!(1));
+            let row = &response["rows"][0];
+            assert_eq!(row["input"]["args"], expected_args);
+            assert_eq!(row["input"]["span_input"], expected_span_input);
+            assert_eq!(row["input"]["root_span_id"], json!("root-span"));
+            assert_eq!(row["id"], expected_id);
+        }
+    }
+
+    #[test]
+    fn pipeline_inspect_rejects_unknown_source_scope() {
+        let error = serde_json::from_value::<PipelineInspect>(json!({
+            "source": { "projectName": "test-project", "scope": "traces" },
+            "target": { "projectName": "test-target-project", "datasetName": "test-dataset" },
+        }))
+        .expect_err("unknown scope should not deserialize");
+
+        assert!(
+            error.to_string().contains("`span`") && error.to_string().contains("`trace`"),
+            "error should name the valid scopes: {error}"
         );
     }
 }

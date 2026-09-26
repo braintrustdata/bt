@@ -332,12 +332,10 @@ def ref_span_row_id(ref: Any) -> str | None:
 
 
 def hydrate_discovery_refs(
-    pipeline: Any,
-    source_override: Any,
+    source: dict[str, Any],
     source_project_id: str,
     refs: list[Any],
 ) -> list[dict[str, Any]]:
-    source = merged_source(pipeline, source_override)
     state = state_for_org(source.get("orgName"))
     candidates: list[dict[str, Any]] = []
     traces_by_root_span_id: dict[str, LocalTrace] = {}
@@ -385,7 +383,13 @@ async def source_row_for_candidate(candidate: dict[str, Any]) -> Any | None:
     raise RuntimeError(f"Source span row {row_id!r} was not found in hydrated trace.")
 
 
-async def transform_args_for_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+async def transform_args_for_candidate(
+    candidate: dict[str, Any],
+    scope: str,
+) -> dict[str, Any]:
+    if scope == "trace":
+        return {"trace": candidate["trace"]}
+
     row = await source_row_for_candidate(candidate)
     args = {
         "input": span_attr(row, "input"),
@@ -447,13 +451,15 @@ async def transform_refs(
     if max_concurrency <= 0:
         raise RuntimeError("maxConcurrency must be a positive integer.")
     transform = pipeline_transform(pipeline)
-    candidates = hydrate_discovery_refs(pipeline, source_override, source_project_id, refs)
+    source = merged_source(pipeline, source_override)
+    scope = source.get("scope") or "span"
+    candidates = hydrate_discovery_refs(source, source_project_id, refs)
     transformed_rows: list[list[dict[str, Any]]] = [[] for _ in candidates]
     semaphore = asyncio.Semaphore(max_concurrency)
 
     async def run_one(index: int, candidate: dict[str, Any]) -> None:
         async with semaphore:
-            transform_args = await transform_args_for_candidate(candidate)
+            transform_args = await transform_args_for_candidate(candidate, scope)
             result = await call_user_fn(
                 asyncio.get_running_loop(),
                 transform,
