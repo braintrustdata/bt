@@ -1,0 +1,53 @@
+name: Set up Rust and Node
+description: Install Rust, Node, and pnpm at the versions pinned in the repo's mise config, with Rust build caching.
+
+inputs:
+  mise-tools:
+    required: false
+    default: "rust node pnpm"
+    description: Space-separated mise tools to install; versions come from .tool-versions / mise.toml
+  rust-components:
+    required: false
+    default: ""
+    description: Space-separated rustup components to add to the mise toolchain (for example "rustfmt clippy")
+  rust-cache-key:
+    required: false
+    default: ""
+    description: Shared rust-cache key for jobs that build the same artifacts; defaults to a per-job cache
+  node-version:
+    required: false
+    default: ""
+    description: Override the mise Node.js version (for matrix jobs); defaults to the version in mise config
+
+runs:
+  using: composite
+  steps:
+    - name: Override Node version
+      if: inputs.node-version != ''
+      shell: bash
+      run: echo "MISE_NODE_VERSION=$NODE_VERSION" >> "$GITHUB_ENV"
+      env:
+        NODE_VERSION: ${{ inputs.node-version }}
+
+    - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      with:
+        install_args: ${{ inputs.mise-tools }}
+        cache_key: "{{default}}-node{{env.MISE_NODE_VERSION}}"
+        cache_save: ${{ github.ref == 'refs/heads/main' }}
+
+    # Runner rustup installs the minimal profile, which omits rustfmt/clippy.
+    - name: Add Rust components
+      if: inputs.rust-components != ''
+      shell: bash
+      run: rustup component add $RUST_COMPONENTS
+      env:
+        RUST_COMPONENTS: ${{ inputs.rust-components }}
+
+    # Only main writes caches; PR runs restore from main's so they don't evict
+    # each other under the repo's 10 GB cache limit. Fork PRs build without the
+    # cache so untrusted code never reads what main saved.
+    - if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: ${{ inputs.rust-cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
