@@ -73,6 +73,43 @@ The SHA1 is the commit hash while the (optional) SHA256 of `mise.toml` are hashe
 
 Non-`main` branch builds are available as GitHub Actions run artifacts (download from the workflow run page or with `gh run download`). They are not published as GitHub Releases.
 
+### npm, Yarn, and pnpm
+
+Install the CLI in your project using your package manager:
+
+```bash
+# npm
+npm install --save-dev @braintrust/bt
+
+# Yarn
+yarn add --dev @braintrust/bt
+
+# pnpm
+pnpm add --save-dev @braintrust/bt
+```
+
+Once installed, you can invoke `bt` directly from scripts in your `package.json`:
+
+```json
+{
+  "scripts": {
+    "bt": "bt"
+  }
+}
+```
+
+For example, run `npm run bt -- --help`, `yarn run bt --help`, or `pnpm run bt --help`.
+
+To install globally with npm:
+
+```bash
+npm install -g @braintrust/bt
+bt --version
+```
+
+To run without adding a project dependency, use `npx @braintrust/bt --help`.
+See the [npm package README](npm/bt/README.md) for supported platforms and fallback download behavior.
+
 ## Verify
 
 ```bash
@@ -94,6 +131,8 @@ shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 
 ## Update
 
+For npm installations, use `npm install -g @braintrust/bt@latest` globally or `npm install --save-dev @braintrust/bt@latest` in a project.
+
 `bt` can update itself when installed via the official installer.
 
 ```bash
@@ -108,6 +147,8 @@ bt update --channel canary
 ```
 
 ## Uninstall
+
+For npm installations, use `npm uninstall -g @braintrust/bt` globally or `npm uninstall @braintrust/bt` in a project.
 
 Unix-like systems:
 

@@ -50,7 +50,11 @@ jobs:
 
       - name: Install dist
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 3 \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh \
+            --output "$RUNNER_TEMP/cargo-dist-installer.sh"
+          sh "$RUNNER_TEMP/cargo-dist-installer.sh"
 
       - name: Cache dist
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -159,7 +163,18 @@ jobs:
           chmod +x /tmp/sha256sum
           echo /tmp >> "$GITHUB_PATH"
 
-      - name: Install dist
+      - name: Install dist (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 3 \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh \
+            --output "$RUNNER_TEMP/cargo-dist-installer.sh"
+          sh "$RUNNER_TEMP/cargo-dist-installer.sh"
+
+      - name: Install dist (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: ${{ matrix.install_dist.run }}
 
       - name: Fetch local artifacts

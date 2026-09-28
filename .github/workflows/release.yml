@@ -33,7 +33,13 @@ jobs:
       tag: ${{ steps.resolve-tag.outputs.tag }}
       tag-flag: ${{ steps.resolve-tag.outputs.tag_flag }}
       release-version: ${{ steps.resolve-tag.outputs.release_version }}
+      release-sha: ${{ steps.resolve-tag.outputs.release_sha }}
       should-release: ${{ steps.resolve-tag.outputs.should_release }}
+      approval-manifest: ${{ steps.approval-manifest.outputs.manifest }}
+      branch: ${{ steps.configure.outputs.branch }}
+      on-release-branch: ${{ steps.configure.outputs.on_release_branch }}
+      commit-message: ${{ steps.configure.outputs.commit_message }}
+      notes: ${{ steps.configure.outputs.notes }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -47,13 +53,15 @@ jobs:
       - id: resolve-tag
         name: Resolve release tag
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
           should_release=true
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
+            tag="$REQUESTED_TAG"
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             tag="${{ github.ref_name }}"
           else
@@ -89,6 +97,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "tag_flag=--tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release_version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$tag" > release-tag.txt
 
@@ -97,6 +106,38 @@ jobs:
         with:
           name: release-metadata
           path: release-tag.txt
+
+      - name: Configure release metadata
+        id: configure
+        if: steps.resolve-tag.outputs.should_release == 'true'
+        uses: braintrustdata/sdk-actions/actions/release/lang/js/configure@337c5475631d724441403f5a4d8ad0b32ce12e29
+        with:
+          sha: ${{ steps.resolve-tag.outputs.release_sha }}
+          version: ${{ steps.resolve-tag.outputs.release_version }}
+          working_directory: npm/bt
+          npm_package_name: "@braintrust/bt"
+          package_label: Braintrust CLI
+
+      - name: Prepare approval manifest
+        id: approval-manifest
+        if: steps.resolve-tag.outputs.should_release == 'true'
+        env:
+          RELEASE_PACKAGE: ${{ steps.configure.outputs.package }}
+          RELEASE_VERSION: ${{ steps.resolve-tag.outputs.release_version }}
+        run: |
+          # One native release plus all npm distributions. Only the wrapper's
+          # registry state is known here; the publisher checks each tarball again.
+          manifest="$(jq -cn --argjson release "$RELEASE_PACKAGE" --arg version "$RELEASE_VERSION" \
+            --slurpfile wrapper npm/bt/package.json '
+            {packages: [
+              ($release | del(.registries)),
+              (($wrapper[0].optionalDependencies | keys[]) as $name | {
+                label: $name, tag: $version, release_body: "Native binary distribution on npm.",
+                registries: {npm: {name: $name, version: $version, channel: "latest"}}
+              }),
+              ($release + {label: $wrapper[0].name, notes: "", release_body: "Standalone CLI on npm."})
+            ]}')"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
 
       - name: Configure git auth for private dependencies
         if: steps.resolve-tag.outputs.should_release == 'true'
@@ -111,7 +152,11 @@ jobs:
       - name: Install dist
         if: steps.resolve-tag.outputs.should_release == 'true'
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 3 \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh \
+            --output "$RUNNER_TEMP/cargo-dist-installer.sh"
+          sh "$RUNNER_TEMP/cargo-dist-installer.sh"
 
       - name: Cache dist
         if: steps.resolve-tag.outputs.should_release == 'true'
@@ -136,18 +181,38 @@ jobs:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
 
+  request-approval:
+    needs: plan
+    if: needs.plan.outputs.should-release == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Request stable release approval
+        uses: braintrustdata/sdk-actions/actions/release/request-approval@337c5475631d724441403f5a4d8ad0b32ce12e29
+        with:
+          packages: ${{ needs.plan.outputs.approval-manifest }}
+          title: Braintrust CLI stable release
+          sha: ${{ needs.plan.outputs.release-sha }}
+          branch: ${{ needs.plan.outputs.branch }}
+          on_release_branch: ${{ needs.plan.outputs.on-release-branch }}
+          commit_message: ${{ needs.plan.outputs.commit-message }}
+          slack_token: ${{ secrets.SLACK_BOT_TOKEN }}
+          slack_channel: C0ABHT0SWA2
+
   build-local-artifacts:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     needs:
       - plan
+      - request-approval
     if: ${{ needs.plan.outputs.should-release == 'true' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
-    # OIDC token subject must match the AAD federated credential, which is
-    # scoped to the `release` environment.
+    # Required reviewers on `release` gate the entire native + npm release.
+    # Windows signing's AAD federated credential also requires this environment.
     environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -159,6 +224,7 @@ jobs:
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.plan.outputs.release-sha }}
           persist-credentials: false
           submodules: recursive
 
@@ -199,7 +265,18 @@ jobs:
           chmod +x /tmp/sha256sum
           echo /tmp >> "$GITHUB_PATH"
 
-      - name: Install dist
+      - name: Install dist (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 3 \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh \
+            --output "$RUNNER_TEMP/cargo-dist-installer.sh"
+          sh "$RUNNER_TEMP/cargo-dist-installer.sh"
+
+      - name: Install dist (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: ${{ matrix.install_dist.run }}
 
       - name: Fetch local artifacts
@@ -285,6 +362,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.plan.outputs.release-sha }}
           persist-credentials: false
           submodules: recursive
 
@@ -349,7 +427,7 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    if: ${{ always() && needs.plan.outputs.should-release == 'true' && needs.plan.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: needs.plan.outputs.should-release == 'true'
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -358,6 +436,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.plan.outputs.release-sha }}
           persist-credentials: false
           submodules: recursive
 
@@ -399,91 +478,178 @@ jobs:
           name: artifacts-dist-manifest
           path: dist-manifest.json
 
-  announce:
+  build-npm:
     needs:
       - plan
       - host
-    if: ${{ always() && needs.host.result == 'success' }}
     runs-on: ubuntu-22.04
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      manifest: ${{ steps.packages.outputs.manifest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ needs.plan.outputs.release-sha }}
           persist-credentials: false
-          submodules: recursive
-          fetch-depth: 0
-          fetch-tags: true
 
-      - name: Download GitHub artifacts
+      - name: Download native release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifacts-build-local-*
+          path: archives
+          merge-multiple: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Use npm 11.12.1
+        run: npm install -g npm@11.12.1
+
+      - name: Build npm packages
+        id: packages
+        env:
+          RELEASE_SHA: ${{ needs.plan.outputs.release-sha }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_TITLE: ${{ fromJSON(needs.host.outputs.val).announcement_title }}
+          INSTALL_NOTES: ${{ fromJSON(needs.host.outputs.val).announcement_github_body }}
+          CHANGELOG: ${{ needs.plan.outputs.notes }}
+        run: |
+          node npm/scripts/build-platform-packages.mjs \
+            --version "${{ needs.plan.outputs.release-version }}" \
+            --archives-dir archives \
+            --out-dir npm/dist
+          # All npm distributions belong to the same native CLI release/tag.
+          jq --arg sha "$RELEASE_SHA" --arg tag "$RELEASE_TAG" \
+            --arg title "$RELEASE_TITLE" --arg install "$INSTALL_NOTES" \
+            --arg notes "$(printf '%s' "$CHANGELOG" | base64 --decode)" \
+            '.commit = $sha | .packages |= map(. + {
+              tag: $tag, release_title: $title, release_body: ($install + "\n\n" + $notes)
+            })' npm/dist/artifacts/release-manifest.json > "$RUNNER_TEMP/release-manifest.json"
+          mv "$RUNNER_TEMP/release-manifest.json" npm/dist/artifacts/release-manifest.json
+          echo "manifest=$(jq -c . npm/dist/artifacts/release-manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Attest npm build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: npm/dist/artifacts/*.tgz
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-packages
+          path: npm/dist/artifacts/
+          if-no-files-found: error
+
+  attest-npm-sboms:
+    needs: build-npm
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.build-npm.outputs.manifest).packages }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-packages
+          path: release-artifacts
+
+      - name: Attest npm package SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-artifacts/${{ matrix.package.tarball_asset }}
+          sbom-path: release-artifacts/${{ matrix.package.sbom_asset }}
+
+  publish-release:
+    needs:
+      - plan
+      - build-npm
+      - attest-npm-sboms
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    # Approval happened on `release` before the builds. Keep the npm OIDC identity.
+    environment: npm-publish
+    permissions:
+      contents: write
+      id-token: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.release-sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-packages
+          path: release-artifacts
+
+      - name: Download native release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
-          path: artifacts
+          path: native-artifacts
           merge-multiple: true
 
-      - name: Cleanup
-        run: rm -f artifacts/*-dist-manifest.json
-
-      - name: Create GitHub release
+      - name: Ensure release tag points to the approved commit
         env:
-          PRERELEASE_FLAG: "${{ fromJson(needs.host.outputs.val).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(needs.host.outputs.val).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(needs.host.outputs.val).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
-          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
-          REPO: "${{ github.repository }}"
-        shell: bash
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release-sha }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
-
-          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
-
-          # Append the commits included in this release (previous stable tag -> this release).
-          #
-          # Resolve the commit this release actually points at. On a manual
-          # workflow_dispatch the tag may already exist and point at a different
-          # commit than the workflow's github.sha, so prefer the tag when it
-          # resolves; otherwise fall back to the release commit (the normal push
-          # flow creates the tag at this commit in the release step below).
-          release_ref="$RELEASE_COMMIT"
-          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null 2>&1; then
-            release_ref="refs/tags/${RELEASE_TAG}^{commit}"
-          fi
-
-          # Find the most recent stable v<major>.<minor>.<patch> tag that precedes
-          # this release in its own ancestry (--merged), so re-publishing an older
-          # or backport release never picks an unrelated newer tag as the previous
-          # one. canary-* and other non-release tags are ignored by the glob.
-          previous_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --merged "$release_ref" --sort=-version:refname \
-            | grep -vFx "$RELEASE_TAG" | head -n1 || true)"
-
-          if [ -n "$previous_tag" ]; then
-            commit_range="${previous_tag}..${release_ref}"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SHA"
           else
-            # First release (no earlier tag in ancestry): include the whole history.
-            commit_range="$release_ref"
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" --method POST \
+              -f ref="refs/tags/$RELEASE_TAG" -f sha="$RELEASE_SHA"
           fi
 
-          commits="$(git log --no-merges --pretty=format:'- %s (%h)' "$commit_range" || true)"
-          if [ -n "$commits" ]; then
-            {
-              printf '\n## Commits\n\n'
-              printf '%s\n' "$commits"
-              if [ -n "$previous_tag" ]; then
-                printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
-                  "$REPO" "$previous_tag" "$RELEASE_TAG"
-              fi
-            } >> "$RUNNER_TEMP/notes.txt"
+      - name: Publish platform packages and standalone CLI
+        uses: braintrustdata/sdk-actions/actions/release/lang/js/publish-npm-tarballs@337c5475631d724441403f5a4d8ad0b32ce12e29
+        with:
+          manifest: release-artifacts/release-manifest.json
+          tarballs: release-artifacts/*.tgz
+          npm_version: "11.12.1"
+          slack_token: ${{ secrets.SLACK_BOT_TOKEN }}
+          slack_channel: C0ABHT0SWA2
+
+      - name: Publish GitHub release with all assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"; then
+            title="$(jq -r '.packages[0].release_title' release-artifacts/release-manifest.json)"
+            jq -r '.packages[0].release_body' release-artifacts/release-manifest.json > "$RUNNER_TEMP/notes.txt"
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --title "$title" --notes-file "$RUNNER_TEMP/notes.txt"
+            is_draft=true
           fi
 
-          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          # Reuse drafts on retries and repair assets on already-public releases.
+          rm -f native-artifacts/*-dist-manifest.json
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            native-artifacts/* release-artifacts/*.sbom.json
+
+          # Installers and archives must be available before this becomes latest.
+          if [ "$is_draft" = true ]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi
 
   smoke-install-unix:
     needs:
       - plan
-      - announce
-    if: ${{ needs.announce.result == 'success' }}
+      - publish-release
+    if: ${{ needs.publish-release.result == 'success' }}
     runs-on: ubuntu-22.04
     env:
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
@@ -510,9 +676,9 @@ jobs:
   smoke-install-macos:
     needs:
       - plan
-      - announce
-    if: ${{ needs.announce.result == 'success' && vars.BT_ENABLE_MACOS_SMOKE == '1' }}
-    runs-on: macos-13
+      - publish-release
+    if: ${{ needs.publish-release.result == 'success' && vars.BT_ENABLE_MACOS_SMOKE == '1' }}
+    runs-on: macos-latest
     env:
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
       REPO: ${{ github.repository }}
@@ -533,8 +699,8 @@ jobs:
   smoke-install-windows:
     needs:
       - plan
-      - announce
-    if: ${{ needs.announce.result == 'success' }}
+      - publish-release
+    if: ${{ needs.publish-release.result == 'success' }}
     runs-on: windows-2022
     env:
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
@@ -558,68 +724,55 @@ jobs:
           $env:PATH = "$binDir;$env:PATH"
           & $btExe update --check --channel stable
 
-  publish-npm:
+  smoke-npm:
     needs:
       - plan
-      - announce
-    if: ${{ needs.announce.result == 'success' }}
-    runs-on: ubuntu-22.04
-    environment: npm-publish
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - publish-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Download release archives
-        env:
-          TAG: ${{ needs.plan.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p archives
-          gh release download "$TAG" \
-            --repo "${{ github.repository }}" \
-            --pattern 'bt-*.tar.gz' \
-            --pattern 'bt-*.zip' \
-            --dir archives
-          ls -la archives
-
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-      - name: Use npm 11.12.1
-        run: npm install -g npm@11.12.1
-
-      - name: Build npm packages
-        run: |
-          node npm/scripts/build-platform-packages.mjs \
-            --version "${{ needs.plan.outputs.release-version }}" \
-            --archives-dir archives \
-            --out-dir npm/dist
-
-      - name: Publish platform packages
+          node-version: "22"
+      - name: Install and run the published CLI
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.release-version }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          package_dirs=(npm/dist/bt-*)
-          if [ "${#package_dirs[@]}" -eq 0 ]; then
-            echo "No npm platform packages found in npm/dist" >&2
-            exit 1
-          fi
-          for dir in "${package_dirs[@]}"; do
-            name="$(node -p "require('./$dir/package.json').name")"
-            version="$(node -p "require('./$dir/package.json').version")"
-            # Skip already-published versions so a partial publish can be re-run.
-            # Test output, not exit code: npm view is empty for a missing version.
-            published="$(npm view "$name@$version" version 2>/dev/null || true)"
-            if [ -n "$published" ]; then
-              echo "Skipping $name@$version (already published)"
-              continue
-            fi
-            echo "Publishing $name@$version"
-            (cd "$dir" && npm publish --access public)
-          done
+          npm install --global --ignore-scripts "@braintrust/bt@${RELEASE_VERSION}"
+          test "$(bt --version)" = "bt ${RELEASE_VERSION}"
+          test "$(npx --yes "@braintrust/bt@${RELEASE_VERSION}" --version)" = "bt ${RELEASE_VERSION}"
+
+  notify-failure:
+    needs:
+      - plan
+      - request-approval
+      - build-local-artifacts
+      - build-global-artifacts
+      - host
+      - build-npm
+      - attest-npm-sboms
+      - publish-release
+      - smoke-install-unix
+      - smoke-install-macos
+      - smoke-install-windows
+      - smoke-npm
+    if: ${{ failure() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Notify release failure
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: C0ABHT0SWA2
+            text: "Braintrust CLI stable release failed. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"

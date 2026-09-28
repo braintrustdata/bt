@@ -17,6 +17,7 @@ Thumbs.db
 
 # Node
 node_modules/
+/npm/dist/
 tests/evals/js/eval-bun/test-data.txt
 
 # Python

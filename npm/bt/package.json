@@ -1,0 +1,40 @@
+{
+  "name": "@braintrust/bt",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Braintrust command line interface",
+  "homepage": "https://github.com/braintrustdata/bt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/braintrustdata/bt.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Braintrust engineering <eng@braintrust.dev>",
+  "bin": {
+    "bt": "./bin/bt"
+  },
+  "files": [
+    "checksums.json",
+    "bin/bt",
+    "scripts/bt-helper.js",
+    "scripts/install.js"
+  ],
+  "scripts": {
+    "postinstall": "node ./scripts/install.js"
+  },
+  "preferUnplugged": true,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "optionalDependencies": {
+    "@braintrust/bt-darwin-arm64": "0.0.0",
+    "@braintrust/bt-darwin-x64": "0.0.0",
+    "@braintrust/bt-linux-arm64": "0.0.0",
+    "@braintrust/bt-linux-x64": "0.0.0",
+    "@braintrust/bt-linux-x64-musl": "0.0.0",
+    "@braintrust/bt-win32-arm64": "0.0.0",
+    "@braintrust/bt-win32-x64": "0.0.0"
+  }
+}

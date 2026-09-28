@@ -1,0 +1,25 @@
+{
+  "name": "@braintrust/bt-linux-x64",
+  "version": "0.0.0",
+  "description": "Prebuilt bt binary for linux-x64-glibc",
+  "homepage": "https://github.com/braintrustdata/bt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/braintrustdata/bt.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Braintrust engineering <eng@braintrust.dev>",
+  "files": [
+    "bin/"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "preferUnplugged": true
+}
