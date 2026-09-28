@@ -5,34 +5,26 @@ on:
   push:
     branches: [main]
 
+# Superseded PR runs are cancelled; every push to main runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Configure git auth for private dependencies
-        run: |
-          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
-          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
-        env:
-          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+      - uses: ./.github/actions/setup-rust-node
         with:
-          toolchain: 1.97.1
-          components: rustfmt, clippy
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
+          bt-github-token: ${{ secrets.BT_GITHUB_TOKEN }}
+          rust-components: rustfmt, clippy
           node-version: "24"
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.28.2 --activate
       - name: Install JS dependencies
         run: pnpm install --ignore-scripts
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -46,6 +38,7 @@ jobs:
   npm-tests:
     name: npm-tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +59,7 @@ jobs:
   core-tests:
     name: core-tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -76,24 +70,10 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Configure git auth for private dependencies
-        run: |
-          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
-          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
-        env:
-          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+      - uses: ./.github/actions/setup-rust-node
         with:
-          toolchain: 1.97.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.15.0"
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.28.2 --activate
+          bt-github-token: ${{ secrets.BT_GITHUB_TOKEN }}
+          rust-cache-key: tests
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Run all unit tests
@@ -106,30 +86,17 @@ jobs:
   eval-tests-go:
     name: eval-tests-go
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Configure git auth for private dependencies
-        run: |
-          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
-          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
-        env:
-          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+      - uses: ./.github/actions/setup-rust-node
         with:
-          toolchain: 1.97.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.15.0"
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.28.2 --activate
+          bt-github-token: ${{ secrets.BT_GITHUB_TOKEN }}
+          rust-cache-key: tests
       - name: Install JS dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
       # No Go toolchain is installed on purpose: these tests stub `go` through
@@ -141,6 +108,7 @@ jobs:
   eval-tests-node:
     name: eval-tests-node (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -153,28 +121,15 @@ jobs:
       BT_EVAL_FIXTURE_RUNTIMES: node,bun,deno
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Configure git auth for private dependencies
-        run: |
-          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
-          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
-        env:
-          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+      - uses: ./.github/actions/setup-rust-node
         with:
-          toolchain: 1.97.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
+          bt-github-token: ${{ secrets.BT_GITHUB_TOKEN }}
+          rust-cache-key: tests
           node-version: ${{ matrix.node-version }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282 # v2.0.4
         with:
           deno-version: v2.x
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.28.2 --activate
       - name: Install JS toolchain dependencies
         run: pnpm install --ignore-scripts
       - name: Run eval fixtures
@@ -185,6 +140,7 @@ jobs:
   eval-tests-python:
     name: eval-tests-python (py ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -197,28 +153,14 @@ jobs:
       BT_EVAL_FIXTURE_RUNTIMES: python
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Configure git auth for private dependencies
-        run: |
-          token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
-          git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
-        env:
-          BT_GITHUB_TOKEN: ${{ secrets.BT_GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+      - uses: ./.github/actions/setup-rust-node
         with:
-          toolchain: 1.97.1
+          bt-github-token: ${{ secrets.BT_GITHUB_TOKEN }}
+          rust-cache-key: tests
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.15.0"
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@10.28.2 --activate
       - name: Install JS dependencies
         run: pnpm install --ignore-scripts
       - name: Run eval fixtures

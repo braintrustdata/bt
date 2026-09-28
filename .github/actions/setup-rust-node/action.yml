@@ -1,0 +1,55 @@
+name: Set up Rust and Node
+description: Configure private dependency auth, install the pinned Rust toolchain with build caching, and install Node with pnpm.
+
+inputs:
+  bt-github-token:
+    required: false
+    default: ""
+    description: Token with read access to private git dependencies; falls back to the workflow GITHUB_TOKEN when empty
+  rust-components:
+    required: false
+    default: ""
+    description: Extra rustup components to install (for example "rustfmt, clippy")
+  rust-cache-key:
+    required: false
+    default: ""
+    description: Shared rust-cache key for jobs that build the same artifacts; defaults to a per-job cache
+  node-version:
+    required: false
+    default: "22.15.0"
+    description: Node.js version to install
+
+runs:
+  using: composite
+  steps:
+    - name: Configure git auth for private dependencies
+      shell: bash
+      run: |
+        token="${BT_GITHUB_TOKEN:-$GITHUB_TOKEN}"
+        git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/"
+      env:
+        BT_GITHUB_TOKEN: ${{ inputs.bt-github-token }}
+        GITHUB_TOKEN: ${{ github.token }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+      with:
+        toolchain: 1.97.1
+        components: ${{ inputs.rust-components }}
+
+    # Only main writes caches; PR runs restore from main's so they don't evict
+    # each other under the repo's 10 GB cache limit.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: ${{ inputs.rust-cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Enable pnpm
+      shell: bash
+      run: |
+        corepack enable
+        corepack prepare pnpm@10.28.2 --activate
