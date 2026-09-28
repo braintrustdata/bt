@@ -110,7 +110,7 @@ jobs:
       - name: Configure release metadata
         id: configure
         if: steps.resolve-tag.outputs.should_release == 'true'
-        uses: braintrustdata/sdk-actions/actions/release/lang/js/configure@337c5475631d724441403f5a4d8ad0b32ce12e29
+        uses: braintrustdata/sdk-actions/actions/release/lang/js/configure@9d481f601e62e149777259d2a0f8088b1a5f54fb
         with:
           sha: ${{ steps.resolve-tag.outputs.release_sha }}
           version: ${{ steps.resolve-tag.outputs.release_version }}
@@ -189,7 +189,7 @@ jobs:
     permissions: {}
     steps:
       - name: Request stable release approval
-        uses: braintrustdata/sdk-actions/actions/release/request-approval@337c5475631d724441403f5a4d8ad0b32ce12e29
+        uses: braintrustdata/sdk-actions/actions/release/request-approval@9d481f601e62e149777259d2a0f8088b1a5f54fb
         with:
           packages: ${{ needs.plan.outputs.approval-manifest }}
           title: Braintrust CLI stable release
@@ -613,7 +613,7 @@ jobs:
           fi
 
       - name: Publish platform packages and standalone CLI
-        uses: braintrustdata/sdk-actions/actions/release/lang/js/publish-npm-tarballs@337c5475631d724441403f5a4d8ad0b32ce12e29
+        uses: braintrustdata/sdk-actions/actions/release/lang/js/publish-npm-tarballs@9d481f601e62e149777259d2a0f8088b1a5f54fb
         with:
           manifest: release-artifacts/release-manifest.json
           tarballs: release-artifacts/*.tgz
