@@ -1,28 +1,35 @@
 name: Set up Rust and Node
-description: Install the pinned Rust toolchain with build caching, and install Node with pnpm.
+description: Install Rust, Node, and pnpm at the versions pinned in the repo's mise config, with Rust build caching.
 
 inputs:
-  rust-components:
+  mise-tools:
     required: false
-    default: ""
-    description: Extra rustup components to install (for example "rustfmt, clippy")
+    default: "rust node pnpm"
+    description: Space-separated mise tools to install; versions come from .tool-versions / mise.toml
   rust-cache-key:
     required: false
     default: ""
     description: Shared rust-cache key for jobs that build the same artifacts; defaults to a per-job cache
   node-version:
     required: false
-    default: "22.15.0"
-    description: Node.js version to install
+    default: ""
+    description: Override the mise Node.js version (for matrix jobs); defaults to the version in mise config
 
 runs:
   using: composite
   steps:
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+    - name: Override Node version
+      if: inputs.node-version != ''
+      shell: bash
+      run: echo "MISE_NODE_VERSION=$NODE_VERSION" >> "$GITHUB_ENV"
+      env:
+        NODE_VERSION: ${{ inputs.node-version }}
+
+    - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
       with:
-        toolchain: 1.97.1
-        components: ${{ inputs.rust-components }}
+        install_args: ${{ inputs.mise-tools }}
+        cache_key: "{{default}}-node{{env.MISE_NODE_VERSION}}"
+        cache_save: ${{ github.ref == 'refs/heads/main' }}
 
     # Only main writes caches; PR runs restore from main's so they don't evict
     # each other under the repo's 10 GB cache limit. Fork PRs build without the
@@ -32,13 +39,3 @@ runs:
       with:
         shared-key: ${{ inputs.rust-cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
-
-    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-      with:
-        node-version: ${{ inputs.node-version }}
-
-    - name: Enable pnpm
-      shell: bash
-      run: |
-        corepack enable
-        corepack prepare pnpm@10.28.2 --activate
