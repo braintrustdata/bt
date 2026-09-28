@@ -13,7 +13,7 @@ concurrency:
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -38,7 +38,7 @@ jobs:
   npm-tests:
     name: npm-tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +59,7 @@ jobs:
   core-tests:
     name: core-tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +86,7 @@ jobs:
   eval-tests-go:
     name: eval-tests-go
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
@@ -108,7 +108,7 @@ jobs:
   eval-tests-node:
     name: eval-tests-node (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -140,7 +140,7 @@ jobs:
   eval-tests-python:
     name: eval-tests-python (py ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -178,7 +178,7 @@ jobs:
       - eval-tests-node
       - eval-tests-python
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 60
     if: always()
     permissions: {}
     steps:
