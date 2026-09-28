@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (for example v0.1.1)"
+        description: "Release tag (for example v0.1.1); if absent, release the selected workflow ref"
         required: true
         type: string
 
@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.sha }}
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
@@ -59,6 +59,7 @@ jobs:
           set -euo pipefail
 
           should_release=true
+          release_sha="$(git rev-parse HEAD)"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             tag="$REQUESTED_TAG"
@@ -94,10 +95,23 @@ jobs:
             exit 1
           fi
 
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Retry existing tags at their original commit; otherwise use the
+            # selected workflow commit and create the tag after approval.
+            if git show-ref --verify --quiet "refs/tags/$tag"; then
+              release_sha="$(git rev-parse "refs/tags/$tag^{commit}")"
+            fi
+            version="$(git show "${release_sha}:Cargo.toml" | grep -m1 '^version = "' | cut -d '"' -f2)"
+            if [ "$version" != "${tag#v}" ]; then
+              echo "Tag $tag requires Cargo.toml version ${tag#v}, but commit $release_sha has version $version. Select a matching workflow ref or correct the release tag." >&2
+              exit 1
+            fi
+          fi
+
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "tag_flag=--tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release_version=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$tag" > release-tag.txt
 
