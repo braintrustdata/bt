@@ -6,6 +6,10 @@ inputs:
     required: false
     default: "rust node pnpm"
     description: Space-separated mise tools to install; versions come from .tool-versions / mise.toml
+  rust-components:
+    required: false
+    default: ""
+    description: Space-separated rustup components to add to the mise toolchain (for example "rustfmt clippy")
   rust-cache-key:
     required: false
     default: ""
@@ -30,6 +34,14 @@ runs:
         install_args: ${{ inputs.mise-tools }}
         cache_key: "{{default}}-node{{env.MISE_NODE_VERSION}}"
         cache_save: ${{ github.ref == 'refs/heads/main' }}
+
+    # Runner rustup installs the minimal profile, which omits rustfmt/clippy.
+    - name: Add Rust components
+      if: inputs.rust-components != ''
+      shell: bash
+      run: rustup component add $RUST_COMPONENTS
+      env:
+        RUST_COMPONENTS: ${{ inputs.rust-components }}
 
     # Only main writes caches; PR runs restore from main's so they don't evict
     # each other under the repo's 10 GB cache limit. Fork PRs build without the
