@@ -530,13 +530,11 @@ function refSpanRowId(ref: DiscoveryRef): string | undefined {
 
 async function hydrateDiscoveryRefs(
   braintrust: BraintrustModule,
-  pipeline: DatasetPipelineDefinition,
-  sourceOverride: PipelineSource | undefined,
+  source: PipelineSource,
   sourceProjectId: string,
   refs: unknown[],
 ): Promise<HydratedCandidate[]> {
   requireBraintrustRuntime(braintrust);
-  const source = requirePipelineSource(pipeline, sourceOverride);
   const state = await stateForOrg(braintrust, source.orgName);
   const tracesByRootSpanId = new Map<string, unknown>();
   return refs.map((ref) => {
@@ -680,8 +678,7 @@ async function transformRefs(
   const scope = source.scope ?? "span";
   const candidates = await hydrateDiscoveryRefs(
     braintrust,
-    pipeline,
-    sourceOverride,
+    source,
     sourceProjectId,
     refs,
   );
