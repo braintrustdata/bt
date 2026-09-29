@@ -4,7 +4,7 @@ use std::io;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
@@ -36,6 +36,7 @@ use crate::args::BaseArgs;
 use crate::auth::login;
 use crate::experiments::api as experiments_api;
 use crate::http::ApiClient;
+use crate::projects::api::Project;
 use crate::ui::{fuzzy_select, is_interactive, with_spinner};
 use crate::utils::parse_duration_to_seconds;
 
@@ -5920,6 +5921,107 @@ pub(crate) async fn resolve_trace_root_span_id(
         } else {
             "trace URL must include query parameter `r` or `s`".to_string()
         }
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct TraceRef {
+    pub(crate) source_expr: String,
+    pub(crate) root_span_id: String,
+    pub(crate) span_id: Option<String>,
+}
+
+pub(crate) struct TraceRefSelector<'a> {
+    pub(crate) url: Option<&'a str>,
+    pub(crate) project_id: Option<&'a str>,
+    pub(crate) trace_id: Option<&'a str>,
+    pub(crate) span_id: Option<&'a str>,
+    pub(crate) lookup_window: &'a str,
+}
+
+pub(crate) async fn resolve_trace_ref(
+    client: &ApiClient,
+    default_project: Option<&Project>,
+    selector: &TraceRefSelector<'_>,
+) -> Result<TraceRef> {
+    if let Some(url) = selector.url {
+        let parsed = parse_trace_url(url)?;
+        let project_id = match parsed.project.as_deref() {
+            Some(project)
+                if default_project
+                    .map(|default_project| {
+                        project == default_project.id || project == default_project.name
+                    })
+                    .unwrap_or(false) =>
+            {
+                default_project.expect("checked above").id.clone()
+            }
+            Some(project) if project.len() == 36 && uuid::Uuid::try_parse(project).is_ok() => {
+                project.to_string()
+            }
+            Some(project) => {
+                get_project_by_name(client, project)
+                    .await?
+                    .ok_or_else(|| anyhow!("project '{project}' from trace URL not found"))?
+                    .id
+            }
+            None => selector
+                .project_id
+                .map(ToOwned::to_owned)
+                .or_else(|| default_project.map(|project| project.id.clone()))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "trace URL must include a project path like /app/<org>/p/<project>/... or a project must be supplied"
+                    )
+                })?,
+        };
+        let lookup_seconds =
+            parse_duration_to_seconds(selector.lookup_window).context("invalid --lookup-window")?;
+        let span_filter = format!("created >= NOW() - INTERVAL {lookup_seconds} SECOND");
+        let is_project_logs = trace_url_experiment_selectors(&parsed).is_empty();
+        let (object_type, object_id) = if is_project_logs {
+            ("project_logs", project_id)
+        } else {
+            let project = ProjectSelection {
+                id: project_id,
+                name: parsed.project.clone(),
+            };
+            let experiment =
+                resolve_first_experiment_for_trace_url(client, &project, &parsed).await?;
+            ("experiment", experiment.id)
+        };
+        let source_expr = format!("{object_type}({})", sql_quote(&object_id));
+        let root_span_id = resolve_trace_root_span_id(
+            client,
+            &source_expr,
+            &parsed,
+            is_project_logs.then_some(span_filter.as_str()),
+            false,
+        )
+        .await
+        .context("failed to resolve trace URL; for older span IDs, increase --lookup-window or use --trace-id with the root span ID")?;
+        return Ok(TraceRef {
+            source_expr,
+            root_span_id,
+            span_id: selector.span_id.map(ToOwned::to_owned).or(parsed.span_id),
+        });
+    }
+
+    let project_id = selector
+        .project_id
+        .map(ToOwned::to_owned)
+        .or_else(|| default_project.map(|project| project.id.clone()))
+        .ok_or_else(|| {
+            anyhow!("trace preview requires --project-id or --project when --trace-id is used")
+        })?;
+    let root_span_id = selector
+        .trace_id
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("trace preview requires --trace-id or --url"))?;
+    Ok(TraceRef {
+        source_expr: format!("project_logs({})", sql_quote(&project_id)),
+        root_span_id,
+        span_id: selector.span_id.map(ToOwned::to_owned),
     })
 }
 

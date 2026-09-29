@@ -6,6 +6,7 @@ mod ids;
 mod json_object;
 mod plurals;
 mod profile;
+mod slug;
 mod structured_source;
 mod text_source;
 
@@ -21,5 +22,6 @@ pub(crate) use ids::new_uuid_id;
 pub(crate) use json_object::{lookup_object_path, merge_json_objects};
 pub use plurals::pluralize;
 pub(crate) use profile::{profile_author_slug, resolve_profile_info, sanitize_name_segment};
+pub(crate) use slug::slug_from_name;
 pub(crate) use structured_source::read_yaml_object_source;
 pub(crate) use text_source::read_text_source;

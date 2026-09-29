@@ -19,6 +19,7 @@ mod functions;
 mod go_runner;
 mod http;
 mod init;
+mod js_bundle;
 mod js_runner;
 mod observability;
 mod profiles;
