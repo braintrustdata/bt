@@ -195,7 +195,7 @@ enum Commands {
     /// Show current identity, org, and project context
     Status(CLIArgs<status::StatusArgs>),
     /// Manage coding-agent tracing
-    Trace(CLIArgs<bt_daemon::TraceArgs>),
+    Trace(Box<CLIArgs<bt_daemon::TraceArgs>>),
     // /// View and modify config
     // Config(CLIArgs<config::ConfigArgs>),
 }
