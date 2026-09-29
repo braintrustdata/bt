@@ -22,6 +22,7 @@ mod init;
 mod js_bundle;
 mod js_runner;
 mod observability;
+mod preprocessors;
 mod profiles;
 mod project_context;
 mod projects;
@@ -78,6 +79,7 @@ Projects & resources
   topics        Inspect and control Topics automation
   prompts       Manage prompts
   custom-views  Push and preview custom views
+  preprocessors Push, preview, and manage preprocessors
   functions     Manage functions (tools, scorers, and more)
   tools         Manage tools
   scorers       Manage scorers
@@ -154,6 +156,8 @@ enum Commands {
     View(CLIArgs<traces::ViewArgs>),
     /// Push and preview custom views
     CustomViews(CLIArgs<custom_views::CustomViewsArgs>),
+    /// Push, preview, and manage preprocessors
+    Preprocessors(CLIArgs<preprocessors::PreprocessorsArgs>),
     #[cfg(unix)]
     /// Run eval files
     Eval(CLIArgs<eval::EvalArgs>),
@@ -208,6 +212,7 @@ impl Commands {
             Commands::Profiles(cmd) => &cmd.base,
             Commands::View(cmd) => &cmd.base,
             Commands::CustomViews(cmd) => &cmd.base,
+            Commands::Preprocessors(cmd) => &cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &cmd.base,
             Commands::Projects(cmd) => &cmd.base,
@@ -241,6 +246,7 @@ impl Commands {
             Commands::Profiles(cmd) => &mut cmd.base,
             Commands::View(cmd) => &mut cmd.base,
             Commands::CustomViews(cmd) => &mut cmd.base,
+            Commands::Preprocessors(cmd) => &mut cmd.base,
             #[cfg(unix)]
             Commands::Eval(cmd) => &mut cmd.base,
             Commands::Projects(cmd) => &mut cmd.base,
@@ -373,6 +379,7 @@ fn try_main() -> Result<()> {
             Commands::Profiles(cmd) => profiles::run(cmd.base, cmd.args)?,
             Commands::View(cmd) => traces::run(cmd.base, cmd.args).await?,
             Commands::CustomViews(cmd) => custom_views::run(cmd.base, cmd.args).await?,
+            Commands::Preprocessors(cmd) => preprocessors::run(cmd.base, cmd.args).await?,
             Commands::Init(cmd) => init::run(cmd.base, cmd.args).await?,
             Commands::Sql(cmd) => sql::run(cmd.base, cmd.args).await?,
             Commands::Setup(cmd) => setup::run_setup_top(cmd.base, cmd.args).await?,

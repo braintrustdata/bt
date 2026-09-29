@@ -124,6 +124,7 @@ pub(crate) fn run_node_metadata_runner(
 pub(crate) enum SwcBundleTarget {
     Discovery,
     Browser,
+    QuickJs,
 }
 
 pub(crate) struct VirtualModule {
@@ -141,7 +142,7 @@ impl SwcResolver {
     fn new(target: SwcBundleTarget, virtual_modules: &'static [VirtualModule]) -> Self {
         let target_env = match target {
             SwcBundleTarget::Discovery => SwcTargetEnv::Node,
-            SwcBundleTarget::Browser => SwcTargetEnv::Browser,
+            SwcBundleTarget::Browser | SwcBundleTarget::QuickJs => SwcTargetEnv::Browser,
         };
         Self {
             node: NodeModulesResolver::new(target_env, Default::default(), false),

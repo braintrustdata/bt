@@ -2251,6 +2251,255 @@ fn custom_views_bootstrap_preserves_existing_tsconfig_without_force() {
 }
 
 #[test]
+fn preprocessors_help_lists_push_bootstrap_preview_and_function_commands() {
+    bt_command()
+        .args(["preprocessors", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("push"))
+        .stdout(predicate::str::contains("bootstrap"))
+        .stdout(predicate::str::contains("preview"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("delete"));
+}
+
+#[test]
+fn preprocessors_push_help_lists_preprocessor_flags() {
+    bt_command()
+        .args(["preprocessors", "push", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--if-exists"))
+        .stdout(predicate::str::contains("BT_PREPROCESSORS_PUSH_FILES"));
+}
+
+#[test]
+fn preprocessors_preview_help_lists_trace_selectors() {
+    bt_command()
+        .args(["preprocessors", "preview", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--trace-id"))
+        .stdout(predicate::str::contains("--url"))
+        .stdout(predicate::str::contains("--project-id"));
+}
+
+#[test]
+fn preprocessors_bootstrap_creates_starter_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args(["preprocessors", "bootstrap", "Conversation Review"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "braintrust-preprocessors/conversation-review.preprocessor.ts",
+        ));
+
+    let contents = fs::read_to_string(
+        dir.path()
+            .join("braintrust-preprocessors/conversation-review.preprocessor.ts"),
+    )
+    .expect("read starter preprocessor");
+    assert!(contents.contains("export default {"));
+    assert!(contents.contains(r#"name: "Conversation Review""#));
+    assert!(contents.contains(r#"slug: "conversation-review""#));
+    assert!(contents.contains("handler({ input, output, span_attributes }"));
+}
+
+#[test]
+fn preprocessors_bootstrap_accepts_named_and_env_names_with_positional_precedence() {
+    for (inputs, expected) in [
+        (vec!["--name", "Flag Preprocessor"], "Flag Preprocessor"),
+        (vec![], "Env Preprocessor"),
+        (
+            vec!["Positional Preprocessor", "--name", "Flag Preprocessor"],
+            "Positional Preprocessor",
+        ),
+        (vec!["Positional Preprocessor"], "Positional Preprocessor"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        bt_command()
+            .current_dir(dir.path())
+            .env("BT_PREPROCESSORS_BOOTSTRAP_NAME", "Env Preprocessor")
+            .args(["preprocessors", "bootstrap"])
+            .args(inputs)
+            .args(["--file", "test.preprocessor.ts"])
+            .assert()
+            .success();
+
+        let contents = fs::read_to_string(dir.path().join("test.preprocessor.ts"))
+            .expect("read starter preprocessor");
+        assert!(contents.contains(&format!("name: {expected:?}")));
+    }
+}
+
+#[test]
+fn preprocessors_preview_accepts_named_and_env_paths_with_positional_precedence() {
+    for (inputs, expected) in [
+        (
+            vec!["--file", "flag.preprocessor.ts"],
+            "flag.preprocessor.ts",
+        ),
+        (
+            vec!["--path", "alias.preprocessor.ts"],
+            "alias.preprocessor.ts",
+        ),
+        (vec![], "env.preprocessor.ts"),
+        (
+            vec![
+                "positional.preprocessor.ts",
+                "--file",
+                "flag.preprocessor.ts",
+            ],
+            "positional.preprocessor.ts",
+        ),
+        (
+            vec!["positional.preprocessor.ts"],
+            "positional.preprocessor.ts",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        bt_command()
+            .current_dir(dir.path())
+            .env("BT_PREPROCESSORS_PREVIEW_FILE", "env.preprocessor.ts")
+            .args(["preprocessors", "preview"])
+            .args(inputs)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "preprocessor file not found: {expected}"
+            )));
+    }
+}
+
+#[test]
+fn preprocessors_bootstrap_and_preview_require_primary_inputs() {
+    for command in ["bootstrap", "preview"] {
+        bt_command()
+            .env_remove("BT_PREPROCESSORS_BOOTSTRAP_NAME")
+            .env_remove("BT_PREPROCESSORS_PREVIEW_FILE")
+            .args(["preprocessors", command])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "required arguments were not provided",
+            ));
+    }
+}
+
+#[test]
+fn preprocessors_bootstrap_json_reports_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let output = bt_command()
+        .current_dir(dir.path())
+        .args([
+            "preprocessors",
+            "--json",
+            "bootstrap",
+            "Conversation Review",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output).expect("parse bootstrap json output");
+
+    assert_eq!(
+        payload["path"],
+        "braintrust-preprocessors/conversation-review.preprocessor.ts"
+    );
+}
+
+#[test]
+fn preprocessors_bootstrap_requires_force_to_overwrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("test.preprocessor.ts"),
+        "old preprocessor\n",
+    )
+    .expect("write preprocessor");
+
+    bt_command()
+        .current_dir(dir.path())
+        .args([
+            "preprocessors",
+            "bootstrap",
+            "Test",
+            "--file",
+            "test.preprocessor.ts",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Use --force to overwrite"));
+    bt_command()
+        .current_dir(dir.path())
+        .args([
+            "preprocessors",
+            "bootstrap",
+            "Test",
+            "--file",
+            "test.preprocessor.ts",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    let contents =
+        fs::read_to_string(dir.path().join("test.preprocessor.ts")).expect("read preprocessor");
+    assert!(contents.contains("export default {"));
+}
+
+#[test]
+fn preprocessors_starter_typechecks() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tempfile::tempdir().expect("tempdir");
+    bt_command()
+        .current_dir(dir.path())
+        .args(["preprocessors", "bootstrap", "Test Preprocessor"])
+        .assert()
+        .success();
+    let output = std::process::Command::new("node")
+        .arg(root.join("node_modules/typescript/bin/tsc"))
+        .args([
+            "--noEmit",
+            "--strict",
+            "--target",
+            "es2022",
+            "--module",
+            "esnext",
+            "--moduleResolution",
+            "bundler",
+        ])
+        .arg(
+            dir.path()
+                .join("braintrust-preprocessors/test-preprocessor.preprocessor.ts"),
+        )
+        .output()
+        .expect("typecheck starter");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn scorers_create_help_lists_preprocessor_sources() {
+    bt_command()
+        .args(["scorers", "create", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--preprocessor <SOURCE>"))
+        .stdout(predicate::str::contains("global:<NAME>"));
+}
+
+#[test]
 fn custom_views_bootstrap_force_overwrites_view_and_tsconfig() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join("custom")).expect("create custom view dir");

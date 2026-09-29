@@ -174,26 +174,27 @@ Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyC
 
 ## Commands
 
-| Command           | Description                                                         |
-| ----------------- | ------------------------------------------------------------------- |
-| `bt init`         | Initialize `.bt/` config directory and link to a project            |
-| `bt login`        | Log in to Braintrust or refresh an OAuth login                      |
-| `bt logout`       | Remove a saved Braintrust login                                     |
-| `bt profiles`     | List, delete, and rename saved login profiles                       |
-| `bt switch`       | Switch org and project context                                      |
-| `bt status`       | Show current org and project context                                |
-| `bt eval`         | Run eval files (Unix only)                                          |
-| `bt trace`        | Trace coding-agent sessions                                         |
-| `bt sql`          | Run SQL queries against Braintrust                                  |
-| `bt view`         | View logs, traces, and spans                                        |
-| `bt custom-views` | Bootstrap, preview, and push trace and dataset custom views         |
-| `bt projects`     | Manage projects (list, create, view, delete)                        |
-| `bt datasets`     | Manage remote datasets (list, create, update, view, delete)         |
-| `bt prompts`      | Manage prompts (list, view, versions, assign, delete)               |
-| `bt scorers`      | Manage scorers (list, create, view, invoke, delete)                 |
-| `bt environments` | Manage deployment environments (list, view, create, update, delete) |
-| `bt sync`         | Synchronize project logs between Braintrust and local NDJSON files  |
-| `bt update`       | Update bt in-place                                                  |
+| Command            | Description                                                         |
+| ------------------ | ------------------------------------------------------------------- |
+| `bt init`          | Initialize `.bt/` config directory and link to a project            |
+| `bt login`         | Log in to Braintrust or refresh an OAuth login                      |
+| `bt logout`        | Remove a saved Braintrust login                                     |
+| `bt profiles`      | List, delete, and rename saved login profiles                       |
+| `bt switch`        | Switch org and project context                                      |
+| `bt status`        | Show current org and project context                                |
+| `bt eval`          | Run eval files (Unix only)                                          |
+| `bt trace`         | Trace coding-agent sessions                                         |
+| `bt sql`           | Run SQL queries against Braintrust                                  |
+| `bt view`          | View logs, traces, and spans                                        |
+| `bt custom-views`  | Bootstrap, preview, and push trace and dataset custom views         |
+| `bt preprocessors` | Bootstrap, preview, and push trace preprocessors                    |
+| `bt projects`      | Manage projects (list, create, view, delete)                        |
+| `bt datasets`      | Manage remote datasets (list, create, update, view, delete)         |
+| `bt prompts`       | Manage prompts (list, view, versions, assign, delete)               |
+| `bt scorers`       | Manage scorers (list, create, view, invoke, delete)                 |
+| `bt environments`  | Manage deployment environments (list, view, create, update, delete) |
+| `bt sync`          | Synchronize project logs between Braintrust and local NDJSON files  |
+| `bt update`        | Update bt in-place                                                  |
 
 ## `bt custom-views`
 
@@ -219,6 +220,21 @@ Set `project` in each definition or use `--project` / your configured project.
 Push requires Node.js; preview assets and the SDK helpers are embedded in the CLI.
 When building bt from source, run `pnpm install --frozen-lockfile --ignore-scripts` before Cargo to install the embedded assets and their build tools.
 
+## `bt preprocessors`
+
+Preprocessors turn a trace into the messages that prompt-based scorers receive for trace template variables.
+Each file default-exports `{ name, slug, handler }`; `handler` receives a span's `input`, `output`, `error`, `metadata`, and `span_attributes` and returns the messages to include for that span.
+
+```bash
+bt preprocessors bootstrap 'Conversation'
+bt preprocessors preview ./braintrust-preprocessors/conversation.preprocessor.ts --url <BRAINTRUST_TRACE_URL>
+bt preprocessors push ./braintrust-preprocessors --project test-project --if-exists replace
+```
+
+Preview runs the local handler on a trace in Braintrust's QuickJS runtime and prints the resulting messages.
+Push bundles local imports into inline QuickJS code. Set `project` in each definition or use `--project` / your configured project.
+Push and preview require Node.js. Use `bt preprocessors list`, `view`, `invoke`, and `delete` to manage published preprocessors.
+
 ## `bt scorers`
 
 Create prompt-based LLM scorers or classifiers in the current project:
@@ -239,6 +255,8 @@ bt scorers create "Safety label" \
 Use `--if-exists error|ignore|replace` to control slug conflicts. Text and structured input flags accept an inline value, `@PATH`, or `-` for stdin; only one flag per command may read stdin. Use `--template-format mustache|jinja|none`; `nunjucks` and `jinja2` are accepted aliases for Jinja. Model options include `--use-cache[=true|false]` and `--response-format text|json-object|<SOURCE>`; structured output accepts a full `response_format` JSON object inline or from `@PATH`.
 
 Before writing a scorer, `bt` sends the complete candidate definition to Braintrust for validation. The backend applies the same model-parameter and replacement checks as the write and returns structured issues with normalization suggestions when available.
+
+Use `--preprocessor <SLUG>` to build trace template variables with a preprocessor pushed to the project, `global:<NAME>` for a built-in preprocessor, `@PATH` to inline a local preprocessor file, or `none` to disable preprocessing. Without it, the project's default preprocessor applies.
 
 For TypeScript and Python code scorers, use the Braintrust SDK and `bt functions push`.
 

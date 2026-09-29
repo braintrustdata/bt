@@ -5927,6 +5927,8 @@ pub(crate) async fn resolve_trace_root_span_id(
 #[derive(Debug)]
 pub(crate) struct TraceRef {
     pub(crate) source_expr: String,
+    pub(crate) object_type: &'static str,
+    pub(crate) object_id: String,
     pub(crate) root_span_id: String,
     pub(crate) span_id: Option<String>,
 }
@@ -6002,6 +6004,8 @@ pub(crate) async fn resolve_trace_ref(
         .context("failed to resolve trace URL; for older span IDs, increase --lookup-window or use --trace-id with the root span ID")?;
         return Ok(TraceRef {
             source_expr,
+            object_type,
+            object_id,
             root_span_id,
             span_id: selector.span_id.map(ToOwned::to_owned).or(parsed.span_id),
         });
@@ -6020,6 +6024,8 @@ pub(crate) async fn resolve_trace_ref(
         .ok_or_else(|| anyhow!("trace preview requires --trace-id or --url"))?;
     Ok(TraceRef {
         source_expr: format!("project_logs({})", sql_quote(&project_id)),
+        object_type: "project_logs",
+        object_id: project_id,
         root_span_id,
         span_id: selector.span_id.map(ToOwned::to_owned),
     })
