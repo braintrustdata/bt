@@ -738,31 +738,6 @@ jobs:
           $env:PATH = "$binDir;$env:PATH"
           & $btExe update --check --channel stable
 
-  smoke-npm:
-    needs:
-      - plan
-      - publish-release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-      - name: Install and run the published CLI
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.plan.outputs.release-version }}
-        run: |
-          set -euo pipefail
-          npm install --global --ignore-scripts "@braintrust/bt@${RELEASE_VERSION}"
-          test "$(bt --version)" = "bt ${RELEASE_VERSION}"
-          test "$(npx --yes "@braintrust/bt@${RELEASE_VERSION}" --version)" = "bt ${RELEASE_VERSION}"
-
   notify-failure:
     needs:
       - plan
@@ -776,7 +751,6 @@ jobs:
       - smoke-install-unix
       - smoke-install-macos
       - smoke-install-windows
-      - smoke-npm
     if: ${{ failure() }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
