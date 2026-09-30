@@ -21,6 +21,13 @@ enum UtilCommands {
     /// Version and pagination-key conversion utilities
     #[command(name = "version")]
     Version(VersionArgs),
+    /// Internal, auth-only migration relay for packaged Windows processes.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    MigrateWindowsAuth {
+        #[arg(long)]
+        worker: bool,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -141,6 +148,8 @@ struct XactInfo {
 pub async fn run(base: BaseArgs, args: UtilArgs) -> Result<()> {
     match args.command {
         UtilCommands::Version(version) => run_version(base, version),
+        #[cfg(windows)]
+        UtilCommands::MigrateWindowsAuth { worker } => crate::auth::migrate_windows_auth(worker),
     }
 }
 

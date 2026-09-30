@@ -7,6 +7,15 @@ use serde::Serialize;
 use crate::args::LoginBaseArgs;
 use crate::{auth, ui};
 
+#[cfg(windows)]
+const FILE_SECRET_SCOPE: &str = "windows_dpapi";
+#[cfg(not(windows))]
+const FILE_SECRET_SCOPE: &str = "plaintext_fallback";
+#[cfg(windows)]
+const FILE_SECRET_STORE: &str = "Windows DPAPI-encrypted credential file";
+#[cfg(not(windows))]
+const FILE_SECRET_STORE: &str = "plaintext fallback store";
+
 #[derive(Debug, Clone, Args)]
 #[command(after_help = "\
 Examples:
@@ -27,9 +36,9 @@ pub struct ProfilesArgs {
 enum ProfilesCommand {
     /// List saved profiles
     List,
-    /// Diagnose orphaned credentials in the plaintext fallback store
+    /// Diagnose orphaned credentials in file storage
     Doctor,
-    /// Remove orphaned credentials from the plaintext fallback store
+    /// Remove orphaned credentials from file storage
     Repair(RepairArgs),
     /// Delete a saved profile and its credentials
     Delete(DeleteArgs),
@@ -39,7 +48,7 @@ enum ProfilesCommand {
 
 #[derive(Debug, Clone, Args)]
 struct RepairArgs {
-    /// Deleted profile names to remove from the OS keychain and fallback store
+    /// Deleted profile names whose credentials should be removed from active storage
     #[arg(value_name = "NAME")]
     names: Vec<String>,
 
@@ -121,30 +130,34 @@ pub fn run(base: LoginBaseArgs, args: ProfilesArgs) -> Result<()> {
 }
 
 fn doctor(json: bool) -> Result<()> {
-    let orphaned_keys = auth::orphaned_plaintext_secret_keys()?;
+    let orphaned_keys = auth::orphaned_file_secret_keys()?;
     let output = CredentialDoctorOutput {
         status: if orphaned_keys.is_empty() {
             "ok"
         } else {
             "orphaned_credentials"
         },
-        scope: "plaintext_fallback",
+        scope: FILE_SECRET_SCOPE,
         orphaned_keys,
         keychain_checked: false,
     };
     if json {
         println!("{}", serde_json::to_string(&output)?);
     } else if output.orphaned_keys.is_empty() {
-        println!("No orphaned credentials found in the plaintext fallback store.");
+        println!("No orphaned credentials found in the {FILE_SECRET_STORE}.");
+        #[cfg(not(windows))]
         println!("OS keychain entries were not enumerated.");
     } else {
         println!(
-            "Found {} orphaned credential entries in the plaintext fallback store:",
+            "Found {} orphaned credential entries in the {FILE_SECRET_STORE}:",
             output.orphaned_keys.len()
         );
         for key in &output.orphaned_keys {
             println!("  {key}");
         }
+        #[cfg(windows)]
+        println!("Run `bt profiles repair` to remove them.");
+        #[cfg(not(windows))]
         println!(
             "Run `bt profiles repair` to remove them. OS keychain entries were not enumerated."
         );
@@ -159,7 +172,7 @@ fn repair(base: &LoginBaseArgs, args: RepairArgs) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("confirmation required; re-run with `--force`"))?;
             let confirmed = dialoguer::Confirm::new()
                 .with_prompt(format!(
-                    "Remove credentials for {} deleted profile names from the OS keychain and plaintext fallback store?",
+                    "Remove credentials for {} deleted profile names from active storage?",
                     args.names.len()
                 ))
                 .default(false)
@@ -187,19 +200,26 @@ fn repair(base: &LoginBaseArgs, args: RepairArgs) -> Result<()> {
             );
         } else {
             println!(
-                "Removed credentials for {} deleted profile names from the OS keychain and plaintext fallback store.",
+                "Removed credentials for {} deleted profile names from active storage.",
                 repaired.len()
             );
         }
         return Ok(());
     }
 
-    let orphaned = auth::orphaned_plaintext_secret_keys()?;
+    let orphaned = auth::orphaned_file_secret_keys()?;
     if orphaned.is_empty() {
         if base.json {
-            println!(r#"{{"status":"ok","scope":"plaintext_fallback","removed_keys":[]}}"#);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "scope": FILE_SECRET_SCOPE,
+                    "removed_keys": [],
+                })
+            );
         } else {
-            println!("No orphaned credentials found in the plaintext fallback store.");
+            println!("No orphaned credentials found in the {FILE_SECRET_STORE}.");
         }
         return Ok(());
     }
@@ -210,7 +230,7 @@ fn repair(base: &LoginBaseArgs, args: RepairArgs) -> Result<()> {
         })?;
         let confirmed = dialoguer::Confirm::new()
             .with_prompt(format!(
-                "Remove {} orphaned plaintext credential entries?",
+                "Remove {} orphaned credential entries from the {FILE_SECRET_STORE}?",
                 orphaned.len()
             ))
             .default(false)
@@ -218,7 +238,12 @@ fn repair(base: &LoginBaseArgs, args: RepairArgs) -> Result<()> {
         if !confirmed {
             if base.json {
                 println!(
-                    r#"{{"status":"cancelled","scope":"plaintext_fallback","removed_keys":[]}}"#
+                    "{}",
+                    serde_json::json!({
+                        "status": "cancelled",
+                        "scope": FILE_SECRET_SCOPE,
+                        "removed_keys": [],
+                    })
                 );
             } else {
                 println!("Cancelled");
@@ -227,21 +252,22 @@ fn repair(base: &LoginBaseArgs, args: RepairArgs) -> Result<()> {
         }
     }
 
-    let removed = auth::repair_orphaned_plaintext_secrets()?;
+    let removed = auth::repair_orphaned_file_secrets()?;
     if base.json {
         println!(
             "{}",
             serde_json::json!({
                 "status": "repaired",
-                "scope": "plaintext_fallback",
+                "scope": FILE_SECRET_SCOPE,
                 "removed_keys": removed,
             })
         );
     } else {
         println!(
-            "Removed {} orphaned credential entries from the plaintext fallback store.",
+            "Removed {} orphaned credential entries from the {FILE_SECRET_STORE}.",
             removed.len()
         );
+        #[cfg(not(windows))]
         println!("OS keychain entries were not enumerated or changed.");
     }
     Ok(())

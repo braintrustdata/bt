@@ -37,12 +37,21 @@ use crate::{
     ui,
 };
 
+#[cfg(any(windows, test))]
+mod windows_store;
+
+#[cfg(windows)]
+pub(crate) fn migrate_windows_auth(worker: bool) -> Result<()> {
+    windows_store::migrate_helper(worker)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const KEYCHAIN_SERVICE: &str = "com.braintrust.bt.cli";
 const OAUTH_SCOPE: &str = "mcp";
 const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_REFRESH_SAFETY_WINDOW_SECONDS: u64 = 60;
 const AI_PROVIDER_KEY_STALENESS_CHECK_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
+#[cfg(not(windows))]
 static SECRET_STORE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static AI_PROVIDER_KEY_STALENESS_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -385,7 +394,7 @@ fn secret_profile_name(key: &str) -> &str {
         .unwrap_or(key)
 }
 
-pub(crate) fn orphaned_plaintext_secret_keys() -> Result<Vec<String>> {
+pub(crate) fn orphaned_file_secret_keys() -> Result<Vec<String>> {
     let profiles = load_auth_store()?;
     let secrets = load_secret_store()?;
     Ok(secrets
@@ -396,7 +405,7 @@ pub(crate) fn orphaned_plaintext_secret_keys() -> Result<Vec<String>> {
         .collect())
 }
 
-pub(crate) fn repair_orphaned_plaintext_secrets() -> Result<Vec<String>> {
+pub(crate) fn repair_orphaned_file_secrets() -> Result<Vec<String>> {
     let profiles = load_auth_store()?;
     let path = secret_store_path()?;
     if !path.exists() {
@@ -956,7 +965,13 @@ fn config_auth_context_from_config(
 }
 
 pub async fn resolve_auth(base: &BaseArgs) -> Result<ResolvedAuth> {
-    let mut store = load_auth_store()?;
+    let mut store = if resolve_api_key_override(base).is_some() {
+        // Overrides need no saved profiles. Avoid initializing or migrating
+        // the credential store, not just swallowing an initialization error.
+        AuthStore::default()
+    } else {
+        load_auth_store()?
+    };
     let mut auth_base = base.clone();
     let (cfg_profile, cfg_org) = config_auth_context(base);
     if let Some(profile) = cfg_profile {
@@ -2543,7 +2558,12 @@ pub(crate) fn secret_storage_description() -> Result<String> {
         "Secret Service (plaintext fallback: {})",
         fallback.display()
     ));
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    return Ok(format!(
+        "Windows DPAPI (current user): {}",
+        fallback.display()
+    ));
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     return Ok(format!("plaintext file: {}", fallback.display()));
 }
 
@@ -3325,6 +3345,12 @@ fn linux_secret_service_error() -> anyhow::Error {
     )
 }
 
+#[cfg(windows)]
+fn save_profile_secret(profile_name: &str, api_key: &str) -> Result<()> {
+    windows_store::set_secret(profile_name, Some(api_key))
+}
+
+#[cfg(not(windows))]
 fn save_profile_secret(profile_name: &str, api_key: &str) -> Result<()> {
     match save_profile_secret_keychain(profile_name, api_key) {
         Ok(()) => {
@@ -3339,6 +3365,12 @@ fn save_profile_secret(profile_name: &str, api_key: &str) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
+    Ok(load_secret_store()?.secrets.remove(profile_name))
+}
+
+#[cfg(not(windows))]
 fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
     match load_profile_secret_keychain(profile_name) {
         Ok(Some(secret)) => Ok(Some(secret)),
@@ -3347,6 +3379,12 @@ fn load_profile_secret(profile_name: &str) -> Result<Option<String>> {
     }
 }
 
+#[cfg(windows)]
+fn delete_profile_secret(profile_name: &str) -> Result<()> {
+    windows_store::set_secret(profile_name, None)
+}
+
+#[cfg(not(windows))]
 fn delete_profile_secret(profile_name: &str) -> Result<()> {
     let keychain_err = delete_profile_secret_keychain(profile_name).err();
     let plaintext_err = delete_profile_secret_plaintext(profile_name).err();
@@ -3356,6 +3394,7 @@ fn delete_profile_secret(profile_name: &str) -> Result<()> {
     Err(keychain_err.expect("checked is_some"))
 }
 
+#[cfg(not(windows))]
 fn warn_secret_store_plaintext_fallback(err: &anyhow::Error) {
     if SECRET_STORE_FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
         return;
@@ -3372,6 +3411,7 @@ fn warn_secret_store_plaintext_fallback(err: &anyhow::Error) {
     }
 }
 
+#[cfg(not(windows))]
 fn save_profile_secret_plaintext(profile_name: &str, api_key: &str) -> Result<()> {
     let mut store = load_secret_store()?;
     store
@@ -3380,11 +3420,13 @@ fn save_profile_secret_plaintext(profile_name: &str, api_key: &str) -> Result<()
     save_secret_store(&store)
 }
 
+#[cfg(not(windows))]
 fn load_profile_secret_plaintext(profile_name: &str) -> Result<Option<String>> {
     let store = load_secret_store()?;
     Ok(store.secrets.get(profile_name).cloned())
 }
 
+#[cfg(not(windows))]
 fn delete_profile_secret_plaintext(profile_name: &str) -> Result<()> {
     let path = secret_store_path()?;
     if !path.exists() {
@@ -3396,6 +3438,12 @@ fn delete_profile_secret_plaintext(profile_name: &str) -> Result<()> {
     save_secret_store(&store)
 }
 
+#[cfg(windows)]
+fn load_secret_store() -> Result<SecretStore> {
+    windows_store::load_secrets(&auth_store_path()?)
+}
+
+#[cfg(not(windows))]
 fn load_secret_store() -> Result<SecretStore> {
     let path = secret_store_path()?;
     if !path.exists() {
@@ -3408,18 +3456,31 @@ fn load_secret_store() -> Result<SecretStore> {
         .with_context(|| format!("failed to parse secret store {}", path.display()))
 }
 
+#[cfg(windows)]
+fn save_secret_store(store: &SecretStore) -> Result<()> {
+    windows_store::save_secrets(&auth_store_path()?, store)
+}
+
+#[cfg(not(windows))]
 fn save_secret_store(store: &SecretStore) -> Result<()> {
     let path = secret_store_path()?;
     crate::utils::write_json_atomic_private(&path, store)
         .with_context(|| format!("failed to write secret store {}", path.display()))
 }
 
+#[cfg(windows)]
+fn secret_store_path() -> Result<PathBuf> {
+    auth_store_path()
+}
+
+#[cfg(not(windows))]
 fn secret_store_path() -> Result<PathBuf> {
     let mut path = auth_store_path()?;
     path.set_file_name("secrets.json");
     Ok(path)
 }
 
+#[cfg(not(windows))]
 fn save_profile_secret_keychain(profile_name: &str, api_key: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -3498,6 +3559,7 @@ fn save_profile_secret_keychain(profile_name: &str, api_key: &str) -> Result<()>
     }
 }
 
+#[cfg(not(windows))]
 fn load_profile_secret_keychain(profile_name: &str) -> Result<Option<String>> {
     #[cfg(target_os = "macos")]
     {
@@ -3576,6 +3638,7 @@ fn load_profile_secret_keychain(profile_name: &str) -> Result<Option<String>> {
     }
 }
 
+#[cfg(not(windows))]
 fn delete_profile_secret_keychain(profile_name: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -3850,6 +3913,12 @@ fn with_auth_store_lock<T>(path: &Path, action: impl FnOnce() -> Result<T>) -> R
     result
 }
 
+#[cfg(windows)]
+fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
+    windows_store::load_auth(path)
+}
+
+#[cfg(not(windows))]
 fn load_auth_store_from_path(path: &Path) -> Result<AuthStore> {
     if !path.exists() {
         return Ok(AuthStore::default());
@@ -3866,6 +3935,12 @@ fn save_auth_store(store: &AuthStore) -> Result<()> {
     with_auth_store_lock(&path, || save_auth_store_to_path(&path, store))
 }
 
+#[cfg(windows)]
+fn save_auth_store_to_path(path: &Path, store: &AuthStore) -> Result<()> {
+    windows_store::save_auth(path, store)
+}
+
+#[cfg(not(windows))]
 fn save_auth_store_to_path(path: &Path, store: &AuthStore) -> Result<()> {
     crate::utils::write_json_atomic_private(path, store)
         .with_context(|| format!("failed to write auth config {}", path.display()))
@@ -3874,9 +3949,7 @@ fn save_auth_store_to_path(path: &Path, store: &AuthStore) -> Result<()> {
 fn auth_store_path() -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        let app_data =
-            std::env::var_os("APPDATA").ok_or_else(|| anyhow::anyhow!("APPDATA is not set"))?;
-        Ok(PathBuf::from(app_data).join("bt").join("auth.json"))
+        windows_store::path()
     }
 
     #[cfg(not(windows))]
@@ -4416,6 +4489,11 @@ mod tests {
     #[tokio::test]
     async fn loading_a_legacy_store_backfills_profile_ids_on_disk() {
         let _env = TestEnv::new(None, None).await;
+        #[cfg(windows)]
+        let path = PathBuf::from(env::var_os("XDG_CONFIG_HOME").unwrap())
+            .join("bt")
+            .join("auth.json");
+        #[cfg(not(windows))]
         let path = auth_store_path().expect("auth store path");
         fs::create_dir_all(path.parent().expect("auth store parent")).expect("create parent");
         fs::write(
@@ -4432,10 +4510,9 @@ mod tests {
             Some("test-profile".to_string())
         );
 
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).expect("read migrated store"))
-                .expect("parse migrated store");
-        assert_eq!(persisted["profile_ids"]["test-profile"], *id);
+        let persisted = load_auth_store_from_path(&auth_store_path().expect("migrated path"))
+            .expect("read migrated store");
+        assert_eq!(persisted.profile_ids["test-profile"], *id);
     }
 
     #[test]
@@ -4519,6 +4596,70 @@ mod tests {
 
         assert_eq!(profile, None);
         assert_eq!(org.as_deref(), Some("local-org"));
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_api_key_override_leaves_legacy_credentials_untouched() {
+        let _env = TestEnv::new(None, Some("test-org")).await;
+        let directory = PathBuf::from(env::var_os("XDG_CONFIG_HOME").unwrap()).join("bt");
+        // Missing profile IDs trigger a metadata upgrade on every platform;
+        // Windows additionally migrates both files into the DPAPI snapshot.
+        let metadata = br#"{"profiles":{"test-profile":{"auth_kind":"api_key"}}}"#;
+        let secrets = br#"{"secrets":{"test-profile":"test-saved-key"}}"#;
+        fs::write(directory.join("auth.json"), metadata).expect("write legacy metadata");
+        fs::write(directory.join("secrets.json"), secrets).expect("write legacy credentials");
+
+        let mut base = make_base();
+        base.api_key = Some("test-api-key".to_string());
+        base.profile = Some("test-profile".to_string());
+        let resolved = resolve_auth(&base).await.expect("resolve API-key override");
+        assert_eq!(resolved.api_key.as_deref(), Some("test-api-key"));
+        assert_eq!(resolved.org_name.as_deref(), Some("test-org"));
+        assert!(resolved.profile.is_none());
+        assert!(resolved.profile_id.is_none());
+        #[cfg(windows)]
+        assert!(!directory.join("windows-auth").exists());
+        assert_eq!(
+            fs::read(directory.join("auth.json")).expect("legacy metadata remains"),
+            metadata
+        );
+        assert_eq!(
+            fs::read(directory.join("secrets.json")).expect("legacy credentials remain"),
+            secrets
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_api_key_override_survives_unavailable_credential_store() {
+        let _env = TestEnv::new(None, None).await;
+        let config_home = PathBuf::from(env::var_os("XDG_CONFIG_HOME").unwrap());
+        fs::create_dir_all(config_home.join("bt")).expect("create bt config dir");
+        // A file where the private auth directory belongs fails store setup.
+        #[cfg(windows)]
+        fs::write(
+            config_home.join("bt").join("windows-auth"),
+            b"not a directory",
+        )
+        .expect("block windows auth dir");
+        #[cfg(not(windows))]
+        fs::write(auth_store_path().expect("auth store path"), b"not json")
+            .expect("corrupt auth store");
+        assert!(load_auth_store().is_err());
+
+        let mut base = make_base();
+        base.api_key = Some("test-api-key".to_string());
+        let resolved = resolve_auth(&base).await.expect("api key bypasses store");
+        assert_eq!(resolved.api_key.as_deref(), Some("test-api-key"));
+        assert!(resolved.profile.is_none());
+
+        // Anything that needs saved profiles still reports the store error.
+        assert!(resolve_auth(&make_base()).await.is_err());
+        base.prefer_profile = true;
+        assert!(resolve_auth(&base).await.is_err());
+        base.prefer_profile = false;
+        base.profile = Some("test-profile".to_string());
+        base.profile_explicit = true;
+        assert!(resolve_auth(&base).await.is_err());
     }
 
     #[test]
@@ -5690,8 +5831,13 @@ mod tests {
         let mut cfg = crate::config::load_global().expect("load global config");
         cfg.profile = Some("acme-profile".to_string());
         crate::config::save_global(&cfg).expect("save active profile");
-        save_profile_secret_plaintext("acme-profile", "acme-secret").expect("save acme secret");
-        save_profile_secret_plaintext("other-profile", "other-secret").expect("save other secret");
+        save_secret_store(&SecretStore {
+            secrets: BTreeMap::from([
+                ("acme-profile".to_string(), "acme-secret".to_string()),
+                ("other-profile".to_string(), "other-secret".to_string()),
+            ]),
+        })
+        .expect("save profile secrets");
 
         let mut base = make_base();
         base.profile = Some("acme-profile".to_string());

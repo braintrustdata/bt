@@ -8,6 +8,7 @@ use tempfile::Builder;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Visibility {
     Default,
+    #[cfg(not(windows))]
     Private,
 }
 
@@ -29,6 +30,7 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_json(path, value, Visibility::Default)
 }
 
+#[cfg(not(windows))]
 pub fn write_json_atomic_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_json(path, value, Visibility::Private)
 }
