@@ -900,6 +900,98 @@ print(json.dumps(entries))
 }
 
 #[test]
+fn functions_python_runner_forwards_project_group_name() {
+    let Some(python) = find_python() else {
+        eprintln!(
+            "Skipping functions_python_runner_forwards_project_group_name (python not installed)."
+        );
+        return;
+    };
+
+    let root = repo_root();
+    let scripts_dir = root.join("scripts");
+    let runner_script = scripts_dir.join("functions-runner.py");
+    let snippet = r#"
+import asyncio
+import importlib.util
+import json
+import pathlib
+import sys
+
+runner_path = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("functions_runner", runner_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"failed to load {runner_path}")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class Project:
+    def __init__(self, name, project_group_name=None):
+        self.name = name
+        self.project_group_name = project_group_name
+
+class Params:
+    @staticmethod
+    def model_json_schema():
+        return {"type": "object", "properties": {}}
+
+class Tool:
+    def __init__(self, slug, project):
+        self.name = slug
+        self.slug = slug
+        self.type_ = "tool"
+        self.parameters = Params
+        self.project = project
+
+class Prompt:
+    def __init__(self, project):
+        self.project = project
+
+    def to_function_definition(self, _if_exists, resolver):
+        return {"name": "my-prompt", "slug": "my-prompt"}
+
+code_entries = module.collect_code_entries(
+    [
+        Tool("grouped-tool", Project("test-project", "test-group")),
+        Tool("ungrouped-tool", Project("test-project")),
+    ]
+)
+event_entries = asyncio.run(
+    module.collect_function_event_entries([Prompt(Project("test-project", "test-group"))])
+)
+print(json.dumps(code_entries + event_entries))
+"#;
+
+    let output = Command::new(&python)
+        .env("PYTHONPATH", &scripts_dir)
+        .arg("-c")
+        .arg(snippet)
+        .arg(&runner_script)
+        .output()
+        .expect("run functions-runner project group script");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("Python runner project group script failed:\n{stderr}");
+    }
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let entries: Vec<Value> =
+        serde_json::from_str(stdout.trim()).expect("parse entries JSON from project group script");
+    let project_group_names: Vec<Option<&str>> = entries
+        .iter()
+        .map(|entry| entry.get("project_group_name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        project_group_names,
+        vec![Some("test-group"), None, Some("test-group")]
+    );
+    assert!(entries
+        .iter()
+        .all(|entry| entry.get("project_name").and_then(Value::as_str) == Some("test-project")));
+}
+
+#[test]
 fn functions_js_runner_emits_valid_manifest() {
     if !command_exists("node") {
         eprintln!("Skipping functions_js_runner_emits_valid_manifest (node not installed).");
