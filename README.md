@@ -164,6 +164,8 @@ Windows (PowerShell):
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME ".cargo" }
 Remove-Item -Force (Join-Path $cargoHome "bin\\bt.exe") -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force (Join-Path $env:APPDATA "bt") -ErrorAction SilentlyContinue
+$userProfile = [Environment]::GetFolderPath("UserProfile")
+Remove-Item -Recurse -Force (Join-Path $userProfile ".braintrust\auth") -ErrorAction SilentlyContinue
 ```
 
 ## Troubleshooting
@@ -466,6 +468,24 @@ Auth resolution order for commands is:
 6. Interactive profile picker (if multiple compatible profiles exist and a TTY is available)
 
 On Linux, secure storage uses `secret-tool` (libsecret) with a running Secret Service daemon. On macOS, it uses the `security` keychain utility. If a secure store is unavailable, `bt` falls back to a plaintext secrets file with `0600` permissions.
+
+On Windows, profile metadata and credentials share one file,
+`<Windows user profile>\.braintrust\auth\credentials.dpapi`, outside MSIX's
+AppData virtualization. Windows DPAPI encrypts it for the current user, and
+the directory permits only that user and SYSTEM. Windows does not fall back
+to plaintext if encryption fails. `bt status --all` shows the storage location.
+Other configuration, logs, and tracing journals keep their existing locations.
+
+On upgrade, the first command that accesses saved authentication automatically
+migrates the normal Windows roaming AppData `bt\auth.json` and `bt\secrets.json`
+together, preserving profile IDs and existing logins. It verifies the encrypted
+copy before removing those legacy files. Desktop-launched commands use an
+unpackaged migration helper so an app-private stale copy cannot replace the
+normal login. If Windows policy blocks that helper, run `bt profiles` once
+from a normal Windows terminal, then retry; migration failures retain the
+original credentials. App-private legacy copies are never used as a fallback.
+Older versions of `bt` do not understand the new store and may require login
+again after a downgrade.
 
 ## `bt switch`
 

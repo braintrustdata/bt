@@ -667,7 +667,9 @@ dependencies = [
  "unicode-width 0.1.14",
  "urlencoding",
  "uuid",
+ "windows-sys 0.61.2",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
