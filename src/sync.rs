@@ -3354,7 +3354,7 @@ async fn resolve_project_logs_target(
             if !mode.allows_project_creation() || is_uuid_like(project_selector) {
                 return Err(err);
             }
-            let created = create_project(client, project_selector)
+            let created = create_project(client, project_selector, None)
                 .await
                 .with_context(|| {
                     format!("project '{project_selector}' not found, and creating it failed")

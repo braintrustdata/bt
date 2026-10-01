@@ -56,6 +56,7 @@ type CodeEntry = {
   kind: "code";
   project_id?: string;
   project_name?: string;
+  project_group_name?: string;
   name: string;
   slug: string;
   description?: string;
@@ -72,6 +73,7 @@ type FunctionEventEntry = {
   kind: "function_event";
   project_id?: string;
   project_name?: string;
+  project_group_name?: string;
   event: JsonValue;
 };
 
@@ -374,6 +376,7 @@ async function collectFunctionEvents(
       kind: "function_event",
       project_id: projectId,
       project_name: projectName,
+      project_group_name: selector.project_group_name,
       event: normalizedEvent,
     });
   }
@@ -439,6 +442,7 @@ async function collectLegacyPromptEvent(
     kind: "function_event",
     project_id: projectId,
     project_name: projectName,
+    project_group_name: selector.project_group_name,
     event,
   };
 }
@@ -526,6 +530,7 @@ function collectCodeEntries(items: CodeRegistryItem[]): CodeEntry[] {
         typeof selector.project_name === "string"
           ? selector.project_name
           : undefined,
+      project_group_name: selector.project_group_name,
       name: item.name,
       slug: item.slug,
       description:

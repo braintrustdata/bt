@@ -32,7 +32,7 @@ pub(crate) async fn create_project_checked(
 
     match with_spinner_visible(
         "Creating project...",
-        api::create_project(client, name),
+        api::create_project(client, name, None),
         Duration::from_millis(300),
     )
     .await

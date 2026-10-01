@@ -24,8 +24,15 @@ pub async fn list_projects(client: &ApiClient) -> Result<Vec<Project>> {
     Ok(list.objects)
 }
 
-pub async fn create_project(client: &ApiClient, name: &str) -> Result<Project> {
-    let body = serde_json::json!({ "name": name, "org_name": client.org_name() });
+pub async fn create_project(
+    client: &ApiClient,
+    name: &str,
+    project_group_name: Option<&str>,
+) -> Result<Project> {
+    let mut body = serde_json::json!({ "name": name, "org_name": client.org_name() });
+    if let Some(project_group_name) = project_group_name {
+        body["project_group_name"] = project_group_name.into();
+    }
     client.post("/v1/project", &body).await
 }
 
