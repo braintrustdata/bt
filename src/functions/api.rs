@@ -261,6 +261,20 @@ pub async fn delete_function(client: &ApiClient, function_id: &str) -> Result<()
     client.delete(&path).await
 }
 
+/// Partially update a function (scorer/tool/prompt/...) by id.
+///
+/// Top-level fields are patched, but object-valued fields such as `prompt_data`
+/// are replaced wholesale. Callers updating `prompt_data` must materialize the
+/// complete value before sending the request.
+pub async fn patch_function(
+    client: &ApiClient,
+    function_id: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let path = format!("/v1/function/{}", encode(function_id));
+    client.patch(&path, body).await
+}
+
 pub async fn list_functions_page(
     client: &ApiClient,
     query: &FunctionListQuery,
