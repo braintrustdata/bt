@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -97,6 +97,8 @@ struct CodeEntry {
     project_id: Option<String>,
     #[serde(default)]
     project_name: Option<String>,
+    #[serde(default)]
+    project_group_name: Option<String>,
     name: String,
     slug: String,
     #[serde(default)]
@@ -123,6 +125,8 @@ struct FunctionEventEntry {
     project_id: Option<String>,
     #[serde(default)]
     project_name: Option<String>,
+    #[serde(default)]
+    project_group_name: Option<String>,
     event: Value,
 }
 
@@ -201,6 +205,8 @@ struct ProjectPreflight {
     default_project_name: Option<String>,
     requires_default_project: bool,
     named_projects: BTreeSet<String>,
+    /// Project group to create each named project in, keyed by project name.
+    project_group_names: BTreeMap<String, String>,
     direct_project_ids: BTreeSet<String>,
 }
 
@@ -539,6 +545,7 @@ pub async fn run(base: BaseArgs, args: PushArgs) -> Result<()> {
     let mut project_name_cache = match resolve_named_projects(
         &auth_ctx,
         &preflight.named_projects,
+        &preflight.project_group_names,
         args.create_missing_projects,
     )
     .await
@@ -2550,18 +2557,47 @@ fn collect_project_preflight(
     let default_project_name = resolve_default_project_name(base, Some(resolved_org))?;
     let mut requires_default_project = false;
     let mut named_projects = BTreeSet::new();
+    let mut project_group_names = BTreeMap::new();
     let mut direct_project_ids = BTreeSet::new();
     for file in &manifest.files {
         for entry in &file.entries {
-            let selector = match entry {
-                ManifestEntry::Code(code) => project_selector_for_code(code)?,
+            let (selector, project_group_name) = match entry {
+                ManifestEntry::Code(code) => (
+                    project_selector_for_code(code)?,
+                    code.project_group_name.as_deref(),
+                ),
                 ManifestEntry::FunctionEvent(event) => {
                     let mut placeholders = BTreeSet::new();
                     collect_project_name_placeholders_checked(&event.event, &mut placeholders)?;
                     named_projects.extend(placeholders);
-                    project_selector_for_event(event)?
+                    (
+                        project_selector_for_event(event)?,
+                        event.project_group_name.as_deref(),
+                    )
                 }
             };
+
+            if let (ProjectSelector::Name(project_name), Some(project_group_name)) = (
+                &selector,
+                project_group_name
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+            ) {
+                match project_group_names.entry(project_name.clone()) {
+                    btree_map::Entry::Vacant(slot) => {
+                        slot.insert(project_group_name.to_string());
+                    }
+                    btree_map::Entry::Occupied(existing)
+                        if existing.get() != project_group_name =>
+                    {
+                        bail!(
+                            "project '{project_name}' is assigned to conflicting project groups '{}' and '{project_group_name}'",
+                            existing.get()
+                        );
+                    }
+                    btree_map::Entry::Occupied(_) => {}
+                }
+            }
 
             add_selector_requirement(
                 file,
@@ -2579,6 +2615,7 @@ fn collect_project_preflight(
         default_project_name,
         requires_default_project,
         named_projects,
+        project_group_names,
         direct_project_ids,
     })
 }
@@ -2721,6 +2758,7 @@ fn resolve_default_project_id(
 async fn resolve_named_projects(
     auth_ctx: &super::AuthContext,
     named_projects: &BTreeSet<String>,
+    project_group_names: &BTreeMap<String, String>,
     create_missing_projects: bool,
 ) -> Result<BTreeMap<String, String>> {
     let mut project_name_cache = BTreeMap::new();
@@ -2737,17 +2775,18 @@ async fn resolve_named_projects(
             continue;
         }
 
-        match create_project(&auth_ctx.client, project_name).await {
+        let project_group_name = project_group_names.get(project_name).map(String::as_str);
+        match create_project(&auth_ctx.client, project_name, project_group_name).await {
             Ok(project) => {
                 project_name_cache.insert(project_name.clone(), project.id);
             }
-            Err(_) => {
+            Err(err) => {
                 // Another writer may have created the project concurrently.
                 if let Some(project) = get_project_by_name(&auth_ctx.client, project_name).await? {
                     project_name_cache.insert(project_name.clone(), project.id);
                 } else {
                     bail!(
-                        "failed to create project '{project_name}' in org '{}'",
+                        "failed to create project '{project_name}' in org '{}': {err:#}",
                         current_org_label(auth_ctx)
                     );
                 }
@@ -2957,7 +2996,8 @@ async fn resolve_project_name(
     let project = if let Some(project) = get_project_by_name(client, project_name).await? {
         project
     } else if create_missing_projects {
-        match create_project(client, project_name).await {
+        // Named projects, including their project groups, are created during preflight.
+        match create_project(client, project_name, None).await {
             Ok(project) => project,
             Err(_) => get_project_by_name(client, project_name)
                 .await?
@@ -3249,6 +3289,7 @@ mod tests {
                     ManifestEntry::Code(CodeEntry {
                         project_id: None,
                         project_name: None,
+                        project_group_name: None,
                         name: "Code Tool".to_string(),
                         slug: "code-tool".to_string(),
                         description: None,
@@ -3263,6 +3304,7 @@ mod tests {
                     ManifestEntry::FunctionEvent(FunctionEventEntry {
                         project_id: None,
                         project_name: None,
+                        project_group_name: None,
                         event: serde_json::json!({
                             "name": " Prompt Function ",
                             "slug": " prompt-function "
@@ -3368,6 +3410,7 @@ mod tests {
                 entries: vec![ManifestEntry::Code(CodeEntry {
                     project_id: None,
                     project_name: None,
+                    project_group_name: None,
                     name: "A".to_string(),
                     slug: "same".to_string(),
                     description: None,
@@ -3389,6 +3432,69 @@ mod tests {
         assert!(
             preflight.named_projects.contains("demo-project"),
             "default project should be included in named set"
+        );
+    }
+
+    fn group_code_entry(slug: &str, project_group_name: &str) -> ManifestEntry {
+        ManifestEntry::Code(CodeEntry {
+            project_id: None,
+            project_name: Some("test-project".to_string()),
+            project_group_name: Some(project_group_name.to_string()),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            description: None,
+            function_type: Some("tool".to_string()),
+            if_exists: None,
+            metadata: None,
+            tags: None,
+            function_schema: None,
+            location: None,
+            preview: None,
+        })
+    }
+
+    fn group_manifest(entries: Vec<ManifestEntry>) -> RunnerManifest {
+        RunnerManifest {
+            runtime_context: RuntimeContext {
+                runtime: "node".to_string(),
+                version: "20.0.0".to_string(),
+            },
+            files: vec![ManifestFile {
+                source_file: "a.ts".to_string(),
+                entries,
+                python_bundle: None,
+            }],
+            baseline_dep_versions: vec![],
+        }
+    }
+
+    #[test]
+    fn collect_project_preflight_records_project_groups() {
+        let manifest = group_manifest(vec![
+            group_code_entry("a", "test-group"),
+            group_code_entry("b", "test-group"),
+        ]);
+
+        let preflight =
+            collect_project_preflight(&test_base_args(), &manifest, "test-org").expect("preflight");
+        assert_eq!(
+            preflight.project_group_names.get("test-project"),
+            Some(&"test-group".to_string())
+        );
+    }
+
+    #[test]
+    fn collect_project_preflight_rejects_conflicting_project_groups() {
+        let manifest = group_manifest(vec![
+            group_code_entry("a", "test-group-a"),
+            group_code_entry("b", "test-group-b"),
+        ]);
+
+        let err = collect_project_preflight(&test_base_args(), &manifest, "test-org")
+            .expect_err("conflicting groups must fail");
+        assert!(
+            err.to_string().contains("conflicting project groups"),
+            "unexpected error: {err}"
         );
     }
 
@@ -3652,6 +3758,7 @@ mod tests {
                 entries: vec![ManifestEntry::Code(CodeEntry {
                     project_id: None,
                     project_name: None,
+                    project_group_name: None,
                     name: "Tool".to_string(),
                     slug: "tool".to_string(),
                     description: None,
@@ -3697,6 +3804,7 @@ mod tests {
                 entries: vec![ManifestEntry::Code(CodeEntry {
                     project_id: None,
                     project_name: None,
+                    project_group_name: None,
                     name: "Tool".to_string(),
                     slug: "tool".to_string(),
                     description: None,
@@ -3743,6 +3851,7 @@ mod tests {
                 entries: vec![ManifestEntry::Code(CodeEntry {
                     project_id: None,
                     project_name: None,
+                    project_group_name: None,
                     name: "Tool".to_string(),
                     slug: "tool".to_string(),
                     description: None,
@@ -3792,6 +3901,7 @@ mod tests {
                 entries: vec![ManifestEntry::Code(CodeEntry {
                     project_id: None,
                     project_name: None,
+                    project_group_name: None,
                     name: "Tool".to_string(),
                     slug: "tool".to_string(),
                     description: None,

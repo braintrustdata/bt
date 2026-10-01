@@ -98,6 +98,20 @@ def normalize_project_selector(project: Any) -> tuple[str | None, str | None]:
     return None, None
 
 
+def project_selector_fields(project: Any) -> dict[str, str]:
+    project_id, project_name = normalize_project_selector(project)
+    if project_id:
+        return {"project_id": project_id}
+    if not project_name:
+        return {}
+    fields = {"project_name": project_name}
+    # braintrust.framework2.Project exposes `.project_group_name` on SDKs that support project groups.
+    project_group_name = getattr(project, "project_group_name", None)
+    if isinstance(project_group_name, str) and project_group_name.strip():
+        fields["project_group_name"] = project_group_name.strip()
+    return fields
+
+
 def normalize_function_type(raw: Any) -> str | None:
     if isinstance(raw, str):
         value = raw.strip()
@@ -189,8 +203,6 @@ def collect_code_entries(functions_registry: Any) -> list[dict[str, Any]]:
         if not isinstance(name, str) or not isinstance(slug, str) or not name or not slug:
             continue
 
-        project_id, project_name = normalize_project_selector(getattr(item, "project", None))
-
         entry: dict[str, Any] = {
             "kind": "code",
             "name": name,
@@ -232,10 +244,7 @@ def collect_code_entries(functions_registry: Any) -> list[dict[str, Any]]:
             normalized_tags = [tag for tag in tags if isinstance(tag, str)]
             if normalized_tags:
                 entry["tags"] = normalized_tags
-        if project_id:
-            entry["project_id"] = project_id
-        if project_name:
-            entry["project_name"] = project_name
+        entry.update(project_selector_fields(getattr(item, "project", None)))
 
         preview = getattr(item, "preview", None)
         if isinstance(preview, str):
@@ -275,13 +284,13 @@ async def collect_function_event_entries(prompts_registry: Any) -> list[dict[str
             if isinstance(normalized, dict):
                 if normalized.get("if_exists") is None:
                     normalized.pop("if_exists", None)
-                project_id, project_name = normalize_project_selector(getattr(item, "project", None))
-                event_entry: dict[str, Any] = {"kind": "function_event", "event": normalized}
-                if project_id:
-                    event_entry["project_id"] = project_id
-                if project_name:
-                    event_entry["project_name"] = project_name
-                entries.append(event_entry)
+                entries.append(
+                    {
+                        "kind": "function_event",
+                        "event": normalized,
+                        **project_selector_fields(getattr(item, "project", None)),
+                    }
+                )
 
     return entries
 

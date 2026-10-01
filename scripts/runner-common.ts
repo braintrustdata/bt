@@ -6,11 +6,13 @@ export type JsonValue = JsonPrimitive | JsonArray | JsonObject;
 export type ProjectSelector = {
   project_id?: string;
   project_name?: string;
+  project_group_name?: string;
 };
 
 export type ProjectRef = {
   id?: string;
   name?: string;
+  projectGroupName?: string;
 };
 
 export function asProjectSelector(
@@ -25,7 +27,13 @@ export function asProjectSelector(
   }
 
   if (typeof project.name === "string" && project.name.trim().length > 0) {
-    return { project_name: project.name };
+    return typeof project.projectGroupName === "string" &&
+      project.projectGroupName.trim().length > 0
+      ? {
+          project_name: project.name,
+          project_group_name: project.projectGroupName,
+        }
+      : { project_name: project.name };
   }
 
   return {};

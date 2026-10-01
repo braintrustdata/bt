@@ -282,7 +282,11 @@ async fn validate_or_create_project(client: &ApiClient, name: &str) -> Result<ap
         .interact()?;
 
     if create {
-        with_spinner("Creating project...", api::create_project(client, name)).await
+        with_spinner(
+            "Creating project...",
+            api::create_project(client, name, None),
+        )
+        .await
     } else {
         bail!("project '{name}' not found");
     }

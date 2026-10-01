@@ -1808,7 +1808,7 @@ async fn resolve_target_project(
     if let Some(project) = get_project_by_name(client, project_name).await? {
         Ok(project)
     } else {
-        create_project(client, project_name)
+        create_project(client, project_name, None)
             .await
             .with_context(|| format!("project '{project_name}' not found, and creating it failed"))
     }
