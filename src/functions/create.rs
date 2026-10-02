@@ -1,10 +1,13 @@
-use anyhow::{bail, Context, Result};
+use std::path::Path;
+
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{builder::BoolishValueParser, ArgGroup, Args};
 use dialoguer::Input;
 use serde_json::{json, Map, Value};
 
 use crate::{
     error::user_error,
+    preprocessors::load_local_preprocessor,
     ui::{is_interactive, print_command_status, with_spinner, CommandStatus},
     utils::{merge_json_objects, read_text_source, read_yaml_object_source},
 };
@@ -41,6 +44,8 @@ Examples:
     --messages @messages.json --choice-scores @scores.json
   bt scorers create \"Safety label\" --model gpt-5.4-nano --messages @messages.json \\
     --classifications '[\"safe\",\"unsafe\"]' --template-format jinja
+  bt scorers create \"Conversation quality\" --model gpt-5.4-nano \\
+    --messages @messages.json --choice-scores @scores.json --preprocessor conversation
 
 TypeScript and Python code scorers:
   TypeScript: projects.create({ name: \"test-project\" }).scorers.create({...})
@@ -111,6 +116,13 @@ pub(crate) struct CreateArgs {
     #[arg(long, value_name = "SOURCE")]
     metadata: Option<String>,
 
+    /// Preprocessor for trace template variables: a preprocessor slug in the
+    /// project, global:<NAME> for a built-in preprocessor, @PATH to inline a
+    /// local preprocessor file, or none to disable preprocessing. Defaults to
+    /// the project's default preprocessor.
+    #[arg(long, value_name = "SOURCE")]
+    preprocessor: Option<String>,
+
     /// Behavior when a scorer with the same slug already exists.
     #[arg(long, value_enum, default_value = "error")]
     if_exists: IfExistsMode,
@@ -119,8 +131,13 @@ pub(crate) struct CreateArgs {
 pub(crate) async fn run(ctx: &ResolvedContext, args: &CreateArgs, json_output: bool) -> Result<()> {
     let name = resolve_name(args).map_err(user_error)?;
     let slug = resolve_slug(args, &name).map_err(user_error)?;
-    let definition =
+    let mut definition =
         build_scorer_definition(args, &ctx.project.id, &name, &slug).map_err(user_error)?;
+    if let Some(source) = args.preprocessor.as_deref() {
+        definition["prompt_data"]["preprocessor"] = resolve_preprocessor(ctx, source)
+            .await
+            .map_err(user_error)?;
+    }
 
     let result = match with_spinner(
         "Creating scorer...",
@@ -357,6 +374,66 @@ fn resolve_metadata(args: &CreateArgs) -> Result<Map<String, Value>> {
     Ok(metadata)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PreprocessorSource<'a> {
+    Saved(&'a str),
+    Global(&'a str),
+    File(&'a Path),
+    Disabled,
+}
+
+fn parse_preprocessor_source(source: &str) -> Result<PreprocessorSource<'_>> {
+    let source = source.trim();
+    if source == "none" {
+        return Ok(PreprocessorSource::Disabled);
+    }
+    if let Some(name) = source.strip_prefix("global:") {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("--preprocessor global:<NAME> requires a name");
+        }
+        return Ok(PreprocessorSource::Global(name));
+    }
+    if let Some(path) = source.strip_prefix('@') {
+        let path = path.trim();
+        if path.is_empty() {
+            bail!("--preprocessor @PATH requires a path");
+        }
+        return Ok(PreprocessorSource::File(Path::new(path)));
+    }
+    if source.is_empty() {
+        bail!("--preprocessor cannot be empty");
+    }
+    Ok(PreprocessorSource::Saved(source))
+}
+
+async fn resolve_preprocessor(ctx: &ResolvedContext, source: &str) -> Result<Value> {
+    match parse_preprocessor_source(source)? {
+        PreprocessorSource::Disabled => Ok(Value::Null),
+        PreprocessorSource::Global(name) => Ok(json!({
+            "type": "global",
+            "name": name,
+            "function_type": "preprocessor",
+        })),
+        PreprocessorSource::File(path) => {
+            let preprocessor = load_local_preprocessor(path)?;
+            Ok(json!({ "type": "inline", "code": preprocessor.code }))
+        }
+        PreprocessorSource::Saved(slug) => {
+            let function = with_spinner(
+                "Resolving preprocessor...",
+                api::get_function_by_slug(&ctx.client, &ctx.project.id, slug, None, None),
+            )
+            .await?
+            .ok_or_else(|| anyhow!("preprocessor with slug '{slug}' not found"))?;
+            if function.function_type.as_deref() != Some("preprocessor") {
+                bail!("function '{slug}' is not a preprocessor");
+            }
+            Ok(json!({ "type": "function", "id": function.id }))
+        }
+    }
+}
+
 fn resolve_prompt_block(args: &CreateArgs) -> Result<Value> {
     let raw = read_text_source(&args.messages, "messages")?;
     parse_messages(&raw)
@@ -397,6 +474,7 @@ mod tests {
             use_cot: true,
             pass_threshold: None,
             metadata: None,
+            preprocessor: None,
             if_exists: IfExistsMode::Error,
         }
     }
@@ -585,6 +663,36 @@ mod tests {
             resolve_name(&parsed.args).expect("resolve name"),
             "Positional name"
         );
+    }
+
+    #[test]
+    fn parses_preprocessor_sources() {
+        assert_eq!(
+            parse_preprocessor_source("conversation").expect("saved"),
+            PreprocessorSource::Saved("conversation")
+        );
+        assert_eq!(
+            parse_preprocessor_source("global:thread").expect("global"),
+            PreprocessorSource::Global("thread")
+        );
+        assert_eq!(
+            parse_preprocessor_source("@./conversation.preprocessor.ts").expect("file"),
+            PreprocessorSource::File(Path::new("./conversation.preprocessor.ts"))
+        );
+        assert_eq!(
+            parse_preprocessor_source("none").expect("disabled"),
+            PreprocessorSource::Disabled
+        );
+    }
+
+    #[test]
+    fn rejects_empty_preprocessor_sources() {
+        for source in ["", "  ", "global:", "@"] {
+            assert!(
+                parse_preprocessor_source(source).is_err(),
+                "expected '{source}' to be rejected"
+            );
+        }
     }
 
     #[test]
