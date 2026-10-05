@@ -2,9 +2,9 @@
   "name": "bt-eval-cjs",
   "private": true,
   "dependencies": {
-    "braintrust": "^3.25.0"
+    "braintrust": "^3.37.0"
   },
   "devDependencies": {
-    "tsx": "^4.16.2"
+    "tsx": "^4.23.15"
   }
 }

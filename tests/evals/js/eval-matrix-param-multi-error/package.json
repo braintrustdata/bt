@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "braintrust": "^3.25.0",
-    "zod": "^3.0.0"
+    "braintrust": "^3.37.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "tsx": "^4.16.2"
+    "tsx": "^4.23.15"
   }
 }

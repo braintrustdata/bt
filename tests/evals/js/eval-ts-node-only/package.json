@@ -2,11 +2,11 @@
   "name": "bt-eval-ts-node-only",
   "private": true,
   "dependencies": {
-    "braintrust": "^3.25.0",
+    "braintrust": "^3.37.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "ts-node": "^10.9.2",
-    "typescript": "^5.4.4"
+    "typescript": "^5.9.3"
   }
 }

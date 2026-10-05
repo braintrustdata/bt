@@ -2,10 +2,10 @@
   "name": "bt-eval-ts-esm-only-dep",
   "private": true,
   "dependencies": {
-    "braintrust": "^3.25.0",
+    "braintrust": "^3.37.0",
     "esm-only-pkg": "file:./esm-only-pkg"
   },
   "devDependencies": {
-    "tsx": "^4.16.2"
+    "tsx": "^4.23.15"
   }
 }

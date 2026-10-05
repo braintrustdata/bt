@@ -4,15 +4,15 @@
   "type": "module",
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",
-    "@opentelemetry/auto-instrumentations-node": "^0.79.0",
-    "@opentelemetry/exporter-trace-otlp-proto": "^0.221.0",
-    "@opentelemetry/sdk-node": "^0.221.0",
-    "@opentelemetry/sdk-trace-node": "^2.10.0",
-    "braintrust": "^3.25.0",
+    "@opentelemetry/auto-instrumentations-node": "^0.80.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0",
+    "@opentelemetry/sdk-node": "^0.222.0",
+    "@opentelemetry/sdk-trace-node": "^2.11.0",
+    "braintrust": "^3.37.0",
     "require-in-the-middle": "^8.0.1",
     "vite-node": "^6.0.0"
   },
   "devDependencies": {
-    "tsx": "^4.16.2"
+    "tsx": "^4.23.15"
   }
 }
