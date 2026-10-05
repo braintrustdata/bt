@@ -6,7 +6,7 @@
   ],
   "dependencies": {
     "@repo/lib": "workspace:*",
-    "braintrust": "^3.37.0"
+    "braintrust": "3.36.0"
   },
   "devDependencies": {
     "tsx": "^4.23.15",
