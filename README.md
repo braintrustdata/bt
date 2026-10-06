@@ -134,6 +134,20 @@ shasum -a 256 -c "bt-<target>.tar.gz.sha256"
 For npm installations, use `npm install -g @braintrust/bt@latest` globally or `npm install --save-dev @braintrust/bt@latest` in a project.
 
 `bt` can update itself when installed via the official installer.
+Before upgrading the CLI or its tracing plugins, it runs `bt trace stop` to
+gracefully stop the tracing daemon. If stopping fails, the upgrade is aborted
+before anything is installed; an already-stopped daemon is fine.
+
+`bt update` also updates tracing plugins previously installed with `bt trace enable`,
+using their saved per-agent tracing settings to discover them. Plugin updates run
+even when the stable `bt` release is already current. They preserve tracing
+configuration and do not enable tracing or install plugins for other agents.
+Restart your coding agents afterward to load the updated plugins.
+
+`--check` only checks the CLI release; it does not stop the daemon or update
+plugins. If a plugin update fails, `bt` still attempts the remaining plugins and
+exits with an error containing a `bt trace update <agent>` retry command. A
+successfully updated CLI is not rolled back.
 
 ```bash
 # update on the current build channel (canary for local/dev builds, stable for official releases)
