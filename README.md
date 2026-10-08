@@ -201,6 +201,8 @@ Remove-Item -Recurse -Force (Join-Path $userProfile ".braintrust\auth") -ErrorAc
 
 Facets can use extraction prompts or inline code. Observability template pull and push preserve inline code, runtime settings, code hashes, and tags. Bundled code cannot be packaged; use an inline code facet instead.
 
+Push with `--force` repairs duplicate topic map wiring by preserving the oldest map, breaking timestamp ties by function ID, and detaching extra maps from automations. The retained map keeps its customization and reports. Detached maps remain in the project and are listed in human and JSON push output.
+
 ## `bt custom-views`
 
 Define custom views with `customTraceView` or `customDatasetView` from `braintrust/custom-views` (SDK 3.33.0 or later).

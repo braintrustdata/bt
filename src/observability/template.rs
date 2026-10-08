@@ -227,6 +227,12 @@ fn topics_by_facet(
         .collect()
 }
 
+pub(crate) fn topic_map_order(left: &Function, right: &Function) -> std::cmp::Ordering {
+    left.created
+        .cmp(&right.created)
+        .then_with(|| left.id.cmp(&right.id))
+}
+
 pub(crate) fn topic_map_matches(topic_map: &Function, facet: &Function) -> bool {
     let Some(data) = topic_map.function_data.as_ref() else {
         return false;

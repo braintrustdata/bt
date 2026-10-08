@@ -182,16 +182,17 @@ async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
     .await?;
 
     if base.json {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "kind": "active_observability_template",
-                "status": "pushed",
-                "project": ctx.project.name,
-                "facets": result.facets,
-                "automations": result.automations,
-            }))?
-        );
+        let mut output = serde_json::json!({
+            "kind": "active_observability_template",
+            "status": "pushed",
+            "project": ctx.project.name,
+            "facets": result.facets,
+            "automations": result.automations,
+        });
+        if !result.detached_topic_maps.is_empty() {
+            output["detached_topic_maps"] = serde_json::to_value(&result.detached_topic_maps)?;
+        }
+        println!("{}", serde_json::to_string(&output)?);
     } else {
         print_command_status(
             CommandStatus::Success,
@@ -202,6 +203,16 @@ async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
                 result.automations.len()
             ),
         );
+        for map in &result.detached_topic_maps {
+            print_command_status(
+                CommandStatus::Warning,
+                &format!(
+                    "Detached duplicate topic map '{}' ({}); it remains in the project",
+                    map.slug.as_deref().unwrap_or(&map.name),
+                    map.id
+                ),
+            );
+        }
     }
     Ok(())
 }
