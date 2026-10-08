@@ -719,6 +719,54 @@ mod tests {
     }
 
     #[test]
+    fn active_observability_inline_code_facet_round_trips() {
+        use crate::observability::template::from_remote;
+
+        let mut facet = existing_function("test-code-facet", "facet", "code");
+        let data = json!({
+            "type": "code",
+            "data": {
+                "type": "inline",
+                "runtime_context": {"runtime": "node", "version": "22"},
+                "code": "export default (span) => span.metadata.test_value;",
+                "code_hash": "test-code-hash"
+            }
+        });
+        facet.function_data = Some(data.clone());
+        facet.tags = Some(vec!["test-code-facet".to_string()]);
+        let mut map = existing_function("test-code-facet-topic-map", "classifier", "topic_map");
+        map.function_data = Some(
+            json!({"type": "topic_map", "source_facet_function": {"type": "function", "id": facet.id}}),
+        );
+        let mut topics = automation("test-topics-id", "Test Topics", "topic");
+        topics.config =
+            add_topics_functions(&topics.config, &[(facet.id.clone(), map.id.clone())]).unwrap();
+        let exported = from_remote(&[facet, map], &[topics]).unwrap();
+        let source: ActiveObservabilityTemplate =
+            serde_json::from_str(&serde_json::to_string(&exported).unwrap()).unwrap();
+        validate(&source).unwrap();
+        let planned = plan(
+            &source,
+            Snapshot {
+                functions: vec![],
+                automations: vec![],
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        let mutation = &planned.facets[0];
+        let request = mutation.template.request(
+            "test-destination-project-id",
+            &mutation.template.function_data,
+        );
+        assert_eq!(request["function_type"], "facet");
+        assert_eq!(request["function_data"], data);
+        assert_eq!(request["tags"], json!(["test-code-facet"]));
+        assert!(planned.topics.contains_key("new:Test Topics"));
+    }
+
+    #[test]
     fn active_observability_plans_topics_selection_rules() {
         let only = automation("auto-topics", "Topics", "topic");
         let inferred = plan(
