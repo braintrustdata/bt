@@ -86,16 +86,23 @@ pub(crate) struct FacetImport<'a> {
 }
 
 impl ActiveObservabilityTemplate {
-    pub(crate) fn facet_imports(&self) -> Result<Vec<FacetImport<'_>>> {
-        validate(self)?;
+    pub(crate) fn facet_imports(
+        &self,
+        use_destination_settings: bool,
+    ) -> Result<Vec<FacetImport<'_>>> {
+        validate_for_push(self, use_destination_settings)?;
         Ok(self
             .facets
             .iter()
             .map(|facet| FacetImport {
                 facet,
-                settings: self.topics_automations.iter().find(|settings| {
-                    facet.topics_automation.as_deref() == Some(settings.name.as_str())
-                }),
+                settings: if use_destination_settings {
+                    None
+                } else {
+                    self.topics_automations.iter().find(|settings| {
+                        facet.topics_automation.as_deref() == Some(settings.name.as_str())
+                    })
+                },
                 filter: if self.schema_version == SCHEMA_VERSION
                     && (facet.topics_automation.is_some() || facet.topic_map_btql_filter.is_some())
                 {
@@ -192,8 +199,7 @@ fn facet_from_remote(
         .function_data
         .clone()
         .ok_or_else(|| anyhow!("facet '{}' is missing function_data", facet.name))?;
-    validate_facet_data(&function_data, &facet.name)?;
-
+    // Validate after selection so an unsupported facet can be left out.
     let preprocessor = saved_preprocessor(&mut function_data, by_id)?;
     Ok(FacetTemplate {
         name: facet.name.clone(),
@@ -344,6 +350,67 @@ pub(crate) fn topic_map_matches(topic_map: &Function, facet: &Function) -> bool 
 }
 
 pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
+    validate_template(template, false)
+}
+
+pub(crate) fn validate_for_push(
+    template: &ActiveObservabilityTemplate,
+    use_destination_settings: bool,
+) -> Result<()> {
+    validate_template(template, use_destination_settings)?;
+    if !use_destination_settings {
+        for automation in &template.topics_automations {
+            new_topic_automation_window_seconds(&automation.config).with_context(|| {
+                format!(
+                    "invalid timing settings for Topics automation '{}'",
+                    automation.name
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_experiment_scoped(config: &Value) -> bool {
+    config
+        .get("data_scope")
+        .and_then(|scope| scope.get("type"))
+        .and_then(Value::as_str)
+        == Some("experiment")
+}
+
+pub(crate) fn facet_export_issue(
+    facet: &FacetTemplate,
+    topics: &[AutomationTemplate],
+) -> Option<&'static str> {
+    if validate_facet_data(&facet.function_data, &facet.name).is_err() {
+        return Some(
+            if facet
+                .function_data
+                .get("data")
+                .and_then(|data| data.get("type"))
+                .and_then(Value::as_str)
+                == Some("bundle")
+            {
+                "bundled code"
+            } else {
+                "unsupported function data"
+            },
+        );
+    }
+    topics
+        .iter()
+        .find(|automation| {
+            facet.topics_automation.as_deref() == Some(automation.name.as_str())
+                && is_experiment_scoped(&automation.config)
+        })
+        .map(|_| "specific experiment scope")
+}
+
+fn validate_template(
+    template: &ActiveObservabilityTemplate,
+    use_destination_settings: bool,
+) -> Result<()> {
     if template.kind != KIND {
         bail!("template kind must be '{KIND}'");
     }
@@ -368,7 +435,12 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
     for facet in &template.facets {
         require_text(&facet.name, "facet name")?;
         require_text(&facet.slug, "facet slug")?;
-        validate_facet_data(&facet.function_data, &facet.name)?;
+        validate_facet_data(&facet.function_data, &facet.name).map_err(|error| {
+            anyhow!(
+                "{error}; to omit this facet when pulling, use --exclude-facet {}",
+                facet.slug
+            )
+        })?;
         reserve_slug(&mut slugs, &facet.slug, "facet")?;
         reserve_slug(
             &mut slugs,
@@ -429,12 +501,7 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
         if WIRING_KEYS.iter().any(|key| config.contains_key(*key)) {
             bail!("Topics automation '{}' must omit project-specific function references; wiring is generated from facets", automation.name);
         }
-        if config
-            .get("data_scope")
-            .and_then(|scope| scope.get("type"))
-            .and_then(Value::as_str)
-            == Some("experiment")
-        {
+        if !use_destination_settings && is_experiment_scoped(&automation.config) {
             let facets = template
                 .facets
                 .iter()
@@ -444,14 +511,17 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
                 .map(|facet| format!("'{}'", facet.name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!("Topics automation '{}' attached to facets [{}] uses a project-specific experiment_id; portable templates require project_logs or project_experiments data_scope. Run `bt observability template pull` in an interactive terminal without --json or --no-input and deselect these facets", automation.name, facets);
+            let excludes = template
+                .facets
+                .iter()
+                .filter(|facet| {
+                    facet.topics_automation.as_deref() == Some(automation.name.as_str())
+                })
+                .map(|facet| format!("--exclude-facet {}", facet.slug))
+                .collect::<Vec<_>>()
+                .join(" ");
+            bail!("Topics automation '{}' attached to facets [{}] uses a project-specific experiment_id; portable templates require project_logs or project_experiments data_scope. Run `bt observability template pull {}` or deselect these facets in the interactive picker", automation.name, facets, excludes);
         }
-        new_topic_automation_window_seconds(&automation.config).with_context(|| {
-            format!(
-                "invalid timing settings for Topics automation '{}'",
-                automation.name
-            )
-        })?;
         if !template
             .facets
             .iter()
@@ -491,6 +561,47 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn settings_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| settings_equal(value, other))
+                })
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(value, other)| settings_equal(value, other))
+        }
+        (Value::Number(left), Value::Number(right)) => {
+            // Compare integral values exactly, including mixed integer/float
+            // representations, without rounding large integers through f64.
+            let integer = |number: &serde_json::Number| {
+                number
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| number.as_u64().map(i128::from))
+            };
+            match (integer(left), integer(right)) {
+                (Some(left), Some(right)) => left == right,
+                (Some(integer), None) => right
+                    .as_f64()
+                    .is_some_and(|float| float.fract() == 0.0 && float as i128 == integer),
+                (None, Some(integer)) => left
+                    .as_f64()
+                    .is_some_and(|float| float.fract() == 0.0 && float as i128 == integer),
+                (None, None) => left.as_f64() == right.as_f64(),
+            }
+        }
+        _ => left == right,
+    }
 }
 
 fn validate_facet_data(data: &Value, name: &str) -> Result<()> {
@@ -1021,15 +1132,49 @@ mod tests {
     }
 
     #[test]
-    fn active_observability_validation_rejects_invalid_topics_timing() {
-        let template = from_remote(&test_facet_and_maps()[..1], &[automation("Test Topics", json!({
-            "event_type": "topic", "facet_functions": [{"type": "function", "id": "fn-test-facet"}],
-            "backfill_time_range": "bogus"
-        }))]).unwrap();
-        let error = validate(&template).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("Test Topics"));
-        assert!(message.contains("backfill_time_range"));
+    fn active_observability_pull_preserves_legacy_timing_but_push_validates_it() {
+        for range in [
+            json!({"from": "2026-01-01T00:00:00Z"}),
+            json!({"from": "2026-01-01T00:00:00Z", "to": null}),
+            json!("1.5h"),
+            json!("1d12h"),
+            json!("bogus"),
+        ] {
+            let template = from_remote(&test_facet_and_maps()[..1], &[automation("Test Topics", json!({
+                "event_type": "topic", "facet_functions": [{"type": "function", "id": "fn-test-facet"}],
+                "backfill_time_range": range, "rerun_seconds": 7200
+            }))]).unwrap();
+            validate(&template).unwrap();
+            let serialized = serde_json::to_value(&template).unwrap();
+            assert_eq!(
+                serialized["topics_automations"][0]["config"]["backfill_time_range"],
+                range
+            );
+            let error = validate_for_push(&template, false).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("Test Topics"));
+            assert!(message.contains("backfill_time_range"));
+            validate_for_push(&template, true).unwrap();
+        }
+    }
+
+    #[test]
+    fn active_observability_settings_compare_numeric_values_recursively() {
+        assert!(settings_equal(
+            &json!({"sampling_rate": 1, "scope": {"limits": [600, 0.5]}}),
+            &json!({"sampling_rate": 1.0, "scope": {"limits": [600.0, 0.5]}})
+        ));
+        for (left, right) in [
+            (json!(1), json!("1")),
+            (json!(0.5), json!(1)),
+            (json!([1]), json!([1, 2])),
+            (json!({"a": 1}), json!({"b": 1})),
+            (json!(9007199254740993_u64), json!(9007199254740992_u64)),
+            (json!(9007199254740993_u64), json!(9007199254740992.0)),
+        ] {
+            assert!(!settings_equal(&left, &right));
+            assert!(!settings_equal(&right, &left));
+        }
     }
 
     #[test]
@@ -1118,7 +1263,8 @@ mod tests {
             ),
         ] {
             let facet = function("fn-test-facet", "test-facet", "facet", data.clone());
-            assert!(from_remote(&[facet], &[])
+            let remote = from_remote(&[facet], &[]).unwrap();
+            assert!(validate(&remote)
                 .unwrap_err()
                 .to_string()
                 .contains(expected));

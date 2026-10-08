@@ -16,10 +16,10 @@ use crate::{
 use super::template::{
     add_topics_functions, default_topics_config, embedding_model, is_loop_config, is_topics,
     loop_config_for_target, new_topic_map_request, reconciled_topic_map_request,
-    remove_topics_functions, saved_preprocessor_slug, topic_map_ids, topic_map_matches,
-    topic_map_order, topic_map_slug, topics_config_for_target, with_preprocessor_id,
-    ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate, PortableFunction,
-    TopicMapFilter, DEFAULT_TOPICS_DESCRIPTION,
+    remove_topics_functions, saved_preprocessor_slug, settings_equal, topic_map_ids,
+    topic_map_matches, topic_map_order, topic_map_slug, topics_config_for_target,
+    with_preprocessor_id, ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate,
+    PortableFunction, TopicMapFilter, DEFAULT_TOPICS_DESCRIPTION,
 };
 
 #[derive(Debug)]
@@ -117,7 +117,7 @@ pub(crate) fn plan(
     topics_override: Option<&str>,
     force: bool,
 ) -> Result<MutationPlan> {
-    let imports = template.facet_imports()?;
+    let imports = template.facet_imports(topics_override.is_some())?;
     let functions_by_slug = functions_by_slug(&snapshot.functions);
     let functions_by_id = snapshot
         .functions
@@ -238,10 +238,8 @@ pub(crate) fn plan(
             config,
             description,
         });
-        if topics_override.is_none() {
-            if let Some(settings) = import.settings {
-                settings_by_target.insert(key.clone(), settings);
-            }
+        if let Some(settings) = import.settings {
+            settings_by_target.insert(key.clone(), settings);
         }
         for map in &duplicate_topic_maps {
             detached_topic_maps
@@ -267,7 +265,9 @@ pub(crate) fn plan(
         let mutation = topics.get_mut(&key).expect("resolved Topics destination");
         let config = topics_config_for_target(&settings.config, &mutation.config)?;
         if let TopicsTarget::Existing(existing) = &mutation.target {
-            if !force && (config != mutation.config || settings.description != existing.description)
+            if !force
+                && (!settings_equal(&config, &mutation.config)
+                    || settings.description != existing.description)
             {
                 bail!("Topics automation '{}' has different settings; use --force to replace its settings or --topics-automation to use the destination settings", settings.name);
             }
@@ -1020,11 +1020,13 @@ mod tests {
 
     #[test]
     fn active_observability_matching_settings_do_not_require_force() {
-        let source = scoped_template();
+        let mut source = scoped_template();
+        source.topics_automations[0].config["sampling_rate"] = json!(1);
         let mut existing = automation("test-existing-automation", "Test scoped Topics", "topic");
         existing.config =
             topics_config_for_target(&source.topics_automations[0].config, &json!({})).unwrap();
         existing.description = source.topics_automations[0].description.clone();
+        existing.config["sampling_rate"] = json!(1.0);
         let snapshot = |row| Snapshot {
             functions: vec![],
             automations: vec![row],
@@ -1035,6 +1037,42 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--force"));
+    }
+
+    #[test]
+    fn active_observability_override_ignores_unused_experiment_and_timing_settings() {
+        let mut source = scoped_template();
+        source.topics_automations[0].config["data_scope"] =
+            json!({"type": "experiment", "experiment_id": "test-experiment-id"});
+        source.topics_automations[0].config["backfill_time_range"] = json!("bogus");
+        let existing = automation(
+            "test-existing-automation",
+            "Test destination Topics",
+            "topic",
+        );
+        let snapshot = || Snapshot {
+            functions: vec![],
+            automations: vec![existing.clone()],
+        };
+        assert!(plan(&source, snapshot(), None, false).is_err());
+        let planned = plan(&source, snapshot(), Some("test-existing-automation"), false).unwrap();
+        let mutation = &planned.topics["id:test-existing-automation"];
+        assert_eq!(mutation.config, existing.config);
+        assert_eq!(mutation.description, existing.description);
+        let request = mutation
+            .request(
+                "test-project-id",
+                &[(
+                    "fn-test-facet".to_string(),
+                    "fn-test-map".to_string(),
+                    planned.facets[0].filter.clone(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            request["config"]["topic_map_functions"][0]["btql_filter"],
+            "metadata.test_enabled = true"
+        );
     }
 
     #[test]
