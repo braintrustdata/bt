@@ -1012,9 +1012,32 @@ pub(crate) async fn seed_new_topic_automation_cursors(
     project_id: &str,
     automation: &ProjectAutomation,
 ) -> Result<()> {
-    seed_topic_automation_cursors(client, project_id, &serde_json::to_value(automation)?, None)
-        .await?;
+    let window_seconds = new_topic_automation_window_seconds(&automation.config)?;
+    seed_topic_automation_cursors(
+        client,
+        project_id,
+        &serde_json::to_value(automation)?,
+        Some(window_seconds),
+    )
+    .await?;
     Ok(())
+}
+
+pub(crate) fn new_topic_automation_window_seconds(config: &Value) -> Result<i64> {
+    match config
+        .get("backfill_time_range")
+        .filter(|value| !value.is_null())
+    {
+        Some(range) => backfill_time_range_to_window_seconds(Some(range))
+            .ok_or_else(|| anyhow::anyhow!("Topics automation has an invalid backfill_time_range")),
+        // The app permits an omitted window; the data plane uses the rerun
+        // interval (24 hours by default). Keep the exported config unchanged.
+        None => Ok(config
+            .get("rerun_seconds")
+            .and_then(Value::as_i64)
+            .unwrap_or(DEFAULT_TOPIC_WINDOW_SECONDS)
+            .max(600)),
+    }
 }
 
 fn filter_or_resolve_topic_automation_rows(
@@ -2538,6 +2561,32 @@ mod tests {
             Some("3")
         );
         assert_eq!(runtime.window_candidates.len(), 1);
+    }
+
+    #[test]
+    fn active_observability_new_topics_cursor_window_matches_runtime_defaults() {
+        assert_eq!(
+            new_topic_automation_window_seconds(&json!({})).unwrap(),
+            DEFAULT_TOPIC_WINDOW_SECONDS
+        );
+        assert_eq!(
+            new_topic_automation_window_seconds(
+                &json!({"backfill_time_range": null, "rerun_seconds": 7200})
+            )
+            .unwrap(),
+            7200
+        );
+        assert_eq!(
+            new_topic_automation_window_seconds(
+                &json!({"backfill_time_range": "6h", "rerun_seconds": 7200})
+            )
+            .unwrap(),
+            21600
+        );
+        assert!(
+            new_topic_automation_window_seconds(&json!({"backfill_time_range": "invalid"}))
+                .is_err()
+        );
     }
 
     #[test]

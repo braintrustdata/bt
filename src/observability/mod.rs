@@ -28,7 +28,7 @@ pub(crate) struct ObservabilityArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum ObservabilityCommand {
-    /// Pull and push facets and Loop automations as a portable template
+    /// Pull and push facets, Topics settings, and Loop automations as a portable template
     Template(TemplateArgs),
 }
 
@@ -47,9 +47,9 @@ struct TemplateArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum TemplateCommand {
-    /// Pull facets and Loop automations into a portable template
+    /// Pull facets, attached Topics settings, and Loop automations into a portable template
     Pull(PullArgs),
-    /// Push facets and Loop automations from a portable template
+    /// Push facets, attached Topics settings, and Loop automations from a portable template
     Push(PushArgs),
 }
 
@@ -72,6 +72,15 @@ pub(super) struct PullArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     force: bool,
+
+    /// Leave out a facet with this exact slug; repeat to exclude multiple facets
+    #[arg(
+        long,
+        env = "BT_OBSERVABILITY_TEMPLATE_PULL_EXCLUDE_FACET",
+        value_name = "SLUG",
+        value_delimiter = ','
+    )]
+    exclude_facet: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -89,7 +98,7 @@ struct PushArgs {
     )]
     source_flag: Option<String>,
 
-    /// Use this existing Topics automation for every facet
+    /// Use this existing Topics automation and its settings for every facet
     #[arg(
         long,
         env = "BT_OBSERVABILITY_TEMPLATE_PUSH_TOPICS_AUTOMATION",
@@ -97,7 +106,7 @@ struct PushArgs {
     )]
     topics_automation: Option<String>,
 
-    /// Replace existing matching resources
+    /// Replace existing matching resources, including bundled Topics settings
     #[arg(
         long,
         env = "BT_OBSERVABILITY_TEMPLATE_PUSH_FORCE",
@@ -148,7 +157,7 @@ async fn run_push(base: BaseArgs, args: PushArgs) -> Result<()> {
         read_template_source(args.source()?),
     )
     .await?;
-    template::validate(&template)?;
+    template::validate_for_push(&template, args.topics_automation.is_some())?;
 
     let ctx = resolve_project_command_context_with_auth_mode(&base, false).await?;
     let snapshot = with_spinner("Checking target resources...", async {
@@ -232,7 +241,7 @@ fn confirm_push(
         ""
     };
     let prompt = format!(
-        "Push {} facets and {} Loop automations, including Topics wiring, to {}/{}{}?",
+        "Push {} facets and {} Loop automations, including Topics settings and wiring, to {}/{}{}?",
         template.facets.len(),
         template.automations.len(),
         ctx.client.org_name(),
@@ -319,6 +328,34 @@ mod tests {
         ] {
             crate::Cli::try_parse_from(args).expect("command should parse");
         }
+    }
+
+    #[test]
+    fn active_observability_scripted_pull_accepts_repeated_facet_exclusions() {
+        let cli = crate::Cli::try_parse_from([
+            "bt",
+            "observability",
+            "template",
+            "pull",
+            "--json",
+            "--no-input",
+            "--exclude-facet",
+            "test-experiment-facet",
+            "--exclude-facet",
+            "test-bundle-facet",
+        ])
+        .unwrap();
+        let crate::Commands::Observability(args) = cli.command else {
+            panic!("observability command");
+        };
+        let ObservabilityCommand::Template(args) = args.args.command;
+        let TemplateCommand::Pull(args) = args.command else {
+            panic!("pull command");
+        };
+        assert_eq!(
+            args.exclude_facet,
+            vec!["test-experiment-facet", "test-bundle-facet"]
+        );
     }
 
     #[test]

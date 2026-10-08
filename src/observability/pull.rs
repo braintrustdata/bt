@@ -7,16 +7,17 @@ use dialoguer::{theme::ColorfulTheme, MultiSelect};
 use crate::{
     args::BaseArgs,
     functions::api::list_all_functions,
+    functions::api::Function,
     project_context::resolve_project_command_context_with_auth_mode,
-    topics::api::list_project_automations,
+    topics::api::{list_project_automations, ProjectAutomation},
     ui::{self, print_command_status, with_spinner, CommandStatus},
     utils::write_json_atomic,
 };
 
 use super::{
     template::{
-        deduplicate_preprocessors, from_remote, ActiveObservabilityTemplate, AutomationTemplate,
-        FacetTemplate,
+        deduplicate_preprocessors, facet_export_issue, from_remote, retain_topics_dependencies,
+        validate, ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate,
     },
     PullArgs,
 };
@@ -33,14 +34,19 @@ pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
             )
         })
         .await?;
-    let mut template = from_remote(&functions, &automations)?;
+    let mut template = template_for_pull(&functions, &automations, &args.exclude_facet)?;
     if !base.json && !base.no_input && ui::is_interactive() {
-        (template.facets, template.automations) =
-            select_resources(template.facets, template.automations)?;
+        (template.facets, template.automations) = select_resources(
+            template.facets,
+            template.automations,
+            &template.topics_automations,
+        )?;
     } else {
         (template.facets, template.automations) =
             filter_active_resources(template.facets, template.automations);
     }
+    retain_topics_dependencies(&mut template);
+    validate(&template)?;
     // Selection happens first so a selected facet never loses its required definition.
     deduplicate_preprocessors(&mut template.facets);
 
@@ -79,6 +85,36 @@ pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
     Ok(())
 }
 
+fn template_for_pull(
+    functions: &[Function],
+    automations: &[ProjectAutomation],
+    excluded: &[String],
+) -> Result<ActiveObservabilityTemplate> {
+    if excluded.is_empty() {
+        return from_remote(functions, automations);
+    }
+    let slugs = functions
+        .iter()
+        .filter(|function| function.function_type.as_deref() == Some("facet"))
+        .map(|function| function.slug.as_str())
+        .collect::<HashSet<_>>();
+    for slug in excluded {
+        if !slugs.contains(slug.as_str()) {
+            bail!("--exclude-facet '{slug}' does not match a facet slug in this project; use an exact facet slug");
+        }
+    }
+    let excluded = excluded.iter().map(String::as_str).collect::<HashSet<_>>();
+    let functions = functions
+        .iter()
+        .filter(|function| {
+            function.function_type.as_deref() != Some("facet")
+                || !excluded.contains(function.slug.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    from_remote(&functions, automations)
+}
+
 fn write_template(
     template: &ActiveObservabilityTemplate,
     output: Option<&Path>,
@@ -112,13 +148,14 @@ fn serialize_stdout(template: &ActiveObservabilityTemplate) -> Result<String> {
 fn select_resources(
     facets: Vec<FacetTemplate>,
     automations: Vec<AutomationTemplate>,
+    topics: &[AutomationTemplate],
 ) -> Result<(Vec<FacetTemplate>, Vec<AutomationTemplate>)> {
     if facets.is_empty() && automations.is_empty() {
         return Ok((facets, automations));
     }
     let labels = facets
         .iter()
-        .map(|facet| label("Facet", &facet.name, facet.active()))
+        .map(|facet| facet_label(facet, topics))
         .chain(
             automations
                 .iter()
@@ -127,7 +164,7 @@ fn select_resources(
         .collect::<Vec<_>>();
     let defaults = facets
         .iter()
-        .map(FacetTemplate::active)
+        .map(|facet| facet_default(facet, topics))
         .chain(automations.iter().map(AutomationTemplate::active))
         .collect::<Vec<_>>();
     let term =
@@ -140,6 +177,18 @@ fn select_resources(
         .interact_on(&term)
         .context("failed to select active observability resources")?;
     Ok(filter_resources(facets, automations, &selected))
+}
+
+fn facet_default(facet: &FacetTemplate, topics: &[AutomationTemplate]) -> bool {
+    facet.active() && facet_export_issue(facet, topics).is_none()
+}
+
+fn facet_label(facet: &FacetTemplate, topics: &[AutomationTemplate]) -> String {
+    let label = label("Facet", &facet.name, facet.active());
+    match facet_export_issue(facet, topics) {
+        Some(reason) => format!("{label} (cannot export: {reason})"),
+        None => label,
+    }
 }
 
 fn label(kind: &str, name: &str, active: bool) -> String {
@@ -216,6 +265,137 @@ mod tests {
         let (facets, automations) = filter_resources(template.facets, template.automations, &[1]);
         assert!(facets.is_empty());
         assert_eq!(automations.len(), 1);
+    }
+
+    #[test]
+    fn active_observability_experiment_scope_error_explains_selection_recovery() {
+        let mut template = template();
+        template.facets[0].topics_automation = Some("Test experiment Topics".to_string());
+        template.topics_automations.push(AutomationTemplate {
+            name: "Test experiment Topics".to_string(),
+            description: None,
+            config: json!({"event_type": "topic", "data_scope": {"type": "experiment", "experiment_id": "test-experiment-id"}}),
+        });
+        let error = validate(&template).unwrap_err().to_string();
+        assert!(error.contains("Test facet"));
+        assert!(error.contains("Test experiment Topics"));
+        assert!(error.contains("deselect these facets"));
+        assert!(error.contains("--exclude-facet test-facet"));
+
+        template.facets.push(FacetTemplate {
+            name: "Portable test facet".to_string(),
+            slug: "test-portable-facet".to_string(),
+            topics_automation: None,
+            ..template.facets[0].clone()
+        });
+        (template.facets, template.automations) =
+            filter_resources(template.facets, template.automations, &[1]);
+        retain_topics_dependencies(&mut template);
+        validate(&template).unwrap();
+        assert_eq!(template.facets.len(), 1);
+        assert!(template.topics_automations.is_empty());
+    }
+
+    fn mixed_project() -> (Vec<Function>, Vec<ProjectAutomation>) {
+        let functions = [
+            ("test-portable-facet", json!({"type": "facet"})),
+            ("test-experiment-facet", json!({"type": "facet"})),
+            (
+                "test-bundle-facet",
+                json!({"type": "code", "data": {"type": "bundle", "bundle_id": "test-bundle-id"}}),
+            ),
+        ]
+        .into_iter()
+        .map(|(slug, data)| {
+            serde_json::from_value(json!({
+                "id": format!("fn-{slug}"), "slug": slug, "name": slug,
+                "project_id": "test-project-id", "function_type": "facet", "function_data": data
+            }))
+            .unwrap()
+        })
+        .collect();
+        let automations = vec![
+            ProjectAutomation {
+                id: "test-topics-id".to_string(),
+                project_id: "test-project-id".to_string(),
+                name: "Test Topics".to_string(),
+                description: None,
+                config: json!({"event_type": "topic", "facet_functions": [
+                    {"type": "function", "id": "fn-test-portable-facet"}, {"type": "function", "id": "fn-test-bundle-facet"}
+                ]}),
+            },
+            ProjectAutomation {
+                id: "test-experiment-topics-id".to_string(),
+                project_id: "test-project-id".to_string(),
+                name: "Test experiment Topics".to_string(),
+                description: None,
+                config: json!({"event_type": "topic", "data_scope": {"type": "experiment", "experiment_id": "test-experiment-id"},
+                "facet_functions": [{"type": "function", "id": "fn-test-experiment-facet"}]}),
+            },
+        ];
+        (functions, automations)
+    }
+
+    #[test]
+    fn active_observability_scripted_pull_excludes_unsupported_facets() {
+        let (functions, automations) = mixed_project();
+        let mut template = template_for_pull(
+            &functions,
+            &automations,
+            &[
+                "test-experiment-facet".to_string(),
+                "test-bundle-facet".to_string(),
+            ],
+        )
+        .unwrap();
+        (template.facets, template.automations) =
+            filter_active_resources(template.facets, template.automations);
+        retain_topics_dependencies(&mut template);
+        validate(&template).unwrap();
+        let output: serde_json::Value =
+            serde_json::from_str(&serialize_stdout(&template).unwrap()).unwrap();
+        assert_eq!(output["facets"].as_array().unwrap().len(), 1);
+        assert_eq!(output["facets"][0]["slug"], "test-portable-facet");
+        assert_eq!(template.topics_automations.len(), 1);
+        let error = template_for_pull(
+            &functions,
+            &automations,
+            &["test-unknown-facet".to_string()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match a facet slug"));
+    }
+
+    #[test]
+    fn active_observability_picker_marks_unsupported_facets_before_selection() {
+        let (functions, automations) = mixed_project();
+        let mut template = template_for_pull(&functions, &automations, &[]).unwrap();
+        let selected = template
+            .facets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, facet)| {
+                let label = facet_label(facet, &template.topics_automations);
+                if facet.slug == "test-portable-facet" {
+                    assert!(!label.contains("cannot export"));
+                    assert!(facet_default(facet, &template.topics_automations));
+                    Some(index)
+                } else {
+                    assert!(label.contains(if facet.slug == "test-bundle-facet" {
+                        "bundled code"
+                    } else {
+                        "specific experiment scope"
+                    }));
+                    assert!(!facet_default(facet, &template.topics_automations));
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        (template.facets, template.automations) =
+            filter_resources(template.facets, template.automations, &selected);
+        retain_topics_dependencies(&mut template);
+        validate(&template).unwrap();
+        assert_eq!(template.facets.len(), 1);
     }
 
     #[test]
