@@ -28,7 +28,7 @@ pub(crate) struct ObservabilityArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum ObservabilityCommand {
-    /// Pull and push facets and Loop automations as a portable template
+    /// Pull and push facets, Topics settings, and Loop automations as a portable template
     Template(TemplateArgs),
 }
 
@@ -47,9 +47,9 @@ struct TemplateArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum TemplateCommand {
-    /// Pull facets and Loop automations into a portable template
+    /// Pull facets, attached Topics settings, and Loop automations into a portable template
     Pull(PullArgs),
-    /// Push facets and Loop automations from a portable template
+    /// Push facets, attached Topics settings, and Loop automations from a portable template
     Push(PushArgs),
 }
 
@@ -89,7 +89,7 @@ struct PushArgs {
     )]
     source_flag: Option<String>,
 
-    /// Use this existing Topics automation for every facet
+    /// Use this existing Topics automation and its settings for every facet
     #[arg(
         long,
         env = "BT_OBSERVABILITY_TEMPLATE_PUSH_TOPICS_AUTOMATION",
@@ -97,7 +97,7 @@ struct PushArgs {
     )]
     topics_automation: Option<String>,
 
-    /// Replace existing matching resources
+    /// Replace existing matching resources, including bundled Topics settings
     #[arg(
         long,
         env = "BT_OBSERVABILITY_TEMPLATE_PUSH_FORCE",
@@ -232,7 +232,7 @@ fn confirm_push(
         ""
     };
     let prompt = format!(
-        "Push {} facets and {} Loop automations, including Topics wiring, to {}/{}{}?",
+        "Push {} facets and {} Loop automations, including Topics settings and wiring, to {}/{}{}?",
         template.facets.len(),
         template.automations.len(),
         ctx.client.org_name(),

@@ -199,9 +199,24 @@ Remove-Item -Recurse -Force (Join-Path $userProfile ".braintrust\auth") -ErrorAc
 
 ## `bt observability template`
 
-Facets can use extraction prompts or inline code. Observability template pull and push preserve inline code, runtime settings, code hashes, and tags. Bundled code cannot be packaged; use an inline code facet instead.
+Export facets with their attached Topics automation settings and Loop automations, then import them into another project:
 
-Push with `--force` repairs duplicate topic map wiring by preserving the oldest map, breaking timestamp ties by function ID, and detaching extra maps from automations. The retained map keeps its customization and reports. Detached maps remain in the project and are listed in human and JSON push output.
+```bash
+bt observability template pull --output observability-template.json --project test-source-project
+bt observability template push observability-template.json --project test-destination-project
+```
+
+Templates include Topics span, trace, or group scope, automation and per-topic-map BTQL filters, sampling, model, status, and timing settings. Each attached Topics automation is included once for the selected facets; function references are rebuilt in the destination project.
+
+Facets can use extraction prompts or inline code. Inline code, runtime settings, and code hashes are preserved; bundled code is not packaged by observability templates.
+
+Use `--force` to replace matching facets and differing bundled Topics settings or descriptions. Matching automation settings and descriptions do not require `--force`. Settings are replaced in full: destination-only settings are dropped, and an omitted source description clears the destination description. Existing unrelated facet and topic map references remain attached, so replacing a shared automation's settings also affects those references. Use `--topics-automation <NAME_OR_ID>` to attach every imported facet to an existing automation using its settings; imported per-topic-map filters still apply. A mapped version 2 facet with no filter clears the destination map's filter, including with `--topics-automation`.
+
+New exports use schema version 2; version 1 templates remain supported with their original destination/default Topics settings behavior. Automations scoped to a specific experiment cannot be exported as portable templates because their experiment IDs belong to the source project; project logs and all project experiments are supported. Pull errors name the affected facets; run an interactive pull without `--json` or `--no-input` and deselect those facets to export the rest. Invalid backfill settings are rejected during template validation for both pull and push.
+
+Export uses the oldest attached topic map for a facet within each automation, breaking timestamp ties by function ID. A topic map's automation takes precedence over direct facet membership in another automation. Push with `--force` repairs duplicate wiring using the same oldest-map rule and reports detached maps; those maps remain in the project.
+
+Topic map definitions and their embedding models are not exported. Newly created automations use `brain-embedding-1` for generated maps; existing maps retain their customization. Absolute `backfill_time_range` dates are copied as written and are not shifted to the import date.
 
 ## `bt custom-views`
 

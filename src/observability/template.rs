@@ -1,16 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::{functions::api::Function, topics::api::ProjectAutomation};
+use crate::{
+    functions::api::Function,
+    topics::api::{new_topic_automation_window_seconds, ProjectAutomation},
+};
 
 pub(crate) const KIND: &str = "active_observability_template";
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "brain-embedding-1";
 pub(crate) const DEFAULT_TOPICS_DESCRIPTION: &str =
     "Automatically extract facets and classify logs using topic maps";
+const WIRING_KEYS: [&str; 2] = ["facet_functions", "topic_map_functions"];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub(crate) struct ActiveObservabilityTemplate {
@@ -18,6 +22,8 @@ pub(crate) struct ActiveObservabilityTemplate {
     pub schema_version: u32,
     #[serde(default)]
     pub facets: Vec<FacetTemplate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics_automations: Vec<AutomationTemplate>,
     #[serde(default)]
     pub automations: Vec<AutomationTemplate>,
 }
@@ -28,6 +34,8 @@ pub(crate) struct FacetTemplate {
     pub slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topics_automation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_map_btql_filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +72,42 @@ pub(crate) struct AutomationTemplate {
     pub config: Value,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) enum TopicMapFilter {
+    #[default]
+    Preserve,
+    Replace(Option<String>),
+}
+
+pub(crate) struct FacetImport<'a> {
+    pub facet: &'a FacetTemplate,
+    pub settings: Option<&'a AutomationTemplate>,
+    pub filter: TopicMapFilter,
+}
+
+impl ActiveObservabilityTemplate {
+    pub(crate) fn facet_imports(&self) -> Result<Vec<FacetImport<'_>>> {
+        validate(self)?;
+        Ok(self
+            .facets
+            .iter()
+            .map(|facet| FacetImport {
+                facet,
+                settings: self.topics_automations.iter().find(|settings| {
+                    facet.topics_automation.as_deref() == Some(settings.name.as_str())
+                }),
+                filter: if self.schema_version == SCHEMA_VERSION
+                    && (facet.topics_automation.is_some() || facet.topic_map_btql_filter.is_some())
+                {
+                    TopicMapFilter::Replace(facet.topic_map_btql_filter.clone())
+                } else {
+                    TopicMapFilter::Preserve
+                },
+            })
+            .collect())
+    }
+}
+
 #[derive(Serialize)]
 struct PortableFunctionRequest<'a> {
     project_id: &'a str,
@@ -97,6 +141,24 @@ pub(crate) fn from_remote(
         .collect::<Result<Vec<_>>>()?;
     facet_templates.sort_by(|a, b| a.name.cmp(&b.name).then(a.slug.cmp(&b.slug)));
 
+    let mut topics_automations = automations
+        .iter()
+        .filter(|automation| {
+            is_topics(&automation.config)
+                && facet_templates.iter().any(|facet| {
+                    facet.topics_automation.as_deref() == Some(automation.name.as_str())
+                })
+        })
+        .map(|automation| {
+            Ok(AutomationTemplate {
+                name: automation.name.clone(),
+                description: automation.description.clone(),
+                config: topics_settings(&automation.config)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    topics_automations.sort_by(|a, b| a.name.cmp(&b.name));
+
     let mut loop_templates = automations
         .iter()
         .filter(|automation| is_loop_config(&automation.config))
@@ -116,13 +178,14 @@ pub(crate) fn from_remote(
         kind: KIND.to_string(),
         schema_version: SCHEMA_VERSION,
         facets: facet_templates,
+        topics_automations,
         automations: loop_templates,
     })
 }
 
 fn facet_from_remote(
     facet: &Function,
-    topics_automation: Option<String>,
+    topics: Option<(String, Option<String>)>,
     by_id: &HashMap<&str, &Function>,
 ) -> Result<FacetTemplate> {
     let mut function_data = facet
@@ -135,7 +198,8 @@ fn facet_from_remote(
     Ok(FacetTemplate {
         name: facet.name.clone(),
         slug: facet.slug.clone(),
-        topics_automation,
+        topics_automation: topics.as_ref().map(|(name, _)| name.clone()),
+        topic_map_btql_filter: topics.and_then(|(_, filter)| filter),
         description: facet.description.clone(),
         preprocessor,
         function_data,
@@ -178,35 +242,61 @@ fn topics_by_facet(
     facets: &[&Function],
     by_id: &HashMap<&str, &Function>,
     automations: &[ProjectAutomation],
-) -> Result<HashMap<String, String>> {
-    let mut names: HashMap<String, HashSet<String>> = HashMap::new();
+) -> Result<HashMap<String, (String, Option<String>)>> {
+    let mut names: HashMap<String, HashMap<String, Option<String>>> = HashMap::new();
     for automation in automations
         .iter()
         .filter(|automation| is_topics(&automation.config))
     {
-        for id in topic_map_ids(&automation.config) {
-            let Some(topic_map) = by_id.get(id) else {
-                continue;
-            };
-            if topic_map.function_type.as_deref() != Some("classifier")
-                || topic_map
-                    .function_data
-                    .as_ref()
-                    .and_then(|data| data.get("type"))
-                    .and_then(Value::as_str)
-                    != Some("topic_map")
-            {
-                continue;
+        for facet in facets {
+            let oldest = topic_map_entries(&automation.config)
+                .filter_map(|(id, filter)| by_id.get(id).map(|map| (*map, filter)))
+                .filter(|(map, _)| {
+                    map.function_type.as_deref() == Some("classifier")
+                        && map
+                            .function_data
+                            .as_ref()
+                            .and_then(|data| data.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("topic_map")
+                        && topic_map_matches(map, facet)
+                })
+                .min_by(|(left, _), (right, _)| topic_map_order(left, right));
+            if let Some((_, filter)) = oldest {
+                names
+                    .entry(facet.id.clone())
+                    .or_default()
+                    .insert(automation.name.clone(), filter.map(str::to_string));
             }
-            for facet in facets
-                .iter()
-                .copied()
-                .filter(|facet| topic_map_matches(topic_map, facet))
+        }
+    }
+    // A map is the authoritative destination. Direct extraction membership is
+    // only a fallback for facets with no attached map anywhere in the project.
+    let mapped_facets = names.keys().cloned().collect::<HashSet<_>>();
+    for facet in facets
+        .iter()
+        .copied()
+        .filter(|facet| !mapped_facets.contains(&facet.id))
+    {
+        for automation in automations
+            .iter()
+            .filter(|automation| is_topics(&automation.config))
+        {
+            if automation
+                .config
+                .get("facet_functions")
+                .and_then(Value::as_array)
+                .is_some_and(|references| {
+                    references
+                        .iter()
+                        .any(|reference| function_ref_id(reference) == Some(facet.id.as_str()))
+                })
             {
                 names
                     .entry(facet.id.clone())
                     .or_default()
-                    .insert(automation.name.clone());
+                    .entry(automation.name.clone())
+                    .or_insert(None);
             }
         }
     }
@@ -215,10 +305,11 @@ fn topics_by_facet(
         .into_iter()
         .map(|(facet_id, names)| {
             if names.len() != 1 {
-                let mut names = names.into_iter().collect::<Vec<_>>();
+                let mut names = names.into_keys().collect::<Vec<_>>();
                 names.sort();
                 bail!(
-                    "facet '{facet_id}' belongs to multiple Topics automations ({}); use one Topics destination per facet",
+                    "facet '{}' belongs to multiple Topics automations ({}); use one Topics destination per facet",
+                    by_id.get(facet_id.as_str()).map_or(facet_id.as_str(), |facet| facet.name.as_str()),
                     names.join(", ")
                 );
             }
@@ -256,11 +347,20 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
     if template.kind != KIND {
         bail!("template kind must be '{KIND}'");
     }
-    if template.schema_version != SCHEMA_VERSION {
+    if !matches!(template.schema_version, 1 | SCHEMA_VERSION) {
         bail!(
-            "unsupported template schema version {}; supported version is {SCHEMA_VERSION}",
+            "unsupported template schema version {}; supported versions are 1 and {SCHEMA_VERSION}",
             template.schema_version
         );
+    }
+    if template.schema_version == 1
+        && (!template.topics_automations.is_empty()
+            || template
+                .facets
+                .iter()
+                .any(|facet| facet.topic_map_btql_filter.is_some()))
+    {
+        bail!("Topics automation settings and topic map filters require template schema version {SCHEMA_VERSION}");
     }
 
     let mut slugs = HashMap::<String, &'static str>::new();
@@ -311,6 +411,70 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
     }
 
     let mut automation_names = HashSet::new();
+    for automation in &template.topics_automations {
+        require_text(&automation.name, "Topics automation name")?;
+        if !automation_names.insert(automation.name.as_str()) {
+            bail!(
+                "template contains duplicate automation name '{}'",
+                automation.name
+            );
+        }
+        if !is_topics(&automation.config) {
+            bail!(
+                "automation '{}' is not a Topics automation",
+                automation.name
+            );
+        }
+        let config = object(&automation.config, "Topics automation settings")?;
+        if WIRING_KEYS.iter().any(|key| config.contains_key(*key)) {
+            bail!("Topics automation '{}' must omit project-specific function references; wiring is generated from facets", automation.name);
+        }
+        if config
+            .get("data_scope")
+            .and_then(|scope| scope.get("type"))
+            .and_then(Value::as_str)
+            == Some("experiment")
+        {
+            let facets = template
+                .facets
+                .iter()
+                .filter(|facet| {
+                    facet.topics_automation.as_deref() == Some(automation.name.as_str())
+                })
+                .map(|facet| format!("'{}'", facet.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("Topics automation '{}' attached to facets [{}] uses a project-specific experiment_id; portable templates require project_logs or project_experiments data_scope. Run `bt observability template pull` in an interactive terminal without --json or --no-input and deselect these facets", automation.name, facets);
+        }
+        new_topic_automation_window_seconds(&automation.config).with_context(|| {
+            format!(
+                "invalid timing settings for Topics automation '{}'",
+                automation.name
+            )
+        })?;
+        if !template
+            .facets
+            .iter()
+            .any(|facet| facet.topics_automation.as_deref() == Some(automation.name.as_str()))
+        {
+            bail!(
+                "Topics automation '{}' is not referenced by a template facet",
+                automation.name
+            );
+        }
+    }
+    if template.schema_version == SCHEMA_VERSION {
+        for facet in &template.facets {
+            if let Some(name) = facet.topics_automation.as_deref() {
+                if !automation_names.contains(name) {
+                    bail!(
+                        "facet '{}' references missing Topics automation settings '{name}'",
+                        facet.name
+                    );
+                }
+            }
+        }
+    }
     for automation in &template.automations {
         require_text(&automation.name, "automation name")?;
         if !automation_names.insert(automation.name.as_str()) {
@@ -559,13 +723,43 @@ pub(crate) fn default_topics_config() -> Value {
     })
 }
 
+fn topics_settings(config: &Value) -> Result<Value> {
+    let mut settings = object(config, "Topics automation config")?.clone();
+    for key in WIRING_KEYS {
+        settings.remove(key);
+    }
+    Ok(Value::Object(settings))
+}
+
+pub(crate) fn topics_config_for_target(settings: &Value, existing: &Value) -> Result<Value> {
+    let mut config = object(settings, "Topics automation settings")?.clone();
+    for key in WIRING_KEYS {
+        config.insert(
+            key.to_string(),
+            existing.get(key).cloned().unwrap_or_else(|| json!([])),
+        );
+    }
+    add_topics_functions(&Value::Object(config), &[])
+}
+
+pub(crate) fn retain_topics_dependencies(template: &mut ActiveObservabilityTemplate) {
+    let names = template
+        .facets
+        .iter()
+        .filter_map(|facet| facet.topics_automation.as_deref())
+        .collect::<HashSet<_>>();
+    template
+        .topics_automations
+        .retain(|automation| names.contains(automation.name.as_str()));
+}
+
 pub(crate) fn add_topics_functions(
     config: &Value,
-    functions: &[(String, String)],
+    functions: &[(String, String, TopicMapFilter)],
 ) -> Result<Value> {
     let mut config = object(config, "Topics automation config")?.clone();
     let facets = array_entry(&mut config, "facet_functions")?;
-    for (facet_id, _) in functions {
+    for (facet_id, _, _) in functions {
         if !facets
             .iter()
             .any(|entry| function_ref_id(entry) == Some(facet_id.as_str()))
@@ -574,11 +768,28 @@ pub(crate) fn add_topics_functions(
         }
     }
     let topic_maps = array_entry(&mut config, "topic_map_functions")?;
-    for (_, topic_map_id) in functions {
+    for (_, topic_map_id, filter) in functions {
         if !topic_maps.iter().any(|entry| {
             entry.get("function").and_then(function_ref_id) == Some(topic_map_id.as_str())
         }) {
             topic_maps.push(json!({"function": {"type": "function", "id": topic_map_id}}));
+        }
+        if let TopicMapFilter::Replace(filter) = filter {
+            for entry in topic_maps.iter_mut().filter(|entry| {
+                entry.get("function").and_then(function_ref_id) == Some(topic_map_id.as_str())
+            }) {
+                let entry = entry
+                    .as_object_mut()
+                    .expect("topic map reference is an object");
+                match filter {
+                    Some(filter) => {
+                        entry.insert("btql_filter".to_string(), json!(filter));
+                    }
+                    None => {
+                        entry.remove("btql_filter");
+                    }
+                }
+            }
         }
     }
     Ok(Value::Object(config))
@@ -636,13 +847,19 @@ pub(crate) fn embedding_model(
 }
 
 pub(crate) fn topic_map_ids(config: &Value) -> impl Iterator<Item = &str> {
+    topic_map_entries(config).map(|(id, _)| id)
+}
+
+pub(crate) fn topic_map_entries(config: &Value) -> impl Iterator<Item = (&str, Option<&str>)> {
     config
         .get("topic_map_functions")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|entry| entry.get("function"))
-        .filter_map(function_ref_id)
+        .filter_map(|entry| {
+            let id = entry.get("function").and_then(function_ref_id)?;
+            Some((id, entry.get("btql_filter").and_then(Value::as_str)))
+        })
 }
 
 fn function_ref_id(reference: &Value) -> Option<&str> {
@@ -703,38 +920,116 @@ mod tests {
         }
     }
 
+    fn test_facet_and_maps() -> Vec<Function> {
+        let mut oldest = function(
+            "fn-test-old",
+            "test-old-map",
+            "classifier",
+            json!({
+                "type": "topic_map", "source_facet_function": {"type": "function", "id": "fn-test-facet"}
+            }),
+        );
+        oldest.created = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newest = oldest.clone();
+        newest.id = "fn-test-new".to_string();
+        newest.slug = "test-new-map".to_string();
+        newest.created = Some("2026-02-01T00:00:00Z".to_string());
+        vec![
+            function(
+                "fn-test-facet",
+                "test-facet",
+                "facet",
+                json!({"type": "facet"}),
+            ),
+            oldest,
+            newest,
+        ]
+    }
+
     #[test]
-    fn active_observability_rejects_nonportable_or_unrelated_facet_data() {
-        for (data, expected) in [
-            (
-                json!({"type": "code", "data": {"type": "bundle", "bundle_id": "test-bundle-id"}}),
-                "cannot package",
-            ),
-            (
-                json!({"type": "code", "data": {}}),
-                "must use function_data.data.type 'inline'",
-            ),
-            (
-                json!({"type": "topic_map"}),
-                "must be type 'facet' or inline 'code'",
-            ),
-        ] {
-            let facet = function("fn-test-facet", "test-facet", "facet", data.clone());
-            assert!(from_remote(&[facet], &[])
-                .unwrap_err()
-                .to_string()
-                .contains(expected));
-            let template: ActiveObservabilityTemplate = serde_json::from_value(json!({
-                "kind": KIND,
-                "schema_version": SCHEMA_VERSION,
-                "facets": [{"name": "Test facet", "slug": "test-facet", "function_data": data}]
-            }))
-            .unwrap();
-            assert!(validate(&template)
-                .unwrap_err()
-                .to_string()
-                .contains(expected));
+    fn active_observability_export_uses_oldest_duplicate_map_filter() {
+        let functions = test_facet_and_maps();
+        for reverse in [false, true] {
+            for filter_oldest in [false, true] {
+                let mut entries = vec![
+                    json!({"function": {"type": "function", "id": "fn-test-old"}}),
+                    json!({"function": {"type": "function", "id": "fn-test-new"}}),
+                ];
+                entries[usize::from(!filter_oldest)]["btql_filter"] =
+                    json!("metadata.test_selected = true");
+                if reverse {
+                    entries.reverse();
+                }
+                let template = from_remote(
+                    &functions,
+                    &[automation(
+                        "Test Topics",
+                        json!({
+                            "event_type": "topic", "topic_map_functions": entries
+                        }),
+                    )],
+                )
+                .unwrap();
+                validate(&template).unwrap();
+                assert_eq!(
+                    template.facets[0].topic_map_btql_filter.as_deref(),
+                    filter_oldest.then_some("metadata.test_selected = true")
+                );
+            }
         }
+        // Match the push tie breaker when creation timestamps are equal.
+        let mut tied = functions;
+        tied[2].created = tied[1].created.clone();
+        assert_eq!(
+            topic_map_order(&tied[1], &tied[2]),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn active_observability_export_prefers_map_over_direct_membership() {
+        let functions = test_facet_and_maps();
+        let direct = automation(
+            "Test A",
+            json!({
+                "event_type": "topic", "facet_functions": [{"type": "function", "id": "fn-test-facet"}]
+            }),
+        );
+        let mapped = automation(
+            "Test B",
+            json!({
+                "event_type": "topic", "topic_map_functions": [{"function": {"type": "function", "id": "fn-test-old"}}]
+            }),
+        );
+        for automations in [
+            vec![direct.clone(), mapped.clone()],
+            vec![mapped, direct.clone()],
+        ] {
+            let template = from_remote(&functions, &automations).unwrap();
+            validate(&template).unwrap();
+            assert_eq!(
+                template.facets[0].topics_automation.as_deref(),
+                Some("Test B")
+            );
+            assert_eq!(template.topics_automations.len(), 1);
+        }
+        let fallback = from_remote(&functions[..1], &[direct]).unwrap();
+        assert_eq!(
+            fallback.facets[0].topics_automation.as_deref(),
+            Some("Test A")
+        );
+    }
+
+    #[test]
+    fn active_observability_validation_rejects_invalid_topics_timing() {
+        let template = from_remote(&test_facet_and_maps()[..1], &[automation("Test Topics", json!({
+            "event_type": "topic", "facet_functions": [{"type": "function", "id": "fn-test-facet"}],
+            "backfill_time_range": "bogus"
+        }))]).unwrap();
+        let error = validate(&template).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Test Topics"));
+        assert!(message.contains("backfill_time_range"));
     }
 
     #[test]
@@ -807,6 +1102,188 @@ mod tests {
     }
 
     #[test]
+    fn active_observability_rejects_nonportable_or_unrelated_facet_data() {
+        for (data, expected) in [
+            (
+                json!({"type": "code", "data": {"type": "bundle", "bundle_id": "test-bundle-id"}}),
+                "cannot package",
+            ),
+            (
+                json!({"type": "code", "data": {}}),
+                "must use function_data.data.type 'inline'",
+            ),
+            (
+                json!({"type": "topic_map"}),
+                "must be type 'facet' or inline 'code'",
+            ),
+        ] {
+            let facet = function("fn-test-facet", "test-facet", "facet", data.clone());
+            assert!(from_remote(&[facet], &[])
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+            let template: ActiveObservabilityTemplate = serde_json::from_value(json!({
+                "kind": KIND,
+                "schema_version": SCHEMA_VERSION,
+                "facets": [{"name": "Test facet", "slug": "test-facet", "function_data": data}]
+            }))
+            .unwrap();
+            assert!(validate(&template)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
+    }
+
+    #[test]
+    fn active_observability_topics_dependencies_follow_selected_facets() {
+        let facets = vec![
+            function(
+                "fn-test-first",
+                "test-first",
+                "facet",
+                json!({"type": "facet"}),
+            ),
+            function(
+                "fn-test-second",
+                "test-second",
+                "facet",
+                json!({"type": "facet"}),
+            ),
+            function(
+                "fn-test-third",
+                "test-third",
+                "facet",
+                json!({"type": "facet"}),
+            ),
+        ];
+        let shared = automation(
+            "Test shared Topics",
+            json!({"event_type": "topic", "facet_functions": [{"type": "function", "id": facets[0].id}, {"type": "function", "id": facets[1].id}], "scope": {"type": "span"}, "sampling_rate": 1}),
+        );
+        let other = automation(
+            "Test other Topics",
+            json!({"event_type": "topic", "facet_functions": [{"type": "function", "id": facets[2].id}], "sampling_rate": 1}),
+        );
+        let mut template = from_remote(&facets, &[shared, other]).unwrap();
+        assert_eq!(template.topics_automations.len(), 2);
+        template.facets.retain(|facet| facet.slug == "test-second");
+        retain_topics_dependencies(&mut template);
+        validate(&template).unwrap();
+        assert_eq!(template.topics_automations.len(), 1);
+        assert_eq!(template.topics_automations[0].name, "Test shared Topics");
+        template.facets.clear();
+        retain_topics_dependencies(&mut template);
+        assert!(template.topics_automations.is_empty());
+    }
+
+    #[test]
+    fn active_observability_versions_and_topics_settings_are_validated() {
+        let legacy = json!({"kind": KIND, "schema_version": 1, "facets": [{"name": "Test facet", "slug": "test-facet", "topics_automation": "Test Topics", "function_data": {"type": "facet"}}]});
+        let mut template: ActiveObservabilityTemplate = serde_json::from_value(legacy).unwrap();
+        validate(&template).unwrap();
+        template.schema_version = SCHEMA_VERSION;
+        assert!(validate(&template)
+            .unwrap_err()
+            .to_string()
+            .contains("missing Topics automation settings"));
+        template.topics_automations.push(automation_template());
+        validate(&template).unwrap();
+        template.schema_version = 1;
+        assert!(validate(&template)
+            .unwrap_err()
+            .to_string()
+            .contains("require template schema version"));
+        template.schema_version = SCHEMA_VERSION;
+        template.topics_automations[0].config["facet_functions"] =
+            json!([{ "type": "function", "id": "fn-test-source" }]);
+        assert!(validate(&template)
+            .unwrap_err()
+            .to_string()
+            .contains("project-specific function references"));
+        template.topics_automations[0]
+            .config
+            .as_object_mut()
+            .unwrap()
+            .remove("facet_functions");
+        template.topics_automations[0].config["data_scope"] =
+            json!({"type": "experiment", "experiment_id": "test-experiment-id"});
+        assert!(validate(&template)
+            .unwrap_err()
+            .to_string()
+            .contains("project-specific experiment_id"));
+        template.topics_automations[0]
+            .config
+            .as_object_mut()
+            .unwrap()
+            .remove("data_scope");
+        template.automations.push(AutomationTemplate {
+            name: "Test Topics".to_string(),
+            description: None,
+            config: json!({"event_type": "windowed", "loop": {}}),
+        });
+        assert!(validate(&template)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate automation name"));
+    }
+
+    fn automation_template() -> AutomationTemplate {
+        AutomationTemplate {
+            name: "Test Topics".to_string(),
+            description: None,
+            config: json!({"event_type": "topic", "sampling_rate": 1, "scope": {"type": "span"}}),
+        }
+    }
+
+    #[test]
+    fn active_observability_topic_map_filters_replace_or_clear_only_selected_maps() {
+        let mut config = json!({"topic_map_functions": [
+            {"function": {"type": "function", "id": "fn-test-selected"}, "btql_filter": "metadata.test_old = true"},
+            {"function": {"type": "function", "id": "fn-test-other"}, "btql_filter": "metadata.test_other = true"}
+        ]});
+        config = add_topics_functions(
+            &config,
+            &[(
+                "fn-test-facet".to_string(),
+                "fn-test-selected".to_string(),
+                TopicMapFilter::Replace(Some("metadata.test_new = true".to_string())),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            config["topic_map_functions"][0]["btql_filter"],
+            "metadata.test_new = true"
+        );
+        let preserved = add_topics_functions(
+            &config,
+            &[(
+                "fn-test-facet".to_string(),
+                "fn-test-selected".to_string(),
+                TopicMapFilter::Preserve,
+            )],
+        )
+        .unwrap();
+        assert_eq!(preserved, config);
+        config = add_topics_functions(
+            &config,
+            &[(
+                "fn-test-facet".to_string(),
+                "fn-test-selected".to_string(),
+                TopicMapFilter::Replace(None),
+            )],
+        )
+        .unwrap();
+        assert!(config["topic_map_functions"][0]
+            .get("btql_filter")
+            .is_none());
+        assert_eq!(
+            config["topic_map_functions"][1]["btql_filter"],
+            "metadata.test_other = true"
+        );
+    }
+
+    #[test]
     fn active_observability_topic_map_reconciliation_preserves_customization() {
         let topic_map = function(
             "fn-test-topic-map",
@@ -855,7 +1332,11 @@ mod tests {
             "facet_functions": [{"type": "function", "id": "fn-test-facet"}],
             "topic_map_functions": []
         });
-        let pairs = vec![("fn-test-facet".to_string(), "fn-test-topic-map".to_string())];
+        let pairs = vec![(
+            "fn-test-facet".to_string(),
+            "fn-test-topic-map".to_string(),
+            TopicMapFilter::Preserve,
+        )];
         let once = add_topics_functions(&config, &pairs).unwrap();
         let twice = add_topics_functions(&once, &pairs).unwrap();
         assert_eq!(once, twice);

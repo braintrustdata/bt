@@ -15,8 +15,8 @@ use crate::{
 
 use super::{
     template::{
-        deduplicate_preprocessors, from_remote, ActiveObservabilityTemplate, AutomationTemplate,
-        FacetTemplate,
+        deduplicate_preprocessors, from_remote, retain_topics_dependencies, validate,
+        ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate,
     },
     PullArgs,
 };
@@ -41,6 +41,8 @@ pub(crate) async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         (template.facets, template.automations) =
             filter_active_resources(template.facets, template.automations);
     }
+    retain_topics_dependencies(&mut template);
+    validate(&template)?;
     // Selection happens first so a selected facet never loses its required definition.
     deduplicate_preprocessors(&mut template.facets);
 
@@ -216,6 +218,35 @@ mod tests {
         let (facets, automations) = filter_resources(template.facets, template.automations, &[1]);
         assert!(facets.is_empty());
         assert_eq!(automations.len(), 1);
+    }
+
+    #[test]
+    fn active_observability_experiment_scope_error_explains_selection_recovery() {
+        let mut template = template();
+        template.facets[0].topics_automation = Some("Test experiment Topics".to_string());
+        template.topics_automations.push(AutomationTemplate {
+            name: "Test experiment Topics".to_string(),
+            description: None,
+            config: json!({"event_type": "topic", "data_scope": {"type": "experiment", "experiment_id": "test-experiment-id"}}),
+        });
+        let error = validate(&template).unwrap_err().to_string();
+        assert!(error.contains("Test facet"));
+        assert!(error.contains("Test experiment Topics"));
+        assert!(error.contains("deselect these facets"));
+        assert!(error.contains("without --json or --no-input"));
+
+        template.facets.push(FacetTemplate {
+            name: "Portable test facet".to_string(),
+            slug: "test-portable-facet".to_string(),
+            topics_automation: None,
+            ..template.facets[0].clone()
+        });
+        (template.facets, template.automations) =
+            filter_resources(template.facets, template.automations, &[1]);
+        retain_topics_dependencies(&mut template);
+        validate(&template).unwrap();
+        assert_eq!(template.facets.len(), 1);
+        assert!(template.topics_automations.is_empty());
     }
 
     #[test]
