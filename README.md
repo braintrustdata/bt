@@ -211,6 +211,10 @@ Remove-Item -Recurse -Force (Join-Path $userProfile ".braintrust\auth") -ErrorAc
 | `bt sync`         | Synchronize project logs between Braintrust and local NDJSON files  |
 | `bt update`       | Update bt in-place                                                  |
 
+## `bt observability template`
+
+Facets can use extraction prompts or inline code. Observability template pull and push preserve inline code, runtime settings, code hashes, and tags. Bundled code cannot be packaged; use an inline code facet instead.
+
 ## `bt custom-views`
 
 Define custom views with `customTraceView` or `customDatasetView` from `braintrust/custom-views` (SDK 3.33.0 or later).

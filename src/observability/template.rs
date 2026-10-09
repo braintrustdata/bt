@@ -129,12 +129,7 @@ fn facet_from_remote(
         .function_data
         .clone()
         .ok_or_else(|| anyhow!("facet '{}' is missing function_data", facet.name))?;
-    if function_data.get("type").and_then(Value::as_str) != Some("facet") {
-        bail!(
-            "function '{}' has facet type but non-facet function_data",
-            facet.name
-        );
-    }
+    validate_facet_data(&function_data, &facet.name)?;
 
     let preprocessor = saved_preprocessor(&mut function_data, by_id)?;
     Ok(FacetTemplate {
@@ -267,9 +262,7 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
     for facet in &template.facets {
         require_text(&facet.name, "facet name")?;
         require_text(&facet.slug, "facet slug")?;
-        if facet.function_data.get("type").and_then(Value::as_str) != Some("facet") {
-            bail!("facet '{}' function_data.type must be 'facet'", facet.name);
-        }
+        validate_facet_data(&facet.function_data, &facet.name)?;
         reserve_slug(&mut slugs, &facet.slug, "facet")?;
         reserve_slug(
             &mut slugs,
@@ -328,6 +321,18 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_facet_data(data: &Value, name: &str) -> Result<()> {
+    match data.get("type").and_then(Value::as_str) {
+        Some("facet") => Ok(()),
+        Some("code") => match data.get("data").and_then(|data| data.get("type")).and_then(Value::as_str) {
+            Some("inline") => Ok(()),
+            Some("bundle") => bail!("facet '{name}' uses bundled code, which observability templates cannot package; use an inline code facet"),
+            _ => bail!("code facet '{name}' must use function_data.data.type 'inline'"),
+        },
+        _ => bail!("facet '{name}' function_data must be type 'facet' or inline 'code'"),
+    }
 }
 
 fn reserve_slug(
@@ -689,6 +694,40 @@ mod tests {
             name: name.to_string(),
             description: None,
             config,
+        }
+    }
+
+    #[test]
+    fn active_observability_rejects_nonportable_or_unrelated_facet_data() {
+        for (data, expected) in [
+            (
+                json!({"type": "code", "data": {"type": "bundle", "bundle_id": "test-bundle-id"}}),
+                "cannot package",
+            ),
+            (
+                json!({"type": "code", "data": {}}),
+                "must use function_data.data.type 'inline'",
+            ),
+            (
+                json!({"type": "topic_map"}),
+                "must be type 'facet' or inline 'code'",
+            ),
+        ] {
+            let facet = function("fn-test-facet", "test-facet", "facet", data.clone());
+            assert!(from_remote(&[facet], &[])
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+            let template: ActiveObservabilityTemplate = serde_json::from_value(json!({
+                "kind": KIND,
+                "schema_version": SCHEMA_VERSION,
+                "facets": [{"name": "Test facet", "slug": "test-facet", "function_data": data}]
+            }))
+            .unwrap();
+            assert!(validate(&template)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
         }
     }
 
