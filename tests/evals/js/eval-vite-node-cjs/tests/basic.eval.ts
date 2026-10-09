@@ -1,5 +1,5 @@
 import { Eval } from "braintrust";
-import { isMatch } from "micromatch";
+import { isMatch } from "picomatch";
 
 const exactMatch = ({
   output,
