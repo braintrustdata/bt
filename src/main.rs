@@ -343,7 +343,7 @@ fn apply_runtime_env_overrides(base: &LoginBaseArgs) {
 
 fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    let env_deprecation_warnings = env::bootstrap_from_args(&argv)?;
+    env::bootstrap_from_args(&argv)?;
 
     if handle_version_json(&argv)? {
         return Ok(());
@@ -359,9 +359,6 @@ fn try_main() -> Result<()> {
         std::sync::atomic::Ordering::Relaxed,
     );
     configure_output(cli.command.base());
-    for warning in &env_deprecation_warnings {
-        ui::print_command_status(ui::CommandStatus::Warning, warning);
-    }
     apply_runtime_env_overrides(cli.command.base());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

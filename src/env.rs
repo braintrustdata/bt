@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// Pre-`BRAINTRUST_` names of CLI env vars. Each `BT_<NAME>` is still honored as
-/// an alias for `BRAINTRUST_<NAME>`, with a deprecation warning, until support is
-/// removed. Do not add entries: new env vars must use the `BRAINTRUST_` prefix.
+/// a silent alias for `BRAINTRUST_<NAME>` until support is removed. Do not add entries: new env vars must use the `BRAINTRUST_` prefix.
 ///
 /// `BT_EVAL_*`, `BT_DATASET_PIPELINE_*`, and `BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES`
 /// are also the internal protocol `bt` uses to configure runner subprocesses (and
@@ -115,12 +114,13 @@ pub(crate) const DEPRECATED_BT_ENV_VARS: &[&str] = &[
 ];
 
 /// Loads `--env-file` and maps deprecated env var names, before clap reads the
-/// environment. Returns deprecation warnings to print once output is configured.
-pub fn bootstrap_from_args(args: &[OsString]) -> Result<Vec<String>> {
+/// environment.
+pub fn bootstrap_from_args(args: &[OsString]) -> Result<()> {
     let explicit_env_file = extract_env_file_arg(args)
         .or_else(|| std::env::var("BRAINTRUST_ENV_FILE").ok().map(PathBuf::from));
     load_env(explicit_env_file.as_ref())?;
-    Ok(apply_deprecated_env_aliases(DEPRECATED_BT_ENV_VARS))
+    apply_deprecated_env_aliases(DEPRECATED_BT_ENV_VARS);
+    Ok(())
 }
 
 pub(crate) fn canonical_env_name(deprecated: &str) -> String {
@@ -131,8 +131,7 @@ pub(crate) fn canonical_env_name(deprecated: &str) -> String {
 // Process-internal plumbing: clap supports a single env name per arg, so
 // deprecated names are copied onto their canonical names before parsing. The
 // canonical name wins when both are set.
-fn apply_deprecated_env_aliases(deprecated_names: &[&str]) -> Vec<String> {
-    let mut warnings = Vec::new();
+fn apply_deprecated_env_aliases(deprecated_names: &[&str]) {
     for deprecated in deprecated_names {
         let Some(value) = std::env::var_os(deprecated) else {
             continue;
@@ -141,17 +140,10 @@ fn apply_deprecated_env_aliases(deprecated_names: &[&str]) -> Vec<String> {
         if std::env::var_os(&canonical).is_some() {
             // Drop the ignored value so runner subprocesses can't inherit it.
             std::env::remove_var(deprecated);
-            warnings.push(format!(
-                "{deprecated} is deprecated and ignored because {canonical} is set; unset {deprecated}"
-            ));
         } else {
             std::env::set_var(&canonical, value);
-            warnings.push(format!(
-                "{deprecated} is deprecated; use {canonical} instead"
-            ));
         }
     }
-    warnings
 }
 
 pub fn load_env(explicit_env_file: Option<&PathBuf>) -> Result<()> {
@@ -249,8 +241,7 @@ mod tests {
         std::env::remove_var(UNSET_DEPRECATED);
         std::env::remove_var(UNSET_CANONICAL);
 
-        let warnings =
-            apply_deprecated_env_aliases(&[DEPRECATED, BOTH_DEPRECATED, UNSET_DEPRECATED]);
+        apply_deprecated_env_aliases(&[DEPRECATED, BOTH_DEPRECATED, UNSET_DEPRECATED]);
 
         let deprecated_value = std::env::var(CANONICAL).ok();
         let both_value = std::env::var(BOTH_CANONICAL).ok();
@@ -264,14 +255,5 @@ mod tests {
         assert_eq!(both_value.as_deref(), Some("from-canonical"));
         assert_eq!(both_deprecated_value, None);
         assert_eq!(unset_value, None);
-        assert_eq!(
-            warnings,
-            vec![
-                format!("{DEPRECATED} is deprecated; use {CANONICAL} instead"),
-                format!(
-                    "{BOTH_DEPRECATED} is deprecated and ignored because {BOTH_CANONICAL} is set; unset {BOTH_DEPRECATED}"
-                ),
-            ]
-        );
     }
 }
