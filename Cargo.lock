@@ -545,34 +545,6 @@ dependencies = [
 [[package]]
 name = "braintrust-sdk-rust"
 version = "0.1.0-alpha.2"
-source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=019e428ab80d0da4c00dab383d4b0d1fdf4486fd#019e428ab80d0da4c00dab383d4b0d1fdf4486fd"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "backoff",
- "base64 0.22.1",
- "bon",
- "bytes",
- "chrono",
- "crossbeam",
- "futures",
- "indexmap 2.14.0",
- "regex",
- "reqwest",
- "serde",
- "serde_json 1.0.151",
- "serde_repr",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "braintrust-sdk-rust"
-version = "0.1.0-alpha.2"
 source = "git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=e85ab580f52174efa9f90b9069a5fb2f5460a20d#e85ab580f52174efa9f90b9069a5fb2f5460a20d"
 dependencies = [
  "anyhow",
@@ -649,7 +621,7 @@ dependencies = [
  "async-trait",
  "backoff",
  "base64 0.22.1",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=e85ab580f52174efa9f90b9069a5fb2f5460a20d)",
+ "braintrust-sdk-rust",
  "bt-daemon",
  "chrono",
  "clap",
@@ -703,12 +675,12 @@ dependencies = [
 [[package]]
 name = "bt-daemon"
 version = "0.1.0"
-source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=cccf8d01ee5a28b29db51d96c82b75a90327db72#cccf8d01ee5a28b29db51d96c82b75a90327db72"
+source = "git+https://github.com/braintrustdata/braintrust-coding-agent-plugins?rev=8b3fdd2ef90515c51c5524cd26499493879278fd#8b3fdd2ef90515c51c5524cd26499493879278fd"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "braintrust-sdk-rust 0.1.0-alpha.2 (git+https://github.com/braintrustdata/braintrust-sdk-rust?rev=019e428ab80d0da4c00dab383d4b0d1fdf4486fd)",
+ "braintrust-sdk-rust",
  "chrono",
  "clap",
  "fs2",
@@ -1391,7 +1363,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1874,7 +1846,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -2489,7 +2461,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3024,7 +2996,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -3062,9 +3034,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3475,7 +3447,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4449,10 +4421,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
