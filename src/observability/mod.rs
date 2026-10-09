@@ -59,7 +59,7 @@ pub(super) struct PullArgs {
     #[arg(
         long,
         short = 'O',
-        env = "BT_OBSERVABILITY_TEMPLATE_PULL_OUTPUT",
+        env = "BRAINTRUST_OBSERVABILITY_TEMPLATE_PULL_OUTPUT",
         value_name = "PATH"
     )]
     output: Option<PathBuf>,
@@ -67,7 +67,7 @@ pub(super) struct PullArgs {
     /// Overwrite an existing output file
     #[arg(
         long,
-        env = "BT_OBSERVABILITY_TEMPLATE_PULL_FORCE",
+        env = "BRAINTRUST_OBSERVABILITY_TEMPLATE_PULL_FORCE",
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
@@ -84,7 +84,7 @@ struct PushArgs {
     #[arg(
         long = "file",
         short = 'f',
-        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_FILE",
+        env = "BRAINTRUST_OBSERVABILITY_TEMPLATE_PUSH_FILE",
         value_name = "SOURCE"
     )]
     source_flag: Option<String>,
@@ -92,7 +92,7 @@ struct PushArgs {
     /// Use this existing Topics automation for every facet
     #[arg(
         long,
-        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_TOPICS_AUTOMATION",
+        env = "BRAINTRUST_OBSERVABILITY_TEMPLATE_PUSH_TOPICS_AUTOMATION",
         value_name = "NAME_OR_ID"
     )]
     topics_automation: Option<String>,
@@ -100,7 +100,7 @@ struct PushArgs {
     /// Replace existing matching resources
     #[arg(
         long,
-        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_FORCE",
+        env = "BRAINTRUST_OBSERVABILITY_TEMPLATE_PUSH_FORCE",
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
@@ -110,7 +110,7 @@ struct PushArgs {
     #[arg(
         long,
         short = 'y',
-        env = "BT_OBSERVABILITY_TEMPLATE_PUSH_YES",
+        env = "BRAINTRUST_OBSERVABILITY_TEMPLATE_PUSH_YES",
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new()
     )]

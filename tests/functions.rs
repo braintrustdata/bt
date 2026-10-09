@@ -203,24 +203,24 @@ fn env_flag(name: &str) -> bool {
 
 fn sanitized_env_keys() -> &'static [&'static str] {
     &[
-        "BT_FUNCTIONS_PUSH_FILES",
-        "BT_FUNCTIONS_PUSH_IF_EXISTS",
-        "BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE",
-        "BT_FUNCTIONS_PUSH_RUNNER",
-        "BT_FUNCTIONS_PUSH_LANGUAGE",
-        "BT_FUNCTIONS_PUSH_REQUIREMENTS",
-        "BT_FUNCTIONS_PUSH_TSCONFIG",
-        "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
-        "BT_FUNCTIONS_VIEW_ID",
-        "BT_FUNCTIONS_VIEW_VERSION",
-        "BT_FUNCTIONS_PULL_OUTPUT_DIR",
-        "BT_FUNCTIONS_PULL_PROJECT_ID",
-        "BT_FUNCTIONS_PULL_PROJECT_NAME",
-        "BT_FUNCTIONS_PULL_ID",
-        "BT_FUNCTIONS_PULL_SLUG",
-        "BT_FUNCTIONS_PULL_VERSION",
-        "BT_FUNCTIONS_PULL_FORCE",
-        "BT_FUNCTIONS_PULL_LANGUAGE",
+        "BRAINTRUST_FUNCTIONS_PUSH_FILES",
+        "BRAINTRUST_FUNCTIONS_PUSH_IF_EXISTS",
+        "BRAINTRUST_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE",
+        "BRAINTRUST_FUNCTIONS_PUSH_RUNNER",
+        "BRAINTRUST_FUNCTIONS_PUSH_LANGUAGE",
+        "BRAINTRUST_FUNCTIONS_PUSH_REQUIREMENTS",
+        "BRAINTRUST_FUNCTIONS_PUSH_TSCONFIG",
+        "BRAINTRUST_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+        "BRAINTRUST_FUNCTIONS_VIEW_ID",
+        "BRAINTRUST_FUNCTIONS_VIEW_VERSION",
+        "BRAINTRUST_FUNCTIONS_PULL_OUTPUT_DIR",
+        "BRAINTRUST_FUNCTIONS_PULL_PROJECT_ID",
+        "BRAINTRUST_FUNCTIONS_PULL_PROJECT_NAME",
+        "BRAINTRUST_FUNCTIONS_PULL_ID",
+        "BRAINTRUST_FUNCTIONS_PULL_SLUG",
+        "BRAINTRUST_FUNCTIONS_PULL_VERSION",
+        "BRAINTRUST_FUNCTIONS_PULL_FORCE",
+        "BRAINTRUST_FUNCTIONS_PULL_LANGUAGE",
     ]
 }
 
@@ -527,6 +527,10 @@ fn functions_fixtures() {
         cmd.args(&config.command).current_dir(&dir);
         for key in sanitized_env_keys() {
             cmd.env_remove(key);
+            // Deprecated BT_* names still map onto these, so strip them too.
+            if let Some(suffix) = key.strip_prefix("BRAINTRUST_") {
+                cmd.env_remove(format!("BT_{suffix}"));
+            }
         }
         for (key, value) in &config.env {
             cmd.env(key, value);
@@ -630,7 +634,7 @@ fn functions_view_help_includes_expected_flags() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--id"));
     assert!(stdout.contains("--version"));
-    assert!(stdout.contains("BT_FUNCTIONS_VIEW_VERSION"));
+    assert!(stdout.contains("BRAINTRUST_FUNCTIONS_VIEW_VERSION"));
 }
 
 #[test]
@@ -793,14 +797,14 @@ fn push_and_pull_help_are_machine_readable() {
 
     let push_stdout = String::from_utf8_lossy(&push_help.stdout);
     let pull_stdout = String::from_utf8_lossy(&pull_help.stdout);
-    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_FILES"));
-    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_LANGUAGE"));
-    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_REQUIREMENTS"));
-    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_TSCONFIG"));
-    assert!(push_stdout.contains("BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES"));
-    assert!(pull_stdout.contains("BT_FUNCTIONS_PULL_OUTPUT_DIR"));
-    assert!(pull_stdout.contains("BT_FUNCTIONS_PULL_LANGUAGE"));
-    assert!(pull_stdout.contains("BT_FUNCTIONS_PULL_VERSION"));
+    assert!(push_stdout.contains("BRAINTRUST_FUNCTIONS_PUSH_FILES"));
+    assert!(push_stdout.contains("BRAINTRUST_FUNCTIONS_PUSH_LANGUAGE"));
+    assert!(push_stdout.contains("BRAINTRUST_FUNCTIONS_PUSH_REQUIREMENTS"));
+    assert!(push_stdout.contains("BRAINTRUST_FUNCTIONS_PUSH_TSCONFIG"));
+    assert!(push_stdout.contains("BRAINTRUST_FUNCTIONS_PUSH_EXTERNAL_PACKAGES"));
+    assert!(pull_stdout.contains("BRAINTRUST_FUNCTIONS_PULL_OUTPUT_DIR"));
+    assert!(pull_stdout.contains("BRAINTRUST_FUNCTIONS_PULL_LANGUAGE"));
+    assert!(pull_stdout.contains("BRAINTRUST_FUNCTIONS_PULL_VERSION"));
 }
 
 #[test]
@@ -2375,8 +2379,8 @@ async fn functions_view_by_positional_id_does_not_require_project_context() {
         .env("BRAINTRUST_NO_INPUT", "1")
         .env_remove("BRAINTRUST_PROFILE")
         .env_remove("BRAINTRUST_DEFAULT_PROJECT")
-        .env_remove("BT_FUNCTIONS_VIEW_ID")
-        .env_remove("BT_FUNCTIONS_VIEW_VERSION")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_ID")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_VERSION")
         .output()
         .expect("run bt functions view fn_123");
 
@@ -2450,8 +2454,8 @@ async fn functions_view_by_id_passes_version() {
         .env("BRAINTRUST_NO_INPUT", "1")
         .env_remove("BRAINTRUST_PROFILE")
         .env_remove("BRAINTRUST_DEFAULT_PROJECT")
-        .env_remove("BT_FUNCTIONS_VIEW_ID")
-        .env_remove("BT_FUNCTIONS_VIEW_VERSION")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_ID")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_VERSION")
         .output()
         .expect("run bt functions view --id fn_123 --version");
 
@@ -2533,8 +2537,8 @@ async fn functions_view_by_slug_passes_version() {
         .env("BRAINTRUST_NO_COLOR", "1")
         .env("BRAINTRUST_NO_INPUT", "1")
         .env_remove("BRAINTRUST_PROFILE")
-        .env_remove("BT_FUNCTIONS_VIEW_ID")
-        .env_remove("BT_FUNCTIONS_VIEW_VERSION")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_ID")
+        .env_remove("BRAINTRUST_FUNCTIONS_VIEW_VERSION")
         .output()
         .expect("run bt functions view doc-search --version");
 

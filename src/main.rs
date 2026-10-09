@@ -343,7 +343,7 @@ fn apply_runtime_env_overrides(base: &LoginBaseArgs) {
 
 fn try_main() -> Result<()> {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    env::bootstrap_from_args(&argv)?;
+    let env_deprecation_warnings = env::bootstrap_from_args(&argv)?;
 
     if handle_version_json(&argv)? {
         return Ok(());
@@ -359,6 +359,9 @@ fn try_main() -> Result<()> {
         std::sync::atomic::Ordering::Relaxed,
     );
     configure_output(cli.command.base());
+    for warning in &env_deprecation_warnings {
+        ui::print_command_status(ui::CommandStatus::Warning, warning);
+    }
     apply_runtime_env_overrides(cli.command.base());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -632,6 +635,7 @@ fn print_error(err: &anyhow::Error, code: ExitCode, missing_credential: bool, js
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::env;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
@@ -690,6 +694,52 @@ mod tests {
         ] {
             let err = Cli::try_parse_from(args).expect_err("context flag should be rejected");
             assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    fn collect_arg_env_names(command: &clap::Command, names: &mut BTreeSet<String>) {
+        for arg in command.get_arguments() {
+            if let Some(name) = arg.get_env().and_then(OsStr::to_str) {
+                names.insert(name.to_string());
+            }
+        }
+        for subcommand in command.get_subcommands() {
+            collect_arg_env_names(subcommand, names);
+        }
+    }
+
+    #[test]
+    fn cli_env_vars_use_braintrust_prefix() {
+        let mut names = BTreeSet::new();
+        collect_arg_env_names(&Cli::command(), &mut names);
+
+        let unprefixed: Vec<_> = names
+            .iter()
+            .filter(|name| !name.starts_with("BRAINTRUST_"))
+            .collect();
+        assert!(
+            unprefixed.is_empty(),
+            "CLI env vars must use the BRAINTRUST_ prefix: {unprefixed:?}"
+        );
+
+        // Interpreter overrides read directly rather than through clap.
+        let non_clap = [
+            "BRAINTRUST_DATASET_PIPELINE_PYTHON",
+            "BRAINTRUST_EVAL_GO",
+            "BRAINTRUST_EVAL_GO_BIN",
+            "BRAINTRUST_EVAL_PYTHON",
+            "BRAINTRUST_EVAL_PYTHON_RUNNER",
+        ];
+        for deprecated in crate::env::DEPRECATED_BT_ENV_VARS {
+            let canonical = crate::env::canonical_env_name(deprecated);
+            if cfg!(not(unix)) && canonical.starts_with("BRAINTRUST_EVAL_") {
+                // `bt eval` is unix-only.
+                continue;
+            }
+            assert!(
+                names.contains(&canonical) || non_clap.contains(&canonical.as_str()),
+                "{deprecated} maps to {canonical}, which no CLI arg reads"
+            );
         }
     }
 

@@ -47,9 +47,10 @@ const PYTHON_RUNNER_COMMON_SOURCE: &str = include_str!("../../scripts/python_run
 const PYTHON_BASELINE_DEPS: &[&str] =
     &["pydantic", "braintrust", "autoevals", "requests", "openai"];
 // Compatibility shim for existing test harnesses and eval workflows that set
-// Python interpreter via BT_EVAL_* variables. Preferred path is still
-// --runner / BT_FUNCTIONS_PUSH_RUNNER.
-const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
+// Python interpreter via BRAINTRUST_EVAL_* variables. Preferred path is still
+// --runner / BRAINTRUST_FUNCTIONS_PUSH_RUNNER.
+const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] =
+    &["BRAINTRUST_EVAL_PYTHON_RUNNER", "BRAINTRUST_EVAL_PYTHON"];
 
 #[derive(Debug, Deserialize)]
 struct RunnerManifest {
