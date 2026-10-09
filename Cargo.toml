@@ -19,7 +19,7 @@ actix-web = "4.11.0"
 anyhow = "1.0.89"
 backoff = { version = "0.4.0", features = ["tokio"] }
 braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-rust", rev = "e85ab580f52174efa9f90b9069a5fb2f5460a20d" }
-bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "cccf8d01ee5a28b29db51d96c82b75a90327db72" }
+bt-daemon = { git = "https://github.com/braintrustdata/braintrust-coding-agent-plugins", rev = "8b3fdd2ef90515c51c5524cd26499493879278fd" }
 async-trait = "0.1"
 clap = { version = "4.5.20", features = ["derive", "env"] }
 crossterm = "0.28.1"
