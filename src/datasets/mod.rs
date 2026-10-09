@@ -51,7 +51,7 @@ struct DatasetInputArgs {
     /// JSON/JSONL input file. If omitted, bt reads dataset rows from --rows or stdin.
     #[arg(
         long,
-        env = "BT_DATASETS_FILE",
+        env = "BRAINTRUST_DATASETS_FILE",
         value_name = "PATH",
         conflicts_with = "rows"
     )]
@@ -60,7 +60,7 @@ struct DatasetInputArgs {
     /// Inline dataset rows as JSON, such as an array of row objects.
     #[arg(
         long,
-        env = "BT_DATASETS_ROWS",
+        env = "BRAINTRUST_DATASETS_ROWS",
         value_name = "JSON",
         conflicts_with = "file"
     )]
@@ -70,7 +70,7 @@ struct DatasetInputArgs {
     /// and literal backslashes with `\\`.
     #[arg(
         long,
-        env = "BT_DATASETS_ID_FIELD",
+        env = "BRAINTRUST_DATASETS_ID_FIELD",
         value_name = "PATH",
         default_value = "id"
     )]
@@ -134,7 +134,7 @@ struct CreateArgs {
     #[arg(
         long,
         short = 'd',
-        env = "BT_DATASETS_DESCRIPTION",
+        env = "BRAINTRUST_DATASETS_DESCRIPTION",
         value_name = "TEXT"
     )]
     description: Option<String>,
@@ -166,7 +166,7 @@ struct ViewArgs {
     /// Open in browser
     #[arg(
         long,
-        env = "BT_DATASETS_WEB",
+        env = "BRAINTRUST_DATASETS_WEB",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -175,7 +175,7 @@ struct ViewArgs {
     /// Show all returned row fields instead of compact columns.
     #[arg(
         long,
-        env = "BT_DATASETS_VERBOSE",
+        env = "BRAINTRUST_DATASETS_VERBOSE",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -184,20 +184,20 @@ struct ViewArgs {
     /// Load full row values instead of BTQL previews.
     #[arg(
         long,
-        env = "BT_DATASETS_VIEW_FULL",
+        env = "BRAINTRUST_DATASETS_VIEW_FULL",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
     full: bool,
 
     /// Maximum number of rows to load. Defaults to 200 unless --all-rows is passed.
-    #[arg(long, env = "BT_DATASETS_VIEW_LIMIT", value_name = "N")]
+    #[arg(long, env = "BRAINTRUST_DATASETS_VIEW_LIMIT", value_name = "N")]
     limit: Option<usize>,
 
     /// Load all rows. Values are still previewed unless --full is passed.
     #[arg(
         long = "all-rows",
-        env = "BT_DATASETS_VIEW_ALL",
+        env = "BRAINTRUST_DATASETS_VIEW_ALL",
         value_parser = BoolishValueParser::new(),
         default_value_t = false,
         conflicts_with = "limit"
@@ -220,7 +220,7 @@ struct DeleteArgs {
     #[arg(
         long,
         short = 'f',
-        env = "BT_DATASETS_FORCE",
+        env = "BRAINTRUST_DATASETS_FORCE",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]

@@ -281,7 +281,7 @@ pub(crate) struct PushArgs {
     /// File or directory path(s) to scan for function definitions.
     #[arg(
         long = "file",
-        env = "BT_FUNCTIONS_PUSH_FILES",
+        env = "BRAINTRUST_FUNCTIONS_PUSH_FILES",
         value_name = "PATH",
         value_delimiter = ','
     )]
@@ -290,7 +290,7 @@ pub(crate) struct PushArgs {
     /// Behavior when a function with the same slug already exists.
     #[arg(
         long = "if-exists",
-        env = "BT_FUNCTIONS_PUSH_IF_EXISTS",
+        env = "BRAINTRUST_FUNCTIONS_PUSH_IF_EXISTS",
         value_enum,
         default_value = "error"
     )]
@@ -299,7 +299,7 @@ pub(crate) struct PushArgs {
     /// Stop after the first hard failure.
     #[arg(
         long,
-        env = "BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE",
+        env = "BRAINTRUST_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE",
         default_value_t = false,
         value_parser = BoolishValueParser::new()
     )]
@@ -308,38 +308,42 @@ pub(crate) struct PushArgs {
     /// Create referenced projects automatically when they do not exist.
     #[arg(
         long = "create-missing-projects",
-        env = "BT_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
+        env = "BRAINTRUST_FUNCTIONS_PUSH_CREATE_MISSING_PROJECTS",
         default_value_t = true,
         value_parser = BoolishValueParser::new()
     )]
     pub create_missing_projects: bool,
 
     /// Override runner binary (e.g. tsx, vite-node, deno, python).
-    #[arg(long, env = "BT_FUNCTIONS_PUSH_RUNNER", value_name = "RUNNER")]
+    #[arg(long, env = "BRAINTRUST_FUNCTIONS_PUSH_RUNNER", value_name = "RUNNER")]
     pub runner: Option<String>,
 
     /// Force runtime language selection.
     #[arg(
         long = "language",
-        env = "BT_FUNCTIONS_PUSH_LANGUAGE",
+        env = "BRAINTRUST_FUNCTIONS_PUSH_LANGUAGE",
         value_enum,
         default_value = "auto"
     )]
     pub language: PushLanguage,
 
     /// Optional Python requirements file.
-    #[arg(long, env = "BT_FUNCTIONS_PUSH_REQUIREMENTS", value_name = "PATH")]
+    #[arg(
+        long,
+        env = "BRAINTRUST_FUNCTIONS_PUSH_REQUIREMENTS",
+        value_name = "PATH"
+    )]
     pub requirements: Option<PathBuf>,
 
     /// Optional tsconfig path for JS runner and bundler.
-    #[arg(long, env = "BT_FUNCTIONS_PUSH_TSCONFIG", value_name = "PATH")]
+    #[arg(long, env = "BRAINTRUST_FUNCTIONS_PUSH_TSCONFIG", value_name = "PATH")]
     pub tsconfig: Option<PathBuf>,
 
     /// Additional packages to mark external during JS bundling.
     /// SDK dependencies (for example `braintrust`) are bundled by default.
     #[arg(
         long = "external-packages",
-        env = "BT_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
+        env = "BRAINTRUST_FUNCTIONS_PUSH_EXTERNAL_PACKAGES",
         num_args = 1..,
         value_delimiter = ',',
         value_name = "PACKAGE"
@@ -373,7 +377,7 @@ pub(crate) struct PullArgs {
     #[arg(
         long = "slug",
         short = 's',
-        env = "BT_FUNCTIONS_PULL_SLUG",
+        env = "BRAINTRUST_FUNCTIONS_PULL_SLUG",
         value_delimiter = ','
     )]
     pub slug_flag: Vec<String>,
@@ -381,7 +385,7 @@ pub(crate) struct PullArgs {
     /// Destination directory for generated files.
     #[arg(
         long,
-        env = "BT_FUNCTIONS_PULL_OUTPUT_DIR",
+        env = "BRAINTRUST_FUNCTIONS_PULL_OUTPUT_DIR",
         default_value = "./braintrust",
         value_name = "PATH"
     )]
@@ -390,28 +394,28 @@ pub(crate) struct PullArgs {
     /// Output language.
     #[arg(
         long = "language",
-        env = "BT_FUNCTIONS_PULL_LANGUAGE",
+        env = "BRAINTRUST_FUNCTIONS_PULL_LANGUAGE",
         value_enum,
         default_value = "typescript"
     )]
     pub language: FunctionsLanguage,
 
     /// Project id filter.
-    #[arg(long, env = "BT_FUNCTIONS_PULL_PROJECT_ID")]
+    #[arg(long, env = "BRAINTRUST_FUNCTIONS_PULL_PROJECT_ID")]
     pub project_id: Option<String>,
 
     /// Function id selector.
-    #[arg(long, env = "BT_FUNCTIONS_PULL_ID")]
+    #[arg(long, env = "BRAINTRUST_FUNCTIONS_PULL_ID")]
     pub id: Option<String>,
 
     /// Version selector.
-    #[arg(long, env = "BT_FUNCTIONS_PULL_VERSION")]
+    #[arg(long, env = "BRAINTRUST_FUNCTIONS_PULL_VERSION")]
     pub version: Option<String>,
 
     /// Overwrite targets even when dirty.
     #[arg(
         long,
-        env = "BT_FUNCTIONS_PULL_FORCE",
+        env = "BRAINTRUST_FUNCTIONS_PULL_FORCE",
         default_value_t = false,
         value_parser = BoolishValueParser::new()
     )]
@@ -436,17 +440,17 @@ pub struct ViewArgs {
     #[command(flatten)]
     slug: SlugArgs,
     /// Function id
-    #[arg(long = "id", env = "BT_FUNCTIONS_VIEW_ID")]
+    #[arg(long = "id", env = "BRAINTRUST_FUNCTIONS_VIEW_ID")]
     id: Option<String>,
     /// Function version identifier (for example, a transaction ID)
     #[arg(
         long,
-        env = "BT_FUNCTIONS_VIEW_VERSION",
+        env = "BRAINTRUST_FUNCTIONS_VIEW_VERSION",
         conflicts_with = "environment"
     )]
     version: Option<String>,
     /// Environment slug whose assigned function version should be shown
-    #[arg(long, env = "BT_FUNCTIONS_VIEW_ENVIRONMENT")]
+    #[arg(long, env = "BRAINTRUST_FUNCTIONS_VIEW_ENVIRONMENT")]
     environment: Option<String>,
     /// Open in browser
     #[arg(long)]
@@ -769,11 +773,11 @@ mod tests {
     fn push_file_env_uses_delimiter() {
         let _guard = test_lock();
         unsafe {
-            std::env::set_var("BT_FUNCTIONS_PUSH_FILES", "a.ts,b.ts");
+            std::env::set_var("BRAINTRUST_FUNCTIONS_PUSH_FILES", "a.ts,b.ts");
         }
         let parsed = parse(&["functions", "push"]).expect("parse push");
         unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PUSH_FILES");
+            std::env::remove_var("BRAINTRUST_FUNCTIONS_PUSH_FILES");
         }
 
         let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
@@ -790,11 +794,11 @@ mod tests {
     fn push_boolish_flag_from_env() {
         let _guard = test_lock();
         unsafe {
-            std::env::set_var("BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE", "true");
+            std::env::set_var("BRAINTRUST_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE", "true");
         }
         let parsed = parse(&["functions", "push"]).expect("parse push");
         unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE");
+            std::env::remove_var("BRAINTRUST_FUNCTIONS_PUSH_TERMINATE_ON_FAILURE");
         }
 
         let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
@@ -835,11 +839,11 @@ mod tests {
     fn push_language_from_env() {
         let _guard = test_lock();
         unsafe {
-            std::env::set_var("BT_FUNCTIONS_PUSH_LANGUAGE", "python");
+            std::env::set_var("BRAINTRUST_FUNCTIONS_PUSH_LANGUAGE", "python");
         }
         let parsed = parse(&["functions", "push"]).expect("parse push");
         unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PUSH_LANGUAGE");
+            std::env::remove_var("BRAINTRUST_FUNCTIONS_PUSH_LANGUAGE");
         }
 
         let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
@@ -852,11 +856,11 @@ mod tests {
     fn push_requirements_from_env() {
         let _guard = test_lock();
         unsafe {
-            std::env::set_var("BT_FUNCTIONS_PUSH_REQUIREMENTS", "requirements.txt");
+            std::env::set_var("BRAINTRUST_FUNCTIONS_PUSH_REQUIREMENTS", "requirements.txt");
         }
         let parsed = parse(&["functions", "push"]).expect("parse push");
         unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PUSH_REQUIREMENTS");
+            std::env::remove_var("BRAINTRUST_FUNCTIONS_PUSH_REQUIREMENTS");
         }
 
         let FunctionsCommands::Push(push) = parsed.command.expect("subcommand") else {
@@ -911,11 +915,11 @@ mod tests {
     fn pull_language_from_env() {
         let _guard = test_lock();
         unsafe {
-            std::env::set_var("BT_FUNCTIONS_PULL_LANGUAGE", "python");
+            std::env::set_var("BRAINTRUST_FUNCTIONS_PULL_LANGUAGE", "python");
         }
         let parsed = parse(&["functions", "pull"]).expect("parse pull");
         unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PULL_LANGUAGE");
+            std::env::remove_var("BRAINTRUST_FUNCTIONS_PULL_LANGUAGE");
         }
 
         let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
@@ -928,7 +932,7 @@ mod tests {
     fn pull_language_defaults_to_typescript() {
         let _guard = test_lock();
         unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PULL_LANGUAGE");
+            std::env::remove_var("BRAINTRUST_FUNCTIONS_PULL_LANGUAGE");
         }
         let parsed = parse(&["functions", "pull"]).expect("parse pull");
         let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {
@@ -1021,11 +1025,11 @@ mod tests {
     fn pull_slug_env_uses_delimiter() {
         let _guard = test_lock();
         unsafe {
-            std::env::set_var("BT_FUNCTIONS_PULL_SLUG", "a,b,c");
+            std::env::set_var("BRAINTRUST_FUNCTIONS_PULL_SLUG", "a,b,c");
         }
         let parsed = parse(&["functions", "pull"]).expect("parse pull");
         unsafe {
-            std::env::remove_var("BT_FUNCTIONS_PULL_SLUG");
+            std::env::remove_var("BRAINTRUST_FUNCTIONS_PULL_SLUG");
         }
 
         let FunctionsCommands::Pull(pull) = parsed.command.expect("subcommand") else {

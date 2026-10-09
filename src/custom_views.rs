@@ -105,7 +105,7 @@ struct ViewsPushArgs {
     /// File or directory path(s) to scan for custom view definitions.
     #[arg(
         long = "file",
-        env = "BT_CUSTOM_VIEWS_PUSH_FILES",
+        env = "BRAINTRUST_CUSTOM_VIEWS_PUSH_FILES",
         value_name = "PATH",
         value_delimiter = ','
     )]
@@ -114,7 +114,7 @@ struct ViewsPushArgs {
     /// Behavior when a custom view with the same slug already exists.
     #[arg(
         long = "if-exists",
-        env = "BT_CUSTOM_VIEWS_PUSH_IF_EXISTS",
+        env = "BRAINTRUST_CUSTOM_VIEWS_PUSH_IF_EXISTS",
         value_enum,
         default_value = "error"
     )]
@@ -124,7 +124,7 @@ struct ViewsPushArgs {
     #[arg(
         long,
         short = 'y',
-        env = "BT_CUSTOM_VIEWS_PUSH_YES",
+        env = "BRAINTRUST_CUSTOM_VIEWS_PUSH_YES",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -180,7 +180,7 @@ struct BootstrapCommonArgs {
     /// Custom view name (positional NAME takes precedence).
     #[arg(
         long = "name",
-        env = "BT_CUSTOM_VIEWS_BOOTSTRAP_NAME",
+        env = "BRAINTRUST_CUSTOM_VIEWS_BOOTSTRAP_NAME",
         value_name = "NAME"
     )]
     name_flag: Option<String>,
@@ -188,7 +188,7 @@ struct BootstrapCommonArgs {
     /// Output file or directory path. Defaults to braintrust-custom-views/<name>.<type>-view.tsx.
     #[arg(
         long = "file",
-        env = "BT_CUSTOM_VIEWS_BOOTSTRAP_FILE",
+        env = "BRAINTRUST_CUSTOM_VIEWS_BOOTSTRAP_FILE",
         value_name = "PATH"
     )]
     file_flag: Option<PathBuf>,
@@ -197,7 +197,7 @@ struct BootstrapCommonArgs {
     #[arg(
         long,
         short = 'f',
-        env = "BT_CUSTOM_VIEWS_BOOTSTRAP_FORCE",
+        env = "BRAINTRUST_CUSTOM_VIEWS_BOOTSTRAP_FORCE",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -227,7 +227,7 @@ struct DatasetViewBootstrapArgs {
     /// Dataset name to reference in the starter view.
     #[arg(
         long,
-        env = "BT_CUSTOM_VIEWS_BOOTSTRAP_DATASET",
+        env = "BRAINTRUST_CUSTOM_VIEWS_BOOTSTRAP_DATASET",
         value_name = "NAME",
         conflicts_with = "dataset_id"
     )]
@@ -236,7 +236,7 @@ struct DatasetViewBootstrapArgs {
     /// Dataset id to reference in the starter view.
     #[arg(
         long = "dataset-id",
-        env = "BT_CUSTOM_VIEWS_BOOTSTRAP_DATASET_ID",
+        env = "BRAINTRUST_CUSTOM_VIEWS_BOOTSTRAP_DATASET_ID",
         value_name = "ID",
         conflicts_with = "dataset"
     )]
@@ -261,24 +261,28 @@ struct PreviewCommonArgs {
     #[arg(
         long = "file",
         alias = "path",
-        env = "BT_CUSTOM_VIEWS_PREVIEW_FILE",
+        env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_FILE",
         value_name = "PATH"
     )]
     file_flag: Option<PathBuf>,
 
     /// View slug or name to preview.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_VIEW")]
+    #[arg(long, env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_VIEW")]
     view: Option<String>,
 
     /// Local port to bind. Defaults to an ephemeral port.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_PORT", default_value_t = 0)]
+    #[arg(
+        long,
+        env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_PORT",
+        default_value_t = 0
+    )]
     port: u16,
 
     /// Do not open a browser.
     /// Preview edits stay local and are discarded on reload.
     #[arg(
         long,
-        env = "BT_CUSTOM_VIEWS_PREVIEW_NO_OPEN",
+        env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_NO_OPEN",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -306,30 +310,30 @@ struct TraceViewPreviewArgs {
 #[derive(Debug, Clone, Args)]
 struct TracePreviewTargetArgs {
     /// Braintrust app URL to resolve trace preview data from.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_URL")]
+    #[arg(long, env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_URL")]
     url: Option<String>,
 
     /// Project ID to query for trace preview data.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_PROJECT_ID")]
+    #[arg(long, env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_PROJECT_ID")]
     project_id: Option<String>,
 
     /// Root span id for trace preview data.
     #[arg(
         long = "trace-id",
         alias = "root-span-id",
-        env = "BT_CUSTOM_VIEWS_PREVIEW_TRACE_ID"
+        env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_TRACE_ID"
     )]
     trace_id: Option<String>,
 
     /// Selected span id or row id for trace preview data.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_SPAN_ID")]
+    #[arg(long, env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_SPAN_ID")]
     span_id: Option<String>,
 
     /// Lookback window when resolving a URL's span ID (e.g. 7d, 30d).
     /// Root span IDs and row IDs do not require a time window.
     #[arg(
         long,
-        env = "BT_CUSTOM_VIEWS_PREVIEW_LOOKUP_WINDOW",
+        env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_LOOKUP_WINDOW",
         default_value = "30d"
     )]
     lookup_window: String,
@@ -347,15 +351,15 @@ struct DatasetViewPreviewArgs {
 #[derive(Debug, Clone, Args)]
 struct DatasetPreviewTargetArgs {
     /// Dataset name or id for dataset preview data.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_DATASET")]
+    #[arg(long, env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_DATASET")]
     dataset: Option<String>,
 
     /// Dataset row id for dataset preview data.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_ROW_ID")]
+    #[arg(long, env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_ROW_ID")]
     row_id: Option<String>,
 
     /// Dataset row index for dataset preview data.
-    #[arg(long, env = "BT_CUSTOM_VIEWS_PREVIEW_ROW_INDEX")]
+    #[arg(long, env = "BRAINTRUST_CUSTOM_VIEWS_PREVIEW_ROW_INDEX")]
     row_index: Option<usize>,
 }
 

@@ -96,7 +96,7 @@ struct PullArgs {
     filter: Option<String>,
 
     /// Relative time window (e.g. 1h, 30m, 3d). Defaults to 3d for project_logs; other object types are unbounded.
-    #[arg(long, env = "BT_SYNC_WINDOW")]
+    #[arg(long, env = "BRAINTRUST_SYNC_WINDOW")]
     window: Option<String>,
 
     /// Number of traces to fetch (default when no limit flag is set).
@@ -176,7 +176,7 @@ struct PushArgs {
     /// Maximum approximate input bytes per upload batch.
     #[arg(
         long,
-        env = "BT_SYNC_PUSH_MAX_BATCH_BYTES",
+        env = "BRAINTRUST_SYNC_PUSH_MAX_BATCH_BYTES",
         default_value_t = PUSH_BATCH_MAX_INPUT_BYTES
     )]
     max_batch_bytes: usize,
@@ -184,7 +184,7 @@ struct PushArgs {
     /// Maximum approximate input bytes held by in-flight upload batches.
     #[arg(
         long,
-        env = "BT_SYNC_PUSH_MAX_IN_FLIGHT_BYTES",
+        env = "BRAINTRUST_SYNC_PUSH_MAX_IN_FLIGHT_BYTES",
         default_value_t = PUSH_MAX_IN_FLIGHT_INPUT_BYTES
     )]
     max_in_flight_bytes: usize,
