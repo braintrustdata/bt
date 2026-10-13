@@ -91,6 +91,33 @@ pub struct FunctionValidationIssue {
     pub suggestion: Option<FunctionValidationSuggestion>,
 }
 
+impl std::fmt::Display for FunctionValidationIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.path.is_empty() {
+            f.write_str(&self.code)?;
+        } else {
+            for (index, part) in self.path.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(".")?;
+                }
+                match part.as_str() {
+                    Some(part) => f.write_str(part)?,
+                    None => write!(f, "{part}")?,
+                }
+            }
+        }
+        write!(f, ": {}", self.message)?;
+        if let Some(suggestion) = &self.suggestion {
+            match (suggestion.action.as_str(), &suggestion.value) {
+                ("remove", _) => f.write_str("; suggestion: remove this parameter")?,
+                ("set", Some(value)) => write!(f, "; suggestion: set it to {value}")?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FunctionValidationResult {
     pub issues: Vec<FunctionValidationIssue>,
@@ -109,7 +136,13 @@ pub struct FunctionValidationError {
 
 impl std::fmt::Display for FunctionValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the backend rejected the function definition")
+        f.write_str("the backend rejected the function definition")?;
+        for result in &self.report.results {
+            for issue in &result.issues {
+                write!(f, "; {issue}")?;
+            }
+        }
+        Ok(())
     }
 }
 
