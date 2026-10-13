@@ -214,7 +214,7 @@ Remove-Item -Recurse -Force (Join-Path $userProfile ".braintrust\auth") -ErrorAc
 
 ## `bt observability template`
 
-Push with `--force` repairs duplicate topic map wiring by preserving the oldest map, breaking timestamp ties by function ID, and detaching extra maps from automations. The retained map keeps its customization and reports. Detached maps remain in the project and are listed in human and JSON push output.
+Push with `--force` replaces an imported facet's topic map binding in the selected automation. It reuses the map with the generated template slug, or creates that map if needed, and detaches superseded maps from that automation. Other automations keep their facet and map bindings. Detached map functions remain in the project and are listed in human and JSON push output. Existing generated state updates when the Topics pipeline runs again.
 
 ## `bt custom-views`
 
