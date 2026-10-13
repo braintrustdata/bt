@@ -385,7 +385,7 @@ fn eval_dev_server_streams_python_events() {
             format!("http://127.0.0.1:{mock_auth_port}"),
         )
         .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BT_EVAL_PYTHON_RUNNER", &python)
+        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -637,7 +637,7 @@ fn eval_dev_server_done_deferred_until_process_exit() {
             format!("http://127.0.0.1:{mock_api_port}"),
         )
         .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BT_EVAL_PYTHON_RUNNER", &python)
+        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
         .env("ATEXIT_MARKER_FILE", marker_path.to_string_lossy().as_ref())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -765,7 +765,7 @@ fn eval_dev_server_parent_accepted() {
             format!("http://127.0.0.1:{mock_auth_port}"),
         )
         .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BT_EVAL_PYTHON_RUNNER", &python)
+        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -877,7 +877,7 @@ fn eval_dev_server_parent_dict_accepted() {
             format!("http://127.0.0.1:{mock_auth_port}"),
         )
         .env("BRAINTRUST_API_KEY", "test-key")
-        .env("BT_EVAL_PYTHON_RUNNER", &python)
+        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

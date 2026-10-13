@@ -82,7 +82,7 @@ struct PipelineRunnerArgs {
     #[arg(
         long,
         short = 'r',
-        env = "BT_DATASET_PIPELINE_RUNNER",
+        env = "BRAINTRUST_DATASET_PIPELINE_RUNNER",
         value_name = "RUNNER"
     )]
     runner: Option<String>,
@@ -137,7 +137,7 @@ struct PipelinePullOptions {
     root_span_ids: Vec<String>,
 
     /// Relative time window for source ref discovery when --root-span-id is not set
-    #[arg(long, env = "BT_DATASET_PIPELINE_WINDOW", default_value = "1d")]
+    #[arg(long, env = "BRAINTRUST_DATASET_PIPELINE_WINDOW", default_value = "1d")]
     window: String,
 
     /// Page size for discovery BTQL pagination
@@ -658,7 +658,7 @@ fn build_pipeline_runner_command(
                 materialize_dataset_pipeline_runner(PY_RUNNER_FILE, PY_RUNNER_SOURCE)?;
             let python = python_runner::resolve_python_interpreter_for_roots(
                 runner.runner.as_deref(),
-                &["BT_DATASET_PIPELINE_PYTHON"],
+                &["BRAINTRUST_DATASET_PIPELINE_PYTHON"],
                 files,
             )
             .context("No Python interpreter found. Install python, create a virtualenv, or pass --runner.")?;

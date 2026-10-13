@@ -151,7 +151,7 @@ fn eval_fixtures() {
                 cmd.args(trailing_args);
             }
             cmd.current_dir(&dir);
-            cmd.env("BT_EVAL_LOCAL", "1");
+            cmd.env("BRAINTRUST_EVAL_LOCAL", "1");
             cmd.env(
                 "BRAINTRUST_API_KEY",
                 std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
@@ -165,12 +165,12 @@ fn eval_fixtures() {
 
             if runner.is_some() {
                 if let Some(tsx_path) = local_tsx_path(&dir) {
-                    cmd.env("BT_EVAL_RUNNER", tsx_path);
+                    cmd.env("BRAINTRUST_EVAL_RUNNER", tsx_path);
                 }
             }
 
             if let Some(python) = python_runner.as_ref() {
-                cmd.env("BT_EVAL_PYTHON_RUNNER", python);
+                cmd.env("BRAINTRUST_EVAL_PYTHON_RUNNER", python);
             }
 
             let expect_success = config.expect_success.unwrap_or(true);
@@ -226,7 +226,7 @@ fn eval_auto_instrumentation_failure_warns_and_continues() {
     let output = Command::new(bt_binary_path(&root))
         .args(["eval", "--sample", "5", "sample-init-dataset.eval.cjs"])
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env("BT_TEST_AUTO_INSTRUMENTATION_FAILURE", "1")
         .output()
         .expect("run eval with synthetic auto-instrumentation failure");
@@ -780,7 +780,7 @@ fn eval_matrix_param_single_runs_all_combinations() {
         .arg("--matrix-param")
         .arg("enableBashTool=true,false")
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env("BT_MATRIX_TEST_OUT", &out_file)
         .env(
             "BRAINTRUST_API_KEY",
@@ -835,7 +835,7 @@ fn eval_matrix_param_rejects_multiple_evals() {
         .arg("--matrix-param")
         .arg("model=a,b")
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env(
             "BRAINTRUST_API_KEY",
             std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
@@ -898,7 +898,7 @@ fn eval_matrix_param_terminate_on_failure_stops_early() {
         .arg("model=fail,ok,ok2")
         .arg("--terminate-on-failure")
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env("BT_MATRIX_TEST_OUT", &out_file)
         .env(
             "BRAINTRUST_API_KEY",
@@ -988,7 +988,7 @@ fn eval_javascript_max_concurrency_limits_evaluators() {
     let output = Command::new(bt_binary_path(&root))
         .args(["eval", "--max-concurrency", "2", "max-concurrency.eval.mjs"])
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env("BT_MAX_CONCURRENCY_TEST_OUT", &out_file)
         .output()
         .expect("run JavaScript eval with max concurrency");
@@ -1044,7 +1044,7 @@ fn eval_javascript_max_concurrency_limits_sampling() {
             "max-concurrency-sampling.eval.mjs",
         ])
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env("BT_MAX_CONCURRENCY_TEST_OUT", &out_file)
         .output()
         .expect("run JavaScript sampled eval with max concurrency");
@@ -1093,8 +1093,8 @@ fn eval_python_max_concurrency_limits_evaluators() {
     let output = Command::new(bt_binary_path(&root))
         .args(["eval", "--max-concurrency", "2", "eval_max_concurrency.py"])
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
-        .env("BT_EVAL_PYTHON_RUNNER", &python)
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_PYTHON_RUNNER", &python)
         .env("BT_MAX_CONCURRENCY_TEST_OUT", &out_file)
         .output()
         .expect("run Python eval with max concurrency");
@@ -1150,7 +1150,7 @@ fn eval_python_callable_list_data_preserves_parallel_scorers() {
         .arg(&python)
         .arg("eval_callable_parallelization.py")
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env("BT_PARALLEL_SCORE_OUT", &out_file)
         .env(
             "BRAINTRUST_API_KEY",
@@ -1219,7 +1219,7 @@ fn eval_python_sync_task_progress_wrapper_preserves_parallel_tasks() {
         .arg(&python)
         .arg("eval_sync_task_parallelization.py")
         .current_dir(&fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env("BT_SYNC_TASK_PARALLEL_OUT", &out_file)
         .env("BT_SYNC_TASK_SLEEP_S", "0.5")
         .env(
@@ -1290,7 +1290,7 @@ fn collect_deno_eval_diagnostics(dir: &Path, files: &[String]) -> Option<String>
     cmd.arg(runner_script_str);
     cmd.args(files);
     cmd.current_dir(dir);
-    cmd.env("BT_EVAL_LOCAL", "1");
+    cmd.env("BRAINTRUST_EVAL_LOCAL", "1");
     cmd.env(
         "BRAINTRUST_API_KEY",
         std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),
@@ -1354,7 +1354,7 @@ fn assert_watch_detects_dependency_change(
         .arg(runner)
         .arg(entry_file)
         .current_dir(fixture_dir)
-        .env("BT_EVAL_LOCAL", "1")
+        .env("BRAINTRUST_EVAL_LOCAL", "1")
         .env(
             "BRAINTRUST_API_KEY",
             std::env::var("BRAINTRUST_API_KEY").unwrap_or_else(|_| "local".to_string()),

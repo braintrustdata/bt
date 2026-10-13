@@ -70,7 +70,7 @@ struct StatusArgs {
     /// Window for status progress counts, for example 1h or 7d
     #[arg(
         long = "progress-window",
-        env = "BT_TOPICS_STATUS_PROGRESS_WINDOW",
+        env = "BRAINTRUST_TOPICS_STATUS_PROGRESS_WINDOW",
         value_name = "WINDOW"
     )]
     progress_window: Option<String>,
@@ -293,15 +293,15 @@ struct ReportArgs {
     function_id_positional: Option<String>,
 
     /// Topic map function ID
-    #[arg(long = "id", env = "BT_TOPICS_REPORT_FUNCTION_ID")]
+    #[arg(long = "id", env = "BRAINTRUST_TOPICS_REPORT_FUNCTION_ID")]
     id: Option<String>,
 
     /// Specific topic map version/xact ID
-    #[arg(long, env = "BT_TOPICS_REPORT_VERSION")]
+    #[arg(long, env = "BRAINTRUST_TOPICS_REPORT_VERSION")]
     version: Option<String>,
 
     /// Output file path. Omit to write the report JSON to stdout.
-    #[arg(long, env = "BT_TOPICS_REPORT_OUTPUT")]
+    #[arg(long, env = "BRAINTRUST_TOPICS_REPORT_OUTPUT")]
     output: Option<PathBuf>,
 }
 
@@ -326,15 +326,15 @@ struct BtmapArgs {
     function_id_positional: Option<String>,
 
     /// Topic map function ID
-    #[arg(long = "id", env = "BT_TOPICS_BTMAP_FUNCTION_ID")]
+    #[arg(long = "id", env = "BRAINTRUST_TOPICS_BTMAP_FUNCTION_ID")]
     id: Option<String>,
 
     /// Specific topic map version/xact ID
-    #[arg(long, env = "BT_TOPICS_BTMAP_VERSION")]
+    #[arg(long, env = "BRAINTRUST_TOPICS_BTMAP_VERSION")]
     version: Option<String>,
 
     /// Output file path. Omit to write the .btmap bytes to stdout.
-    #[arg(long, env = "BT_TOPICS_BTMAP_OUTPUT")]
+    #[arg(long, env = "BRAINTRUST_TOPICS_BTMAP_OUTPUT")]
     output: Option<PathBuf>,
 }
 

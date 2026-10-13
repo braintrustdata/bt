@@ -6,6 +6,7 @@
 - All user-facing/runtime configuration must be defined in `clap` arguments:
   - a CLI flag, and
   - for persistent configuration, a corresponding environment variable (`#[arg(env = ...)]`).
+- User-facing environment variables must use the `BRAINTRUST_` prefix (for example `BRAINTRUST_EVAL_WATCH`), matching the Braintrust SDKs. Do not add new `BT_*` names; `DEPRECATED_BT_ENV_VARS` in `src/env.rs` only keeps old names working. `BT_EVAL_*` / `BT_DATASET_PIPELINE_*` remain the internal protocol for runner subprocesses.
 - Entry points/runners should receive configuration from the CLI layer (via args/env that the CLI owns), not from independent, undocumented env lookups.
 - Extreme edge-case exceptions are allowed only when a flag is not feasible (for example, process-internal plumbing), and must be:
   - documented inline with a short rationale, and
