@@ -17,8 +17,8 @@ importers:
         specifier: 18.3.31
         version: 18.3.31
       braintrust:
-        specifier: 3.33.0
-        version: 3.33.0(zod@4.6.5)
+        specifier: 3.36.0
+        version: 3.36.0(zod@4.6.5)
       esbuild:
         specifier: 0.28.1
         version: 0.28.1
@@ -476,10 +476,10 @@ packages:
       }
     engines: { node: 20 || >=22 }
 
-  braintrust@3.33.0:
+  braintrust@3.36.0:
     resolution:
       {
-        integrity: sha512-C1S6iyppX9Rr2fHsytctWMCnMJeDRtWfFWa84o8JQylLl+rzLGpFHaVZxrPI0icOJ6qFnrTZOdzSYNF7xz1QPg==,
+        integrity: sha512-E6lzjWrLyOyU/rOdiDqCS1Sw+sb+DlqcKtR8W2lreXaogPd442nz9gxUVUw8QaXR3SVoso57K9wNxx5ppionrA==,
       }
     hasBin: true
     peerDependencies:
@@ -1381,7 +1381,7 @@ snapshots:
     dependencies:
       balanced-match: 4.0.4
 
-  braintrust@3.33.0(zod@4.6.5):
+  braintrust@3.36.0(zod@4.6.5):
     dependencies:
       "@next/env": 14.2.35
       "@types/react": 18.3.31

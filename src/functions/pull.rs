@@ -44,6 +44,8 @@ struct PullFunctionRow {
     #[serde(default)]
     function_data: Option<Value>,
     #[serde(default)]
+    function_type: Option<String>,
+    #[serde(default)]
     created: Option<String>,
     #[serde(default)]
     _xact_id: Option<String>,
@@ -239,11 +241,20 @@ pub async fn run(base: BaseArgs, args: PullArgs) -> Result<()> {
         } else {
             summary.unsupported_records_skipped += 1;
             if base.verbose {
-                eprintln!(
-                    "{} skipping '{}' because it is not a prompt",
-                    style("warning:").yellow(),
-                    row.slug
-                );
+                if row.function_type.as_deref() == Some("preprocessor") {
+                    eprintln!(
+                        "{} skipping '{}' because it is a preprocessor; use `bt preprocessors view {}`",
+                        style("warning:").yellow(),
+                        row.slug,
+                        row.slug
+                    );
+                } else {
+                    eprintln!(
+                        "{} skipping '{}' because it is not a prompt",
+                        style("warning:").yellow(),
+                        row.slug
+                    );
+                }
             }
         }
     }
@@ -1600,6 +1611,7 @@ mod tests {
             description: None,
             prompt_data: None,
             function_data: None,
+            function_type: None,
             created: None,
             _xact_id: None,
         };
@@ -1630,6 +1642,7 @@ mod tests {
                 description: None,
                 prompt_data: None,
                 function_data: None,
+                function_type: None,
                 created: None,
                 _xact_id: None,
             },
@@ -1642,6 +1655,7 @@ mod tests {
                 description: None,
                 prompt_data: None,
                 function_data: None,
+                function_type: None,
                 created: None,
                 _xact_id: None,
             },
@@ -1654,6 +1668,7 @@ mod tests {
                 description: None,
                 prompt_data: None,
                 function_data: None,
+                function_type: None,
                 created: None,
                 _xact_id: None,
             },
@@ -1687,6 +1702,7 @@ mod tests {
             description: None,
             prompt_data: None,
             function_data: None,
+            function_type: None,
             created: None,
             _xact_id: None,
         };
@@ -1713,6 +1729,7 @@ mod tests {
             description: None,
             prompt_data: None,
             function_data: None,
+            function_type: None,
             created: None,
             _xact_id: None,
         };
@@ -1785,6 +1802,7 @@ mod tests {
                 ]
             })),
             function_data: Some(serde_json::json!({ "type": "prompt" })),
+            function_type: None,
             created: None,
             _xact_id: Some("123".to_string()),
         };
@@ -1830,6 +1848,7 @@ mod tests {
                 }
             })),
             function_data: Some(serde_json::json!({ "type": "prompt" })),
+            function_type: None,
             created: None,
             _xact_id: Some("123".to_string()),
         };

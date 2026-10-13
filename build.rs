@@ -76,6 +76,7 @@ fn copy_preview_assets() {
         .current_dir(&manifest_dir)
         .arg("scripts/custom-views-assets.mjs")
         .arg(out_dir.join("custom-views.mjs"))
+        .arg(out_dir.join("preprocessors.mjs"))
         .status()
         .expect("failed to run node to bundle custom view SDK assets");
     assert!(

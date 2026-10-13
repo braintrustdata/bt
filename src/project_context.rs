@@ -5,7 +5,7 @@ use crate::{
     auth::{login, login_read_only},
     config,
     http::ApiClient,
-    projects::api::{get_project_by_name, Project},
+    projects::api::{get_project_by_name, list_projects, Project},
     ui::{is_interactive, select_project, ProjectSelectMode},
 };
 
@@ -48,6 +48,40 @@ pub(crate) async fn resolve_required_project(
     resolve_project_optional(base, client, allow_interactive_selection)
         .await?
         .ok_or_else(|| anyhow!("--project required (or set BRAINTRUST_DEFAULT_PROJECT)"))
+}
+
+pub(crate) async fn resolve_definition_project(
+    client: &ApiClient,
+    default_project: Option<&Project>,
+    project_id: Option<&str>,
+    project_name: Option<&str>,
+) -> Result<Option<Project>> {
+    if let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(project) = default_project.filter(|project| project.id == project_id) {
+            return Ok(Some(project.clone()));
+        }
+        let projects = list_projects(client).await?;
+        return projects
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .map(Some)
+            .ok_or_else(|| anyhow!("project id '{project_id}' not found"));
+    }
+
+    if let Some(project_name) = project_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(project) = default_project.filter(|project| project.name == project_name) {
+            return Ok(Some(project.clone()));
+        }
+        return get_project_by_name(client, project_name)
+            .await?
+            .map(Some)
+            .ok_or_else(|| anyhow!("project '{project_name}' not found"));
+    }
+
+    Ok(default_project.cloned())
 }
 
 pub(crate) async fn resolve_project_command_context_with_auth_mode(
