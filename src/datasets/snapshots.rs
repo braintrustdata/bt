@@ -105,13 +105,17 @@ pub(super) struct SnapshotCreateArgs {
     /// Transaction id to snapshot. Defaults to the dataset's current head xact.
     #[arg(
         long = "xact-id",
-        env = "BT_DATASETS_SNAPSHOT_XACT_ID",
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_XACT_ID",
         value_name = "XACT_ID"
     )]
     pub(super) xact_id: Option<String>,
 
     /// Optional snapshot description
-    #[arg(long, env = "BT_DATASETS_SNAPSHOT_DESCRIPTION", value_name = "TEXT")]
+    #[arg(
+        long,
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_DESCRIPTION",
+        value_name = "TEXT"
+    )]
     pub(super) description: Option<String>,
 }
 
@@ -135,7 +139,7 @@ pub(super) struct SnapshotDeleteTargetArgs {
     #[arg(
         long = "name",
         short = 'n',
-        env = "BT_DATASETS_SNAPSHOT_DELETE_NAME",
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_DELETE_NAME",
         value_name = "NAME",
         conflicts_with = "snapshot"
     )]
@@ -145,7 +149,7 @@ pub(super) struct SnapshotDeleteTargetArgs {
     #[arg(
         long = "snapshot",
         visible_alias = "version",
-        env = "BT_DATASETS_SNAPSHOT_DELETE_XACT_ID",
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_DELETE_XACT_ID",
         value_name = "XACT_ID",
         conflicts_with_all = ["name_positional", "name_flag"]
     )]
@@ -181,7 +185,7 @@ pub(super) struct SnapshotDeleteArgs {
     #[arg(
         long,
         short = 'f',
-        env = "BT_DATASETS_SNAPSHOT_DELETE_FORCE",
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_DELETE_FORCE",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -211,7 +215,7 @@ pub(super) struct SnapshotRestoreArgs {
     #[arg(
         long,
         short = 'n',
-        env = "BT_DATASETS_SNAPSHOT_RESTORE_NAME",
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_RESTORE_NAME",
         value_name = "NAME",
         conflicts_with = "snapshot"
     )]
@@ -221,7 +225,7 @@ pub(super) struct SnapshotRestoreArgs {
     #[arg(
         long = "snapshot",
         visible_alias = "version",
-        env = "BT_DATASETS_SNAPSHOT_RESTORE_XACT_ID",
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_RESTORE_XACT_ID",
         value_name = "XACT_ID",
         conflicts_with = "name"
     )]
@@ -231,7 +235,7 @@ pub(super) struct SnapshotRestoreArgs {
     #[arg(
         long,
         short = 'f',
-        env = "BT_DATASETS_SNAPSHOT_RESTORE_FORCE",
+        env = "BRAINTRUST_DATASETS_SNAPSHOT_RESTORE_FORCE",
         value_parser = BoolishValueParser::new(),
         default_value_t = false
     )]

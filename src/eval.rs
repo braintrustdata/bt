@@ -249,8 +249,9 @@ const PY_RUNNER_SOURCE: &str = include_str!("../scripts/eval-runner.py");
 // from within the same file via the local binding.
 const JS_RUNNER_FIRE_AND_FORGET_ENTRY: &str =
     "\nmain().catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n";
-const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] = &["BT_EVAL_PYTHON_RUNNER", "BT_EVAL_PYTHON"];
-const GO_TOOLCHAIN_ENV_OVERRIDES: &[&str] = &["BT_EVAL_GO_BIN", "BT_EVAL_GO"];
+const PYTHON_INTERPRETER_ENV_OVERRIDES: &[&str] =
+    &["BRAINTRUST_EVAL_PYTHON_RUNNER", "BRAINTRUST_EVAL_PYTHON"];
+const GO_TOOLCHAIN_ENV_OVERRIDES: &[&str] = &["BRAINTRUST_EVAL_GO_BIN", "BRAINTRUST_EVAL_GO"];
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 pub enum EvalLanguage {
@@ -278,14 +279,19 @@ pub struct EvalArgs {
     pub files: Vec<String>,
 
     /// Eval runner binary (e.g. tsx, bun, ts-node, deno, python, or a prebuilt Go eval binary). Defaults to tsx for JS files.
-    #[arg(long, short = 'r', env = "BT_EVAL_RUNNER", value_name = "RUNNER")]
+    #[arg(
+        long,
+        short = 'r',
+        env = "BRAINTRUST_EVAL_RUNNER",
+        value_name = "RUNNER"
+    )]
     pub runner: Option<String>,
 
     /// Force eval language instead of inferring from file extensions.
     #[arg(
         long,
         short = 'l',
-        env = "BT_EVAL_LANGUAGE",
+        env = "BRAINTRUST_EVAL_LANGUAGE",
         value_enum,
         value_name = "LANGUAGE"
     )]
@@ -295,7 +301,7 @@ pub struct EvalArgs {
     #[arg(
         long,
         alias = "no-send-logs",
-        env = "BT_EVAL_LOCAL",
+        env = "BRAINTRUST_EVAL_LOCAL",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub no_send_logs: bool,
@@ -303,7 +309,7 @@ pub struct EvalArgs {
     /// Output one JSON summary per evaluator.
     #[arg(
         long,
-        env = "BT_EVAL_JSONL",
+        env = "BRAINTRUST_EVAL_JSONL",
         value_parser = clap::builder::BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -312,7 +318,7 @@ pub struct EvalArgs {
     /// Stop after the first failing evaluator.
     #[arg(
         long,
-        env = "BT_EVAL_TERMINATE_ON_FAILURE",
+        env = "BRAINTRUST_EVAL_TERMINATE_ON_FAILURE",
         value_parser = clap::builder::BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -321,7 +327,7 @@ pub struct EvalArgs {
     /// Maximum number of evaluators to run concurrently.
     #[arg(
         long,
-        env = "BT_EVAL_MAX_CONCURRENCY",
+        env = "BRAINTRUST_EVAL_MAX_CONCURRENCY",
         value_name = "COUNT",
         value_parser = parse_positive_usize,
         conflicts_with = "dev"
@@ -329,13 +335,13 @@ pub struct EvalArgs {
     pub max_concurrency: Option<usize>,
 
     /// Number of worker threads for Python eval execution.
-    #[arg(long, env = "BT_EVAL_NUM_WORKERS", value_name = "COUNT")]
+    #[arg(long, env = "BRAINTRUST_EVAL_NUM_WORKERS", value_name = "COUNT")]
     pub num_workers: Option<usize>,
 
     /// List evaluators without executing them.
     #[arg(
         long,
-        env = "BT_EVAL_LIST",
+        env = "BRAINTRUST_EVAL_LIST",
         value_parser = clap::builder::BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -344,7 +350,7 @@ pub struct EvalArgs {
     /// Filter expression(s) used to select which evaluators to run.
     #[arg(
         long,
-        env = "BT_EVAL_FILTER",
+        env = "BRAINTRUST_EVAL_FILTER",
         value_name = "FILTER",
         value_delimiter = ','
     )]
@@ -353,7 +359,7 @@ pub struct EvalArgs {
     /// Run only the first N dataset records. Marks the run as non-final.
     #[arg(
         long,
-        env = "BT_EVAL_FIRST",
+        env = "BRAINTRUST_EVAL_FIRST",
         value_name = "N",
         value_parser = parse_positive_usize,
         conflicts_with = "sample"
@@ -363,7 +369,7 @@ pub struct EvalArgs {
     /// Run a deterministic random sample of N dataset records. Marks the run as non-final.
     #[arg(
         long,
-        env = "BT_EVAL_SAMPLE",
+        env = "BRAINTRUST_EVAL_SAMPLE",
         value_name = "N",
         value_parser = parse_positive_usize,
         conflicts_with = "first"
@@ -373,7 +379,7 @@ pub struct EvalArgs {
     /// Seed used with --sample.
     #[arg(
         long = "sample-seed",
-        env = "BT_EVAL_SAMPLE_SEED",
+        env = "BRAINTRUST_EVAL_SAMPLE_SEED",
         value_name = "SEED",
         requires = "sample"
     )]
@@ -382,7 +388,7 @@ pub struct EvalArgs {
     #[arg(
         long,
         short = 'w',
-        env = "BT_EVAL_WATCH",
+        env = "BRAINTRUST_EVAL_WATCH",
         value_parser = clap::builder::BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -421,7 +427,7 @@ pub struct EvalArgs {
     /// Disable automatic instrumentation of supported JavaScript LLM SDKs.
     #[arg(
         long,
-        env = "BT_EVAL_NO_AUTO_INSTRUMENTATION",
+        env = "BRAINTRUST_EVAL_NO_AUTO_INSTRUMENTATION",
         value_parser = clap::builder::BoolishValueParser::new(),
         default_value_t = false
     )]
@@ -430,29 +436,29 @@ pub struct EvalArgs {
     /// Start the eval dev web server.
     #[arg(
         long,
-        env = "BT_EVAL_DEV",
+        env = "BRAINTRUST_EVAL_DEV",
         value_parser = clap::builder::BoolishValueParser::new(),
         default_value_t = false
     )]
     pub dev: bool,
 
     /// Host interface for eval dev server.
-    #[arg(long, env = "BT_EVAL_DEV_HOST", default_value = "localhost")]
+    #[arg(long, env = "BRAINTRUST_EVAL_DEV_HOST", default_value = "localhost")]
     pub dev_host: String,
 
     /// Port for eval dev server.
-    #[arg(long, env = "BT_EVAL_DEV_PORT", default_value_t = 8300)]
+    #[arg(long, env = "BRAINTRUST_EVAL_DEV_PORT", default_value_t = 8300)]
     pub dev_port: u16,
 
     /// Restrict eval dev server access to a specific org name.
-    #[arg(long, env = "BT_EVAL_DEV_ORG_NAME")]
+    #[arg(long, env = "BRAINTRUST_EVAL_DEV_ORG_NAME")]
     pub dev_org_name: Option<String>,
 
     /// Additional allowed browser origin(s) for eval dev server CORS checks.
-    /// Repeat this flag or set BT_EVAL_DEV_ALLOWED_ORIGIN as a comma-separated list.
+    /// Repeat this flag or set BRAINTRUST_EVAL_DEV_ALLOWED_ORIGIN as a comma-separated list.
     #[arg(
         long = "dev-allowed-origin",
-        env = "BT_EVAL_DEV_ALLOWED_ORIGIN",
+        env = "BRAINTRUST_EVAL_DEV_ALLOWED_ORIGIN",
         value_name = "ORIGIN",
         value_delimiter = ','
     )]
@@ -2829,7 +2835,7 @@ fn build_go_command(runner_override: Option<&str>, files: &[String]) -> Result<C
 fn require_go_toolchain() -> Result<PathBuf> {
     go_runner::resolve_go_toolchain(GO_TOOLCHAIN_ENV_OVERRIDES).ok_or_else(|| {
         anyhow::anyhow!(
-            "No Go toolchain found. Install Go (https://go.dev/dl/), set BT_EVAL_GO_BIN, or pass a prebuilt eval binary with --runner."
+            "No Go toolchain found. Install Go (https://go.dev/dl/), set BRAINTRUST_EVAL_GO_BIN, or pass a prebuilt eval binary with --runner."
         )
     })
 }
@@ -4555,7 +4561,10 @@ mod tests {
             let dir = make_temp_dir("go-package");
             let json = go_list_json(&dir, "main", &["main.go", "classifier.go"], &[]);
             let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let result = expand_eval_file_globs_for_language(
                 &[dir.to_string_lossy().into_owned()],
@@ -4563,7 +4572,7 @@ mod tests {
             )
             .expect("package dir should expand");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
 
             // Sorted, absolute, and exactly what `go list` reported -- note neither
             // filename carries an `_eval.go` suffix.
@@ -4585,7 +4594,10 @@ mod tests {
             fs::write(dir.join("linux_only.go"), "package main").expect("constrained written");
             let json = go_list_json(&dir, "main", &["main.go"], &[]);
             let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let result = expand_eval_file_globs_for_language(
                 &[dir.to_string_lossy().into_owned()],
@@ -4593,7 +4605,7 @@ mod tests {
             )
             .expect("package dir should expand");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
 
             assert_eq!(result.len(), 1, "unexpected matches: {result:?}");
             assert!(result[0].ends_with("main.go"));
@@ -4607,7 +4619,10 @@ mod tests {
             let _guard = lock_env();
             let dir = make_temp_dir("go-empty");
             let fake_go = write_fake_go(&dir, "");
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let err = expand_eval_file_globs_for_language(
                 &[dir.to_string_lossy().into_owned()],
@@ -4615,7 +4630,7 @@ mod tests {
             )
             .expect_err("an empty package should fail");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
             assert!(format!("{err:#}").contains("no Go files found in package directory"));
 
             let _ = fs::remove_dir_all(&dir);
@@ -4650,12 +4665,15 @@ mod tests {
                 runner = go_runner::EVAL_RUNNER_IMPORT
             );
             let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let result = expand_eval_file_globs(&[dir.to_string_lossy().into_owned()])
                 .expect("go evals should be discovered");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
 
             assert_eq!(result.len(), 2, "unexpected matches: {result:?}");
             assert!(result[0].ends_with("classifier.go"), "got {result:?}");
@@ -4761,12 +4779,15 @@ mod tests {
             fs::write(dir.join("main.go"), "package main").expect("main written");
             let json = go_list_json(&dir, "main", &["main.go"], &[]);
             let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let cmd = build_go_command(None, &[dir.join("main.go").to_string_lossy().into_owned()])
                 .expect("go run command should build");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
 
             let std_cmd = cmd.as_std();
             assert_eq!(Path::new(std_cmd.get_program()), fake_go);
@@ -4792,12 +4813,15 @@ mod tests {
             fs::write(dir.join("lib.go"), "package lib").expect("lib written");
             let json = go_list_json(&dir, "lib", &["lib.go"], &[]);
             let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let err = build_go_command(None, &[dir.join("lib.go").to_string_lossy().into_owned()])
                 .expect_err("a library package should fail");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
             let message = format!("{err:#}");
             assert!(message.contains("not `package main`"), "got {message}");
 
@@ -4810,8 +4834,8 @@ mod tests {
             let dir = make_temp_dir("go-missing-toolchain");
             fs::write(dir.join("main.go"), "package main").expect("main written");
 
-            let go_bin = clear_env_var("BT_EVAL_GO_BIN");
-            let go_alt = clear_env_var("BT_EVAL_GO");
+            let go_bin = clear_env_var("BRAINTRUST_EVAL_GO_BIN");
+            let go_alt = clear_env_var("BRAINTRUST_EVAL_GO");
             let goroot = clear_env_var("GOROOT");
             let path = clear_env_var("PATH");
 
@@ -4821,8 +4845,8 @@ mod tests {
 
             restore_env_var("PATH", path);
             restore_env_var("GOROOT", goroot);
-            restore_env_var("BT_EVAL_GO", go_alt);
-            restore_env_var("BT_EVAL_GO_BIN", go_bin);
+            restore_env_var("BRAINTRUST_EVAL_GO", go_alt);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", go_bin);
             let _ = fs::remove_dir_all(&dir);
         }
 
@@ -4839,7 +4863,10 @@ mod tests {
             fs::write(dir.join("main_test.go"), "package main").expect("test written");
             let json = go_list_json(&dir, "main", &["main.go", "helper.go"], &[]);
             let fake_go = write_fake_go(&dir, &json);
-            let previous = set_env_var("BT_EVAL_GO_BIN", fake_go.to_str().expect("utf-8 path"));
+            let previous = set_env_var(
+                "BRAINTRUST_EVAL_GO_BIN",
+                fake_go.to_str().expect("utf-8 path"),
+            );
 
             let deps = collect_go_static_dependencies(&[dir
                 .join("main.go")
@@ -4847,7 +4874,7 @@ mod tests {
                 .into_owned()])
             .expect("dependencies should be collected");
 
-            restore_env_var("BT_EVAL_GO_BIN", previous);
+            restore_env_var("BRAINTRUST_EVAL_GO_BIN", previous);
 
             let names: Vec<String> = deps
                 .iter()
@@ -5718,7 +5745,11 @@ mod tests {
         let _guard = env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let keys = [
+            "BRAINTRUST_EVAL_FIRST",
+            "BRAINTRUST_EVAL_SAMPLE",
+            "BRAINTRUST_EVAL_SAMPLE_SEED",
+        ];
         let previous: Vec<(&str, Option<String>)> =
             keys.iter().map(|key| (*key, clear_env_var(key))).collect();
 
@@ -5737,7 +5768,11 @@ mod tests {
         let _guard = env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let keys = ["BT_EVAL_FIRST", "BT_EVAL_SAMPLE", "BT_EVAL_SAMPLE_SEED"];
+        let keys = [
+            "BRAINTRUST_EVAL_FIRST",
+            "BRAINTRUST_EVAL_SAMPLE",
+            "BRAINTRUST_EVAL_SAMPLE_SEED",
+        ];
         let previous: Vec<(&str, Option<String>)> =
             keys.iter().map(|key| (*key, clear_env_var(key))).collect();
 
@@ -5764,7 +5799,7 @@ mod tests {
         let _guard = env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = clear_env_var("BT_EVAL_MAX_CONCURRENCY");
+        let previous = clear_env_var("BRAINTRUST_EVAL_MAX_CONCURRENCY");
 
         let parsed =
             EvalArgsHarness::try_parse_from(["bt", "--max-concurrency", "2", "sample.eval.ts"])
@@ -5792,14 +5827,14 @@ mod tests {
         assert!(message.contains("--max-concurrency"));
         assert!(message.contains("--dev"));
 
-        set_env_var("BT_EVAL_MAX_CONCURRENCY", "2");
+        set_env_var("BRAINTRUST_EVAL_MAX_CONCURRENCY", "2");
         let err = EvalArgsHarness::try_parse_from(["bt", "--dev", "sample.eval.ts"])
             .expect_err("max concurrency env var with dev mode should fail");
         let message = err.to_string();
         assert!(message.contains("--max-concurrency"));
         assert!(message.contains("--dev"));
 
-        restore_env_var("BT_EVAL_MAX_CONCURRENCY", previous);
+        restore_env_var("BRAINTRUST_EVAL_MAX_CONCURRENCY", previous);
     }
 
     #[test]
@@ -5808,34 +5843,37 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let keys = [
-            "BT_EVAL_JSONL",
-            "BT_EVAL_TERMINATE_ON_FAILURE",
-            "BT_EVAL_NUM_WORKERS",
-            "BT_EVAL_LIST",
-            "BT_EVAL_FILTER",
-            "BT_EVAL_FIRST",
-            "BT_EVAL_SAMPLE",
-            "BT_EVAL_SAMPLE_SEED",
-            "BT_EVAL_WATCH",
-            "BT_EVAL_NO_AUTO_INSTRUMENTATION",
-            "BT_EVAL_DEV",
-            "BT_EVAL_DEV_HOST",
-            "BT_EVAL_DEV_PORT",
-            "BT_EVAL_DEV_ORG_NAME",
+            "BRAINTRUST_EVAL_JSONL",
+            "BRAINTRUST_EVAL_TERMINATE_ON_FAILURE",
+            "BRAINTRUST_EVAL_NUM_WORKERS",
+            "BRAINTRUST_EVAL_LIST",
+            "BRAINTRUST_EVAL_FILTER",
+            "BRAINTRUST_EVAL_FIRST",
+            "BRAINTRUST_EVAL_SAMPLE",
+            "BRAINTRUST_EVAL_SAMPLE_SEED",
+            "BRAINTRUST_EVAL_WATCH",
+            "BRAINTRUST_EVAL_NO_AUTO_INSTRUMENTATION",
+            "BRAINTRUST_EVAL_DEV",
+            "BRAINTRUST_EVAL_DEV_HOST",
+            "BRAINTRUST_EVAL_DEV_PORT",
+            "BRAINTRUST_EVAL_DEV_ORG_NAME",
         ];
         let previous: Vec<(&str, Option<String>)> =
             keys.iter().map(|key| (*key, clear_env_var(key))).collect();
-        set_env_var("BT_EVAL_JSONL", "true");
-        set_env_var("BT_EVAL_TERMINATE_ON_FAILURE", "1");
-        set_env_var("BT_EVAL_NUM_WORKERS", "4");
-        set_env_var("BT_EVAL_LIST", "yes");
-        set_env_var("BT_EVAL_FILTER", "metadata.case=smoke.*,metadata.kind=fast");
-        set_env_var("BT_EVAL_WATCH", "on");
-        set_env_var("BT_EVAL_NO_AUTO_INSTRUMENTATION", "true");
-        set_env_var("BT_EVAL_DEV", "true");
-        set_env_var("BT_EVAL_DEV_HOST", "127.0.0.1");
-        set_env_var("BT_EVAL_DEV_PORT", "9999");
-        set_env_var("BT_EVAL_DEV_ORG_NAME", "acme");
+        set_env_var("BRAINTRUST_EVAL_JSONL", "true");
+        set_env_var("BRAINTRUST_EVAL_TERMINATE_ON_FAILURE", "1");
+        set_env_var("BRAINTRUST_EVAL_NUM_WORKERS", "4");
+        set_env_var("BRAINTRUST_EVAL_LIST", "yes");
+        set_env_var(
+            "BRAINTRUST_EVAL_FILTER",
+            "metadata.case=smoke.*,metadata.kind=fast",
+        );
+        set_env_var("BRAINTRUST_EVAL_WATCH", "on");
+        set_env_var("BRAINTRUST_EVAL_NO_AUTO_INSTRUMENTATION", "true");
+        set_env_var("BRAINTRUST_EVAL_DEV", "true");
+        set_env_var("BRAINTRUST_EVAL_DEV_HOST", "127.0.0.1");
+        set_env_var("BRAINTRUST_EVAL_DEV_PORT", "9999");
+        set_env_var("BRAINTRUST_EVAL_DEV_ORG_NAME", "acme");
 
         let parsed = EvalArgsHarness::try_parse_from(["bt", "sample.eval.ts"])
             .expect("env vars should parse into eval args");

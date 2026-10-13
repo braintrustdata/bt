@@ -2,9 +2,9 @@
   "name": "bt-eval-vite-node-cjs",
   "private": true,
   "dependencies": {
-    "@types/micromatch": "^4.0.10",
+    "@types/picomatch": "^4.0.3",
     "braintrust": "^3.37.0",
-    "micromatch": "^4.0.8",
+    "picomatch": "^4.0.7",
     "vite-node": "^6.0.0"
   }
 }

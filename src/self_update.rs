@@ -2,6 +2,7 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::fs;
@@ -133,15 +134,26 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
     }
 
     ensure_installer_managed_install()?;
+    // Capture this before replacement: current_exe() may no longer resolve the
+    // original pathname after the installer unlinks the running executable.
+    let exe = env::current_exe().context("failed to resolve current executable path")?;
 
     if args.check {
         check_for_update(base, channel).await?;
         return Ok(());
     }
 
+    with_spinner(
+        "Stopping tracing daemon...",
+        run_trace_command(&exe, &["stop"], base.quiet),
+    )
+    .await
+    .context("failed to stop tracing; refusing to upgrade while tracing could still be running. Run `bt trace stop` before retrying `bt update`")?;
+
     if channel == UpdateChannel::Stable {
         match with_spinner("Checking for updates...", fetch_release(base, channel)).await {
             Ok(release) if stable_is_up_to_date(env!("CARGO_PKG_VERSION"), &release.tag_name) => {
+                update_trace_plugins(base, &exe).await?;
                 print_check(base, channel, &release)?;
                 return Ok(());
             }
@@ -163,7 +175,62 @@ async fn run_update(base: &BaseArgs, args: UpdateArgs) -> Result<()> {
         );
         return Err(err);
     }
+    update_trace_plugins(base, &exe).await.map_err(|error| {
+        anyhow::anyhow!("bt was updated, but tracing plugin updates failed: {error:#}")
+    })?;
     print_update_completed(base, channel)
+}
+
+async fn update_trace_plugins(base: &BaseArgs, exe: &Path) -> Result<()> {
+    // Enable writes this agent-owned settings file; disable removes it. Use
+    // the runtime's command registry and path resolver rather than maintaining
+    // a second list of supported agents or their configuration locations.
+    let agents = bt_daemon::SetupAgent::augment_subcommands(clap::Command::new("plugins"));
+    let agents: Vec<_> = agents
+        .get_subcommands()
+        .map(|agent| {
+            let source = agent.get_name().to_string();
+            let settings = bt_daemon::paths::agent_settings_path(&source, None);
+            (source, settings)
+        })
+        .collect();
+    let mut failures = Vec::new();
+    for (source, settings) in &agents {
+        // A settings override (e.g. BT_DAEMON_CONFIG) points every agent at
+        // one file, so its existence does not say which agents are enabled.
+        if agents.iter().filter(|(_, path)| path == settings).count() > 1 {
+            if settings.exists() {
+                eprintln!(
+                    "warning: skipping {source} plugin update: tracing settings at {} are shared by multiple agents; run `bt trace update {source}` if it is enabled",
+                    settings.display()
+                );
+            }
+            continue;
+        }
+        let result = match settings.try_exists() {
+            Ok(false) => continue,
+            Ok(true) => {
+                // Run the installed binary, not this process's old embedded
+                // runtime: some integrations ship their plugin assets in bt.
+                run_trace_command(exe, &["update", source], base.quiet).await
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to inspect tracing settings at {}",
+                    settings.display()
+                )
+            }),
+        };
+        if let Err(error) = result {
+            failures.push(format!(
+                "{source}: {error:#}; retry with `bt trace update {source}`"
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("failed to update tracing plugins:\n{}", failures.join("\n"));
+    }
+    Ok(())
 }
 
 fn print_update_completed(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
@@ -459,6 +526,63 @@ async fn run_installer(base: &BaseArgs, channel: UpdateChannel) -> Result<()> {
             anyhow::bail!("installer exited with status {status}");
         }
         Ok(())
+    }
+}
+
+const TRACE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run `bt trace <args> --no-input` with the given executable, relaying its
+/// stdout to stderr and failing if it does not finish within the timeout.
+async fn run_trace_command(exe: &Path, args: &[&str], quiet: bool) -> Result<()> {
+    let display = format!("bt trace {}", args.join(" "));
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .arg("trace")
+        .args(args)
+        .arg("--no-input")
+        .stdin(Stdio::null())
+        .stdout(if quiet { Stdio::null() } else { Stdio::piped() })
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run `{display}`"))?;
+    let stdout = child.stdout.take();
+    let run = async {
+        if let Some(mut stdout) = stdout {
+            relay_to_stderr(&mut stdout)
+                .await
+                .with_context(|| format!("failed to relay `{display}` output"))?;
+        }
+        child
+            .wait()
+            .await
+            .with_context(|| format!("failed to wait for `{display}`"))
+    };
+    let status = tokio::time::timeout(TRACE_COMMAND_TIMEOUT, run)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "`{display}` did not finish within {}s",
+                TRACE_COMMAND_TIMEOUT.as_secs()
+            )
+        })??;
+    if !status.success() {
+        anyhow::bail!("`{display}` exited with status {status}");
+    }
+    Ok(())
+}
+
+async fn relay_to_stderr(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> io::Result<()> {
+    use std::io::Write;
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        io::stderr().write_all(&buf[..read])?;
     }
 }
 

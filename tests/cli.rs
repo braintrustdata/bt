@@ -1867,7 +1867,9 @@ fn custom_views_replaces_old_views_command() {
         .args(["custom-views", "push", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("BT_CUSTOM_VIEWS_PUSH_FILES"));
+        .stdout(predicate::str::contains(
+            "BRAINTRUST_CUSTOM_VIEWS_PUSH_FILES",
+        ));
 }
 
 #[test]
@@ -2002,7 +2004,7 @@ fn custom_views_bootstrap_accepts_named_and_env_names_with_positional_precedence
             let dir = tempfile::tempdir().expect("tempdir");
             bt_command()
                 .current_dir(dir.path())
-                .env("BT_CUSTOM_VIEWS_BOOTSTRAP_NAME", "Env View")
+                .env("BRAINTRUST_CUSTOM_VIEWS_BOOTSTRAP_NAME", "Env View")
                 .args(["custom-views", kind, "bootstrap"])
                 .args(inputs)
                 .args(["--file", "test.view.tsx"])
@@ -2032,7 +2034,7 @@ fn custom_views_preview_accepts_named_and_env_paths_with_positional_precedence()
             let dir = tempfile::tempdir().expect("tempdir");
             bt_command()
                 .current_dir(dir.path())
-                .env("BT_CUSTOM_VIEWS_PREVIEW_FILE", "env.view.tsx")
+                .env("BRAINTRUST_CUSTOM_VIEWS_PREVIEW_FILE", "env.view.tsx")
                 .args(["custom-views", kind, "preview"])
                 .args(inputs)
                 .assert()
@@ -2049,8 +2051,8 @@ fn custom_views_bootstrap_and_preview_require_primary_inputs() {
     for kind in ["trace", "dataset"] {
         for command in ["bootstrap", "preview"] {
             bt_command()
-                .env_remove("BT_CUSTOM_VIEWS_BOOTSTRAP_NAME")
-                .env_remove("BT_CUSTOM_VIEWS_PREVIEW_FILE")
+                .env_remove("BRAINTRUST_CUSTOM_VIEWS_BOOTSTRAP_NAME")
+                .env_remove("BRAINTRUST_CUSTOM_VIEWS_PREVIEW_FILE")
                 .args(["custom-views", kind, command])
                 .assert()
                 .failure()
