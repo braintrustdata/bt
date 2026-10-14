@@ -227,6 +227,8 @@ New automations use the bundled settings. Existing automations with matching set
 
 Settings scoped to a specific experiment cannot be exported because its ID is project-specific. Timing validation and normalization remain with the server; settings returned by the API may differ from the submitted values. Topic map definitions and generated state are not exported. Topics update when the pipeline runs again.
 
+Push with `--force` replaces an imported facet's topic map binding in the selected automation. It reuses the map with the generated template slug, or creates that map if needed, and detaches superseded maps from that automation. Other automations keep their facet and map bindings. Detached map functions remain in the project and are listed in human and JSON push output. Existing generated state updates when the Topics pipeline runs again.
+
 ## `bt custom-views`
 
 Define custom views with `customTraceView` or `customDatasetView` from `braintrust/custom-views` (SDK 3.33.0 or later).
