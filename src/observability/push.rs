@@ -17,8 +17,9 @@ use super::template::{
     add_topics_functions, default_topics_config, embedding_model, is_loop_config, is_topics,
     loop_config_for_target, new_topic_map_request, reconciled_topic_map_request,
     remove_topics_functions, saved_preprocessor_slug, topic_map_ids, topic_map_matches,
-    topic_map_slug, with_preprocessor_id, ActiveObservabilityTemplate, AutomationTemplate,
-    FacetTemplate, PortableFunction, DEFAULT_TOPICS_DESCRIPTION,
+    topic_map_slug, topics_config_for_target, topics_settings, validate_topics_scope,
+    with_preprocessor_id, ActiveObservabilityTemplate, AutomationTemplate, FacetTemplate,
+    PortableFunction, DEFAULT_TOPICS_DESCRIPTION,
 };
 
 #[derive(Debug)]
@@ -67,6 +68,7 @@ struct TopicsMutation {
     target: TopicsTarget,
     embedding_model: String,
     config: Value,
+    description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +91,9 @@ pub(crate) fn plan(
     topics_override: Option<&str>,
     force: bool,
 ) -> Result<MutationPlan> {
+    if topics_override.is_none() {
+        validate_topics_scope(template)?;
+    }
     let functions_by_slug = functions_by_slug(&snapshot.functions);
     let functions_by_id = snapshot
         .functions
@@ -194,10 +199,15 @@ pub(crate) fn plan(
             TopicsTarget::Existing(automation) => add_topics_functions(&automation.config, &[])?,
             TopicsTarget::New(_) => default_topics_config(),
         };
+        let description = match &target {
+            TopicsTarget::Existing(automation) => automation.description.clone(),
+            TopicsTarget::New(_) => Some(DEFAULT_TOPICS_DESCRIPTION.to_string()),
+        };
         topics.entry(key.clone()).or_insert(TopicsMutation {
             target,
             embedding_model: model,
             config,
+            description,
         });
         plan_topics_removals(
             &mut topics,
@@ -213,6 +223,32 @@ pub(crate) fn plan(
             topic_map: topic_map.cloned(),
             topics_key: key,
         });
+    }
+
+    if topics_override.is_none() {
+        for mutation in topics.values_mut() {
+            let name = match &mutation.target {
+                TopicsTarget::Existing(automation) => &automation.name,
+                TopicsTarget::New(name) => name,
+            };
+            let Some(settings) = template
+                .topics_automations
+                .iter()
+                .find(|settings| &settings.name == name)
+            else {
+                continue;
+            };
+            if let TopicsTarget::Existing(existing) = &mutation.target {
+                if !force
+                    && (topics_settings(&existing.config)? != settings.config
+                        || existing.description != settings.description)
+                {
+                    bail!("Topics automation '{name}' has different settings; use --force to replace them or --topics-automation to use the destination settings");
+                }
+            }
+            mutation.config = topics_config_for_target(&settings.config, &mutation.config)?;
+            mutation.description = settings.description.clone();
+        }
     }
 
     let loops = template
@@ -299,6 +335,7 @@ fn plan_topics_removals(
                 topics.insert(
                     key,
                     TopicsMutation {
+                        description: automation.description.clone(),
                         target: TopicsTarget::Existing(automation.clone()),
                         embedding_model: embedding_model(automation, functions_by_id),
                         config,
@@ -559,7 +596,7 @@ pub(crate) async fn execute(
             TopicsTarget::Existing(automation) => {
                 let body = json!({
                     "name": automation.name,
-                    "description": automation.description,
+                    "description": mutation.description,
                     "config": config,
                 });
                 patch_project_automation(client, &automation.id, &body)
@@ -572,7 +609,7 @@ pub(crate) async fn execute(
                 let body = json!({
                     "project_id": project_id,
                     "name": name,
-                    "description": DEFAULT_TOPICS_DESCRIPTION,
+                    "description": mutation.description,
                     "config": config,
                 });
                 let created = create_project_automation(client, &body)
@@ -644,9 +681,7 @@ async fn upsert_function(client: &ApiClient, request: &Value, replace: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability::template::{
-        deduplicate_preprocessors, validate, KIND, SCHEMA_VERSION,
-    };
+    use crate::observability::template::{deduplicate_preprocessors, validate, KIND};
 
     fn facet(topics: Option<&str>) -> FacetTemplate {
         FacetTemplate {
@@ -665,8 +700,9 @@ mod tests {
     fn template(facet: FacetTemplate) -> ActiveObservabilityTemplate {
         ActiveObservabilityTemplate {
             kind: KIND.to_string(),
-            schema_version: SCHEMA_VERSION,
+            schema_version: 1,
             facets: vec![facet],
+            topics_automations: Vec::new(),
             automations: Vec::new(),
         }
     }
@@ -813,8 +849,9 @@ mod tests {
         deduplicate_preprocessors(&mut facets);
         let source = ActiveObservabilityTemplate {
             kind: KIND.to_string(),
-            schema_version: SCHEMA_VERSION,
+            schema_version: 1,
             facets,
+            topics_automations: Vec::new(),
             automations: Vec::new(),
         };
         validate(&source).expect("valid shared preprocessor template");
@@ -925,8 +962,9 @@ mod tests {
         let wrong_loop = plan(
             &ActiveObservabilityTemplate {
                 kind: KIND.to_string(),
-                schema_version: SCHEMA_VERSION,
+                schema_version: 1,
                 facets: Vec::new(),
+                topics_automations: Vec::new(),
                 automations: vec![AutomationTemplate {
                     name: "Test automation".to_string(),
                     description: None,
@@ -942,5 +980,262 @@ mod tests {
         )
         .expect_err("wrong automation type");
         assert!(wrong_loop.to_string().contains("not a Loop"));
+    }
+
+    fn scoped_template() -> ActiveObservabilityTemplate {
+        let mut source = template(facet(Some("Test scoped Topics")));
+        source.schema_version = 2;
+        source.topics_automations = vec![AutomationTemplate {
+            name: "Test scoped Topics".to_string(),
+            description: Some("Test span policy".to_string()),
+            config: json!({"event_type":"topic", "scope":{"type":"span"},
+                "data_scope":{"type":"project_logs"}, "btql_filter":"metadata.test_enabled = true",
+                "sampling_rate":1, "model":"test-model", "status":"active", "rerun_seconds":86400,
+                "backfill_time_range":"604800s"}),
+        }];
+        source
+    }
+
+    #[test]
+    fn active_observability_v2_pull_push_round_trip_creates_bundled_settings() {
+        use crate::observability::template::from_remote;
+        let expected = scoped_template();
+        let settings = &expected.topics_automations[0];
+        let source_facet = existing_function("test-facet", "facet", "facet");
+        let mut source_map = existing_function("test-facet-topic-map", "classifier", "topic_map");
+        source_map.function_data = Some(
+            json!({"type":"topic_map", "source_facet_function":{"type":"function", "id":source_facet.id}}),
+        );
+        let mut remote = automation("test-source-automation", &settings.name, "topic");
+        remote.description = settings.description.clone();
+        remote.config = add_topics_functions(
+            &topics_config_for_target(&settings.config, &json!({})).unwrap(),
+            &[(source_facet.id.clone(), source_map.id.clone())],
+        )
+        .unwrap();
+        let pulled = from_remote(&[source_facet, source_map], &[remote]).unwrap();
+        let source = serde_json::from_str(&serde_json::to_string(&pulled).unwrap()).unwrap();
+        validate(&source).unwrap();
+        assert_eq!(source.topics_automations, expected.topics_automations);
+        let planned = plan(
+            &source,
+            Snapshot {
+                functions: vec![],
+                automations: vec![],
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        let mutation = &planned.topics["new:Test scoped Topics"];
+        assert_eq!(topics_settings(&mutation.config).unwrap(), settings.config);
+        assert_eq!(mutation.description, settings.description);
+        assert_eq!(mutation.config["facet_functions"], json!([]));
+        assert_eq!(mutation.config["topic_map_functions"], json!([]));
+    }
+
+    #[test]
+    fn active_observability_v2_matching_settings_do_not_require_force() {
+        let source = scoped_template();
+        let settings = &source.topics_automations[0];
+        let mut existing = automation("test-existing-automation", &settings.name, "topic");
+        existing.config = topics_config_for_target(&settings.config, &json!({})).unwrap();
+        existing.description = settings.description.clone();
+        let planned = plan(
+            &source,
+            Snapshot {
+                functions: vec![],
+                automations: vec![existing.clone()],
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            planned.topics["id:test-existing-automation"].config,
+            existing.config
+        );
+        assert_eq!(
+            planned.topics["id:test-existing-automation"].description,
+            existing.description
+        );
+    }
+
+    #[test]
+    fn active_observability_v2_differing_settings_require_force_and_keep_wiring() {
+        let mut source = scoped_template();
+        source.topics_automations[0].description = None;
+        let mut existing = automation("test-existing-automation", "Test scoped Topics", "topic");
+        existing.description = Some("Test destination description".to_string());
+        existing.config = add_topics_functions(
+            &default_topics_config(),
+            &[(
+                "fn-test-other-facet".to_string(),
+                "fn-test-other-map".to_string(),
+            )],
+        )
+        .unwrap();
+        existing.config["test_destination_only"] = json!(true);
+        let snapshot = || Snapshot {
+            functions: vec![],
+            automations: vec![existing.clone()],
+        };
+        assert!(plan(&source, snapshot(), None, false)
+            .unwrap_err()
+            .to_string()
+            .contains("--force"));
+        let planned = plan(&source, snapshot(), None, true).unwrap();
+        let mutation = &planned.topics["id:test-existing-automation"];
+        assert_eq!(
+            topics_settings(&mutation.config).unwrap(),
+            source.topics_automations[0].config
+        );
+        assert_eq!(
+            mutation.config["facet_functions"],
+            existing.config["facet_functions"]
+        );
+        assert_eq!(
+            mutation.config["topic_map_functions"],
+            existing.config["topic_map_functions"]
+        );
+        assert!(mutation.description.is_none());
+    }
+
+    #[test]
+    fn active_observability_v2_override_uses_destination_settings() {
+        let mut source = scoped_template();
+        source.topics_automations[0].config["data_scope"] =
+            json!({"type":"experiment", "experiment_id":"test-experiment-id"});
+        source.topics_automations[0].config["backfill_time_range"] = json!("server-owned-value");
+        let existing = automation(
+            "test-destination-automation",
+            "Test destination Topics",
+            "topic",
+        );
+        let planned = plan(
+            &source,
+            Snapshot {
+                functions: vec![],
+                automations: vec![existing.clone()],
+            },
+            Some("test-destination-automation"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(planned.topics.len(), 1);
+        let mutation = &planned.topics["id:test-destination-automation"];
+        assert_eq!(mutation.config, existing.config);
+        assert_eq!(mutation.description, existing.description);
+    }
+
+    #[tokio::test]
+    async fn active_observability_v2_execute_sends_settings_description_and_wiring() {
+        use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+        use std::{
+            net::TcpListener,
+            sync::{Arc, Mutex},
+        };
+
+        type RecordedRequests = Arc<Mutex<Vec<(String, String, Value)>>>;
+        let requests: RecordedRequests = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let state = web::Data::new(requests.clone());
+        let server = HttpServer::new(move || {
+            App::new().app_data(state.clone()).default_service(web::to(
+                |request: HttpRequest,
+                 body: web::Json<Value>,
+                 state: web::Data<RecordedRequests>| async move {
+                    let mut response = body.into_inner();
+                    state.lock().unwrap().push((
+                        request.method().to_string(),
+                        request.path().to_string(),
+                        response.clone(),
+                    ));
+                    match (request.method().as_str(), request.path()) {
+                        ("PUT", "/v1/function") => {
+                            response["id"] = if response["function_type"] == "facet" {
+                                json!("fn-test-facet")
+                            } else {
+                                json!("fn-test-map")
+                            };
+                        }
+                        ("PATCH", "/v1/project_automation/test-existing-automation") => {
+                            response["id"] = json!("test-existing-automation");
+                            response["project_id"] = json!("test-project-id");
+                        }
+                        _ => return HttpResponse::NotFound().finish(),
+                    }
+                    HttpResponse::Ok().json(response)
+                },
+            ))
+        })
+        .workers(1)
+        .listen(listener)
+        .unwrap()
+        .run();
+        let handle = server.handle();
+        tokio::spawn(server);
+        let login = braintrust_sdk_rust::LoginState::new();
+        login.set(
+            "test-key".to_string(),
+            "test-org-id".to_string(),
+            "test-org".to_string(),
+            api_url.clone(),
+            "https://example.invalid".to_string(),
+        );
+        let client = ApiClient::new(&crate::auth::LoginContext {
+            login,
+            api_url,
+            app_url: "https://example.invalid".to_string(),
+            profile: None,
+        })
+        .unwrap();
+
+        let mut source = scoped_template();
+        source.topics_automations[0].description = None;
+        let mut facet = existing_function("test-facet", "facet", "facet");
+        facet.id = "fn-test-facet".to_string();
+        let mut map = existing_function("test-facet-topic-map", "classifier", "topic_map");
+        map.id = "fn-test-map".to_string();
+        map.function_data = Some(
+            json!({"type": "topic_map", "source_facet_function": {"type": "function", "id": facet.id}}),
+        );
+        let mut automation = automation("test-existing-automation", "Test scoped Topics", "topic");
+        automation.description = Some("Test old description".to_string());
+        automation.config =
+            add_topics_functions(&automation.config, &[(facet.id.clone(), map.id.clone())])
+                .unwrap();
+        let planned = plan(
+            &source,
+            Snapshot {
+                functions: vec![facet, map],
+                automations: vec![automation],
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        let result = execute(&client, "test-project-id", planned).await;
+        handle.stop(true).await;
+        assert_eq!(result.unwrap().facets[0].id, "fn-test-facet");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].0, "PUT");
+        assert_eq!(requests[1].0, "PUT");
+        assert_eq!(requests[2].0, "PATCH");
+        let body = &requests[2].2;
+        assert_eq!(body["name"], "Test scoped Topics");
+        assert!(body["description"].is_null());
+        assert_eq!(body["config"]["scope"], json!({"type": "span"}));
+        assert_eq!(
+            body["config"]["btql_filter"],
+            "metadata.test_enabled = true"
+        );
+        assert_eq!(body["config"]["facet_functions"][0]["id"], "fn-test-facet");
+        assert_eq!(
+            body["config"]["topic_map_functions"][0]["function"]["id"],
+            "fn-test-map"
+        );
     }
 }

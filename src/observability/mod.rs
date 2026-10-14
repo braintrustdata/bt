@@ -28,7 +28,7 @@ pub(crate) struct ObservabilityArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum ObservabilityCommand {
-    /// Pull and push facets and Loop automations as a portable template
+    /// Pull and push facets, Topics settings, and Loop automations as a portable template
     Template(TemplateArgs),
 }
 
@@ -47,9 +47,9 @@ struct TemplateArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 enum TemplateCommand {
-    /// Pull facets and Loop automations into a portable template
+    /// Pull facets, Topics settings, and Loop automations into a portable template
     Pull(PullArgs),
-    /// Push facets and Loop automations from a portable template
+    /// Push facets, Topics settings, and Loop automations from a portable template
     Push(PushArgs),
 }
 

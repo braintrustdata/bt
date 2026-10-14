@@ -7,10 +7,11 @@ use serde_json::{json, Map, Value};
 use crate::{functions::api::Function, topics::api::ProjectAutomation};
 
 pub(crate) const KIND: &str = "active_observability_template";
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "brain-embedding-1";
 pub(crate) const DEFAULT_TOPICS_DESCRIPTION: &str =
     "Automatically extract facets and classify logs using topic maps";
+const WIRING_KEYS: [&str; 2] = ["facet_functions", "topic_map_functions"];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub(crate) struct ActiveObservabilityTemplate {
@@ -18,6 +19,8 @@ pub(crate) struct ActiveObservabilityTemplate {
     pub schema_version: u32,
     #[serde(default)]
     pub facets: Vec<FacetTemplate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics_automations: Vec<AutomationTemplate>,
     #[serde(default)]
     pub automations: Vec<AutomationTemplate>,
 }
@@ -97,6 +100,25 @@ pub(crate) fn from_remote(
         .collect::<Result<Vec<_>>>()?;
     facet_templates.sort_by(|a, b| a.name.cmp(&b.name).then(a.slug.cmp(&b.slug)));
 
+    let names = facet_templates
+        .iter()
+        .filter_map(|facet| facet.topics_automation.as_deref())
+        .collect::<HashSet<_>>();
+    let mut topics_templates = automations
+        .iter()
+        .filter(|automation| {
+            is_topics(&automation.config) && names.contains(automation.name.as_str())
+        })
+        .map(|automation| {
+            Ok(AutomationTemplate {
+                name: automation.name.clone(),
+                description: automation.description.clone(),
+                config: topics_settings(&automation.config)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    topics_templates.sort_by(|a, b| a.name.cmp(&b.name));
+
     let mut loop_templates = automations
         .iter()
         .filter(|automation| is_loop_config(&automation.config))
@@ -116,6 +138,7 @@ pub(crate) fn from_remote(
         kind: KIND.to_string(),
         schema_version: SCHEMA_VERSION,
         facets: facet_templates,
+        topics_automations: topics_templates,
         automations: loop_templates,
     })
 }
@@ -255,9 +278,9 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
     if template.kind != KIND {
         bail!("template kind must be '{KIND}'");
     }
-    if template.schema_version != SCHEMA_VERSION {
+    if !matches!(template.schema_version, 1 | SCHEMA_VERSION) {
         bail!(
-            "unsupported template schema version {}; supported version is {SCHEMA_VERSION}",
+            "unsupported template schema version {}; supported versions are 1 and {SCHEMA_VERSION}",
             template.schema_version
         );
     }
@@ -311,7 +334,40 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
         }
     }
 
+    if template.schema_version == 1 && !template.topics_automations.is_empty() {
+        bail!("bundled Topics settings require template schema version 2");
+    }
     let mut automation_names = HashSet::new();
+    for automation in &template.topics_automations {
+        require_text(&automation.name, "Topics automation name")?;
+        if !automation_names.insert(automation.name.as_str()) {
+            bail!(
+                "template contains duplicate automation name '{}'",
+                automation.name
+            );
+        }
+        if !is_topics(&automation.config) {
+            bail!(
+                "automation '{}' is not a Topics automation (expected event_type 'topic')",
+                automation.name
+            );
+        }
+        if WIRING_KEYS
+            .iter()
+            .any(|key| automation.config.get(key).is_some())
+        {
+            bail!("Topics automation '{}' settings must not contain facet_functions or topic_map_functions", automation.name);
+        }
+    }
+    if template.schema_version == SCHEMA_VERSION {
+        for facet in &template.facets {
+            if let Some(name) = facet.topics_automation.as_deref() {
+                if !automation_names.contains(name) {
+                    bail!("facet '{}' references Topics automation '{name}' without bundled settings in topics_automations", facet.name);
+                }
+            }
+        }
+    }
     for automation in &template.automations {
         require_text(&automation.name, "automation name")?;
         if !automation_names.insert(automation.name.as_str()) {
@@ -328,6 +384,56 @@ pub(crate) fn validate(template: &ActiveObservabilityTemplate) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_topics_scope(template: &ActiveObservabilityTemplate) -> Result<()> {
+    for automation in &template.topics_automations {
+        if automation
+            .config
+            .get("data_scope")
+            .and_then(|scope| scope.get("experiment_id"))
+            .is_some_and(|id| !id.is_null())
+        {
+            let facet = template
+                .facets
+                .iter()
+                .find(|facet| facet.topics_automation.as_deref() == Some(automation.name.as_str()));
+            if let Some(facet) = facet {
+                bail!("facet '{}' uses Topics automation '{}' scoped to a specific experiment; its settings cannot be copied to another project", facet.name, automation.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn retain_topics_settings(template: &mut ActiveObservabilityTemplate) {
+    let names = template
+        .facets
+        .iter()
+        .filter_map(|facet| facet.topics_automation.as_deref())
+        .collect::<HashSet<_>>();
+    template
+        .topics_automations
+        .retain(|automation| names.contains(automation.name.as_str()));
+}
+
+pub(crate) fn topics_settings(config: &Value) -> Result<Value> {
+    let mut settings = object(config, "Topics automation config")?.clone();
+    for key in WIRING_KEYS {
+        settings.remove(key);
+    }
+    Ok(Value::Object(settings))
+}
+
+pub(crate) fn topics_config_for_target(settings: &Value, destination: &Value) -> Result<Value> {
+    let mut config = object(settings, "Topics automation settings")?.clone();
+    for key in WIRING_KEYS {
+        config.insert(
+            key.to_string(),
+            destination.get(key).cloned().unwrap_or_else(|| json!([])),
+        );
+    }
+    Ok(Value::Object(config))
 }
 
 fn reserve_slug(
@@ -817,5 +923,54 @@ mod tests {
         assert_eq!(twice["custom"]["keep"], true);
         assert_eq!(twice["facet_functions"].as_array().unwrap().len(), 1);
         assert_eq!(twice["topic_map_functions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn active_observability_v2_settings_validate_and_follow_selection() {
+        let mut source: ActiveObservabilityTemplate = serde_json::from_value(json!({
+            "kind": KIND, "schema_version": 2,
+            "facets": [{"name":"Test facet", "slug":"test-facet", "topics_automation":"Test Topics", "function_data":{"type":"facet"}}],
+            "topics_automations": [{"name":"Test Topics", "config":{"event_type":"topic", "backfill_time_range":"server-owned-value"}}]
+        })).unwrap();
+        validate(&source).unwrap();
+        source.topics_automations[0].config["facet_functions"] = json!([]);
+        assert!(validate(&source)
+            .unwrap_err()
+            .to_string()
+            .contains("facet_functions"));
+        source.topics_automations[0]
+            .config
+            .as_object_mut()
+            .unwrap()
+            .remove("facet_functions");
+        source.topics_automations[0].config["event_type"] = json!("windowed");
+        assert!(validate(&source)
+            .unwrap_err()
+            .to_string()
+            .contains("not a Topics"));
+        source.topics_automations[0].config["event_type"] = json!("topic");
+        source
+            .topics_automations
+            .push(source.topics_automations[0].clone());
+        assert!(validate(&source)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        source.topics_automations.pop();
+        let mut missing = source.clone();
+        missing.topics_automations.clear();
+        assert!(validate(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("without bundled settings"));
+        missing.schema_version = 1;
+        validate(&missing).unwrap();
+        source.topics_automations[0].config["data_scope"] =
+            json!({"type":"experiment", "experiment_id":"test-experiment-id"});
+        let error = validate_topics_scope(&source).unwrap_err().to_string();
+        assert!(error.contains("Test facet") && error.contains("specific experiment"));
+        source.facets.clear();
+        retain_topics_settings(&mut source);
+        assert!(source.topics_automations.is_empty());
     }
 }

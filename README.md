@@ -212,6 +212,21 @@ Remove-Item -Recurse -Force (Join-Path $userProfile ".braintrust\auth") -ErrorAc
 | `bt sync`          | Synchronize project logs between Braintrust and local NDJSON files  |
 | `bt update`        | Update bt in-place                                                  |
 
+## `bt observability template`
+
+Copy custom facets, their Topics automation settings, and Loop automations between projects:
+
+```bash
+bt observability template pull --output observability-template.json --project test-source-project
+bt observability template push observability-template.json --project test-destination-project
+```
+
+Schema v2 adds `topics_automations`, with each referenced automation's name, description, and API-returned config. Scope, automation-level BTQL filters, sampling, model, status, and timing travel with the facet. Project-specific `facet_functions` and `topic_map_functions` wiring is rebuilt in the destination. Version 1 templates remain readable and use destination/default Topics settings.
+
+New automations use the bundled settings. Existing automations with matching settings and descriptions retain them. Differences require `--force`, which replaces settings in full while preserving destination facet/map wiring; destination-only settings are dropped. `--topics-automation <NAME_OR_ID>` uses that existing automation's settings instead of the template's. Existing resource replacement rules still apply to facet and preprocessor definitions.
+
+Settings scoped to a specific experiment cannot be exported because its ID is project-specific. Timing validation and normalization remain with the server; settings returned by the API may differ from the submitted values. Topic map definitions and generated state are not exported. Topics update when the pipeline runs again.
+
 ## `bt custom-views`
 
 Define custom views with `customTraceView` or `customDatasetView` from `braintrust/custom-views` (SDK 3.33.0 or later).
