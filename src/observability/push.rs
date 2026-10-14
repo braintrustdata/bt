@@ -217,15 +217,7 @@ pub(crate) fn plan(
                     slug: Some(map.slug.clone()),
                 });
         }
-        plan_topics_removals(
-            &mut topics,
-            &topics_automations,
-            &key,
-            existing,
-            topic_map,
-            &duplicate_topic_maps,
-            &functions_by_id,
-        )?;
+        plan_topics_removals(&mut topics, &key, &duplicate_topic_maps)?;
         facets.push(FacetMutation {
             template: facet.clone(),
             existing: existing.cloned(),
@@ -285,12 +277,8 @@ pub(crate) fn plan(
 
 fn plan_topics_removals(
     topics: &mut BTreeMap<String, TopicsMutation>,
-    _automations: &[&ProjectAutomation],
     selected_key: &str,
-    _facet: Option<&Function>,
-    _topic_map: Option<&Function>,
     duplicate_topic_maps: &[&Function],
-    _functions_by_id: &HashMap<&str, &Function>,
 ) -> Result<()> {
     let selected = topics
         .get_mut(selected_key)
